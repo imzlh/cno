@@ -443,7 +443,7 @@ declare namespace CModuleFS {
      */
     export function read(
         fd: number,
-        buffer: ArrayBuffer,
+        buffer: ArrayBuffer | Uint8Array,
         offset?: number,
         length?: number
     ): number;
@@ -459,7 +459,7 @@ declare namespace CModuleFS {
      */
     export function write(
         fd: number,
-        buffer: ArrayBuffer,
+        buffer: ArrayBuffer | Uint8Array,
         offset?: number,
         length?: number
     ): number;
@@ -485,9 +485,20 @@ declare namespace CModuleFS {
      */
     export function writeFile(
         path: string,
-        data: ArrayBuffer,
+        data: ArrayBuffer | Uint8Array,
         mode?: number
     ): void;
+
+    /**
+     * Read entire file synchronously with specific encoding
+     * <br>
+     * High-performance using Windows/Linux OS-level copy
+     * @param path - File path
+     * @param encoding - Encoding to use (default: 'utf-8')
+     * @returns File contents as string
+     * @throws Error if file doesn't exist or read fails
+     */
+    export function copy(path: string, dest: string): void;
 
     // ============================================================================
     // Directory Operations
@@ -535,6 +546,20 @@ declare namespace CModuleFS {
      */
     export function rename(oldPath: string, newPath: string): void;
 
+    /**
+     * Link a file (creates a new name for an existing file)
+     * @param path - File path
+     * @param newPath - New file path
+     */
+    export function link(path: string, newPath: string): void;
+
+    /**
+     * Create a symbolic link (creates a new file that points to an existing file)
+     * @param path - File path
+     * @param newPath - Symlink path
+     */
+    export function symlink(path: string, newPath: string): void;
+
     // ============================================================================
     // Path Operations
     // ============================================================================
@@ -560,4 +585,11 @@ declare namespace CModuleFS {
      * @throws Error if directory doesn't exist or change fails
      */
     export function chdir(path: string): void;
+
+    /**
+     * read symbolic link contents
+     * @param path - Symbolic link path
+     * @returns Target path of symbolic link
+     */
+    export function readlink(path: string): string;
 }

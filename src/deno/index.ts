@@ -4,10 +4,14 @@ import packageJson from '../../package.json';
 const os = import.meta.use('os');
 const sys = import.meta.use('sys');
 const engine = import.meta.use('engine');
+const signal = import.meta.use('signal');
+const console = import.meta.use('console');
 
 function notSupported(): never{
     throw new errors.NotSupported("Not supported");
 }
+
+const signalMap: Record<string, Map<() => void, CModuleSignals.SignalHandler>> = {};
 
 function safeGetEnv(env: string){
     try{
@@ -57,13 +61,27 @@ Object.defineProperty(globalThis, "Deno", {
         execPath: () => sys.exePath,
         noColor: safeGetEnv("NO_COLOR") === "1",
         memoryUsage: () => {
-            // TODO
+            const memory = os.memoryUsage();
             return {
-                external: 0,
-                heapTotal: 0,
-                heapUsed: 0,
-                rss: 0,
+                external: memory["vm.used"],
+                // note: qjs does not have heap
+                heapTotal: memory['used'],
+                heapUsed: memory['used'],
+                rss: memory["os.rss"],
             }
+        },
+        systemMemoryInfo(){
+            const memory = os.memoryUsage();
+            return {
+                total: memory["os.total"],
+                free: memory["os.free"],
+                available: memory["os.free"],
+                // these are not supported by cjs
+                buffers: 0,
+                cached: 0,
+                swapTotal: 0,
+                swapFree: 0
+            };
         },
         hostname: () => os.hostname,
         loadavg: os.loadavg,
@@ -89,7 +107,35 @@ Object.defineProperty(globalThis, "Deno", {
             revoke: notSupported,
             revokeSync: notSupported,
         },
-        // todo: PermissionStatus, Permissions,
+        // todo: PermissionStatus, Permissions, test, bench
+
+        addSignalListener(sig, handler){
+            // @ts-ignore
+            const sigint = signal.signals[sig];
+            if (typeof sigint != 'number')
+                throw new Error(`Invalid signal: ${sig}`);
+            if (signalMap[sig]?.has(handler))
+                return;
+            const ret = signal.signal(sigint, handler);
+            if (!signalMap[sig]) signalMap[sig] = new Map();
+            signalMap[sig].set(handler, ret);
+        },
+
+        removeSignalListener(sig, handler){
+            // @ts-ignore
+            const sigint = signal.signals[sig];
+            if (typeof sigint != 'number')
+                throw new Error(`Invalid signal: ${sig}`);
+            const map = signalMap[sig];
+            if (!map) return;
+            const ret = map.get(handler);
+            if (ret) ret.close();
+        },
+
+        inspect(obj, opt){
+           // todo
+           return String(obj);
+        }
     } as Partial<typeof Deno>,
     writable: false,
     enumerable: true,
@@ -97,4 +143,8 @@ Object.defineProperty(globalThis, "Deno", {
 })
 
 // then import polyfills
-await import('./fs');
+await import('./02_fs');
+await import('./03_fopen');
+await import('./04_stdio');
+await import('./05_net');
+await import('./06_process');

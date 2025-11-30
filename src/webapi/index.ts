@@ -42,6 +42,9 @@ Object.defineProperties(globalThis, {
     }
 });
 
+// performance
+import './performance';
+
 // URL polyfill
 // @ts-ignore
 await import('url-polyfill');

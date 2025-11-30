@@ -4,3 +4,4 @@ test.json
 cjs
 node_modules/
 tsrt.js
+types/

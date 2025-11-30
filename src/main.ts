@@ -1,5 +1,5 @@
-import './webapi/core';
-import './deno/deno';
+import './webapi';
+import './deno';
 
 const entry = Deno.args.splice(1, 1)[0];
 if (!entry){
