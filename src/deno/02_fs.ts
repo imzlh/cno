@@ -582,6 +582,22 @@ Object.assign(Deno, {
         return toDenoStat(st);
     },
 
+    async makeTempFile(opt){
+        const randomValue = Math.floor(Math.random() * 1e9).toString(36);
+        const path = join(opt?.dir ?? os.tmpdir, opt?.prefix ?? 'cno', opt?.suffix ?? 'cno-')
+            + randomValue;
+        await mkdirRecursive(path, 755);
+        return path;
+    },
+
+    makeTempFileSync(opt){
+        const randomValue = Math.floor(Math.random() * 1e9).toString(36);
+        const path = join(opt?.dir ?? os.tmpdir, opt?.prefix ?? 'cno', opt?.suffix ?? 'cno-')
+            + randomValue;
+        mkdirRecursiveSync(path, 755);
+        return path;
+    },
+
     watchFs(path, options) {
         const paths = Array.isArray(path) ? path : [path];
         const watchers: Map<string, AsyncIterableIterator<Deno.FsEvent> & { close(): void }> = new Map();

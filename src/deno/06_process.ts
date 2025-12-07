@@ -1,5 +1,6 @@
 import { toString } from "./02_fs";
 import { Stream } from "./04_stdio";
+import { useWritable } from "./05_net";
 
 const os = import.meta.use('os');
 const proc = import.meta.use('process');
@@ -70,7 +71,7 @@ class Process implements Deno.ChildProcess {
     status: Promise<Deno.CommandStatus>;
     
     constructor(private $proc: CModuleProcess.ChildProcess, private $wait: Promise<CModuleProcess.ExitInfo>) {
-        this.$stdin = this.createWriteStream($proc.stdin!);
+        this.$stdin = useWritable($proc.stdin!);
         this.$stdout = new RStream($proc.stdout!);
         this.$stderr = new RStream($proc.stderr!);
         this.pid = $proc.pid;
@@ -79,22 +80,6 @@ class Process implements Deno.ChildProcess {
             success: f.exit_status === 0, 
             signal: f.term_signal as any
         }));
-    }
-
-    private createWriteStream(pipe: CModuleProcess.Pipe): WritableStream {
-        return  new WritableStream({
-            write: async (chunk, control) => {
-                try {
-                    let written = 0;
-                    while (written < chunk.length) {
-                        const n = await pipe.write(chunk.subarray(written));
-                        written += n;
-                    }
-                } catch (e) {
-                    control.error(e);
-                }
-            }
-        });
     }
 
     output(): Promise<Deno.CommandOutput> {
@@ -191,4 +176,8 @@ Object.assign(Deno, {
     kill(pid: number, signo: Deno.Signal): void {
         proc.kill(pid, signo);
     },
+
+    umask(mask?: number): number {
+        return 0;   // not implemented
+    }
 } as Partial<typeof Deno>);

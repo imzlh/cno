@@ -1,7 +1,10 @@
-import './webapi';
-import './deno';
+import { installGlobal } from './cjs';
+installGlobal(); // allow require()
 
-const entry = Deno.args.splice(1, 1)[0];
+await import('./webapi/index');
+await import('./deno/index');
+
+const entry = Deno.args[0];
 if (!entry){
     console.error("No entry point specified");
     Deno.exit(1);

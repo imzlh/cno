@@ -1,4 +1,4 @@
-import { errors } from "./01_errors.js";
+import { errors } from "./01_errors";
 import packageJson from '../../package.json';
 
 const os = import.meta.use('os');
@@ -26,7 +26,7 @@ Object.defineProperty(globalThis, "Deno", {
 
         pid: os.pid,
         ppid: os.ppid,
-        args: sys.args,
+        args: sys.args.slice(1),    // remove self
         env: {
             get: safeGetEnv,
             set: os.setenv,
@@ -46,14 +46,14 @@ Object.defineProperty(globalThis, "Deno", {
             arch: os.uname().machine,
             os: sys.platform,
             standalone: false,
-            target: "unknown",
-            vendor: "unknown",
+            target: `${os.uname().machine}-unknown-${sys.platform}`,
+            vendor: "cno"
         },
         version: {
             deno: packageJson.version,
             // note: this is not real!
             v8: engine.versions.quickjs,
-            typescript: "3.9.2",
+            typescript: "5.9.0-sucrase",
         },
         cwd: () => os.cwd,
         chdir: (dir: string) => os.chdir(dir),
@@ -133,8 +133,22 @@ Object.defineProperty(globalThis, "Deno", {
         },
 
         inspect(obj, opt){
-           // todo
-           return String(obj);
+            return console.inspect(obj);
+        },
+
+        refTimer(id){
+            // todo?
+        },
+        unrefTimer(id){
+            // todo?
+        },
+
+        uid(){
+            // fixme: this is not work well when suid
+            return os.userInfo.userId;
+        },
+        gid(){
+            return os.userInfo.groupId;
         }
     } as Partial<typeof Deno>,
     writable: false,
@@ -148,3 +162,5 @@ await import('./03_fopen');
 await import('./04_stdio');
 await import('./05_net');
 await import('./06_process');
+await import('./07_http');
+await import('./08_serve');

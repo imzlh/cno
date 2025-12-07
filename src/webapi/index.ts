@@ -1,3 +1,5 @@
+import { assert } from '../utils/assert';
+
 const { onEvent } = import.meta.use('engine');
 
 // basic polyfills
@@ -42,20 +44,32 @@ Object.defineProperties(globalThis, {
     }
 });
 
-// performance
-import './performance';
+// basic
+await import('./basic');
 
 // URL polyfill
 // @ts-ignore
-await import('url-polyfill');
+const { URL, URLSearchParams } = require('whatwg-url');
+Reflect.set(globalThis, 'URL', URL);
+Reflect.set(globalThis, 'URLSearchParams', URLSearchParams);
+
+// URLPattern polyfill
+// @ts-ignore
+await import('urlpattern-polyfill');
 
 // web streams polyfill
 // @ts-ignore
-await import('web-streams-polyfill');
+const stream =  await import('web-streams-polyfill');
+for (const key in stream) {
+    if (key === 'default') continue;
+    // @ts-ignore
+    Reflect.set(globalThis, key, stream[key]);
+}
 
 // fetch
 // @ts-ignore
 await import('whatwg-fetch');
+assert(globalThis.fetch)
 
 // abort-signal polyfill
 // @ts-ignore
@@ -86,3 +100,18 @@ onEvent((eventName, eventData) => {
     if(event.defaultPrevented) return true;
     return false;
 });
+
+// crypto
+await import('./crypto');
+
+// performance
+await import('./performance');
+
+// wasm
+await import('./wasm');
+
+// websocket
+await import('./ws');
+
+// storage
+await import('./storage');

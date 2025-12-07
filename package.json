@@ -4,7 +4,7 @@
   "description": "cts - circu.js bootstrap to provide full typescript experience",
   "main": "src/main.ts",
   "scripts": {
-    "build": "esbuild main.ts --bundle --target=es2024 --format=esm --outfile=dist.js",
+    "build": "esbuild src/main.ts --bundle --target=es2024 --format=esm --outfile=dist.js",
     "bundle": "cjsc -b cjs -s -e dist.js"
   },
   "keywords": [],
@@ -13,11 +13,13 @@
   "packageManager": "pnpm@10.17.1",
   "dependencies": {
     "abortcontroller-polyfill": "^1.7.8",
+    "custom-event-polyfill": "^1.0.7",
     "event-target-polyfill": "^0.0.4",
     "sucrase": "^3.35.1",
-    "url-polyfill": "^1.1.14",
+    "urlpattern-polyfill": "^10.1.0",
     "web-streams-polyfill": "^4.2.0",
-    "whatwg-fetch": "^3.6.20"
+    "whatwg-fetch": "^3.6.20",
+    "whatwg-url": "^15.1.0"
   },
   "devDependencies": {
     "esbuild": "^0.27.0"
