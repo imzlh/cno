@@ -13,12 +13,14 @@
   "packageManager": "pnpm@10.17.1",
   "dependencies": {
     "abortcontroller-polyfill": "^1.7.8",
+    "blob-polyfill": "^9.0.20240710",
     "custom-event-polyfill": "^1.0.7",
     "event-target-polyfill": "^0.0.4",
+    "formdata-polyfill": "^4.0.10",
+    "headers-polyfill": "^4.0.3",
     "sucrase": "^3.35.1",
     "urlpattern-polyfill": "^10.1.0",
     "web-streams-polyfill": "^4.2.0",
-    "whatwg-fetch": "^3.6.20",
     "whatwg-url": "^15.1.0"
   },
   "devDependencies": {

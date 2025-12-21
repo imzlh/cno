@@ -509,7 +509,7 @@ Object.assign(Deno, {
     },
 
     truncateSync(name, len){
-        throw new Deno.errors.NotSupported();
+        fs.truncate(toString(name), len ?? 0);
     },
 
     async mkdir(path, opt) {
@@ -558,7 +558,7 @@ Object.assign(Deno, {
     },
 
     chmodSync(path, mode){
-        throw new Deno.errors.NotSupported();
+        return fs.chmod(toString(path), mode);
     },
 
     chown(path, uid, gid){
@@ -567,10 +567,8 @@ Object.assign(Deno, {
     },
 
     chownSync(path, uid, gid){
-        throw new Deno.errors.NotSupported();
+        return fs.chown(toString(path), uid ?? os.userInfo.userId, gid ?? os.userInfo.groupId);
     },
-    
-
 
     async stat(path) {
         const st = await asfs.stat(toString(path));

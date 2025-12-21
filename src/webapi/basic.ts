@@ -1,9 +1,13 @@
+import { assert } from "../utils/assert";
+
 const crypto = import.meta.use('crypto');
 const engine = import.meta.use('engine');
 const text = import.meta.use('text');
 const os = import.meta.use('os');
 const fs = import.meta.use('fs');
 const timer = import.meta.use('timers');
+
+assert(text, 'text module is not available');
 
 globalThis.atob = function(str) {
     const dec = crypto.base64Decode(str);
@@ -20,15 +24,20 @@ globalThis.alert = function(msg) {
 }
 
 globalThis.prompt = function(msg) {
-    fs.write(os.STDOUT_FILENO, engine.encodeString(msg ?? '? '));
+    fs.setBlocking(os.STDIN_FILENO, true);
+    fs.setBlocking(os.STDOUT_FILENO, true);
+    assert(fs.write(os.STDOUT_FILENO, engine.encodeString(msg ? msg + ' ' : '? ')), "write() operation failed");
     let buf = new Uint8Array(1024);
     let i = 0;
+    const LF = engine.encodeString('\n')[0];
     while(true){
         const n = fs.read(os.STDIN_FILENO, buf);
         if(n === 0) break;
         for(let j = 0; j < n; j++) {
-            if(buf[j] === 10) {
+            if(buf[j] === LF) {
                 const s = engine.decodeString(buf.subarray(0, j));
+                fs.setBlocking(os.STDIN_FILENO, false);
+                fs.setBlocking(os.STDOUT_FILENO, false);
                 return s;
             }
         }
@@ -40,6 +49,8 @@ globalThis.prompt = function(msg) {
         buf.set(buf.subarray(n), i);
         i += n;
     }
+    fs.setBlocking(os.STDIN_FILENO, false);
+    fs.setBlocking(os.STDOUT_FILENO, false);
     return null;
 }
 

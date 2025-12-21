@@ -15,6 +15,7 @@
 
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
+const os = import.meta.use('os');
 
 // ============================================================================
 // Type Definitions
@@ -131,7 +132,7 @@ const path = {
     resolve(...parts: string[]): string {
         let resolved = path.join(...parts);
         if (!resolved.startsWith('/')) {
-            resolved = path.join(fs.getcwd(), resolved);
+            resolved = path.join(os.cwd, resolved);
         }
 
         // Normalize path
@@ -666,7 +667,7 @@ class ModuleLoader {
      * Install require globally
      */
     public installGlobal(mainFilename?: string): RequireFunction {
-        const filename = mainFilename || path.join(fs.getcwd(), 'index.js');
+        const filename = mainFilename || path.join(os.cwd, 'index.js');
         const require = this.createRequireFunction(filename);
         (globalThis as any).require = require;
         this.log('Installed global require');

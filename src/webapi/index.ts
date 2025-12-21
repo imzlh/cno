@@ -27,20 +27,6 @@ Object.defineProperties(globalThis, {
         writable: false,
         enumerable: true,
         configurable: false
-    },
-    exports: {
-        value: {},
-        writable: true,
-        enumerable: true,
-        configurable: false
-    },
-    module: {
-        value: {
-            exports: {}
-        },
-        writable: true,
-        enumerable: true,
-        configurable: false
     }
 });
 
@@ -66,12 +52,15 @@ for (const key in stream) {
     Reflect.set(globalThis, key, stream[key]);
 }
 
-// fetch
+// blob and formdata polyfill
 // @ts-ignore
-await import('whatwg-fetch');
-assert(globalThis.fetch)
+await import('blob-polyfill');
+// @ts-ignore
+await import('formdata-polyfill');
 
 // abort-signal polyfill
+// @ts-ignore 欺骗abortcontroller-polyfill
+globalThis.fetch = () => void 0;
 // @ts-ignore
 await import('abortcontroller-polyfill');
 
@@ -101,6 +90,16 @@ onEvent((eventName, eventData) => {
     return false;
 });
 
+// headers
+const { Headers } = await import('headers-polyfill');
+Reflect.set(globalThis, 'Headers', Headers);
+
+// fetch & xhr polyfill
+await import('../module/http/fetch');
+
+// websocket
+await import('../module/http/websocket');
+
 // crypto
 await import('./crypto');
 
@@ -109,9 +108,6 @@ await import('./performance');
 
 // wasm
 await import('./wasm');
-
-// websocket
-await import('./ws');
 
 // storage
 await import('./storage');

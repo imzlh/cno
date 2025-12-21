@@ -1,3 +1,6 @@
+import { assert } from "../utils/assert";
+import { dirname } from "../utils/path";
+
 const sqlite3 = import.meta.use('sqlite3');
 const fs = import.meta.use('fs');
 const os = import.meta.use('os');
@@ -93,12 +96,14 @@ class Storage {
             quota: 10 * 1024 * 1024, // 10MB default
             useWAL: true,
             autoVacuum: true,
-            path: ':inmemory:',
+            path: ':memory:',
             ...(options ?? {})
         };
 
-        this.db = sqlite3.open(this.options.path, sqlite3.SQLITE_OPEN_READWRITE | sqlite3.SQLITE_OPEN_CREATE); // in-memory database for testing
         this.ensureStorageDirectory();
+        this.db = options?.path 
+            ? sqlite3.open(this.options.path, sqlite3.SQLITE_OPEN_READWRITE | sqlite3.SQLITE_OPEN_CREATE)
+            : sqlite3.open(':memory:', sqlite3.SQLITE_OPEN_READWRITE | sqlite3.SQLITE_OPEN_CREATE | sqlite3.SQLITE_OPEN_MEMORY | sqlite3.SQLITE_OPEN_NOMUTEX);        
         this.openDatabase();
         this.initializeSchema();
         this.prepareStatements();
@@ -116,7 +121,7 @@ class Storage {
     /**
      * Ensure storage directory exists
      */
-    private ensureStorageDirectory(): void {
+    private ensureStorageDirectory() {
         const dir = this.getDirectoryPath(this.options.path);
         if (dir && !fs.exists(dir)) {
             this.mkdirRecursive(dir);
@@ -674,14 +679,16 @@ class StorageManager {
     /**
      * Get default storage path
      */
-    private getDefaultPath(name: string): string {
+    private getDefaultPath(name: string) {
         const hash = crypto.base64Encode(crypto.md5(engine.encodeString(os.cwd)));
+        let path;
         try {
-            const homeDir = os.getenv('HOME') ?? fs.getcwd();
-            return `${homeDir}/.storage/${hash}/${name}.db`;
+            const homeDir = os.getenv('HOME') ?? os.cwd;
+            path = `${homeDir}/.storage/${hash}/${name}.db`;
         } catch {
-            return `${os.tmpdir}/.storage/${hash}/${name}.db`;
+            path = `${os.tmpdir}/.storage/${hash}/${name}.db`;
         }
+        return path;
     }
 
     /**

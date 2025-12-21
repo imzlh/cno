@@ -428,10 +428,6 @@ Object.assign(Deno, {
         }
     },
 
-    connectQuic() {
-        throw new Deno.errors.NotSupported();
-    },
-
     async connectTls(options) {
         const af4 = !options.hostname?.includes(':');
         const pipe = new stream.TCP(af4 ? os.AF_INET : os.AF_INET6);
@@ -449,11 +445,6 @@ Object.assign(Deno, {
         });
 
         return toConn(sslpipe, pipe);
-    },
-
-    // quic
-    upgradeWebTransport(conn){
-        throw new Deno.errors.NotSupported();
     },
 
     // @ts-ignore
