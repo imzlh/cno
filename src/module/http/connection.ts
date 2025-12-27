@@ -1,46 +1,49 @@
 /**
- * HTTP/HTTPS 连接管理器
- * 实现 Keep-Alive 连接池，支持连接复用和自动清理
+ * HTTP/HTTPS Connection Manager
+ * Implements Keep-Alive pooling with connection reuse and automatic cleanup.
+ * 
+ * Critical OpenSSL BIO behavior:
+ * - feed() returns bytes consumed (may be < input length)
+ * - read() returns 0 when no data buffered (NOT an error)
+ * - handshake() must be called repeatedly until complete
  */
 
 import { assert } from "../../utils/assert";
 
-const streams = import.meta.use('streams');
-const ssl = import.meta.use('ssl');
-const dns = import.meta.use('dns');
-const os = import.meta.use('os');
-const timers = import.meta.use('timers');
-const asfs = import.meta.use('asyncfs')
+const streams = import.meta.use("streams");
+const ssl     = import.meta.use("ssl");
+const dns     = import.meta.use("dns");
+const os      = import.meta.use("os");
+const timers  = import.meta.use("timers");
+const asfs    = import.meta.use("asyncfs");
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
-/**
- * 连接配置
- */
+/* ------------------------------------------------------------------ */
+/* Configuration & State                                              */
+/* ------------------------------------------------------------------ */
+
 interface ConnectionConfig {
     hostname: string;
     port: number;
-    protocol: 'http:' | 'https:';
+    protocol: "http:" | "https:";
     timeout?: number;
     keepAlive?: boolean;
     keepAliveTimeout?: number;
     maxSockets?: number;
 }
 
-/**
- * 连接状态
- */
 export enum ConnectionState {
-    IDLE = 'idle',           // 空闲可用
-    ACTIVE = 'active',       // 正在使用
-    CONNECTING = 'connecting', // 连接中
-    CLOSED = 'closed'        // 已关闭
+    IDLE       = "idle",
+    ACTIVE     = "active",
+    CONNECTING = "connecting",
+    CLOSED     = "closed"
 }
 
 export interface ConnectionLike {
-    socket: any; // 或者更具体的 socket 类型
-    sslPipe: null | CModuleSSL.Pipe;
-    state: ConnectionState; // 假设 ConnectionState 是一个枚举
+    socket:   CModuleStreams.TCP;
+    sslPipe:  CModuleSSL.Pipe | null;
+    state:    ConnectionState;
     lastUsed: number;
     requests: number;
 
@@ -52,52 +55,52 @@ export interface ConnectionLike {
     close(): void;
     isAvailable(): boolean;
     isClosed(): boolean;
-};
+}
 
-/**
- * 连接对象
- */
+/* ------------------------------------------------------------------ */
+/* Single Connection                                                  */
+/* ------------------------------------------------------------------ */
+
 export class Connection implements ConnectionLike {
-    public socket: CModuleStreams.TCP;
-    public sslPipe: CModuleSSL.Pipe | null = null;
-    public state: ConnectionState = ConnectionState.CONNECTING;
-    public lastUsed: number = Date.now();
-    public requests: number = 0;
+    public socket:   CModuleStreams.TCP;
+    public sslPipe:  CModuleSSL.Pipe | null = null;
+    public state:    ConnectionState        = ConnectionState.CONNECTING;
+    public lastUsed: number                 = Date.now();
+    public requests: number                 = 0;
+
     private idleTimer: number | null = null;
     private config: ConnectionConfig;
+    
+    // Buffer for unfed ciphertext when SSL pipe is full
+    private pendingCiphertext: Uint8Array | null = null;
 
-    constructor(config: ConnectionConfig) {
-        this.config = config;
+    constructor(cfg: ConnectionConfig) {
+        this.config = cfg;
         this.socket = new streams.TCP();
     }
 
-    /**
-     * 连接到远程服务器
-     */
+    /* -------------------------------------------------------------- */
+    /* Public API                                                     */
+    /* -------------------------------------------------------------- */
+
     async connect(): Promise<void> {
         try {
-            // DNS 解析
-            const addresses = await dns.resolve(this.config.hostname, {
-                family: os.AF_UNSPEC
-            });
-
-            if (!addresses || addresses.length === 0) {
+            // DNS resolution
+            const addrs = await dns.resolve(this.config.hostname, { family: os.AF_UNSPEC });
+            if (!addrs || !addrs.length) {
                 throw new Error(`DNS resolution failed for ${this.config.hostname}`);
             }
 
-            // 优先使用 IPv4
-            const addr = addresses.find(a => a.family === 4) || addresses[0];
-            assert(addr, `No IPv4 address found for ${this.config.hostname}`);
+            // Prefer IPv4
+            const addr = addrs.find(a => a.family === 4) || addrs[0];
+            assert(addr, `No IP address found for ${this.config.hostname}`);
 
-            // TCP 连接
-            await this.socket.connect({
-                ip: addr.ip,
-                port: this.config.port
-            });
+            // TCP connect
+            await this.socket.connect({ ip: addr.ip, port: this.config.port });
 
-            // HTTPS 需要 SSL 握手
-            if (this.config.protocol === 'https:') {
-                await this.setupSSL();
+            // TLS handshake if HTTPS
+            if (this.config.protocol === "https:") {
+                await this.performTLSHandshake();
             }
 
             this.state = ConnectionState.IDLE;
@@ -108,149 +111,100 @@ export class Connection implements ConnectionLike {
         }
     }
 
-    /**
-     * 自动探测系统 CA 证书文件路径
-     * @returns {Promise<string>} 可读到的证书文件绝对路径
-     * @throws  {Error} 所有候选路径都不可读时抛出
-     */
-    private async findSystemCaPath() {
-        const candidates = (() => {
-            switch (os.uname().sysname) {
-                case 'Linux':
-                    return [
-                        '/etc/ssl/certs/ca-certificates.crt',      // Debian/Ubuntu/WSL
-                        '/etc/pki/tls/certs/ca-bundle.crt',        // RHEL/CentOS 7
-                        '/etc/ssl/ca-bundle.pem',                  // openSUSE/SLES
-                        '/etc/pki/tls/cert.pem',                   // Fedora new layout
-                        '/etc/ssl/cert.pem',                       // Alpine
-                    ];
-                case 'Darwin': 
-                    return [
-                        '/etc/ssl/cert.pem',                       // macOS 自带
-                        '/usr/local/etc/openssl/cert.pem',         // Homebrew OpenSSL
-                        '/opt/homebrew/etc/openssl/cert.pem',      // Homebrew on Apple Silicon
-                    ];
-                case 'Windows_NT':
-                    return [
-                        'C:\\Windows\\cacert.pem',                 // User-provided CA bundle
-                        'C:\\Program Files\\OpenSSL-Win64\\bin\\curl-ca-bundle.crt', // OpenSSL full-install
-                        'C:\\Program Files\\Git\\mingw64\\ssl\\cert.pem',            // Git for Windows
-                    ];
-                default:
-                    return [];
-            }
-        })();
-        
-        for (const p of candidates) {
-            try {
-                const st = await asfs.stat(p);
-                if (st.isFile) return p;
-            } catch {
-                // not-exist or not-file
-            }
-        }
-
-        return null;
-    }
-
-    /**
-     * 设置 SSL 连接
-     */
-    private async setupSSL(): Promise<void> {
-        const ca = await this.findSystemCaPath();
-        const context = new ssl.Context({
-            mode: 'client',
-            verify: !!ca,
-            ca: ca ?? undefined
-        });
-        if (!ca) console.warn('No system CA certificate found, skipping SSL verification');
-
-        this.sslPipe = new ssl.Pipe(context, {
-            servername: this.config.hostname
-        });
-
-        // 开始握手
-        this.sslPipe.doHandshake();
-        let handshakeData = this.sslPipe.getOutput();
-        if (handshakeData) {
-            const buf = new Uint8Array(handshakeData);
-            await this.socket.write(buf);
-        }
-
-        // 完成握手
-        while (!this.sslPipe.handshakeComplete) {
-            const readBuf = new Uint8Array(16384);
-            const n = await this.socket.read(readBuf);
-
-            if (n === null || n === 0) {
-                throw new Error('SSL handshake failed: connection closed');
-            }
-
-            this.sslPipe.feed(readBuf.slice(0, n));
-            this.sslPipe.doHandshake();
-
-            handshakeData = this.sslPipe.getOutput();
-            if (handshakeData) {
-                const buf = new Uint8Array(handshakeData);
-                await this.socket.write(buf);
-            }
-        }
-    }
-
-    /**
-     * 写入数据
-     */
     async write(data: Uint8Array): Promise<void> {
         if (this.sslPipe) {
-            this.sslPipe.write(data);
+            // SSL mode: encrypt plaintext
+            const written = this.sslPipe.write(data);
+            
+            // Note: write() returns bytes written, but OpenSSL may buffer
+            // We assume it always accepts all data for application writes
+            if (written < 0) {
+                throw new Error(`SSL_write failed: ${written}`);
+            }
+
+            // Send encrypted data to network
             const encrypted = this.sslPipe.getOutput();
             if (encrypted) {
                 await this.socket.write(new Uint8Array(encrypted));
             }
         } else {
+            // Plain HTTP: write directly
             await this.socket.write(data);
         }
     }
 
-    /**
-     * 读取数据
-     */
-    async read(size: number = 16384): Promise<Uint8Array | null> {
-        const buf = new Uint8Array(size);
-        const n = await this.socket.read(buf);
-
-        if (n === null || n === 0) {
-            return null;
-        }
-
-        const data = buf.slice(0, n);
-
+    async read(size = 16384): Promise<Uint8Array | null> {
         if (this.sslPipe) {
-            this.sslPipe.feed(data);
-            const decrypted = this.sslPipe.read(size);
-            return decrypted ? new Uint8Array(decrypted) : null;
-        }
+            // Try to read buffered plaintext first
+            const buffered = this.sslPipe.read(size);
+            if (buffered && buffered.byteLength > 0) {
+                return new Uint8Array(buffered);
+            }
 
-        return data;
+            // Feed any pending ciphertext from previous partial feed
+            if (this.pendingCiphertext && this.pendingCiphertext.length > 0) {
+                const consumed = this.feedCiphertext(this.pendingCiphertext);
+                if (consumed > 0) {
+                    this.pendingCiphertext = consumed < this.pendingCiphertext.length
+                        ? this.pendingCiphertext.subarray(consumed)
+                        : null;
+                }
+                
+                // Check if we got plaintext now
+                const plain = this.sslPipe.read(size);
+                if (plain && plain.byteLength > 0) {
+                    return new Uint8Array(plain);
+                }
+            }
+
+            // Read more ciphertext from network
+            const cipherBuf = new Uint8Array(size);
+            const n = await this.socket.read(cipherBuf);
+            
+            if (n === null || n === 0) {
+                return null; // EOF or no data
+            }
+
+            // Feed ciphertext to SSL pipe
+            const ciphertext = cipherBuf.subarray(0, n);
+            const consumed = this.feedCiphertext(ciphertext);
+            
+            // Store unfed portion for next read
+            if (consumed < ciphertext.length) {
+                this.pendingCiphertext = ciphertext.subarray(consumed);
+            }
+
+            // Try to read decrypted plaintext
+            const plaintext = this.sslPipe.read(size);
+            
+            // IMPORTANT: read() returns 0/null when no data, NOT an error
+            return (plaintext && plaintext.byteLength > 0) 
+                ? new Uint8Array(plaintext) 
+                : null;
+        } else {
+            // Plain HTTP: read directly from socket
+            const buf = new Uint8Array(size);
+            const n = await this.socket.read(buf);
+            
+            if (n === null || n === 0) {
+                return null;
+            }
+            
+            return buf.subarray(0, n);
+        }
     }
 
-    /**
-     * 标记为活跃状态
-     */
     markActive(): void {
         this.stopIdleTimer();
-        this.state = ConnectionState.ACTIVE;
+        this.state    = ConnectionState.ACTIVE;
         this.lastUsed = Date.now();
         this.requests++;
     }
 
-    /**
-     * 标记为空闲状态
-     */
     markIdle(): void {
-        this.state = ConnectionState.IDLE;
+        this.state    = ConnectionState.IDLE;
         this.lastUsed = Date.now();
-
+        
         if (this.config.keepAlive) {
             this.startIdleTimer();
         } else {
@@ -258,14 +212,185 @@ export class Connection implements ConnectionLike {
         }
     }
 
-    /**
-     * 启动空闲定时器
-     */
-    private startIdleTimer(): void {
-        if (!this.config.keepAlive) return;
+    close(): void {
+        if (this.state === ConnectionState.CLOSED) return;
 
         this.stopIdleTimer();
+        
+        try {
+            if (this.sslPipe) {
+                this.sslPipe.shutdown();
+            }
+            this.socket.close();
+        } catch (err) {
+            // Ignore close errors
+        }
 
+        this.state = ConnectionState.CLOSED;
+        this.pendingCiphertext = null;
+    }
+
+    isAvailable(): boolean {
+        return this.state === ConnectionState.IDLE;
+    }
+
+    isClosed(): boolean {
+        return this.state === ConnectionState.CLOSED;
+    }
+
+    /* -------------------------------------------------------------- */
+    /* TLS Handshake                                                  */
+    /* -------------------------------------------------------------- */
+
+    private async performTLSHandshake(): Promise<void> {
+        // Find system CA bundle
+        const caPath = await this.findSystemCaPath();
+        
+        // Create SSL context
+        const ctx = new ssl.Context({
+            mode  : "client",
+            verify: !!caPath,
+            ca    : caPath ?? undefined
+        });
+        
+        if (!caPath) {
+            console.warn("No system CA bundle found - disabling certificate verification");
+        }
+
+        // Create SSL pipe
+        this.sslPipe = new ssl.Pipe(ctx, { servername: this.config.hostname });
+
+        // Start handshake (generates ClientHello)
+        this.sslPipe.handshake();
+        
+        // Send initial handshake data
+        const initialData = this.sslPipe.getOutput();
+        if (initialData) {
+            await this.socket.write(new Uint8Array(initialData));
+        }
+
+        // Complete handshake loop
+        while (!this.sslPipe.handshakeComplete) {
+            // Read server response
+            const buf = new Uint8Array(16384);
+            const n = await this.socket.read(buf);
+            
+            if (n === null || n === 0) {
+                throw new Error("TLS handshake failed: connection closed");
+            }
+
+            // Feed server data to SSL pipe
+            // CRITICAL: feed() may not consume all data at once
+            let toFeed = buf.subarray(0, n);
+            while (toFeed.length > 0) {
+                const consumed = this.feedCiphertext(toFeed);
+                
+                if (consumed <= 0) {
+                    // Should not happen during handshake, but handle gracefully
+                    throw new Error(`SSL feed failed during handshake: consumed=${consumed}`);
+                }
+                
+                if (consumed < toFeed.length) {
+                    toFeed = toFeed.subarray(consumed);
+                } else {
+                    break;
+                }
+            }
+
+            // Advance handshake state machine
+            this.sslPipe.handshake();
+
+            // Send handshake response if any
+            const responseData = this.sslPipe.getOutput();
+            if (responseData) {
+                await this.socket.write(new Uint8Array(responseData));
+            }
+        }
+    }
+
+    /* -------------------------------------------------------------- */
+    /* SSL Pipe Helpers                                               */
+    /* -------------------------------------------------------------- */
+
+    /**
+     * Feed ciphertext to SSL pipe
+     * Returns: number of bytes consumed (may be < data.length)
+     * 
+     * CRITICAL: feed() uses BIO_write which may return less than
+     * the input size when the internal buffer is full
+     */
+    private feedCiphertext(data: Uint8Array): number {
+        if (!this.sslPipe) return 0;
+        
+        const consumed = this.sslPipe.feed(data);
+        
+        // consumed can be:
+        // - positive: bytes written to BIO
+        // - 0: BIO buffer full (try again later)
+        // - negative: error (should not happen normally)
+        
+        if (consumed < 0) {
+            throw new Error(`SSL feed error: ${consumed}`);
+        }
+        
+        return consumed;
+    }
+
+    /* -------------------------------------------------------------- */
+    /* CA Certificate Discovery                                       */
+    /* -------------------------------------------------------------- */
+
+    private async findSystemCaPath(): Promise<string | null> {
+        const candidates = (() => {
+            switch (os.uname().sysname) {
+                case "Linux":
+                    return [
+                        "/etc/ssl/certs/ca-certificates.crt",       // Debian/Ubuntu
+                        "/etc/pki/tls/certs/ca-bundle.crt",        // RHEL/CentOS
+                        "/etc/ssl/ca-bundle.pem",                  // OpenSUSE
+                        "/etc/pki/tls/cert.pem",                   // Fedora
+                        "/etc/ssl/cert.pem"                        // Alpine
+                    ];
+                case "Darwin":
+                    return [
+                        "/etc/ssl/cert.pem",                       // macOS system
+                        "/usr/local/etc/openssl/cert.pem",         // Homebrew Intel
+                        "/opt/homebrew/etc/openssl/cert.pem"       // Homebrew ARM
+                    ];
+                case "Windows_NT":
+                    return [
+                        "C:\\Windows\\cacert.pem",
+                        "C:\\Program Files\\OpenSSL-Win64\\bin\\curl-ca-bundle.crt",
+                        "C:\\Program Files\\Git\\mingw64\\ssl\\cert.pem"
+                    ];
+                default:
+                    return [];
+            }
+        })();
+
+        for (const path of candidates) {
+            try {
+                const stat = await asfs.stat(path);
+                if (stat.isFile) {
+                    return path;
+                }
+            } catch (err) {
+                // File doesn't exist, try next
+            }
+        }
+
+        return null;
+    }
+
+    /* -------------------------------------------------------------- */
+    /* Idle Timeout Management                                        */
+    /* -------------------------------------------------------------- */
+
+    private startIdleTimer(): void {
+        if (!this.config.keepAlive) return;
+        
+        this.stopIdleTimer();
+        
         const timeout = this.config.keepAliveTimeout || 5000;
         this.idleTimer = timers.setTimeout(() => {
             if (this.state === ConnectionState.IDLE) {
@@ -274,103 +399,66 @@ export class Connection implements ConnectionLike {
         }, timeout);
     }
 
-    /**
-     * 停止空闲定时器
-     */
     private stopIdleTimer(): void {
         if (this.idleTimer !== null) {
             timers.clearTimeout(this.idleTimer);
             this.idleTimer = null;
         }
     }
-
-    /**
-     * 关闭连接
-     */
-    close(): void {
-        this.stopIdleTimer();
-
-        if (this.state === ConnectionState.CLOSED) {
-            return;
-        }
-
-        try {
-            if (this.sslPipe) {
-                this.sslPipe.shutdown();
-            }
-            this.socket.close();
-        } catch (err) {
-            // 忽略关闭错误
-        }
-
-        this.state = ConnectionState.CLOSED;
-    }
-
-    /**
-     * 检查连接是否可用
-     */
-    isAvailable(): boolean {
-        return this.state === ConnectionState.IDLE;
-    }
-
-    /**
-     * 检查连接是否已关闭
-     */
-    isClosed(): boolean {
-        return this.state === ConnectionState.CLOSED;
-    }
 }
 
-/**
- * 连接池管理器
- */
+/* ------------------------------------------------------------------ */
+/* Connection Pool Manager                                            */
+/* ------------------------------------------------------------------ */
+
 export class ConnectionManager {
-    private pools: Map<string, Connection[]> = new Map();
+    private pools = new Map<string, Connection[]>();
+    
     private defaultConfig: Partial<ConnectionConfig> = {
-        timeout: 30000,
-        keepAlive: true,
+        timeout         : 30000,
+        keepAlive       : true,
         keepAliveTimeout: 5000,
-        maxSockets: 10
+        maxSockets      : 10
     };
 
     /**
-     * 获取连接键
+     * Generate pool key from connection config
      */
-    private getKey(config: ConnectionConfig): string {
-        return `${config.protocol}//${config.hostname}:${config.port}`;
+    private getKey(cfg: ConnectionConfig): string {
+        return `${cfg.protocol}//${cfg.hostname}:${cfg.port}`;
     }
 
     /**
-     * 获取或创建连接
+     * Acquire a connection from the pool or create a new one
      */
-    async acquire(config: ConnectionConfig): Promise<Connection> {
-        const fullConfig = { ...this.defaultConfig, ...config };
-        const key = this.getKey(fullConfig as ConnectionConfig);
+    async acquire(cfg: ConnectionConfig): Promise<Connection> {
+        const fullCfg = { ...this.defaultConfig, ...cfg } as ConnectionConfig;
+        const key = this.getKey(fullCfg);
 
-        // 清理已关闭的连接
+        // Clean up closed connections
         this.cleanupPool(key);
 
-        // 查找可用连接
+        // Try to reuse an idle connection
         const pool = this.pools.get(key) || [];
-        const available = pool.find(conn => conn.isAvailable());
-
+        const available = pool.find(c => c.isAvailable());
+        
         if (available) {
             available.markActive();
             return available;
         }
 
-        // 检查连接数限制
-        const maxSockets = fullConfig.maxSockets || 10;
+        // Check pool size limit
+        const maxSockets = fullCfg.maxSockets || 10;
         if (pool.length >= maxSockets) {
-            // 等待可用连接
-            return this.waitForConnection(key, fullConfig as ConnectionConfig);
+            return this.waitForConnection(key, fullCfg);
         }
 
-        // 创建新连接
-        const conn = new Connection(fullConfig as ConnectionConfig);
+        // Create new connection
+        const conn = new Connection(fullCfg);
         await conn.connect();
         conn.markActive();
 
+        // Add to pool
         pool.push(conn);
         this.pools.set(key, pool);
 
@@ -378,11 +466,11 @@ export class ConnectionManager {
     }
 
     /**
-     * 释放连接
+     * Release a connection back to the pool
      */
-    release(config: ConnectionConfig, conn: Connection): void {
+    release(cfg: ConnectionConfig, conn: Connection): void {
         if (conn.isClosed()) {
-            this.removeConnection(config, conn);
+            this.removeConnection(cfg, conn);
             return;
         }
 
@@ -390,68 +478,7 @@ export class ConnectionManager {
     }
 
     /**
-     * 等待可用连接
-     */
-    private async waitForConnection(
-        key: string,
-        config: ConnectionConfig
-    ): Promise<Connection> {
-        return new Promise((resolve, reject) => {
-            const timeout = timers.setTimeout(() => {
-                reject(new Error('Connection pool timeout'));
-            }, config.timeout || 30000);
-
-            const checkInterval = timers.setInterval(() => {
-                const pool = this.pools.get(key) || [];
-                const available = pool.find(conn => conn.isAvailable());
-
-                if (available) {
-                    timers.clearTimeout(timeout);
-                    timers.clearInterval(checkInterval);
-                    available.markActive();
-                    resolve(available);
-                }
-            }, 100);
-        });
-    }
-
-    /**
-     * 清理连接池
-     */
-    private cleanupPool(key: string): void {
-        const pool = this.pools.get(key);
-        if (!pool) return;
-
-        const active = pool.filter(conn => !conn.isClosed());
-
-        if (active.length === 0) {
-            this.pools.delete(key);
-        } else {
-            this.pools.set(key, active);
-        }
-    }
-
-    /**
-     * 移除连接
-     */
-    private removeConnection(config: ConnectionConfig, conn: Connection): void {
-        const key = this.getKey(config);
-        const pool = this.pools.get(key);
-
-        if (!pool) return;
-
-        const index = pool.indexOf(conn);
-        if (index !== -1) {
-            pool.splice(index, 1);
-        }
-
-        if (pool.length === 0) {
-            this.pools.delete(key);
-        }
-    }
-
-    /**
-     * 关闭所有连接
+     * Close all connections in all pools
      */
     closeAll(): void {
         for (const pool of this.pools.values()) {
@@ -463,7 +490,7 @@ export class ConnectionManager {
     }
 
     /**
-     * 获取连接池统计
+     * Get pool statistics
      */
     getStats(): Record<string, { total: number; idle: number; active: number }> {
         const stats: Record<string, any> = {};
@@ -481,7 +508,70 @@ export class ConnectionManager {
 
         return stats;
     }
+
+    /* -------------------------------------------------------------- */
+    /* Private Helpers                                                */
+    /* -------------------------------------------------------------- */
+
+    /**
+     * Wait for a connection to become available
+     */
+    private async waitForConnection(key: string, cfg: ConnectionConfig): Promise<Connection> {
+        return new Promise((resolve, reject) => {
+            const timeout = timers.setTimeout(() => {
+                reject(new Error("Connection pool timeout"));
+            }, cfg.timeout || 30000);
+
+            const checkInterval = timers.setInterval(() => {
+                const pool = this.pools.get(key) || [];
+                const available = pool.find(c => c.isAvailable());
+
+                if (available) {
+                    timers.clearTimeout(timeout);
+                    timers.clearInterval(checkInterval);
+                    available.markActive();
+                    resolve(available);
+                }
+            }, 100);
+        });
+    }
+
+    /**
+     * Remove closed connections from pool
+     */
+    private cleanupPool(key: string): void {
+        const pool = this.pools.get(key);
+        if (!pool) return;
+
+        const alive = pool.filter(c => !c.isClosed());
+
+        if (alive.length === 0) {
+            this.pools.delete(key);
+        } else if (alive.length < pool.length) {
+            this.pools.set(key, alive);
+        }
+    }
+
+    /**
+     * Remove a specific connection from pool
+     */
+    private removeConnection(cfg: ConnectionConfig, conn: Connection): void {
+        const key = this.getKey(cfg);
+        const pool = this.pools.get(key);
+        if (!pool) return;
+
+        const index = pool.indexOf(conn);
+        if (index !== -1) {
+            pool.splice(index, 1);
+        }
+
+        if (pool.length === 0) {
+            this.pools.delete(key);
+        }
+    }
 }
 
-// 导出单例
+/**
+ * Global connection manager instance
+ */
 export const connectionManager = new ConnectionManager();

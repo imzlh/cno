@@ -1,8 +1,3 @@
-/**
- * Deno.serve API 实现
- * 基于之前实现的 HTTP Server 和 WebSocket
- */
-
 import { createServer, Server, ServerRequest, ServerResponse } from '../module/http/server';
 import { WebSocket } from '../module/http/websocket';
 

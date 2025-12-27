@@ -4,6 +4,7 @@
  */
 
 import { Headers } from "headers-polyfill";
+import { assert } from "../../utils/assert";
 
 const http = import.meta.use('http');
 const engine = import.meta.use('engine');
@@ -213,19 +214,19 @@ export class HttpResponseParser {
      */
     private setupCallbacks(): void {
         // 状态行
-        this.parser.onStatus = (ev, buf, off, len) => {
+        this.parser.onStatus = (buf, off, len) => {
             const view = new Uint8Array(buf as ArrayBuffer).slice(off, off + len);
             this.statusText = engine.decodeString(view);
         };
 
         // 头部字段名
-        this.parser.onHeaderField = (ev, buf, off, len) => {
+        this.parser.onHeaderField = (buf, off, len) => {
             const view = new Uint8Array(buf as ArrayBuffer).slice(off, off + len);
             this.currentHeaderField = engine.decodeString(view).toLowerCase();
         };
 
         // 头部值
-        this.parser.onHeaderValue = (ev, buf, off, len) => {
+        this.parser.onHeaderValue = (buf, off, len) => {
             const view = new Uint8Array(buf as ArrayBuffer).slice(off, off + len);
             const value = engine.decodeString(view);
             this.headers.append(this.currentHeaderField, value);
@@ -237,29 +238,23 @@ export class HttpResponseParser {
             // update status
             this.statusCode = this.parser.state.status;
             this.headersComplete = true;
-
-            if (this.onHeadersComplete) {
-                this.onHeadersComplete(this.statusCode, this.headers);
+            if(!this.statusText) {
+                this.statusText = http.strstatus(this.statusCode);
             }
+            this.onHeadersComplete?.(this.statusCode, this.headers);
         };
 
         // 响应体数据
-        this.parser.onBody = (ev, buf, off, len) => {
+        this.parser.onBody = (buf, off, len) => {
             const view = new Uint8Array(buf as ArrayBuffer).slice(off, off + len);
-            this.bodyChunks.push(view);
-
-            if (this.onData) {
-                this.onData(view);
-            }
+            if(!this.onData) this.bodyChunks.push(view);    // 缓存
+            this.onData?.(view);
         };
 
         // 消息完成
         this.parser.onMessageComplete = () => {
             this.completed = true;
-
-            if (this.onComplete) {
-                this.onComplete();
-            }
+            this.onComplete?.();
         };
     }
 
@@ -268,7 +263,8 @@ export class HttpResponseParser {
      */
     feed(data: Uint8Array): void {
         try {
-            const result = this.parser.execute(data);
+            // 传ArrayBuffer，匹配callback断言
+            const result = this.parser.execute(data.buffer.slice(data.byteOffset, data.length + data.byteOffset));
             if (result.errno !== 0) {
                 const error = new Error(`HTTP parse error: ${result.reason}`);
                 if (this.onError) {
@@ -290,7 +286,7 @@ export class HttpResponseParser {
      * 获取状态码
      */
     getStatusCode(): number {
-        // if (this.statusCode == 0) throw new Error("Response not completed");
+        assert(this.statusCode, "Response not completed");
         return this.statusCode;
     }
 
@@ -298,7 +294,7 @@ export class HttpResponseParser {
      * 获取状态文本
      */
     getStatusText(): string {
-        // if (this.statusCode == 0) throw new Error("Response not completed");
+        assert(this.statusCode, "Response not completed");
         return this.statusText || "Unknown";
     }
 
@@ -306,6 +302,7 @@ export class HttpResponseParser {
      * 获取头部
      */
     getHeaders(): globalThis.Headers {
+        assert(this.statusCode, "Response not completed");
         return this.headers;
     }
 
@@ -318,14 +315,14 @@ export class HttpResponseParser {
     /**
      * 检查是否完成
      */
-    isCompleted(): boolean {
+    get isCompleted(): boolean {
         return this.completed;
     }
 
     /**
      * 检查头部是否完成
      */
-    isHeadersComplete(): boolean {
+    get isHeadersComplete(): boolean {
         return this.headersComplete;
     }
 
@@ -341,6 +338,10 @@ export class HttpResponseParser {
         this.currentHeaderField = '';
         this.completed = false;
         this.headersComplete = false;
+
+        // 重置回调
+        this.onComplete = this.onData = 
+        this.onError = this.onHeadersComplete = undefined;
     }
 }
 

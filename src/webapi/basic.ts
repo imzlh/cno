@@ -32,7 +32,7 @@ globalThis.prompt = function(msg) {
     const LF = engine.encodeString('\n')[0];
     while(true){
         const n = fs.read(os.STDIN_FILENO, buf);
-        if(n === 0) break;
+        if(!n) break;
         for(let j = 0; j < n; j++) {
             if(buf[j] === LF) {
                 const s = engine.decodeString(buf.subarray(0, j));
@@ -82,3 +82,22 @@ globalThis.setInterval = function(cb, timeout, ...args) {
         cb(...args);
     }, timeout ?? 0);
 };
+
+globalThis.structuredClone = function(v, opt){
+    return engine.deserialize(engine.serialize(v));
+}
+
+globalThis.reportError = function(e) {
+    globalThis.dispatchEvent(new CustomEvent('error', {
+        detail: e
+    }));
+}
+
+// @ts-ignore
+globalThis.WebTransport = function(){
+    throw new Error('Unsupported');
+}
+
+globalThis.close = function(){
+    os.exit(0);
+}

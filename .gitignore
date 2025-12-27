@@ -4,3 +4,4 @@ cjs
 node_modules/
 tsrt.js
 types/
+dist.js

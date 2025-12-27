@@ -85,11 +85,8 @@ Object.defineProperty(globalThis, "Deno", {
         },
         hostname: () => os.hostname,
         loadavg: os.loadavg,
-        // TODO: not supported by cjs
-        networkInterfaces: () => [],
         osRelease: () => os.uname().release,
         osUptime: () => os.uptime(),
-        umask: () => notSupported(),
 
         // permission eco
         permissions: {

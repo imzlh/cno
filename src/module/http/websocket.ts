@@ -8,7 +8,7 @@ const engine = import.meta.use('engine');
 const timers = import.meta.use('timers');
 
 import { connectionManager, Connection, type ConnectionLike } from './connection';
-import { HttpRequestBuilder, HttpResponseParser } from './base';
+import { HttpRequestBuilder, HttpResponseParser } from './http';
 import { Headers } from 'headers-polyfill';
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
@@ -113,6 +113,9 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
     public onerror: ((this: globalThis.WebSocket, ev: ErrorEvent | Event) => any) | null = null;
     public onclose: ((this: globalThis.WebSocket, ev: CloseEvent) => any) | null = null;
 
+    // buffer 相关
+    public bufferedAmount: number = 0;
+
     /**
      * 客户端构造函数
      */
@@ -161,13 +164,6 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
      */
     get readyState(): WebSocketReadyState {
         return this._readyState;
-    }
-
-    /**
-     * 缓冲数据量
-     */
-    get bufferedAmount(): number {
-        return 0; // 简化实现，实际应该跟踪发送缓冲区
     }
 
     /**
@@ -231,7 +227,12 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
         });
 
         const request = builder.build();
-        await this.connection!.write(request);
+        this.bufferedAmount += request.length;
+        try{
+            await this.connection!.write(request);
+        }finally{
+            this.bufferedAmount -= request.length;
+        }
     }
 
     /**
@@ -509,10 +510,13 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
         const frame = this.buildFrame(opcode, payload, fin, masked);
 
         try {
+            this.bufferedAmount += frame.length;
             await this.connection.write(frame);
         } catch (err) {
             this.emitError(err as Error);
             this.close(WebSocketCloseCode.ABNORMAL, 'Write error');
+        } finally {
+            this.bufferedAmount -= frame.length;
         }
     }
 

@@ -45,7 +45,7 @@ await import('urlpattern-polyfill');
 
 // web streams polyfill
 // @ts-ignore
-const stream =  await import('web-streams-polyfill');
+const stream = await import('web-streams-polyfill');
 for (const key in stream) {
     if (key === 'default') continue;
     // @ts-ignore
@@ -67,13 +67,20 @@ await import('abortcontroller-polyfill');
 // event
 // @ts-ignore
 await import('event-target-polyfill');
-// @ts-ignore
-await import('custom-event-polyfill');
+class CustomEvent extends Event implements globalThis.CustomEvent {
+    public readonly detail: any;
+    constructor(type: string, eventInitDict?: CustomEventInit) {
+        super(type, eventInitDict);
+        this.detail = eventInitDict?.detail;
+    }
+}
+Reflect.set(globalThis, 'CustomEvent', CustomEvent);
+
 // global event
 const globalEvent = new EventTarget();
-globalEvent.addEventListener = globalEvent.addEventListener.bind(globalEvent);
-globalEvent.removeEventListener = globalEvent.removeEventListener.bind(globalEvent);
-globalEvent.dispatchEvent = globalEvent.dispatchEvent.bind(globalEvent);
+globalThis.addEventListener = globalEvent.addEventListener.bind(globalEvent);
+globalThis.removeEventListener = globalEvent.removeEventListener.bind(globalEvent);
+globalThis.dispatchEvent = globalEvent.dispatchEvent.bind(globalEvent);
 // brigde cjs event
 onEvent((eventName, eventData) => {
     let event;
@@ -82,11 +89,13 @@ onEvent((eventName, eventData) => {
             event = new Event('exit');
             break;
         default:
-            event = new Event(eventName);
+            event = new CustomEvent(eventName, {
+                detail: eventData
+            });
             break;
     }
     globalEvent.dispatchEvent(event);
-    if(event.defaultPrevented) return true;
+    if (event.defaultPrevented) return true;
     return false;
 });
 
@@ -111,3 +120,10 @@ await import('./wasm');
 
 // storage
 await import('./storage');
+
+// Intl (partial support)
+await import('./intl');
+
+// temporal
+const { Temporal } = await import('temporal-polyfill');
+globalThis.Temporal = Temporal;

@@ -1,8 +1,3 @@
-/**
- * Fetch API 完整实现（重构版）
- * 符合 WHATWG Fetch Standard
- */
-
 const engine = import.meta.use('engine');
 
 import { connectionManager, Connection } from './connection';
@@ -11,8 +6,9 @@ import {
     HttpResponseParser,
     type HttpMethod,
     isRedirect
-} from './base';
+} from './http';
 import { Headers } from 'headers-polyfill';
+import { assert } from '../../utils/assert';
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
@@ -62,7 +58,7 @@ export class Request implements globalThis.Request {
                 this._bodyBuffer = input._bodyBuffer;
             }
         } else {
-            throw new TypeError('Invalid input');
+            throw new TypeError('Invalid input:' + input);
         }
 
         // 处理 body
@@ -191,7 +187,8 @@ export class Request implements globalThis.Request {
 
     async blob(): Promise<Blob> {
         const buffer = await this.arrayBuffer();
-        return new Blob([buffer]);
+        const contentType = this.headers.get('content-type') || 'application/octet-stream';
+        return new Blob([buffer], { type: contentType });
     }
 
     formData(): Promise<FormData> {
@@ -203,8 +200,9 @@ export class Request implements globalThis.Request {
         return engine.decodeString(new Uint8Array(buffer));
     }
 
-    json(): Promise<any> {
-        return this.text().then(JSON.parse);
+    async json<T = any>(): Promise<T> {
+        const text = await this.text();
+        return JSON.parse(text);
     }
 }
 
@@ -436,6 +434,7 @@ function createResponseBodyStream(ctx: FetchContext): ReadableStream<Uint8Array>
                 ctx.parser.onData = (chunk) => {
                     if (!ctx.aborted) {
                         controller.enqueue(chunk);
+                        console.log('onData', chunk.length);
                     }
                 };
                 
@@ -446,7 +445,7 @@ function createResponseBodyStream(ctx: FetchContext): ReadableStream<Uint8Array>
                 }
 
                 // 检查是否已完成
-                if (ctx.parser.isCompleted()) {
+                if (ctx.parser.isCompleted) {
                     controller.close();
                     releaseConnection(ctx);
                     return;
@@ -490,10 +489,12 @@ function createResponseBodyStream(ctx: FetchContext): ReadableStream<Uint8Array>
  * 读取响应头部
  */
 async function readHeaders(ctx: FetchContext): Promise<void> {
-    while (!ctx.parser.isHeadersComplete() && !ctx.aborted) {
+    while (!ctx.parser.isHeadersComplete && !ctx.aborted) try{
         const data = await ctx.connection.read();
-        if (!data || data.length === 0) break;
+        if (!data || data.length === 0) continue;
         ctx.parser.feed(data);
+    } catch {
+        break;
     }
 }
 
@@ -502,15 +503,16 @@ async function readHeaders(ctx: FetchContext): Promise<void> {
  */
 async function readBody(ctx: FetchContext): Promise<void> {
     const data = await ctx.connection.read();
-    if (!data || data.length === 0) return;
+    if (!data) return;
     ctx.parser.feed(data);
 }
 
 /**
  * 释放连接
  */
-function releaseConnection(ctx: FetchContext): void {
-    const { url, connection } = ctx;
+function releaseConnection(ctx: Partial<FetchContext>): void {
+    const { url, connection, parser } = ctx;
+    assert(url && connection, "invaild connection");
     const port = url.port ? parseInt(url.port) : (url.protocol === 'https:' ? 443 : 80);
 
     connectionManager.release({
@@ -518,7 +520,7 @@ function releaseConnection(ctx: FetchContext): void {
         port,
         protocol: url.protocol as 'http:' | 'https:'
     }, connection);
-    ctx.parser.reset();
+    parser?.reset();
 }
 
 /**

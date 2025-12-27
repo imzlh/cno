@@ -10,37 +10,37 @@ const engine = import.meta.use('engine');
 const http = import.meta.use('http');
 const timers = import.meta.use('timers');
 
-import { HttpResponseParser, parseContentType } from './base';
 import { WebSocket, createWebSocketFromConnection } from './websocket';
-import { Connection, ConnectionState, type ConnectionLike } from './connection';
+import { ConnectionState, type ConnectionLike } from './connection';
+import { Request } from './fetch';
+import { Headers } from 'headers-polyfill';
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
 /**
  * 服务器请求
  */
-export class ServerRequest {
+export class ServerRequest extends Request {
     public readonly method: string;
-    public readonly url: string;
     public readonly path: string;
     public readonly query: URLSearchParams;
-    public readonly headers: globalThis.Headers;
+    public readonly headers: Headers;
     public readonly httpVersion: string;
     public readonly socket: ServerSocket;
-
-    private _body: ReadableStream<Uint8Array> | null = null;
+    public body: ReadableStream<Uint8Array> | null = null;
+    
     private _bodyUsed: boolean = false;
     private _bodyChunks: Uint8Array[] = [];
 
     constructor(
         method: string,
         url: string,
-        headers: globalThis.Headers,
+        headers: Headers,
         httpVersion: string,
         socket: ServerSocket
     ) {
+        super(url);
         this.method = method.toUpperCase();
-        this.url = url;
         this.headers = headers;
         this.httpVersion = httpVersion;
         this.socket = socket;
@@ -52,21 +52,10 @@ export class ServerRequest {
     }
 
     /**
-     * 获取请求体
-     */
-    get body(): ReadableStream<Uint8Array> | null {
-        if (this._bodyUsed) {
-            throw new TypeError('Body already used');
-        }
-
-        return this._body;
-    }
-
-    /**
      * 设置请求体流（内部使用）
      */
     _setBodyStream(stream: ReadableStream<Uint8Array>): void {
-        this._body = stream;
+        this.body = stream;
     }
 
     /**
@@ -100,22 +89,19 @@ export class ServerRequest {
         return result;
     }
 
-    /**
-     * 读取为 ArrayBuffer
-     */
-    async arrayBuffer(): Promise<ArrayBuffer> {
+    async bytes(): Promise<globalThis.Uint8Array<ArrayBuffer>> {
         if (this._bodyUsed) {
             throw new TypeError('Body already used');
         }
 
         this._bodyUsed = true;
 
-        if (!this._body) {
+        if (!this.body) {
             const buffered = this._getBufferedBody();
-            return buffered.buffer.slice(buffered.byteOffset, buffered.byteOffset + buffered.byteLength);
+            return buffered;
         }
 
-        const reader = this._body.getReader();
+        const reader = this.body.getReader();
         const chunks: Uint8Array[] = [...this._bodyChunks];
 
         try {
@@ -129,11 +115,11 @@ export class ServerRequest {
         }
 
         if (chunks.length === 0) {
-            return new ArrayBuffer(0);
+            return new Uint8Array(0);
         }
 
         if (chunks.length === 1) {
-            return chunks[0].buffer.slice(chunks[0].byteOffset, chunks[0].byteOffset + chunks[0].byteLength);
+            return chunks[0];
         }
 
         const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
@@ -145,32 +131,12 @@ export class ServerRequest {
             offset += chunk.length;
         }
 
-        return result.buffer;
+        return result;
     }
 
-    /**
-     * 读取为文本
-     */
-    async text(): Promise<string> {
-        const buffer = await this.arrayBuffer();
-        return engine.decodeString(new Uint8Array(buffer));
-    }
-
-    /**
-     * 读取为 JSON
-     */
-    async json<T = any>(): Promise<T> {
-        const text = await this.text();
-        return JSON.parse(text);
-    }
-
-    /**
-     * 读取为 Blob
-     */
-    async blob(): Promise<Blob> {
-        const buffer = await this.arrayBuffer();
-        const contentType = this.headers.get('content-type') || 'application/octet-stream';
-        return new Blob([buffer], { type: contentType });
+    async arrayBuffer(): Promise<ArrayBuffer> {
+        const bytes = await this.bytes();
+        return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
     }
 }
 
@@ -181,7 +147,7 @@ export class ServerResponse {
     private socket: ServerSocket;
     private statusCode: number = 200;
     private statusText: string = 'OK';
-    private headers: globalThis.Headers = new globalThis.Headers();
+    private headers: Headers = new Headers();
     private headersSent: boolean = false;
     private finished: boolean = false;
     private chunkedEncoding: boolean = false;
@@ -442,7 +408,7 @@ export class ServerResponse {
         // 协议协商
         const protocols = req.headers.get('sec-websocket-protocol');
         if (protocols) {
-            // 简化实现：选择第一个协议
+            // TODO: 用户回调判断可用协议
             const protocol = protocols.split(',')[0].trim();
             this.setHeader('sec-websocket-protocol', protocol);
         }
@@ -495,7 +461,7 @@ class ServerSocket {
             async read(size?: number) {
                 const buf = new Uint8Array(size || 16384);
                 const n = await this.socket.read(buf);
-                return n === null || n === 0 ? null : buf.slice(0, n);
+                return n === null ? null : buf.slice(0, n);
             },
             markActive() { },
             markIdle() { },
@@ -700,21 +666,21 @@ export class Server {
         let httpMajor = 1;
         let httpMinor = 1;
         let headersComplete = false;
-        const headers = new globalThis.Headers();
+        const headers = new Headers();
         let currentHeaderField = '';
 
         // 设置解析器回调
-        parser.onUrl = (ev, buf, off, len) => {
+        parser.onUrl = (buf, off, len) => {
             const view = new Uint8Array(buf as ArrayBuffer).slice(off, off + len);
             url += engine.decodeString(view);
         };
 
-        parser.onHeaderField = (ev, buf, off, len) => {
+        parser.onHeaderField = (buf, off, len) => {
             const view = new Uint8Array(buf as ArrayBuffer).slice(off, off + len);
             currentHeaderField = engine.decodeString(view).toLowerCase();
         };
 
-        parser.onHeaderValue = (ev, buf, off, len) => {
+        parser.onHeaderValue = (buf, off, len) => {
             const view = new Uint8Array(buf as ArrayBuffer).slice(off, off + len);
             const value = engine.decodeString(view);
             headers.append(currentHeaderField, value);
@@ -733,7 +699,7 @@ export class Server {
                 const buf = new Uint8Array(16384);
                 const n = await socket._getConnection().socket.read(buf);
 
-                if (n === null || n === 0) {
+                if (n === null) {
                     return null;
                 }
 
@@ -771,7 +737,7 @@ export class Server {
                         try {
                             let remaining = contentLength ? parseInt(contentLength) : Infinity;
 
-                            parser.onBody = (ev, buf, off, len) => {
+                            parser.onBody = (buf, off, len) => {
                                 const view = new Uint8Array(buf as ArrayBuffer).slice(off, off + len);
                                 request._addBodyChunk(view);
                                 controller.enqueue(view);
@@ -787,7 +753,7 @@ export class Server {
                                 const buf = new Uint8Array(Math.min(16384, remaining));
                                 const n = await socket._getConnection().socket.read(buf);
 
-                                if (n === null || n === 0) break;
+                                if (n === null) break;
 
                                 const data = buf.slice(0, n);
                                 parser.execute(data);
