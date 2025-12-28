@@ -232,7 +232,11 @@ export class Response implements globalThis.Response {
 
         if (init?.headers) {
             this.headers = new Headers();
-            for (const [key, value] of (init.headers as any).entries()) {
+            if (Reflect.getPrototypeOf(init.headers) === Object.prototype){
+                init.headers = Object.entries(init.headers);
+            }
+            // @ts-ignore
+            for (const [key, value] of init.headers) {
                 this.headers.set(key, value);
             }
         } else {
@@ -253,15 +257,21 @@ export class Response implements globalThis.Response {
         return new ReadableStream({
             start: async (controller) => {
                 try {
+                    let bodyLen = -1;
                     if (typeof bodyInit === 'string') {
-                        controller.enqueue(engine.encodeString(bodyInit));
+                        const buf = engine.encodeString(bodyInit);
+                        controller.enqueue(buf);
+                        bodyLen = buf.length;
                     } else if (bodyInit instanceof Uint8Array) {
                         controller.enqueue(bodyInit as Uint8Array);
+                        bodyLen = bodyInit.length;
                     } else if (bodyInit instanceof ArrayBuffer) {
                         controller.enqueue(new Uint8Array(bodyInit));
+                        bodyLen = bodyInit.byteLength;
                     } else if (bodyInit instanceof Blob) {
                         const buffer = await bodyInit.arrayBuffer();
                         controller.enqueue(new Uint8Array(buffer));
+                        bodyLen = buffer.byteLength;
                     } else if (bodyInit instanceof ReadableStream) {
                         const reader = bodyInit.getReader();
                         try {
@@ -274,12 +284,17 @@ export class Response implements globalThis.Response {
                             reader.releaseLock();
                         }
                     } else if (bodyInit instanceof URLSearchParams) {
-                        controller.enqueue(engine.encodeString(bodyInit.toString()));
+                        const buf = engine.encodeString(bodyInit.toString());
+                        controller.enqueue(buf);
+                        bodyLen = buf.length;
                     } else if (bodyInit instanceof FormData) {
                         throw new Error('FormData not yet implemented');
                     } else {
-                        controller.enqueue(engine.encodeString(JSON.stringify(bodyInit)));
+                        const buf = engine.encodeString(JSON.stringify(bodyInit));
+                        controller.enqueue(buf);
+                        bodyLen = buf.length;
                     }
+                    this.headers.set('content-length', String(bodyLen));
                     controller.close();
                 } catch (err) {
                     controller.error(err);
@@ -434,7 +449,6 @@ function createResponseBodyStream(ctx: FetchContext): ReadableStream<Uint8Array>
                 ctx.parser.onData = (chunk) => {
                     if (!ctx.aborted) {
                         controller.enqueue(chunk);
-                        console.log('onData', chunk.length);
                     }
                 };
                 

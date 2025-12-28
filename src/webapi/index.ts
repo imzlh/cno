@@ -1,4 +1,5 @@
 import { assert } from '../utils/assert';
+import { fromError, CustomEvent, PromiseRejectionEvent } from './events';
 
 const { onEvent } = import.meta.use('engine');
 
@@ -52,11 +53,16 @@ for (const key in stream) {
     Reflect.set(globalThis, key, stream[key]);
 }
 
-// blob and formdata polyfill
+// blob
 // @ts-ignore
-await import('blob-polyfill');
-// @ts-ignore
-await import('formdata-polyfill');
+const { Blob, File, FileReader } = await import('blob-polyfill');
+Reflect.set(globalThis, 'Blob', Blob);
+Reflect.set(globalThis, 'File', File);
+Reflect.set(globalThis, 'FileReader', FileReader);
+
+// formdata
+const { FormData } = await import('formdata-polyfill/esm.min');
+Reflect.set(globalThis, 'FormData', FormData);
 
 // abort-signal polyfill
 // @ts-ignore 欺骗abortcontroller-polyfill
@@ -65,16 +71,7 @@ globalThis.fetch = () => void 0;
 await import('abortcontroller-polyfill');
 
 // event
-// @ts-ignore
-await import('event-target-polyfill');
-class CustomEvent extends Event implements globalThis.CustomEvent {
-    public readonly detail: any;
-    constructor(type: string, eventInitDict?: CustomEventInit) {
-        super(type, eventInitDict);
-        this.detail = eventInitDict?.detail;
-    }
-}
-Reflect.set(globalThis, 'CustomEvent', CustomEvent);
+await import('./events');
 
 // global event
 const globalEvent = new EventTarget();
@@ -87,6 +84,17 @@ onEvent((eventName, eventData) => {
     switch (eventName) {
         case 'exit':
             event = new Event('exit');
+            break;
+        case 'jobexception':
+            event = fromError(eventData[0]);
+            console.log(eventName, eventData);
+            event.preventDefault(); // prevent default error event
+            break;
+        case 'unhandledrejection':
+            event = new PromiseRejectionEvent('unhandledrejection', {
+                promise: eventData[0],
+                reason: eventData[1]
+            })
             break;
         default:
             event = new CustomEvent(eventName, {

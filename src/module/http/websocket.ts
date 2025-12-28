@@ -7,6 +7,7 @@ const crypto = import.meta.use('crypto');
 const engine = import.meta.use('engine');
 const timers = import.meta.use('timers');
 
+import { assert } from '../../utils/assert';
 import { connectionManager, Connection, type ConnectionLike } from './connection';
 import { HttpRequestBuilder, HttpResponseParser } from './http';
 import { Headers } from 'headers-polyfill';
@@ -98,6 +99,7 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
 
     private _readyState: WebSocketReadyState = WebSocketReadyState.CONNECTING;
     private connection: ConnectionLike | null = null;
+    private pendingConnection: Promise<ConnectionLike> | null = null;
     private isClient: boolean;
     private receiveBuffer: Uint8Array[] = [];
     private fragments: Uint8Array[] = [];
@@ -124,9 +126,9 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
     /**
      * 服务器端构造函数（内部使用）
      */
-    constructor(connection: ConnectionLike, isServer: true);
+    constructor(connection: Promise<ConnectionLike>, isServer: true);
 
-    constructor(urlOrConnection: string | ConnectionLike, protocolsOrIsServer?: string | string[] | true) {
+    constructor(urlOrConnection: string |  Promise<ConnectionLike>, protocolsOrIsServer?: string | string[] | true) {
         super();
 
         if (typeof urlOrConnection === 'string') {
@@ -144,17 +146,24 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
             // 服务器模式
             this.url = '';
             this.isClient = false;
-            this.connection = urlOrConnection;
-            this._readyState = WebSocketReadyState.OPEN;
+            this.pendingConnection = urlOrConnection;
+            this._readyState = WebSocketReadyState.CONNECTING;
 
-            // 立即开始接收数据
-            this.startReceiving();
-            this.startPingTimer();
 
             // 触发 open 事件
-            queueMicrotask(() => {
+            urlOrConnection.then(conn => {
+                this._readyState = WebSocketReadyState.OPEN;
+                this.connection = conn;
+
+                // 传递open()
                 this.dispatchEvent(new Event('open'));
-                if (this.onopen) this.onopen.call(this, new Event('open'));
+                this.onopen?.(new Event('open'));
+                
+                // 开始接收数据
+                queueMicrotask(() => {
+                    this.startReceiving();
+                    this.startPingTimer();
+                });
             });
         }
     }
@@ -208,6 +217,7 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
      * 发送握手请求
      */
     private async sendHandshake(url: URL): Promise<void> {
+        assert(this.connection, "Connection is not established");
         const key = this.generateWebSocketKey();
 
         const headers = new Headers({
@@ -229,7 +239,7 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
         const request = builder.build();
         this.bufferedAmount += request.length;
         try{
-            await this.connection!.write(request);
+            await this.connection.write(request);
         }finally{
             this.bufferedAmount -= request.length;
         }
@@ -277,7 +287,7 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
                 try {
                     while (!resolved && this.connection) {
                         const data = await this.connection.read();
-                        if (!data) {
+                        if (null === data) {
                             if (!resolved) reject(new Error('Connection closed during handshake'));
                             break;
                         }
@@ -306,11 +316,13 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
             while (this._readyState === WebSocketReadyState.OPEN && this.connection) {
                 const data = await this.connection.read();
 
-                if (!data || data.length === 0) {
+                if (data === null) {
                     // 连接关闭
                     this.handleClose(WebSocketCloseCode.ABNORMAL, 'Connection closed');
                     break;
                 }
+
+                if (data.length == 0) continue;
 
                 this.receiveBuffer.push(data);
                 this.processFrames();
@@ -798,7 +810,7 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
 /**
  * 从服务器端连接创建 WebSocket（用于 HTTP 服务器的 upgrade）
  */
-export function createWebSocketFromConnection(connection: ConnectionLike): WebSocket {
+export function createWebSocketFromConnection(connection: Promise<ConnectionLike>): WebSocket {
     return new WebSocket(connection, true);
 }
 

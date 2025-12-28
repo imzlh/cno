@@ -1,579 +1,739 @@
 /**
- * HTTP Server 完整实现
- * 支持 HTTP/1.1、Keep-Alive、WebSocket Upgrade
+ * HTTP Server Core
+ * Handles TCP/TLS listening, SSL handshake, HTTP parsing, and WebSocket upgrade
+ * 
+ * Key features:
+ * - Streaming request body (ReadableStream)
+ * - SSL support with proper feed() handling
+ * - WebSocket upgrade support
  */
 
-const streams = import.meta.use('streams');
-const ssl = import.meta.use('ssl');
-const crypto = import.meta.use('crypto');
-const engine = import.meta.use('engine');
-const http = import.meta.use('http');
-const timers = import.meta.use('timers');
+import { assert } from "../../utils/assert";
 
-import { WebSocket, createWebSocketFromConnection } from './websocket';
-import { ConnectionState, type ConnectionLike } from './connection';
-import { Request } from './fetch';
-import { Headers } from 'headers-polyfill';
+const streams = import.meta.use("streams");
+const ssl = import.meta.use("ssl");
+const http = import.meta.use("http");
+const engine = import.meta.use("engine");
+const timers = import.meta.use("timers");
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
+/* ------------------------------------------------------------------ */
+/* Types & Interfaces                                                 */
+/* ------------------------------------------------------------------ */
+
 /**
- * 服务器请求
+ * Server configuration
  */
-export class ServerRequest extends Request {
-    public readonly method: string;
-    public readonly path: string;
-    public readonly query: URLSearchParams;
-    public readonly headers: Headers;
-    public readonly httpVersion: string;
-    public readonly socket: ServerSocket;
-    public body: ReadableStream<Uint8Array> | null = null;
-    
-    private _bodyUsed: boolean = false;
-    private _bodyChunks: Uint8Array[] = [];
+export interface ServerConfig {
+    hostname?: string;
+    port: number;
 
-    constructor(
-        method: string,
-        url: string,
-        headers: Headers,
-        httpVersion: string,
-        socket: ServerSocket
-    ) {
-        super(url);
-        this.method = method.toUpperCase();
-        this.headers = headers;
-        this.httpVersion = httpVersion;
-        this.socket = socket;
+    // TLS options (if provided, enables HTTPS)
+    cert?: string;  // Path to certificate file
+    key?: string;   // Path to private key file
 
-        // 解析路径和查询参数
-        const urlObj = new URL(url, `http://${headers.get('host') || 'localhost'}`);
-        this.path = urlObj.pathname;
-        this.query = urlObj.searchParams;
-    }
-
-    /**
-     * 设置请求体流（内部使用）
-     */
-    _setBodyStream(stream: ReadableStream<Uint8Array>): void {
-        this.body = stream;
-    }
-
-    /**
-     * 添加 body 数据块（内部使用）
-     */
-    _addBodyChunk(chunk: Uint8Array): void {
-        this._bodyChunks.push(chunk);
-    }
-
-    /**
-     * 获取已缓存的 body 数据（内部使用）
-     */
-    _getBufferedBody(): Uint8Array {
-        if (this._bodyChunks.length === 0) {
-            return new Uint8Array(0);
-        }
-
-        if (this._bodyChunks.length === 1) {
-            return this._bodyChunks[0];
-        }
-
-        const totalLength = this._bodyChunks.reduce((sum, chunk) => sum + chunk.length, 0);
-        const result = new Uint8Array(totalLength);
-        let offset = 0;
-
-        for (const chunk of this._bodyChunks) {
-            result.set(chunk, offset);
-            offset += chunk.length;
-        }
-
-        return result;
-    }
-
-    async bytes(): Promise<globalThis.Uint8Array<ArrayBuffer>> {
-        if (this._bodyUsed) {
-            throw new TypeError('Body already used');
-        }
-
-        this._bodyUsed = true;
-
-        if (!this.body) {
-            const buffered = this._getBufferedBody();
-            return buffered;
-        }
-
-        const reader = this.body.getReader();
-        const chunks: Uint8Array[] = [...this._bodyChunks];
-
-        try {
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                chunks.push(value);
-            }
-        } finally {
-            reader.releaseLock();
-        }
-
-        if (chunks.length === 0) {
-            return new Uint8Array(0);
-        }
-
-        if (chunks.length === 1) {
-            return chunks[0];
-        }
-
-        const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-        const result = new Uint8Array(totalLength);
-        let offset = 0;
-
-        for (const chunk of chunks) {
-            result.set(chunk, offset);
-            offset += chunk.length;
-        }
-
-        return result;
-    }
-
-    async arrayBuffer(): Promise<ArrayBuffer> {
-        const bytes = await this.bytes();
-        return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-    }
+    // Connection limits
+    keepAliveTimeout?: number;     // Default: 5000ms
+    maxRequestsPerConnection?: number;  // Default: 100
+    requestTimeout?: number;       // Default: 30000ms
 }
 
 /**
- * 服务器响应
+ * Parsed HTTP request (with streaming body)
  */
-export class ServerResponse {
-    private socket: ServerSocket;
-    private statusCode: number = 200;
-    private statusText: string = 'OK';
-    private headers: Headers = new Headers();
-    private headersSent: boolean = false;
-    private finished: boolean = false;
-    private chunkedEncoding: boolean = false;
-
-    constructor(socket: ServerSocket) {
-        this.socket = socket;
-    }
-
-    /**
-     * 设置状态码
-     */
-    status(code: number, text?: string): this {
-        if (this.headersSent) {
-            throw new Error('Headers already sent');
-        }
-
-        this.statusCode = code;
-        this.statusText = text || http.strstatus(code);
-        return this;
-    }
-
-    /**
-     * 设置头部
-     */
-    setHeader(name: string, value: string | string[]): this {
-        if (this.headersSent) {
-            throw new Error('Headers already sent');
-        }
-
-        if (Array.isArray(value)) {
-            this.headers.delete(name);
-            for (const v of value) {
-                this.headers.append(name, v);
-            }
-        } else {
-            this.headers.set(name, value);
-        }
-
-        return this;
-    }
-
-    /**
-     * 获取头部
-     */
-    getHeader(name: string): string | null {
-        return this.headers.get(name);
-    }
-
-    /**
-     * 移除头部
-     */
-    removeHeader(name: string): this {
-        if (this.headersSent) {
-            throw new Error('Headers already sent');
-        }
-
-        this.headers.delete(name);
-        return this;
-    }
-
-    /**
-     * 发送头部
-     */
-    async writeHead(statusCode?: number, statusText?: string, headers?: Record<string, string>): Promise<void> {
-        if (this.headersSent) {
-            throw new Error('Headers already sent');
-        }
-
-        if (statusCode !== undefined) {
-            this.statusCode = statusCode;
-        }
-
-        if (statusText !== undefined) {
-            this.statusText = statusText;
-        }
-
-        if (headers) {
-            for (const [key, value] of Object.entries(headers)) {
-                this.headers.set(key, value);
-            }
-        }
-
-        // 构建状态行
-        let response = `HTTP/1.1 ${this.statusCode} ${this.statusText}\r\n`;
-
-        // 添加头部
-        response += this.headers.toString();
-
-        // 结束头部
-        response += '\r\n';
-
-        // 发送
-        await this.socket._write(engine.encodeString(response));
-        this.headersSent = true;
-    }
-
-    /**
-     * 写入数据
-     */
-    async write(chunk: string | Uint8Array | ArrayBuffer): Promise<void> {
-        if (this.finished) {
-            throw new Error('Response already finished');
-        }
-
-        // 自动发送头部
-        if (!this.headersSent) {
-            // 检查是否需要 chunked 编码
-            if (!this.headers.has('content-length') && !this.headers.has('transfer-encoding')) {
-                this.chunkedEncoding = true;
-                this.headers.set('transfer-encoding', 'chunked');
-            }
-
-            await this.writeHead();
-        }
-
-        // 转换数据
-        let data: Uint8Array;
-        if (typeof chunk === 'string') {
-            data = engine.encodeString(chunk);
-        } else if (chunk instanceof ArrayBuffer) {
-            data = new Uint8Array(chunk);
-        } else {
-            data = chunk;
-        }
-
-        // Chunked 编码
-        if (this.chunkedEncoding) {
-            const chunkSize = data.length.toString(16);
-            await this.socket._write(engine.encodeString(`${chunkSize}\r\n`));
-            await this.socket._write(data);
-            await this.socket._write(engine.encodeString('\r\n'));
-        } else {
-            await this.socket._write(data);
-        }
-    }
-
-    /**
-     * 结束响应
-     */
-    async end(chunk?: string | Uint8Array | ArrayBuffer): Promise<void> {
-        if (this.finished) {
-            return;
-        }
-
-        if (chunk !== undefined) {
-            await this.write(chunk);
-        } else if (!this.headersSent) {
-            // 没有 body，发送头部
-            if (!this.headers.has('content-length')) {
-                this.headers.set('content-length', '0');
-            }
-            await this.writeHead();
-        }
-
-        // Chunked 编码结束标记
-        if (this.chunkedEncoding) {
-            await this.socket._write(engine.encodeString('0\r\n\r\n'));
-        }
-
-        this.finished = true;
-    }
-
-    /**
-     * 发送 JSON
-     */
-    async json(data: any): Promise<void> {
-        const body = JSON.stringify(data);
-
-        this.setHeader('content-type', 'application/json');
-        this.setHeader('content-length', String(engine.encodeString(body).length));
-
-        await this.writeHead();
-        await this.write(body);
-        await this.end();
-    }
-
-    /**
-     * 发送文本
-     */
-    async text(data: string): Promise<void> {
-        const body = engine.encodeString(data);
-
-        this.setHeader('content-type', 'text/plain; charset=utf-8');
-        this.setHeader('content-length', String(body.length));
-
-        await this.writeHead();
-        await this.write(body);
-        await this.end();
-    }
-
-    /**
-     * 发送 HTML
-     */
-    async html(data: string): Promise<void> {
-        const body = engine.encodeString(data);
-
-        this.setHeader('content-type', 'text/html; charset=utf-8');
-        this.setHeader('content-length', String(body.length));
-
-        await this.writeHead();
-        await this.write(body);
-        await this.end();
-    }
-
-    /**
-     * 重定向
-     */
-    async redirect(url: string, statusCode: number = 302): Promise<void> {
-        this.status(statusCode);
-        this.setHeader('location', url);
-        this.setHeader('content-length', '0');
-        await this.writeHead();
-        await this.end();
-    }
-
-    /**
-     * Upgrade 到 WebSocket
-     */
-    async upgrade(): Promise<WebSocket> {
-        if (this.headersSent) {
-            throw new Error('Headers already sent');
-        }
-
-        const req = this.socket._currentRequest;
-        if (!req) {
-            throw new Error('No request available');
-        }
-
-        // 验证 WebSocket 握手
-        const upgrade = req.headers.get('upgrade')?.toLowerCase();
-        const connection = req.headers.get('connection')?.toLowerCase();
-        const wsKey = req.headers.get('sec-websocket-key');
-        const wsVersion = req.headers.get('sec-websocket-version');
-
-        if (upgrade !== 'websocket' || !connection?.includes('upgrade')) {
-            throw new Error('Not a WebSocket upgrade request');
-        }
-
-        if (wsVersion !== '13') {
-            throw new Error('Unsupported WebSocket version');
-        }
-
-        if (!wsKey) {
-            throw new Error('Missing Sec-WebSocket-Key');
-        }
-
-        // 计算 Sec-WebSocket-Accept
-        const magic = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
-        const hash = crypto.sha1(engine.encodeString(wsKey + magic));
-        const accept = crypto.base64Encode(hash);
-
-        // 发送握手响应
-        this.status(101, 'Switching Protocols');
-        this.setHeader('upgrade', 'websocket');
-        this.setHeader('connection', 'Upgrade');
-        this.setHeader('sec-websocket-accept', accept);
-
-        // 协议协商
-        const protocols = req.headers.get('sec-websocket-protocol');
-        if (protocols) {
-            // TODO: 用户回调判断可用协议
-            const protocol = protocols.split(',')[0].trim();
-            this.setHeader('sec-websocket-protocol', protocol);
-        }
-
-        await this.writeHead();
-        this.finished = true;
-
-        // 创建 WebSocket
-        const connection2 = this.socket._getConnection();
-        const ws = createWebSocketFromConnection(connection2);
-
-        return ws;
-    }
+export interface HttpRequest {
+    method: string;
+    url: string;
+    httpVersion: string;
+    headers: Map<string, string>;
+    body: ReadableStream<Uint8Array> | null;
 }
 
 /**
- * 服务器 Socket 包装
+ * HTTP response builder
  */
-class ServerSocket {
-    private connection: CModuleStreams.TCP;
-    public _currentRequest: ServerRequest | null = null;
-
-    constructor(connection: CModuleStreams.TCP) {
-        this.connection = connection;
-    }
+export interface HttpResponse {
+    /**
+     * Write status line and headers
+     */
+    writeHead(status: number, statusText: string, headers: Record<string, string>): Promise<void>;
 
     /**
-     * 写入数据（内部使用）
+     * Write response body chunk
      */
-    async _write(data: Uint8Array): Promise<void> {
-        await this.connection.write(data);
-    }
+    write(chunk: Uint8Array | string): Promise<void>;
 
     /**
-     * 获取底层连接（内部使用）
+     * End response
      */
-    _getConnection(): ConnectionLike {
-        // 包装为 Connection 接口
-        return {
-            socket: this.connection,
-            sslPipe: null,
-            state: ConnectionState.ACTIVE,
-            lastUsed: Date.now(),
-            requests: 0,
+    end(chunk?: Uint8Array | string): Promise<void>;
 
-            async connect() { },
-            async write(data: Uint8Array) {
-                await this.socket.write(data);
-            },
-            async read(size?: number) {
-                const buf = new Uint8Array(size || 16384);
-                const n = await this.socket.read(buf);
-                return n === null ? null : buf.slice(0, n);
-            },
-            markActive() { },
-            markIdle() { },
-            close() {
-                this.socket.close();
-            },
-            isAvailable() { return false; },
-            isClosed() { return false; },
+    /**
+     * Upgrade connection (for WebSocket)
+     * Returns the underlying ServerConnection for direct socket access
+     */
+    upgrade(): ServerConnection;
+}
+
+/**
+ * Request handler callback
+ */
+export type RequestHandler = (req: HttpRequest, res: HttpResponse) => void | Promise<void>;
+
+/* ------------------------------------------------------------------ */
+/* Server Connection (per-client)                                     */
+/* ------------------------------------------------------------------ */
+
+enum ConnectionState {
+    HANDSHAKING = "handshaking",  // SSL handshake in progress
+    IDLE = "idle",         // Waiting for request
+    PARSING = "parsing",      // Parsing HTTP request
+    RESPONDING = "responding",   // Sending response
+    UPGRADING = "upgrading",   // WebSocket upgrade in progress
+    UPGRADED = "upgraded",     // WebSocket/upgraded protocol
+    CLOSED = "closed"
+}
+
+export class ServerConnection {
+    public readonly socket: CModuleStreams.TCP;
+    public sslPipe: CModuleSSL.Pipe | null = null;
+
+    private state: ConnectionState = ConnectionState.IDLE;
+    private parser: CModuleHTTP.Parser;
+    private server: Server;
+
+    // Request parsing state
+    private currentMethod = "";
+    private currentUrl = "";
+    private currentHeaders = new Map<string, string>();
+    private currentHeaderField = "";
+    private headersComplete = false;
+    private expectBody = false;
+    private contentLength = 0;
+    private isChunked = false;
+
+    // Body stream controller
+    private bodyController: ReadableStreamDefaultController<Uint8Array> | null = null;
+    private bodyBytesRead = 0;
+
+    // Response state
+    private headersSent = false;
+    private responseEnded = false;
+
+    // Keep-alive state
+    private requestCount = 0;
+    private keepAlive = true;
+
+    // Pending ciphertext (when SSL BIO full)
+    private pendingCiphertext: Uint8Array | null = null;
+
+    constructor(socket: CModuleStreams.TCP, server: Server) {
+        this.socket = socket;
+        this.server = server;
+        this.parser = new http.Parser(http.REQUEST);
+        this.setupParser();
+    }
+
+    /* -------------------------------------------------------------- */
+    /* SSL Handshake (Server-side)                                    */
+    /* -------------------------------------------------------------- */
+
+    /**
+     * Perform server-side SSL handshake
+     */
+    async performSSLHandshake(sslContext: CModuleSSL.Context): Promise<void> {
+        this.state = ConnectionState.HANDSHAKING;
+
+        // Create SSL pipe
+        this.sslPipe = new ssl.Pipe(sslContext);
+
+        // Server-side handshake: wait for ClientHello
+        const buf = new Uint8Array(16384);
+        while (!this.sslPipe.handshakeComplete) {
+            // Read from network
+            const n = await this.socket.read(buf);
+
+            if (n === null || n === 0) {
+                throw new Error("SSL handshake failed: connection closed");
+            }
+
+            // Feed to SSL pipe (may not consume all data)
+            let toFeed = buf.subarray(0, n);
+            while (toFeed.length > 0) {
+                const consumed = this.feedCiphertext(toFeed);
+                if (consumed <= 0) break;
+                toFeed = toFeed.subarray(consumed);
+            }
+
+            // Advance handshake
+            this.sslPipe.handshake();
+
+            // Send response (ServerHello, Certificate, etc.)
+            const response = this.sslPipe.getOutput();
+            if (response) {
+                await this.socket.write(new Uint8Array(response));
+            }
+        }
+
+        this.state = ConnectionState.IDLE;
+    }
+
+    /* -------------------------------------------------------------- */
+    /* HTTP Request Parsing                                           */
+    /* -------------------------------------------------------------- */
+
+    /**
+     * Setup llhttp parser callbacks
+     */
+    private setupParser(): void {
+        this.parser.onUrl = (buf, off, len) => {
+            const view = new Uint8Array(buf as ArrayBuffer).slice(off, off + len);
+            this.currentUrl += engine.decodeString(view);
+        };
+
+        this.parser.onHeaderField = (buf, off, len) => {
+            const view = new Uint8Array(buf as ArrayBuffer).slice(off, off + len);
+            this.currentHeaderField = engine.decodeString(view).toLowerCase();
+        };
+
+        this.parser.onHeaderValue = (buf, off, len) => {
+            if (len > 8192) throw new Error("HTTP header value too long");
+
+            const view = new Uint8Array(buf as ArrayBuffer).slice(off, off + len);
+            const value = engine.decodeString(view);
+
+            // Combine multiple values with comma
+            const existing = this.currentHeaders.get(this.currentHeaderField);
+            if (existing) {
+                this.currentHeaders.set(this.currentHeaderField, existing + ", " + value);
+            } else {
+                this.currentHeaders.set(this.currentHeaderField, value);
+            }
+        };
+
+        this.parser.onHeadersComplete = () => {
+            this.currentMethod = this.getHttpMethod(this.parser.state.method);
+            this.headersComplete = true;
+
+            // Check Connection header for keep-alive
+            const connection = this.currentHeaders.get("connection")?.toLowerCase();
+            const httpVersion = `${this.parser.state.httpMajor}.${this.parser.state.httpMinor}`;
+
+            // HTTP/1.1 defaults to keep-alive unless "close" specified
+            if (httpVersion === "1.1") {
+                this.keepAlive = connection !== "close";
+            } else {
+                this.keepAlive = connection === "keep-alive";
+            }
+
+            // Check if body is expected
+            const contentLength = this.currentHeaders.get("content-length");
+            const transferEncoding = this.currentHeaders.get("transfer-encoding");
+
+            if (contentLength) {
+                this.contentLength = parseInt(contentLength);
+                this.expectBody = this.contentLength > 0;
+            } else if (transferEncoding?.toLowerCase().includes("chunked")) {
+                this.isChunked = true;
+                this.expectBody = true;
+            }
+        };
+
+        this.parser.onBody = (buf, off, len) => {
+            const view = new Uint8Array(buf as ArrayBuffer).slice(off, off + len);
+
+            // Push to body stream if controller exists
+            if (this.bodyController) {
+                this.bodyController.enqueue(view);
+                this.bodyBytesRead += len;
+
+                // Close stream if we've read all content
+                if (!this.isChunked && this.bodyBytesRead >= this.contentLength) {
+                    this.bodyController.close();
+                    this.bodyController = null;
+                }
+            }
+        };
+
+        this.parser.onMessageComplete = () => {
+            // Close body stream if still open
+            if (this.bodyController) {
+                this.bodyController.close();
+                this.bodyController = null;
+            }
         };
     }
 
     /**
-     * 关闭连接
+     * Get HTTP method name from parser enum
      */
-    close(): void {
+    private getHttpMethod(methodEnum: number): string {
+        // llhttp method enum: 0=DELETE, 1=GET, 2=HEAD, 3=POST, 4=PUT, etc.
+        const methods = ["DELETE", "GET", "HEAD", "POST", "PUT", "CONNECT",
+            "OPTIONS", "TRACE", "COPY", "LOCK", "MKCOL", "MOVE",
+            "PROPFIND", "PROPPATCH", "SEARCH", "UNLOCK", "BIND",
+            "REBIND", "UNBIND", "ACL", "REPORT", "MKACTIVITY",
+            "CHECKOUT", "MERGE", "MSEARCH", "NOTIFY", "SUBSCRIBE",
+            "UNSUBSCRIBE", "PATCH", "PURGE", "MKCALENDAR", "LINK", "UNLINK"];
+        return methods[methodEnum] || "UNKNOWN";
+    }
+
+    /**
+     * Handle incoming request
+     */
+    async handleRequest(): Promise<boolean> {
+        this.state = ConnectionState.PARSING;
+
+        // Reset parsing state
+        this.currentMethod = "";
+        this.currentUrl = "";
+        this.currentHeaders.clear();
+        this.currentHeaderField = "";
+        this.headersComplete = false;
+        this.expectBody = false;
+        this.contentLength = 0;
+        this.isChunked = false;
+        this.bodyBytesRead = 0;
+        this.bodyController = null;
+        this.headersSent = false;
+        this.responseEnded = false;
+
+        let destState = ConnectionState.RESPONDING;
         try {
-            this.connection.close();
+            // Read and parse headers
+            while (!this.headersComplete) {
+                const data = await this.readData();
+                if (null === data) {
+                    return false;   // closed
+                }
+                if (data.length === 0) continue;
+
+                const result = this.parser.execute(data);
+                if (result.errno !== 0) {
+                    if (result.name == 'HPE_PAUSED_UPGRADE') {
+                        destState = ConnectionState.UPGRADING;
+                        this.keepAlive = false;  // Upgraded connections don't reuse
+                        this.expectBody = false;
+                        break;
+                    }
+                    throw new Error(`HTTP parse error: ${result.reason}`);
+                }
+            }
+
+            // Create body stream if body is expected
+            let bodyStream: ReadableStream<Uint8Array> | null = null;
+
+            if (this.expectBody) {
+                const self = this;
+
+                bodyStream = new ReadableStream({
+                    start(controller) {
+                        self.bodyController = controller;
+                    },
+
+                    async pull(controller) {
+                        // Read more data from socket
+                        try {
+                            const data = await self.readData();
+                            if (!data) {
+                                if (data === null) {
+                                    controller.close();
+                                    self.bodyController = null;
+                                }
+                                return;
+                            }
+
+                            // Feed to parser (will trigger onBody callback)
+                            const result = self.parser.execute(data);
+                            if (result.errno !== 0) {
+                                controller.error(new Error(`HTTP parse error: ${result.reason}`));
+                                self.bodyController = null;
+                            }
+
+                            // Check if message is complete
+                            if (self.parser.state.eof) {
+                                controller.close();
+                                self.bodyController = null;
+                            }
+                        } catch (err) {
+                            controller.error(err);
+                            self.bodyController = null;
+                        }
+                    },
+
+                    cancel() {
+                        self.bodyController = null;
+                    }
+                });
+            }
+
+            // Build request object
+            const request: HttpRequest = {
+                method: this.currentMethod,
+                url: this.currentUrl,
+                httpVersion: `${this.parser.state.httpMajor}.${this.parser.state.httpMinor}`,
+                headers: this.currentHeaders,
+                body: bodyStream
+            };
+
+            // Build response object
+            const response: HttpResponse = {
+                writeHead: this.writeHead.bind(this),
+                write: this.writeData.bind(this),
+                end: this.endResponse.bind(this),
+                upgrade: this.upgradeConnection.bind(this)
+            };
+
+            // Call user handler
+            this.state = destState;
+            await this.server.handler(request, response);
+
+            // Ensure response is ended
+            if (!this.responseEnded && !this.isUpgraded()) {
+                await this.endResponse();
+            }
+
+            // Consume any remaining body data
+            if (this.bodyController) {
+                (this.bodyController as ReadableStreamDefaultController<Uint8Array>).close();
+                this.bodyController = null;
+            }
+
+            // Reset parser for next request
+            this.parser.reset(http.REQUEST);
+            this.requestCount++;
+
+            // Check if we should keep connection alive
+            return this.keepAlive &&
+                this.requestCount < (this.server.config.maxRequestsPerConnection ?? 1024) &&
+                !this.isUpgraded();
+
         } catch (err) {
-            // 忽略
+            console.error("Request handling error:", err);
+
+            // Try to send 500 error
+            if (!this.headersSent) {
+                try {
+                    await this.writeHead(500, "Internal Server Error", {});
+                    await this.endResponse();
+                } catch (e) {
+                    // Ignore
+                }
+            }
+
+            return false;
         }
+    }
+
+    /* -------------------------------------------------------------- */
+    /* Response Methods                                               */
+    /* -------------------------------------------------------------- */
+
+    private async writeHead(status: number, statusText: string, headers: Record<string, string>): Promise<void> {
+        if (this.headersSent) {
+            throw new Error("Headers already sent");
+        }
+
+        // Build status line
+        let response = `HTTP/1.1 ${status} ${statusText}\r\n`;
+
+        // Add headers
+        for (const [key, value] of Object.entries(headers)) {
+            response += `${key}: ${value}\r\n`;
+        }
+
+        // End headers
+        response += "\r\n";
+
+        // Send
+        await this.writeRaw(engine.encodeString(response));
+        this.headersSent = true;
+    }
+
+    private async writeData(chunk: Uint8Array | string): Promise<void> {
+        if (this.responseEnded) {
+            throw new Error("Response already ended");
+        }
+
+        if (!this.headersSent) {
+            // Auto-send headers if not sent
+            await this.writeHead(200, "OK", {
+                "transfer-encoding": "chunked"
+            });
+        }
+
+        const data = typeof chunk === "string"
+            ? engine.encodeString(chunk)
+            : chunk;
+
+        await this.writeRaw(data);
+    }
+
+    private async endResponse(chunk?: Uint8Array | string): Promise<void> {
+        if (this.responseEnded) return;
+
+        if (chunk !== undefined) {
+            await this.writeData(chunk);
+        } else if (!this.headersSent) {
+            // No body sent, send empty response
+            await this.writeHead(200, "OK", {
+                "content-length": "0"
+            });
+        }
+
+        this.responseEnded = true;
+        this.state = ConnectionState.IDLE;
+    }
+
+    private upgradeConnection(): ServerConnection {
+        assert (this.headersSent, "Cannot upgrade after headers sent");
+        assert (this.state === ConnectionState.UPGRADING, "Cannot upgrade a non-upgrading connection");
+
+        this.state = ConnectionState.UPGRADED;
+        this.keepAlive = false;  // Upgraded connections don't reuse
+
+        return this;
+    }
+
+    /* -------------------------------------------------------------- */
+    /* I/O Helpers                                                    */
+    /* -------------------------------------------------------------- */
+
+    /**
+     * Read data from socket (handles SSL if enabled)
+     */
+    async readData(size = 16384): Promise<Uint8Array | null> {
+        assert(size > 0, "invaild size");
+        if (this.sslPipe) {
+            // Try buffered plaintext first
+            const buffered = this.sslPipe.read(size);
+            if (buffered && buffered.byteLength > 0) {
+                return new Uint8Array(buffered);
+            }
+
+            // Feed pending ciphertext if any
+            if (this.pendingCiphertext && this.pendingCiphertext.length > 0) {
+                const consumed = this.feedCiphertext(this.pendingCiphertext);
+                if (consumed > 0) {
+                    this.pendingCiphertext = consumed < this.pendingCiphertext.length
+                        ? this.pendingCiphertext.subarray(consumed)
+                        : null;
+                }
+
+                const plain = this.sslPipe.read(size);
+                if (plain && plain.byteLength > 0) {
+                    return new Uint8Array(plain);
+                }
+            }
+
+            // Read from network
+            const buf = new Uint8Array(size);
+            const n = await this.socket.read(buf);
+            if (n === null || n === 0) return null;
+
+            // Feed to SSL
+            const ciphertext = buf.subarray(0, n);
+            const consumed = this.feedCiphertext(ciphertext);
+
+            if (consumed < ciphertext.length) {
+                this.pendingCiphertext = ciphertext.subarray(consumed);
+            }
+
+            // Read plaintext
+            const plaintext = this.sslPipe.read(size);
+            return (plaintext && plaintext.byteLength > 0)
+                ? new Uint8Array(plaintext)
+                : null;
+        } else {
+            // Plain HTTP
+            const buf = new Uint8Array(size);
+            const n = await this.socket.read(buf);
+            return n === null ? null : buf.subarray(0, n ?? 0);
+        }
+    }
+
+    /**
+     * Write raw data to socket (handles SSL if enabled)
+     */
+    async writeRaw(data: Uint8Array): Promise<void> {
+        if (this.sslPipe) {
+            // Encrypt
+            const written = this.sslPipe.write(data);
+            if (written < 0) {
+                throw new Error(`SSL_write failed: ${written}`);
+            }
+
+            // Send encrypted data
+            const encrypted = this.sslPipe.getOutput();
+            if (encrypted) {
+                await this.socket.write(new Uint8Array(encrypted));
+            }
+        } else {
+            // Plain HTTP
+            await this.socket.write(data);
+        }
+    }
+
+    async readRaw(size = 16384): Promise<Uint8Array | null> {
+        if (this.sslPipe) {
+            const buf = new Uint8Array(size);
+            const n = await this.socket.read(buf);
+            if (n === null || n === 0) return null;
+            
+            const consumed = this.sslPipe.feed(buf.subarray(0, n));
+            if (consumed < 0) {
+                throw new Error(`SSL feed error: ${consumed}`);
+            }
+            
+            const plaintext = this.sslPipe.read(size);
+            return plaintext ? new Uint8Array(plaintext) : null;
+        } else {
+            const buf = new Uint8Array(size);
+            const n = await this.socket.read(buf);
+            return (n === null || n === 0) ? null : buf.subarray(0, n);
+        }
+    }
+
+    /**
+     * Feed ciphertext to SSL pipe
+     * Returns: bytes consumed (may be < data.length)
+     */
+    private feedCiphertext(data: Uint8Array): number {
+        if (!this.sslPipe) return 0;
+
+        const consumed = this.sslPipe.feed(data);
+        if (consumed < 0) {
+            throw new Error(`SSL feed error: ${consumed}`);
+        }
+
+        return consumed;
+    }
+
+    /* -------------------------------------------------------------- */
+    /* State                                                          */
+    /* -------------------------------------------------------------- */
+
+    isUpgraded(): boolean {
+        return this.state === ConnectionState.UPGRADED;
+    }
+
+    isClosed(): boolean {
+        return this.state === ConnectionState.CLOSED;
+    }
+
+    close(): void {
+        if (this.state === ConnectionState.CLOSED) return;
+
+        // Close body stream if open
+        if (this.bodyController) {
+            try {
+                this.bodyController.close();
+            } catch (e) {
+                // Already closed
+            }
+            this.bodyController = null;
+        }
+
+        try {
+            this.sslPipe?.shutdown();
+            this.socket.close();
+        } catch (err) {
+            // Ignore
+        }
+
+        this.state = ConnectionState.CLOSED;
+        this.pendingCiphertext = null;
     }
 }
 
-/**
- * 请求处理器
- */
-export type RequestHandler = (req: ServerRequest, res: ServerResponse) => void | Promise<void>;
+/* ------------------------------------------------------------------ */
+/* HTTP Server                                                        */
+/* ------------------------------------------------------------------ */
 
-/**
- * HTTP Server
- */
 export class Server {
-    private server: CModuleStreams.TCP | null = null;
-    private handler: RequestHandler;
-    private listening: boolean = false;
-    private sslContext: CModuleSSL.Context | null = null;
-    private connections: Set<ServerSocket> = new Set();
-    private keepAliveTimeout: number = 5000;
-    private maxRequestsPerConnection: number = 100;
+    public readonly config: ServerConfig;
+    public readonly handler: RequestHandler;
 
-    constructor(handler: RequestHandler) {
+    private listener: CModuleStreams.TCP | null = null;
+    private sslContext: CModuleSSL.Context | null = null;
+    private connections = new Set<ServerConnection>();
+    private listening = false;
+    private cleanupTimer: number | null = null;
+
+    constructor(handler: RequestHandler, config: ServerConfig) {
         this.handler = handler;
+        this.config = {
+            hostname: config.hostname || "0.0.0.0",
+            port: config.port,
+            cert: config.cert,
+            key: config.key,
+            keepAliveTimeout: config.keepAliveTimeout || 5000,
+            maxRequestsPerConnection: config.maxRequestsPerConnection || 100,
+            requestTimeout: config.requestTimeout || 30000
+        };
     }
 
     /**
-     * 监听端口
+     * Start listening
      */
-    listen(port: number, hostname: string = '0.0.0.0', options?: {
-        keepAliveTimeout?: number;
-        maxRequestsPerConnection?: number;
-    }): void {
+    async listen(): Promise<void> {
         if (this.listening) {
-            throw new Error('Server already listening');
+            throw new Error("Server already listening");
         }
 
-        if (options?.keepAliveTimeout !== undefined) {
-            this.keepAliveTimeout = options.keepAliveTimeout;
+        // Create SSL context if cert/key provided
+        if (this.config.cert && this.config.key) {
+            this.sslContext = new ssl.Context({
+                mode: "server",
+                cert: this.config.cert,
+                key: this.config.key
+            });
         }
 
-        if (options?.maxRequestsPerConnection !== undefined) {
-            this.maxRequestsPerConnection = options.maxRequestsPerConnection;
-        }
-
-        this.server = new streams.TCP();
-
-        this.server.bind({ ip: hostname, port });
-        this.server.listen(511);
+        // Create TCP listener
+        assert(this.config.hostname);
+        this.listener = new streams.TCP();
+        this.listener.bind({
+            ip: this.config.hostname,
+            port: this.config.port
+        });
+        this.listener.listen(511);
 
         this.listening = true;
 
-        // 开始接受连接
+        const protocol = this.sslContext ? "https" : "http";
+        console.debug(`Server listening on ${protocol}://${this.config.hostname}:${this.config.port}`);
+
+        // Start accept loop
         this.acceptLoop();
     }
 
-    /**
-     * 监听 HTTPS
-     */
-    listenTLS(port: number, hostname: string = '0.0.0.0', options: {
-        cert: string;
-        key: string;
-        keepAliveTimeout?: number;
-        maxRequestsPerConnection?: number;
-    }): void {
-        if (this.listening) {
-            throw new Error('Server already listening');
+    private cleanup(): void {
+        for (const conn of this.connections) {
+            if (conn.isClosed()) {
+                this.connections.delete(conn);
+            }
         }
-
-        // 创建 SSL 上下文
-        this.sslContext = new ssl.Context({
-            mode: 'server',
-            cert: options.cert,
-            key: options.key
-        });
-
-        // 调用普通 listen
-        this.listen(port, hostname, {
-            keepAliveTimeout: options.keepAliveTimeout,
-            maxRequestsPerConnection: options.maxRequestsPerConnection
-        });
     }
 
     /**
-     * 接受连接循环
+     * Accept loop
      */
     private async acceptLoop(): Promise<void> {
-        while (this.listening && this.server) {
+        this.cleanupTimer = timers.setInterval(() => {
+            this.cleanup();
+        }, 30000);
+
+        while (this.listening && this.listener) {
             try {
-                const conn = await this.server.accept();
-                this.handleConnection(conn as CModuleStreams.TCP);
+                const socket = await this.listener.accept() as CModuleStreams.TCP;
+                socket.setNoDelay(true);
+                socket.setKeepAlive(true, 1000);
+                this.handleConnection(socket);
             } catch (err) {
                 if (this.listening) {
-                    console.error('Accept error:', err);
+                    console.error("Accept error:", err);
                 }
                 break;
             }
@@ -581,268 +741,96 @@ export class Server {
     }
 
     /**
-     * 处理连接
+     * Handle new connection
      */
-    private async handleConnection(conn: CModuleStreams.TCP): Promise<void> {
-        const socket = new ServerSocket(conn);
-        this.connections.add(socket);
+    private async handleConnection(socket: CModuleStreams.TCP): Promise<void> {
+        const conn = new ServerConnection(socket, this);
+        this.connections.add(conn);
 
         try {
-            // TODO: 如果需要 SSL，在这里进行 SSL 握手
+            // Perform SSL handshake if needed
+            if (this.sslContext) {
+                await conn.performSSLHandshake(this.sslContext);
+            }
 
-            let requestCount = 0;
+            // Handle requests in a loop (keep-alive)
             let keepAlive = true;
+            // Set timeout for request
+            let timeoutId;
+            if (this.config.requestTimeout)
+                timeoutId = timers.setTimeout(() => {
+                    conn.close();
+                }, this.config.requestTimeout);
 
-            while (keepAlive && requestCount < this.maxRequestsPerConnection) {
-                const result = await this.handleRequest(socket);
-
-                if (!result) {
-                    // 连接关闭或错误
-                    break;
-                }
-
-                requestCount++;
-                keepAlive = result.keepAlive;
-
-                // Keep-Alive 超时
-                if (keepAlive) {
-                    const timeoutId = timers.setTimeout(() => {
-                        socket.close();
-                    }, this.keepAliveTimeout);
-
-                    // 等待下一个请求（带超时）
-                    const hasNextRequest = await Promise.race([
-                        this.waitForData(conn, 100),
-                        new Promise<boolean>(resolve => {
-                            timers.setTimeout(() => resolve(false), this.keepAliveTimeout);
-                        })
-                    ]);
-
-                    timers.clearTimeout(timeoutId);
-
-                    if (!hasNextRequest) {
-                        break;
-                    }
-                }
-            }
-
-        } catch (err) {
-            console.error('Connection error:', err);
-        } finally {
-            socket.close();
-            this.connections.delete(socket);
-        }
-    }
-
-    /**
-     * 等待数据可用
-     */
-    private async waitForData(conn: CModuleStreams.TCP, timeout: number): Promise<boolean> {
-        try {
-            const buf = new Uint8Array(1);
-
-            // 非阻塞检查
-            conn.setBlocking(false);
-            const n = await Promise.race([
-                conn.read(buf),
-                new Promise<null>(resolve => timers.setTimeout(() => resolve(null), timeout))
-            ]);
-            conn.setBlocking(true);
-
-            return n !== null && n > 0;
-        } catch (err) {
-            return false;
-        }
-    }
-
-    /**
-     * 处理单个请求
-     */
-    private async handleRequest(socket: ServerSocket): Promise<{ keepAlive: boolean } | null> {
-        const parser = new http.Parser(http.REQUEST);
-
-        let method = '';
-        let url = '';
-        let httpMajor = 1;
-        let httpMinor = 1;
-        let headersComplete = false;
-        const headers = new Headers();
-        let currentHeaderField = '';
-
-        // 设置解析器回调
-        parser.onUrl = (buf, off, len) => {
-            const view = new Uint8Array(buf as ArrayBuffer).slice(off, off + len);
-            url += engine.decodeString(view);
-        };
-
-        parser.onHeaderField = (buf, off, len) => {
-            const view = new Uint8Array(buf as ArrayBuffer).slice(off, off + len);
-            currentHeaderField = engine.decodeString(view).toLowerCase();
-        };
-
-        parser.onHeaderValue = (buf, off, len) => {
-            const view = new Uint8Array(buf as ArrayBuffer).slice(off, off + len);
-            const value = engine.decodeString(view);
-            headers.append(currentHeaderField, value);
-        };
-
-        parser.onHeadersComplete = () => {
-            method = http.strstatus(parser.state.method) || 'GET';
-            httpMajor = parser.state.httpMajor;
-            httpMinor = parser.state.httpMinor;
-            headersComplete = true;
-        };
-
-        try {
-            // 读取请求头
-            while (!headersComplete) {
-                const buf = new Uint8Array(16384);
-                const n = await socket._getConnection().socket.read(buf);
-
-                if (n === null) {
-                    return null;
-                }
-
-                const data = buf.slice(0, n);
-                const result = parser.execute(data);
-
-                if (result.errno !== 0) {
-                    console.error('Parse error:', result.reason);
-                    return null;
-                }
-            }
-
-            // 创建请求对象
-            const request = new ServerRequest(
-                method,
-                url,
-                headers,
-                `${httpMajor}.${httpMinor}`,
-                socket
-            );
-
-            socket._currentRequest = request;
-
-            // 创建响应对象
-            const response = new ServerResponse(socket);
-
-            // 处理请求体
-            const contentLength = headers.get('content-length');
-            const transferEncoding = headers.get('transfer-encoding');
-
-            if (contentLength || transferEncoding?.toLowerCase().includes('chunked')) {
-                // 创建 body 流
-                const bodyStream = new ReadableStream<Uint8Array>({
-                    start: async (controller) => {
-                        try {
-                            let remaining = contentLength ? parseInt(contentLength) : Infinity;
-
-                            parser.onBody = (buf, off, len) => {
-                                const view = new Uint8Array(buf as ArrayBuffer).slice(off, off + len);
-                                request._addBodyChunk(view);
-                                controller.enqueue(view);
-                                remaining -= len;
-                            };
-
-                            parser.onMessageComplete = () => {
-                                controller.close();
-                            };
-
-                            // 继续读取 body
-                            while (!parser.state.eof && remaining > 0) {
-                                const buf = new Uint8Array(Math.min(16384, remaining));
-                                const n = await socket._getConnection().socket.read(buf);
-
-                                if (n === null) break;
-
-                                const data = buf.slice(0, n);
-                                parser.execute(data);
-
-                                if (contentLength) {
-                                    remaining -= n;
-                                }
-                            }
-
-                            if (!parser.state.eof) {
-                                controller.close();
-                            }
-                        } catch (err) {
-                            controller.error(err);
-                        }
-                    }
-                });
-
-                request._setBodyStream(bodyStream);
-            }
-
-            // 调用处理器
-            await this.handler(request, response);
-
-            // 确保响应已结束
-            if (!response['finished']) {
-                await response.end();
-            }
-
-            // 检查 Keep-Alive
-            const connection = headers.get('connection')?.toLowerCase();
-            const keepAlive = connection === 'keep-alive' ||
-                (httpMajor === 1 && httpMinor === 1 && connection !== 'close');
-
-            return { keepAlive };
-
-        } catch (err) {
-            console.error('Request handler error:', err);
-
-            // 发送 500 错误
             try {
-                const response = new ServerResponse(socket);
-                await response.status(500).text('Internal Server Error');
-            } catch (e) {
-                // 忽略
+                keepAlive = await conn.handleRequest();
+            } finally {
+                if (timeoutId) timers.clearTimeout(timeoutId);
             }
 
-            return null;
+            // If upgraded (WebSocket), stop processing HTTP
+            // with Keep-alive idle timeout
+            while (keepAlive && !conn.isClosed() && !conn.isUpgraded()) {
+                const idlePromise = Promise.withResolvers<void>();
+                const idleTimeout = timers.setTimeout(() => {
+                    conn.close();
+                    idlePromise.resolve(undefined);
+                }, this.config.keepAliveTimeout ?? 600_000);
+
+                // Wait for next request or timeouttry {
+                const r = await Promise.race([
+                    conn.handleRequest(),
+                    idlePromise.promise
+                ]);
+                if (typeof r === "boolean") {
+                    keepAlive = r;
+                } else {
+                    // timeout
+                    keepAlive = false;
+                }
+            }
+        } catch (err) {
+            console.error("Connection error:", err);
+        } finally {
+            if (!conn.isUpgraded()) {
+                conn.close();
+            }
+            this.connections.delete(conn);
         }
     }
 
     /**
-     * 关闭服务器
+     * Close server
      */
     close(): void {
-        if (!this.listening) {
-            return;
-        }
+        if (!this.listening) return;
 
         this.listening = false;
 
-        // 关闭所有连接
-        for (const socket of this.connections) {
-            socket.close();
+        // Close all connections
+        for (const conn of this.connections) {
+            conn.close();
         }
         this.connections.clear();
 
-        // 关闭服务器
-        if (this.server) {
-            this.server.close();
-            this.server = null;
+        // Close listener
+        if (this.listener) {
+            this.listener.close();
+            this.listener = null;
         }
     }
 
     /**
-     * 获取服务器地址
+     * Get server address
      */
     address(): { ip: string; port: number } | null {
-        if (!this.server) {
-            return null;
-        }
-
-        return this.server.getsockname();
+        return this.listener?.getsockname() ?? null;
     }
 }
 
 /**
- * 创建 HTTP 服务器
+ * Create HTTP server
  */
-export function createServer(handler: RequestHandler): Server {
-    return new Server(handler);
+export function createServer(handler: RequestHandler, config: ServerConfig): Server {
+    return new Server(handler, config);
 }

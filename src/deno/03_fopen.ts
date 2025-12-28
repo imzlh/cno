@@ -1,3 +1,4 @@
+import { malloc } from "../utils/malloc";
 import { asToDenoStat, toDenoStat, toString } from "./02_fs";
 
 const fs = import.meta.use('fs');
@@ -65,7 +66,7 @@ export class FSFile implements Deno.FsFile {
         this.readable = new ReadableStream({
             pull: async (controller) => {
                 try {
-                    const buf = new Uint8Array(controller.desiredSize ?? 4 * 1024);
+                    const buf = malloc(controller);
                     const n = await $handle.read(buf, this.fpointer);
                     controller.enqueue(buf.slice(0, n));
                     this.fpointer += n;
@@ -99,7 +100,7 @@ export class FSFile implements Deno.FsFile {
 
     writeSync(p: Uint8Array): number {
         const fno = this.$handle.fileno();
-        const n = fs.write(fno, p, this.fpointer);
+        const n = fs.pwrite(fno, p, this.fpointer);
         this.fpointer += n;
         return n;
     }
@@ -112,7 +113,7 @@ export class FSFile implements Deno.FsFile {
 
     readSync(p: Uint8Array): number | null {
         const fno = this.$handle.fileno();
-        const n = fs.read(fno, p, this.fpointer);
+        const n = fs.pread(fno, p, this.fpointer);
         this.fpointer += n;
         return n;
     }

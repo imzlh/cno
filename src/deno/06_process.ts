@@ -1,3 +1,5 @@
+import { assert } from "../utils/assert";
+import { malloc } from "../utils/malloc";
 import { toString } from "./02_fs";
 import { Stream } from "./04_stdio";
 import { useWritable } from "./05_net";
@@ -6,6 +8,8 @@ const os = import.meta.use('os');
 const proc = import.meta.use('process');
 const signal = import.meta.use('signal');
 const text = import.meta.use('text');
+const pty = import.meta.use('pty');
+const engine = import.meta.use('engine');
 
 const pipe = (type?: Deno.CommandOptions['stdout']): CModuleProcess.SpawnOptions['stdout'] => 
     type == 'piped' ? 'pipe' : (type == 'null' ? 'ignore' : 'inherit');
@@ -15,7 +19,7 @@ class RStream extends ReadableStream<Uint8Array<ArrayBuffer>> implements Deno.Su
         super({
             pull: async ctrl => {
                 try{
-                    const buf = new Uint8Array(ctrl.desiredSize ?? 2048);
+                    const buf = malloc(ctrl);
                     const readed = await pipe.read(buf);
                     if (!readed) ctrl.close();
                     else ctrl.enqueue(buf.slice(0, readed));
@@ -45,7 +49,7 @@ class RStream extends ReadableStream<Uint8Array<ArrayBuffer>> implements Deno.Su
 
     async text(): Promise<string> {
         const buf = await this.readAll();
-        return new text.Decoder().decode(buf.buffer);
+        return text ? new text.Decoder().decode(buf.buffer) : engine.decodeString(buf);
     }
 
     async json(): Promise<any> {
@@ -94,6 +98,8 @@ class Process implements Deno.ChildProcess {
     }
 
     kill(signo?: Deno.Signal): void {
+        assert(signo == 'SIGEMT', "Not implemented");
+        // @ts-ignore
         this.$proc.kill(signo);
     }
 
@@ -121,6 +127,12 @@ class Process implements Deno.ChildProcess {
         this.kill();
         await this.status;
     }
+
+    resize(cols: number, rows: number): Promise<void> {
+        const stdin = this.$proc.stdin?.fileno();
+        assert(stdin, "stdin is not piped");
+        return pty.resize(stdin, cols, rows);
+    }
 }
 
 class Command implements Deno.Command {
@@ -129,7 +141,6 @@ class Command implements Deno.Command {
 
     constructor(command: string | URL, options?: Deno.CommandOptions){
         const path = toString(command);
-        // @ts-ignore object assign
         this.proc = proc.spawn(path, options?.args, {
             cwd: options?.cwd ? toString(options.cwd) : undefined,
             env: options?.env,
@@ -144,8 +155,9 @@ class Command implements Deno.Command {
     }
 
     async output(): Promise<Deno.CommandOutput> {
-        if (this.detached)
-            throw new TypeError("Detached process cannot be waited");
+        assert(!this.detached, "Detached process cannot be waited");
+        assert(this.proc.stdout && this.proc.stderr, "stdout and stderr are not piped");
+        
         const stdo = new RStream(this.proc.stdout!).bytes();
         const stde = new RStream(this.proc.stderr!).bytes();
         const res = await this.proc.wait();
@@ -160,7 +172,18 @@ class Command implements Deno.Command {
     }
 
     outputSync(): Deno.CommandOutput {
-        throw new Deno.errors.NotSupported();
+        assert(!this.detached, "Detached process cannot be waited");
+        
+        // TODO: implement reading stdout/stderr data
+        const res = this.proc.waitSync();
+        return {
+            code: res.exit_status,
+            // @ts-ignore
+            signal: res.term_signal ? signal.signals[res.term_signal] : null,
+            success: res.exit_status === 0,
+            stderr: new Uint8Array(0),
+            stdout: new Uint8Array(0)
+        };
     }
 
     spawn(): Deno.ChildProcess {
@@ -174,10 +197,12 @@ Object.assign(Deno, {
     Command,
 
     kill(pid: number, signo: Deno.Signal): void {
+        assert(signo != 'SIGEMT', "Not implemented");
+        // @ts-ignore
         proc.kill(pid, signo);
     },
 
     umask(mask?: number): number {
         return 0;   // not implemented
-    }
+    },
 } as Partial<typeof Deno>);

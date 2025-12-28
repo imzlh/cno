@@ -1,3 +1,5 @@
+import { malloc } from "../utils/malloc";
+
 const os = import.meta.use('os');
 const dns = import.meta.use('dns');
 const stream = import.meta.use('streams');
@@ -22,7 +24,7 @@ export const useWritable = (pipe: CModuleStreams.Stream) => new WritableStream({
 export const useReadable = (pipe: CModuleStreams.Stream) => new ReadableStream({
     async pull(controller) {
         try {
-            const buf = new Uint8Array(controller.desiredSize ?? 1024);
+            const buf = malloc(controller);
             const n = await pipe.read(buf);
             if (n === null) {
                 controller.close();
@@ -126,7 +128,7 @@ class TlsConn implements Deno.TlsConn {
         this.$readable = new ReadableStream({
             async pull(controller) {
                 try {
-                    const buf = $pipe.read(controller.desiredSize ?? 1024);
+                    const buf = malloc(controller);
                     if (buf === null) {
                         controller.close();
                     } else {

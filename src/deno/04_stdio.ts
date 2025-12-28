@@ -1,3 +1,4 @@
+import { malloc } from "../utils/malloc";
 import { FSFile } from "./03_fopen";
 
 const os = import.meta.use('os');
@@ -48,7 +49,7 @@ export class Stream {
         } else {
             // fixme: use other method to read sync
             const fno = (this.stream as CModuleStreams.Pipe | CModuleStreams.TTY).fileno();
-            return syncfs.read(fno, buf, 0, 0);
+            return syncfs.read(fno, buf);
         }
     }
 
@@ -58,7 +59,7 @@ export class Stream {
         } else {
             // fixme: use other method to write sync
             const fno = (this.stream as CModuleStreams.Pipe | CModuleStreams.TTY).fileno();
-            return syncfs.write(fno, data, 0, 0);
+            return syncfs.write(fno, data);
         }
     }
 
@@ -71,7 +72,7 @@ export class Stream {
         return new ReadableStream({
             pull: async ctrl => {
                 try{
-                    const buf = new Uint8Array(ctrl.desiredSize ?? 2048);
+                    const buf = malloc(ctrl);
                     const readed = await this.stream.read(buf);
                     if (!readed) ctrl.close();
                     else ctrl.enqueue(buf.slice(0, readed));

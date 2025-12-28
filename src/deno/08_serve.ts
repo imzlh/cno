@@ -1,70 +1,167 @@
-import { createServer, Server, ServerRequest, ServerResponse } from '../module/http/server';
-import { WebSocket } from '../module/http/websocket';
+/**
+ * Deno.serve API Adapter
+ * Bridges between Server core and Web API (Request/Response/WebSocket)
+ */
+
+import { Server, ServerConnection, createServer, type HttpRequest, type HttpResponse } from '../module/http/server';
+import { WebSocket, createWebSocketFromConnection } from '../module/http/websocket';
 
 const crypto = import.meta.use('crypto');
 const engine = import.meta.use('engine');
 
-/**
- * WebSocket 升级标记
- */
-const websocketSymbol = Symbol('server.websocket');
+type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
-/**
- * 扩展的 Response 接口（用于 WebSocket）
- */
+/* ------------------------------------------------------------------ */
+/* WebSocket Upgrade Symbol                                           */
+/* ------------------------------------------------------------------ */
+
+const websocketSymbol = Symbol('deno.serve.websocket');
+
 interface WebSocketResponse extends Response {
-    [websocketSymbol]?: (req: ServerRequest, res: ServerResponse) => Promise<void>;
+    [websocketSymbol]?: (conn: ServerConnection) => void;
+}
+
+/* ------------------------------------------------------------------ */
+/* Adapter: Server Core → Web API                                    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Convert core HttpRequest to Web API Request
+ */
+function createWebRequest(coreReq: HttpRequest, connInfo: { hostname: string; port: number }): Request {
+    // Build full URL
+    const host = coreReq.headers.get('host') || `${connInfo.hostname}:${connInfo.port}`;
+    const protocol = 'http:'; // Server will be HTTP or HTTPS, but Request constructor needs valid URL
+    const url = new URL(coreReq.url, `${protocol}//${host}`);
+
+    // Convert headers
+    const headers = new Headers();
+    for (const [key, value] of coreReq.headers) {
+        headers.append(key, value);
+    }
+
+    return new Request(url.toString(), {
+        method: coreReq.method,
+        headers,
+        body: coreReq.body
+    });
 }
 
 /**
- * Serve 连接信息
+ * Adapter for HttpResponse to handle Web API Response
  */
-interface ServeConnInfo {
-    readonly remoteAddr: Deno.NetAddr | Deno.UnixAddr;
-    readonly completed: Promise<void>;
+class ResponseAdapter {
+    private coreRes: HttpResponse;
+    private headersSent = false;
+
+    constructor(coreRes: HttpResponse) {
+        this.coreRes = coreRes;
+    }
+
+    /**
+     * Send Web API Response to client
+     */
+    async sendResponse(response: Response): Promise<void> {
+        // Check if this is a WebSocket upgrade response
+        const wsResponse = response as WebSocketResponse;
+        if (wsResponse[websocketSymbol]) {
+            // Handle WebSocket upgrade
+            await this.handleWebSocketUpgrade(wsResponse);
+            return;
+        }
+
+        // Send status and headers
+        const headers: Record<string, string> = {};
+        response.headers.forEach((value, key) => {
+            headers[key] = value;
+        });
+
+        await this.coreRes.writeHead(response.status, response.statusText, headers);
+        this.headersSent = true;
+
+        // Send body if present
+        if (response.body) {
+            const reader = response.body.getReader();
+
+            try {
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    await this.coreRes.write(value);
+                }
+            } finally {
+                reader.releaseLock();
+            }
+        }
+
+        // End response
+        await this.coreRes.end();
+    }
+
+    /**
+     * Handle WebSocket upgrade
+     */
+    private async handleWebSocketUpgrade(response: WebSocketResponse): Promise<void> {
+        // Send upgrade headers
+        const headers: Record<string, string> = {};
+        response.headers.forEach((value, key) => {
+            headers[key] = value;
+        });
+
+        await this.coreRes.writeHead(response.status, response.statusText, headers);
+
+        // Upgrade connection
+        const conn = this.coreRes.upgrade();
+
+        // Execute WebSocket handler
+        if (response[websocketSymbol]) {
+            response[websocketSymbol]!(conn);
+        }
+    }
 }
 
+/* ------------------------------------------------------------------ */
+/* Deno.serve Implementation                                          */
+/* ------------------------------------------------------------------ */
+
 /**
- * HTTP 服务器包装
+ * HTTP server wrapper (implements Deno.HttpServer interface)
  */
-class HttpServer implements Deno.HttpServer<Deno.NetAddr> {
+class DenoHttpServer implements Deno.HttpServer<Deno.NetAddr> {
     private server: Server;
-    private $finished: boolean = false;
-    readonly addr: Deno.NetAddr;
+    private finishedPromise: Promise<void>;
+    private finishedResolve!: () => void;
+    public readonly addr: Deno.NetAddr;
 
-    constructor(server: Server, addr: Deno.NetAddr) {
+    constructor(server: Server) {
         this.server = server;
-        this.addr = addr;
+        this.finishedPromise = new Promise<void>(resolve => {
+            this.finishedResolve = resolve;
+        });
+        const addr = server.address();
+        this.addr = {
+            transport: 'tcp',
+            hostname: addr?.ip ?? '::',
+            port: addr?.port ?? 80
+        };
     }
 
     get finished(): Promise<void> {
-        return new Promise((resolve) => {
-            if (this.$finished) {
-                resolve();
-            } else {
-
-                const checkInterval = setInterval(() => {
-                    if (this.$finished) {
-                        clearInterval(checkInterval);
-                        resolve();
-                    }
-                }, 100);
-            }
-        });
+        return this.finishedPromise;
     }
 
     ref(): void {
-        // NOOP
+        // Not implemented (Txiki.js doesn't have ref/unref)
     }
 
     unref(): void {
-        // NOOP
+        // Not implemented
     }
 
-    shutdown(): Promise<void> {
-        this.$finished = true;
+    async shutdown(): Promise<void> {
         this.server.close();
-        return Promise.resolve();
+        this.finishedResolve();
     }
 
     [Symbol.asyncDispose](): Promise<void> {
@@ -73,225 +170,7 @@ class HttpServer implements Deno.HttpServer<Deno.NetAddr> {
 }
 
 /**
- * 创建 Request 对象
- */
-function createRequest(req: ServerRequest): Request {
-    const url = new URL(req.url, `http://${req.headers.get('host') || 'localhost'}`);
-
-    return new Request(url.toString(), {
-        method: req.method,
-        headers: req.headers as any,
-        body: req.body as any
-    });
-}
-
-/**
- * 创建连接信息
- */
-function createConnInfo(req: ServerRequest, completed: Promise<void>): ServeConnInfo {
-
-    const addr = req.socket._getConnection().socket.getpeername();
-
-    return {
-        remoteAddr: {
-            hostname: addr.ip,
-            port: addr.port,
-            transport: 'tcp' as const
-        },
-        completed
-    };
-}
-
-/**
- * 处理 Response 并发送
- */
-async function handleResponse(
-    response: Response,
-    req: ServerRequest,
-    res: ServerResponse
-): Promise<void> {
-
-    const wsResponse = response as WebSocketResponse;
-    if (wsResponse[websocketSymbol]) {
-        await wsResponse[websocketSymbol]!(req, res);
-        return;
-    }
-
-
-    res.status(response.status, response.statusText);
-
-
-    response.headers.forEach((value, key) => {
-        res.setHeader(key, value);
-    });
-
-
-    await res.writeHead();
-
-
-    if (response.body) {
-        const reader = response.body.getReader();
-
-        try {
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-
-                await res.write(value);
-            }
-        } finally {
-            reader.releaseLock();
-        }
-    }
-
-
-    await res.end();
-}
-
-/**
- * TCP 服务器
- */
-async function serveTcp(
-    options: Deno.ServeTcpOptions & Deno.ServeInit<Deno.NetAddr>
-): Promise<Deno.HttpServer<Deno.NetAddr>> {
-    const server = createServer(async (req, res) => {
-        try {
-
-            const completedResolvers = Promise.withResolvers<void>();
-            const request = createRequest(req);
-            const connInfo = createConnInfo(req, completedResolvers.promise);
-            // @ts-ignore UnixAddr never reaches here
-            const response = await options.handler(request, connInfo);
-
-            await handleResponse(response, req, res);
-
-            completedResolvers.resolve();
-
-        } catch (error) {
-            console.error('Request handler error:', error);
-
-
-            try {
-                if (!res['headersSent']) {
-                    await res.status(500).text('Internal Server Error');
-                }
-            } catch (e) {
-
-            }
-        }
-    });
-
-
-    const hostname = options.hostname || '0.0.0.0';
-    const port = options.port || 8000;
-
-    server.listen(port, hostname, {
-        keepAliveTimeout: 5000,
-        maxRequestsPerConnection: 1000
-    });
-
-    console.log(`HTTP server listening on http://${hostname}:${port}`);
-
-    return new HttpServer(server, {
-        transport: 'tcp',
-        hostname,
-        port
-    });
-}
-
-/**
- * TLS 服务器
- */
-async function serveTls(
-    options: Deno.ServeTcpOptions & Deno.ServeInit<Deno.NetAddr> & Deno.TlsCertifiedKeyPem
-): Promise<Deno.HttpServer<Deno.NetAddr>> {
-
-    if (!options.cert || !options.key) {
-        throw new TypeError('TLS options must include cert and key');
-    }
-
-
-    let certPath: string;
-    let keyPath: string;
-
-    if (typeof options.cert === 'string') {
-
-        certPath = options.cert;
-    } else {
-
-        const tmpCert = `/tmp/cert-${Date.now()}.pem`;
-        const certContent = typeof options.cert === 'string'
-            ? options.cert
-            : engine.decodeString(options.cert);
-        await Deno.writeTextFile(tmpCert, certContent);
-        certPath = tmpCert;
-    }
-
-    if (typeof options.key === 'string') {
-        keyPath = options.key;
-    } else {
-        const tmpKey = `/tmp/key-${Date.now()}.pem`;
-        const keyContent = typeof options.key === 'string'
-            ? options.key
-            : engine.decodeString(options.key);
-        await Deno.writeTextFile(tmpKey, keyContent);
-        keyPath = tmpKey;
-    }
-
-    const server = createServer(async (req, res) => {
-        try {
-            const completedResolvers = Promise.withResolvers<void>();
-            const request = createRequest(req);
-            const connInfo = createConnInfo(req, completedResolvers.promise);
-            // @ts-ignore UnixAddr never reaches here
-            const response = await options.handler(request, connInfo);
-            await handleResponse(response, req, res);
-
-            completedResolvers.resolve();
-
-        } catch (error) {
-            console.error('Request handler error:', error);
-
-            try {
-                if (!res['headersSent']) {
-                    await res.status(500).text('Internal Server Error');
-                }
-            } catch (e) {
-
-            }
-        }
-    });
-
-    const hostname = options.hostname || '0.0.0.0';
-    const port = options.port || 8443;
-
-    server.listenTLS(port, hostname, {
-        cert: certPath,
-        key: keyPath,
-        keepAliveTimeout: 5000,
-        maxRequestsPerConnection: 1000
-    });
-
-    console.log(`HTTPS server listening on https://${hostname}:${port}`);
-
-    return new HttpServer(server, {
-        transport: 'tcp',
-        hostname,
-        port
-    });
-}
-
-/**
- * Unix Socket 服务器
- */
-async function serveUnix(
-    options: Deno.ServeUnixOptions & Deno.ServeInit<Deno.UnixAddr>
-): Promise<Deno.HttpServer<Deno.UnixAddr>> {
-    throw new Deno.errors.NotSupported('Unix socket server not yet implemented');
-}
-
-/**
- * Deno.serve 实现
+ * Deno.serve - main entry point
  */
 function serve(options: Deno.ServeOptions): Deno.HttpServer;
 function serve(handler: Deno.ServeHandler): Deno.HttpServer;
@@ -303,42 +182,97 @@ function serve(
     optionsOrHandler: Deno.ServeOptions | Deno.ServeHandler,
     handler?: Deno.ServeHandler
 ): Deno.HttpServer {
-    let options: Deno.ServeOptions;
+    let options: Deno.ServeOptions & Deno.ServeTcpOptions & { handler: Deno.ServeHandler };
 
+    // Handle overloads
     if (typeof optionsOrHandler === 'function') {
         options = {
-            // @ts-ignore
             handler: optionsOrHandler,
             port: 8000
         };
     } else {
+        // @ts-ignore
         options = optionsOrHandler;
         if (handler) {
-            // @ts-ignore
             options.handler = handler;
         }
     }
 
-    // @ts-ignore
+    // Validate handler
     if (!options.handler) {
         throw new TypeError('Handler is required');
     }
 
-
+    // Check for Unix socket
     if ('path' in options && options.path) {
-
-        return serveUnix(options as any) as any;
-    } else if ('cert' in options && 'key' in options) {
-
-        return serveTls(options as any) as any;
-    } else {
-
-        return serveTcp(options as any) as any;
+        throw new Deno.errors.NotSupported('Unix socket server not yet implemented');
     }
+
+    // Create core server
+    const coreServer = createServer(
+        async (req, res) => {
+            try {
+                // Create Web API Request
+                const addr = coreServer.address();
+                const webRequest = createWebRequest(req, {
+                    hostname: addr?.ip || '0.0.0.0',
+                    port: addr?.port || options.port || 8000
+                });
+
+                // Create connection info
+                const connInfo: Deno.ServeHandlerInfo = {
+                    remoteAddr: {
+                        hostname: addr?.ip || '0.0.0.0',
+                        port: addr?.port || 0,
+                        transport: 'tcp'
+                    },
+                    completed: Promise.resolve() // Simplified
+                };
+
+                // Call user handler
+                const webResponse = await options.handler!(webRequest, connInfo);
+                if (!webResponse || !(webResponse instanceof Response)) {
+                    throw new TypeError('Handler must return a Response');
+                }
+
+                // Send response
+                const adapter = new ResponseAdapter(res);
+                await adapter.sendResponse(webResponse);
+
+            } catch (error) {
+                console.error('Request handler error:', error);
+
+                // Send 500 error
+                try {
+                    await res.writeHead(500, 'Internal Server Error', {
+                        'content-type': 'text/plain'
+                    });
+                    await res.end('Internal Server Error');
+                } catch (e) {
+                    // Ignore
+                }
+            }
+        },
+        {
+            hostname: options.hostname || '0.0.0.0',
+            port: options.port || 8000,
+            cert: ('cert' in options) ? options.cert as string : undefined,
+            key: ('key' in options) ? options.key as string : undefined
+        }
+    );
+
+    // Start listening
+    coreServer.listen();
+
+    return new DenoHttpServer(coreServer);
 }
 
+/* ------------------------------------------------------------------ */
+/* Deno.upgradeWebSocket                                              */
+/* ------------------------------------------------------------------ */
+
 /**
- * 计算 WebSocket Accept 值
+ * Calculate WebSocket accept value
  */
 function calculateWebSocketAccept(key: string): string {
     const magic = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
@@ -347,13 +281,13 @@ function calculateWebSocketAccept(key: string): string {
 }
 
 /**
- * Deno.upgradeWebSocket 实现
+ * Deno.upgradeWebSocket implementation
  */
 function upgradeWebSocket(
     request: Request,
     options?: Deno.UpgradeWebSocketOptions
 ): Deno.WebSocketUpgrade {
-
+    // Validate WebSocket request
     const upgradeHeader = request.headers.get('upgrade')?.toLowerCase();
     const connectionHeader = request.headers.get('connection')?.toLowerCase();
     const wsKey = request.headers.get('sec-websocket-key');
@@ -371,14 +305,14 @@ function upgradeWebSocket(
         throw new TypeError('Missing Sec-WebSocket-Key header');
     }
 
-
+    // Build response headers
     const headers = new Headers({
         'upgrade': 'websocket',
         'connection': 'Upgrade',
         'sec-websocket-accept': calculateWebSocketAccept(wsKey)
     });
 
-
+    // Handle protocol negotiation
     const protocols = request.headers.get('sec-websocket-protocol');
     if (protocols && options?.protocol) {
         const requestedProtocols = protocols.split(',').map(p => p.trim());
@@ -387,39 +321,72 @@ function upgradeWebSocket(
         }
     }
 
+    // Create WebSocket promise
+    const conProm = Promise.withResolvers<ServerConnection>();
 
-    let wsResolve: (ws: WebSocket) => void;
-    const wsPromise = new Promise<WebSocket>((resolve) => {
-        wsResolve = resolve;
-    });
-
-
+    // Create upgrade response
     const response = new Response(null, {
         status: 101,
         statusText: 'Switching Protocols',
         headers
     }) as WebSocketResponse;
 
-    // @ts-ignore internal symbol
-    response[websocketSymbol] = async (req: ServerRequest, res: ServerResponse) => {
-        const ws = await res.upgrade();
-        queueMicrotask(() => {
-            wsResolve(ws);
-
-            try {
-                ws.onopen?.(new Event('open'));
-                ws.dispatchEvent(new Event('open'));
-            } catch (err) {
-                console.error('WebSocket onopen error:', err);
-            }
-        });
-    };
+    // Attach WebSocket handler
+    const ws = createWebSocketFromServerConnection(conProm.promise);
+    response[websocketSymbol] = c => conProm.resolve(c);
 
     return {
         response,
-        socket: wsPromise as any
+        socket: ws
     };
 }
+
+/**
+ * Create WebSocket from ServerConnection
+ * This adapts the raw connection to WebSocket protocol
+ */
+function createWebSocketFromServerConnection(conn: Promise<ServerConnection>): WebSocket {
+    // Wrap ServerConnection to match Connection interface expected by WebSocket
+
+
+    // Create WebSocket in server mode
+    return createWebSocketFromConnection(conn.then(conn => ({
+        socket: conn.socket,
+        sslPipe: conn.sslPipe,
+        state: 'active' as any,
+        lastUsed: Date.now(),
+        requests: 0,
+
+        async connect() { },
+
+        async write(data: Uint8Array) {
+            await conn.writeRaw(data);
+        },
+
+        async read(size?: number): Promise<Uint8Array | null> {
+            return await conn.readRaw(size);
+        },
+
+        markActive() { },
+        markIdle() { },
+
+        close() {
+            conn.close();
+        },
+
+        isAvailable() {
+            return false;
+        },
+
+        isClosed() {
+            return conn.isClosed();
+        }
+    })));
+}
+
+/* ------------------------------------------------------------------ */
+/* Export to Deno namespace                                           */
+/* ------------------------------------------------------------------ */
 
 Object.assign(Deno, {
     serve,
