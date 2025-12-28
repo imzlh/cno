@@ -44,7 +44,6 @@
         /* Title Bar - Windows 11 Style */
         .title-bar {
             height: 40px;
-            min-height: env(titlebar-area-height, auto);
             background: var(--bg-secondary);
             display: flex;
             justify-content: space-between;
@@ -77,6 +76,7 @@
             height: 100%;
             -webkit-app-region: no-drag;
             padding-right: env(titlebar-area-width, calc(100% - env(titlebar-area-x, 100%)));
+            min-height: env(titlebar-area-height, auto);
         }
 
         .title-bar-divider {
@@ -537,14 +537,14 @@
 
             // 注册 Service Worker
             async registerServiceWorker() {
-                // if ('serviceWorker' in navigator) {
-                //     try {
-                //         await navigator.serviceWorker.register('/sw.js');
-                //         console.log('Service Worker registered');
-                //     } catch (error) {
-                //         console.error('Service Worker registration failed:', error);
-                //     }
-                // }
+                if ('serviceWorker' in navigator) {
+                    try {
+                        await navigator.serviceWorker.register('/sw.js');
+                        console.log('Service Worker registered');
+                    } catch (error) {
+                        console.error('Service Worker registration failed:', error);
+                    }
+                }
             }
 
             // 创建新标签页

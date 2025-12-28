@@ -126,15 +126,10 @@ Deno.serve({ port: 8080 }, async (req) => {
                     'Cache-Control': 'public, max-age=3600',
                 },
             });
-        } catch (error) {
-            if (error instanceof Deno.errors.NotFound) {
-                return new Response('File not found', { status: 404 });
-            }
-            return new Response('Internal Server Error', { status: 500 });
+        } catch {
+            return new Response('File not found', { status: 404 });
         }
     }
-
-    return new Response("Not Found", { status: 404 });
 });
 
 console.log("Web Terminal Server running at http://localhost:8080");

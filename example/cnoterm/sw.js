@@ -2,8 +2,6 @@ const CACHE_NAME = 'terminal-v1';
 const urlsToCache = [
     '/',
     '/index.html',
-    '/styles.css',
-    '/app.js',
     '/manifest.json',
     'https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css',
     'https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js',
