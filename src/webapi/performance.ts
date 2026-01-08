@@ -1,319 +1,704 @@
-/*!
- * User Timing Level 3 Polyfill for Deno/QuickJS
- * TypeScript version with full spec compliance
- */
+import { EventTarget } from "./events";
 
-// === Type Definitions ===
-type DOMHighResTimeStamp = number;
-type PerformanceEntryType = "mark" | "measure" | "navigation" | "resource" | "paint" | "largest-contentful-paint" | "first-input" | "layout-shift";
-interface PerformanceMarkOptions {
-    detail?: any;
-    startTime?: DOMHighResTimeStamp;
+// Store native performance.now reference
+const nativePerformanceNow = globalThis.performance?.now?.bind(globalThis.performance) ?? (() => Date.now());
+
+type PerformanceEntryType =
+    | 'mark'
+    | 'measure'
+    | 'navigation'
+    | 'resource'
+    | 'paint'
+    | 'frame';
+
+type PerformanceObserverCallback = (
+    list: PerformanceObserverEntryList,
+    observer: PerformanceObserver
+) => void;
+
+interface PerformanceObserverInit {
+    entryTypes?: PerformanceEntryType[];
+    type?: PerformanceEntryType;
+    buffered?: boolean;
 }
 
-interface PerformanceMeasureOptions {
-    detail?: any;
-    start?: string | DOMHighResTimeStamp ;
-    end?: string | DOMHighResTimeStamp;
-    duration?: DOMHighResTimeStamp;
-}
+// ==================== PerformanceEntry ====================
 
-// === Module Scope Storage ===
-// Use WeakMap instead of symbols for better TypeScript compatibility
-const storage = new WeakMap<Performance, {
-    buffer: PerformanceEntry[];
-    marks: Map<string, PerformanceMark[]>;
-}>();
-
-// === PerformanceMark Class ===
-class PerformanceMark implements PerformanceEntry {
-    readonly entryType: "mark" = "mark";
-    readonly duration: DOMHighResTimeStamp = 0;
+class PerformanceEntry<ET extends PerformanceEntryType> implements globalThis.PerformanceEntry {
     readonly name: string;
-    readonly startTime: DOMHighResTimeStamp;
-    readonly detail: any;
-
-    constructor(markName: string, markOptions: PerformanceMarkOptions = {}) {
-        if (typeof markName !== "string" || markName === "") {
-            throw new TypeError("markName must be a non-empty string");
-        }
-
-        // PerformanceTiming reserved names (for spec compliance)
-        const forbidden = ["navigationStart", "unloadEventStart", "unloadEventEnd",
-            "redirectStart", "redirectEnd", "fetchStart", "domainLookupStart",
-            "domainLookupEnd", "connectStart", "connectEnd", "secureConnectionStart",
-            "requestStart", "responseStart", "responseEnd", "domLoading",
-            "domInteractive", "domContentLoadedEventStart", "domContentLoadedEventEnd",
-            "domComplete", "loadEventStart", "loadEventEnd"];
-
-        if (forbidden.includes(markName)) {
-            throw new SyntaxError(`Cannot use reserved timing name: ${markName}`);
-        }
-
-        this.name = markName;
-        this.startTime = markOptions.startTime !== undefined
-            ? Number(markOptions.startTime)
-            : performance.now();
-
-        if (this.startTime < 0) throw new TypeError("startTime cannot be negative");
-
-        // Structured clone simulation
-        this.detail = markOptions.detail !== undefined
-            ? JSON.parse(JSON.stringify(markOptions.detail))
-            : null;
-
-        Object.freeze(this);
-    }
-
-    toJSON() {
-        return {
-            name: this.name,
-            entryType: this.entryType,
-            startTime: this.startTime,
-            duration: this.duration,
-            detail: this.detail,
-        };
-    }
-}
-
-// === PerformanceMeasure Class ===
-class PerformanceMeasure implements PerformanceEntry {
-    readonly entryType: "measure" = "measure";
-    readonly name: string;
-    readonly startTime: DOMHighResTimeStamp;
-    readonly duration: DOMHighResTimeStamp;
+    readonly entryType: ET;
+    readonly startTime: number;
+    readonly duration: number;
     readonly detail: any;
 
     constructor(
-        measureName: string,
-        startTime: DOMHighResTimeStamp,
-        duration: DOMHighResTimeStamp,
-        detail: any = null
+        name: string,
+        entryType: ET,
+        startTime: number,
+        duration: number,
+        detail?: any
     ) {
-        if (typeof measureName !== "string" || measureName === "") {
-            throw new TypeError("measureName must be a non-empty string");
+        this.name = name;
+        this.entryType = entryType;
+        this.startTime = startTime;
+        this.duration = duration;
+        if (detail !== undefined) {
+            this.detail = detail;
         }
-
-        this.name = measureName;
-        this.startTime = Number(startTime);
-        this.duration = Number(duration);
-        this.detail = detail !== null ? JSON.parse(JSON.stringify(detail)) : null;
-
-        Object.freeze(this);
     }
 
-    toJSON() {
-        return {
+    toJSON(): object {
+        const obj: any = {
             name: this.name,
             entryType: this.entryType,
             startTime: this.startTime,
-            duration: this.duration,
-            detail: this.detail,
+            duration: this.duration
+        };
+        if (this.detail !== undefined) {
+            obj.detail = this.detail;
+        }
+        return obj;
+    }
+}
+
+// ==================== PerformanceMark ====================
+
+class PerformanceMark extends PerformanceEntry<'mark'> implements globalThis.PerformanceMark {
+    public detail: any;
+
+    constructor(name: string, options?: PerformanceMarkOptions) {
+        const startTime = options?.startTime ?? nativePerformanceNow();
+        super(name, 'mark', startTime, 0, options?.detail);
+        this.detail = options?.detail;
+    }
+}
+
+// ==================== PerformanceMeasure ====================
+
+class PerformanceMeasure extends PerformanceEntry<'measure'> implements globalThis.PerformanceMeasure {
+    constructor(
+        name: string,
+        startTime: number,
+        duration: number,
+        detail?: any
+    ) {
+        super(name, 'measure', startTime, duration, detail);
+    }
+}
+
+// ==================== PerformanceNavigationTiming ====================
+
+class PerformanceNavigationTiming extends PerformanceEntry<'navigation'> {
+    readonly unloadEventStart: number = 0;
+    readonly unloadEventEnd: number = 0;
+    readonly domInteractive: number;
+    readonly domContentLoadedEventStart: number;
+    readonly domContentLoadedEventEnd: number;
+    readonly domComplete: number;
+    readonly loadEventStart: number;
+    readonly loadEventEnd: number;
+    readonly type: string = 'navigate';
+    readonly redirectCount: number = 0;
+
+    constructor() {
+        const now = nativePerformanceNow();
+        super('navigation', 'navigation', 0, now);
+
+        this.domInteractive = now;
+        this.domContentLoadedEventStart = now;
+        this.domContentLoadedEventEnd = now;
+        this.domComplete = now;
+        this.loadEventStart = now;
+        this.loadEventEnd = now;
+    }
+
+    toJSON(): object {
+        return {
+            ...super.toJSON(),
+            unloadEventStart: this.unloadEventStart,
+            unloadEventEnd: this.unloadEventEnd,
+            domInteractive: this.domInteractive,
+            domContentLoadedEventStart: this.domContentLoadedEventStart,
+            domContentLoadedEventEnd: this.domContentLoadedEventEnd,
+            domComplete: this.domComplete,
+            loadEventStart: this.loadEventStart,
+            loadEventEnd: this.loadEventEnd,
+            type: this.type,
+            redirectCount: this.redirectCount
         };
     }
 }
 
-// === Utility Functions ===
-function getStore(perf: Performance) {
-    if (!storage.has(perf)) {
-        storage.set(perf, {
-            buffer: [],
-            marks: new Map<string, PerformanceMark[]>(),
-        });
+// ==================== PerformanceResourceTiming ====================
+
+class PerformanceResourceTiming extends PerformanceEntry<'resource'> {
+    readonly initiatorType: string;
+    readonly nextHopProtocol: string = '';
+    readonly workerStart: number = 0;
+    readonly redirectStart: number = 0;
+    readonly redirectEnd: number = 0;
+    readonly fetchStart: number;
+    readonly domainLookupStart: number;
+    readonly domainLookupEnd: number;
+    readonly connectStart: number;
+    readonly connectEnd: number;
+    readonly secureConnectionStart: number = 0;
+    readonly requestStart: number;
+    readonly responseStart: number;
+    readonly responseEnd: number;
+    readonly transferSize: number;
+    readonly encodedBodySize: number;
+    readonly decodedBodySize: number;
+
+    constructor(
+        name: string,
+        startTime: number,
+        duration: number,
+        initiatorType: string,
+        transferSize: number = 0
+    ) {
+        super(name, 'resource', startTime, duration);
+
+        this.initiatorType = initiatorType;
+        this.fetchStart = startTime;
+        this.domainLookupStart = startTime;
+        this.domainLookupEnd = startTime;
+        this.connectStart = startTime;
+        this.connectEnd = startTime;
+        this.requestStart = startTime;
+        this.responseStart = startTime + duration * 0.7;
+        this.responseEnd = startTime + duration;
+        this.transferSize = transferSize;
+        this.encodedBodySize = transferSize;
+        this.decodedBodySize = transferSize;
     }
-    return storage.get(perf)!;
+
+    toJSON(): object {
+        return {
+            ...super.toJSON(),
+            initiatorType: this.initiatorType,
+            nextHopProtocol: this.nextHopProtocol,
+            workerStart: this.workerStart,
+            redirectStart: this.redirectStart,
+            redirectEnd: this.redirectEnd,
+            fetchStart: this.fetchStart,
+            domainLookupStart: this.domainLookupStart,
+            domainLookupEnd: this.domainLookupEnd,
+            connectStart: this.connectStart,
+            connectEnd: this.connectEnd,
+            secureConnectionStart: this.secureConnectionStart,
+            requestStart: this.requestStart,
+            responseStart: this.responseStart,
+            responseEnd: this.responseEnd,
+            transferSize: this.transferSize,
+            encodedBodySize: this.encodedBodySize,
+            decodedBodySize: this.decodedBodySize
+        };
+    }
 }
 
-function convertMarkToTimestamp(mark: string | DOMHighResTimeStamp): DOMHighResTimeStamp {
-    if (typeof mark === "string") {
-        const store = getStore(performance);
-        const marks = store.marks.get(mark);
-        if (!marks?.length) throw new SyntaxError(`Mark not found: ${mark}`);
-        return marks[marks.length - 1]!.startTime;
+// ==================== PerformanceObserverEntryList ====================
+
+class PerformanceObserverEntryList {
+    #entries: globalThis.PerformanceEntry[];
+
+    constructor(entries: globalThis.PerformanceEntry[]) {
+        this.#entries = [...entries];
     }
 
-    const timestamp = Number(mark);
-    if (timestamp < 0) throw new TypeError("Timestamp cannot be negative");
-    return timestamp;
+    getEntries(): globalThis.PerformanceEntry[] {
+        return [...this.#entries].sort((a, b) => a.startTime - b.startTime);
+    }
+
+    getEntriesByType(type: PerformanceEntryType): globalThis.PerformanceEntry[] {
+        return this.#entries
+            .filter(entry => entry.entryType === type)
+            .sort((a, b) => a.startTime - b.startTime);
+    }
+
+    getEntriesByName(name: string, type?: PerformanceEntryType): globalThis.PerformanceEntry[] {
+        return this.#entries
+            .filter(entry => {
+                if (entry.name !== name) return false;
+                if (type !== undefined && entry.entryType !== type) return false;
+                return true;
+            })
+            .sort((a, b) => a.startTime - b.startTime);
+    }
 }
 
-function isMeasureOptions(obj: any): obj is PerformanceMeasureOptions {
-    return obj && typeof obj === "object" &&
-        ("start" in obj || "end" in obj || "duration" in obj);
+// ==================== PerformanceObserver ====================
+
+class PerformanceObserver {
+    #callback: PerformanceObserverCallback;
+    #observedTypes = new Set<PerformanceEntryType>();
+    #connected = false;
+    #buffered = false;
+
+    static supportedEntryTypes: PerformanceEntryType[] = [
+        'mark',
+        'measure',
+        'navigation',
+        'resource',
+        'paint',
+        'frame'
+    ];
+
+    constructor(callback: PerformanceObserverCallback) {
+        if (typeof callback !== 'function') {
+            throw new TypeError('Callback must be a function');
+        }
+        this.#callback = callback;
+    }
+
+    observe(options: PerformanceObserverInit): void {
+        if (!options || typeof options !== 'object') {
+            throw new TypeError('Options must be an object');
+        }
+
+        const { entryTypes, type, buffered } = options;
+
+        if (entryTypes && type) {
+            throw new TypeError('Cannot specify both entryTypes and type');
+        }
+
+        if (!entryTypes && !type) {
+            throw new TypeError('Must specify either entryTypes or type');
+        }
+
+        const types = entryTypes ?? (type ? [type] : []);
+
+        for (const entryType of types) {
+            if (!PerformanceObserver.supportedEntryTypes.includes(entryType)) {
+                console.warn(`Unsupported entry type: ${entryType}`);
+                continue;
+            }
+            this.#observedTypes.add(entryType);
+        }
+
+        this.#buffered = buffered ?? false;
+        this.#connected = true;
+
+        const perf = globalThis.performance as unknown as Performance;
+        perf._registerObserver(this);
+
+        if (this.#buffered) {
+            const bufferedEntries = perf._getBufferedEntries(Array.from(this.#observedTypes));
+            if (bufferedEntries.length > 0) {
+                this._notify(bufferedEntries);
+            }
+        }
+    }
+
+    disconnect(): void {
+        if (!this.#connected) return;
+
+        this.#connected = false;
+        this.#observedTypes.clear();
+
+        const perf = globalThis.performance as unknown as Performance;
+        perf._unregisterObserver(this);
+    }
+
+    takeRecords(): globalThis.PerformanceEntry[] {
+        const perf = globalThis.performance as unknown as Performance;
+        return perf._takeRecordsForObserver(this);
+    }
+
+    _notify(entries: globalThis.PerformanceEntry[]): void {
+        if (!this.#connected) return;
+
+        const filteredEntries = entries.filter(entry =>
+            // @ts-ignore string to EntryType
+            this.#observedTypes.has(entry.entryType)
+        );
+
+        if (filteredEntries.length === 0) return;
+
+        const list = new PerformanceObserverEntryList(filteredEntries);
+
+        try {
+            this.#callback(list, this);
+        } catch (error) {
+            console.error('Error in PerformanceObserver callback:', error);
+        }
+    }
+
+    _observes(type: PerformanceEntryType): boolean {
+        return this.#connected && this.#observedTypes.has(type);
+    }
 }
 
-// === Polyfill Installation ===
-export function installUserTimingPolyfill(): void {
-    if ((performance as any).userTimingPolyfill) return;
+// ==================== Performance ===================f=
 
-    // Store original methods once
-    const original = {
-        getEntriesByType: performance.getEntriesByType?.bind(performance),
-        getEntriesByName: performance.getEntriesByName?.bind(performance),
-        getEntries: performance.getEntries?.bind(performance),
+class Performance extends EventTarget implements globalThis.Performance {
+    #entries: globalThis.PerformanceEntry[] = [];
+    #marks = new Map<string, PerformanceMark>();
+    #observers = new Set<PerformanceObserver>();
+    #pendingEntries = new Map<PerformanceObserver, globalThis.PerformanceEntry[]>();
+    #timeOrigin: number;
+    #resourceTimingBufferSize: number = 250;
+    #navigationTiming: PerformanceNavigationTiming;
+
+    // Navigation Timing (deprecated but widely used)
+    readonly timing: {
+        navigationStart: number;
+        unloadEventStart: number;
+        unloadEventEnd: number;
+        redirectStart: number;
+        redirectEnd: number;
+        fetchStart: number;
+        domainLookupStart: number;
+        domainLookupEnd: number;
+        connectStart: number;
+        connectEnd: number;
+        secureConnectionStart: number;
+        requestStart: number;
+        responseStart: number;
+        responseEnd: number;
+        domLoading: number;
+        domInteractive: number;
+        domContentLoadedEventStart: number;
+        domContentLoadedEventEnd: number;
+        domComplete: number;
+        loadEventStart: number;
+        loadEventEnd: number;
     };
 
-    // Implement mark()
-    performance.mark = function (
-        markName: string,
-        markOptions?: PerformanceMarkOptions
-    ): PerformanceMark {
-        const mark = new PerformanceMark(markName, markOptions);
-        const store = getStore(this);
+    // Navigation object (deprecated)
+    readonly navigation: {
+        type: number;
+        redirectCount: number;
+    };
 
-        store.buffer.push(mark);
+    constructor() {
+        super();
+        const startTime = nativePerformanceNow();
+        this.#timeOrigin = Date.now() - startTime;
 
-        if (!store.marks.has(mark.name)) {
-            store.marks.set(mark.name, []);
+        this.#navigationTiming = new PerformanceNavigationTiming();
+        this.#entries.push(this.#navigationTiming);
+
+        this.timing = {
+            navigationStart: 0,
+            unloadEventStart: 0,
+            unloadEventEnd: 0,
+            redirectStart: 0,
+            redirectEnd: 0,
+            fetchStart: 0,
+            domainLookupStart: 0,
+            domainLookupEnd: 0,
+            connectStart: 0,
+            connectEnd: 0,
+            secureConnectionStart: 0,
+            requestStart: 0,
+            responseStart: 0,
+            responseEnd: 0,
+            domLoading: 0,
+            domInteractive: startTime,
+            domContentLoadedEventStart: startTime,
+            domContentLoadedEventEnd: startTime,
+            domComplete: startTime,
+            loadEventStart: startTime,
+            loadEventEnd: startTime
+        };
+
+        this.navigation = {
+            type: 0, // TYPE_NAVIGATE
+            redirectCount: 0
+        };
+    }
+
+    now(): number {
+        return nativePerformanceNow();
+    }
+
+    get timeOrigin(): number {
+        return this.#timeOrigin;
+    }
+
+    // ==================== User Timing API ====================
+
+    mark(markName: string, options?: PerformanceMarkOptions): PerformanceMark {
+        if (arguments.length === 0) {
+            throw new TypeError('Failed to execute \'mark\' on \'Performance\': 1 argument required, but only 0 present.');
         }
-        store.marks.get(mark.name)!.push(mark);
+
+        const name = String(markName);
+
+        // Prevent reserved names
+        if (name.startsWith('mark_')) {
+            console.warn(`Mark name "${name}" starts with reserved prefix "mark_"`);
+        }
+
+        const mark = new PerformanceMark(name, options);
+        this.#marks.set(name, mark);
+        this.#addEntry(mark);
 
         return mark;
-    };
+    }
 
-    // Implement measure()
-    performance.measure = function (
+    clearMarks(markName?: string): void {
+        if (markName !== undefined) {
+            const name = String(markName);
+            this.#marks.delete(name);
+            this.#entries = this.#entries.filter(
+                entry => !(entry.entryType === 'mark' && entry.name === name)
+            );
+        } else {
+            this.#marks.clear();
+            this.#entries = this.#entries.filter(entry => entry.entryType !== 'mark');
+        }
+    }
+
+    measure(
         measureName: string,
-        startOrMeasureOptions?: string | PerformanceMeasureOptions,
+        startOrOptions?: string | PerformanceMeasureOptions,
         endMark?: string
     ): PerformanceMeasure {
-        let startTime: DOMHighResTimeStamp;
-        let endTime: DOMHighResTimeStamp;
-        let detail: any = null;
+        if (arguments.length === 0) {
+            throw new TypeError('Failed to execute \'measure\' on \'Performance\': 1 argument required, but only 0 present.');
+        }
 
-        // Parameter validation
-        if (typeof startOrMeasureOptions === "string" && endMark !== undefined) {
-            // Legacy: measure(name, startMark, endMark)
-            startTime = convertMarkToTimestamp(startOrMeasureOptions);
-            endTime = convertMarkToTimestamp(endMark);
-        } else if (isMeasureOptions(startOrMeasureOptions)) {
-            // Modern options object
-            if (endMark !== undefined) {
-                throw new TypeError("Cannot provide both options object and endMark");
-            }
+        const name = String(measureName);
+        let startTime: number;
+        let endTime: number;
+        let detail: any;
 
-            const opts = startOrMeasureOptions;
-            detail = opts.detail;
+        if (typeof startOrOptions === 'object' && startOrOptions !== null) {
+            const options = startOrOptions;
+            detail = options.detail;
 
-            const hasStart = opts.start !== undefined;
-            const hasEnd = opts.end !== undefined;
-            const hasDuration = opts.duration !== undefined;
-
-            if (!hasStart && !hasEnd && !hasDuration) {
-                throw new TypeError("Must specify at least start, end, or duration");
-            }
-            if (hasStart && hasEnd && hasDuration) {
-                throw new TypeError("Cannot specify start, end, and duration simultaneously");
-            }
-
-            if (hasStart && hasEnd) {
-                startTime = convertMarkToTimestamp(opts.start!);
-                endTime = convertMarkToTimestamp(opts.end!);
-            } else if (hasStart && hasDuration) {
-                startTime = convertMarkToTimestamp(opts.start!);
-                endTime = startTime + Number(opts.duration);
-            } else if (hasEnd && hasDuration) {
-                endTime = convertMarkToTimestamp(opts.end!);
-                startTime = endTime - Number(opts.duration);
-            } else if (hasStart) {
-                startTime = convertMarkToTimestamp(opts.start!);
-                endTime = performance.now();
-            } else if (hasEnd) {
-                startTime = 0;
-                endTime = convertMarkToTimestamp(opts.end!);
+            if (options.start !== undefined) {
+                startTime = this.#resolveTimestamp(options.start);
             } else {
-                endTime = performance.now();
-                startTime = endTime - Number(opts.duration);
+                startTime = 0;
             }
-        } else if (typeof startOrMeasureOptions === "string") {
-            // measure(name, startMark)
-            startTime = convertMarkToTimestamp(startOrMeasureOptions);
-            endTime = performance.now();
+
+            if (options.duration !== undefined && options.end !== undefined) {
+                throw new TypeError('Cannot specify both duration and end');
+            }
+
+            if (options.duration !== undefined) {
+                const duration = Number(options.duration);
+                if (duration < 0) {
+                    throw new TypeError('Duration cannot be negative');
+                }
+                endTime = startTime + duration;
+            } else if (options.end !== undefined) {
+                endTime = this.#resolveTimestamp(options.end);
+            } else {
+                endTime = this.now();
+            }
         } else {
-            // measure(name)
-            startTime = 0;
-            endTime = performance.now();
+            startTime = startOrOptions !== undefined
+                ? this.#resolveTimestamp(startOrOptions)
+                : 0;
+
+            endTime = endMark !== undefined
+                ? this.#resolveTimestamp(endMark)
+                : this.now();
+        }
+
+        if (endTime < startTime) {
+            throw new DOMException(
+                `Failed to execute 'measure': The end time (${endTime}) is before the start time (${startTime}).`,
+                'InvalidAccessError'
+            );
         }
 
         const duration = endTime - startTime;
-        const measure = new PerformanceMeasure(measureName, startTime, duration, detail);
-
-        const store = getStore(this);
-        store.buffer.push(measure);
+        const measure = new PerformanceMeasure(name, startTime, duration, detail);
+        this.#addEntry(measure);
 
         return measure;
-    };
+    }
 
-    // Implement clearMarks()
-    performance.clearMarks = function (markName?: string): void {
-        const store = getStore(this);
-
-        if (markName === undefined) {
-            store.buffer = store.buffer.filter((e) => e.entryType !== "mark");
-            store.marks.clear();
-        } else {
-            store.buffer = store.buffer.filter(
-                (e) => !(e.entryType === "mark" && e.name === markName)
+    clearMeasures(measureName?: string): void {
+        if (measureName !== undefined) {
+            const name = String(measureName);
+            this.#entries = this.#entries.filter(
+                entry => !(entry.entryType === 'measure' && entry.name === name)
             );
-            store.marks.delete(markName);
-        }
-    };
-
-    // Implement clearMeasures()
-    performance.clearMeasures = function (measureName?: string): void {
-        const store = getStore(this);
-
-        if (measureName === undefined) {
-            store.buffer = store.buffer.filter((e) => e.entryType !== "measure");
         } else {
-            store.buffer = store.buffer.filter(
-                (e) => !(e.entryType === "measure" && e.name === measureName)
-            );
+            this.#entries = this.#entries.filter(entry => entry.entryType !== 'measure');
         }
-    };
+    }
 
-    // Override getEntriesByType()
-    performance.getEntriesByType = function <K extends PerformanceEntryType>(
-        type: K
-    ): PerformanceEntryList {
-        const store = getStore(this);
-        const ourEntries = store.buffer.filter((e) => e.entryType === type);
+    // ==================== Performance Timeline API ====================
 
-        const nativeEntries = original.getEntriesByType
-            ? original.getEntriesByType(type)
-            : [];
+    getEntries(): globalThis.PerformanceEntryList {
+        return [...this.#entries].sort((a, b) => a.startTime - b.startTime);
+    }
 
-        return [...ourEntries, ...nativeEntries] as PerformanceEntryList;
-    };
+    getEntriesByType(type: PerformanceEntryType): globalThis.PerformanceEntryList {
+        return this.#entries
+            .filter(entry => entry.entryType === type)
+            .sort((a, b) => a.startTime - b.startTime);
+    }
 
-    // Override getEntriesByName()
-    performance.getEntriesByName = function (
+    getEntriesByName(name: string, type?: PerformanceEntryType): globalThis.PerformanceEntryList {
+        return this.#entries
+            .filter(entry => {
+                if (entry.name !== name) return false;
+                if (type !== undefined && entry.entryType !== type) return false;
+                return true;
+            })
+            .sort((a, b) => a.startTime - b.startTime);
+    }
+
+    // ==================== Resource Timing API ====================
+
+    clearResourceTimings(): void {
+        this.#entries = this.#entries.filter(entry => entry.entryType !== 'resource');
+    }
+
+    setResourceTimingBufferSize(maxSize: number): void {
+        const size = Number(maxSize);
+        if (size < 0 || !Number.isInteger(size)) {
+            throw new TypeError('Buffer size must be a non-negative integer');
+        }
+        this.#resourceTimingBufferSize = size;
+        this.#trimResourceTimings();
+    }
+
+    #trimResourceTimings(): void {
+        const resourceEntries = this.#entries.filter(e => e.entryType === 'resource');
+        if (resourceEntries.length > this.#resourceTimingBufferSize) {
+            const toRemove = resourceEntries.slice(
+                0,
+                resourceEntries.length - this.#resourceTimingBufferSize
+            );
+            this.#entries = this.#entries.filter(e => !toRemove.includes(e));
+            this.dispatchEvent(new Event('resourcetimingbufferfull'));
+        }
+    }
+
+    // Public API to add resource timing
+    addResourceTiming(
         name: string,
-        type?: PerformanceEntryType
-    ): PerformanceEntryList {
-        const store = getStore(this);
-        let ourEntries = store.buffer.filter((e) => e.name === name);
-        if (type) {
-            ourEntries = ourEntries.filter((e) => e.entryType === type);
+        initiatorType: string,
+        startTime?: number,
+        duration?: number,
+        transferSize?: number
+    ): void {
+        const start = startTime ?? this.now();
+        const dur = duration ?? 0;
+        const entry = new PerformanceResourceTiming(
+            name,
+            start,
+            dur,
+            initiatorType,
+            transferSize
+        );
+        this.#addEntry(entry);
+        this.#trimResourceTimings();
+    }
+
+    // ==================== Utilities ====================
+
+    toJSON(): object {
+        return {
+            timeOrigin: this.timeOrigin,
+            timing: { ...this.timing },
+            navigation: { ...this.navigation }
+        };
+    }
+
+    #resolveTimestamp(markNameOrTimestamp: string | number): number {
+        if (typeof markNameOrTimestamp === 'number') {
+            return markNameOrTimestamp;
         }
 
-        const nativeEntries = original.getEntriesByName
-            ? original.getEntriesByName(name, type)
-            : [];
+        const name = String(markNameOrTimestamp);
 
-        return [...ourEntries, ...nativeEntries] as PerformanceEntryList;
-    };
+        // Check for navigation timing properties
+        const timingValue = this.timing[name as keyof typeof this.timing];
+        if (timingValue !== undefined) {
+            return timingValue;
+        }
 
-    // Override getEntries()
-    performance.getEntries = function (): PerformanceEntryList {
-        const store = getStore(this);
-        const nativeEntries = original.getEntries ? original.getEntries() : [];
-        return [...store.buffer, ...nativeEntries] as PerformanceEntryList;
-    };
+        // Check for marks
+        const mark = this.#marks.get(name);
+        if (!mark) {
+            throw new DOMException(
+                `Failed to execute 'measure' on 'Performance': The mark '${name}' does not exist.`,
+                'SyntaxError'
+            );
+        }
 
-    // Mark as installed
-    (performance as any).userTimingPolyfill = true;
+        return mark.startTime;
+    }
+
+    #addEntry(entry: globalThis.PerformanceEntry): void {
+        this.#entries.push(entry);
+        if (entry.entryType === 'resource') {
+            const resourceEntries = this.#entries.filter(e => e.entryType === 'resource');
+            if (resourceEntries.length >= this.#resourceTimingBufferSize) {
+                this.dispatchEvent(new Event('resourcetimingbufferfull'));
+            }
+        }
+
+        for (const observer of this.#observers) {
+            // @ts-ignore string to EntryType
+            if (observer._observes(entry.entryType)) {
+                if (!this.#pendingEntries.has(observer)) {
+                    this.#pendingEntries.set(observer, []);
+                }
+                // @ts-ignore string to EntryType
+                this.#pendingEntries.get(observer)!.push(entry);
+            }
+        }
+
+        queueMicrotask(() => this.#flushObserverNotifications());
+    }
+
+    #flushObserverNotifications(): void {
+        for (const [observer, entries] of this.#pendingEntries.entries()) {
+            if (entries.length > 0) {
+                observer._notify(entries);
+            }
+        }
+        this.#pendingEntries.clear();
+    }
+
+    // ==================== Observer Management ====================
+
+    _registerObserver(observer: PerformanceObserver): void {
+        this.#observers.add(observer);
+    }
+
+    _unregisterObserver(observer: PerformanceObserver): void {
+        this.#observers.delete(observer);
+        this.#pendingEntries.delete(observer);
+    }
+
+    _getBufferedEntries(types: PerformanceEntryType[]): globalThis.PerformanceEntry[] {
+        // @ts-ignore
+        return this.#entries.filter(entry => types.includes(entry.entryType));
+    }
+
+    _takeRecordsForObserver(observer: PerformanceObserver): globalThis.PerformanceEntry[] {
+        const entries = this.#pendingEntries.get(observer) ?? [];
+        this.#pendingEntries.delete(observer);
+        return entries;
+    }
 }
 
-// Auto-install for module consumers
-installUserTimingPolyfill();
+const performanceInstance = new Performance();
+
+// Preserve native now() function
+const originalNow = nativePerformanceNow;
+Reflect.set(performanceInstance, 'now', originalNow);
+
+// Replace global performance
+Reflect.deleteProperty(globalThis, 'performance');
+Reflect.set(globalThis, 'performance', performanceInstance);
+Reflect.set(globalThis, 'Performance', Performance);
+Reflect.set(globalThis, 'PerformanceEntry', PerformanceEntry);
+Reflect.set(globalThis, 'PerformanceMark', PerformanceMark);
+Reflect.set(globalThis, 'PerformanceMeasure', PerformanceMeasure);
+Reflect.set(globalThis, 'PerformanceObserver', PerformanceObserver);
+Reflect.set(globalThis, 'PerformanceObserverEntryList', PerformanceObserverEntryList);
+Reflect.set(globalThis, 'PerformanceNavigationTiming', PerformanceNavigationTiming);
+Reflect.set(globalThis, 'PerformanceResourceTiming', PerformanceResourceTiming);

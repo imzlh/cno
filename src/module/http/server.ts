@@ -9,6 +9,7 @@
  */
 
 import { assert } from "../../utils/assert";
+import { wrapFsClassDec as wrap } from "../../utils/wrap";
 
 const streams = import.meta.use("streams");
 const ssl = import.meta.use("ssl");
@@ -74,6 +75,11 @@ export interface HttpResponse {
      * Returns the underlying ServerConnection for direct socket access
      */
     upgrade(): ServerConnection;
+
+    /**
+     * Close connection
+     */
+    close(): void;
 }
 
 /**
@@ -382,7 +388,8 @@ export class ServerConnection {
                 writeHead: this.writeHead.bind(this),
                 write: this.writeData.bind(this),
                 end: this.endResponse.bind(this),
-                upgrade: this.upgradeConnection.bind(this)
+                upgrade: this.upgradeConnection.bind(this),
+                close: this.close.bind(this)
             };
 
             // Call user handler
@@ -503,6 +510,7 @@ export class ServerConnection {
     /**
      * Read data from socket (handles SSL if enabled)
      */
+    @wrap
     async readData(size = 16384): Promise<Uint8Array | null> {
         assert(size > 0, "invaild size");
         if (this.sslPipe) {
@@ -677,7 +685,7 @@ export class Server {
     /**
      * Start listening
      */
-    async listen(): Promise<void> {
+    listen() {
         if (this.listening) {
             throw new Error("Server already listening");
         }
@@ -699,14 +707,9 @@ export class Server {
             port: this.config.port
         });
         this.listener.listen(511);
-
         this.listening = true;
 
-        const protocol = this.sslContext ? "https" : "http";
-        console.debug(`Server listening on ${protocol}://${this.config.hostname}:${this.config.port}`);
-
-        // Start accept loop
-        this.acceptLoop();
+        console.log('Server listening on', (this.sslContext ? "https" : "http") +'://' + this.config.hostname + ':' + this.config.port);
     }
 
     private cleanup(): void {
@@ -720,10 +723,14 @@ export class Server {
     /**
      * Accept loop
      */
-    private async acceptLoop(): Promise<void> {
+    public async acceptLoop(): Promise<void> {
+        assert(!this.cleanupTimer, "already accepting requests");
         this.cleanupTimer = timers.setInterval(() => {
             this.cleanup();
         }, 30000);
+        
+        const protocol = this.sslContext ? "https" : "http";
+        console.debug(`Server listening on ${protocol}://${this.config.hostname}:${this.config.port}`);
 
         while (this.listening && this.listener) {
             try {

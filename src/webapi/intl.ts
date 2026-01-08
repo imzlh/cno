@@ -1,6 +1,5 @@
 // complete-intl.ts
 
-type LocaleCode = 'zh' | 'zh-CN' | 'zh-TW' | 'zh-HK' | 'en' | 'en-US' | 'en-GB';
 type CurrencyCode = 'USD' | 'EUR' | 'GBP' | 'CNY' | 'JPY' | 'KRW' | 'TWD' | 'HKD';
 type TimeUnit = 'second' | 'minute' | 'hour' | 'day' | 'week' | 'month' | 'year';
 

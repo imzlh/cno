@@ -3,8 +3,11 @@ const asfs = import.meta.use("asyncfs");
 const engine = import.meta.use("engine");
 const fswatch = import.meta.use("fswatch");
 const os = import.meta.use("os");
+const error = import.meta.use("error");
 
+import { assert } from "../utils/assert";
 import { join } from "../utils/path";
+import { wrapFSns } from "../utils/wrap";
 import { errors } from "./01_errors";
 
 export const toString = (e: URL | string) => e instanceof URL ? e.pathname : e;
@@ -107,13 +110,13 @@ async function mkdirRecursive(fullPath: string, mode?: number): Promise<void> {
 function mkdirRecursiveSync(fullPath: string, mode?: number): void {
     // Normalize path: convert backslashes to forward slashes
     const normalizedPath = fullPath.replace(/\\/g, '/');
-    
+
     // Split path into components
     const parts = normalizedPath.split('/').filter(part => part !== '' && part !== '.');
-    
+
     // Build path progressively
     let currentPath = '';
-    
+
     for (const part of parts) {
         // Handle root paths
         if (currentPath === '') {
@@ -144,7 +147,7 @@ function mkdirRecursiveSync(fullPath: string, mode?: number): void {
         } else {
             currentPath = currentPath + '/' + part;
         }
-        
+
         try {
             if (!fs.stat(currentPath).isDirectory)
                 throw -1;
@@ -162,7 +165,7 @@ function mkdirRecursiveSync(fullPath: string, mode?: number): void {
 function removeRecursiveSync(targetPath: string): void {
     try {
         const stats = fs.stat(targetPath);
-        
+
         if (stats.isDirectory) {
             const items = fs.readdir(targetPath);
             for (const item of items) {
@@ -180,11 +183,11 @@ function removeRecursiveSync(targetPath: string): void {
 async function removeRecursive(targetPath: string): Promise<void> {
     try {
         const stats = await asfs.stat(targetPath);
-        
+
         if (stats.isDirectory) {
             // Open directory for reading contents
             const dirHandle = await asfs.readDir(targetPath);
-            
+
             try {
                 // Read and delete all directory contents
                 for await (const entry of dirHandle) {
@@ -194,7 +197,7 @@ async function removeRecursive(targetPath: string): Promise<void> {
             } finally {
                 await dirHandle.close();
             }
-            
+
             // Delete empty directory
             await CModuleAsyncFS.rmdir(targetPath);
         } else {
@@ -341,7 +344,7 @@ function watchToIterator(path: string): AsyncIterableIterator<Deno.FsEvent> & { 
     return iterator;
 }
 
-Object.assign(Deno, {
+Object.assign(Deno, wrapFSns({
     // @ts-ignore not SharedArrayBuffer
     readFile(path, opt) {
         return asfs.readFile(toString(path));
@@ -425,7 +428,7 @@ Object.assign(Deno, {
     removeSync(path, opt) {
         const pathStr = toString(path);
         const recursive = opt?.recursive ?? false;
-        
+
         if (!recursive) {
             // Try both unlink and rmdir without checking file type first
             try {
@@ -440,22 +443,22 @@ Object.assign(Deno, {
             }
             return;
         }
-        
+
         removeRecursiveSync(pathStr);
     },
 
     async remove(path, opt) {
         const pathStr = toString(path);
         const recursive = opt?.recursive ?? false;
-        
+
         if (!recursive) {
-            if((await asfs.stat(pathStr)).isDirectory)
+            if ((await asfs.stat(pathStr)).isDirectory)
                 asfs.rmdir(pathStr);
             else
                 asfs.unlink(pathStr);
             return;
         }
-        
+
         // Recursive: delete directory tree recursively
         await removeRecursive(pathStr);
     },
@@ -468,11 +471,11 @@ Object.assign(Deno, {
         return asfs.rename(toString(oldPath), toString(newPath));
     },
 
-    copyFile(from, to){
+    copyFile(from, to) {
         return asfs.copyFile(toString(from), toString(to));
     },
 
-    copyFileSync(from, to){
+    copyFileSync(from, to) {
         return fs.copy(toString(from), toString(to));
     },
 
@@ -502,13 +505,13 @@ Object.assign(Deno, {
         return denoWriteAnyFile(path, data, options);
     },
 
-    async truncate(name, len){
+    async truncate(name, len) {
         const file = await asfs.open(toString(name), "r+");
         file.truncate(len);
         await file.close();
     },
 
-    truncateSync(name, len){
+    truncateSync(name, len) {
         fs.truncate(toString(name), len ?? 0);
     },
 
@@ -529,12 +532,12 @@ Object.assign(Deno, {
     mkdirSync(path, opt) {
         const pathStr = toString(path);
         const recursive = opt?.recursive ?? false;
-        
+
         if (!recursive) {
             // Non-recursive mode: create single directory
             return fs.mkdir(pathStr, opt?.mode);
         }
-        
+
         // Recursive mode: create directory tree
         mkdirRecursiveSync(pathStr, opt?.mode);
     },
@@ -546,27 +549,27 @@ Object.assign(Deno, {
         return tmp;
     },
 
-    makeTempDirSync(opt){
+    makeTempDirSync(opt) {
         const rand = Math.floor(Math.random() * 1e9).toString(36);
         const tmp = join(opt?.dir ?? os.tmpdir, opt?.prefix ?? 'deno', opt?.suffix ?? rand);
         mkdirRecursiveSync(tmp, 755);
         return tmp;
     },
 
-    chmod(path, mode){
+    chmod(path, mode) {
         return asfs.chmod(toString(path), mode);
     },
 
-    chmodSync(path, mode){
+    chmodSync(path, mode) {
         return fs.chmod(toString(path), mode);
     },
 
-    chown(path, uid, gid){
+    chown(path, uid, gid) {
         const info = os.userInfo;
         return asfs.chown(toString(path), uid ?? info.userId, gid ?? info.groupId);
     },
 
-    chownSync(path, uid, gid){
+    chownSync(path, uid, gid) {
         return fs.chown(toString(path), uid ?? os.userInfo.userId, gid ?? os.userInfo.groupId);
     },
 
@@ -580,7 +583,7 @@ Object.assign(Deno, {
         return toDenoStat(st);
     },
 
-    async makeTempFile(opt){
+    async makeTempFile(opt) {
         const randomValue = Math.floor(Math.random() * 1e9).toString(36);
         const path = join(opt?.dir ?? os.tmpdir, opt?.prefix ?? 'cno', opt?.suffix ?? 'cno-')
             + randomValue;
@@ -588,7 +591,7 @@ Object.assign(Deno, {
         return path;
     },
 
-    makeTempFileSync(opt){
+    makeTempFileSync(opt) {
         const randomValue = Math.floor(Math.random() * 1e9).toString(36);
         const path = join(opt?.dir ?? os.tmpdir, opt?.prefix ?? 'cno', opt?.suffix ?? 'cno-')
             + randomValue;
@@ -704,4 +707,4 @@ Object.assign(Deno, {
         return iterator;
     }
 
-} satisfies Partial<typeof Deno>);
+}));

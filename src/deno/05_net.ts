@@ -1,4 +1,5 @@
 import { malloc } from "../utils/malloc";
+import { wrapFsClassDec as wrap, wrapFSErr, wrapFSns } from "../utils/wrap";
 
 const os = import.meta.use('os');
 const dns = import.meta.use('dns');
@@ -16,7 +17,7 @@ export const useWritable = (pipe: CModuleStreams.Stream) => new WritableStream({
                 written += n;
             }
         } catch (e) {
-            control.error(e);
+            control.error(wrapFSErr(e as any));
         }
     }
 });
@@ -32,7 +33,7 @@ export const useReadable = (pipe: CModuleStreams.Stream) => new ReadableStream({
                 controller.enqueue(buf.subarray(0, n));
             }
         } catch (e) {
-            controller.error(e);
+            controller.error(wrapFSErr(e as any));
         }
     }
 });
@@ -50,18 +51,22 @@ class Conn<T extends Deno.Addr = Deno.Addr> implements Deno.Conn<T> {
         this.$writable = useWritable(pipe);
     }
 
+    @wrap
     async read(p: Uint8Array): Promise<number | null> {
         return this.pipe.read(p);
     }
 
+    @wrap
     write(p: Uint8Array): Promise<number> {
         return this.pipe.write(p);
     }
 
+    @wrap
     close(): void {
         this.pipe.close();
     }
 
+    @wrap
     closeWrite(): Promise<void> {
         return this.pipe.shutdown();
     }
@@ -82,6 +87,7 @@ class Conn<T extends Deno.Addr = Deno.Addr> implements Deno.Conn<T> {
         return this.$writable;
     }
 
+    @wrap
     [Symbol.dispose]() {
         return this.pipe.close();
     }
@@ -104,10 +110,12 @@ class TcpConn extends Conn<Deno.NetAddr> implements Deno.TcpConn {
         super(pipe, addrinfo2deno(pipe.getsockname()), addrinfo2deno(pipe.getpeername()));
     }
 
+    @wrap
     setNoDelay(noDelay?: boolean): void {
         (this.pipe as CModuleStreams.TCP).setNoDelay(noDelay ?? false);
     }
 
+    @wrap
     setKeepAlive(keepAlive?: boolean): void {
         // TODO: 60 seconds is hardcoded
         (this.pipe as CModuleStreams.TCP).setKeepAlive(!!keepAlive, 60);
@@ -135,7 +143,7 @@ class TlsConn implements Deno.TlsConn {
                         controller.enqueue(buf);
                     }
                 } catch (e) {
-                    controller.error(e);
+                    controller.error(wrapFSErr(e as any));
                 }
             }
         });
@@ -149,7 +157,7 @@ class TlsConn implements Deno.TlsConn {
                         await this.output();
                     }
                 } catch (e) {
-                    control.error(e);
+                    control.error(wrapFSErr(e as any));
                 }
             }
         });
@@ -157,6 +165,7 @@ class TlsConn implements Deno.TlsConn {
         this.remoteAddr = addrinfo2deno(this.$rawPipe.getpeername());
     }
 
+    @wrap
     private async output() {
         const obuf = this.$pipe.getOutput();
         if (!obuf || obuf.byteLength === 0) return;
@@ -176,6 +185,7 @@ class TlsConn implements Deno.TlsConn {
         return this.$writable;
     }
 
+    @wrap
     async close(): Promise<void> {
         return this.$rawPipe.close();
     }
@@ -192,6 +202,7 @@ class TlsConn implements Deno.TlsConn {
         // TODO
     }
 
+    @wrap
     async read(p: Uint8Array): Promise<number | null> {
         const buf = this.$pipe.read(p.byteLength);
         if (buf === null) return null;
@@ -199,16 +210,19 @@ class TlsConn implements Deno.TlsConn {
         return buf.byteLength;
     }
 
+    @wrap
     async write(p: Uint8Array): Promise<number> {
         const r = this.$pipe.write(p);
         await this.output();
         return r;
     }
 
+    @wrap
     closeWrite(): Promise<void> {
         return this.$rawPipe.shutdown();
     }
 
+    @wrap
     [Symbol.dispose]() {
         this.$rawPipe.close();
     }
@@ -228,10 +242,9 @@ class Listener implements Deno.Listener {
         protected $pipe: CModuleStreams.Stream,
         protected $isTCP: boolean,
         protected $addr: Deno.Addr
-    ) {
+    ) {}
 
-    }
-
+    @wrap
     async accept(): Promise<Deno.Conn<Deno.Addr>> {
         const conn = await this.$pipe.accept();
         return this.$isTCP
@@ -255,6 +268,7 @@ class Listener implements Deno.Listener {
         return this.$addr;
     }
 
+    @wrap
     async *[Symbol.asyncIterator]() {
         while (true) {
             const conn = await this.accept();
@@ -262,6 +276,7 @@ class Listener implements Deno.Listener {
         }
     }
 
+    @wrap
     [Symbol.dispose]() {
         return this.close();
     }
@@ -277,10 +292,10 @@ function toConn(sslpipe: CModuleSSL.Pipe, pipe: CModuleStreams.TCP): Deno.TlsCon
             const n = await pipe.read(buf);
             if (n === null) break;
             sslpipe.feed(buf.subarray(0, n));
-            if (!handshake && sslpipe.doHandshake()) {
+            if (!handshake && sslpipe.handshake()) {
                 handshake = true;
                 hsProm.resolve({
-                    alpnProtocol: sslpipe.getALPNProtocol()
+                    alpnProtocol: sslpipe.alpnProtocol()
                 });
             }
         }
@@ -295,10 +310,12 @@ class TcpListener extends Listener implements Deno.TcpListener {
         return this.$addr as Deno.NetAddr;
     }
 
+    @wrap
     accept(): Promise<Deno.TcpConn> {
         return super.accept() as Promise<Deno.TcpConn>;
     }
 
+    @wrap
     async*[Symbol.asyncIterator]() {
         while (true) {
             const conn = await this.accept();
@@ -312,6 +329,7 @@ class TlsListener extends Listener implements Deno.TlsListener {
         super(pipe, true, addr);
     }
 
+    @wrap
     async accept(): Promise<Deno.TlsConn> {
         const conn = await this.$pipe.accept();
 
@@ -322,6 +340,7 @@ class TlsListener extends Listener implements Deno.TlsListener {
         return toConn(sslpipe, conn as CModuleStreams.TCP);
     }
 
+    @wrap
     async* [Symbol.asyncIterator](){
         while (true) {
             const conn = await this.accept();
@@ -334,7 +353,7 @@ class TlsListener extends Listener implements Deno.TlsListener {
     }
 }
 
-Object.assign(Deno, {
+Object.assign(Deno, wrapFSns({
     networkInterfaces() {
         const intf = os.networkInterfaces();
         return intf.map(i => ({
@@ -516,4 +535,4 @@ Object.assign(Deno, {
         });
         return toConn(sslpipe, pipe);
     }
-} satisfies Partial<typeof Deno>);
+}));

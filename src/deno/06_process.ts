@@ -1,12 +1,12 @@
 import { assert } from "../utils/assert";
 import { malloc } from "../utils/malloc";
+import { wrapFsClassDec as wrap, wrapFSns } from "../utils/wrap";
 import { toString } from "./02_fs";
-import { Stream } from "./04_stdio";
 import { useWritable } from "./05_net";
 
 const os = import.meta.use('os');
 const proc = import.meta.use('process');
-const signal = import.meta.use('signal');
+const signal = import.meta.use('signals');
 const text = import.meta.use('text');
 const pty = import.meta.use('pty');
 const engine = import.meta.use('engine');
@@ -30,6 +30,7 @@ class RStream extends ReadableStream<Uint8Array<ArrayBuffer>> implements Deno.Su
         });
     }
 
+    @wrap
     private async readAll(){
         const bufs = [] as Uint8Array[];
         const reader = this.getReader();
@@ -86,6 +87,7 @@ class Process implements Deno.ChildProcess {
         }));
     }
 
+    @wrap
     output(): Promise<Deno.CommandOutput> {
         return this.$wait.then(async f => ({
             code: f.exit_status,
@@ -97,6 +99,7 @@ class Process implements Deno.ChildProcess {
         }));
     }
 
+    @wrap
     kill(signo?: Deno.Signal): void {
         assert(signo == 'SIGEMT', "Not implemented");
         // @ts-ignore
@@ -123,11 +126,13 @@ class Process implements Deno.ChildProcess {
         return this.$stderr;
     }
 
+    @wrap
     async [Symbol.asyncDispose](){
         this.kill();
         await this.status;
     }
 
+    @wrap
     resize(cols: number, rows: number): Promise<void> {
         const stdin = this.$proc.stdin?.fileno();
         assert(stdin, "stdin is not piped");
@@ -154,6 +159,7 @@ class Command implements Deno.Command {
         this.detached = options?.detached ?? false;
     }
 
+    @wrap
     async output(): Promise<Deno.CommandOutput> {
         assert(!this.detached, "Detached process cannot be waited");
         assert(this.proc.stdout && this.proc.stderr, "stdout and stderr are not piped");
@@ -171,6 +177,7 @@ class Command implements Deno.Command {
         };
     }
 
+    @wrap
     outputSync(): Deno.CommandOutput {
         assert(!this.detached, "Detached process cannot be waited");
         
@@ -186,6 +193,7 @@ class Command implements Deno.Command {
         };
     }
 
+    @wrap
     spawn(): Deno.ChildProcess {
         if (this.detached)
             throw new TypeError("Detached process cannot be spawned");
@@ -193,10 +201,10 @@ class Command implements Deno.Command {
     }
 }
 
-Object.assign(Deno, {
+Object.assign(Deno, wrapFSns({
     Command,
 
-    kill(pid: number, signo: Deno.Signal): void {
+    kill(pid: number, signo?: Deno.Signal): void {
         assert(signo != 'SIGEMT', "Not implemented");
         // @ts-ignore
         proc.kill(pid, signo);
@@ -205,4 +213,4 @@ Object.assign(Deno, {
     umask(mask?: number): number {
         return 0;   // not implemented
     },
-} as Partial<typeof Deno>);
+}));

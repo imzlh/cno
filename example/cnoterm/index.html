@@ -1,990 +1,391 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
-
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
     <title>Terminal</title>
     <meta name="theme-color" content="#1c1c1c">
     <link rel="manifest" href="manifest.json">
     <link rel="icon" href="favicon.ico">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css">
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
-        :root {
-            --bg-primary: #0c0c0c;
-            --bg-secondary: #1c1c1c;
-            --bg-tertiary: #2d2d2d;
-            --text-primary: #e5e5e5;
-            --text-secondary: #a0a0a0;
-            --accent: #60cdff;
-            --accent-hover: #4fb3e6;
-            --border: rgba(255, 255, 255, 0.08);
-            --overlay: rgba(28, 28, 28, 0.95);
-            --close-hover: #c42b1c;
-            --tab-hover: rgba(255, 255, 255, 0.06);
-            --tab-active: rgba(255, 255, 255, 0.09);
-        }
-
-        body {
-            font-family: 'Segoe UI Variable', 'Segoe UI', system-ui, -apple-system, sans-serif;
-            background: var(--bg-primary);
-            color: var(--text-primary);
-            height: 100vh;
-            overflow: hidden;
-            display: flex;
-            flex-direction: column;
-        }
-
-        /* Title Bar - Windows 11 Style */
-        .title-bar {
-            height: 40px;
-            background: var(--bg-secondary);
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            -webkit-app-region: drag;
-            user-select: none;
-            border-bottom: 1px solid var(--border);
-        }
-
-        .title-bar-drag-region {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            padding: 0 16px;
-        }
-
-        .title-bar-icon {
-            width: 18px;
-            height: 18px;
-        }
-
-        .title-bar-title {
-            font-size: 12px;
-            font-weight: 400;
-            color: var(--text-primary);
-        }
-
-        .title-bar-controls {
-            display: flex;
-            height: 100%;
-            -webkit-app-region: no-drag;
-            padding-right: env(titlebar-area-width, calc(100% - env(titlebar-area-x, 100%)));
-            min-height: env(titlebar-area-height, auto);
-        }
-
-        .title-bar-divider {
-            width: 1px;
-            height: 16px;
-            background: var(--border);
-            align-self: center;
-            margin: 0 4px;
-        }
-
-        .title-bar-button {
-            width: 46px;
-            height: 100%;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            background: transparent;
-            border: none;
-            color: var(--text-primary);
-            cursor: pointer;
-            transition: background-color 0.1s ease;
-        }
-
-        .title-bar-button:hover {
-            background: var(--tab-hover);
-        }
-
-        .title-bar-button.close-btn:hover {
-            background: var(--close-hover);
-            color: white;
-        }
-
-        /* Tab Bar - Windows 11 Style */
-        .tab-bar {
-            height: 42px;
-            background: var(--bg-secondary);
-            display: flex;
-            align-items: flex-end;
-            border-bottom: 1px solid var(--border);
-            padding: 0 8px;
-            flex: 1;
-        }
-
-        .tab-list {
-            display: flex;
-            gap: 4px;
-            flex: 1;
-            overflow-x: auto;
-            overflow-y: hidden;
-            scrollbar-width: none;
-        }
-
-        .tab-list::-webkit-scrollbar {
-            display: none;
-        }
-
-        .tab {
-            height: 36px;
-            min-width: 120px;
-            max-width: 240px;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            padding: 0 12px;
-            background: transparent;
-            border: none;
-            border-radius: 6px 6px 0 0;
-            color: var(--text-secondary);
-            font-size: 13px;
-            cursor: pointer;
-            transition: all 0.1s ease;
-            position: relative;
-            user-select: none;
-        }
-
-        .tab:hover {
-            background: var(--tab-hover);
-            color: var(--text-primary);
-        }
-
-        .tab.active {
-            background: var(--bg-primary);
-            color: var(--text-primary);
-        }
-
-        .tab.active::after {
-            content: '';
-            position: absolute;
-            bottom: 0;
-            left: 8px;
-            right: 8px;
-            height: 2px;
-            background: var(--accent);
-            border-radius: 2px 2px 0 0;
-        }
-
-        .tab-icon {
-            font-size: 14px;
-            flex-shrink: 0;
-        }
-
-        .tab-title {
-            flex: 1;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            white-space: nowrap;
-        }
-
-        .tab-close {
-            width: 20px;
-            height: 20px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            border-radius: 4px;
-            opacity: 0;
-            transition: all 0.1s ease;
-            flex-shrink: 0;
-        }
-
-        .tab:hover .tab-close {
-            opacity: 1;
-        }
-
-        .tab-close:hover {
-            background: var(--tab-hover);
-        }
-
-        .tab-actions {
-            display: flex;
-            align-items: center;
-            padding: 0 4px;
-        }
-
-        .tab-action-btn {
-            width: 32px;
-            height: 32px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            background: transparent;
-            border: none;
-            border-radius: 4px;
-            color: var(--text-secondary);
-            cursor: pointer;
-            transition: all 0.1s ease;
-        }
-
-        .tab-action-btn:hover {
-            background: var(--tab-hover);
-            color: var(--text-primary);
-        }
-
-        /* Terminal Container */
-        .terminal-container {
-            flex: 1;
-            display: flex;
-            overflow: hidden;
-            position: relative;
-        }
-
-        .terminal-pane {
-            flex: 1;
-            display: flex;
-            flex-direction: column;
-            overflow: hidden;
-            position: relative;
-        }
-
-        .terminal-wrapper {
-            flex: 1;
-            padding: 8px;
-            overflow: hidden;
-        }
-
-        .pane-divider {
-            width: 4px;
-            background: var(--bg-secondary);
-            cursor: col-resize;
-            position: relative;
-        }
-
-        .pane-divider:hover {
-            background: var(--accent);
-        }
-
-        .pane-divider.vertical {
-            width: 100%;
-            height: 4px;
-            cursor: row-resize;
-        }
-
-        /* XTerm Styles */
-        .xterm {
-            height: 100%;
-            padding: 0;
-        }
-
-        .xterm-viewport {
-            background-color: transparent !important;
-        }
-
-        .xterm-screen {
-            background-color: transparent !important;
-        }
-
-        /* Context Menu - Windows 11 Style */
-        .context-menu {
-            position: fixed;
-            min-width: 240px;
-            background: var(--overlay);
-            backdrop-filter: blur(40px);
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            padding: 4px;
-            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
-            z-index: 1000;
-            display: none;
-        }
-
-        .context-menu-item {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding: 8px 12px;
-            border-radius: 4px;
-            font-size: 13px;
-            cursor: pointer;
-            transition: background 0.1s ease;
-        }
-
-        .context-menu-item:hover {
-            background: var(--tab-hover);
-        }
-
-        .context-menu-item .shortcut {
-            font-size: 11px;
-            color: var(--text-secondary);
-            margin-left: 24px;
-        }
-
-        .context-menu-divider {
-            height: 1px;
-            background: var(--border);
-            margin: 4px 0;
-        }
-
-        /* Command Palette - Windows 11 Style */
-        .command-palette {
-            position: fixed;
-            top: 80px;
-            left: 50%;
-            transform: translateX(-50%);
-            width: 600px;
-            max-width: 90vw;
-            background: var(--overlay);
-            backdrop-filter: blur(40px);
-            border: 1px solid var(--border);
-            border-radius: 12px;
-            box-shadow: 0 16px 48px rgba(0, 0, 0, 0.6);
-            z-index: 2000;
-            display: none;
-            overflow: hidden;
-        }
-
-        .command-palette-input-wrapper {
-            display: flex;
-            align-items: center;
-            padding: 16px;
-            border-bottom: 1px solid var(--border);
-        }
-
-        .command-palette-icon {
-            color: var(--text-secondary);
-            margin-right: 12px;
-        }
-
-        .command-palette-input {
-            flex: 1;
-            background: transparent;
-            border: none;
-            outline: none;
-            font-size: 15px;
-            color: var(--text-primary);
-            font-family: inherit;
-        }
-
-        .command-palette-list {
-            max-height: 400px;
-            overflow-y: auto;
-        }
-
-        .command-item {
-            display: flex;
-            align-items: center;
-            padding: 12px 16px;
-            cursor: pointer;
-            transition: background 0.1s ease;
-        }
-
-        .command-item:hover,
-        .command-item.selected {
-            background: var(--tab-active);
-        }
-
-        .command-item-icon {
-            width: 32px;
-            height: 32px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            margin-right: 12px;
-            border-radius: 6px;
-            background: var(--bg-tertiary);
-            font-size: 16px;
-        }
-
-        .command-item-text {
-            flex: 1;
-        }
-
-        .command-item-title {
-            font-size: 13px;
-            color: var(--text-primary);
-            margin-bottom: 2px;
-        }
-
-        .command-item-description {
-            font-size: 11px;
-            color: var(--text-secondary);
-        }
-
-        .command-item-shortcut {
-            font-size: 11px;
-            color: var(--text-secondary);
-        }
-
-        /* Scrollbar Styling */
-        ::-webkit-scrollbar {
-            width: 12px;
-            height: 12px;
-        }
-
-        ::-webkit-scrollbar-track {
-            background: transparent;
-        }
-
-        ::-webkit-scrollbar-thumb {
-            background: var(--bg-tertiary);
-            border-radius: 6px;
-            border: 3px solid var(--bg-primary);
-        }
-
-        ::-webkit-scrollbar-thumb:hover {
-            background: #3d3d3d;
-        }
-
-        /* Focus Styles */
-        /* .terminal-pane.focused {
-            outline: 2px solid var(--accent);
-            outline-offset: -2px;
-        } */
-    </style>
+    <link rel="stylesheet" href="styles.css">
 </head>
-
-<body>
+<body data-theme="dark">
     <!-- Title Bar -->
-    <div class="title-bar" id="title-bar">
-        <div class="title-bar-drag-region">
-            <img class="title-bar-icon" src="favicon.ico">
-        </div>
-
-        <div class="tab-bar" id="tab-bar">
-            <div class="tab-list" id="tab-list"></div>
-            <div class="tab-actions">
-                <button class="tab-action-btn" id="dropdown-btn" title="更多选项">
-                    <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
-                        <path d="M8 10.5l-4-4h8l-4 4z" />
+    <div class="title-bar">
+        <div class="title-bar-start">
+            <img class="title-bar-icon" src="favicon.ico" alt="Terminal">
+            <div class="tab-bar">
+                <div class="tab-list" id="tab-list"></div>
+                <button class="new-tab-btn" id="new-tab-btn" title="新建标签页">
+                    <svg viewBox="0 0 16 16" fill="currentColor">
+                        <path d="M8 3.5v9m-4.5-4.5h9" stroke="currentColor" stroke-width="1.5" fill="none"/>
                     </svg>
                 </button>
             </div>
         </div>
-
-        <div class="title-bar-controls">
-            <button class="title-bar-button" id="new-tab-btn" title="新建标签页">
-                <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
-                    <path d="M6.5 1.5v4h4v1h-4v4h-1v-4h-4v-1h4v-4h1z" />
+        <div class="title-bar-end">
+            <button class="title-btn" id="search-btn" title="搜索">
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+                    <path d="M11.5 2a4.5 4.5 0 11-3.163 7.663L3.5 14.5l-.707-.707 4.837-4.837A4.5 4.5 0 0111.5 2zm0 1a3.5 3.5 0 100 7 3.5 3.5 0 000-7z"/>
                 </svg>
             </button>
-            <div class="title-bar-divider"></div>
+            <button class="title-btn" id="split-btn" title="拆分窗格">
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+                    <rect x="2" y="2" width="5" height="12" rx="1"/>
+                    <rect x="9" y="2" width="5" height="12" rx="1"/>
+                </svg>
+            </button>
+            <button class="title-btn" id="theme-btn" title="切换主题">
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+                    <path d="M8 1a7 7 0 100 14A7 7 0 008 1zm0 1v12a6 6 0 010-12z"/>
+                </svg>
+            </button>
+            <button class="title-btn" id="help-btn" title="快捷键">
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+                    <path d="M8 1a7 7 0 100 14A7 7 0 008 1zm0 1a6 6 0 110 12A6 6 0 018 2zm0 2.5a1.5 1.5 0 00-1.5 1.5c0 .8.7 1.5 1.5 1.5s1.5-.7 1.5-1.5S8.8 4.5 8 4.5zm0 4c-.8 0-1.5.7-1.5 1.5v2c0 .8.7 1.5 1.5 1.5s1.5-.7 1.5-1.5v-2c0-.8-.7-1.5-1.5-1.5z"/>
+                </svg>
+            </button>
+            <button class="title-btn" id="settings-btn" title="设置">
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+                    <path d="M8 10.5a2.5 2.5 0 100-5 2.5 2.5 0 000 5zM14 8c0-.3 0-.6-.1-.8l1.3-1c.2-.1.2-.4.1-.6l-1.2-2c-.1-.2-.3-.3-.5-.2l-1.5.6c-.4-.3-.8-.5-1.2-.7l-.3-1.6c0-.2-.2-.4-.5-.4h-2.4c-.2 0-.4.2-.5.4l-.3 1.6c-.5.2-.9.4-1.2.7l-1.5-.6c-.2-.1-.4 0-.5.2l-1.2 2c-.1.2-.1.4.1.6l1.3 1c-.1.3-.1.5-.1.8s0 .6.1.8l-1.3 1c-.2.1-.2.4-.1.6l1.2 2c.1.2.3.3.5.2l1.5-.6c.4.3.8.5 1.2.7l.3 1.6c0 .2.2.4.5.4h2.4c.2 0 .4-.2.5-.4l.3-1.6c.5-.2.9-.4 1.2-.7l1.5.6c.2.1.4 0 .5-.2l1.2-2c.1-.2.1-.4-.1-.6l-1.3-1c.1-.2.1-.5.1-.8z"/>
+                </svg>
+            </button>
         </div>
     </div>
 
     <!-- Terminal Container -->
     <div class="terminal-container" id="terminal-container"></div>
 
-    <!-- Command Palette -->
-    <div class="command-palette" id="command-palette">
-        <div class="command-palette-input-wrapper">
-            <svg class="command-palette-icon" width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
-                <path
-                    d="M11.5 2a4.5 4.5 0 11-3.163 7.663L3.5 14.5l-.707-.707 4.837-4.837A4.5 4.5 0 0111.5 2zm0 1a3.5 3.5 0 100 7 3.5 3.5 0 000-7z" />
-            </svg>
-            <input type="text" class="command-palette-input" id="command-palette-input" placeholder="输入命令...">
+    <!-- Search Panel -->
+    <div class="search-panel" id="search-panel">
+        <div class="search-header">
+            <input type="text" class="search-input" id="search-input" placeholder="搜索...">
+            <div class="search-controls">
+                <button class="search-btn" id="search-prev" title="上一个">
+                    <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
+                        <path d="M6 2l-4 4 4 4" stroke="currentColor" stroke-width="1.5" fill="none"/>
+                    </svg>
+                </button>
+                <button class="search-btn" id="search-next" title="下一个">
+                    <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
+                        <path d="M6 2l4 4-4 4" stroke="currentColor" stroke-width="1.5" fill="none"/>
+                    </svg>
+                </button>
+                <span class="search-count" id="search-count">0/0</span>
+                <button class="search-btn" id="close-search" title="关闭">
+                    <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
+                        <path d="M3 3l6 6m0-6l-6 6" stroke="currentColor" stroke-width="1.5" fill="none"/>
+                    </svg>
+                </button>
+            </div>
         </div>
-        <div class="command-palette-list" id="command-palette-list"></div>
+        <div class="search-options">
+            <label><input type="checkbox" id="search-case"> 区分大小写</label>
+            <label><input type="checkbox" id="search-regex"> 正则表达式</label>
+            <label><input type="checkbox" id="search-whole"> 全字匹配</label>
+        </div>
+    </div>
+
+    <!-- Status Bar -->
+    <div class="status-bar" id="status-bar">
+        <div class="status-left">
+            <span class="status-item" id="connection-status">
+                <span class="status-dot"></span>
+                <span>未连接</span>
+            </span>
+            <span class="status-item" id="terminal-info">80×24</span>
+        </div>
+        <div class="status-right">
+            <span class="status-item" id="encoding-info">UTF-8</span>
+            <button class="status-btn" id="fullscreen-btn" title="全屏">
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+                    <path d="M2 2v4h1V3h3V2H2zm9 0v1h3v3h1V2h-4zM2 10v4h4v-1H3v-3H2zm12 0v3h-3v1h4v-4h-1z"/>
+                </svg>
+            </button>
+        </div>
+    </div>
+
+    <!-- Mobile Keyboard Toolbar -->
+    <div class="mobile-toolbar" id="mobile-toolbar">
+        <div class="toolbar-input-container">
+            <input type="text" class="toolbar-input" id="toolbar-input" placeholder="在此输入文本..." autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+            <button class="toolbar-btn" id="toolbar-send-btn" title="发送">发送</button>
+        </div>
+        <div class="toolbar-scroll">
+            <button class="toolbar-btn" data-key="Escape">ESC</button>
+            <button class="toolbar-btn" data-key="Tab">TAB</button>
+            <button class="toolbar-btn modifier" data-key="Control">CTRL</button>
+            <button class="toolbar-btn modifier" data-key="Alt">ALT</button>
+            <button class="toolbar-btn" data-key="ArrowUp">↑</button>
+            <button class="toolbar-btn" data-key="ArrowDown">↓</button>
+            <button class="toolbar-btn" data-key="ArrowLeft">←</button>
+            <button class="toolbar-btn" data-key="ArrowRight">→</button>
+            <button class="toolbar-btn" data-char="~">~</button>
+            <button class="toolbar-btn" data-char="|">|</button>
+            <button class="toolbar-btn" data-char="/">/ </button>
+            <button class="toolbar-btn" data-char="-">-</button>
+            <button class="toolbar-btn" data-action="paste">粘贴</button>
+        </div>
+    </div>
+
+    <!-- 快捷键帮助对话框 -->
+    <div id="shortcuts-dialog" class="dialog">
+        <div class="dialog-content">
+            <div class="dialog-header">
+                <h3>快捷键</h3>
+                <button class="dialog-close">&times;</button>
+            </div>
+            <div class="dialog-body">
+                <div class="shortcuts-section">
+                    <h4>终端控制</h4>
+                    <div class="shortcut-item">
+                        <span>中断进程</span>
+                        <span>Ctrl+C</span>
+                    </div>
+                    <div class="shortcut-item">
+                        <span>清屏</span>
+                        <span>Ctrl+L</span>
+                    </div>
+                    <div class="shortcut-item">
+                        <span>刷新终端</span>
+                        <span>F5</span>
+                    </div>
+                    <div class="shortcut-item">
+                        <span>重置终端</span>
+                        <span>Ctrl+Shift+R</span>
+                    </div>
+                </div>
+                
+                <div class="shortcuts-section">
+                    <h4>编辑操作</h4>
+                    <div class="shortcut-item">
+                        <span>复制</span>
+                        <span>Ctrl+Shift+C</span>
+                    </div>
+                    <div class="shortcut-item">
+                        <span>粘贴</span>
+                        <span>Ctrl+Shift+V</span>
+                    </div>
+                    <div class="shortcut-item">
+                        <span>全选</span>
+                        <span>Ctrl+Shift+A</span>
+                    </div>
+                    <div class="shortcut-item">
+                        <span>搜索</span>
+                        <span>Ctrl+Shift+F</span>
+                    </div>
+                </div>
+                
+                <div class="shortcuts-section">
+                    <h4>窗格管理</h4>
+                    <div class="shortcut-item">
+                        <span>水平拆分窗格</span>
+                        <span>Ctrl+Shift+D</span>
+                    </div>
+                    <div class="shortcut-item">
+                        <span>垂直拆分窗格</span>
+                        <span>Ctrl+Shift+E</span>
+                    </div>
+                    <div class="shortcut-item">
+                        <span>关闭窗格</span>
+                        <span>Ctrl+Shift+Q</span>
+                    </div>
+                </div>
+                
+                <div class="shortcuts-section">
+                    <h4>标签管理</h4>
+                    <div class="shortcut-item">
+                        <span>新建标签</span>
+                        <span>Ctrl+Shift+T</span>
+                    </div>
+                    <div class="shortcut-item">
+                        <span>关闭标签</span>
+                        <span>Ctrl+Shift+W</span>
+                    </div>
+                    <div class="shortcut-item">
+                        <span>下一个标签</span>
+                        <span>Ctrl+Tab</span>
+                    </div>
+                    <div class="shortcut-item">
+                        <span>上一个标签</span>
+                        <span>Ctrl+Shift+Tab</span>
+                    </div>
+                </div>
+                
+                <div class="shortcuts-section">
+                    <h4>界面控制</h4>
+                    <div class="shortcut-item">
+                        <span>设置</span>
+                        <span>Ctrl+,</span>
+                    </div>
+                    <div class="shortcut-item">
+                        <span>快捷键帮助</span>
+                        <span>Ctrl+Shift+?</span>
+                    </div>
+                    <div class="shortcut-item">
+                        <span>全屏</span>
+                        <span>F11</span>
+                    </div>
+                    <div class="shortcut-item">
+                        <span>保存会话</span>
+                        <span>Ctrl+Shift+S</span>
+                    </div>
+                    <div class="shortcut-item">
+                        <span>缩放级别</span>
+                        <span>Ctrl+0~9</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Settings Panel -->
+    <div class="settings-panel" id="settings-panel">
+        <div class="settings-header">
+            <h2>设置</h2>
+            <button class="close-btn" id="close-settings">
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+                    <path d="M4.5 4.5l7 7m0-7l-7 7" stroke="currentColor" stroke-width="1.5" fill="none"/>
+                </svg>
+            </button>
+        </div>
+        <div class="settings-content">
+            <div class="setting-section">
+                <h3>外观</h3>
+                <div class="setting-group">
+                    <label>字体大小</label>
+                    <select id="font-size-select">
+                        <option value="12">12px</option>
+                        <option value="14">14px</option>
+                        <option value="16" selected>16px</option>
+                        <option value="18">18px</option>
+                        <option value="20">20px</option>
+                    </select>
+                </div>
+                <div class="setting-group">
+                    <label>光标样式</label>
+                    <select id="cursor-style-select">
+                        <option value="block">方块</option>
+                        <option value="underline">下划线</option>
+                        <option value="bar" selected>竖线</option>
+                    </select>
+                </div>
+                <div class="setting-group">
+                    <label>
+                        <input type="checkbox" id="cursor-blink"> 光标闪烁
+                    </label>
+                </div>
+            </div>
+
+            <div class="setting-section">
+                <h3>行为</h3>
+                <div class="setting-group">
+                    <label>滚动回溯行数</label>
+                    <select id="scrollback-select">
+                        <option value="1000">1000</option>
+                        <option value="5000">5000</option>
+                        <option value="10000" selected>10000</option>
+                        <option value="50000">50000</option>
+                    </select>
+                </div>
+                <div class="setting-group">
+                    <label>
+                        <input type="checkbox" id="bell-enabled"> 启用响铃
+                    </label>
+                </div>
+                <div class="setting-group">
+                    <label>
+                        <input type="checkbox" id="auto-reconnect" checked> 自动重连
+                    </label>
+                </div>
+            </div>
+
+            <div class="setting-section">
+                <h3>会话</h3>
+                <div class="setting-group">
+                    <button class="settings-btn" id="export-btn">导出会话日志</button>
+                </div>
+                <div class="setting-group">
+                    <button class="settings-btn" id="clear-storage-btn">清除本地存储</button>
+                </div>
+            </div>
+        </div>
     </div>
 
     <!-- Context Menu -->
     <div class="context-menu" id="context-menu">
-        <div class="context-menu-item" data-action="copy">
+        <button class="context-item" data-action="copy">
             <span>复制</span>
             <span class="shortcut">Ctrl+Shift+C</span>
-        </div>
-        <div class="context-menu-item" data-action="paste">
+        </button>
+        <button class="context-item" data-action="paste">
             <span>粘贴</span>
             <span class="shortcut">Ctrl+Shift+V</span>
-        </div>
-        <div class="context-menu-divider"></div>
-        <div class="context-menu-item" data-action="split-horizontal">
-            <span>水平拆分窗格</span>
-            <span class="shortcut">Alt+Shift+-</span>
-        </div>
-        <div class="context-menu-item" data-action="split-vertical">
-            <span>垂直拆分窗格</span>
-            <span class="shortcut">Alt+Shift++</span>
-        </div>
-        <div class="context-menu-divider"></div>
-        <div class="context-menu-item" data-action="clear">
+        </button>
+        <button class="context-item" data-action="select-all">
+            <span>全选</span>
+            <span class="shortcut">Ctrl+Shift+A</span>
+        </button>
+        <div class="context-divider"></div>
+        <button class="context-item" data-action="search">
+            <span>搜索</span>
+            <span class="shortcut">Ctrl+Shift+F</span>
+        </button>
+        <div class="context-divider"></div>
+        <button class="context-item" data-action="split-horizontal">
+            <span>水平拆分</span>
+            <span class="shortcut">Ctrl+Shift+D</span>
+        </button>
+        <button class="context-item" data-action="split-vertical">
+            <span>垂直拆分</span>
+            <span class="shortcut">Ctrl+Shift+E</span>
+        </button>
+        <button class="context-item" data-action="close-pane">
+            <span>关闭窗格</span>
+            <span class="shortcut">Ctrl+Shift+Q</span>
+        </button>
+        <div class="context-divider"></div>
+        <button class="context-item" data-action="reset">
+            <span>重置终端</span>
+            <span class="shortcut">Ctrl+Shift+R</span>
+        </button>
+        <button class="context-item" data-action="save-session">
+            <span>保存会话</span>
+            <span class="shortcut">Ctrl+Shift+S</span>
+        </button>
+        <div class="context-divider"></div>
+        <button class="context-item" data-action="clear">
             <span>清空终端</span>
             <span class="shortcut">Ctrl+L</span>
-        </div>
-        <div class="context-menu-item" data-action="settings">
+        </button>
+        <button class="context-item" data-action="refresh-terminal">
+            <span>刷新终端</span>
+            <span class="shortcut">F5</span>
+        </button>
+        <div class="context-divider"></div>
+        <button class="context-item" data-action="new-tab">
+            <span>新建标签</span>
+            <span class="shortcut">Ctrl+Shift+T</span>
+        </button>
+        <button class="context-item" data-action="close-tab">
+            <span>关闭标签</span>
+            <span class="shortcut">Ctrl+Shift+W</span>
+        </button>
+        <div class="context-divider"></div>
+        <button class="context-item" data-action="settings">
             <span>设置</span>
             <span class="shortcut">Ctrl+,</span>
-        </div>
+        </button>
     </div>
+
+    <!-- Toast Notification -->
+    <div class="toast" id="toast"></div>
 
     <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/xterm-addon-web-links@0.9.0/lib/xterm-addon-web-links.min.js"></script>
-    <script>
-        // Terminal Manager - 支持多实例
-        class TerminalManager {
-            constructor() {
-                this.tabs = [];
-                this.activeTabId = null;
-                this.tabCounter = 0;
-                this.init();
-            }
-
-            init() {
-                this.registerServiceWorker();
-                this.setupEventListeners();
-                this.createTab(); // 创建初始标签页
-                this.loadCommandPalette();
-            }
-
-            // 注册 Service Worker
-            async registerServiceWorker() {
-                if ('serviceWorker' in navigator) {
-                    try {
-                        await navigator.serviceWorker.register('/sw.js');
-                        console.log('Service Worker registered');
-                    } catch (error) {
-                        console.error('Service Worker registration failed:', error);
-                    }
-                }
-            }
-
-            // 创建新标签页
-            createTab(profile = 'bash') {
-                const tabId = `tab-${++this.tabCounter}`;
-
-                const tab = {
-                    id: tabId,
-                    title: profile,
-                    profile: profile,
-                    term: null,
-                    fitAddon: null,
-                    socket: null,
-                    element: null,
-                    paneElement: null
-                };
-
-                // 创建标签元素
-                const tabElement = document.createElement('div');
-                tabElement.className = 'tab';
-                tabElement.dataset.tabId = tabId;
-                tabElement.innerHTML = `
-            <span class="tab-icon">❯</span>
-            <span class="tab-title">${profile}</span>
-            <button class="tab-close">
-                <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
-                    <path d="M2.22 2.22l7.56 7.56m0-7.56l-7.56 7.56" stroke="currentColor" stroke-width="1.5" fill="none"/>
-                </svg>
-            </button>
-        `;
-
-                // 创建终端窗格
-                const paneElement = document.createElement('div');
-                paneElement.className = 'terminal-pane';
-                paneElement.dataset.tabId = tabId;
-                paneElement.style.display = 'none';
-
-                const wrapperElement = document.createElement('div');
-                wrapperElement.className = 'terminal-wrapper';
-                paneElement.appendChild(wrapperElement);
-
-                // 初始化 XTerm
-                const term = new Terminal({
-                    fontSize: 16,
-                    fontFamily: '"Cascadia Code", "Cascadia Mono", Consolas, "Courier New", monospace',
-                    cursorBlink: true,
-                    cursorStyle: 'bar',
-                    theme: {
-                        background: '#0c0c0c',
-                        foreground: '#e5e5e5',
-                        cursor: '#ffffff',
-                        cursorAccent: '#0c0c0c',
-                        selection: 'rgba(96, 205, 255, 0.3)',
-                        black: '#0c0c0c',
-                        red: '#c50f1f',
-                        green: '#13a10e',
-                        yellow: '#c19c00',
-                        blue: '#0037da',
-                        magenta: '#881798',
-                        cyan: '#3a96dd',
-                        white: '#cccccc',
-                        brightBlack: '#767676',
-                        brightRed: '#e74856',
-                        brightGreen: '#16c60c',
-                        brightYellow: '#f9f1a5',
-                        brightBlue: '#3b78ff',
-                        brightMagenta: '#b4009e',
-                        brightCyan: '#61d6d6',
-                        brightWhite: '#f2f2f2'
-                    },
-                    allowTransparency: false,
-                    scrollback: 10000,
-                    tabStopWidth: 4
-                });
-
-                const fitAddon = new FitAddon.FitAddon();
-                const webLinksAddon = new WebLinksAddon.WebLinksAddon();
-
-                term.loadAddon(fitAddon);
-                term.loadAddon(webLinksAddon);
-                term.open(wrapperElement);
-
-                tab.term = term;
-                tab.fitAddon = fitAddon;
-                tab.element = tabElement;
-                tab.paneElement = paneElement;
-
-                // 添加到 DOM
-                document.getElementById('tab-list').appendChild(tabElement);
-                document.getElementById('terminal-container').appendChild(paneElement);
-
-                // 事件监听
-                tabElement.addEventListener('click', (e) => {
-                    if (!e.target.closest('.tab-close')) {
-                        this.switchTab(tabId);
-                    }
-                });
-
-                tabElement.querySelector('.tab-close').addEventListener('click', (e) => {
-                    e.stopPropagation();
-                    this.closeTab(tabId);
-                });
-
-                paneElement.addEventListener('click', () => {
-                    this.switchTab(tabId);
-                });
-
-                this.tabs.push(tab);
-                this.switchTab(tabId);
-                this.connectWebSocket(tab);
-
-                return tab;
-            }
-
-            // 切换标签页
-            switchTab(tabId) {
-                this.tabs.forEach(tab => {
-                    const isActive = tab.id === tabId;
-                    tab.element.classList.toggle('active', isActive);
-                    tab.paneElement.style.display = isActive ? 'flex' : 'none';
-                    tab.paneElement.classList.toggle('focused', isActive);
-                });
-
-                this.activeTabId = tabId;
-                const activeTab = this.getTab(tabId);
-
-                if (activeTab) {
-                    setTimeout(() => {
-                        activeTab.fitAddon.fit();
-                        this.updateTerminalSize(activeTab);
-                        activeTab.term.focus();
-                    }, 50);
-                }
-            }
-
-            // 关闭标签页
-            closeTab(tabId) {
-                const index = this.tabs.findIndex(t => t.id === tabId);
-                if (index === -1) return;
-
-                const tab = this.tabs[index];
-
-                // 关闭 WebSocket
-                if (tab.socket) {
-                    tab.socket.close();
-                }
-
-                // 清理 DOM
-                tab.element.remove();
-                tab.paneElement.remove();
-
-                // 从数组中移除
-                this.tabs.splice(index, 1);
-
-                // 如果关闭的是当前标签，切换到其他标签
-                if (tab.id === this.activeTabId) {
-                    if (this.tabs.length > 0) {
-                        const newActiveTab = this.tabs[Math.max(0, index - 1)];
-                        this.switchTab(newActiveTab.id);
-                    } else {
-                        // 如果没有标签了，创建一个新的
-                        this.createTab();
-                    }
-                }
-            }
-
-            // 获取标签
-            getTab(tabId) {
-                return this.tabs.find(t => t.id === tabId);
-            }
-
-            // 获取活动标签
-            getActiveTab() {
-                return this.getTab(this.activeTabId);
-            }
-
-            // 连接 WebSocket
-            connectWebSocket(tab) {
-                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-                const host = window.location.host;
-                const socketUrl = `${protocol}//${host}/ws`;
-
-                tab.socket = new WebSocket(socketUrl);
-                tab.socket.binaryType = 'arraybuffer';
-
-                tab.socket.onopen = () => {
-                    this.updateTerminalSize(tab);
-
-                    const toU8 = any => new Uint8Array(
-                        typeof any === 'string' ? new TextEncoder().encode(any) : any
-                    );
-
-                    tab.term.onData(data => {
-                        if (tab.socket && tab.socket.readyState === WebSocket.OPEN) {
-                            tab.socket.send(toU8(data));
-                        }
-                    });
-
-                    tab.socket.onmessage = (event) => {
-                        tab.term.write(toU8(event.data));
-                    };
-                };
-
-                tab.socket.onclose = () => {
-                    console.log(`Tab ${tab.id} disconnected`);
-                };
-
-                tab.socket.onerror = (error) => {
-                    console.error(`Tab ${tab.id} error:`, error);
-                };
-            }
-
-            // 更新终端尺寸
-            updateTerminalSize(tab) {
-                if (tab.socket && tab.socket.readyState === WebSocket.OPEN) {
-                    const cols = tab.term.cols;
-                    const rows = tab.term.rows;
-                    tab.socket.send(JSON.stringify({ col: cols, row: rows }));
-                }
-            }
-
-            // 设置事件监听
-            setupEventListeners() {
-                // 新建标签
-                document.getElementById('new-tab-btn').addEventListener('click', () => {
-                    this.createTab();
-                });
-
-                // 窗口大小调整
-                let resizeTimeout;
-                window.addEventListener('resize', () => {
-                    clearTimeout(resizeTimeout);
-                    resizeTimeout = setTimeout(() => {
-                        const activeTab = this.getActiveTab();
-                        if (activeTab) {
-                            activeTab.fitAddon.fit();
-                            this.updateTerminalSize(activeTab);
-                        }
-                    }, 100);
-                });
-
-                // 右键菜单
-                const contextMenu = document.getElementById('context-menu');
-
-                document.getElementById('terminal-container').addEventListener('contextmenu', (e) => {
-                    e.preventDefault();
-                    contextMenu.style.display = 'block';
-                    contextMenu.style.left = e.pageX + 'px';
-                    contextMenu.style.top = e.pageY + 'px';
-                });
-
-                document.addEventListener('click', () => {
-                    contextMenu.style.display = 'none';
-                });
-
-                // 上下文菜单操作
-                contextMenu.addEventListener('click', async (e) => {
-                    const item = e.target.closest('.context-menu-item');
-                    if (!item) return;
-
-                    const action = item.dataset.action;
-                    const activeTab = this.getActiveTab();
-                    if (!activeTab) return;
-
-                    switch (action) {
-                        case 'copy':
-                            const selection = activeTab.term.getSelection();
-                            if (selection) {
-                                await navigator.clipboard.writeText(selection);
-                            }
-                            break;
-                        case 'paste':
-                            try {
-                                const text = await navigator.clipboard.readText();
-                                activeTab.term.paste(text);
-                            } catch (err) {
-                                console.error('Paste error:', err);
-                            }
-                            break;
-                        case 'clear':
-                            activeTab.term.clear();
-                            break;
-                        case 'split-horizontal':
-                            console.log('Split horizontal - 功能待实现');
-                            break;
-                        case 'split-vertical':
-                            console.log('Split vertical - 功能待实现');
-                            break;
-                    }
-                });
-
-                // 快捷键
-                document.addEventListener('keydown', async (e) => {
-                    // Ctrl+Shift+C - 复制
-                    if (e.ctrlKey && e.shiftKey && e.key === 'C') {
-                        e.preventDefault();
-                        const activeTab = this.getActiveTab();
-                        if (activeTab) {
-                            const selection = activeTab.term.getSelection();
-                            if (selection) {
-                                await navigator.clipboard.writeText(selection);
-                            }
-                        }
-                    }
-
-                    // Ctrl+Shift+V - 粘贴
-                    if (e.ctrlKey && e.shiftKey && e.key === 'V') {
-                        e.preventDefault();
-                        const activeTab = this.getActiveTab();
-                        if (activeTab) {
-                            try {
-                                const text = await navigator.clipboard.readText();
-                                activeTab.term.paste(text);
-                            } catch (err) {
-                                console.error('Paste error:', err);
-                            }
-                        }
-                    }
-
-                    // Ctrl+Shift+T - 新建标签
-                    if (e.ctrlKey && e.shiftKey && e.key === 'T') {
-                        e.preventDefault();
-                        this.createTab();
-                    }
-
-                    // Ctrl+Shift+W - 关闭标签
-                    if (e.ctrlKey && e.shiftKey && e.key === 'W') {
-                        e.preventDefault();
-                        if (this.activeTabId) {
-                            this.closeTab(this.activeTabId);
-                        }
-                    }
-
-                    // Ctrl+Shift+P - 命令面板
-                    if (e.ctrlKey && e.shiftKey && e.key === 'P') {
-                        e.preventDefault();
-                        this.toggleCommandPalette();
-                    }
-
-                    // Ctrl+Tab - 下一个标签
-                    if (e.ctrlKey && e.key === 'Tab') {
-                        e.preventDefault();
-                        const currentIndex = this.tabs.findIndex(t => t.id === this.activeTabId);
-                        const nextIndex = (currentIndex + 1) % this.tabs.length;
-                        this.switchTab(this.tabs[nextIndex].id);
-                    }
-
-                    // Ctrl+L - 清屏
-                    if (e.ctrlKey && e.key === 'l') {
-                        e.preventDefault();
-                        const activeTab = this.getActiveTab();
-                        if (activeTab) {
-                            activeTab.term.clear();
-                        }
-                    }
-                });
-
-                // 下拉菜单
-                document.getElementById('dropdown-btn').addEventListener('click', () => {
-                    this.toggleCommandPalette();
-                });
-            }
-
-            // 加载命令面板
-            loadCommandPalette() {
-                const commands = [
-                    { icon: '❯', title: '新建标签页', description: 'bash', action: () => this.createTab('bash') },
-                    { icon: '⚙️', title: '设置', description: '打开设置', action: () => console.log('Settings') },
-                    { icon: '🎨', title: '主题', description: '更改配色方案', action: () => console.log('Theme') },
-                    { icon: '📋', title: '复制', description: '复制选定文本', action: () => this.copySelection() },
-                    { icon: '📄', title: '粘贴', description: '粘贴剪贴板内容', action: () => this.pasteClipboard() }
-                ];
-
-                const paletteList = document.getElementById('command-palette-list');
-                commands.forEach((cmd, index) => {
-                    const item = document.createElement('div');
-                    item.className = 'command-item';
-                    if (index === 0) item.classList.add('selected');
-                    item.innerHTML = `
-                <div class="command-item-icon">${cmd.icon}</div>
-                <div class="command-item-text">
-                    <div class="command-item-title">${cmd.title}</div>
-                    <div class="command-item-description">${cmd.description}</div>
-                </div>
-            `;
-                    item.addEventListener('click', () => {
-                        cmd.action();
-                        this.toggleCommandPalette();
-                    });
-                    paletteList.appendChild(item);
-                });
-
-                // 命令面板搜索
-                const input = document.getElementById('command-palette-input');
-                input.addEventListener('keydown', (e) => {
-                    if (e.key === 'Escape') {
-                        this.toggleCommandPalette();
-                    }
-                });
-            }
-
-            // 切换命令面板
-            toggleCommandPalette() {
-                const palette = document.getElementById('command-palette');
-                const isVisible = palette.style.display === 'block';
-                palette.style.display = isVisible ? 'none' : 'block';
-
-                if (!isVisible) {
-                    document.getElementById('command-palette-input').focus();
-                }
-            }
-
-            // 复制选择
-            async copySelection() {
-                const activeTab = this.getActiveTab();
-                if (activeTab) {
-                    const selection = activeTab.term.getSelection();
-                    if (selection) {
-                        await navigator.clipboard.writeText(selection);
-                    }
-                }
-            }
-
-            // 粘贴剪贴板
-            async pasteClipboard() {
-                const activeTab = this.getActiveTab();
-                if (activeTab) {
-                    try {
-                        const text = await navigator.clipboard.readText();
-                        activeTab.term.paste(text);
-                    } catch (err) {
-                        console.error('Paste error:', err);
-                    }
-                }
-            }
-        }
-
-        // 初始化应用
-        const terminalManager = new TerminalManager();
-    </script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-search@0.13.0/lib/xterm-addon-search.min.js"></script>
+    <script src="app.js"></script>
 </body>
-
 </html>

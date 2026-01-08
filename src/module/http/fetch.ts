@@ -232,7 +232,7 @@ export class Response implements globalThis.Response {
 
         if (init?.headers) {
             this.headers = new Headers();
-            if (Reflect.getPrototypeOf(init.headers) === Object.prototype){
+            if (Reflect.getPrototypeOf(init.headers) === Object.prototype) {
                 init.headers = Object.entries(init.headers);
             }
             // @ts-ignore
@@ -253,49 +253,41 @@ export class Response implements globalThis.Response {
     private createBodyStream(bodyInit: BodyInit): ReadableStream<Uint8Array> {
         if (bodyInit instanceof ReadableStream)
             return bodyInit as ReadableStream<Uint8Array>;
-        
+
         return new ReadableStream({
             start: async (controller) => {
                 try {
                     let bodyLen = -1;
+                    let data: Uint8Array;
+
                     if (typeof bodyInit === 'string') {
-                        const buf = engine.encodeString(bodyInit);
-                        controller.enqueue(buf);
-                        bodyLen = buf.length;
+                        data = engine.encodeString(bodyInit);
+                        bodyLen = data.length;
                     } else if (bodyInit instanceof Uint8Array) {
-                        controller.enqueue(bodyInit as Uint8Array);
+                        // @ts-ignore
+                        data = bodyInit;
                         bodyLen = bodyInit.length;
                     } else if (bodyInit instanceof ArrayBuffer) {
-                        controller.enqueue(new Uint8Array(bodyInit));
+                        data = new Uint8Array(bodyInit);
                         bodyLen = bodyInit.byteLength;
                     } else if (bodyInit instanceof Blob) {
                         const buffer = await bodyInit.arrayBuffer();
-                        controller.enqueue(new Uint8Array(buffer));
+                        data = new Uint8Array(buffer);
                         bodyLen = buffer.byteLength;
-                    } else if (bodyInit instanceof ReadableStream) {
-                        const reader = bodyInit.getReader();
-                        try {
-                            while (true) {
-                                const { done, value } = await reader.read();
-                                if (done) break;
-                                controller.enqueue(value as Uint8Array);
-                            }
-                        } finally {
-                            reader.releaseLock();
-                        }
                     } else if (bodyInit instanceof URLSearchParams) {
-                        const buf = engine.encodeString(bodyInit.toString());
-                        controller.enqueue(buf);
-                        bodyLen = buf.length;
+                        data = engine.encodeString(bodyInit.toString());
+                        bodyLen = data.length;
                     } else if (bodyInit instanceof FormData) {
                         throw new Error('FormData not yet implemented');
                     } else {
-                        const buf = engine.encodeString(JSON.stringify(bodyInit));
-                        controller.enqueue(buf);
-                        bodyLen = buf.length;
+                        data = engine.encodeString(JSON.stringify(bodyInit));
+                        bodyLen = data.length;
                     }
-                    this.headers.set('content-length', String(bodyLen));
+
+                    controller.enqueue(data);
                     controller.close();
+
+                    this.headers.set('content-length', String(bodyLen));
                 } catch (err) {
                     controller.error(err);
                 }
@@ -451,7 +443,7 @@ function createResponseBodyStream(ctx: FetchContext): ReadableStream<Uint8Array>
                         controller.enqueue(chunk);
                     }
                 };
-                
+
                 // 输出已缓存的 body 数据
                 const existingBody = ctx.parser.getBodyChunks();
                 for (const chunk of existingBody) {
@@ -503,7 +495,7 @@ function createResponseBodyStream(ctx: FetchContext): ReadableStream<Uint8Array>
  * 读取响应头部
  */
 async function readHeaders(ctx: FetchContext): Promise<void> {
-    while (!ctx.parser.isHeadersComplete && !ctx.aborted) try{
+    while (!ctx.parser.isHeadersComplete && !ctx.aborted) try {
         const data = await ctx.connection.read();
         if (!data || data.length === 0) continue;
         ctx.parser.feed(data);
@@ -606,7 +598,7 @@ async function performFetch(
                 return handleRedirect(request, url, location, statusCode, redirectCount);
             }
         }
-        
+
         // 创建响应体流
         const bodyStream = createResponseBodyStream(ctx);
         const response = new Response(bodyStream, {

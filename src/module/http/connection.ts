@@ -8,6 +8,7 @@
  * - handshake() must be called repeatedly until complete
  */
 
+import { wrapFsClassDec as wrap, wrapFSns } from "../../utils/wrap";
 import { assert } from "../../utils/assert";
 
 const streams = import.meta.use("streams");
@@ -82,7 +83,7 @@ export class Connection implements ConnectionLike {
     /* -------------------------------------------------------------- */
     /* Public API                                                     */
     /* -------------------------------------------------------------- */
-
+    @wrap
     async connect(): Promise<void> {
         try {
             // DNS resolution
@@ -111,6 +112,7 @@ export class Connection implements ConnectionLike {
         }
     }
 
+    @wrap
     async write(data: Uint8Array): Promise<void> {
         if (this.sslPipe) {
             // SSL mode: encrypt plaintext
@@ -133,6 +135,7 @@ export class Connection implements ConnectionLike {
         }
     }
 
+    @wrap
     async read(size = 16384): Promise<Uint8Array | null> {
         if (this.sslPipe) {
             // Try to read buffered plaintext first
@@ -212,6 +215,7 @@ export class Connection implements ConnectionLike {
         }
     }
 
+    @wrap
     close(): void {
         if (this.state === ConnectionState.CLOSED) return;
 
@@ -241,7 +245,7 @@ export class Connection implements ConnectionLike {
     /* -------------------------------------------------------------- */
     /* TLS Handshake                                                  */
     /* -------------------------------------------------------------- */
-
+    @wrap
     private async performTLSHandshake(): Promise<void> {
         // Find system CA bundle
         const caPath = await this.findSystemCaPath();
@@ -431,6 +435,7 @@ export class ConnectionManager {
     /**
      * Acquire a connection from the pool or create a new one
      */
+    @wrap
     async acquire(cfg: ConnectionConfig): Promise<Connection> {
         const fullCfg = { ...this.defaultConfig, ...cfg } as ConnectionConfig;
         const key = this.getKey(fullCfg);
@@ -516,6 +521,7 @@ export class ConnectionManager {
     /**
      * Wait for a connection to become available
      */
+    @wrap
     private async waitForConnection(key: string, cfg: ConnectionConfig): Promise<Connection> {
         return new Promise((resolve, reject) => {
             const timeout = timers.setTimeout(() => {

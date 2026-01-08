@@ -1,5 +1,6 @@
 import { malloc } from "../utils/malloc";
 import { asToDenoStat, toDenoStat, toString } from "./02_fs";
+import { wrapFsClassDec as wrap, wrapFSns } from "../utils/wrap";
 
 const fs = import.meta.use('fs');
 const asfs = import.meta.use('asyncfs');
@@ -92,12 +93,14 @@ export class FSFile implements Deno.FsFile {
         });
     }
 
+    @wrap
     async write(data: Uint8Array) {
         const n = await this.$handle.write(data, this.fpointer);
         this.fpointer += n;
         return n;
     }
 
+    @wrap
     writeSync(p: Uint8Array): number {
         const fno = this.$handle.fileno();
         const n = fs.pwrite(fno, p, this.fpointer);
@@ -105,12 +108,14 @@ export class FSFile implements Deno.FsFile {
         return n;
     }
 
+    @wrap
     async read(p: Uint8Array): Promise<number | null> {
         const n = await this.$handle.read(p, this.fpointer);
         this.fpointer += n;
         return n;
     }
 
+    @wrap
     readSync(p: Uint8Array): number | null {
         const fno = this.$handle.fileno();
         const n = fs.pread(fno, p, this.fpointer);
@@ -118,6 +123,7 @@ export class FSFile implements Deno.FsFile {
         return n;
     }
 
+    @wrap
     truncate(len?: number): Promise<void> {
         return this.$handle.truncate(len);
     }
@@ -126,15 +132,18 @@ export class FSFile implements Deno.FsFile {
         throw new Deno.errors.NotSupported();
     }
 
+    @wrap
     async stat(): Promise<Deno.FileInfo> {
         return asToDenoStat(await this.$handle.stat());
     }
 
+    @wrap
     statSync(): Deno.FileInfo {
         const stat = fs.stat(this.$handle.path);
         return toDenoStat(stat);
     }
 
+    @wrap
     async seek(offset: number | bigint, whence: Deno.SeekMode): Promise<number> {
         const fs = (await this.$handle.stat()).size;
         const off = Number(offset);
@@ -146,6 +155,7 @@ export class FSFile implements Deno.FsFile {
         return this.fpointer;
     }
 
+    @wrap
     seekSync(offset: number | bigint, whence: Deno.SeekMode): number {
         const fsize = fs.lstat(this.$handle.path).size;
         const off = Number(offset);
@@ -157,10 +167,12 @@ export class FSFile implements Deno.FsFile {
         return this.fpointer;
     }
 
+    @wrap
     sync(): Promise<void> {
         return this.$handle.sync();
     }
 
+    @wrap
     syncData(): Promise<void> {
         return this.$handle.datasync();
     }
@@ -174,25 +186,33 @@ export class FSFile implements Deno.FsFile {
     }
 
     lock(exclusive?: boolean): Promise<void> {
-        throw new Deno.errors.NotSupported();
+        // fixme: implement lock asynchronously
+        return Promise.resolve(this.lockSync(exclusive));
     }
 
+    @wrap
     lockSync(exclusive?: boolean): void {
-        throw new Deno.errors.NotSupported();
+        const fd = this.$handle.fileno();
+        fs.flock(fd, exclusive ? (fs.LOCK_EX | fs.LOCK_NB) : (fs.LOCK_SH | fs.LOCK_NB));
     }
 
     unlock(): Promise<void> {
-        throw new Deno.errors.NotSupported();
+        // fixme: implement unlock asynchronously
+        return Promise.resolve(this.unlockSync());
     }
 
+    @wrap
     unlockSync(): void {
-        throw new Deno.errors.NotSupported();
+        const fd = this.$handle.fileno();
+        fs.flock(fd, fs.LOCK_UN);
     }
 
+    @wrap
     utime(atime: number | Date, mtime: number | Date): Promise<void> {
         return this.$handle.utime(toDate(atime), toDate(mtime));
     }
 
+    @wrap
     utimeSync(atime: number | Date, mtime: number | Date): void {
         throw new Deno.errors.NotSupported();
     }
@@ -214,7 +234,7 @@ export class FSFile implements Deno.FsFile {
     }
 }
 
-Object.assign(Deno, {
+Object.assign(Deno, wrapFSns({
     async open(path, opt) {
         let flag: CModuleFS.OpenFlags = "r";
         if (opt) flag = optionsToMode(opt);
@@ -228,4 +248,4 @@ Object.assign(Deno, {
         const fno = fs.open(toString(path), flag, opt?.mode);
         return new FSFile(asfs.newStdioFile(toString(path), fno));
     },
-} satisfies Partial<typeof Deno>)
+}))

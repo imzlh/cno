@@ -1,5 +1,5 @@
 import { assert } from '../utils/assert';
-import { fromError, CustomEvent, PromiseRejectionEvent } from './events';
+import { fromError, CustomEvent, PromiseRejectionEvent, EventTarget } from './events';
 
 const { onEvent } = import.meta.use('engine');
 
@@ -35,23 +35,22 @@ Object.defineProperties(globalThis, {
 await import('./basic');
 
 // URL polyfill
-// @ts-ignore
-const { URL, URLSearchParams } = require('whatwg-url');
-Reflect.set(globalThis, 'URL', URL);
-Reflect.set(globalThis, 'URLSearchParams', URLSearchParams);
+await import('./url');
 
 // URLPattern polyfill
 // @ts-ignore
 await import('urlpattern-polyfill');
 
 // web streams polyfill
+await import('./streams');
 // @ts-ignore
-const stream = await import('web-streams-polyfill');
-for (const key in stream) {
-    if (key === 'default') continue;
-    // @ts-ignore
-    Reflect.set(globalThis, key, stream[key]);
-}
+// const stream = await import('web-streams-polyfill');
+// for (const key in stream) {
+//     if (key === 'default') continue;
+//     // @ts-ignore
+//     Reflect.set(globalThis, key, stream[key]);
+// }
+
 
 // blob
 // @ts-ignore
@@ -70,14 +69,12 @@ globalThis.fetch = () => void 0;
 // @ts-ignore
 await import('abortcontroller-polyfill');
 
-// event
-await import('./events');
-
 // global event
 const globalEvent = new EventTarget();
-globalThis.addEventListener = globalEvent.addEventListener.bind(globalEvent);
-globalThis.removeEventListener = globalEvent.removeEventListener.bind(globalEvent);
-globalThis.dispatchEvent = globalEvent.dispatchEvent.bind(globalEvent);
+Reflect.set(globalThis, 'addEventListener', globalEvent.addEventListener.bind(globalEvent));
+Reflect.set(globalThis,'removeEventListener', globalEvent.removeEventListener.bind(globalEvent));
+Reflect.set(globalThis, 'dispatchEvent', globalEvent.dispatchEvent.bind(globalEvent));
+
 // brigde cjs event
 onEvent((eventName, eventData) => {
     let event;
@@ -114,6 +111,9 @@ Reflect.set(globalThis, 'Headers', Headers);
 // fetch & xhr polyfill
 await import('../module/http/fetch');
 
+// sse(EventSource) polyfill
+await import('../module/http/sse');
+
 // websocket
 await import('../module/http/websocket');
 
@@ -133,5 +133,5 @@ await import('./storage');
 await import('./intl');
 
 // temporal
-const { Temporal } = await import('temporal-polyfill');
-globalThis.Temporal = Temporal;
+// const { Temporal } = await import('temporal-polyfill');
+// globalThis.Temporal = Temporal;

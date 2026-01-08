@@ -26,32 +26,33 @@ globalThis.alert = function(msg) {
 globalThis.prompt = function(msg) {
     fs.setBlocking(os.STDIN_FILENO, true);
     fs.setBlocking(os.STDOUT_FILENO, true);
-    assert(fs.write(os.STDOUT_FILENO, engine.encodeString(msg ? msg + ' ' : '? ')), "write() operation failed");
-    let buf = new Uint8Array(1024);
-    let i = 0;
-    const LF = engine.encodeString('\n')[0];
-    while(true){
-        const n = fs.read(os.STDIN_FILENO, buf);
-        if(!n) break;
-        for(let j = 0; j < n; j++) {
-            if(buf[j] === LF) {
-                const s = engine.decodeString(buf.subarray(0, j));
-                fs.setBlocking(os.STDIN_FILENO, false);
-                fs.setBlocking(os.STDOUT_FILENO, false);
-                return s;
-            }
+    
+    assert(fs.write(os.STDOUT_FILENO, 
+        engine.encodeString(msg ? msg + ' ' : '? ')), "write() operation failed");
+    
+    const decoder = new TextDecoder();
+    const chunk = new Uint8Array(1024);
+    let line = '';
+    
+    while (true) {
+        const n = fs.read(os.STDIN_FILENO, chunk);
+        if (!n) break;  // EOF
+        
+        line += decoder.decode(chunk.subarray(0, n), { stream: true });
+        
+        const newlineIdx = line.indexOf('\n');
+        if (newlineIdx !== -1) {
+            fs.setBlocking(os.STDIN_FILENO, false);
+            fs.setBlocking(os.STDOUT_FILENO, false);
+            return line.substring(0, newlineIdx).replace(/\r$/, '');
         }
-        if(i + n > buf.length) {
-            const newbuf = new Uint8Array(buf.length * 2);
-            newbuf.set(buf);
-            buf = newbuf;
-        }
-        buf.set(buf.subarray(n), i);
-        i += n;
     }
+    
     fs.setBlocking(os.STDIN_FILENO, false);
     fs.setBlocking(os.STDOUT_FILENO, false);
-    return null;
+    
+    line += decoder.decode();
+    return line.replace(/\r?\n$/, '') || null;
 }
 
 globalThis.confirm = function(msg) {

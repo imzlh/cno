@@ -4,7 +4,7 @@ import packageJson from '../../package.json';
 const os = import.meta.use('os');
 const sys = import.meta.use('sys');
 const engine = import.meta.use('engine');
-const signal = import.meta.use('signal');
+const signal = import.meta.use('signals');
 const console = import.meta.use('console');
 
 function notSupported(): never{
@@ -57,7 +57,10 @@ Object.defineProperty(globalThis, "Deno", {
         },
         cwd: () => os.cwd,
         chdir: (dir: string) => os.chdir(dir),
-        mainModule: '',  // TODO
+        get mainModule(){
+            // @ts-ignore - cts api
+            return globalThis.__mainScript; 
+        },
         execPath: () => sys.exePath,
         noColor: safeGetEnv("NO_COLOR") === "1",
         memoryUsage: () => {

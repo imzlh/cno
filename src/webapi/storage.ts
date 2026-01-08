@@ -165,23 +165,23 @@ class Storage {
 
         // Enable WAL mode for better concurrency
         if (this.options.useWAL) {
-            sqlite3.exec(this.db, 'PRAGMA journal_mode=WAL;');
+            this.db.exec('PRAGMA journal_mode=WAL;');
             this.log('Enabled WAL mode');
         }
 
         // Set synchronous mode for better performance
-        sqlite3.exec(this.db, 'PRAGMA synchronous=NORMAL;');
+        this.db.exec('PRAGMA synchronous=NORMAL;');
 
         // Enable auto vacuum if requested
         if (this.options.autoVacuum) {
-            sqlite3.exec(this.db, 'PRAGMA auto_vacuum=INCREMENTAL;');
+            this.db.exec('PRAGMA auto_vacuum=INCREMENTAL;');
         }
 
         // Set cache size (negative value = KB)
-        sqlite3.exec(this.db, 'PRAGMA cache_size=-2000;'); // 2MB cache
+        this.db.exec('PRAGMA cache_size=-2000;'); // 2MB cache
 
         // Enable foreign keys
-        sqlite3.exec(this.db, 'PRAGMA foreign_keys=ON;');
+        this.db.exec('PRAGMA foreign_keys=ON;');
     }
 
     /**
@@ -191,7 +191,7 @@ class Storage {
         this.log('Initializing schema');
 
         // Create storage table with proper indexes
-        sqlite3.exec(this.db, `
+        this.db.exec(`
       CREATE TABLE IF NOT EXISTS storage (
         key TEXT PRIMARY KEY NOT NULL,
         value TEXT NOT NULL,
@@ -202,13 +202,13 @@ class Storage {
     `);
 
         // Create index on updated_at for efficient cleanup
-        sqlite3.exec(this.db, `
+        this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_storage_updated 
       ON storage(updated_at);
     `);
 
         // Create metadata table for storage info
-        sqlite3.exec(this.db, `
+        this.db.exec(`
       CREATE TABLE IF NOT EXISTS storage_metadata (
         key TEXT PRIMARY KEY NOT NULL,
         value TEXT NOT NULL
@@ -216,12 +216,12 @@ class Storage {
     `);
 
         // Insert initial metadata
-        const stmt = sqlite3.prepare(this.db, `
+        const stmt = this.db.prepare(`
       INSERT OR IGNORE INTO storage_metadata (key, value)
       VALUES ('version', '1'), ('name', ?);
     `);
-        sqlite3.stmt_run(stmt, [this.options.name]);
-        sqlite3.stmt_finalize(stmt);
+        stmt.run([this.options.name]);
+        stmt.finalize();
 
         this.log('Schema initialized');
     }
@@ -233,50 +233,46 @@ class Storage {
         // Get item
         this.stmtCache.set(
             Storage.STMT_GET,
-            sqlite3.prepare(this.db, 'SELECT value FROM storage WHERE key = ?')
+            this.db.prepare('SELECT value FROM storage WHERE key = ?')
         );
 
-        // Set item (upsert)
+        // Set item (upsert) - 修改为兼容老版本 SQLite 的语法
         this.stmtCache.set(
             Storage.STMT_SET,
-            sqlite3.prepare(this.db, `
-        INSERT INTO storage (key, value, size, created_at, updated_at)
+            this.db.prepare(`
+        INSERT OR REPLACE INTO storage (key, value, size, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(key) DO UPDATE SET
-          value = excluded.value,
-          size = excluded.size,
-          updated_at = excluded.updated_at
       `)
         );
 
         // Delete item
         this.stmtCache.set(
             Storage.STMT_DELETE,
-            sqlite3.prepare(this.db, 'DELETE FROM storage WHERE key = ?')
+            this.db.prepare('DELETE FROM storage WHERE key = ?')
         );
 
         // Clear all
         this.stmtCache.set(
             Storage.STMT_CLEAR,
-            sqlite3.prepare(this.db, 'DELETE FROM storage')
+            this.db.prepare('DELETE FROM storage')
         );
 
         // Get all keys
         this.stmtCache.set(
             Storage.STMT_KEYS,
-            sqlite3.prepare(this.db, 'SELECT key FROM storage ORDER BY key')
+            this.db.prepare('SELECT key FROM storage ORDER BY key')
         );
 
         // Count items
         this.stmtCache.set(
             Storage.STMT_COUNT,
-            sqlite3.prepare(this.db, 'SELECT COUNT(*) as count FROM storage')
+            this.db.prepare('SELECT COUNT(*) as count FROM storage')
         );
 
         // Get total size
         this.stmtCache.set(
             Storage.STMT_SIZE,
-            sqlite3.prepare(this.db, 'SELECT COALESCE(SUM(size), 0) as total FROM storage')
+            this.db.prepare('SELECT COALESCE(SUM(size), 0) as total FROM storage')
         );
     }
 
@@ -315,7 +311,7 @@ class Storage {
         if (this.options.quota <= 0) return;
 
         const stmt = this.stmtCache.get(Storage.STMT_SIZE)!;
-        const result = sqlite3.stmt_all(stmt, []);
+        const result = stmt.all([]);
         const currentSize = result[0]!.total as number;
 
         if (currentSize + additionalSize > this.options.quota) {
@@ -324,6 +320,27 @@ class Storage {
                 'QuotaExceededError'
             );
         }
+    }
+
+    /**
+     * Helper method to handle created_at preservation on update
+     */
+    private getCreatedTimeForUpdate(key: string, now: number): number {
+        try {
+            // Try to get existing created_at
+            const existingStmt = this.db.prepare('SELECT created_at FROM storage WHERE key = ?');
+            const result = existingStmt.all([key]);
+            existingStmt.finalize();
+            
+            if (result.length > 0) {
+                return result[0]!.created_at as number;
+            }
+        } catch (error) {
+            this.log('Error getting created_at:', error);
+        }
+        
+        // If key doesn't exist or error, return current time
+        return now;
     }
 
     // ========================================================================
@@ -350,7 +367,7 @@ class Storage {
     getItem(key: string): string | null {
         try {
             const stmt = this.stmtCache.get(Storage.STMT_GET)!;
-            const result = sqlite3.stmt_all(stmt, [key]);
+            const result = stmt.all([key]);
 
             if (result.length === 0) {
                 return null;
@@ -384,9 +401,12 @@ class Storage {
                 this.checkQuota(size - oldSize);
             }
 
-            // Insert or update
+            // For INSERT OR REPLACE, we need to preserve created_at
+            const createdTime = oldValue === null ? now : this.getCreatedTimeForUpdate(key, now);
+
+            // Insert or update using INSERT OR REPLACE
             const stmt = this.stmtCache.get(Storage.STMT_SET)!;
-            sqlite3.stmt_run(stmt, [key, stringValue, size, now, now]);
+            stmt.run([key, stringValue, size, createdTime, now]);
 
             this.log(`Set item: ${key} (${size} bytes)`);
 
@@ -412,7 +432,7 @@ class Storage {
 
             // Delete item
             const stmt = this.stmtCache.get(Storage.STMT_DELETE)!;
-            sqlite3.stmt_run(stmt, [key]);
+            stmt.run([key]);
 
             this.log(`Removed item: ${key}`);
 
@@ -430,7 +450,7 @@ class Storage {
     clear(): void {
         try {
             const stmt = this.stmtCache.get(Storage.STMT_CLEAR)!;
-            sqlite3.stmt_run(stmt, []);
+            stmt.run([]);
 
             this.log('Cleared all items');
 
@@ -439,7 +459,7 @@ class Storage {
 
             // Optimize database after clear
             if (this.options.autoVacuum) {
-                sqlite3.exec(this.db, 'PRAGMA incremental_vacuum;');
+                this.db.exec('PRAGMA incremental_vacuum;');
             }
         } catch (error) {
             this.log('Error clearing storage:', error);
@@ -455,7 +475,7 @@ class Storage {
             if (index < 0) return null;
 
             const stmt = this.stmtCache.get(Storage.STMT_KEYS)!;
-            const result = sqlite3.stmt_all(stmt, []);
+            const result = stmt.all([]);
 
             if (index >= result.length) {
                 return null;
@@ -478,7 +498,7 @@ class Storage {
     keys(): string[] {
         try {
             const stmt = this.stmtCache.get(Storage.STMT_KEYS)!;
-            const result = sqlite3.stmt_all(stmt, []);
+            const result = stmt.all([]);
             return result.map(row => row.key as string);
         } catch (error) {
             this.log('Error getting keys:', error);
@@ -491,9 +511,9 @@ class Storage {
      */
     values(): string[] {
         try {
-            const stmt = sqlite3.prepare(this.db, 'SELECT value FROM storage ORDER BY key');
-            const result = sqlite3.stmt_all(stmt, []);
-            sqlite3.stmt_finalize(stmt);
+            const stmt = this.db.prepare('SELECT value FROM storage ORDER BY key');
+            const result = stmt.all([]);
+            stmt.finalize();
             return result.map(row => row.value as string);
         } catch (error) {
             this.log('Error getting values:', error);
@@ -506,9 +526,9 @@ class Storage {
      */
     entries(): Array<[string, string]> {
         try {
-            const stmt = sqlite3.prepare(this.db, 'SELECT key, value FROM storage ORDER BY key');
-            const result = sqlite3.stmt_all(stmt, []);
-            sqlite3.stmt_finalize(stmt);
+            const stmt = this.db.prepare('SELECT key, value FROM storage ORDER BY key');
+            const result = stmt.all([]);
+            stmt.finalize();
             return result.map(row => [row.key as string, row.value as string]);
         } catch (error) {
             this.log('Error getting entries:', error);
@@ -531,8 +551,8 @@ class Storage {
             const countStmt = this.stmtCache.get(Storage.STMT_COUNT)!;
             const sizeStmt = this.stmtCache.get(Storage.STMT_SIZE)!;
 
-            const countResult = sqlite3.stmt_all(countStmt, []);
-            const sizeResult = sqlite3.stmt_all(sizeStmt, []);
+            const countResult = countStmt.all([]);
+            const sizeResult = sizeStmt.all([]);
 
             const count = countResult[0]!.count as number;
             const totalSize = sizeResult[0]!.total as number;
@@ -554,10 +574,10 @@ class Storage {
             this.log('Optimizing database');
 
             if (this.options.autoVacuum) {
-                sqlite3.exec(this.db, 'PRAGMA incremental_vacuum;');
+                this.db.exec('PRAGMA incremental_vacuum;');
             }
 
-            sqlite3.exec(this.db, 'ANALYZE;');
+            this.db.exec('ANALYZE;');
 
             this.log('Database optimized');
         } catch (error) {
@@ -594,12 +614,12 @@ class Storage {
 
             // Finalize all prepared statements
             for (const stmt of this.stmtCache.values()) {
-                sqlite3.stmt_finalize(stmt);
+                stmt.finalize();
             }
             this.stmtCache.clear();
 
             // Close database
-            sqlite3.close(this.db);
+            this.db.close();
 
             this.log('Storage closed');
         } catch (error) {

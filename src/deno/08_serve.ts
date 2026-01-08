@@ -5,9 +5,12 @@
 
 import { Server, ServerConnection, createServer, type HttpRequest, type HttpResponse } from '../module/http/server';
 import { WebSocket, createWebSocketFromConnection } from '../module/http/websocket';
+import { assert } from '../utils/assert';
+import { wrapFsClassDec as wrap, wrapFSns } from "../utils/wrap";
 
 const crypto = import.meta.use('crypto');
 const engine = import.meta.use('engine');
+const http = import.meta.use('http');
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
@@ -58,6 +61,44 @@ class ResponseAdapter {
         this.coreRes = coreRes;
     }
 
+    verify(res: Response): void {
+        const getHeader = (name: string) => res.headers.get(name);
+        const contentType = getHeader('content-type');
+        const contentLength = getHeader('content-length');
+        const transferEncoding = getHeader('transfer-encoding');
+
+        // 1. status code that should not have a body
+        const noBodyStatusCodes = [204, 205, 304];
+        if (noBodyStatusCodes.includes(res.status)) {
+            assert(
+                !res.body,
+                `Status ${res.status} must not have a response body, but got: ${JSON.stringify(res.body)}`
+            );
+            assert(!contentLength || contentLength === '0',
+                `Status ${res.status} must not have Content-Length or it must be 0`);
+            return;
+        }
+
+        // 2. Content-Length
+        if (contentLength) {
+            const length = parseInt(contentLength, 10);
+            assert(!isNaN(length), `Invalid Content-Length: ${contentLength}`);
+            assert(length >= 0, `Content-Length must be non-negative: ${length}`);
+            if (contentLength) assert(res.body, "Body must exist if Content-Length is specified");
+        }
+
+        // no Transfer-Encoding and Content-Length(mutex)
+        if (transferEncoding && transferEncoding.toLowerCase() === 'chunked') {
+            assert(!contentLength,
+                'Transfer-Encoding: chunked and Content-Length cannot coexist');
+        }
+
+        // ensure client can handle content encoding
+        if (res.body && (res.body instanceof ReadableStream) && !transferEncoding && !contentLength) {
+            assert(contentType, 'Streamed body exists but no Content-Type, Content-Length or Transfer-Encoding specified');
+        }
+    }
+
     /**
      * Send Web API Response to client
      */
@@ -76,22 +117,41 @@ class ResponseAdapter {
             headers[key] = value;
         });
 
-        await this.coreRes.writeHead(response.status, response.statusText, headers);
+        const statusText = response.statusText ?? http.strstatus(response.status);
+        await this.coreRes.writeHead(response.status, statusText, headers);
         this.headersSent = true;
 
         // Send body if present
         if (response.body) {
             const reader = response.body.getReader();
+            const _len = response.headers.get('content-length');
+            const length = _len ? parseInt(_len, 10) : Number.MAX_SAFE_INTEGER;
+            let readed = 0;
 
             try {
-                while (true) {
+                while (readed < length) {
                     const { done, value } = await reader.read();
                     if (done) break;
 
                     await this.coreRes.write(value);
+                    readed += value.byteLength;
+                }
+            } catch (error) {
+                // 处理流关闭错误
+                if (error instanceof TypeError && error.message.includes('Stream is closed or closing')) {
+                    // 流已关闭，忽略错误并继续结束响应
+                    console.warn('Stream closed during response processing:', error.message);
+                } else {
+                    // 其他错误重新抛出
+                    throw error;
                 }
             } finally {
                 reader.releaseLock();
+            }
+
+            if (readed != length) {
+                this.coreRes.close();
+                throw new Error('Body length does not match Content-Length header');
             }
         }
 
@@ -102,6 +162,7 @@ class ResponseAdapter {
     /**
      * Handle WebSocket upgrade
      */
+    @wrap
     private async handleWebSocketUpgrade(response: WebSocketResponse): Promise<void> {
         // Send upgrade headers
         const headers: Record<string, string> = {};
@@ -237,6 +298,7 @@ function serve(
 
                 // Send response
                 const adapter = new ResponseAdapter(res);
+                // adapter.verify(webResponse);
                 await adapter.sendResponse(webResponse);
 
             } catch (error) {
@@ -263,6 +325,7 @@ function serve(
 
     // Start listening
     coreServer.listen();
+    coreServer.acceptLoop();
 
     return new DenoHttpServer(coreServer);
 }
@@ -388,7 +451,8 @@ function createWebSocketFromServerConnection(conn: Promise<ServerConnection>): W
 /* Export to Deno namespace                                           */
 /* ------------------------------------------------------------------ */
 
-Object.assign(Deno, {
+Object.assign(Deno, wrapFSns({
+    // @ts-ignore
     serve,
     upgradeWebSocket
-});
+}));
