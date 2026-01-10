@@ -1032,8 +1032,7 @@ class TerminalManager {
 
     // ========== 移动端支持 ==========
     detectMobile() {
-        const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
-        if (isMobile || window.innerWidth <= 768) {
+        if (this.isMobileDevice()) {
             document.getElementById('mobile-toolbar').style.display = 'block';
             setTimeout(() => {
                 const input = document.getElementById('toolbar-input');
@@ -1233,9 +1232,15 @@ class TerminalManager {
 
     setupMobileFocusHandling() {
         const input = document.getElementById('toolbar-input');
+        const toolbar = document.getElementById('mobile-toolbar');
         
         // 监听键盘事件，当按下Ctrl键时，将焦点转移到输入框
         document.addEventListener('keydown', (e) => {
+            // 只在移动设备上处理此功能
+            if (!this.isMobileDevice()) {
+                return;
+            }
+            
             // 如果焦点已经在输入框中，不需要处理
             if (document.activeElement === input) {
                 return;
@@ -1245,8 +1250,12 @@ class TerminalManager {
             if (e.key === 'Control') {
                 e.preventDefault();
                 input.focus();
+                
+                // 滚动到工具栏位置，确保输入框可见
+                toolbar.scrollIntoView({ behavior: 'smooth', block: 'end' });
+                
                 // 显示提示
-                this.showToast('输入框已激活，现在可以输入组合键（如Ctrl+A）', 'info', 2000);
+                this.showToast('输入框已激活，现在可以输入组合键（如A对应Ctrl+A）', 'info', 2000);
             }
         });
         
@@ -1278,8 +1287,27 @@ class TerminalManager {
                 }
                 // 焦点返回终端
                 activeTab.term.focus();
+            } else if (e.key.length === 1 && !e.ctrlKey && !e.altKey) {
+                // 处理单个字符输入，作为Ctrl+字符发送
+                e.preventDefault();
+                this.sendKey(activeTab.term, e.key);
+                // 清空输入框
+                input.value = '';
+                // 焦点返回终端
+                activeTab.term.focus();
             }
         });
+        
+        // 当输入框失去焦点时，清空内容
+        input.addEventListener('blur', () => {
+            input.value = '';
+        });
+    }
+    
+    // 检测是否为移动设备
+    isMobileDevice() {
+        return /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent) || 
+               window.innerWidth <= 768;
     }
 }
 

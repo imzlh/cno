@@ -1,0 +1,644 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>炫酷个人主页 | 视觉测试</title>
+    <!-- Three.js 用于3D效果 -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <!-- Anime.js 用于动画 -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/animejs/3.2.1/anime.min.js"></script>
+    <!-- Tilt.js 用于倾斜效果 -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/vanilla-tilt/1.7.2/vanilla-tilt.min.js"></script>
+    <!-- 字体图标 -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        
+        body {
+            background: #0a0a0a;
+            color: #fff;
+            overflow-x: hidden;
+            min-height: 100vh;
+        }
+        
+        /* 粒子背景容器 */
+        #particles-js {
+            position: fixed;
+            width: 100%;
+            height: 100%;
+            z-index: -1;
+        }
+        
+        /* 主容器 */
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 2rem;
+            position: relative;
+            z-index: 10;
+        }
+        
+        /* 标题样式 */
+        header {
+            text-align: center;
+            padding: 3rem 0;
+            position: relative;
+        }
+        
+        .main-title {
+            font-size: 4.5rem;
+            font-weight: 900;
+            text-transform: uppercase;
+            letter-spacing: 0.2rem;
+            margin-bottom: 1rem;
+            background: linear-gradient(45deg, #ff00ff, #00ffff, #ffff00, #ff00ff);
+            background-size: 400% 100%;
+            -webkit-background-clip: text;
+            background-clip: text;
+            color: transparent;
+            animation: gradientShift 8s ease infinite;
+            text-shadow: 0 0 15px rgba(255, 255, 255, 0.5);
+        }
+        
+        @keyframes gradientShift {
+            0%, 100% { background-position: 0% 50%; }
+            50% { background-position: 100% 50%; }
+        }
+        
+        .subtitle {
+            font-size: 1.5rem;
+            color: #aaa;
+            margin-bottom: 2rem;
+            position: relative;
+            display: inline-block;
+        }
+        
+        .subtitle::after {
+            content: '';
+            position: absolute;
+            bottom: -10px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 100px;
+            height: 3px;
+            background: linear-gradient(90deg, transparent, #ff00ff, transparent);
+        }
+        
+        /* 内容区域 */
+        .content {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 2rem;
+            margin-top: 2rem;
+        }
+        
+        /* 卡片样式 */
+        .card {
+            background: rgba(20, 20, 30, 0.8);
+            border-radius: 20px;
+            padding: 2rem;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            transition: all 0.3s ease;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 5px;
+            background: linear-gradient(90deg, #ff00ff, #00ffff);
+        }
+        
+        .card:hover {
+            transform: translateY(-10px);
+            box-shadow: 0 20px 40px rgba(255, 0, 255, 0.3);
+        }
+        
+        .card-title {
+            font-size: 1.8rem;
+            margin-bottom: 1.5rem;
+            color: #fff;
+            display: flex;
+            align-items: center;
+            gap: 0.8rem;
+        }
+        
+        .card-title i {
+            color: #00ffff;
+            font-size: 1.5rem;
+        }
+        
+        /* 技能条 */
+        .skill {
+            margin-bottom: 1.5rem;
+        }
+        
+        .skill-name {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 0.5rem;
+        }
+        
+        .skill-bar {
+            height: 10px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 5px;
+            overflow: hidden;
+        }
+        
+        .skill-level {
+            height: 100%;
+            border-radius: 5px;
+            background: linear-gradient(90deg, #ff00ff, #00ffff);
+            position: relative;
+            width: 0;
+            transition: width 1.5s ease;
+        }
+        
+        .skill-level::after {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.4), transparent);
+            animation: shine 2s infinite;
+        }
+        
+        @keyframes shine {
+            0% { transform: translateX(-100%); }
+            100% { transform: translateX(100%); }
+        }
+        
+        /* 3D卡片容器 */
+        .card-3d-container {
+            perspective: 1000px;
+            height: 300px;
+        }
+        
+        .card-3d {
+            width: 100%;
+            height: 100%;
+            position: relative;
+            transform-style: preserve-3d;
+            transition: transform 0.8s;
+            border-radius: 20px;
+            overflow: hidden;
+        }
+        
+        .card-3d-front, .card-3d-back {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            backface-visibility: hidden;
+            border-radius: 20px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            padding: 2rem;
+            text-align: center;
+        }
+        
+        .card-3d-front {
+            background: linear-gradient(45deg, #1a1a2e, #16213e);
+            color: white;
+        }
+        
+        .card-3d-back {
+            background: linear-gradient(45deg, #0f3460, #533483);
+            color: white;
+            transform: rotateY(180deg);
+        }
+        
+        /* 联系方式 */
+        .contact-icons {
+            display: flex;
+            justify-content: center;
+            gap: 2rem;
+            margin-top: 2rem;
+            flex-wrap: wrap;
+        }
+        
+        .contact-icon {
+            width: 70px;
+            height: 70px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.8rem;
+            color: white;
+            text-decoration: none;
+            transition: all 0.3s ease;
+            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.3);
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .contact-icon::before {
+            content: '';
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(45deg, #ff00ff, #00ffff);
+            opacity: 0;
+            transition: opacity 0.3s ease;
+        }
+        
+        .contact-icon i {
+            position: relative;
+            z-index: 1;
+        }
+        
+        .contact-icon:hover::before {
+            opacity: 1;
+        }
+        
+        .contact-icon:hover {
+            transform: scale(1.2) rotate(10deg);
+        }
+        
+        /* 霓虹按钮 */
+        .neon-btn {
+            display: inline-block;
+            padding: 1rem 2.5rem;
+            background: transparent;
+            border: 2px solid #00ffff;
+            color: #00ffff;
+            font-size: 1.2rem;
+            font-weight: bold;
+            text-transform: uppercase;
+            letter-spacing: 0.1rem;
+            border-radius: 50px;
+            margin-top: 2rem;
+            cursor: pointer;
+            position: relative;
+            overflow: hidden;
+            transition: all 0.3s ease;
+            text-decoration: none;
+        }
+        
+        .neon-btn::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(0, 255, 255, 0.4), transparent);
+            transition: left 0.5s;
+        }
+        
+        .neon-btn:hover {
+            background: rgba(0, 255, 255, 0.1);
+            box-shadow: 0 0 20px rgba(0, 255, 255, 0.7);
+            color: #fff;
+        }
+        
+        .neon-btn:hover::before {
+            left: 100%;
+        }
+        
+        /* 浮动元素 */
+        .floating-element {
+            position: absolute;
+            width: 50px;
+            height: 50px;
+            border-radius: 50%;
+            background: rgba(255, 255, 255, 0.1);
+            z-index: 1;
+            animation: float 6s ease-in-out infinite;
+        }
+        
+        @keyframes float {
+            0%, 100% { transform: translateY(0) rotate(0deg); }
+            50% { transform: translateY(-20px) rotate(180deg); }
+        }
+        
+        /* 响应式设计 */
+        @media (max-width: 768px) {
+            .main-title {
+                font-size: 2.8rem;
+            }
+            
+            .content {
+                grid-template-columns: 1fr;
+            }
+            
+            .card-3d-container {
+                height: 250px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <!-- 粒子背景 -->
+    <div id="particles-js"></div>
+    
+    <!-- 浮动装饰元素 -->
+    <div class="floating-element" style="top: 10%; left: 5%; background: rgba(255, 0, 255, 0.3);"></div>
+    <div class="floating-element" style="top: 20%; right: 8%; background: rgba(0, 255, 255, 0.3); width: 70px; height: 70px;"></div>
+    <div class="floating-element" style="bottom: 15%; left: 10%; background: rgba(255, 255, 0, 0.3); width: 40px; height: 40px;"></div>
+    
+    <!-- 主容器 -->
+    <div class="container">
+        <header>
+            <h1 class="main-title">炫酷个人主页</h1>
+            <p class="subtitle">前端开发者 | 视觉设计师 | 技术爱好者</p>
+            <a href="#contact" class="neon-btn">联系我</a>
+        </header>
+        
+        <div class="content">
+            <!-- 关于我卡片 -->
+            <div class="card" data-tilt data-tilt-max="20" data-tilt-glare data-tilt-max-glare="0.5">
+                <h2 class="card-title"><i class="fas fa-user"></i>关于我</h2>
+                <p>我是一个充满激情的前端开发者，热爱创造令人惊艳的视觉体验。我专注于将创意与技术结合，打造独特而有趣的用户界面。</p>
+                <p>我的目标是创造既美观又功能强大的网页应用，为用户带来难忘的交互体验。</p>
+                <div style="margin-top: 1.5rem;">
+                    <div class="skill">
+                        <div class="skill-name">
+                            <span>HTML/CSS</span>
+                            <span>95%</span>
+                        </div>
+                        <div class="skill-bar">
+                            <div class="skill-level" data-level="95"></div>
+                        </div>
+                    </div>
+                    <div class="skill">
+                        <div class="skill-name">
+                            <span>JavaScript</span>
+                            <span>90%</span>
+                        </div>
+                        <div class="skill-bar">
+                            <div class="skill-level" data-level="90"></div>
+                        </div>
+                    </div>
+                    <div class="skill">
+                        <div class="skill-name">
+                            <span>UI/UX 设计</span>
+                            <span>85%</span>
+                        </div>
+                        <div class="skill-bar">
+                            <div class="skill-level" data-level="85"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- 3D翻转卡片 -->
+            <div class="card-3d-container" id="card3d">
+                <div class="card-3d">
+                    <div class="card-3d-front">
+                        <i class="fas fa-code" style="font-size: 3rem; margin-bottom: 1rem; color: #00ffff;"></i>
+                        <h2>前端开发</h2>
+                        <p>点击卡片翻转查看详情</p>
+                        <p style="margin-top: 1rem; font-size: 0.9rem; color: #aaa;">(将鼠标悬停在卡片上)</p>
+                    </div>
+                    <div class="card-3d-back">
+                        <h3>技术栈</h3>
+                        <ul style="margin-top: 1rem; text-align: left; list-style-type: none;">
+                            <li><i class="fas fa-check" style="color: #00ff00; margin-right: 0.5rem;"></i>React & Vue.js</li>
+                            <li><i class="fas fa-check" style="color: #00ff00; margin-right: 0.5rem;"></i>Three.js & WebGL</li>
+                            <li><i class="fas fa-check" style="color: #00ff00; margin-right: 0.5rem;"></i>Canvas & SVG动画</li>
+                            <li><i class="fas fa-check" style="color: #00ff00; margin-right: 0.5rem;"></i>CSS3高级特效</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- 项目展示 -->
+            <div class="card">
+                <h2 class="card-title"><i class="fas fa-rocket"></i>精选项目</h2>
+                <div style="margin-bottom: 1.5rem;">
+                    <h3 style="color: #00ffff; margin-bottom: 0.5rem;">交互式数据可视化</h3>
+                    <p>使用D3.js和Three.js创建的可视化平台，将复杂数据转化为直观的3D图表。</p>
+                </div>
+                <div style="margin-bottom: 1.5rem;">
+                    <h3 style="color: #00ffff; margin-bottom: 0.5rem;">动态粒子背景生成器</h3>
+                    <p>一个可自定义的粒子系统，能够生成各种炫酷的背景效果。</p>
+                </div>
+                <div>
+                    <h3 style="color: #00ffff; margin-bottom: 0.5rem;">CSS艺术画廊</h3>
+                    <p>完全使用CSS创建的动画艺术作品集合，展示CSS的无限可能性。</p>
+                </div>
+            </div>
+            
+            <!-- 联系区域 -->
+            <div class="card" id="contact">
+                <h2 class="card-title"><i class="fas fa-envelope"></i>联系方式</h2>
+                <p>如果你对我的作品感兴趣，或者有合作意向，欢迎通过以下方式联系我。</p>
+                
+                <div class="contact-icons">
+                    <a href="#" class="contact-icon" style="background: #1DA1F2;">
+                        <i class="fab fa-twitter"></i>
+                    </a>
+                    <a href="#" class="contact-icon" style="background: #2867B2;">
+                        <i class="fab fa-linkedin-in"></i>
+                    </a>
+                    <a href="#" class="contact-icon" style="background: #333;">
+                        <i class="fab fa-github"></i>
+                    </a>
+                    <a href="#" class="contact-icon" style="background: #E1306C;">
+                        <i class="fab fa-instagram"></i>
+                    </a>
+                    <a href="#" class="contact-icon" style="background: #FF0000;">
+                        <i class="fab fa-youtube"></i>
+                    </a>
+                </div>
+                
+                <div style="margin-top: 2rem; text-align: center;">
+                    <p><i class="fas fa-envelope" style="margin-right: 0.5rem;"></i>contact@example.com</p>
+                    <p style="margin-top: 0.5rem;"><i class="fas fa-phone" style="margin-right: 0.5rem;"></i>+86 138 0000 0000</p>
+                </div>
+            </div>
+        </div>
+        
+        <footer style="text-align: center; margin-top: 4rem; padding: 2rem 0; color: #666; border-top: 1px solid rgba(255, 255, 255, 0.1);">
+            <p>© 2023 炫酷个人主页 | 仅供测试使用 | 设计：前端开发者</p>
+            <p style="margin-top: 0.5rem; font-size: 0.9rem;">鼠标悬停在元素上体验交互效果</p>
+        </footer>
+    </div>
+
+    <script>
+        // 初始化粒子背景
+        function initParticles() {
+            const canvas = document.createElement('canvas');
+            canvas.style.position = 'fixed';
+            canvas.style.top = '0';
+            canvas.style.left = '0';
+            canvas.style.width = '100%';
+            canvas.style.height = '100%';
+            canvas.style.zIndex = '-1';
+            document.getElementById('particles-js').appendChild(canvas);
+            
+            const ctx = canvas.getContext('2d');
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            
+            const particles = [];
+            const particleCount = 150;
+            
+            // 创建粒子
+            for (let i = 0; i < particleCount; i++) {
+                particles.push({
+                    x: Math.random() * canvas.width,
+                    y: Math.random() * canvas.height,
+                    size: Math.random() * 3 + 1,
+                    speedX: Math.random() * 2 - 1,
+                    speedY: Math.random() * 2 - 1,
+                    color: `rgba(${Math.floor(Math.random() * 100 + 155)}, ${Math.floor(Math.random() * 100 + 155)}, 255, ${Math.random() * 0.5 + 0.2})`
+                });
+            }
+            
+            // 绘制粒子
+            function drawParticles() {
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                
+                for (let i = 0; i < particles.length; i++) {
+                    const p = particles[i];
+                    
+                    // 绘制粒子
+                    ctx.beginPath();
+                    ctx.fillStyle = p.color;
+                    ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+                    ctx.fill();
+                    
+                    // 更新粒子位置
+                    p.x += p.speedX;
+                    p.y += p.speedY;
+                    
+                    // 边界检查
+                    if (p.x > canvas.width) p.x = 0;
+                    if (p.x < 0) p.x = canvas.width;
+                    if (p.y > canvas.height) p.y = 0;
+                    if (p.y < 0) p.y = canvas.height;
+                    
+                    // 绘制粒子之间的连线
+                    for (let j = i + 1; j < particles.length; j++) {
+                        const p2 = particles[j];
+                        const distance = Math.sqrt((p.x - p2.x) ** 2 + (p.y - p2.y) ** 2);
+                        
+                        if (distance < 100) {
+                            ctx.beginPath();
+                            ctx.strokeStyle = `rgba(100, 150, 255, ${0.2 * (1 - distance/100)})`;
+                            ctx.lineWidth = 0.5;
+                            ctx.moveTo(p.x, p.y);
+                            ctx.lineTo(p2.x, p2.y);
+                            ctx.stroke();
+                        }
+                    }
+                }
+                
+                requestAnimationFrame(drawParticles);
+            }
+            
+            drawParticles();
+            
+            // 窗口大小调整时重置画布
+            window.addEventListener('resize', function() {
+                canvas.width = window.innerWidth;
+                canvas.height = window.innerHeight;
+            });
+        }
+        
+        // 初始化3D卡片交互
+        function init3DCard() {
+            const card3d = document.querySelector('.card-3d-container');
+            const card = document.querySelector('.card-3d');
+            
+            card3d.addEventListener('mouseenter', function() {
+                card.style.transform = 'rotateY(180deg)';
+            });
+            
+            card3d.addEventListener('mouseleave', function() {
+                card.style.transform = 'rotateY(0deg)';
+            });
+        }
+        
+        // 初始化技能条动画
+        function initSkillBars() {
+            const skillLevels = document.querySelectorAll('.skill-level');
+            
+            skillLevels.forEach(bar => {
+                const level = bar.getAttribute('data-level');
+                bar.style.width = '0%';
+                
+                // 延迟执行动画
+                setTimeout(() => {
+                    bar.style.width = `${level}%`;
+                }, 300);
+            });
+        }
+        
+        // 初始化倾斜效果
+        function initTiltEffect() {
+            if (typeof VanillaTilt !== 'undefined') {
+            VanillaTilt.init(document.querySelectorAll(".card"), {
+                max: 15,
+                speed: 400,
+                glare: true,
+                "max-glare": 0.3,
+            });
+            }
+        }
+        
+        // 初始化标题动画
+        function initTitleAnimation() {
+            anime({
+                targets: '.main-title',
+                translateY: [-50, 0],
+                opacity: [0, 1],
+                duration: 1500,
+                easing: 'easeOutExpo'
+            });
+            
+            anime({
+                targets: '.card',
+                translateY: [50, 0],
+                opacity: [0, 1],
+                duration: 1200,
+                delay: anime.stagger(200),
+                easing: 'easeOutExpo'
+            });
+        }
+        
+        // 页面加载完成后初始化所有效果
+        window.addEventListener('DOMContentLoaded', function() {
+            initParticles();
+            init3DCard();
+            initSkillBars();
+            initTiltEffect();
+            initTitleAnimation();
+            
+            // 为联系图标添加动画
+            const contactIcons = document.querySelectorAll('.contact-icon');
+            contactIcons.forEach((icon, index) => {
+                icon.style.transform = 'scale(0)';
+                setTimeout(() => {
+                    anime({
+                        targets: icon,
+                        scale: 1,
+                        duration: 800,
+                        easing: 'easeOutElastic(1, .5)',
+                        delay: index * 100
+                    });
+                }, 1000);
+            });
+        });
+    </script>
+</body>
+</html>
