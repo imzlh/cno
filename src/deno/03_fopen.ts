@@ -1,6 +1,6 @@
 import { malloc } from "../utils/malloc";
 import { asToDenoStat, toDenoStat, toString } from "./02_fs";
-import { wrapFsClassDec as wrap, wrapFSns } from "../utils/wrap";
+import { wrapFsClassDec as wrap, wrapFSns, wrapFSErr } from "../utils/wrap";
 
 const fs = import.meta.use('fs');
 const asfs = import.meta.use('asyncfs');
@@ -69,15 +69,25 @@ export class FSFile implements Deno.FsFile {
                 try {
                     const buf = malloc(controller);
                     const n = await $handle.read(buf, this.fpointer);
+                    if (n === null || n === 0) {
+                        controller.close();
+                        return;
+                    }
                     controller.enqueue(buf.slice(0, n));
                     this.fpointer += n;
-                } catch (e) {
-                    controller.error(e);
+                } catch (e: any) {
+                    // Wrap filesystem errors to Deno errors
+                    try {
+                        wrapFSErr(e);
+                    } catch (wrappedErr) {
+                        controller.error(wrappedErr);
+                        return;
+                    }
                 }
             },
             type: "bytes"
         });
-        this.writable = new WritableStream({
+        this.writable = new WritableStream<Uint8Array<ArrayBuffer>>({
             write: async (chunk, control) => {
                 try {
                     let written = 0;
@@ -94,7 +104,7 @@ export class FSFile implements Deno.FsFile {
     }
 
     @wrap
-    async write(data: Uint8Array) {
+    async write(data: Uint8Array<ArrayBuffer>) {
         const n = await this.$handle.write(data, this.fpointer);
         this.fpointer += n;
         return n;
@@ -109,8 +119,9 @@ export class FSFile implements Deno.FsFile {
     }
 
     @wrap
-    async read(p: Uint8Array): Promise<number | null> {
+    async read(p: Uint8Array<ArrayBuffer>): Promise<number | null> {
         const n = await this.$handle.read(p, this.fpointer);
+        if (n === null) return null;
         this.fpointer += n;
         return n;
     }

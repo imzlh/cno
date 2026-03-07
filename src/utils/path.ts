@@ -1,54 +1,43 @@
-
-/**
- * Join path segments
- */
-export function join(...segments: string[]): string {
-    return segments
-        .filter(Boolean)
-        .join('/')
-        .replace(/\/+/g, '/');
+export function join(...parts: string[]): string {
+    let path = '';
+    for (const p of parts) {
+        if (!p) continue;
+        if (path) path += '/';
+        path += p;
+    }
+    return normalize(path);
 }
 
-/**
- * Get directory name from path
- */
 export function dirname(path: string): string {
-    const normalized = path.replace(/\\/g, '/');
-    const lastSlash = normalized.lastIndexOf('/');
-    return lastSlash > 0 ? normalized.substring(0, lastSlash) : '.';
+    const i = path.lastIndexOf('/');
+    return i > 0 ? path.slice(0, i) : '.';
 }
 
-/**
- * Get file extension
- */
 export function getExtension(path: string): string {
-    const lastDot = path.lastIndexOf('.');
-    return lastDot > 0 ? path.substring(lastDot) : '';
+    const i = path.lastIndexOf('.');
+    const j = path.lastIndexOf('/');
+    return i > j ? path.slice(i) : '';
 }
 
-/**
- * Normalize path (resolve . and ..)
- */
 export function normalize(path: string): string {
-    const parts = path.split('/').filter(p => p && p !== '.');
-    const result: string[] = [];
-
-    for (const part of parts) {
-        if (part === '..') {
-            if (result.length > 0 && result.at(-1) !== '..') {
-                result.pop();
-            } else if (!path.startsWith('/')) {
-                result.push('..');
+    const abs = path[0] === '/';
+    const out: string[] = [];
+    let cur = '';
+    
+    for (let i = abs ? 1 : 0; i <= path.length; i++) {
+        const ch = i < path.length ? path[i] : '/';
+        if (ch === '/') {
+            if (cur === '..') {
+                if (out.length && out[out.length - 1] !== '..') out.pop();
+                else if (!abs) out.push('..');
+            } else if (cur && cur !== '.') {
+                out.push(cur);
             }
+            cur = '';
         } else {
-            result.push(part);
+            cur += ch;
         }
     }
-
-    let normalized = result.join('/');
-    if (path.startsWith('/') && !normalized.startsWith('/')) {
-        normalized = '/' + normalized;
-    }
-
-    return normalized || '.';
+    
+    return (abs ? '/' : '') + out.join('/') || '.';
 }

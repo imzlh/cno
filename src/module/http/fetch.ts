@@ -9,6 +9,7 @@ import {
 } from './http';
 import { Headers } from 'headers-polyfill';
 import { assert } from '../../utils/assert';
+import { HttpClient } from '../../deno/07_http';
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
@@ -37,6 +38,7 @@ export class Request implements globalThis.Request {
 
     private _bodySource: BodyInit | null = null;
     private _bodyBuffer: Uint8Array | null = null;
+    private _client: HttpClient | null = null;
 
     constructor(input: RequestInfo | URL, init?: RequestInit) {
         // 解析 input
@@ -85,6 +87,11 @@ export class Request implements globalThis.Request {
         const methodsWithoutBody = ['GET', 'HEAD'];
         if (methodsWithoutBody.includes(this.method) && this.body) {
             throw new TypeError(`Request with ${this.method} method cannot have body`);
+        }
+
+        // 提取 Deno 特定的 client 选项
+        if (init && 'client' in init) {
+            this._client = (init as any).client as HttpClient;
         }
     }
 
@@ -136,7 +143,7 @@ export class Request implements globalThis.Request {
             throw new TypeError('Already read');
         }
 
-        return new Request(this.url, {
+        const cloned = new Request(this.url, {
             method: this.method,
             headers: this.headers,
             body: this._bodySource,
@@ -148,8 +155,14 @@ export class Request implements globalThis.Request {
             redirect: this.redirect,
             referrer: this.referrer,
             referrerPolicy: this.referrerPolicy,
-            signal: this.signal
-        });
+            signal: this.signal,
+            client: this._client
+        } as RequestInit);
+        return cloned;
+    }
+
+    getClient(): HttpClient | null {
+        return this._client;
     }
 
     async getBodyBuffer(): Promise<Uint8Array | null> {
@@ -254,40 +267,53 @@ export class Response implements globalThis.Response {
         if (bodyInit instanceof ReadableStream)
             return bodyInit as ReadableStream<Uint8Array>;
 
+        // Compute length synchronously for types where it's known upfront,
+        // so headers are correct before the stream is consumed.
+        let data: Uint8Array | null = null;
+
+        if (typeof bodyInit === 'string') {
+            data = engine.encodeString(bodyInit);
+        } else if (bodyInit instanceof Uint8Array) {
+            // @ts-ignore
+            data = bodyInit;
+        } else if (bodyInit instanceof ArrayBuffer) {
+            data = new Uint8Array(bodyInit);
+        } else if (bodyInit instanceof URLSearchParams) {
+            data = engine.encodeString(bodyInit.toString());
+            if (!this.headers.has('content-type'))
+                this.headers.set('content-type', 'application/x-www-form-urlencoded');
+        }
+
+        if (data !== null) {
+            // Length is known now — set it before the stream is ever read
+            if (!this.headers.has('content-length'))
+                this.headers.set('content-length', String(data.length));
+            const captured = data;
+            return new ReadableStream({
+                start(controller) {
+                    controller.enqueue(captured);
+                    controller.close();
+                }
+            });
+        }
+
+        // Async types (Blob, FormData) — length only known after awaiting
         return new ReadableStream({
             start: async (controller) => {
                 try {
-                    let bodyLen = -1;
-                    let data: Uint8Array;
-
-                    if (typeof bodyInit === 'string') {
-                        data = engine.encodeString(bodyInit);
-                        bodyLen = data.length;
-                    } else if (bodyInit instanceof Uint8Array) {
-                        // @ts-ignore
-                        data = bodyInit;
-                        bodyLen = bodyInit.length;
-                    } else if (bodyInit instanceof ArrayBuffer) {
-                        data = new Uint8Array(bodyInit);
-                        bodyLen = bodyInit.byteLength;
-                    } else if (bodyInit instanceof Blob) {
+                    let resolved: Uint8Array;
+                    if (bodyInit instanceof Blob) {
                         const buffer = await bodyInit.arrayBuffer();
-                        data = new Uint8Array(buffer);
-                        bodyLen = buffer.byteLength;
-                    } else if (bodyInit instanceof URLSearchParams) {
-                        data = engine.encodeString(bodyInit.toString());
-                        bodyLen = data.length;
+                        resolved = new Uint8Array(buffer);
                     } else if (bodyInit instanceof FormData) {
                         throw new Error('FormData not yet implemented');
                     } else {
-                        data = engine.encodeString(JSON.stringify(bodyInit));
-                        bodyLen = data.length;
+                        resolved = engine.encodeString(JSON.stringify(bodyInit));
                     }
-
-                    controller.enqueue(data);
+                    if (!this.headers.has('content-length'))
+                        this.headers.set('content-length', String(resolved.length));
+                    controller.enqueue(resolved);
                     controller.close();
-
-                    this.headers.set('content-length', String(bodyLen));
                 } catch (err) {
                     controller.error(err);
                 }
@@ -543,12 +569,14 @@ async function performFetch(
 
     // 获取连接
     const port = url.port ? parseInt(url.port) : (url.protocol === 'https:' ? 443 : 80);
+    const client = request.getClient();
     const connection = await connectionManager.acquire({
         hostname: url.hostname,
         port,
         protocol: url.protocol as 'http:' | 'https:',
         keepAlive: request.keepalive,
-        timeout: 30000
+        timeout: 30000,
+        client: client || undefined
     });
 
     try {
@@ -623,12 +651,31 @@ async function performFetch(
  */
 async function sendRequest(request: Request, url: URL, connection: Connection): Promise<void> {
     const bodyBuffer = await request.getBodyBuffer();
+    const client = request.getClient();
 
-    const builder = new HttpRequestBuilder(url, {
+    // When using HTTP proxy, use full URL as path
+    const isUsingProxy = client?.shouldUseProxy(url) && url.protocol === 'http:';
+    let requestUrl: URL | string = url;
+    
+    if (isUsingProxy) {
+        // Full URL for proxy
+        requestUrl = url.toString();
+    }
+
+    const builder = new HttpRequestBuilder(requestUrl, {
         method: request.method as HttpMethod,
         headers: request.headers as any,
-        body: bodyBuffer
+        body: bodyBuffer,
+        proxy: isUsingProxy
     });
+
+    // Add Proxy-Authorization if needed
+    if (isUsingProxy) {
+        const proxyAuth = client!.getProxyAuth();
+        if (proxyAuth) {
+            builder.getHeaders().set('Proxy-Authorization', proxyAuth);
+        }
+    }
 
     const requestBytes = builder.build();
     await connection.write(requestBytes);

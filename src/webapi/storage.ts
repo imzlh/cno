@@ -34,14 +34,6 @@ interface StorageEventInit {
     storageArea: Storage | null;
 }
 
-interface StorageRow {
-    key: string;
-    value: string;
-    size: number;
-    created_at: number;
-    updated_at: number;
-}
-
 interface StorageStats {
     count: number;
     totalSize: number;
@@ -75,7 +67,7 @@ class StorageEvent extends Event {
 // ============================================================================
 
 class Storage {
-    private db: CModuleSQLite3.Sqlite3Handle;
+    private db!: CModuleSQLite3.Sqlite3Handle;
     private options: Required<StorageOptions>;
     private eventListeners: Map<string, Set<Function>> = new Map();
     private stmtCache: Map<string, CModuleSQLite3.Sqlite3Stmt> = new Map();
@@ -99,11 +91,10 @@ class Storage {
             path: ':memory:',
             ...(options ?? {})
         };
+        if (this.options.path !== ':memory:') {
+            this.ensureStorageDirectory();
+        }
 
-        this.ensureStorageDirectory();
-        this.db = options?.path 
-            ? sqlite3.open(this.options.path, sqlite3.SQLITE_OPEN_READWRITE | sqlite3.SQLITE_OPEN_CREATE)
-            : sqlite3.open(':memory:', sqlite3.SQLITE_OPEN_READWRITE | sqlite3.SQLITE_OPEN_CREATE | sqlite3.SQLITE_OPEN_MEMORY | sqlite3.SQLITE_OPEN_NOMUTEX);        
         this.openDatabase();
         this.initializeSchema();
         this.prepareStatements();
@@ -123,7 +114,7 @@ class Storage {
      */
     private ensureStorageDirectory() {
         const dir = this.getDirectoryPath(this.options.path);
-        if (dir && !fs.exists(dir)) {
+        if (dir && dir !== '.' && !fs.exists(dir)) {
             this.mkdirRecursive(dir);
         }
     }
@@ -132,6 +123,9 @@ class Storage {
      * Get directory path from file path
      */
     private getDirectoryPath(path: string): string {
+        if (path === ':memory:' || !path.includes('/')) {
+            return '';
+        }
         const lastSlash = path.lastIndexOf('/');
         return lastSlash > 0 ? path.substring(0, lastSlash) : '';
     }
@@ -140,6 +134,8 @@ class Storage {
      * Create directory recursively
      */
     private mkdirRecursive(path: string): void {
+        if (!path || path === '.') return;
+        
         const parts = path.split('/').filter(p => p);
         let current = path.startsWith('/') ? '/' : '';
 
@@ -158,15 +154,38 @@ class Storage {
     private openDatabase(): void {
         this.log('Opening database:', this.options.path);
 
-        const flags = sqlite3.SQLITE_OPEN_READWRITE |
-            sqlite3.SQLITE_OPEN_CREATE;
+        const isMemory = this.options.path === ':memory:';
+        
+        let flags: number;
+        if (isMemory) {
+            flags = sqlite3.O_READWRITE | 
+                    sqlite3.O_CREATE | 
+                    sqlite3.O_MEMORY;
+        } else {
+            flags = sqlite3.O_READWRITE | 
+                    sqlite3.O_CREATE;
+        }
 
-        this.db = sqlite3.open(this.options.path, flags);
+        try {
+            this.db = sqlite3.open(this.options.path, flags);
+            this.log('Database opened successfully');
+        } catch (error) {
+            this.log('Failed to open database:', error, 'with config:', this.options);
+            throw new Error(`Failed to open storage database at ${this.options.path}: ${error}`);
+        }
 
-        // Enable WAL mode for better concurrency
+        if (isMemory) {
+            this.db.exec('PRAGMA foreign_keys=ON;');
+            return;
+        }
+
         if (this.options.useWAL) {
-            this.db.exec('PRAGMA journal_mode=WAL;');
-            this.log('Enabled WAL mode');
+            try {
+                this.db.exec('PRAGMA journal_mode=WAL;');
+                this.log('Enabled WAL mode');
+            } catch (e) {
+                this.log('Failed to enable WAL mode:', e);
+            }
         }
 
         // Set synchronous mode for better performance
@@ -192,34 +211,34 @@ class Storage {
 
         // Create storage table with proper indexes
         this.db.exec(`
-      CREATE TABLE IF NOT EXISTS storage (
-        key TEXT PRIMARY KEY NOT NULL,
-        value TEXT NOT NULL,
-        size INTEGER NOT NULL,
-        created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000),
-        updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000)
-      ) WITHOUT ROWID;
-    `);
+            CREATE TABLE IF NOT EXISTS storage (
+                key TEXT PRIMARY KEY NOT NULL,
+                value TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000),
+                updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000)
+            ) WITHOUT ROWID;
+        `);
 
         // Create index on updated_at for efficient cleanup
         this.db.exec(`
-      CREATE INDEX IF NOT EXISTS idx_storage_updated 
-      ON storage(updated_at);
-    `);
+            CREATE INDEX IF NOT EXISTS idx_storage_updated 
+            ON storage(updated_at);
+        `);
 
         // Create metadata table for storage info
         this.db.exec(`
-      CREATE TABLE IF NOT EXISTS storage_metadata (
-        key TEXT PRIMARY KEY NOT NULL,
-        value TEXT NOT NULL
-      ) WITHOUT ROWID;
-    `);
+            CREATE TABLE IF NOT EXISTS storage_metadata (
+                key TEXT PRIMARY KEY NOT NULL,
+                value TEXT NOT NULL
+            ) WITHOUT ROWID;
+        `);
 
         // Insert initial metadata
         const stmt = this.db.prepare(`
-      INSERT OR IGNORE INTO storage_metadata (key, value)
-      VALUES ('version', '1'), ('name', ?);
-    `);
+            INSERT OR IGNORE INTO storage_metadata (key, value)
+            VALUES ('version', '1'), ('name', ?);
+        `);
         stmt.run([this.options.name]);
         stmt.finalize();
 
@@ -236,13 +255,13 @@ class Storage {
             this.db.prepare('SELECT value FROM storage WHERE key = ?')
         );
 
-        // Set item (upsert) - 修改为兼容老版本 SQLite 的语法
+        // Set item (upsert)
         this.stmtCache.set(
             Storage.STMT_SET,
             this.db.prepare(`
-        INSERT OR REPLACE INTO storage (key, value, size, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?)
-      `)
+                INSERT OR REPLACE INTO storage (key, value, size, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+            `)
         );
 
         // Delete item
@@ -353,7 +372,7 @@ class Storage {
     get length(): number {
         try {
             const stmt = this.stmtCache.get(Storage.STMT_COUNT)!;
-            const result = sqlite3.stmt_all(stmt, []);
+            const result = stmt.all([]);
             return result[0]!.count as number;
         } catch (error) {
             this.log('Error getting length:', error);
@@ -457,8 +476,8 @@ class Storage {
             // Dispatch storage event
             this.dispatchStorageEvent(null, null, null);
 
-            // Optimize database after clear
-            if (this.options.autoVacuum) {
+            // Optimize database after clear 
+            if (this.options.autoVacuum && this.options.path !== ':memory:') {
                 this.db.exec('PRAGMA incremental_vacuum;');
             }
         } catch (error) {
@@ -573,7 +592,7 @@ class Storage {
         try {
             this.log('Optimizing database');
 
-            if (this.options.autoVacuum) {
+            if (this.options.autoVacuum && this.options.path !== ':memory:') {
                 this.db.exec('PRAGMA incremental_vacuum;');
             }
 
@@ -780,11 +799,19 @@ export function closeAllStorages(): void {
 }
 
 function StorageCtor(): never {
-    throw new Error('Storage is not constructable.');
+    throw new Error('Storage is not constructable. Use createStorage() or getLocalStorage() instead.');
 }
 StorageCtor.prototype = Storage.prototype;
 
-globalThis.localStorage = getLocalStorage();
-globalThis.sessionStorage = getSessionStorage();
+// 安全地挂载到 globalThis，避免重复初始化
+if (!globalThis.localStorage) {
+    globalThis.localStorage = getLocalStorage();
+}
+if (!globalThis.sessionStorage) {
+    globalThis.sessionStorage = getSessionStorage();
+}
 // @ts-ignore
-globalThis.Storage = StorageCtor;
+if (!globalThis.Storage) {
+    // @ts-ignore
+    globalThis.Storage = StorageCtor;
+}

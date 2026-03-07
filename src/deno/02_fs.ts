@@ -43,9 +43,13 @@ export function toDenoStat(stat: CModuleFS.Stats) {
 export function asToDenoStat(stat: CModuleAsyncFS.StatResult) {
     return {
         ...stat,
-        isSymlink: stat.isSymbolicLink,
-        isCharDevice: stat.isCharacterDevice,
-        isFifo: stat.isFIFO
+        isSymlink: !!stat.isSymbolicLink,
+        isCharDevice: !!stat.isCharacterDevice,
+        isFifo: !!stat.isFIFO,
+        isDirectory: !!stat.isDirectory,
+        isFile: !!stat.isFile,
+        isBlockDevice: !!stat.isBlockDevice,
+        isSocket: !!stat.isSocket,
     } satisfies Deno.FileInfo;
 }
 
@@ -209,7 +213,7 @@ async function removeRecursive(targetPath: string): Promise<void> {
     }
 }
 
-async function denoWriteAnyFile(path: string | URL, data: string | Uint8Array | ReadableStream<string | Uint8Array>, options?: Deno.WriteFileOptions) {
+async function denoWriteAnyFile(path: string | URL, data: string | Uint8Array<ArrayBuffer> | ReadableStream<string | Uint8Array<ArrayBuffer>>, options?: Deno.WriteFileOptions) {
     let flag = "w";
     if (options?.append) {
         flag = "a";
@@ -226,7 +230,7 @@ async function denoWriteAnyFile(path: string | URL, data: string | Uint8Array | 
     if (data instanceof Uint8Array) {
         let written = 0;
         while (written < data.length) {
-            const n = await fhandle.write(data.subarray(written));
+            const n = await fhandle.write(data.subarray(written) as Uint8Array<ArrayBuffer>);
             if (n === null) {
                 throw new errors.UnexpectedEof("write");
             }
@@ -493,7 +497,7 @@ Object.assign(Deno, wrapFSns({
     },
 
     writeFile(path, data, options) {
-        return denoWriteAnyFile(path, data, options);
+        return denoWriteAnyFile(path, data as any, options);
     },
 
     writeTextFileSync(path, data, options) {

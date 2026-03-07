@@ -6,7 +6,7 @@ const engine = import.meta.use('engine');
 
 // @ts-ignore
 globalThis.addEventListener('promise', function(ev: CustomEvent) {
-    const [ promise, state, parent ]: CModuleEngine.GlobalEvents['promise']
+    const [ promise, state ]: CModuleEngine.GlobalEvents[CModuleEngine.EventType.PROMISE]
         = ev.detail;
     if (state == engine.PromiseState.CONSTRUCT) {
         // trace

@@ -17,15 +17,14 @@
     "@formatjs/intl-displaynames": "^7.0.6",
     "@formatjs/intl-numberformat": "^9.0.7",
     "@formatjs/intl-relativetimeformat": "^12.0.7",
-    "abortcontroller-polyfill": "^1.7.8",
+    "@types/node": "^25.3.0",
     "blob-polyfill": "^9.0.20240710",
-    "event-target-polyfill": "^0.0.4",
+    "buffer": "^6.0.3",
     "formdata-polyfill": "^4.0.10",
     "headers-polyfill": "^4.0.3",
     "sucrase": "^3.35.1",
     "temporal-polyfill": "^0.3.0",
     "urlpattern-polyfill": "^10.1.0",
-    "web-streams-polyfill": "^4.2.0",
     "whatwg-url": "^15.1.0"
   },
   "devDependencies": {

@@ -1,7 +1,6 @@
-import { assert } from '../utils/assert';
 import { fromError, CustomEvent, PromiseRejectionEvent, EventTarget } from './events';
 
-const { onEvent } = import.meta.use('engine');
+const { onEvent, EventType } = import.meta.use('engine');
 
 // basic polyfills
 Object.defineProperties(globalThis, {
@@ -22,14 +21,11 @@ Object.defineProperties(globalThis, {
         writable: false,
         enumerable: true,
         configurable: false
-    },
-    console: {
-        value: import.meta.use('console'),
-        writable: false,
-        enumerable: true,
-        configurable: false
     }
 });
+
+// console with format support
+await import('./console');
 
 // basic
 await import('./basic');
@@ -64,10 +60,7 @@ const { FormData } = await import('formdata-polyfill/esm.min');
 Reflect.set(globalThis, 'FormData', FormData);
 
 // abort-signal polyfill
-// @ts-ignore 欺骗abortcontroller-polyfill
-globalThis.fetch = () => void 0;
-// @ts-ignore
-await import('abortcontroller-polyfill');
+await import('./abort');
 
 // global event
 const globalEvent = new EventTarget();
@@ -79,25 +72,25 @@ Reflect.set(globalThis, 'dispatchEvent', globalEvent.dispatchEvent.bind(globalEv
 onEvent((eventName, eventData) => {
     let event;
     switch (eventName) {
-        case 'exit':
+        case EventType.EXIT:
             event = new Event('exit');
             break;
-        case 'jobexception':
+        case EventType.JOB_EXCEPTION:
             event = fromError(eventData[0]);
             console.log(eventName, eventData);
             event.preventDefault(); // prevent default error event
             break;
-        case 'unhandledrejection':
+        case EventType.UNHANDLED_REJECTION:
             event = new PromiseRejectionEvent('unhandledrejection', {
                 promise: eventData[0],
                 reason: eventData[1]
             })
             break;
-        default:
-            event = new CustomEvent(eventName, {
-                detail: eventData
-            });
+        case EventType.LOAD:
+            event = new Event('load');
             break;
+        default:
+            return true;
     }
     globalEvent.dispatchEvent(event);
     if (event.defaultPrevented) return true;

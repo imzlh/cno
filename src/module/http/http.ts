@@ -1,8 +1,3 @@
-/**
- * HTTP 消息构建与解析
- * 支持 Request/Response 的构建、解析和流式处理
- */
-
 import { Headers } from "headers-polyfill";
 import { assert } from "../../utils/assert";
 
@@ -26,13 +21,16 @@ export class HttpRequestBuilder {
     private url: URL;
     private headers: globalThis.Headers = new Headers();
     private body: Uint8Array | null = null;
+    private useFullUrl: boolean = false;
 
     constructor(url: string | URL, options?: {
         method?: HttpMethod;
         headers?: HeadersInit;
         body?: BodyInit | null;
+        proxy?: boolean;
     }) {
         this.url = typeof url === 'string' ? new URL(url) : url;
+        this.useFullUrl = options?.proxy || false;
 
         if (options?.method) {
             this.method = options.method.toUpperCase() as HttpMethod;
@@ -135,7 +133,9 @@ export class HttpRequestBuilder {
         }
 
         // 构建请求行
-        const path = this.url.pathname + this.url.search;
+        const path = this.useFullUrl 
+            ? this.url.toString()  // Full URL for proxy
+            : this.url.pathname + this.url.search;
         let request = `${this.method} ${path} HTTP/1.1\r\n`;
 
         // 添加头部

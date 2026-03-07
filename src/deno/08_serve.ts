@@ -3,7 +3,8 @@
  * Bridges between Server core and Web API (Request/Response/WebSocket)
  */
 
-import { Server, ServerConnection, createServer, type HttpRequest, type HttpResponse } from '../module/http/server';
+import { Server, createServer, type HttpRequest, type HttpResponse } from '../module/http/server';
+import { ServerConnection } from '../module/http/server-conn';
 import { WebSocket, createWebSocketFromConnection } from '../module/http/websocket';
 import { assert } from '../utils/assert';
 import { wrapFsClassDec as wrap, wrapFSns } from "../utils/wrap";
@@ -56,9 +57,11 @@ function createWebRequest(coreReq: HttpRequest, connInfo: { hostname: string; po
 class ResponseAdapter {
     private coreRes: HttpResponse;
     private headersSent = false;
+    private method: string;
 
-    constructor(coreRes: HttpResponse) {
+    constructor(coreRes: HttpResponse, method: string) {
         this.coreRes = coreRes;
+        this.method = method;
     }
 
     verify(res: Response): void {
@@ -99,63 +102,53 @@ class ResponseAdapter {
         }
     }
 
-    /**
-     * Send Web API Response to client
-     */
     async sendResponse(response: Response): Promise<void> {
-        // Check if this is a WebSocket upgrade response
         const wsResponse = response as WebSocketResponse;
         if (wsResponse[websocketSymbol]) {
-            // Handle WebSocket upgrade
             await this.handleWebSocketUpgrade(wsResponse);
             return;
         }
 
-        // Send status and headers
         const headers: Record<string, string> = {};
         response.headers.forEach((value, key) => {
-            headers[key] = value;
+            headers[key.toLowerCase()] = value;
         });
+
+        const noBodyStatus = [204, 205, 304].includes(response.status);
+        const isHead = this.method === 'HEAD';
+        const hasBody = response.body !== null && !noBodyStatus && !isHead;
+        const hasContentLength = headers['content-length'] !== undefined;
+        const hasTransferEncoding = headers['transfer-encoding'] !== undefined;
+        
+        if (hasBody && !hasContentLength && !hasTransferEncoding) {
+            headers['transfer-encoding'] = 'chunked';
+        }
+
+        // Always set Connection header for HTTP/1.1 keep-alive
+        if (!headers['connection']) {
+            headers['connection'] = 'keep-alive';
+        }
 
         const statusText = response.statusText ?? http.strstatus(response.status);
         await this.coreRes.writeHead(response.status, statusText, headers);
         this.headersSent = true;
 
-        // Send body if present
-        if (response.body) {
-            const reader = response.body.getReader();
-            const _len = response.headers.get('content-length');
-            const length = _len ? parseInt(_len, 10) : Number.MAX_SAFE_INTEGER;
-            let readed = 0;
-
-            try {
-                while (readed < length) {
-                    const { done, value } = await reader.read();
-                    if (done) break;
-
-                    await this.coreRes.write(value);
-                    readed += value.byteLength;
-                }
-            } catch (error) {
-                // 处理流关闭错误
-                if (error instanceof TypeError && error.message.includes('Stream is closed or closing')) {
-                    // 流已关闭，忽略错误并继续结束响应
-                    console.warn('Stream closed during response processing:', error.message);
-                } else {
-                    // 其他错误重新抛出
-                    throw error;
-                }
+        if (hasBody) {
+    const reader = response.body!.getReader();
+    try {
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            await this.coreRes.write(value);
+        }
+    } catch (err) {
+                this.coreRes.close();
+                throw err;
             } finally {
                 reader.releaseLock();
             }
-
-            if (readed != length) {
-                this.coreRes.close();
-                throw new Error('Body length does not match Content-Length header');
-            }
         }
 
-        // End response
         await this.coreRes.end();
     }
 
@@ -170,7 +163,8 @@ class ResponseAdapter {
             headers[key] = value;
         });
 
-        await this.coreRes.writeHead(response.status, response.statusText, headers);
+        const statusText = response.statusText ?? http.strstatus(response.status);
+        await this.coreRes.writeHead(response.status, statusText, headers);
 
         // Upgrade connection
         const conn = this.coreRes.upgrade();
@@ -296,9 +290,7 @@ function serve(
                     throw new TypeError('Handler must return a Response');
                 }
 
-                // Send response
-                const adapter = new ResponseAdapter(res);
-                // adapter.verify(webResponse);
+                const adapter = new ResponseAdapter(res, req.method);
                 await adapter.sendResponse(webResponse);
 
             } catch (error) {
@@ -423,11 +415,11 @@ function createWebSocketFromServerConnection(conn: Promise<ServerConnection>): W
         async connect() { },
 
         async write(data: Uint8Array) {
-            await conn.writeRaw(data);
+            await conn.write(data);
         },
 
         async read(size?: number): Promise<Uint8Array | null> {
-            return await conn.readRaw(size);
+            return await conn.read(size);
         },
 
         markActive() { },

@@ -432,6 +432,7 @@ Object.assign(Deno, wrapFSns({
     // @ts-ignore
     async connect(options) {
         switch (options.transport) {
+            case undefined:
             case 'tcp':
                 const host = options.hostname ?? '::';
                 const tcp = new stream.TCP(host.includes(':') ? os.AF_INET6 : os.AF_INET);
@@ -471,6 +472,7 @@ Object.assign(Deno, wrapFSns({
     // @ts-ignore
     listen(opt) {
         switch (opt.transport) {
+            case undefined:
             case 'tcp':
                 const isV4 = !opt.hostname?.includes(':');
                 const tcp = new stream.TCP(isV4 ? os.AF_INET : os.AF_INET6);

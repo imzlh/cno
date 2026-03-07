@@ -1,10 +1,3 @@
-/**
- * EventSource (Server-Sent Events) Implementation
- * Implements the WHATWG EventSource API for streaming events from server
- * 
- * Spec: https://html.spec.whatwg.org/multipage/server-sent-events.html
- */
-
 const engine = import.meta.use('engine');
 const timers = import.meta.use('timers');
 

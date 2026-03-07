@@ -1,8 +1,3 @@
-/**
- * WebSocket 完整实现
- * 支持客户端和服务器模式，符合 RFC 6455
- */
-
 const crypto = import.meta.use('crypto');
 const engine = import.meta.use('engine');
 const timers = import.meta.use('timers');

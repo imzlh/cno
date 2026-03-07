@@ -1,0 +1,455 @@
+/**
+ * Node.js dns 模块
+ * 基于 CModuleDNS 实现
+ */
+
+const dns = import.meta.use('dns');
+const os = import.meta.use('os');
+
+// ============================================================================
+// 常量
+// ============================================================================
+
+export const NODATA = 'ENODATA';
+export const FORMERR = 'EFORMERR';
+export const SERVFAIL = 'ESERVFAIL';
+export const NOTFOUND = 'ENOTFOUND';
+export const NOTIMP = 'ENOTIMP';
+export const REFUSED = 'EREFUSED';
+export const BADQUERY = 'EBADQUERY';
+export const BADNAME = 'EBADNAME';
+export const BADFAMILY = 'EBADFAMILY';
+export const BADRESP = 'EBADRESP';
+export const CONNREFUSED = 'ECONNREFUSED';
+export const TIMEOUT = 'ETIMEOUT';
+export const EOF = 'EOF';
+export const FILE = 'EFILE';
+export const NOMEM = 'ENOMEM';
+export const DESTRUCTION = 'EDESTRUCTION';
+export const BADSTR = 'EBADSTR';
+export const BADFLAGS = 'EBADFLAGS';
+export const NONAME = 'ENONAME';
+export const BADHINTS = 'EBADHINTS';
+export const NOTINITIALIZED = 'ENOTINITIALIZED';
+export const LOADIPHLPAPI = 'ELOADIPHLPAPI';
+export const ADDRGETNETWORKPARAMS = 'EADDRGETNETWORKPARAMS';
+export const CANCELLED = 'ECANCELLED';
+
+// ============================================================================
+// 解析选项
+// ============================================================================
+
+export interface ResolveOptions {
+    ttl?: boolean;
+}
+
+export interface LookupOptions {
+    family?: number;
+    hints?: number;
+    all?: boolean;
+    verbatim?: boolean;
+}
+
+export interface LookupOneOptions extends LookupOptions {
+    all?: false;
+}
+
+export interface LookupAllOptions extends LookupOptions {
+    all: true;
+}
+
+// ============================================================================
+// 解析记录类型
+// ============================================================================
+
+export interface MxRecord {
+    priority: number;
+    exchange: string;
+}
+
+export interface NaptrRecord {
+    flags: string;
+    service: string;
+    regexp: string;
+    replacement: string;
+    order: number;
+    preference: number;
+}
+
+export interface SoaRecord {
+    nsname: string;
+    hostmaster: string;
+    serial: number;
+    refresh: number;
+    retry: number;
+    expire: number;
+    minttl: number;
+}
+
+export interface SrvRecord {
+    priority: number;
+    weight: number;
+    port: number;
+    name: string;
+}
+
+export interface TxtRecord {
+    [index: number]: string;
+}
+
+export interface AnyRecord {
+    type: number;
+    value: string;
+}
+
+// ============================================================================
+// lookup - 基础域名解析
+// ============================================================================
+
+export function lookup(hostname: string, callback: (err: NodeJS.ErrnoException | null, address: string, family: number) => void): void;
+export function lookup(hostname: string, options: LookupOneOptions, callback: (err: NodeJS.ErrnoException | null, address: string, family: number) => void): void;
+export function lookup(hostname: string, options: LookupAllOptions, callback: (err: NodeJS.ErrnoException | null, addresses: Array<{ address: string; family: number }>) => void): void;
+export function lookup(hostname: string, options: LookupOptions, callback: (err: NodeJS.ErrnoException | null, address: string | Array<{ address: string; family: number }>, family: number) => void): void;
+export function lookup(hostname: string, options?: any, callback?: any): void {
+    if (typeof options === 'function') {
+        callback = options;
+        options = {};
+    }
+
+    const family = options?.family ?? 0;
+    const all = options?.all ?? false;
+
+    dns.resolve(hostname, { family: family === 0 ? os.AF_UNSPEC : family === 4 ? os.AF_INET : os.AF_INET6 }).then(
+        addresses => {
+            if (all) {
+                callback(null, addresses.map(a => ({ address: a.ip, family: a.family })));
+            } else {
+                const addr = addresses[0];
+                if (addr) {
+                    callback(null, addr.ip, addr.family);
+                } else {
+                    callback(new Error(`ENOTFOUND ${hostname}`), '', 0);
+                }
+            }
+        },
+        err => callback(err)
+    );
+}
+
+export function lookupSync(hostname: string, options?: LookupOptions): string | Array<{ address: string; family: number }> {
+    const family = options?.family ?? 0;
+    const all = options?.all ?? false;
+
+    const addresses = dns.resolveSync(hostname, { family: family === 0 ? os.AF_UNSPEC : family === 4 ? os.AF_INET : os.AF_INET6 });
+
+    if (all) {
+        return addresses.map(a => ({ address: a.ip, family: a.family }));
+    }
+
+    return addresses[0]?.ip ?? '';
+}
+
+// ============================================================================
+// resolve - 解析特定类型记录
+// ============================================================================
+
+export function resolve(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
+export function resolve(hostname: string, rrtype: 'A', callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
+export function resolve(hostname: string, rrtype: 'AAAA', callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
+export function resolve(hostname: string, rrtype: 'ANY', callback: (err: NodeJS.ErrnoException | null, addresses: AnyRecord[]) => void): void;
+export function resolve(hostname: string, rrtype: 'CNAME', callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
+export function resolve(hostname: string, rrtype: 'MX', callback: (err: NodeJS.ErrnoException | null, addresses: MxRecord[]) => void): void;
+export function resolve(hostname: string, rrtype: 'NAPTR', callback: (err: NodeJS.ErrnoException | null, addresses: NaptrRecord[]) => void): void;
+export function resolve(hostname: string, rrtype: 'NS', callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
+export function resolve(hostname: string, rrtype: 'PTR', callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
+export function resolve(hostname: string, rrtype: 'SOA', callback: (err: NodeJS.ErrnoException | null, addresses: SoaRecord) => void): void;
+export function resolve(hostname: string, rrtype: 'SRV', callback: (err: NodeJS.ErrnoException | null, addresses: SrvRecord[]) => void): void;
+export function resolve(hostname: string, rrtype: 'TXT', callback: (err: NodeJS.ErrnoException | null, addresses: TxtRecord[]) => void): void;
+export function resolve(hostname: string, rrtype?: any, callback?: any): void {
+    if (typeof rrtype === 'function') {
+        callback = rrtype;
+        rrtype = 'A';
+    }
+
+    const typeMap: Record<string, number> = {
+        'A': dns.A,
+        'AAAA': dns.AAAA,
+        'CNAME': dns.CNAME,
+        'MX': dns.MX,
+        'NAPTR': dns.NAPTR,
+        'NS': dns.NS,
+        'PTR': dns.PTR,
+        'SOA': dns.SOA,
+        'SRV': dns.SRV,
+        'TXT': dns.TXT,
+        'ANY': dns.A,
+    };
+
+    const queryType = typeMap[rrtype] ?? dns.A;
+
+    dns.query(hostname, queryType).then(
+        answers => {
+            if (rrtype === 'A' || rrtype === 'AAAA') {
+                callback(null, answers.map((a: any) => a.address));
+            } else if (rrtype === 'CNAME') {
+                callback(null, answers.map((a: any) => a.cname));
+            } else if (rrtype === 'MX') {
+                callback(null, answers.map((a: any) => ({ priority: a.priority, exchange: a.exchange })));
+            } else if (rrtype === 'NS') {
+                callback(null, answers.map((a: any) => a.ns));
+            } else if (rrtype === 'PTR') {
+                callback(null, answers.map((a: any) => a.ptr));
+            } else if (rrtype === 'SOA') {
+                const a = answers[0] as any;
+                callback(null, {
+                    nsname: a.primary,
+                    hostmaster: a.admin,
+                    serial: a.serial,
+                    refresh: a.refresh,
+                    retry: a.retry,
+                    expire: a.expire,
+                    minttl: a.minimum,
+                });
+            } else if (rrtype === 'SRV') {
+                callback(null, answers.map((a: any) => ({
+                    priority: a.priority,
+                    weight: a.weight,
+                    port: a.port,
+                    name: a.target,
+                })));
+            } else if (rrtype === 'TXT') {
+                callback(null, answers.map((a: any) => [a.txt]));
+            } else {
+                callback(null, answers);
+            }
+        },
+        err => callback(err)
+    );
+}
+
+// ============================================================================
+// resolve4 / resolve6
+// ============================================================================
+
+export function resolve4(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
+export function resolve4(hostname: string, options: { ttl: true }, callback: (err: NodeJS.ErrnoException | null, addresses: Array<{ address: string; ttl: number }>) => void): void;
+export function resolve4(hostname: string, options?: any, callback?: any): void {
+    if (typeof options === 'function') {
+        callback = options;
+        options = {};
+    }
+
+    dns.query(hostname, dns.A).then(
+        answers => {
+            if (options?.ttl) {
+                callback(null, answers.map((a: any) => ({ address: a.address, ttl: a.ttl })));
+            } else {
+                callback(null, answers.map((a: any) => a.address));
+            }
+        },
+        err => callback(err)
+    );
+}
+
+export function resolve6(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
+export function resolve6(hostname: string, options: { ttl: true }, callback: (err: NodeJS.ErrnoException | null, addresses: Array<{ address: string; ttl: number }>) => void): void;
+export function resolve6(hostname: string, options?: any, callback?: any): void {
+    if (typeof options === 'function') {
+        callback = options;
+        options = {};
+    }
+
+    dns.query(hostname, dns.AAAA).then(
+        answers => {
+            if (options?.ttl) {
+                callback(null, answers.map((a: any) => ({ address: a.address, ttl: a.ttl })));
+            } else {
+                callback(null, answers.map((a: any) => a.address));
+            }
+        },
+        err => callback(err)
+    );
+}
+
+// ============================================================================
+// resolveCname / resolveMx / resolveNs / resolveTxt / resolveSrv / resolvePtr / resolveSoa
+// ============================================================================
+
+export function resolveCname(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void {
+    resolve(hostname, 'CNAME', callback);
+}
+
+export function resolveMx(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: MxRecord[]) => void): void {
+    resolve(hostname, 'MX', callback);
+}
+
+export function resolveNs(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void {
+    resolve(hostname, 'NS', callback);
+}
+
+export function resolveTxt(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[][]) => void): void {
+    dns.query(hostname, dns.TXT).then(
+        answers => callback(null, answers.map((a: any) => [a.txt])),
+        err => callback(err, [])
+    );
+}
+
+export function resolveSrv(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: SrvRecord[]) => void): void {
+    resolve(hostname, 'SRV', callback);
+}
+
+export function resolvePtr(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void {
+    resolve(hostname, 'PTR', callback);
+}
+
+export function resolveSoa(hostname: string, callback: (err: NodeJS.ErrnoException | null, address: SoaRecord) => void): void {
+    resolve(hostname, 'SOA', callback);
+}
+
+export function resolveNaptr(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: NaptrRecord[]) => void): void {
+    resolve(hostname, 'NAPTR', callback);
+}
+
+// ============================================================================
+// reverse
+// ============================================================================
+
+export function reverse(ip: string, callback: (err: NodeJS.ErrnoException | null, hostnames: string[]) => void): void {
+    // 反向 DNS 查询
+    const ptrName = ip.split('.').reverse().join('.') + '.in-addr.arpa';
+    resolve(ptrName, 'PTR', callback);
+}
+
+// ============================================================================
+// setServers / getServers
+// ============================================================================
+
+export function setServers(servers: string[]): void {
+    // 简化实现，不实际设置
+}
+
+export function getServers(): string[] {
+    return ['8.8.8.8', '8.8.4.4'];
+}
+
+// ============================================================================
+// setDefaultResultOrder
+// ============================================================================
+
+export function setDefaultResultOrder(order: 'ipv4first' | 'verbatim'): void {
+    // 简化实现
+}
+
+// ============================================================================
+// promises API
+// ============================================================================
+
+export namespace promises {
+    export function lookup(hostname: string, options?: LookupOptions): Promise<string | Array<{ address: string; family: number }>> {
+        return new Promise((resolve, reject) => {
+            module.exports.lookup(hostname, options ?? {}, (err: any, address: any, family: any) => {
+                if (err) reject(err);
+                else resolve(options?.all ? address : address);
+            });
+        });
+    }
+
+    export function resolve(hostname: string, rrtype?: string): Promise<any> {
+        return new Promise((resolve, reject) => {
+            module.exports.resolve(hostname, rrtype ?? 'A', (err: any, addresses: any) => {
+                if (err) reject(err);
+                else resolve(addresses);
+            });
+        });
+    }
+
+    export function resolve4(hostname: string, options?: { ttl?: boolean }): Promise<string[] | Array<{ address: string; ttl: number }>> {
+        return new Promise((resolve, reject) => {
+            module.exports.resolve4(hostname, options ?? {}, (err: any, addresses: any) => {
+                if (err) reject(err);
+                else resolve(addresses);
+            });
+        });
+    }
+
+    export function resolve6(hostname: string, options?: { ttl?: boolean }): Promise<string[] | Array<{ address: string; ttl: number }>> {
+        return new Promise((resolve, reject) => {
+            module.exports.resolve6(hostname, options ?? {}, (err: any, addresses: any) => {
+                if (err) reject(err);
+                else resolve(addresses);
+            });
+        });
+    }
+
+    export function resolveCname(hostname: string): Promise<string[]> {
+        return new Promise((resolve, reject) => {
+            module.exports.resolveCname(hostname, (err: any, addresses: any) => {
+                if (err) reject(err);
+                else resolve(addresses);
+            });
+        });
+    }
+
+    export function resolveMx(hostname: string): Promise<MxRecord[]> {
+        return new Promise((resolve, reject) => {
+            module.exports.resolveMx(hostname, (err: any, addresses: any) => {
+                if (err) reject(err);
+                else resolve(addresses);
+            });
+        });
+    }
+
+    export function resolveNs(hostname: string): Promise<string[]> {
+        return new Promise((resolve, reject) => {
+            module.exports.resolveNs(hostname, (err: any, addresses: any) => {
+                if (err) reject(err);
+                else resolve(addresses);
+            });
+        });
+    }
+
+    export function resolveTxt(hostname: string): Promise<string[][]> {
+        return new Promise((resolve, reject) => {
+            module.exports.resolveTxt(hostname, (err: any, addresses: any) => {
+                if (err) reject(err);
+                else resolve(addresses);
+            });
+        });
+    }
+
+    export function resolveSrv(hostname: string): Promise<SrvRecord[]> {
+        return new Promise((resolve, reject) => {
+            module.exports.resolveSrv(hostname, (err: any, addresses: any) => {
+                if (err) reject(err);
+                else resolve(addresses);
+            });
+        });
+    }
+
+    export function resolvePtr(hostname: string): Promise<string[]> {
+        return new Promise((resolve, reject) => {
+            module.exports.resolvePtr(hostname, (err: any, addresses: any) => {
+                if (err) reject(err);
+                else resolve(addresses);
+            });
+        });
+    }
+
+    export function resolveSoa(hostname: string): Promise<SoaRecord> {
+        return new Promise((resolve, reject) => {
+            module.exports.resolveSoa(hostname, (err: any, address: any) => {
+                if (err) reject(err);
+                else resolve(address);
+            });
+        });
+    }
+
+    export function reverse(ip: string): Promise<string[]> {
+        return new Promise((resolve, reject) => {
+            module.exports.reverse(ip, (err: any, hostnames: any) => {
+                if (err) reject(err);
+                else resolve(hostnames);
+            });
+        });
+    }
+}

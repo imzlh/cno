@@ -79,7 +79,10 @@ class ReadableStreamController<R = any> implements globalThis.ReadableStreamDefa
 
         this.#closeRequested = true;
 
-        if (this.#queue.length === 0 && this.#pendingReads.length === 0) {
+        // If queue is empty, finish immediately — any pending reads get done:true.
+        // (This handles the case where close() is called from inside pull()
+        //  while a pendingRead is waiting for that pull to enqueue something.)
+        if (this.#queue.length === 0) {
             this.#finishClose();
         }
     }
