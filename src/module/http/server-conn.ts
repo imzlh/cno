@@ -194,7 +194,7 @@ export class ServerConnection extends TcpSocket {
                 if (data === null) return false;
                 if (data.length === 0) continue;
 
-                const result = this.parser.execute(data);
+                const result = this.parser.execute(data.buffer.slice(data.byteOffset, data.byteLength + data.byteOffset));
                 if (result.errno !== 0) {
                     if (result.name === "HPE_PAUSED_UPGRADE") {
                         destState      = State.UPGRADING;
@@ -215,7 +215,7 @@ export class ServerConnection extends TcpSocket {
                         try {
                             const data = await this.read();
                             if (data === null) { ctrl.close(); this.bodyCtrl = null; return; }
-                            const res = this.parser.execute(data);
+                            const res = this.parser.execute(data.buffer.slice(data.byteOffset, data.byteLength + data.byteOffset));
                             if (res.errno !== 0) { ctrl.error(new Error(`HTTP parse error: ${res.reason}`)); this.bodyCtrl = null; return; }
                             if (this.parser.state.eof) { ctrl.close(); this.bodyCtrl = null; }
                         } catch (err) {
@@ -259,7 +259,7 @@ export class ServerConnection extends TcpSocket {
                         const data = await this.read();
                         if (data === null) break;
                         if (data.length === 0) continue;
-                        this.parser.execute(data);
+                        this.parser.execute(data.buffer.slice(data.byteOffset, data.byteLength + data.byteOffset));
                         if (this.parser.state.eof) break;
                         if (this.bodyRead > 10 * 1024 * 1024) break; // safety limit
                     }
@@ -355,9 +355,7 @@ export class ServerConnection extends TcpSocket {
     }
 
     private upgradeConnection(): ServerConnection {
-        // Bug fix: was assert(this.headersSent, ...) — inverted
-        assert(!this.headersSent,                      "Cannot upgrade after headers sent");
-        assert(this.state === State.UPGRADING,         "Cannot upgrade a non-upgrading connection");
+        assert(this.state === State.UPGRADING, "Cannot upgrade a non-upgrading connection");
 
         this.state     = State.UPGRADED;
         this.keepAlive = false;

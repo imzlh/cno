@@ -77,7 +77,11 @@ export class Server {
                 const socket = await this.listener.accept() as CModuleStreams.TCP;
                 socket.setNoDelay(true);
                 socket.setKeepAlive(true, 1000);
-                await this.handleConnection(socket);
+                this.handleConnection(socket).catch(err => {
+                    if (!TcpSocket.isDisconnectError(err)) {
+                        console.error("Connection error:", err);
+                    }
+                });
             } catch (err) {
                 if (this.listening) console.error("Accept error:", err);
                 break;

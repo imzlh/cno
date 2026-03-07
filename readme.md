@@ -11,7 +11,7 @@ Built on QuickJS engine, CTS bridges the gap between circu.js runtime and Deno's
 ## Status
 
 ### WebAPI
-- [-] Event
+- [x] Event
   - [x] Event
   - [x] EventTarget
   - [x] CustomEvent
@@ -20,38 +20,38 @@ Built on QuickJS engine, CTS bridges the gap between circu.js runtime and Deno's
   - [x] ErrorEvent
   - [x] StorageEvent
   - [x] PromiseRejectionEvent
-- [-] URL、URLPattern
+- [x] URL、URLPattern
   - [x] URL
   - [x] URLSearchParams
   - [x] URLPattern (polyfill)
-- [-] Stream
+- [x] Stream
   - [x] ReadableStream
   - [x] WritableStream
   - [x] TransformStream
   - [x] ReadableStreamDefaultController
   - [x] WritableStreamDefaultController
-- [-] Blob、FormData
+- [x] Blob、FormData
   - [x] Blob
   - [x] File
   - [x] FileReader
   - [x] FormData
-- [-] AbortSignal
+- [x] AbortSignal
   - [x] AbortController
   - [x] AbortSignal
-- [-] Header Request Response
+- [x] Header Request Response
   - [x] Headers
   - [x] Request
   - [x] Response
-- [-] fetch
+- [x] fetch
   - [x] fetch API
   - [x] Redirect handling
   - [x] Connection pooling
   - [x] Keep-alive support
-- [-] WebSocket
+- [x] WebSocket
   - [x] WebSocket client
   - [x] WebSocket server upgrade
   - [x] RFC 6455 compliant
-- [-] CryptoSubtle crypto
+- [x] CryptoSubtle crypto
   - [x] crypto.getRandomValues
   - [x] SHA-1, SHA-256, SHA-384, SHA-512
   - [x] AES-CBC, AES-GCM, AES-CTR
@@ -59,24 +59,24 @@ Built on QuickJS engine, CTS bridges the gap between circu.js runtime and Deno's
   - [x] ECDSA, ECDH
   - [x] HMAC, PBKDF2
   - [x] Key generation, import, export
-- [-] performance
+- [x] performance
   - [x] performance.now()
   - [x] performance.mark()
   - [x] performance.measure()
   - [x] PerformanceObserver
-- [-] wasm
+- [x] wasm
   - [x] WebAssembly.compile
   - [x] WebAssembly.instantiate
   - [x] WebAssembly.compileStreaming
   - [x] WebAssembly.instantiateStreaming
-- [-] Storage
+- [x] Storage
   - [x] localStorage
   - [x] sessionStorage
   - [x] SQLite-backed persistence
   - [x] WAL mode support
-- [-] Temporal
+- [x] Temporal
   - [ ] Temporal (polyfill available, not enabled)
-- [-] Intl
+- [x] Intl
   - [x] DateTimeFormat
   - [x] NumberFormat
   - [x] RelativeTimeFormat
@@ -97,16 +97,16 @@ Built on QuickJS engine, CTS bridges the gap between circu.js runtime and Deno's
   - [x] permissions.query (always granted)
   - [ ] permissions.request
   - [ ] permissions.revoke
-- [x] unstable
-  - [x] ffi (soon)
+- [-] unstable
+  - [x] ffi
   - [x] kv
-  - [x] vsock
-  - [x] multicast
-  - [x] datagram (soon)
-  - [x] bundle (Deno.bundle)
-  - [x] cron
-  - [x] ws stream
-- [-] basic
+  - [-] vsock
+  - [-] multicast
+  - [-] datagram (soon)
+  - [-] bundle (Deno.bundle)
+  - [-] cron
+  - [-] ws stream (soon)
+- [x] basic
   - [x] Deno.pid / Deno.ppid
   - [x] Deno.args
   - [x] Deno.env
@@ -128,7 +128,7 @@ Built on QuickJS engine, CTS bridges the gap between circu.js runtime and Deno's
   - [x] Deno.errors
   - [x] Deno.addSignalListener
   - [x] Deno.removeSignalListener
-- [-] net
+- [x] net
   - [x] Deno.connect (TCP, Unix)
   - [x] Deno.connectTls
   - [x] Deno.listen (TCP, Unix)
@@ -138,7 +138,7 @@ Built on QuickJS engine, CTS bridges the gap between circu.js runtime and Deno's
   - [x] Deno.networkInterfaces
   - [x] TcpConn / TlsConn / UnixConn
   - [x] Listener / TcpListener / TlsListener
-- [-] fs
+- [x] fs
   - [x] Deno.readFile / readTextFile
   - [x] Deno.writeFile / writeTextFile
   - [x] Deno.readDir
@@ -154,7 +154,7 @@ Built on QuickJS engine, CTS bridges the gap between circu.js runtime and Deno's
   - [x] Deno.makeTempDir / makeTempFile
   - [x] Deno.open / FsFile
   - [x] Deno.watchFs
-- [-] terminal
+- [x] terminal
   - [x] Deno.stdin
   - [x] Deno.stdout
   - [x] Deno.stderr
@@ -167,12 +167,12 @@ Built on QuickJS engine, CTS bridges the gap between circu.js runtime and Deno's
   - [x] ChildProcess
   - [x] spawn / output / outputSync
   - [ ] Deno.umask
-- [-] serve
+- [x] serve
   - [x] Deno.serve
   - [x] HTTP/1.1 server
   - [x] HTTPS support
   - [x] Request/Response handling
-- [-] serve ws
+- [x] serve ws
   - [x] Deno.upgradeWebSocket
   - [x] WebSocket server
 

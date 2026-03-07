@@ -6,12 +6,10 @@ import { assert } from '../../utils/assert';
 import { connectionManager, Connection, type ConnectionLike } from './connection';
 import { HttpRequestBuilder, HttpResponseParser } from './http';
 import { Headers } from 'headers-polyfill';
+import { ReadableStream, WritableStream } from '../../webapi/streams';
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
-/**
- * WebSocket 操作码
- */
 export enum OpCode {
     CONTINUATION = 0x0,
     TEXT = 0x1,
@@ -21,9 +19,6 @@ export enum OpCode {
     PONG = 0xA
 }
 
-/**
- * WebSocket 就绪状态
- */
 export enum WebSocketReadyState {
     CONNECTING = 0,
     OPEN = 1,
@@ -31,9 +26,6 @@ export enum WebSocketReadyState {
     CLOSED = 3
 }
 
-/**
- * WebSocket 关闭码
- */
 export enum WebSocketCloseCode {
     NORMAL = 1000,
     GOING_AWAY = 1001,
@@ -52,9 +44,6 @@ export enum WebSocketCloseCode {
     TLS_HANDSHAKE_FAIL = 1015
 }
 
-/**
- * WebSocket 帧
- */
 interface WebSocketFrame {
     fin: boolean;
     opcode: OpCode;
@@ -62,9 +51,6 @@ interface WebSocketFrame {
     payload: Uint8Array;
 }
 
-/**
- * WebSocket 事件映射
- */
 interface WebSocketEventMap {
     open: Event;
     message: MessageEvent;
@@ -72,11 +58,147 @@ interface WebSocketEventMap {
     close: CloseEvent;
 }
 
-/**
- * WebSocket 类
- */
+const HIGH_WATER_MARK = 64 * 1024;
+const MAX_BUFFERED_AMOUNT = 8 * 1024 * 1024;
+
+class SendQueue {
+    private queue: Array<{
+        data: Uint8Array;
+        resolve: () => void;
+        reject: (e: Error) => void;
+    }> = [];
+    private pending = false;
+    private connection: ConnectionLike | null;
+    private isClient: boolean;
+    private onClose: () => void;
+
+    private _bufferedAmount = 0;
+    get bufferedAmount() { return this._bufferedAmount; }
+
+    constructor(connection: ConnectionLike | null, isClient: boolean, onClose: () => void) {
+        this.connection = connection;
+        this.isClient = isClient;
+        this.onClose = onClose;
+    }
+
+    enqueue(data: Uint8Array): Promise<void> {
+        if (!this.connection) {
+            return Promise.reject(new Error('WebSocket is not open'));
+        }
+
+        if (this._bufferedAmount + data.length > MAX_BUFFERED_AMOUNT) {
+            return Promise.reject(new Error('WebSocket buffer is full'));
+        }
+
+        this._bufferedAmount += data.length;
+
+        return new Promise((resolve, reject) => {
+            this.queue.push({ data, resolve, reject });
+            this.drain();
+        });
+    }
+
+    private async drain(): Promise<void> {
+        if (this.pending || !this.connection) return;
+        if (this.queue.length === 0) return;
+
+        this.pending = true;
+
+        while (this.queue.length > 0 && this.connection) {
+            const item = this.queue.shift()!;
+            try {
+                await this.connection.write(item.data);
+                this._bufferedAmount -= item.data.length;
+                item.resolve();
+            } catch (e) {
+                this._bufferedAmount -= item.data.length;
+                item.reject(e as Error);
+                this.connection = null;
+                this.onClose();
+                this.flushQueue(new Error('Connection closed'));
+                return;
+            }
+        }
+
+        this.pending = false;
+    }
+
+    private buildFrame(opcode: OpCode, payload: Uint8Array, fin: boolean, masked: boolean): Uint8Array {
+        const payloadLength = payload.length;
+        let headerLength = 2;
+
+        if (payloadLength > 65535) {
+            headerLength += 8;
+        } else if (payloadLength > 125) {
+            headerLength += 2;
+        }
+
+        if (masked) {
+            headerLength += 4;
+        }
+
+        const frame = new Uint8Array(headerLength + payloadLength);
+        let offset = 0;
+
+        frame[offset++] = (fin ? 0x80 : 0) | opcode;
+
+        let byte2 = masked ? 0x80 : 0;
+
+        if (payloadLength <= 125) {
+            byte2 |= payloadLength;
+            frame[offset++] = byte2;
+        } else if (payloadLength <= 65535) {
+            byte2 |= 126;
+            frame[offset++] = byte2;
+            frame[offset++] = (payloadLength >> 8) & 0xFF;
+            frame[offset++] = payloadLength & 0xFF;
+        } else {
+            byte2 |= 127;
+            frame[offset++] = byte2;
+            frame[offset++] = 0;
+            frame[offset++] = 0;
+            frame[offset++] = 0;
+            frame[offset++] = 0;
+            frame[offset++] = (payloadLength >> 24) & 0xFF;
+            frame[offset++] = (payloadLength >> 16) & 0xFF;
+            frame[offset++] = (payloadLength >> 8) & 0xFF;
+            frame[offset++] = payloadLength & 0xFF;
+        }
+
+        if (masked) {
+            const maskKey = new Uint8Array(crypto.randomBytes(4));
+            frame.set(maskKey, offset);
+            offset += 4;
+
+            for (let i = 0; i < payload.length; i++) {
+                frame[offset + i] = payload[i] ^ maskKey[i % 4];
+            }
+        } else {
+            frame.set(payload, offset);
+        }
+
+        return frame;
+    }
+
+    private flushQueue(error: Error): void {
+        while (this.queue.length > 0) {
+            const item = this.queue.shift()!;
+            this._bufferedAmount -= item.data.length;
+            item.reject(error);
+        }
+    }
+
+    close(): void {
+        this.connection = null;
+        this.flushQueue(new Error('WebSocket closed'));
+    }
+
+    buildControlFrame(opcode: OpCode, payload: Uint8Array): Uint8Array {
+        return this.buildFrame(opcode, payload, true, this.isClient);
+    }
+}
+
 export class WebSocket extends EventTarget implements globalThis.WebSocket {
-    // 常量
     static readonly CONNECTING = WebSocketReadyState.CONNECTING;
     static readonly OPEN = WebSocketReadyState.OPEN;
     static readonly CLOSING = WebSocketReadyState.CLOSING;
@@ -86,7 +208,6 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
     readonly CLOSING = WebSocketReadyState.CLOSING;
     readonly CLOSED = WebSocketReadyState.CLOSED;
 
-    // 属性
     public readonly url: string;
     public readonly protocol: string = '';
     public readonly extensions: string = '';
@@ -103,31 +224,30 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
     private pongTimeout: number | null = null;
     private closeCode: number = WebSocketCloseCode.NO_STATUS;
     private closeReason: string = '';
+    private sendQueue: SendQueue;
 
-    // 事件处理器
     public onopen: ((this: globalThis.WebSocket, ev: Event) => any) | null = null;
     public onmessage: ((this: globalThis.WebSocket, ev: MessageEvent) => any) | null = null;
     public onerror: ((this: globalThis.WebSocket, ev: ErrorEvent | Event) => any) | null = null;
     public onclose: ((this: globalThis.WebSocket, ev: CloseEvent) => any) | null = null;
 
-    // buffer 相关
-    public bufferedAmount: number = 0;
+    get bufferedAmount(): number {
+        return this.sendQueue.bufferedAmount;
+    }
 
-    /**
-     * 客户端构造函数
-     */
+    get readyState(): WebSocketReadyState {
+        return this._readyState;
+    }
+
     constructor(url: string, protocols?: string | string[]);
-
-    /**
-     * 服务器端构造函数（内部使用）
-     */
     constructor(connection: Promise<ConnectionLike>, isServer: true);
 
-    constructor(urlOrConnection: string |  Promise<ConnectionLike>, protocolsOrIsServer?: string | string[] | true) {
+    constructor(urlOrConnection: string | Promise<ConnectionLike>, protocolsOrIsServer?: string | string[] | true) {
         super();
 
+        this.sendQueue = new SendQueue(null, true, () => this.handleClose(WebSocketCloseCode.ABNORMAL, 'Connection closed'));
+
         if (typeof urlOrConnection === 'string') {
-            // 客户端模式
             this.url = urlOrConnection;
             this.isClient = true;
 
@@ -138,23 +258,19 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
 
             this.connectClient();
         } else {
-            // 服务器模式
             this.url = '';
             this.isClient = false;
             this.pendingConnection = urlOrConnection;
             this._readyState = WebSocketReadyState.CONNECTING;
 
-
-            // 触发 open 事件
             urlOrConnection.then(conn => {
                 this._readyState = WebSocketReadyState.OPEN;
                 this.connection = conn;
+                this.sendQueue = new SendQueue(conn, false, () => this.handleClose(WebSocketCloseCode.ABNORMAL, 'Connection closed'));
 
-                // 传递open()
                 this.dispatchEvent(new Event('open'));
                 this.onopen?.(new Event('open'));
-                
-                // 开始接收数据
+
                 queueMicrotask(() => {
                     this.startReceiving();
                     this.startPingTimer();
@@ -163,44 +279,29 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
         }
     }
 
-    /**
-     * 就绪状态
-     */
-    get readyState(): WebSocketReadyState {
-        return this._readyState;
-    }
-
-    /**
-     * 客户端连接
-     */
     private async connectClient(): Promise<void> {
         try {
             const url = new URL(this.url);
             const isSecure = url.protocol === 'wss:';
             const port = url.port ? parseInt(url.port) : (isSecure ? 443 : 80);
 
-            // 获取连接
             this.connection = await connectionManager.acquire({
                 hostname: url.hostname,
                 port,
                 protocol: isSecure ? 'https:' : 'http:',
-                keepAlive: false // WebSocket 不使用连接池
+                keepAlive: false
             });
 
-            // 发送握手请求
             await this.sendHandshake(url);
-
-            // 等待握手响应
             await this.receiveHandshake();
 
-            // 握手成功
             this._readyState = WebSocketReadyState.OPEN;
+            this.sendQueue = new SendQueue(this.connection, true, () => this.handleClose(WebSocketCloseCode.ABNORMAL, 'Connection closed'));
             this.startReceiving();
             this.startPingTimer();
 
-            // 触发 open 事件
             this.dispatchEvent(new Event('open'));
-            if (this.onopen) this.onopen.call(this, new Event('open'));
+            this.onopen?.(new Event('open'));
 
         } catch (err) {
             this._readyState = WebSocketReadyState.CLOSED;
@@ -208,9 +309,6 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
         }
     }
 
-    /**
-     * 发送握手请求
-     */
     private async sendHandshake(url: URL): Promise<void> {
         assert(this.connection, "Connection is not established");
         const key = this.generateWebSocketKey();
@@ -232,17 +330,9 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
         });
 
         const request = builder.build();
-        this.bufferedAmount += request.length;
-        try{
-            await this.connection.write(request);
-        }finally{
-            this.bufferedAmount -= request.length;
-        }
+        await this.connection.write(request);
     }
 
-    /**
-     * 接收握手响应
-     */
     private async receiveHandshake(): Promise<void> {
         const parser = new HttpResponseParser();
         let resolved = false;
@@ -262,7 +352,6 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
                     return;
                 }
 
-                // 验证 Sec-WebSocket-Accept（简化实现）
                 const accept = headers.get('sec-websocket-accept');
                 if (!accept) {
                     reject(new Error('Missing Sec-WebSocket-Accept header'));
@@ -277,7 +366,6 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
                 if (!resolved) reject(err);
             };
 
-            // 读取响应
             (async () => {
                 try {
                     while (!resolved && this.connection) {
@@ -295,29 +383,22 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
         });
     }
 
-    /**
-     * 生成 WebSocket 密钥
-     */
     private generateWebSocketKey(): string {
         const random = crypto.randomBytes(16);
         return crypto.base64Encode(random);
     }
 
-    /**
-     * 开始接收数据
-     */
     private async startReceiving(): Promise<void> {
         try {
             while (this._readyState === WebSocketReadyState.OPEN && this.connection) {
                 const data = await this.connection.read();
 
                 if (data === null) {
-                    // 连接关闭
                     this.handleClose(WebSocketCloseCode.ABNORMAL, 'Connection closed');
                     break;
                 }
 
-                if (data.length == 0) continue;
+                if (data.length === 0) continue;
 
                 this.receiveBuffer.push(data);
                 this.processFrames();
@@ -330,9 +411,6 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
         }
     }
 
-    /**
-     * 处理接收到的帧
-     */
     private processFrames(): void {
         while (this.receiveBuffer.length > 0) {
             const frame = this.parseFrame();
@@ -342,16 +420,11 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
         }
     }
 
-    /**
-     * 解析帧
-     */
     private parseFrame(): WebSocketFrame | null {
-        // 计算缓冲区总长度
         const totalLength = this.receiveBuffer.reduce((sum, buf) => sum + buf.length, 0);
 
         if (totalLength < 2) return null;
 
-        // 合并缓冲区用于解析
         let buffer: Uint8Array;
         if (this.receiveBuffer.length === 1) {
             buffer = this.receiveBuffer[0];
@@ -364,7 +437,6 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
             }
         }
 
-        // 解析帧头
         const byte1 = buffer[0];
         const byte2 = buffer[1];
 
@@ -375,19 +447,16 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
 
         let offset = 2;
 
-        // 扩展载荷长度
         if (payloadLength === 126) {
             if (totalLength < 4) return null;
             payloadLength = (buffer[2] << 8) | buffer[3];
             offset = 4;
         } else if (payloadLength === 127) {
             if (totalLength < 10) return null;
-            // 简化：不支持超过 2^32 的长度
             payloadLength = (buffer[6] << 24) | (buffer[7] << 16) | (buffer[8] << 8) | buffer[9];
             offset = 10;
         }
 
-        // 掩码密钥
         let maskKey: Uint8Array | null = null;
         if (masked) {
             if (totalLength < offset + 4) return null;
@@ -395,18 +464,14 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
             offset += 4;
         }
 
-        // 检查是否有完整的载荷
         if (totalLength < offset + payloadLength) return null;
 
-        // 提取载荷
         let payload = buffer.slice(offset, offset + payloadLength);
 
-        // 解除掩码
         if (masked && maskKey) {
             payload = this.unmask(payload, maskKey);
         }
 
-        // 更新缓冲区
         const frameLength = offset + payloadLength;
         if (frameLength === totalLength) {
             this.receiveBuffer = [];
@@ -415,26 +480,16 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
             this.receiveBuffer = [remaining];
         }
 
-        return {
-            fin,
-            opcode,
-            masked,
-            payload
-        };
+        return { fin, opcode, masked, payload };
     }
 
-    /**
-     * 处理帧
-     */
     private handleFrame(frame: WebSocketFrame): void {
         switch (frame.opcode) {
             case OpCode.TEXT:
             case OpCode.BINARY:
                 if (frame.fin) {
-                    // 完整消息
                     this.emitMessage(frame.opcode, frame.payload);
                 } else {
-                    // 分片开始
                     this.fragmentOpcode = frame.opcode;
                     this.fragments = [frame.payload];
                 }
@@ -449,7 +504,6 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
                 this.fragments.push(frame.payload);
 
                 if (frame.fin) {
-                    // 分片结束
                     const totalLength = this.fragments.reduce((sum, f) => sum + f.length, 0);
                     const combined = new Uint8Array(totalLength);
                     let offset = 0;
@@ -481,9 +535,6 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
         }
     }
 
-    /**
-     * 发送消息
-     */
     public send(data: string | ArrayBuffer | ArrayBufferView | Blob): void {
         if (this._readyState !== WebSocketReadyState.OPEN) {
             throw new Error('WebSocket is not open');
@@ -491,128 +542,37 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
 
         if (typeof data === 'string') {
             const payload = engine.encodeString(data);
-            this.sendFrame(OpCode.TEXT, payload, true);
+            this.sendFrame(OpCode.TEXT, payload).catch(() => {});
         } else if (data instanceof Blob) {
-            // 异步处理 Blob
             data.arrayBuffer().then(buffer => {
                 const payload = new Uint8Array(buffer);
-                this.sendFrame(OpCode.BINARY, payload, true);
+                this.sendFrame(OpCode.BINARY, payload).catch(() => {});
             });
         } else {
-            // @ts-ignore
             const payload: Uint8Array = data instanceof ArrayBuffer
                 ? new Uint8Array(data)
                 : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-            this.sendFrame(OpCode.BINARY, payload, true);
+            this.sendFrame(OpCode.BINARY, payload).catch(() => {});
         }
     }
 
-    /**
-     * 发送帧
-     */
-    private async sendFrame(opcode: OpCode, payload: Uint8Array, fin: boolean = true): Promise<void> {
-        if (!this.connection) return;
-
-        const masked = this.isClient;
-        const frame = this.buildFrame(opcode, payload, fin, masked);
-
-        try {
-            this.bufferedAmount += frame.length;
-            await this.connection.write(frame);
-        } catch (err) {
-            this.emitError(err as Error);
-            this.close(WebSocketCloseCode.ABNORMAL, 'Write error');
-        } finally {
-            this.bufferedAmount -= frame.length;
+    private async sendFrame(opcode: OpCode, payload: Uint8Array): Promise<void> {
+        if (this._readyState !== WebSocketReadyState.OPEN) {
+            throw new Error('WebSocket is not open');
         }
+
+        const frame = this.sendQueue.buildControlFrame(opcode, payload);
+        await this.sendQueue.enqueue(frame);
     }
 
-    /**
-     * 构建帧
-     */
-    private buildFrame(opcode: OpCode, payload: Uint8Array, fin: boolean, masked: boolean): Uint8Array {
-        const payloadLength = payload.length;
-        let headerLength = 2;
-
-        // 计算头部长度
-        if (payloadLength > 65535) {
-            headerLength += 8;
-        } else if (payloadLength > 125) {
-            headerLength += 2;
-        }
-
-        if (masked) {
-            headerLength += 4;
-        }
-
-        const frame = new Uint8Array(headerLength + payloadLength);
-        let offset = 0;
-
-        // 字节 1: FIN + RSV + Opcode
-        frame[offset++] = (fin ? 0x80 : 0) | opcode;
-
-        // 字节 2: MASK + Payload length
-        let byte2 = masked ? 0x80 : 0;
-
-        if (payloadLength <= 125) {
-            byte2 |= payloadLength;
-            frame[offset++] = byte2;
-        } else if (payloadLength <= 65535) {
-            byte2 |= 126;
-            frame[offset++] = byte2;
-            frame[offset++] = (payloadLength >> 8) & 0xFF;
-            frame[offset++] = payloadLength & 0xFF;
-        } else {
-            byte2 |= 127;
-            frame[offset++] = byte2;
-            // 简化：只支持 32 位长度
-            frame[offset++] = 0;
-            frame[offset++] = 0;
-            frame[offset++] = 0;
-            frame[offset++] = 0;
-            frame[offset++] = (payloadLength >> 24) & 0xFF;
-            frame[offset++] = (payloadLength >> 16) & 0xFF;
-            frame[offset++] = (payloadLength >> 8) & 0xFF;
-            frame[offset++] = payloadLength & 0xFF;
-        }
-
-        // 掩码密钥
-        if (masked) {
-            const maskKey = new Uint8Array(crypto.randomBytes(4));
-            frame.set(maskKey, offset);
-            offset += 4;
-
-            // 应用掩码
-            const maskedPayload = this.mask(payload, maskKey);
-            frame.set(maskedPayload, offset);
-        } else {
-            frame.set(payload, offset);
-        }
-
-        return frame;
-    }
-
-    /**
-     * 应用掩码
-     */
-    private mask(data: Uint8Array, maskKey: Uint8Array): Uint8Array {
-        const masked = new Uint8Array(data.length);
-        for (let i = 0; i < data.length; i++) {
-            masked[i] = data[i] ^ maskKey[i % 4];
-        }
-        return masked;
-    }
-
-    /**
-     * 解除掩码
-     */
     private unmask(data: Uint8Array, maskKey: Uint8Array): Uint8Array {
-        return this.mask(data, maskKey); // 掩码是可逆的
+        const unmasked = new Uint8Array(data.length);
+        for (let i = 0; i < data.length; i++) {
+            unmasked[i] = data[i] ^ maskKey[i % 4];
+        }
+        return unmasked;
     }
 
-    /**
-     * 关闭连接
-     */
     public close(code: number = WebSocketCloseCode.NORMAL, reason: string = ''): void {
         if (this._readyState === WebSocketReadyState.CLOSING ||
             this._readyState === WebSocketReadyState.CLOSED) {
@@ -621,7 +581,6 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
 
         this._readyState = WebSocketReadyState.CLOSING;
 
-        // 发送关闭帧
         const payload = new Uint8Array(2 + engine.encodeString(reason).length);
         payload[0] = (code >> 8) & 0xFF;
         payload[1] = code & 0xFF;
@@ -629,17 +588,15 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
             payload.set(engine.encodeString(reason), 2);
         }
 
-        this.sendFrame(OpCode.CLOSE, payload, true).then(() => {
-            // 等待对方关闭帧或超时
+        this.sendFrame(OpCode.CLOSE, payload).then(() => {
             timers.setTimeout(() => {
                 this.handleClose(code, reason);
             }, 1000);
+        }).catch(() => {
+            this.handleClose(code, reason);
         });
     }
 
-    /**
-     * 处理关闭帧
-     */
     private handleCloseFrame(payload: Uint8Array): void {
         let code = WebSocketCloseCode.NO_STATUS;
         let reason = '';
@@ -652,19 +609,15 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
         }
 
         if (this._readyState === WebSocketReadyState.OPEN) {
-            // 回复关闭帧
             const response = new Uint8Array(2);
             response[0] = (code >> 8) & 0xFF;
             response[1] = code & 0xFF;
-            this.sendFrame(OpCode.CLOSE, response, true);
+            this.sendFrame(OpCode.CLOSE, response).catch(() => {});
         }
 
         this.handleClose(code, reason);
     }
 
-    /**
-     * 处理连接关闭
-     */
     private handleClose(code: number, reason: string): void {
         if (this._readyState === WebSocketReadyState.CLOSED) return;
 
@@ -673,17 +626,15 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
         this.closeReason = reason;
 
         this.stopPingTimer();
+        this.sendQueue.close();
 
         if (this.connection) {
             try {
                 this.connection.close();
-            } catch (err) {
-                // 忽略
-            }
+            } catch {}
             this.connection = null;
         }
 
-        // 触发 close 事件
         const event = new CloseEvent('close', {
             code,
             reason,
@@ -691,35 +642,15 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
         });
 
         this.dispatchEvent(event);
-        if (this.onclose) this.onclose.call(this, event);
+        this.onclose?.(event);
     }
 
-    /**
-     * 发送 Ping
-     */
-    private sendPing(): void {
-        if (this._readyState === WebSocketReadyState.OPEN) {
-            this.sendFrame(OpCode.PING, new Uint8Array(0), true);
-
-            // 设置 Pong 超时
-            this.pongTimeout = timers.setTimeout(() => {
-                this.close(WebSocketCloseCode.ABNORMAL, 'Ping timeout');
-            }, 5000);
-        }
-    }
-
-    /**
-     * 发送 Pong
-     */
     private sendPong(payload: Uint8Array): void {
         if (this._readyState === WebSocketReadyState.OPEN) {
-            this.sendFrame(OpCode.PONG, payload, true);
+            this.sendFrame(OpCode.PONG, payload).catch(() => {});
         }
     }
 
-    /**
-     * 处理 Pong
-     */
     private handlePong(): void {
         if (this.pongTimeout !== null) {
             timers.clearTimeout(this.pongTimeout);
@@ -727,18 +658,18 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
         }
     }
 
-    /**
-     * 启动 Ping 定时器
-     */
     private startPingTimer(): void {
         this.pingInterval = timers.setInterval(() => {
-            this.sendPing();
-        }, 30000); // 每 30 秒 ping 一次
+            if (this._readyState === WebSocketReadyState.OPEN) {
+                this.sendFrame(OpCode.PING, new Uint8Array(0)).catch(() => {});
+
+                this.pongTimeout = timers.setTimeout(() => {
+                    this.close(WebSocketCloseCode.ABNORMAL, 'Ping timeout');
+                }, 5000);
+            }
+        }, 30000);
     }
 
-    /**
-     * 停止 Ping 定时器
-     */
     private stopPingTimer(): void {
         if (this.pingInterval !== null) {
             timers.clearInterval(this.pingInterval);
@@ -751,9 +682,6 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
         }
     }
 
-    /**
-     * 触发消息事件
-     */
     private emitMessage(opcode: OpCode, payload: Uint8Array): void {
         let data: any;
 
@@ -767,21 +695,15 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
 
         const event = new MessageEvent('message', { data });
         this.dispatchEvent(event);
-        if (this.onmessage) this.onmessage.call(this, event);
+        this.onmessage?.(event);
     }
 
-    /**
-     * 触发错误事件
-     */
     private emitError(error: Error): void {
         const event = new ErrorEvent('error', { error, message: error.message });
         this.dispatchEvent(event);
-        if (this.onerror) this.onerror.call(this, event);
+        this.onerror?.(event);
     }
 
-    /**
-     * 添加事件监听器（类型安全）
-     */
     addEventListener<K extends keyof WebSocketEventMap>(
         type: K,
         listener: (this: WebSocket, ev: WebSocketEventMap[K]) => any,
@@ -790,9 +712,6 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
         super.addEventListener(type, listener as any, options);
     }
 
-    /**
-     * 移除事件监听器（类型安全）
-     */
     removeEventListener<K extends keyof WebSocketEventMap>(
         type: K,
         listener: (this: WebSocket, ev: WebSocketEventMap[K]) => any,
@@ -802,11 +721,181 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
     }
 }
 
-/**
- * 从服务器端连接创建 WebSocket（用于 HTTP 服务器的 upgrade）
- */
+export interface WebSocketStreamOptions {
+    protocols?: string | string[];
+}
+
+export interface WebSocketStreamConnection {
+    readable: ReadableStream<Uint8Array | string>;
+    writable: WritableStream<Uint8Array | string>;
+    extensions: string;
+    protocol: string;
+}
+
+export class WebSocketStream {
+    private ws: WebSocket;
+    private readableController: ReadableStreamDefaultController<Uint8Array | string> | null = null;
+    private _openedResolve!: (value: WebSocketStreamConnection) => void;
+    private _openedReject!: (reason: Error) => void;
+    private _closedResolve!: (value: { closeCode: number; reason: string }) => void;
+    private _closeCode = WebSocketCloseCode.NO_STATUS;
+    private _closeReason = '';
+
+    constructor(url: string | URL, options?: WebSocketStreamOptions) {
+        const urlString = typeof url === 'string' ? url : url.toString();
+
+        this.ws = new WebSocket(urlString, options?.protocols);
+        this.ws.binaryType = 'arraybuffer';
+
+        this.setupEventHandlers();
+    }
+
+    private setupEventHandlers(): void {
+        this.ws.addEventListener('open', () => {
+            this._openedResolve({
+                readable: this.createReadableStream(),
+                writable: this.createWritableStream(),
+                extensions: this.ws.extensions,
+                protocol: this.ws.protocol
+            });
+        });
+
+        this.ws.addEventListener('message', (event) => {
+            if (this.readableController) {
+                const data = event.data;
+                if (typeof data === 'string') {
+                    this.readableController.enqueue(data);
+                } else if (data instanceof ArrayBuffer) {
+                    this.readableController.enqueue(new Uint8Array(data));
+                }
+            }
+        });
+
+        this.ws.addEventListener('close', (e) => {
+            this._closeCode = e.code;
+            this._closeReason = e.reason;
+
+            if (this.readableController) {
+                try {
+                    this.readableController.close();
+                } catch {}
+                this.readableController = null;
+            }
+
+            this._closedResolve({
+                closeCode: e.code,
+                reason: e.reason
+            });
+        });
+
+        this.ws.addEventListener('error', (e) => {
+            const error = new Error('WebSocket connection failed');
+            this._openedReject(error);
+
+            if (this.readableController) {
+                try {
+                    this.readableController.error(error);
+                } catch {}
+                this.readableController = null;
+            }
+        });
+    }
+
+    get binaryType(): 'blob' | 'arraybuffer' {
+        return this.ws.binaryType;
+    }
+
+    set binaryType(value: 'blob' | 'arraybuffer') {
+        this.ws.binaryType = value;
+    }
+
+    get bufferedAmount(): number {
+        return this.ws.bufferedAmount;
+    }
+
+    get extensions(): string {
+        return this.ws.extensions;
+    }
+
+    get protocol(): string {
+        return this.ws.protocol;
+    }
+
+    get readyState(): WebSocketReadyState {
+        return this.ws.readyState;
+    }
+
+    get url(): string {
+        return this.ws.url;
+    }
+
+    opened: Promise<WebSocketStreamConnection> = new Promise((resolve, reject) => {
+        this._openedResolve = resolve;
+        this._openedReject = reject;
+    });
+
+    get closed(): Promise<{ closeCode: number; reason: string }> {
+        return new Promise((resolve) => {
+            this._closedResolve = resolve;
+        });
+    }
+
+    close(closeInfo?: { closeCode?: number; reason?: string }): void {
+        this.ws.close(closeInfo?.closeCode ?? WebSocketCloseCode.NORMAL, closeInfo?.reason ?? '');
+    }
+
+    private createReadableStream(): ReadableStream<Uint8Array | string> {
+        const self = this;
+
+        return new ReadableStream<Uint8Array | string>({
+            start(controller) {
+                self.readableController = controller;
+            },
+            pull(controller) {
+            },
+            cancel(reason) {
+                self.close({ reason: String(reason) });
+            }
+        }, {
+            highWaterMark: HIGH_WATER_MARK
+        });
+    }
+
+    private createWritableStream(): WritableStream<Uint8Array | string> {
+        const self = this;
+
+        return new WritableStream<Uint8Array | string>({
+            async write(chunk, controller) {
+                if (self.ws.readyState !== WebSocketReadyState.OPEN) {
+                    controller.error(new Error('WebSocket is not open'));
+                    return;
+                }
+
+                if (typeof chunk === 'string') {
+                    self.ws.send(chunk);
+                } else {
+                    self.ws.send(chunk);
+                }
+
+                while (self.ws.bufferedAmount > HIGH_WATER_MARK) {
+                    await new Promise(resolve => timers.setTimeout(resolve, 16));
+                }
+            },
+            close() {
+                self.close();
+            },
+            abort(reason) {
+                self.close({ reason: String(reason) });
+            }
+        }, {
+            highWaterMark: HIGH_WATER_MARK
+        });
+    }
+}
+
 export function createWebSocketFromConnection(connection: Promise<ConnectionLike>): WebSocket {
     return new WebSocket(connection, true);
 }
 
 Reflect.set(globalThis, 'WebSocket', WebSocket);
+Reflect.set(globalThis, 'WebSocketStream', WebSocketStream);
