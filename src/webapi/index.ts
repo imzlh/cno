@@ -76,13 +76,16 @@ onEvent((eventName, eventData) => {
             event = new Event('exit');
             break;
         case EventType.JOB_EXCEPTION:
+            // @ts-ignore
             event = fromError(eventData[0]);
             console.log(eventName, eventData);
             event.preventDefault(); // prevent default error event
             break;
         case EventType.UNHANDLED_REJECTION:
             event = new PromiseRejectionEvent('unhandledrejection', {
+                // @ts-ignore
                 promise: eventData[0],
+                // @ts-ignore
                 reason: eventData[1]
             })
             break;
@@ -96,6 +99,9 @@ onEvent((eventName, eventData) => {
     if (event.defaultPrevented) return true;
     return false;
 });
+
+// worker
+await import('./worker');
 
 // headers
 const { Headers } = await import('headers-polyfill');

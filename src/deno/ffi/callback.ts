@@ -14,9 +14,7 @@ import {
 } from './types';
 import { UnsafePointer, createPointerObject } from './pointer';
 
-const { ffi_load_native } = import.meta.use('ffi');
-let __ffi_cache: ReturnType<typeof ffi_load_native> | undefined;
-const getNative = () => __ffi_cache ?? (__ffi_cache = ffi_load_native());
+const ffi = import.meta.use('ffi');
 
 interface CallbackInternal {
     closure: CModuleFFI.FfiClosure;
@@ -48,11 +46,10 @@ export class UnsafeCallback<
         this.definition = definition;
         this.callback = callback;
         
-        const native = getNative();
-        const cif = this.createCif(native, definition.parameters, definition.result);
+        const cif = this.createCif(definition.parameters, definition.result);
         const wrappedCallback = this.wrapCallback(callback, definition);
         
-        const closure = new native.FfiClosure(cif, wrappedCallback);
+        const closure = new ffi.FfiClosure(cif, wrappedCallback);
         this.pointer = createPointerObject(closure.addr);
         
         this.internal = {
@@ -102,28 +99,26 @@ export class UnsafeCallback<
     }
 
     private createCif(
-        native: ReturnType<typeof ffi_load_native>,
         parameters: readonly NativeType[],
         result: NativeResultType
     ): CModuleFFI.FfiCif {
-        const retType = this.toFfiType(native, result);
-        const argTypes = parameters.map(p => this.toFfiType(native, p));
-        return new native.FfiCif(retType, ...argTypes);
+        const retType = this.toFfiType(result);
+        const argTypes = parameters.map(p => this.toFfiType(p));
+        return new ffi.FfiCif(retType, argTypes);
     }
 
     private toFfiType(
-        native: ReturnType<typeof ffi_load_native>,
-        type: NativeType | 'void'
+ type: NativeType | 'void'
     ): CModuleFFI.FfiType {
-        if (type === 'void') return native.type_void;
+        if (type === 'void') return ffi.FfiType.type_void;
         if (typeof type !== 'string') {
             if ('struct' in type) {
-                const memberTypes = type.struct.map(t => this.toFfiType(native, t));
-                return new native.FfiType(...memberTypes);
+                const memberTypes = type.struct.map(t => this.toFfiType(t));
+                return new ffi.FfiType(...memberTypes);
             }
         }
         
-        const typeMap: Record<string, keyof typeof native> = {
+        const typeMap: Record<string, keyof typeof ffi.FfiType> = {
             'u8': 'type_uint8',
             'i8': 'type_sint8',
             'u16': 'type_uint16',
@@ -147,7 +142,7 @@ export class UnsafeCallback<
             throw new TypeError(`Unknown type: ${type}`);
         }
         
-        return native[propName] as CModuleFFI.FfiType;
+        return ffi.FfiType[propName] as CModuleFFI.FfiType;
     }
 
     private wrapCallback(

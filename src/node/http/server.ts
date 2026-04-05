@@ -1,0 +1,736 @@
+const engine = import.meta.use('engine');
+const http = import.meta.use('http');
+const text = import.meta.use('text');
+
+import { Readable, Writable } from '../stream';
+import { Socket, Server as NetServer, AddressInfo } from '../net';
+import type { HttpRequest, HttpResponse } from '../../module/http/server';
+
+// @ts-ignore cno namespace
+const { createServer: createHttpServer } = http.__cno as import('http');
+
+type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
+
+export const STATUS_CODES: Record<number, string> = {
+    100: 'Continue', 101: 'Switching Protocols', 102: 'Processing', 103: 'Early Hints',
+    200: 'OK', 201: 'Created', 202: 'Accepted', 203: 'Non-Authoritative Information',
+    204: 'No Content', 205: 'Reset Content', 206: 'Partial Content',
+    207: 'Multi-Status', 208: 'Already Reported', 226: 'IM Used',
+    300: 'Multiple Choices', 301: 'Moved Permanently', 302: 'Found',
+    303: 'See Other', 304: 'Not Modified', 305: 'Use Proxy',
+    306: 'Unused', 307: 'Temporary Redirect', 308: 'Permanent Redirect',
+    400: 'Bad Request', 401: 'Unauthorized', 402: 'Payment Required',
+    403: 'Forbidden', 404: 'Not Found', 405: 'Method Not Allowed',
+    406: 'Not Acceptable', 407: 'Proxy Authentication Required',
+    408: 'Request Timeout', 409: 'Conflict', 410: 'Gone',
+    411: 'Length Required', 412: 'Precondition Failed',
+    413: 'Payload Too Large', 414: 'URI Too Long',
+    415: 'Unsupported Media Type', 416: 'Range Not Satisfiable',
+    417: 'Expectation Failed', 418: "I'm a Teapot",
+    421: 'Misdirected Request', 422: 'Unprocessable Entity',
+    423: 'Locked', 424: 'Failed Dependency', 425: 'Too Early',
+    426: 'Upgrade Required', 428: 'Precondition Required',
+    429: 'Too Many Requests', 431: 'Request Header Fields Too Large',
+    451: 'Unavailable For Legal Reasons',
+    500: 'Internal Server Error', 501: 'Not Implemented',
+    502: 'Bad Gateway', 503: 'Service Unavailable',
+    504: 'Gateway Timeout', 505: 'HTTP Version Not Supported',
+    506: 'Variant Also Negotiates', 507: 'Insufficient Storage',
+    508: 'Loop Detected', 509: 'Bandwidth Limit Exceeded',
+    510: 'Not Extended', 511: 'Network Authentication Required',
+};
+
+export const METHODS = [
+    'ACL', 'BIND', 'CHECKOUT', 'CONNECT', 'COPY', 'DELETE', 'GET', 'HEAD',
+    'LINK', 'LOCK', 'M-SEARCH', 'MERGE', 'MKACTIVITY', 'MKCALENDAR', 'MKCOL',
+    'MOVE', 'NOTIFY', 'OPTIONS', 'PATCH', 'POST', 'PROPFIND', 'PROPPATCH',
+    'PURGE', 'PUT', 'REBIND', 'REPORT', 'SEARCH', 'SOURCE', 'SUBSCRIBE',
+    'TRACE', 'UNBIND', 'UNLINK', 'UNLOCK', 'UNSUBSCRIBE',
+] as const;
+
+export interface IncomingHttpHeaders extends NodeJS.Dict<string | string[]> {
+    accept?: string | undefined;
+    'accept-encoding'?: string | undefined;
+    'accept-language'?: string | undefined;
+    'accept-patch'?: string | undefined;
+    'accept-ranges'?: string | undefined;
+    'access-control-allow-credentials'?: string | undefined;
+    'access-control-allow-headers'?: string | undefined;
+    'access-control-allow-methods'?: string | undefined;
+    'access-control-allow-origin'?: string | undefined;
+    'access-control-expose-headers'?: string | undefined;
+    'access-control-max-age'?: string | undefined;
+    'access-control-request-headers'?: string | undefined;
+    'access-control-request-method'?: string | undefined;
+    age?: string | undefined;
+    allow?: string | undefined;
+    'alt-svc'?: string | undefined;
+    authorization?: string | undefined;
+    'cache-control'?: string | undefined;
+    connection?: string | undefined;
+    'content-disposition'?: string | undefined;
+    'content-encoding'?: string | undefined;
+    'content-language'?: string | undefined;
+    'content-length'?: string | undefined;
+    'content-location'?: string | undefined;
+    'content-range'?: string | undefined;
+    'content-type'?: string | undefined;
+    cookie?: string | undefined;
+    date?: string | undefined;
+    etag?: string | undefined;
+    expect?: string | undefined;
+    expires?: string | undefined;
+    forwarded?: string | undefined;
+    from?: string | undefined;
+    host?: string | undefined;
+    'if-match'?: string | undefined;
+    'if-modified-since'?: string | undefined;
+    'if-none-match'?: string | undefined;
+    'if-unmodified-since'?: string | undefined;
+    'last-modified'?: string | undefined;
+    location?: string | undefined;
+    origin?: string | undefined;
+    pragma?: string | undefined;
+    'proxy-authenticate'?: string | undefined;
+    'proxy-authorization'?: string | undefined;
+    range?: string | undefined;
+    referer?: string | undefined;
+    'retry-after'?: string | undefined;
+    'sec-websocket-accept'?: string | undefined;
+    'sec-websocket-extensions'?: string | undefined;
+    'sec-websocket-key'?: string | undefined;
+    'sec-websocket-protocol'?: string | undefined;
+    'sec-websocket-version'?: string | undefined;
+    'set-cookie'?: string[] | undefined;
+    'strict-transport-security'?: string | undefined;
+    trailer?: string | undefined;
+    'transfer-encoding'?: string | undefined;
+    upgrade?: string | undefined;
+    'user-agent'?: string | undefined;
+    vary?: string | undefined;
+    via?: string | undefined;
+    warning?: string | undefined;
+    'www-authenticate'?: string | undefined;
+}
+
+export type OutgoingHttpHeader = number | string | string[];
+
+export interface OutgoingHttpHeaders extends NodeJS.Dict<OutgoingHttpHeader> {
+    [header: string]: OutgoingHttpHeader | undefined;
+}
+
+export interface IncomingMessage extends Readable {
+    socket: Socket;
+    connection: Socket;
+    httpVersion: string;
+    httpVersionMajor: number;
+    httpVersionMinor: number;
+    complete: boolean;
+    headers: IncomingHttpHeaders;
+    headersDistinct: NodeJS.Dict<string[]>;
+    rawHeaders: string[];
+    trailers: NodeJS.Dict<string>;
+    trailersDistinct: NodeJS.Dict<string[]>;
+    rawTrailers: string[];
+    aborted: boolean;
+    method?: string;
+    url?: string;
+    statusCode?: number;
+    statusMessage?: string;
+    setTimeout(msecs: number, callback?: () => void): this;
+    destroy(error?: Error): this;
+}
+
+export class IncomingMessageImpl extends Readable implements IncomingMessage {
+    socket: Socket;
+    httpVersion: string = '1.1';
+    httpVersionMajor: number = 1;
+    httpVersionMinor: number = 1;
+    complete: boolean = false;
+    headers: IncomingHttpHeaders = {};
+    headersDistinct: NodeJS.Dict<string[]> = {};
+    rawHeaders: string[] = [];
+    trailers: NodeJS.Dict<string> = {};
+    trailersDistinct: NodeJS.Dict<string[]> = {};
+    rawTrailers: string[] = [];
+    aborted: boolean = false;
+    method?: string;
+    url?: string;
+    statusCode?: number;
+    statusMessage?: string;
+
+    constructor(socket: Socket) {
+        super();
+        this.socket = socket;
+    }
+
+    get connection(): Socket {
+        return this.socket;
+    }
+
+    setTimeout(msecs: number, callback?: () => void): this {
+        this.socket.setTimeout(msecs, callback);
+        return this;
+    }
+
+    destroy(error?: Error): this {
+        this.aborted = true;
+        super.destroy(error);
+        return this;
+    }
+}
+
+export interface OutgoingMessage extends Writable {
+    socket: Socket | null;
+    connection: Socket | null;
+    writableEnded: boolean;
+    writableFinished: boolean;
+    headersSent: boolean;
+    sendDate: boolean;
+    finished: boolean;
+    chunkedEncoding: boolean;
+    shouldKeepAlive: boolean;
+    useChunkedEncodingByDefault: boolean;
+    setTimeout(msecs: number, callback?: () => void): this;
+    setHeader(name: string, value: number | string | readonly string[]): this;
+    setHeaders(headers: Headers | Map<string, number | string | readonly string[]>): this;
+    appendHeader(name: string, value: string | readonly string[]): this;
+    getHeader(name: string): number | string | string[] | undefined;
+    getHeaders(): OutgoingHttpHeaders;
+    getHeaderNames(): string[];
+    hasHeader(name: string): boolean;
+    removeHeader(name: string): void;
+    flushHeaders(): void;
+    addTrailers(headers: OutgoingHttpHeaders | ReadonlyArray<[string, string]>): void;
+}
+
+export class OutgoingMessageImpl extends Writable implements OutgoingMessage {
+    socket: Socket | null = null;
+    writableEnded: boolean = false;
+    writableFinished: boolean = false;
+    headersSent: boolean = false;
+    sendDate: boolean = true;
+    finished: boolean = false;
+    chunkedEncoding: boolean = false;
+    shouldKeepAlive: boolean = false;
+    useChunkedEncodingByDefault: boolean = true;
+
+    protected _headers: OutgoingHttpHeaders = {};
+    protected _headerNames: Map<string, string> = new Map();
+    protected _trailers: OutgoingHttpHeaders = {};
+    protected _rawHeaderNames: string[] = [];
+
+    get connection(): Socket | null {
+        return this.socket;
+    }
+
+    setTimeout(msecs: number, callback?: () => void): this {
+        if (this.socket) this.socket.setTimeout(msecs, callback);
+        else if (callback) this.once('socket', () => this.socket?.setTimeout(msecs, callback));
+        return this;
+    }
+
+    setHeader(name: string, value: number | string | readonly string[]): this {
+        if (this.headersSent) throw new Error('Cannot set headers after they are sent to the client');
+        const key = name.toLowerCase();
+        this._headerNames.set(key, name);
+        this._headers[key] = value as OutgoingHttpHeader;
+        return this;
+    }
+
+    setHeaders(headers: Headers | Map<string, number | string | readonly string[]>): this {
+        if (this.headersSent) throw new Error('Cannot set headers after they are sent to the client');
+        for (const [key, value] of headers) {
+            this.setHeader(key, value);
+        }
+        return this;
+    }
+
+    appendHeader(name: string, value: string | readonly string[]): this {
+        if (this.headersSent) throw new Error('Cannot set headers after they are sent to the client');
+        const key = name.toLowerCase();
+        const existing = this._headers[key];
+        if (existing === undefined) {
+            this._headerNames.set(key, name);
+            this._headers[key] = Array.isArray(value) ? value : [value];
+        } else if (Array.isArray(existing)) {
+            this._headers[key] = [...existing, ...(Array.isArray(value) ? value : [value])];
+        } else {
+            this._headers[key] = [existing as string, ...(Array.isArray(value) ? value : [value])];
+        }
+        return this;
+    }
+
+    getHeader(name: string): number | string | string[] | undefined {
+        return this._headers[name.toLowerCase()];
+    }
+
+    getHeaders(): OutgoingHttpHeaders {
+        return { ...this._headers };
+    }
+
+    getHeaderNames(): string[] {
+        return Object.keys(this._headers);
+    }
+
+    getRawHeaderNames(): string[] {
+        return [...this._rawHeaderNames];
+    }
+
+    hasHeader(name: string): boolean {
+        return this._headers[name.toLowerCase()] !== undefined;
+    }
+
+    removeHeader(name: string): void {
+        if (this.headersSent) throw new Error('Cannot remove headers after they are sent to the client');
+        const key = name.toLowerCase();
+        delete this._headers[key];
+        this._headerNames.delete(key);
+    }
+
+    addTrailers(headers: OutgoingHttpHeaders | ReadonlyArray<[string, string]>): void {
+        if (Array.isArray(headers)) {
+            for (const [key, value] of headers) {
+                this._trailers[key.toLowerCase()] = value;
+            }
+        } else {
+            for (const [key, value] of Object.entries(headers)) {
+                if (value !== undefined) this._trailers[key.toLowerCase()] = value;
+            }
+        }
+    }
+
+    flushHeaders(): void {
+        if (!this.headersSent) this._sendHeaders();
+    }
+
+    protected _formatHeaders(): string {
+        let result = '';
+        for (const [key, value] of Object.entries(this._headers)) {
+            const name = this._headerNames.get(key) || key;
+            if (Array.isArray(value)) {
+                for (const v of value) result += `${name}: ${v}\r\n`;
+            } else {
+                result += `${name}: ${value}\r\n`;
+            }
+        }
+        return result;
+    }
+
+    protected _sendHeaders(): void {
+        this.headersSent = true;
+    }
+}
+
+export interface ServerResponse extends OutgoingMessage {
+    statusCode: number;
+    statusMessage: string;
+    strictContentLength: boolean;
+    writeHead(statusCode: number, statusMessage?: string, headers?: OutgoingHttpHeaders | readonly string[]): this;
+    writeHead(statusCode: number, headers?: OutgoingHttpHeaders | readonly string[]): this;
+    writeProcessingContinue(): void;
+    writeEarlyHints(hints: Record<string, string | string[]>, callback?: () => void): void;
+}
+
+export class ServerResponseImpl extends OutgoingMessageImpl implements ServerResponse {
+    statusCode: number = 200;
+    statusMessage: string = 'OK';
+    strictContentLength: boolean = false;
+    req: IncomingMessage | null = null;
+
+    private _tcp: CModuleStreams.TCP | null = null;
+    private _ended: boolean = false;
+    private _bodyLength: number = 0;
+
+    setTcp(tcp: CModuleStreams.TCP): void {
+        this._tcp = tcp;
+    }
+
+    assignSocket(socket: Socket): void {
+        this.socket = socket;
+        socket.on('close', () => {
+            this.socket = null;
+        });
+    }
+
+    detachSocket(socket: Socket): void {
+        this.socket = null;
+    }
+
+    writeHead(statusCode: number, statusMessageOrHeaders?: string | OutgoingHttpHeaders | readonly string[], headers?: OutgoingHttpHeaders | readonly string[]): this {
+        if (this.headersSent) throw new Error('Cannot write headers after they are sent to the client');
+
+        this.statusCode = statusCode;
+        if (typeof statusMessageOrHeaders === 'string') {
+            this.statusMessage = statusMessageOrHeaders;
+        } else if (statusMessageOrHeaders !== undefined) {
+            headers = statusMessageOrHeaders;
+        }
+
+        if (headers) {
+            if (Array.isArray(headers)) {
+                for (let i = 0; i < headers.length; i += 2) {
+                    this.setHeader(headers[i], headers[i + 1]);
+                }
+            } else {
+                for (const [key, value] of Object.entries(headers)) {
+                    if (value !== undefined) this.setHeader(key, value);
+                }
+            }
+        }
+
+        if (!this.hasHeader('date') && this.sendDate) {
+            this.setHeader('Date', new Date().toUTCString());
+        }
+
+        this._sendHeaders();
+        return this;
+    }
+
+    writeProcessingContinue(): void {
+        if (this._tcp && !this.headersSent) {
+            this._tcp.write(engine.encodeString('HTTP/1.1 100 Continue\r\n\r\n'));
+        }
+    }
+
+    writeEarlyHints(hints: Record<string, string | string[]>, callback?: () => void): void {
+        if (this._tcp && !this.headersSent) {
+            let message = 'HTTP/1.1 103 Early Hints\r\n';
+            for (const [key, value] of Object.entries(hints)) {
+                if (Array.isArray(value)) {
+                    for (const v of value) message += `${key}: ${v}\r\n`;
+                } else {
+                    message += `${key}: ${value}\r\n`;
+                }
+            }
+            message += '\r\n';
+            this._tcp.write(engine.encodeString(message)).then(() => callback?.());
+        }
+    }
+
+    protected _sendHeaders(): void {
+        if (this.headersSent || !this._tcp) return;
+
+        let headerStr = `HTTP/1.1 ${this.statusCode} ${this.statusMessage}\r\n`;
+        headerStr += this._formatHeaders();
+        headerStr += '\r\n';
+
+        this._tcp.write(engine.encodeString(headerStr));
+        super._sendHeaders();
+    }
+
+    write(chunk: any, encodingOrCb?: BufferEncoding | ((err?: Error | null) => void), cb?: (err?: Error | null) => void): boolean {
+        if (this._ended) {
+            const callback = typeof encodingOrCb === 'function' ? encodingOrCb : cb;
+            callback?.(new Error('write after end'));
+            return false;
+        }
+
+        if (!this.headersSent) {
+            this.chunkedEncoding = true;
+            this.setHeader('Transfer-Encoding', 'chunked');
+            this._sendHeaders();
+        }
+
+        const encoder = new text!.Encoder(encodingOrCb as BufferEncoding);
+        const data = typeof chunk === 'string' ? encoder.encode(chunk) : chunk as Uint8Array;
+        this._bodyLength += data.length;
+
+        if (this.chunkedEncoding && this._tcp) {
+            this._tcp.write(engine.encodeString(data.length.toString(16) + '\r\n'));
+            this._tcp.write(data);
+            this._tcp.write(engine.encodeString('\r\n'));
+        } else if (this._tcp) {
+            this._tcp.write(data);
+        }
+
+        const callback = typeof encodingOrCb === 'function' ? encodingOrCb : cb;
+        callback?.();
+        return true;
+    }
+
+    end(chunk?: any, encodingOrCb?: BufferEncoding | (() => void), cb?: () => void): this {
+        let callback: (() => void) | undefined;
+        if (typeof chunk === 'function') { callback = chunk; chunk = undefined; }
+        else if (typeof encodingOrCb === 'function') { callback = encodingOrCb; }
+        else if (typeof cb === 'function') { callback = cb; }
+
+        const encoder = new text!.Encoder(encodingOrCb as BufferEncoding);
+
+        if (this._ended) {
+            callback?.();
+            return this;
+        }
+
+        const doEnd = async () => {
+            if (!this._tcp) return;
+            try {
+                if (chunk !== undefined) {
+                    const data = typeof chunk === 'string' ? encoder.encode(chunk) : chunk as Uint8Array;
+                    if (!this.headersSent) {
+                        this.setHeader('Content-Length', data.length);
+                        this._sendHeaders();
+                        await this._tcp.write(data);
+                    } else if (this.chunkedEncoding) {
+                        await this._tcp.write(engine.encodeString(data.length.toString(16) + '\r\n'));
+                        await this._tcp.write(data);
+                        await this._tcp.write(engine.encodeString('\r\n'));
+                    } else {
+                        await this._tcp.write(data);
+                    }
+                } else if (!this.headersSent) {
+                    this.setHeader('Content-Length', '0');
+                    this._sendHeaders();
+                }
+
+                if (this.chunkedEncoding) {
+                    await this._tcp.write(engine.encodeString('0\r\n\r\n'));
+                }
+
+                this._ended = true;
+                this.writableEnded = true;
+                this.finished = true;
+                this.writableFinished = true;
+                this.emit('finish');
+                callback?.();
+            } catch (err) {
+                this.emit('error', err);
+                callback?.();
+            }
+        };
+
+        doEnd();
+        return this;
+    }
+}
+
+export interface ServerOptions {
+    IncomingMessage?: typeof IncomingMessageImpl;
+    ServerResponse?: typeof ServerResponseImpl;
+    requestTimeout?: number;
+    headersTimeout?: number;
+    keepAliveTimeout?: number;
+    keepAliveTimeoutBuffer?: number;
+    maxRequestsPerSocket?: number;
+    connectionsCheckingInterval?: number;
+    highWaterMark?: number;
+    insecureHTTPParser?: boolean;
+    maxHeaderSize?: number;
+    noDelay?: boolean;
+    requireHostHeader?: boolean;
+    keepAlive?: boolean;
+    keepAliveInitialDelay?: number;
+    uniqueHeaders?: Array<string | string[]>;
+    joinDuplicateHeaders?: boolean;
+    rejectNonStandardBodyWrites?: boolean;
+    optimizeEmptyRequests?: boolean;
+}
+
+export interface ListenOptions {
+    port?: number;
+    host?: string;
+    path?: string;
+    backlog?: number;
+    exclusive?: boolean;
+    readableAll?: boolean;
+    writableAll?: boolean;
+    ipv6Only?: boolean;
+    signal?: AbortSignal;
+}
+
+export type RequestListener = (request: IncomingMessage, response: ServerResponse) => void;
+
+export interface Server extends NetServer {
+    maxHeadersCount: number | null;
+    maxRequestsPerSocket: number | null;
+    timeout: number;
+    headersTimeout: number;
+    keepAliveTimeout: number;
+    keepAliveTimeoutBuffer: number;
+    requestTimeout: number;
+    setTimeout(msecs?: number, callback?: (socket: Socket) => void): this;
+    closeAllConnections(): void;
+    closeIdleConnections(): void;
+}
+
+export class ServerImpl extends NetServer implements Server {
+    maxHeadersCount: number | null = null;
+    maxRequestsPerSocket: number | null = null;
+    timeout: number = 0;
+    headersTimeout: number = 60000;
+    keepAliveTimeout: number = 5000;
+    keepAliveTimeoutBuffer: number = 1000;
+    requestTimeout: number = 300000;
+    listening: boolean = false;
+
+    private _httpServer: any = null;
+    private _options: ServerOptions;
+    private _requestListener: RequestListener;
+    private _httpConnections: Set<Socket> = new Set();
+
+    constructor(options: ServerOptions | RequestListener, requestListener?: RequestListener) {
+        super();
+        if (typeof options === 'function') {
+            this._requestListener = options;
+            this._options = {};
+        } else {
+            this._options = options || {};
+            this._requestListener = requestListener!;
+        }
+        if (this._options.requestTimeout !== undefined) this.requestTimeout = this._options.requestTimeout;
+        if (this._options.headersTimeout !== undefined) this.headersTimeout = this._options.headersTimeout;
+        if (this._options.keepAliveTimeout !== undefined) this.keepAliveTimeout = this._options.keepAliveTimeout;
+        if (this._options.maxRequestsPerSocket !== undefined) this.maxRequestsPerSocket = this._options.maxRequestsPerSocket;
+    }
+
+    setTimeout(msecs?: number, callback?: (socket: Socket) => void): this {
+        if (msecs !== undefined) this.timeout = msecs;
+        if (callback) this.on('timeout', callback);
+        return this;
+    }
+
+    closeAllConnections(): void {
+        for (const socket of this._httpConnections) {
+            socket.destroy();
+        }
+        this._httpConnections.clear();
+    }
+
+    closeIdleConnections(): void {
+        for (const socket of this._httpConnections) {
+            if ((socket as any)._httpMessage?.finished || !(socket as any)._httpMessage) {
+                socket.destroy();
+                this._httpConnections.delete(socket);
+            }
+        }
+    }
+
+    listen(arg1?: number | ListenOptions | string, arg2?: string | number | (() => void), arg3?: number | (() => void), arg4?: () => void): this {
+        let port: number | undefined;
+        let host = '0.0.0.0';
+        let backlog: number | undefined;
+        let listener: (() => void) | undefined;
+
+        if (typeof arg1 === 'object') {
+            const opts = arg1 as ListenOptions;
+            port = opts.port;
+            host = opts.host ?? '0.0.0.0';
+            backlog = opts.backlog;
+            listener = arg2 as (() => void) | undefined;
+        } else {
+            port = typeof arg1 == 'number' ? arg1 : parseInt(arg1 ?? '0');
+            if (typeof arg2 === 'function') listener = arg2;
+            else if (typeof arg2 === 'string') {
+                host = arg2;
+                if (typeof arg3 === 'function') listener = arg3;
+                else if (typeof arg3 === 'number') {
+                    backlog = arg3;
+                    if (typeof arg4 === 'function') listener = arg4;
+                }
+            } else if (typeof arg2 === 'number') {
+                backlog = arg2;
+                if (typeof arg3 === 'function') listener = arg3;
+            }
+        }
+
+        const handler = async (req: HttpRequest, res: HttpResponse) => {
+            const incoming = new IncomingMessageImpl(null as any);
+            incoming.method = req.method;
+            incoming.url = req.url;
+            incoming.httpVersion = req.httpVersion;
+            const [major, minor] = req.httpVersion.split('.').map(Number);
+            incoming.httpVersionMajor = major;
+            incoming.httpVersionMinor = minor;
+
+            for (const [key, value] of req.headers) {
+                incoming.headers[key.toLowerCase() as keyof IncomingHttpHeaders] = value;
+                incoming.rawHeaders.push(key, value);
+                const lowerKey = key.toLowerCase();
+                if (!incoming.headersDistinct[lowerKey]) {
+                    incoming.headersDistinct[lowerKey] = [];
+                }
+                incoming.headersDistinct[lowerKey]!.push(value);
+            }
+
+            if (req.body) {
+                req.body.pipeTo(new WritableStream({
+                    write(chunk) {
+                        incoming.push(chunk);
+                    },
+                    close() {
+                        incoming.push(null);
+                        incoming.complete = true;
+                    }
+                })).catch(() => {});
+            }
+
+            const response = new ServerResponseImpl();
+            response.req = incoming;
+
+            const originalEnd = response.end.bind(response);
+            response.end = ((...args: any[]) => {
+                const result = originalEnd(...args);
+                const headers: Record<string, string> = {};
+                for (const [key, value] of Object.entries(response.getHeaders())) {
+                    if (value !== undefined) {
+                        headers[key] = Array.isArray(value) ? value.join(', ') : String(value);
+                    }
+                }
+                res.writeHead(response.statusCode, response.statusMessage, headers);
+                return result;
+            }) as any;
+
+            try {
+                await this._requestListener(incoming, response);
+            } catch (err) {
+                this.emit('error', err);
+            }
+        };
+
+        this._httpServer = createHttpServer(handler, {
+            port: port ?? 0,
+            hostname: host,
+            keepAliveTimeout: this.keepAliveTimeout,
+            maxRequestsPerConnection: this.maxRequestsPerSocket || 100,
+            requestTimeout: this.requestTimeout,
+        });
+
+        this._httpServer.listen();
+        this.listening = true;
+        this.emit('listening');
+        listener?.();
+
+        this._httpServer.acceptLoop();
+
+        return this;
+    }
+
+    close(callback?: (err?: Error) => void): this {
+        this.listening = false;
+        this._httpServer?.close();
+        super.close(callback);
+        return this;
+    }
+
+    address(): AddressInfo | string | null {
+        const addr = this._httpServer?.address();
+        if (!addr) return super.address();
+        return { address: addr.ip, family: addr.ip.includes(':') ? 'IPv6' : 'IPv4', port: addr.port };
+    }
+}
+
+export function createServer(options: ServerOptions | RequestListener, requestListener?: RequestListener): Server {
+    return new ServerImpl(options, requestListener);
+}
+
+export function validateHeaderName(name: string): void {
+    if (!/^[\^_`a-zA-Z\-0-9!#$%&'*+.|~]+$/.test(name)) {
+        throw new TypeError(`Header name "${name}" contains invalid characters`);
+    }
+}
+
+export function validateHeaderValue(name: string, value: string): void {
+    if (/[^\t\u0020-\u007E\u0080-\u00FF]/.test(value)) {
+        throw new TypeError(`Invalid character in header content ["${name}"]`);
+    }
+}

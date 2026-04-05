@@ -5,6 +5,7 @@ import { ServerConnection, type RequestHandler } from "./server-conn";
 const streams = import.meta.use("streams");
 const ssl     = import.meta.use("ssl");
 const timers  = import.meta.use("timers");
+const http    = import.meta.use('http');
 
 /* ------------------------------------------------------------------ */
 /* Types                                                              */
@@ -152,3 +153,9 @@ export class Server {
 export function createServer(handler: RequestHandler, config: ServerConfig): Server {
     return new Server(handler, config);
 }
+
+// save to module scope to allow nodejs server reuse
+Reflect.set(http, "__cno", {
+    Server,
+    createServer
+});

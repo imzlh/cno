@@ -1,6 +1,6 @@
 # Build node polyfill, and install it to ~/.cno/node/
 
-JSC ?= cjs
+JSC ?= cts
 DST_DIR = $(HOME)/.cts/node
 SRC_DIR = src/node
 

@@ -551,7 +551,7 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
         } else {
             const payload: Uint8Array = data instanceof ArrayBuffer
                 ? new Uint8Array(data)
-                : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+                : new Uint8Array(data.buffer as ArrayBuffer, data.byteOffset, data.byteLength);
             this.sendFrame(OpCode.BINARY, payload).catch(() => {});
         }
     }
@@ -734,7 +734,7 @@ export interface WebSocketStreamConnection {
 
 export class WebSocketStream {
     private ws: WebSocket;
-    private readableController: ReadableStreamDefaultController<Uint8Array | string> | null = null;
+    private readableController: ReadableStreamController<string | Uint8Array> | null = null;
     private _openedResolve!: (value: WebSocketStreamConnection) => void;
     private _openedReject!: (reason: Error) => void;
     private _closedResolve!: (value: { closeCode: number; reason: string }) => void;
@@ -764,7 +764,7 @@ export class WebSocketStream {
             if (this.readableController) {
                 const data = event.data;
                 if (typeof data === 'string') {
-                    this.readableController.enqueue(data);
+                    this.readableController.enqueue(engine.encodeString(data));
                 } else if (data instanceof ArrayBuffer) {
                     this.readableController.enqueue(new Uint8Array(data));
                 }
@@ -878,7 +878,7 @@ export class WebSocketStream {
                 }
 
                 while (self.ws.bufferedAmount > HIGH_WATER_MARK) {
-                    await new Promise(resolve => timers.setTimeout(resolve, 16));
+                    await new Promise(resolve => timers.setTimeout(resolve as any, 16));
                 }
             },
             close() {

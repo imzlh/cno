@@ -21,27 +21,6 @@ export enum EventSourceReadyState {
 }
 
 /* ------------------------------------------------------------------ */
-/* Message Event                                                      */
-/* ------------------------------------------------------------------ */
-
-export class MessageEvent extends Event {
-    public readonly data: string;
-    public readonly origin: string;
-    public readonly lastEventId: string;
-
-    constructor(type: string, eventInitDict?: {
-        data?: string;
-        origin?: string;
-        lastEventId?: string;
-    }) {
-        super(type);
-        this.data = eventInitDict?.data || '';
-        this.origin = eventInitDict?.origin || '';
-        this.lastEventId = eventInitDict?.lastEventId || '';
-    }
-}
-
-/* ------------------------------------------------------------------ */
 /* EventSource Implementation                                         */
 /* ------------------------------------------------------------------ */
 

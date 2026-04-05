@@ -55,5 +55,5 @@
         "out": "../api/",
         "disableSources": true
     },
-    "exclude": ["./example/", "./test/"]
+    "exclude": ["./example/", "./test/", "./utils/"]
 }

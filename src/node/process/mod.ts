@@ -1,7 +1,6 @@
 /**
  * Node.js process 模块
  * 提供当前 Node.js 进程的信息和控制能力
- * 类型定义参考 @types/node/process.d.ts
  */
 
 const os = import.meta.use('os');
@@ -402,14 +401,6 @@ export const process: NodeJS.Process = {
         console.warn(warning);
     },
 
-    // 绑定
-    binding: ((name: string) => {
-        throw new Error(`process.binding('${name}') is not supported`);
-    }) as any,
-
-    // 断言
-    _rawDebug: () => {},
-
     // 其他方法
     getuid: () => os.userInfo.userId,
     getgid: () => os.userInfo.groupId,
@@ -420,10 +411,9 @@ export const process: NodeJS.Process = {
     seteuid: () => { throw new Error('seteuid is not supported'); },
     setegid: () => { throw new Error('setegid is not supported'); },
     setgroups: () => { throw new Error('setgroups is not supported'); },
-    initgroups: () => { throw new Error('initgroups is not supported'); },
 
     // umask
-    umask: (mask?: number) => {
+    umask: (mask?: number | string) => {
         return 0o022;
     },
 
@@ -442,18 +432,6 @@ export const process: NodeJS.Process = {
     // 通道
     channel: null as any,
 
-    // 断开连接
-    _debugEnd: () => {},
-    _debugProcess: () => {},
-
-    // 启动时间
-    _startProfilerIdleNotifier: () => {},
-    _stopProfilerIdleNotifier: () => {},
-
-    // 打开句柄
-    _getActiveHandles: () => [],
-    _getActiveRequests: () => [],
-
     // 杀进程
     kill: (pid: number, signal?: string | number) => {
         proc.kill(pid, signal as any);
@@ -461,8 +439,9 @@ export const process: NodeJS.Process = {
     },
 
     // abort
-    abort: () => {
+    abort: (): never => {
         os.exit(134); // SIGABRT
+        throw new Error('unreachable')
     },
 
     // 事件监听器数量
@@ -470,19 +449,10 @@ export const process: NodeJS.Process = {
 
     // 最大监听器
     getMaxListeners: () => 10,
-    setMaxListeners: () => {},
-
-    // 域
-    domain: null as any,
-
-    // 模块
-    moduleLoadList: [],
+    setMaxListeners: (n: number) => process,
 
     // 主模块
     mainModule: undefined,
-
-    // 源映射
-    _sourceMap: undefined,
 
     // 事件
     eventNames: () => [],
@@ -491,11 +461,57 @@ export const process: NodeJS.Process = {
     removeAllListeners: () => process,
     setUncaughtExceptionCaptureCallback: () => {},
     hasUncaughtExceptionCaptureCallback: () => false,
-} as unknown as NodeJS.Process;
 
-// 设置全局 process
-if (typeof globalThis !== 'undefined') {
-    (globalThis as any).process = process;
-}
+    // 缺失的属性
+    debugPort: 5858,
+
+    dlopen: (module: object, filename: string, flags?: number) => {
+        throw new Error('process.dlopen is not supported');
+    },
+
+    finalization: {
+        register: <T extends object>(ref: T, callback: (ref: T, event: "exit") => void) => {},
+        registerBeforeExit: <T extends object>(ref: T, callback: (ref: T, event: "beforeExit") => void) => {},
+        unregister: (ref: object) => {},
+    },
+
+    getActiveResourcesInfo: () => [],
+
+    getBuiltinModule: (id: string) => {
+        try {
+            return require(id);
+        } catch {
+            return undefined;
+        }
+    },
+
+    allowedNodeEnvironmentFlags: new Set([
+        '--require', '-r', '--import', '--loader', '--inspect', '--inspect-brk',
+        '--inspect-port', '--abort-on-uncaught-exception', '--no-deprecation',
+        '--trace-deprecation', '--throw-deprecation', '--enable-source-maps',
+    ]),
+
+    throwDeprecation: false,
+    traceDeprecation: false,
+    noDeprecation: undefined,
+
+    ref: (maybeRefable: any) => {},
+    unref: (maybeRefable: any) => {},
+
+    loadEnvFile: (path?: any) => {
+        throw new Error('process.loadEnvFile is not supported');
+    },
+
+    sourceMapsEnabled: false,
+    setSourceMapsEnabled: (value: boolean) => {},
+
+    threadCpuUsage: (previousValue?: NodeJS.CpuUsage) => cpuUsage(previousValue),
+
+    constrainedMemory: () => 0,
+    availableMemory: () => 0,
+
+    listeners: () => [],
+    rawListeners: () => [],
+};
 
 export default process;

@@ -1,5 +1,6 @@
 // compile.js - TypeScript compiler for denort
 // Usage: compile.js <input.ts> <name> <output.jsc>
+// @ts-nocheck - we are using native modules
 
 import { transform } from "sucrase";
 import { join, normalize } from "../src/utils/path";

@@ -2,6 +2,7 @@
  * Deno FFI Library Implementation
  * DynamicLibrary and dlopen function
  */
+const ffi = import.meta.use('ffi');
 
 import {
     ForeignFunction,
@@ -106,24 +107,23 @@ class DynamicLibraryImpl<S extends ForeignLibraryInterface> implements DynamicLi
         parameters: readonly NativeType[],
         result: NativeResultType
     ): CModuleFFI.FfiCif {
-        const retType = this.toFfiType(native, result);
-        const argTypes = parameters.map(p => this.toFfiType(native, p));
-        return new native.FfiCif(retType, ...argTypes);
+        const retType = this.toFfiType(result);
+        const argTypes = parameters.map(p => this.toFfiType(p));
+        return new ffi.FfiCif(retType, argTypes);
     }
 
     private toFfiType(
-        native: ReturnType<typeof ffi_load_native>,
         type: NativeType | 'void'
     ): CModuleFFI.FfiType {
-        if (type === 'void') return native.type_void;
+        if (type === 'void') return ffi.FfiType.type_void;
         if (typeof type !== 'string') {
             if ('struct' in type) {
-                const memberTypes = type.struct.map(t => this.toFfiType(native, t));
-                return new native.FfiType(...memberTypes);
+                const memberTypes = type.struct.map(t => this.toFfiType(t));
+                return new ffi.FfiType(...memberTypes);
             }
         }
         
-        const typeMap: Record<string, keyof typeof native> = {
+        const typeMap: Record<string, keyof typeof ffi.FfiType> = {
             'u8': 'type_uint8',
             'i8': 'type_sint8',
             'u16': 'type_uint16',
@@ -147,7 +147,7 @@ class DynamicLibraryImpl<S extends ForeignLibraryInterface> implements DynamicLi
             throw new TypeError(`Unknown type: ${type}`);
         }
         
-        return native[propName] as CModuleFFI.FfiType;
+        return ffi.FfiType[propName] as CModuleFFI.FfiType;
     }
 
     private toFfiArg(
