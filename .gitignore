@@ -5,3 +5,5 @@ node_modules/
 tsrt.js
 types/
 dist.js
+dist.min.js
+compile.js
