@@ -160,6 +160,8 @@ export class FSFile implements Deno.FsFile {
         const off = Number(offset);
         if (whence === Deno.SeekMode.Start) {
             this.fpointer = Math.min(off, fs);
+        } else if (whence === Deno.SeekMode.Current) {
+            this.fpointer = Math.max(0, Math.min(this.fpointer + off, fs));
         } else if (whence === Deno.SeekMode.End) {
             this.fpointer = Math.max(fs - off, 0);
         }
@@ -172,6 +174,8 @@ export class FSFile implements Deno.FsFile {
         const off = Number(offset);
         if (whence === Deno.SeekMode.Start) {
             this.fpointer = Math.min(off, fsize);
+        } else if (whence === Deno.SeekMode.Current) {
+            this.fpointer = Math.max(0, Math.min(this.fpointer + off, fsize));
         } else if (whence === Deno.SeekMode.End) {
             this.fpointer = Math.max(fsize - off, 0);
         }

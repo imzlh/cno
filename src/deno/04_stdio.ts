@@ -232,8 +232,8 @@ Object.assign(Deno, {
     consoleSize(){
         const sz = stdout.size;
         return {
-            rows: sz.width,
-            columns: sz.height
+            rows: sz.height,
+            columns: sz.width
         };
     }
 } as Partial<typeof Deno>);

@@ -101,7 +101,7 @@ class Process implements Deno.ChildProcess {
 
     @wrap
     kill(signo?: Deno.Signal): void {
-        assert(signo == 'SIGEMT', "Not implemented");
+        assert(signo != 'SIGEMT', "Not implemented");
         // @ts-ignore
         this.$proc.kill(signo);
     }
@@ -146,14 +146,15 @@ class Command implements Deno.Command {
 
     constructor(command: string | URL, options?: Deno.CommandOptions){
         const path = toString(command);
-        this.proc = proc.spawn(path, options?.args, {
+        const args = options?.args ?? [];
+        this.proc = proc.spawn([path, ...args], {
             cwd: options?.cwd ? toString(options.cwd) : undefined,
             env: options?.env,
             stdin: pipe(options?.stdin) ?? 'inherit',
             stdout: pipe(options?.stdout) ?? 'inherit',
             stderr: pipe(options?.stderr) ?? 'inherit',
             detached: options?.detached,
-            uid: options?.gid,
+            uid: options?.uid,
             gid: options?.gid
         });
         this.detached = options?.detached ?? false;
@@ -162,10 +163,9 @@ class Command implements Deno.Command {
     @wrap
     async output(): Promise<Deno.CommandOutput> {
         assert(!this.detached, "Detached process cannot be waited");
-        assert(this.proc.stdout && this.proc.stderr, "stdout and stderr are not piped");
         
-        const stdo = new RStream(this.proc.stdout!).bytes();
-        const stde = new RStream(this.proc.stderr!).bytes();
+        const stdo = this.proc.stdout ? new RStream(this.proc.stdout).bytes() : Promise.resolve(new Uint8Array(0));
+        const stde = this.proc.stderr ? new RStream(this.proc.stderr).bytes() : Promise.resolve(new Uint8Array(0));
         const res = await this.proc.wait();
         return {
             code: res.exit_status,
@@ -202,8 +202,6 @@ class Command implements Deno.Command {
 }
 
 Object.assign(Deno, wrapFSns({
-    Command,
-
     kill(pid: number, signo?: Deno.Signal): void {
         assert(signo != 'SIGEMT', "Not implemented");
         // @ts-ignore
@@ -214,3 +212,6 @@ Object.assign(Deno, wrapFSns({
         return 0;   // not implemented
     },
 }));
+
+// class constructor should NEVER being wrapped
+Reflect.set(Deno, "Command", Command);

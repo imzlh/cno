@@ -89,9 +89,15 @@ globalThis.structuredClone = function(v, opt){
 }
 
 globalThis.reportError = function(e) {
-    globalThis.dispatchEvent(new CustomEvent('error', {
-        detail: e
-    }));
+    const error = e instanceof Error ? e : new Error(String(e));
+    const event = new ErrorEvent('error', {
+        message: error.message,
+        error: error,
+        filename: '',
+        lineno: 0,
+        colno: 0
+    });
+    globalThis.dispatchEvent(event);
 }
 
 // @ts-ignore

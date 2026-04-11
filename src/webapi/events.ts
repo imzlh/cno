@@ -298,6 +298,21 @@ export class DOMException extends Error {
     }
 }
 
+export class ProgressEvent<T extends EventTarget = EventTarget> extends Event implements globalThis.ProgressEvent<T> {
+    readonly lengthComputable: boolean;
+    readonly loaded: number;
+    readonly total: number;
+
+    declare target: T | null;
+
+    constructor(type: string, init: ProgressEventInit = {}) {
+        super(type, init);
+        this.lengthComputable = init.lengthComputable ?? false;
+        this.loaded = init.loaded ?? 0;
+        this.total = init.total ?? 0;
+    }
+}
+
 Reflect.set(globalThis, 'Event', Event);
 Reflect.set(globalThis, 'EventTarget', EventTarget);
 Reflect.set(globalThis, 'CustomEvent', CustomEvent);
@@ -306,6 +321,7 @@ Reflect.set(globalThis, 'PromiseRejectionEvent', PromiseRejectionEvent);
 Reflect.set(globalThis, 'CloseEvent', CloseEvent);
 Reflect.set(globalThis, 'MessageEvent', MessageEvent);
 Reflect.set(globalThis, 'DOMException', DOMException);
+Reflect.set(globalThis, 'ProgressEvent', ProgressEvent);
 
 export const parseStackFrame = (
     line: string

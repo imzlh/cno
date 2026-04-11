@@ -19,6 +19,9 @@ export const useWritable = (pipe: CModuleStreams.Stream) => new WritableStream({
         } catch (e) {
             control.error(wrapFSErr(e as any));
         }
+    },
+    close: () => {
+        pipe.close();
     }
 });
 
@@ -133,14 +136,17 @@ class TlsConn implements Deno.TlsConn {
         protected $rawPipe: CModuleStreams.TCP,
         protected $handshake: Promise<Deno.TlsHandshakeInfo>
     ) {
+        const pipe = $pipe;
         this.$readable = new ReadableStream({
             async pull(controller) {
                 try {
                     const buf = malloc(controller);
-                    if (buf === null) {
+                    const data = pipe.read(buf.byteLength);
+                    if (data === null || data.byteLength === 0) {
                         controller.close();
                     } else {
-                        controller.enqueue(buf);
+                        buf.set(new Uint8Array(data));
+                        controller.enqueue(buf.slice(0, data.byteLength));
                     }
                 } catch (e) {
                     controller.error(wrapFSErr(e as any));
@@ -283,25 +289,32 @@ class Listener implements Deno.Listener {
 }
 
 function toConn(sslpipe: CModuleSSL.Pipe, pipe: CModuleStreams.TCP): Deno.TlsConn {
-    // feed data until EOF
     let handshake = false;
     const hsProm = Promise.withResolvers<Deno.TlsHandshakeInfo>();
     (async () => {
         const buf = new Uint8Array(2048);
-        while (true) {
-            const n = await pipe.read(buf);
-            if (n === null) break;
-            sslpipe.feed(buf.subarray(0, n));
-            if (!handshake && sslpipe.handshake()) {
-                handshake = true;
-                hsProm.resolve({
-                    alpnProtocol: sslpipe.alpnProtocol()
-                });
+        try {
+            while (true) {
+                const n = await pipe.read(buf);
+                if (n === null) break;
+                sslpipe.feed(buf.subarray(0, n));
+                if (!handshake && sslpipe.handshake()) {
+                    handshake = true;
+                    hsProm.resolve({
+                        alpnProtocol: sslpipe.alpnProtocol()
+                    });
+                }
+            }
+            if (!handshake) {
+                hsProm.reject(new Error('TLS handshake failed: connection closed'));
+            }
+        } catch (e) {
+            if (!handshake) {
+                hsProm.reject(e);
             }
         }
     })();
 
-    // then, give to TlsConn
     return new TlsConn(sslpipe, pipe, hsProm.promise);
 }
 
@@ -434,7 +447,7 @@ Object.assign(Deno, wrapFSns({
         switch (options.transport) {
             case undefined:
             case 'tcp':
-                const host = options.hostname ?? '::';
+                const host = options.hostname ?? '0.0.0.0';
                 const tcp = new stream.TCP(host.includes(':') ? os.AF_INET6 : os.AF_INET);
                 const dnsanswer = await dns.resolve(host, { family: host.includes(':') ? 6 : 4 });
                 const ip = dnsanswer[0]?.ip;
@@ -453,7 +466,7 @@ Object.assign(Deno, wrapFSns({
     async connectTls(options) {
         const af4 = !options.hostname?.includes(':');
         const pipe = new stream.TCP(af4 ? os.AF_INET : os.AF_INET6);
-        await pipe.connect({ ip: options.hostname ?? '::', port: options.port });
+        await pipe.connect({ ip: options.hostname ?? '0.0.0.0', port: options.port });
 
         // create SSL context
         const ctx = new ssl.Context({
@@ -477,12 +490,12 @@ Object.assign(Deno, wrapFSns({
                 const isV4 = !opt.hostname?.includes(':');
                 const tcp = new stream.TCP(isV4 ? os.AF_INET : os.AF_INET6);
                 tcp.bind({
-                    ip: opt.hostname ?? '::',
+                    ip: opt.hostname ?? '0.0.0.0',
                     port: opt.port
                 })
                 tcp.listen(opt.tcpBacklog);
                 return new TcpListener(tcp, true, {
-                    hostname: opt.hostname ?? '::',
+                    hostname: opt.hostname ?? '0.0.0.0',
                     port: opt.port,
                     transport: 'tcp'
                 });
@@ -505,7 +518,7 @@ Object.assign(Deno, wrapFSns({
         const isV4 = !opt.hostname?.includes(':');
         const tcp = new stream.TCP(isV4 ? os.AF_INET : os.AF_INET6);
         tcp.bind({
-            ip: opt.hostname ?? '::',
+            ip: opt.hostname ?? '0.0.0.0',
             port: opt.port
         })
         tcp.listen(opt.tcpBacklog);
@@ -516,7 +529,7 @@ Object.assign(Deno, wrapFSns({
             mode: 'server'
         });
         const listener = new TlsListener(tcp, {
-            hostname: opt.hostname ?? '::',
+            hostname: opt.hostname ?? '0.0.0.0',
             port: opt.port,
             transport: 'tcp'
         }, ctx);

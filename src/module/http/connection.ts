@@ -49,29 +49,66 @@ export interface ConnectionLike {
 /* ------------------------------------------------------------------ */
 /* CA Certificate Discovery                                           */
 /* ------------------------------------------------------------------ */
-
 async function findSystemCaPath(): Promise<string | null> {
     const sysname = os.uname().sysname;
-    const candidates: string[] =
-        sysname === "Linux" ? [
-            "/etc/ssl/certs/ca-certificates.crt",
-            "/etc/pki/tls/certs/ca-bundle.crt",
-            "/etc/ssl/ca-bundle.pem",
-            "/etc/pki/tls/cert.pem",
-            "/etc/ssl/cert.pem"
-        ] : sysname === "Darwin" ? [
-            "/etc/ssl/cert.pem",
-            "/usr/local/etc/openssl/cert.pem",
-            "/opt/homebrew/etc/openssl/cert.pem"
-        ] : sysname === "Windows_NT" ? [
-            "C:\\Windows\\cacert.pem",
-            "C:\\Program Files\\OpenSSL-Win64\\bin\\curl-ca-bundle.crt",
-            "C:\\Program Files\\Git\\mingw64\\ssl\\cert.pem"
-        ] : [];
+    
+    const candidates: string[] = (() => {
+        switch (sysname) {
+            case "Linux": return [
+                // Debian/Ubuntu
+                "/etc/ssl/certs/ca-certificates.crt",
+                // RHEL/CentOS/Fedora (old)
+                "/etc/pki/tls/certs/ca-bundle.crt",
+                "/etc/pki/tls/cert.pem",
+                // RHEL 7+ / CentOS 7+
+                "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+                // Alpine
+                "/etc/ssl/cert.pem",
+                // SUSE
+                "/etc/ssl/ca-bundle.pem",
+                // Arch
+                "/etc/ca-certificates/extracted/tls-ca-bundle.pem",
+                // Others
+                "/etc/ssl/ca-bundle.pem",
+                "/etc/ca-certificates.crt",
+                // Kubernetes
+                "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
+            ];
+            case "Darwin": return [
+                "/etc/ssl/cert.pem",
+                "/usr/local/etc/openssl/cert.pem",
+                "/opt/homebrew/etc/openssl/cert.pem",
+                "/opt/homebrew/etc/openssl@3/cert.pem", // Homebrew OpenSSL 3.x
+                "/usr/local/etc/openssl@3/cert.pem",
+                "/System/Library/OpenSSL/certs",
+            ];
+            case "Windows_NT": return [
+                "C:\\Windows\\System32\\curl-ca-bundle.crt",  // Windows 10+
+                "C:\\Program Files\\Git\\mingw64\\ssl\\cert.pem",
+                "C:\\Program Files\\Git\\mingw32\\ssl\\cert.pem",
+                "C:\\Program Files\\OpenSSL-Win64\\bin\\curl-ca-bundle.crt",
+                "C:\\Program Files\\OpenSSL\\bin\\curl-ca-bundle.crt",
+            ];
+            case "FreeBSD": return [
+                "/usr/local/share/certs/ca-root-nss.crt",     // ca_root_nss
+                "/usr/local/openssl/cert.pem",
+                "/etc/ssl/cert.pem",
+            ];
+            case "OpenBSD": return [
+                "/etc/ssl/cert.pem",
+                "/usr/local/share/cert.pem",
+            ];
+            default: return [];
+        }
+    })();
 
     for (const path of candidates) {
         try {
-            if ((await asfs.stat(path)).isFile) return path;
+            const stat = await asfs.stat(path);
+            if (stat.isFile) return path;
+            if (stat.isDirectory && path.includes("certs")) {
+                return path; 
+            }
         } catch { /* not found */ }
     }
     return null;

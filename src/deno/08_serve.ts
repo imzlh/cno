@@ -319,7 +319,18 @@ function serve(
     coreServer.listen();
     coreServer.acceptLoop();
 
-    return new DenoHttpServer(coreServer);
+    const httpServer = new DenoHttpServer(coreServer);
+
+    // Call onListen callback if provided
+    if (options.onListen) {
+        options.onListen({
+            hostname: httpServer.addr.hostname,
+            port: httpServer.addr.port,
+            transport: 'tcp'
+        });
+    }
+
+    return httpServer;
 }
 
 /* ------------------------------------------------------------------ */

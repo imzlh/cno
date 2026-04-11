@@ -187,7 +187,7 @@ class CryptoKeyImpl implements CryptoKey {
 // SubtleCrypto Implementation
 // ============================================================================
 
-class SubtleCrypto{
+class SubtleCrypto implements globalThis.SubtleCrypto {
     /**
      * Generate cryptographic digest (hash)
      */
@@ -199,6 +199,7 @@ class SubtleCrypto{
     /**
      * Generate a new key pair or secret key
      */
+    // @ts-ignore - overload
     async generateKey(
         algorithm: AlgorithmIdentifier,
         extractable: boolean,
@@ -714,6 +715,7 @@ class SubtleCrypto{
     /**
      * Export key to external format
      */
+    // @ts-ignore - overload
     async exportKey(format: string, key: CryptoKey): Promise<ArrayBuffer | JsonWebKey> {
         if (!key.extractable) {
             throw new Error('Key is not extractable');
@@ -732,9 +734,6 @@ class SubtleCrypto{
             return keyImpl._handle;
         }
 
-        if (format === 'pkcs8' && key.type === 'private') {
-            return keyImpl._handle;
-        }
         if (format === 'pkcs8' && key.type === 'private') {
             return keyImpl._handle;
         }
@@ -815,6 +814,7 @@ const webCrypto: Crypto = {
         return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
     },
 };
+
 Reflect.defineProperty(window, 'crypto', {
     value: webCrypto,
     writable: false,

@@ -43,7 +43,7 @@ export class Request implements globalThis.Request {
     constructor(input: RequestInfo | URL, init?: RequestInit) {
         // 解析 input
         if (input instanceof URL) {
-            this.url = input.toString();
+            this.url = input.href;
             this.method = init?.method?.toUpperCase() || 'GET';
             this.headers = new Headers(init?.headers);
         } else if (typeof input === 'string') {
@@ -635,7 +635,7 @@ async function performFetch(
             headers
         });
 
-        Object.defineProperty(response, 'url', { value: url.toString() });
+        Object.defineProperty(response, 'url', { value: url.href });
         Object.defineProperty(response, 'redirected', { value: redirectCount > 0 });
 
         return response;
@@ -701,7 +701,7 @@ async function handleRedirect(
     }
 
     // 创建重定向请求
-    const redirectRequest = new Request(redirectUrl.toString(), {
+    const redirectRequest = new Request(redirectUrl.href, {
         method: redirectMethod,
         headers: request.headers,
         body: redirectMethod === 'GET' ? null : (request as any)._bodySource,
@@ -719,7 +719,7 @@ async function handleRedirect(
  */
 export async function fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
     if (input instanceof URL) {
-        input = input.toString();
+        input = input.href;
     }
 
     const request = new Request(input, init);

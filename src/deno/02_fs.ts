@@ -203,10 +203,10 @@ async function removeRecursive(targetPath: string): Promise<void> {
             }
 
             // Delete empty directory
-            await CModuleAsyncFS.rmdir(targetPath);
+            await asfs.rmdir(targetPath);
         } else {
             // Delete file
-            await CModuleAsyncFS.unlink(targetPath);
+            await asfs.unlink(targetPath);
         }
     } catch (error) {
         throw error;
@@ -436,10 +436,10 @@ Object.assign(Deno, wrapFSns({
         if (!recursive) {
             // Try both unlink and rmdir without checking file type first
             try {
-                CModuleFS.unlink(pathStr);
+                fs.unlink(pathStr);
             } catch (error1) {
                 try {
-                    CModuleFS.rmdir(pathStr);
+                    fs.rmdir(pathStr);
                 } catch (error2) {
                     // If both fail, throw the original error
                     throw error1;
@@ -457,9 +457,9 @@ Object.assign(Deno, wrapFSns({
 
         if (!recursive) {
             if ((await asfs.stat(pathStr)).isDirectory)
-                asfs.rmdir(pathStr);
+                await asfs.rmdir(pathStr);
             else
-                asfs.unlink(pathStr);
+                await asfs.unlink(pathStr);
             return;
         }
 
@@ -591,7 +591,8 @@ Object.assign(Deno, wrapFSns({
         const randomValue = Math.floor(Math.random() * 1e9).toString(36);
         const path = join(opt?.dir ?? os.tmpdir, opt?.prefix ?? 'cno', opt?.suffix ?? 'cno-')
             + randomValue;
-        await mkdirRecursive(path, 755);
+        const f = await asfs.open(path, 'w', 0o644);
+        await f.close();
         return path;
     },
 
@@ -599,7 +600,8 @@ Object.assign(Deno, wrapFSns({
         const randomValue = Math.floor(Math.random() * 1e9).toString(36);
         const path = join(opt?.dir ?? os.tmpdir, opt?.prefix ?? 'cno', opt?.suffix ?? 'cno-')
             + randomValue;
-        mkdirRecursiveSync(path, 755);
+        const fd = fs.open(path, 'w', 0o644);
+        fs.close(fd);
         return path;
     },
 

@@ -732,6 +732,7 @@ export class TransformStream<I = any, O = any> implements globalThis.TransformSt
         readableStrategy: QueuingStrategy<O> = {}
     ) {
         let readableController: any;
+        let writableRef: WritableStream<I>;
 
         this.readable = new ReadableStream<O>({
             start(c) {
@@ -739,7 +740,7 @@ export class TransformStream<I = any, O = any> implements globalThis.TransformSt
                 return transformer.start?.(c as any);
             },
             cancel: async (reason) => {
-                await this.writable.abort(reason);
+                await writableRef.abort(reason);
             }
         }, readableStrategy);
 
@@ -755,6 +756,8 @@ export class TransformStream<I = any, O = any> implements globalThis.TransformSt
                 readableController.error(reason);
             }
         }, writableStrategy);
+
+        writableRef = this.writable;
     }
 }
 
@@ -783,6 +786,176 @@ export class ByteLengthQueuingStrategy implements globalThis.ByteLengthQueuingSt
     }
 }
 
+// TextEncoderStream
+export class TextEncoderStream implements globalThis.TextEncoderStream {
+    readonly encoding = 'utf-8';
+    readonly readable: globalThis.ReadableStream<Uint8Array<ArrayBuffer>>;
+    readonly writable: globalThis.WritableStream<string>;
+
+    constructor() {
+        const encoder = new TextEncoder();
+        let controller: any;
+
+        this.readable = new ReadableStream<Uint8Array>({
+            start(c) {
+                controller = c;
+            }
+        }) as any;
+
+        this.writable = new WritableStream<string>({
+            write(chunk) {
+                const encoded = encoder.encode(chunk);
+                controller.enqueue(encoded);
+            },
+            close() {
+                controller.close();
+            },
+            abort(reason) {
+                controller.error(reason);
+            }
+        }) as any;
+    }
+}
+
+// TextDecoderStream
+export class TextDecoderStream implements globalThis.TextDecoderStream {
+    readonly encoding: string;
+    readonly fatal: boolean;
+    readonly ignoreBOM: boolean;
+    readonly readable: globalThis.ReadableStream<string>;
+    readonly writable: globalThis.WritableStream<AllowSharedBufferSource>;
+
+    private decoder: TextDecoder;
+    private controller: any = null;
+
+    constructor(label?: string, options?: TextDecoderOptions) {
+        this.decoder = new TextDecoder(label, options);
+        this.encoding = this.decoder.encoding;
+        this.fatal = this.decoder.fatal;
+        this.ignoreBOM = this.decoder.ignoreBOM;
+
+        this.readable = new ReadableStream<string>({
+            start: (c) => {
+                this.controller = c;
+            }
+        }) as any;
+
+        this.writable = new WritableStream<AllowSharedBufferSource>({
+            write: (chunk) => {
+                const decoded = this.decoder.decode(chunk as Uint8Array, { stream: true });
+                if (decoded) {
+                    this.controller?.enqueue(decoded);
+                }
+            },
+            close: () => {
+                const decoded = this.decoder.decode();
+                if (decoded) {
+                    this.controller?.enqueue(decoded);
+                }
+                this.controller?.close();
+            },
+            abort: (reason) => {
+                this.controller?.error(reason);
+            }
+        }) as any;
+    }
+}
+
+// CompressionStream and DecompressionStream
+const zlib = import.meta.use('zlib');
+
+export class CompressionStream implements globalThis.CompressionStream {
+    readonly readable: globalThis.ReadableStream<Uint8Array<ArrayBuffer>>;
+    readonly writable: globalThis.WritableStream<BufferSource>;
+
+    private handle: CModuleZLib.Deflate;
+    private controller: any = null;
+
+    constructor(format: CompressionFormat) {
+        if (format !== 'gzip' && format !== 'deflate' && format !== 'deflate-raw') {
+            throw new TypeError(`Unsupported compression format: ${format}`);
+        }
+
+        if (format === 'gzip') {
+            this.handle = zlib.createGzip(zlib.DEFAULT_COMPRESSION, zlib.DEFAULT_STRATEGY, 8);
+        } else if (format === 'deflate') {
+            this.handle = zlib.createDeflate(zlib.DEFAULT_COMPRESSION, zlib.DEFAULT_STRATEGY, 8);
+        } else {
+            this.handle = zlib.createDeflateRaw(zlib.DEFAULT_COMPRESSION, zlib.DEFAULT_STRATEGY, 8);
+        }
+
+        this.readable = new ReadableStream<Uint8Array>({
+            start: (c) => {
+                this.controller = c;
+            }
+        }) as any;
+
+        this.writable = new WritableStream<BufferSource>({
+            write: (chunk) => {
+                const input = chunk instanceof ArrayBuffer ? new Uint8Array(chunk) : chunk as Uint8Array;
+                const output = this.handle.deflate(input);
+                if (output && output.byteLength > 0) {
+                    this.controller?.enqueue(new Uint8Array(output));
+                }
+            },
+            close: () => {
+                const output = this.handle.finish();
+                if (output && output.byteLength > 0) {
+                    this.controller?.enqueue(new Uint8Array(output));
+                }
+                this.controller?.close();
+            },
+            abort: (reason) => {
+                this.controller?.error(reason);
+            }
+        }) as any;
+    }
+}
+
+export class DecompressionStream implements globalThis.DecompressionStream {
+    readonly readable: globalThis.ReadableStream<Uint8Array<ArrayBuffer>>;
+    readonly writable: globalThis.WritableStream<BufferSource>;
+
+    private handle: CModuleZLib.Inflate;
+    private controller: any = null;
+
+    constructor(format: CompressionFormat) {
+        if (format !== 'gzip' && format !== 'deflate' && format !== 'deflate-raw') {
+            throw new TypeError(`Unsupported decompression format: ${format}`);
+        }
+
+        if (format === 'gzip') {
+            this.handle = zlib.createGunzip();
+        } else if (format === 'deflate') {
+            this.handle = zlib.createInflate();
+        } else {
+            this.handle = zlib.createInflateRaw();
+        }
+
+        this.readable = new ReadableStream<Uint8Array>({
+            start: (c) => {
+                this.controller = c;
+            }
+        }) as any;
+
+        this.writable = new WritableStream<BufferSource>({
+            write: (chunk) => {
+                const input = chunk instanceof ArrayBuffer ? new Uint8Array(chunk) : chunk as Uint8Array;
+                const output = this.handle.inflate(input);
+                if (output && output.byteLength > 0) {
+                    this.controller?.enqueue(new Uint8Array(output));
+                }
+            },
+            close: () => {
+                this.controller?.close();
+            },
+            abort: (reason) => {
+                this.controller?.error(reason);
+            }
+        }) as any;
+    }
+}
+
 // Export to global
 if (typeof globalThis !== 'undefined') {
     Object.assign(globalThis, {
@@ -790,6 +963,10 @@ if (typeof globalThis !== 'undefined') {
         WritableStream,
         TransformStream,
         CountQueuingStrategy,
-        ByteLengthQueuingStrategy
+        ByteLengthQueuingStrategy,
+        TextEncoderStream,
+        TextDecoderStream,
+        CompressionStream,
+        DecompressionStream
     });
 }

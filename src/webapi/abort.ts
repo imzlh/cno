@@ -72,19 +72,17 @@ class AbortSignal extends EventTarget implements globalThis.AbortSignal {
         }
 
         // Listen to all signals
-        const abortHandler = function (this: globalThis.AbortSignal) {
-            resultSignal._abort(this.reason);
-            cleanup();
-        };
-
-        const cleanup = () => {
-            for (const signal of signals) {
-                signal.removeEventListener('abort', abortHandler);
-            }
-        };
+        const handlers = new Map<globalThis.AbortSignal, () => void>();
 
         for (const signal of signals) {
-            signal.addEventListener('abort', abortHandler);
+            const handler = () => {
+                resultSignal._abort(signal.reason);
+                for (const [s, h] of handlers) {
+                    s.removeEventListener('abort', h);
+                }
+            };
+            handlers.set(signal, handler);
+            signal.addEventListener('abort', handler);
         }
 
         return resultSignal;

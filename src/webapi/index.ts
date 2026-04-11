@@ -62,6 +62,9 @@ Reflect.set(globalThis, 'FormData', FormData);
 // abort-signal polyfill
 await import('./abort');
 
+// messaging (MessageChannel, MessagePort)
+await import('./messaging');
+
 // global event
 const globalEvent = new EventTarget();
 Reflect.set(globalThis, 'addEventListener', globalEvent.addEventListener.bind(globalEvent));

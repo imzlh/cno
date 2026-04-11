@@ -165,10 +165,11 @@ function applyFormat(format: string, args: unknown[]): { text: string; consumed:
                         i += 2;
                         continue;
                     case 'c':
-                        // CSS style - apply ANSI codes
+                        // CSS style - apply ANSI codes to subsequent text
+                        // Note: In terminal, we apply style and reset after
+                        // The style affects the next text until another %c or reset
                         if (!noColor) {
-                            result += cssToAnsi(String(arg)) + formatValue(arg);
-                            result += RESET;
+                            result += cssToAnsi(String(arg));
                         }
                         i += 2;
                         continue;

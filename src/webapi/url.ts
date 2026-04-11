@@ -674,7 +674,7 @@ class URL implements globalThis.URL {
         let result = this.#scheme + ':';
 
         if (this.#host || this.#scheme === 'file') {
-            result += '/';
+            result += '//';
             if (this.#username || this.#password) {
                 result += percentEncode(this.#username, USERINFO_ENCODE_SET);
                 if (this.#password) {

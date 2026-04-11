@@ -38,6 +38,7 @@ export class Kv implements Deno.Kv {
     private watchSubscriptions: Set<WatchSubscription> = new Set();
     private queueProcessingInterval: ReturnType<typeof setInterval> | null = null;
     private pendingDeliveries: Map<string, Promise<void>> = new Map();
+    private listenQueueResolvers: Array<() => void> = [];
 
     constructor(dbPath?: string) {
         this.db = new KvDatabase(dbPath);

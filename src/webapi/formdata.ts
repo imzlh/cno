@@ -197,10 +197,11 @@ class BlobImpl implements Blob {
 
 // ==================== File ====================
 
+const filePathStore = new WeakMap<File, string>();
+
 class FileImpl extends BlobImpl implements File {
     #name: string;
     #lastModified: number;
-    #path?: string;
 
     constructor(
         fileBits: BlobPart[],
@@ -224,7 +225,6 @@ class FileImpl extends BlobImpl implements File {
         return '';
     }
 
-    // Extension: create File from filesystem path
     static async fromPath(path: string, options?: {
         type?: string;
         name?: string;
@@ -232,13 +232,11 @@ class FileImpl extends BlobImpl implements File {
         const buffer = await asfs.readFile(path);
         const fileName = options?.name ?? path.split('/').pop() ?? 'file';
 
-        // Get file stats if available
         let lastModified = Date.now();
         try {
             const stats = await asfs.stat(path);
             lastModified = stats.mtime?.getTime() ?? Date.now();
         } catch {
-            // Ignore stat errors
         }
 
         const file = new FileImpl(
@@ -250,13 +248,11 @@ class FileImpl extends BlobImpl implements File {
             }
         );
 
-        // Store original path for reference
-        (file as any).#path = path;
+        filePathStore.set(file, path);
 
         return file;
     }
 
-    // Extension: create File reference without loading (lazy)
     static fromPathLazy(path: string, options?: {
         type?: string;
         name?: string;
@@ -271,7 +267,7 @@ class FileImpl extends BlobImpl implements File {
             }
         );
 
-        (file as any).#path = path;
+        filePathStore.set(file, path);
 
         file.arrayBuffer = async () => {
             const loaded = await FileImpl.fromPath(path, options);
