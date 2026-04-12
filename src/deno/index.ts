@@ -1,6 +1,5 @@
 import { errors } from "./01_errors";
 import packageJson from '../../package.json';
-import { error } from "node:console";
 
 const os = import.meta.use('os');
 const sys = import.meta.use('sys');

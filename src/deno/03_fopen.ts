@@ -4,6 +4,7 @@ import { wrapFsClassDec as wrap, wrapFSns, wrapFSErr } from "../utils/wrap";
 
 const fs = import.meta.use('fs');
 const asfs = import.meta.use('asyncfs');
+const error = import.meta.use('error');
 
 export function optionsToMode(options: Deno.OpenOptions): CModuleFS.OpenFlags {
     const {
@@ -220,6 +221,23 @@ export class FSFile implements Deno.FsFile {
     unlockSync(): void {
         const fd = this.$handle.fileno();
         fs.flock(fd, fs.LOCK_UN);
+    }
+
+    async tryLock(exclusive?: boolean): Promise<boolean> {
+        return this.tryLockSync(exclusive);
+    }
+
+    tryLockSync(exclusive?: boolean): boolean {
+        const fd = this.$handle.fileno();
+        try{
+            fs.flock(fd, exclusive ? (fs.LOCK_EX | fs.LOCK_NB) : (fs.LOCK_SH | fs.LOCK_NB));
+            return true;
+        } catch (e) {
+            if ((e as CModuleError.Error).code == error.errno.EAGAIN) {
+                return false;
+            }
+            throw e;
+        }
     }
 
     @wrap

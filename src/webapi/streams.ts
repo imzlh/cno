@@ -5,6 +5,8 @@
 
 import { assert } from "../utils/assert";
 
+const zlib = import.meta.use('zlib');
+
 const validateHighWaterMark = (value: number | undefined): number => {
     const hwm = Number(value);
     if (Number.isNaN(hwm) || hwm < 0) {
@@ -861,9 +863,6 @@ export class TextDecoderStream implements globalThis.TextDecoderStream {
     }
 }
 
-// CompressionStream and DecompressionStream
-const zlib = import.meta.use('zlib');
-
 export class CompressionStream implements globalThis.CompressionStream {
     readonly readable: globalThis.ReadableStream<Uint8Array<ArrayBuffer>>;
     readonly writable: globalThis.WritableStream<BufferSource>;
@@ -880,8 +879,10 @@ export class CompressionStream implements globalThis.CompressionStream {
             this.handle = zlib.createGzip(zlib.DEFAULT_COMPRESSION, zlib.DEFAULT_STRATEGY, 8);
         } else if (format === 'deflate') {
             this.handle = zlib.createDeflate(zlib.DEFAULT_COMPRESSION, zlib.DEFAULT_STRATEGY, 8);
-        } else {
+        } else if (format === 'deflate-raw') {
             this.handle = zlib.createDeflateRaw(zlib.DEFAULT_COMPRESSION, zlib.DEFAULT_STRATEGY, 8);
+        } else {
+            throw new TypeError(`Unsupported compression format: ${format}`);
         }
 
         this.readable = new ReadableStream<Uint8Array>({
@@ -928,8 +929,10 @@ export class DecompressionStream implements globalThis.DecompressionStream {
             this.handle = zlib.createGunzip();
         } else if (format === 'deflate') {
             this.handle = zlib.createInflate();
-        } else {
+        } else if (format === 'deflate-raw') {
             this.handle = zlib.createInflateRaw();
+        } else {
+            throw new TypeError(`Unsupported decompression format: ${format}`);
         }
 
         this.readable = new ReadableStream<Uint8Array>({
@@ -957,16 +960,14 @@ export class DecompressionStream implements globalThis.DecompressionStream {
 }
 
 // Export to global
-if (typeof globalThis !== 'undefined') {
-    Object.assign(globalThis, {
-        ReadableStream,
-        WritableStream,
-        TransformStream,
-        CountQueuingStrategy,
-        ByteLengthQueuingStrategy,
-        TextEncoderStream,
-        TextDecoderStream,
-        CompressionStream,
-        DecompressionStream
-    });
-}
+Object.assign(globalThis, {
+    ReadableStream,
+    WritableStream,
+    TransformStream,
+    CountQueuingStrategy,
+    ByteLengthQueuingStrategy,
+    TextEncoderStream,
+    TextDecoderStream,
+    CompressionStream,
+    DecompressionStream
+});

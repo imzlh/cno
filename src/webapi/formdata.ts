@@ -111,6 +111,8 @@ class FormDataImpl implements FormData {
     _getEntries(): Array<[string, FormDataEntryValue]> {
         return [...this.#entries];
     }
+
+    [Symbol.toStringTag] = 'FormData';
 }
 
 // ==================== Blob ====================

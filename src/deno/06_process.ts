@@ -11,19 +11,19 @@ const text = import.meta.use('text');
 const pty = import.meta.use('pty');
 const engine = import.meta.use('engine');
 
-const pipe = (type?: Deno.CommandOptions['stdout']): CModuleProcess.SpawnOptions['stdout'] => 
+const pipe = (type?: Deno.CommandOptions['stdout']): CModuleProcess.SpawnOptions['stdout'] =>
     type == 'piped' ? 'pipe' : (type == 'null' ? 'ignore' : 'inherit');
 
 class RStream extends ReadableStream<Uint8Array<ArrayBuffer>> implements Deno.SubprocessReadableStream {
     constructor(private pipe: CModuleProcess.Pipe) {
         super({
             pull: async ctrl => {
-                try{
+                try {
                     const buf = malloc(ctrl);
                     const readed = await pipe.read(buf);
                     if (!readed) ctrl.close();
                     else ctrl.enqueue(buf.slice(0, readed));
-                }catch(e){
+                } catch (e) {
                     ctrl.error(e);
                 }
             }
@@ -31,17 +31,17 @@ class RStream extends ReadableStream<Uint8Array<ArrayBuffer>> implements Deno.Su
     }
 
     @wrap
-    private async readAll(){
+    private async readAll() {
         const bufs = [] as Uint8Array[];
         const reader = this.getReader();
-        while(true){
+        while (true) {
             const { value, done } = await reader.read();
-            if(done) break;
+            if (done) break;
             bufs.push(value);
         }
         const retU8 = new Uint8Array(bufs.reduce((acc, cur) => acc + cur.length, 0));
         let offset = 0;
-        for(const buf of bufs){
+        for (const buf of bufs) {
             retU8.set(buf, offset);
             offset += buf.length;
         }
@@ -74,15 +74,15 @@ class Process implements Deno.ChildProcess {
 
     pid: number;
     status: Promise<Deno.CommandStatus>;
-    
+
     constructor(private $proc: CModuleProcess.ChildProcess, private $wait: Promise<CModuleProcess.ExitInfo>) {
         this.$stdin = useWritable($proc.stdin!);
         this.$stdout = new RStream($proc.stdout!);
         this.$stderr = new RStream($proc.stderr!);
         this.pid = $proc.pid;
-        this.status = this.$wait.then(f => ({ 
-            code: f.exit_status, 
-            success: f.exit_status === 0, 
+        this.status = this.$wait.then(f => ({
+            code: f.exit_status,
+            success: f.exit_status === 0,
             signal: f.term_signal as any
         }));
     }
@@ -127,7 +127,7 @@ class Process implements Deno.ChildProcess {
     }
 
     @wrap
-    async [Symbol.asyncDispose](){
+    async [Symbol.asyncDispose]() {
         this.kill();
         await this.status;
     }
@@ -140,30 +140,33 @@ class Process implements Deno.ChildProcess {
     }
 }
 
-class Command implements Deno.Command {
-    private proc: CModuleProcess.ChildProcess;
-    private detached: boolean;
+function spawn(path: string, args: string[], options?: Deno.CommandOptions): CModuleProcess.ChildProcess {
+    return proc.spawn([path, ...args], {
+        cwd: options?.cwd ? toString(options.cwd) : undefined,
+        env: options?.env,
+        stdin: pipe(options?.stdin) ?? 'inherit',
+        stdout: pipe(options?.stdout) ?? 'inherit',
+        stderr: pipe(options?.stderr) ?? 'inherit',
+        detached: options?.detached,
+        uid: options?.uid,
+        gid: options?.gid
+    })
+}
 
-    constructor(command: string | URL, options?: Deno.CommandOptions){
+class Command implements Deno.Command {
+    private proc: CModuleProcess.ChildProcess; private detached: boolean;
+
+    constructor(command: string | URL, options?: Deno.CommandOptions) {
         const path = toString(command);
         const args = options?.args ?? [];
-        this.proc = proc.spawn([path, ...args], {
-            cwd: options?.cwd ? toString(options.cwd) : undefined,
-            env: options?.env,
-            stdin: pipe(options?.stdin) ?? 'inherit',
-            stdout: pipe(options?.stdout) ?? 'inherit',
-            stderr: pipe(options?.stderr) ?? 'inherit',
-            detached: options?.detached,
-            uid: options?.uid,
-            gid: options?.gid
-        });
+        this.proc = spawn(path, args, options);
         this.detached = options?.detached ?? false;
     }
 
     @wrap
     async output(): Promise<Deno.CommandOutput> {
         assert(!this.detached, "Detached process cannot be waited");
-        
+
         const stdo = this.proc.stdout ? new RStream(this.proc.stdout).bytes() : Promise.resolve(new Uint8Array(0));
         const stde = this.proc.stderr ? new RStream(this.proc.stderr).bytes() : Promise.resolve(new Uint8Array(0));
         const res = await this.proc.wait();
@@ -180,7 +183,7 @@ class Command implements Deno.Command {
     @wrap
     outputSync(): Deno.CommandOutput {
         assert(!this.detached, "Detached process cannot be waited");
-        
+
         // TODO: implement reading stdout/stderr data
         const res = this.proc.waitSync();
         return {
@@ -202,15 +205,22 @@ class Command implements Deno.Command {
 }
 
 Object.assign(Deno, wrapFSns({
-    kill(pid: number, signo?: Deno.Signal): void {
-        assert(signo != 'SIGEMT', "Not implemented");
-        // @ts-ignore
+    kill(pid: number, signo?: number | Deno.Signal): void {
+        assert(signo != 'SIGEMT' && signo != 'SIGIO' && signo != 'SIGUNUSED', "Not implemented");
         proc.kill(pid, signo);
     },
 
     umask(mask?: number): number {
         return 0;   // not implemented
     },
+
+    // unstable, but useful
+    spawn(command: string | URL, optOrArgs?: Deno.CommandOptions | string[], opt?: Deno.CommandOptions): Deno.ChildProcess {
+        const option = Array.isArray(optOrArgs) ? opt : optOrArgs;
+        const args = Array.isArray(optOrArgs) ? optOrArgs : option?.args ?? [];
+        const process = spawn(toString(command), args, option);
+        return new Process(process, process.wait());
+    }
 }));
 
 // class constructor should NEVER being wrapped

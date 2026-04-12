@@ -1,6 +1,6 @@
 {
   "name": "cts",
-  "version": "2.5.6",
+  "version": "2.7.12",
   "description": "cts - circu.js bootstrap to provide full typescript experience",
   "main": "src/main.ts",
   "type": "module",
@@ -20,9 +20,7 @@
     "@formatjs/intl-numberformat": "^9.0.7",
     "@formatjs/intl-relativetimeformat": "^12.0.7",
     "@types/node": "^25.3.0",
-    "blob-polyfill": "^9.0.20240710",
     "buffer": "^6.0.3",
-    "formdata-polyfill": "^4.0.10",
     "headers-polyfill": "^4.0.3",
     "sucrase": "^3.35.1",
     "temporal-polyfill": "^0.3.0",
