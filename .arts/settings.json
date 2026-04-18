@@ -1,0 +1,10 @@
+{
+    "deno.enable": true,
+    "deno.enablePaths": [
+        "./example/",
+        "./test/",
+        "./utils/"
+    ],
+    "diffEditor.renderSideBySide": true,
+    "makefile.configureOnOpen": false
+}
