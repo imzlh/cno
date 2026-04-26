@@ -4,8 +4,7 @@
  */
 
 import { PointerObject, PointerValue } from './types';
-
-const { ffi_load_native } = import.meta.use('ffi');
+const ffi = import.meta.use('ffi');
 const brand = Symbol('brand');
 
 function createPointerObject<T = unknown>(addr: bigint): PointerObject<T> {
@@ -56,8 +55,7 @@ export class UnsafePointer {
             );
         }
         
-        const native = ffi_load_native();
-        const addr = native.getArrayBufPtr(buf);
+        const addr = ffi.getArrayBufPtr(buf);
         if (addr === 0n) return null;
         return createPointerObject<T>(addr);
     }
@@ -78,16 +76,14 @@ export class UnsafePointer {
 export class UnsafePointerView {
     pointer: PointerObject;
     private addr: bigint;
-    private native: ReturnType<typeof ffi_load_native>;
 
     constructor(pointer: PointerObject) {
         this.pointer = pointer;
         this.addr = getPointerAddress(pointer);
-        this.native = ffi_load_native();
     }
 
     private readAt(offset: number, size: number): Uint8Array {
-        return this.native.ptrToBuffer(this.addr + BigInt(offset), size);
+        return ffi.ptrToBuffer(this.addr + BigInt(offset), size);
     }
 
     getBool(offset: number = 0): boolean {
@@ -151,13 +147,12 @@ export class UnsafePointerView {
     }
 
     getCString(offset: number = 0): string {
-        return this.native.getCString(this.addr + BigInt(offset));
+        return ffi.getCString(this.addr + BigInt(offset));
     }
 
     static getCString(pointer: PointerObject, offset: number = 0): string {
         const addr = getPointerAddress(pointer);
-        const native = ffi_load_native();
-        return native.getCString(addr + BigInt(offset));
+        return ffi.getCString(addr + BigInt(offset));
     }
 
     getArrayBuffer(byteLength: number, offset: number = 0): ArrayBuffer {
@@ -171,8 +166,7 @@ export class UnsafePointerView {
         offset: number = 0
     ): ArrayBuffer {
         const addr = getPointerAddress(pointer);
-        const native = ffi_load_native();
-        const buf = native.ptrToBuffer(addr + BigInt(offset), byteLength);
+        const buf = ffi.ptrToBuffer(addr + BigInt(offset), byteLength);
         return buf.buffer.slice(buf.byteOffset, buf.byteOffset + byteLength) as ArrayBuffer;
     }
 
@@ -195,7 +189,6 @@ export class UnsafePointerView {
         offset: number = 0
     ): void {
         const addr = getPointerAddress(pointer);
-        const native = ffi_load_native();
         const destBuffer = destination instanceof ArrayBuffer
             ? new Uint8Array(destination)
             : new Uint8Array(
@@ -204,7 +197,7 @@ export class UnsafePointerView {
                 (destination as ArrayBufferView).byteLength
             );
         
-        const src = native.ptrToBuffer(addr + BigInt(offset), destBuffer.length);
+        const src = ffi.ptrToBuffer(addr + BigInt(offset), destBuffer.length);
         destBuffer.set(src);
     }
 }

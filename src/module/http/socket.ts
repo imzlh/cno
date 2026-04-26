@@ -27,6 +27,40 @@ export class TcpSocket {
         this.socket = socket ?? new streams.TCP();
     }
 
+    private _readCallback: ((data: Uint8Array | null) => void) | null = null;
+    private _readErrHandler: ((err: Error) => void) | null = null;
+
+    private setupReadCallback(): void {
+        // @ts-ignore - onread is not in type definition but exists at runtime
+        this.socket.onread = (data: Uint8Array | null | undefined, err?: CModuleError.Error) => {
+            if (data === undefined && err) {
+                this._readErrHandler?.(err);
+                // @ts-ignore
+                this.socket.onread = null;
+            } else {
+                this._readCallback?.(data ?? null);
+                if (data !== null && this._readCallback) {
+                    this.socket.startRead();
+                }
+            }
+        };
+        this.socket.startRead();
+    }
+
+    onReadable(callback: (data: Uint8Array | null) => void, errHandler?: (err: Error) => void): void {
+        this._readCallback = callback;
+        this._readErrHandler = errHandler ?? null;
+        this.setupReadCallback();
+    }
+
+    stopReading(): void {
+        this.socket.stopRead();
+        this._readCallback = null;
+        this._readErrHandler = null;
+        // @ts-ignore
+        this.socket.onread = null;
+    }
+
     /* -------------------------------------------------------------- */
     /* Read / Write                                                   */
     /* -------------------------------------------------------------- */
@@ -40,24 +74,21 @@ export class TcpSocket {
         if (!this.sslPipe) {
             const buf = new Uint8Array(size);
             const n = await this.socket.read(buf);
-            return (n === null || n === 0) ? null : buf.subarray(0, n);
+            return (n === 0) ? null : buf.subarray(0, n);
         }
 
-        // Drain any buffered plaintext first
         const buffered = this.sslRead(size);
         if (buffered) return buffered;
 
-        // Feed leftover ciphertext from a previous partial read
         if (this.pending) {
             const plain = this.feedAndRead(this.pending, size);
             this.pending = null;
             if (plain) return plain;
         }
 
-        // Read new ciphertext from network
         const buf = new Uint8Array(size);
         const n = await this.socket.read(buf);
-        if (n === null || n === 0) return null;
+        if (n === 0) return null;
 
         const cipher = buf.subarray(0, n);
         const consumed = this.feedCipher(cipher);
@@ -102,7 +133,7 @@ export class TcpSocket {
 
         while (!this.sslPipe.handshakeComplete) {
             const n = await this.socket.read(buf);
-            if (n === null || n === 0) throw new Error("SSL handshake failed: connection closed");
+            if (n === 0) throw new Error("SSL handshake failed: connection closed");
 
             let toFeed = buf.subarray(0, n);
             while (toFeed.length > 0) {
@@ -132,7 +163,7 @@ export class TcpSocket {
         const buf = new Uint8Array(READ_SIZE);
         while (!this.sslPipe.handshakeComplete) {
             const n = await this.socket.read(buf);
-            if (n === null || n === 0) throw new Error("TLS handshake failed: connection closed");
+            if (n === 0) throw new Error("TLS handshake failed: connection closed");
 
             let toFeed = buf.subarray(0, n);
             while (toFeed.length > 0) {
@@ -153,6 +184,7 @@ export class TcpSocket {
 
     close(): void {
         this.pending = null;
+        this.stopReading();
         try { this.sslPipe?.shutdown(); } catch { /* ignore */ }
         try { this.socket.close();      } catch { /* ignore */ }
     }

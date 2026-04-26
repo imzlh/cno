@@ -99,6 +99,7 @@ export class EventTarget {
             // copy to allow removal during iteration
             for (const fn of [...bucket]) {
                 if (event.propagationStopped) break;
+                // @ts-ignore
                 fn.call(this, event);
             }
         }

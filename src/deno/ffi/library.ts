@@ -19,10 +19,6 @@ import {
 } from './types';
 import { UnsafePointer, createPointerObject } from './pointer';
 
-const { ffi_load_native } = import.meta.use('ffi');
-let __ffi_cache: ReturnType<typeof ffi_load_native> | undefined;
-const getNative = () => __ffi_cache ?? (__ffi_cache = ffi_load_native());
-
 class DynamicLibraryImpl<S extends ForeignLibraryInterface> implements DynamicLibrary<S> {
     private lib: CModuleFFI.UvLib;
     private _symbols: StaticForeignLibraryInterface<S>;
@@ -34,7 +30,7 @@ class DynamicLibraryImpl<S extends ForeignLibraryInterface> implements DynamicLi
 
     constructor(filename: string | URL, symbolsDef: S) {
         const path = typeof filename === 'string' ? filename : filename.pathname;
-        const native = getNative();
+        const native = ffi;
         this.lib = new native.UvLib(path);
         this._symbols = this.createSymbols(symbolsDef);
     }
@@ -71,8 +67,8 @@ class DynamicLibraryImpl<S extends ForeignLibraryInterface> implements DynamicLi
     }
 
     private createFunction(symPtr: CModuleFFI.UvDlSym, def: ForeignFunction): Function {
-        const native = getNative();
-        const cif = this.createCif(native, def.parameters, def.result);
+        const native = ffi;
+        const cif = this.createCif(def.parameters, def.result);
         
         const fn = (...args: any[]): any => {
             if (this.closed) {
@@ -81,7 +77,7 @@ class DynamicLibraryImpl<S extends ForeignLibraryInterface> implements DynamicLi
             
             const ffiArgs = args.map((arg, i) => {
                 const type = def.parameters[i];
-                return this.toFfiArg(native, arg, type);
+                return this.toFfiArg(arg, type);
             });
             
             const result = cif.call(symPtr, ...ffiArgs);
@@ -96,14 +92,13 @@ class DynamicLibraryImpl<S extends ForeignLibraryInterface> implements DynamicLi
     }
 
     private createStatic(symPtr: CModuleFFI.UvDlSym, def: ForeignStatic): any {
-        const native = getNative();
+        const native = ffi;
         const size = getTypeSize(def.type);
         const buf = native.ptrToBuffer(symPtr.addr, size);
         return this.fromFfiResult(buf, def.type);
     }
 
     private createCif(
-        native: ReturnType<typeof ffi_load_native>,
         parameters: readonly NativeType[],
         result: NativeResultType
     ): CModuleFFI.FfiCif {
@@ -151,7 +146,6 @@ class DynamicLibraryImpl<S extends ForeignLibraryInterface> implements DynamicLi
     }
 
     private toFfiArg(
-        native: ReturnType<typeof ffi_load_native>,
         value: any,
         type: NativeType
     ): Uint8Array | bigint {
@@ -218,7 +212,7 @@ class DynamicLibraryImpl<S extends ForeignLibraryInterface> implements DynamicLi
                                 (value as ArrayBufferView).byteLength
                             );
                         }
-                        return native.getArrayBufPtr(buf);
+                        return ffi.getArrayBufPtr(buf);
                     }
                     return UnsafePointer.value(value as PointerValue);
                 }

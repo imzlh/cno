@@ -5,12 +5,8 @@
  */
 
 const os = import.meta.use('os');
-const sys = import.meta.use('sys');
 
-// ============================================================================
-// 类型定义（从 @types/node 导入）
-// ============================================================================
-
+const uname = os.uname();
 export interface CpuInfo {
     model: string;
     speed: number;
@@ -200,10 +196,10 @@ export const constants = {
 // ============================================================================
 
 /** 空设备的路径 */
-export const devNull = sys.platform === 'win32' ? '\\\\.\\NUL' : '/dev/null';
+export const devNull = uname.sysname === 'win32' ? '\\\\.\\NUL' : '/dev/null';
 
 /** 操作系统特定的行尾标记 */
-export const EOL = sys.platform === 'win32' ? '\r\n' : '\n';
+export const EOL = uname.sysname === 'win32' ? '\r\n' : '\n';
 
 // ============================================================================
 // 函数实现
@@ -262,14 +258,14 @@ export function availableParallelism(): number {
  * 返回操作系统名称
  */
 export function type(): string {
-    return os.uname().sysname;
+    return uname.sysname;
 }
 
 /**
  * 返回操作系统发行版本
  */
 export function release(): string {
-    return os.uname().release;
+    return uname.release;
 }
 
 /**
@@ -341,7 +337,7 @@ export function userInfo(options?: UserInfoOptions): UserInfo<string> {
  * 返回 Node.js 二进制文件编译时的操作系统 CPU 架构
  */
 export function arch(): NodeJS.Architecture {
-    const machine = os.uname().machine;
+    const machine = uname.machine;
     // 映射到 Node.js 架构名称
     switch (machine) {
         case 'x86_64':
@@ -378,14 +374,14 @@ export function arch(): NodeJS.Architecture {
  * 返回内核版本字符串
  */
 export function version(): string {
-    return os.uname().version;
+        return uname.version;
 }
 
 /**
  * 返回操作系统平台字符串
  */
 export function platform(): NodeJS.Platform {
-    const platform = sys.platform;
+    const platform = uname.sysname;
     switch (platform) {
         case 'linux':
             return 'linux';
@@ -412,7 +408,7 @@ export function platform(): NodeJS.Platform {
  * 返回机器类型字符串
  */
 export function machine(): string {
-    return os.uname().machine;
+    return uname.machine;
 }
 
 /**

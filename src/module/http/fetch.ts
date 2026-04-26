@@ -35,6 +35,7 @@ export class Request implements globalThis.Request {
 
     public readonly isHistoryNavigation = false;
     public readonly isReloadNavigation = false;
+    public readonly duplex: 'half' = 'half';
 
     private _bodySource: BodyInit | null = null;
     private _bodyBuffer: Uint8Array | null = null;
@@ -521,12 +522,17 @@ function createResponseBodyStream(ctx: FetchContext): ReadableStream<Uint8Array>
  * 读取响应头部
  */
 async function readHeaders(ctx: FetchContext): Promise<void> {
-    while (!ctx.parser.isHeadersComplete && !ctx.aborted) try {
-        const data = await ctx.connection.read();
-        if (!data || data.length === 0) continue;
-        ctx.parser.feed(data);
-    } catch {
-        break;
+    while (!ctx.parser.isHeadersComplete) {
+        if (ctx.aborted) {
+            throw new DOMException('The operation was aborted', 'AbortError');
+        }
+        try {
+            const data = await ctx.connection.read();
+            if (!data || data.length === 0) continue;
+            ctx.parser.feed(data);
+        } catch {
+            break;
+        }
     }
 }
 
@@ -534,7 +540,9 @@ async function readHeaders(ctx: FetchContext): Promise<void> {
  * 读取响应体
  */
 async function readBody(ctx: FetchContext): Promise<void> {
+    if (ctx.aborted) return;
     const data = await ctx.connection.read();
+    if (ctx.aborted) return;
     if (!data) return;
     ctx.parser.feed(data);
 }
@@ -579,23 +587,21 @@ async function performFetch(
         client: client || undefined
     });
 
+    const ctx: FetchContext = {
+        request,
+        url,
+        connection,
+        parser: new HttpResponseParser(),
+        aborted: false
+    };
+
+    function abortHandler() {
+        ctx.aborted = true;
+    }
+
     try {
         // 发送请求
         await sendRequest(request, url, connection);
-
-        // 创建解析上下文
-        const ctx: FetchContext = {
-            request,
-            url,
-            connection,
-            parser: new HttpResponseParser(),
-            aborted: false
-        };
-
-        // 设置 AbortSignal 处理
-        const abortHandler = () => {
-            ctx.aborted = true;
-        };
 
         if (request.signal) {
             request.signal.addEventListener('abort', abortHandler);
@@ -635,12 +641,20 @@ async function performFetch(
             headers
         });
 
+        if (request.signal) {
+            request.signal.removeEventListener('abort', abortHandler);
+        }
+
         Object.defineProperty(response, 'url', { value: url.href });
         Object.defineProperty(response, 'redirected', { value: redirectCount > 0 });
 
         return response;
 
     } catch (err) {
+        // @ts-ignore
+        if (request.signal) {
+            request.signal.removeEventListener('abort', abortHandler);
+        }
         releaseConnection({ url, connection } as any);
         throw err;
     }

@@ -83,6 +83,7 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
     private _bodySent: boolean = false;
     private _socketAssigned: boolean = false;
     private _response: IncomingMessageImpl | null = null;
+    private _pendingData: Uint8Array | null = null;
 
     constructor(url: string | URL | ClientRequestArgs, cb?: (res: IncomingMessageImpl) => void) {
         super();
@@ -255,21 +256,51 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
 
         const buffer = new Uint8Array(65536);
 
-        try {
+        const readLoop = async () => {
             while (!this._aborted) {
-                const bytesRead = await this._tcp.read(buffer);
-                if (bytesRead === null) break;
+                let toParse: Uint8Array;
 
-                const data = buffer.slice(0, bytesRead);
-                const result = parser.execute(data.buffer.slice(data.byteOffset, data.byteLength + data.byteOffset));
+                if (this._pendingData) {
+                    toParse = this._pendingData;
+                    this._pendingData = null;
 
-                if (result.errno !== 0) break;
+                    const n = await this._tcp!.read(buffer);
+                    if (n === 0) {
+                        this._cleanup();
+                        return;
+                    }
+                    const combined = new Uint8Array(toParse.byteLength + n);
+                    combined.set(toParse);
+                    combined.set(buffer.subarray(0, n), toParse.byteLength);
+                    toParse = combined;
+                } else {
+                    const n = await this._tcp!.read(buffer);
+                    if (n === 0) {
+                        this._cleanup();
+                        return;
+                    }
+                    toParse = buffer.subarray(0, n);
+                }
+
+                const result = parser.execute(toParse.buffer.slice(toParse.byteOffset, toParse.byteOffset + toParse.byteLength));
+                if (result.errno !== 0) {
+                    this._cleanup();
+                    return;
+                }
+
+                // @ts-ignore - remainder exists at runtime
+                const remainder = result.remainder as number;
+                if (remainder > 0) {
+                    const parsedLength = toParse.byteLength - remainder;
+                    this._pendingData = toParse.subarray(parsedLength);
+                }
             }
-        } catch (err) {
+        };
+
+        readLoop().catch((err) => {
             if (!this._aborted) this.emit('error', err);
-        } finally {
             this._cleanup();
-        }
+        });
     }
 
     write(chunk: any, encodingOrCb?: BufferEncoding | ((err?: Error) => void), cb?: (err?: Error) => void): boolean {
@@ -325,6 +356,7 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
             timers.clearTimeout(this._timeoutId);
             this._timeoutId = null;
         }
+        this._pendingData = null;
         if (this._tcp) {
             try { this._tcp.close(); } catch {}
             this._tcp = null;

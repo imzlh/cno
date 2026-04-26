@@ -3,11 +3,10 @@
 // @ts-nocheck - we are using native modules
 
 import { transform } from "sucrase";
-import { join, normalize } from "../src/utils/path";
+import { join, normalize } from "../src/utils/path.ts";
 
 const os = import.meta.use('os');
 const fs = import.meta.use('fs');
-const sys = import.meta.use('sys');
 const console = import.meta.use('console');
 const engine = import.meta.use('engine');
 const smap = import.meta.use('sourcemap');

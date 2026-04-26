@@ -132,18 +132,24 @@ class ChildProcessImpl extends EventEmitter implements ChildProcess {
 
     private _createReadable(pipe: CModuleStreams.Pipe): Readable {
         const readable = new Readable();
-        readable._read = (size: number) => {
-            const buffer = new Uint8Array(size || 65536);
-            pipe.read(buffer).then((bytesRead) => {
-                if (bytesRead === null) {
+
+        readable._read = async (size: number) => {
+            const chunkSize = size || 65536;
+            const buf = new Uint8Array(chunkSize);
+
+            try {
+                const n = await pipe.read(buf);
+                if (n === 0) {
                     readable.push(null);
-                } else {
-                    readable.push(buffer.slice(0, bytesRead));
+                    return;
                 }
-            }).catch((err) => {
+                readable.push(buf.subarray(0, n));
+            } catch (err) {
                 readable.emit('error', err);
-            });
+                readable.push(null);
+            }
         };
+
         return readable;
     }
 
@@ -243,17 +249,19 @@ export function spawn(command: string, argsOrOptions?: string[] | SpawnOptions, 
     }
 
     const child = new ChildProcessImpl();
+    // @ts-ignore
     const process = proc.spawn(command, args, spawnOpts);
     child._init(process, command, args, opts);
 
     if (opts.signal) {
+        // @ts-ignore
         opts.signal.addEventListener('abort', () => {
             child.kill();
         });
     }
 
     if (opts.timeout) {
-        setTimeout(() => {
+        const tid = setTimeout(() => {
             if (!child.killed) {
                 child.kill(opts.killSignal as string || 'SIGTERM');
             }
@@ -425,6 +433,7 @@ export function spawnSync(command: string, args?: string[], options?: SpawnOptio
     };
 
     try {
+        // @ts-ignore
         const child = proc.spawn(command, args ?? [], opts);
         const info = child.waitSync();
 

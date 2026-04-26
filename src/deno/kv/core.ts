@@ -306,29 +306,28 @@ export class Kv implements Deno.Kv {
                 return;
             } catch (err) {
                 console.error('Queue handler error:', err);
-            }
-        }
-        
-        if (entry.undeliveredKeys && entry.undeliveredKeys.length > 0) {
-            const backoffSchedule = entry.backoffSchedule ?? [100, 200, 400, 800];
-            const nextRetry = entry.retryCount + 1;
-            
-            if (nextRetry <= backoffSchedule.length) {
-                const delay = backoffSchedule[nextRetry - 1];
-                const newEntry: QueueEntry = {
-                    ...entry,
-                    retryCount: nextRetry,
-                    scheduledAt: Date.now() + delay,
-                };
-                
-                const queueKey: KvKey = [QUEUE_PREFIX, newEntry.scheduledAt, entry.id];
-                this.db.set(serializeKey(queueKey), serializeValue(newEntry), delay + 86400000);
-            } else {
-                for (const key of entry.undeliveredKeys) {
-                    try {
-                        await this.set(key, { undelivered: entry.data, id: entry.id });
-                    } catch {
-                        // Ignore
+                if (entry.undeliveredKeys && entry.undeliveredKeys.length > 0) {
+                    const backoffSchedule = entry.backoffSchedule ?? [100, 200, 400, 800];
+                    const nextRetry = entry.retryCount + 1;
+                    
+                    if (nextRetry <= backoffSchedule.length) {
+                        const delay = backoffSchedule[nextRetry - 1];
+                        const newEntry: QueueEntry = {
+                            ...entry,
+                            retryCount: nextRetry,
+                            scheduledAt: Date.now() + delay,
+                        };
+                        
+                        const queueKey: KvKey = [QUEUE_PREFIX, newEntry.scheduledAt, entry.id];
+                        this.db.set(serializeKey(queueKey), serializeValue(newEntry), delay + 86400000);
+                    } else {
+                        for (const key of entry.undeliveredKeys) {
+                            try {
+                                await this.set(key, { undelivered: entry.data, id: entry.id });
+                            } catch {
+                                // Ignore
+                            }
+                        }
                     }
                 }
             }

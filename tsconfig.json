@@ -14,7 +14,7 @@
         // "types": [],
         "typeRoots": [
             "types/",
-            "node_modules/@types/node/"
+            // "node_modules/@types/node/",
         ],
         // For nodejs:
         "lib": [
@@ -55,5 +55,10 @@
         "out": "../api/",
         "disableSources": true
     },
-    "exclude": ["./example/", "./test/", "./utils/"]
+    "exclude": ["./example/", "./test/", "./utils/"],
+    "include": [
+        "src/**/*",
+        "node_modules/@types/node/index.d.ts",
+        "types/**/*.d.ts"
+    ]
 }

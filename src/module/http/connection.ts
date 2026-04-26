@@ -39,6 +39,8 @@ export interface ConnectionLike {
     connect(): Promise<void>;
     write(data: Uint8Array): Promise<void>;
     read(size?: number): Promise<Uint8Array | null>;
+    onReadable(callback: (data: Uint8Array | null) => void, errHandler?: (err: Error) => void): void;
+    stopReading(): void;
     markActive(): void;
     markIdle(): void;
     close(): void;
@@ -274,7 +276,10 @@ export class ConnectionManager {
     @wrap
     private async waitForConnection(key: string, cfg: ConnectionConfig): Promise<Connection> {
         return new Promise((resolve, reject) => {
-            const timeout = timers.setTimeout(() => reject(new Error("Connection pool timeout")), cfg.timeout || 30000);
+            const timeout = timers.setTimeout(() => {
+                timers.clearInterval(interval);
+                reject(new Error("Connection pool timeout"));
+            }, cfg.timeout || 30000);
             const interval = timers.setInterval(() => {
                 const avail = (this.pools.get(key) || []).find(c => c.isAvailable());
                 if (avail) {

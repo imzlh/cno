@@ -17,14 +17,17 @@ const pipe = (type?: Deno.CommandOptions['stdout']): CModuleProcess.SpawnOptions
 class RStream extends ReadableStream<Uint8Array<ArrayBuffer>> implements Deno.SubprocessReadableStream {
     constructor(private pipe: CModuleProcess.Pipe) {
         super({
-            pull: async ctrl => {
+            async pull(controller) {
                 try {
-                    const buf = malloc(ctrl);
-                    const readed = await pipe.read(buf);
-                    if (!readed) ctrl.close();
-                    else ctrl.enqueue(buf.slice(0, readed));
+                    const buf = malloc(controller);
+                    const n = await pipe.read(buf);
+                    if (n === 0) {
+                        controller.close();
+                    } else {
+                        controller.enqueue(buf.slice(0, n));
+                    }
                 } catch (e) {
-                    ctrl.error(e);
+                    controller.error(e);
                 }
             }
         });

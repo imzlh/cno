@@ -122,6 +122,10 @@ class NavigatorImpl implements Navigator {
         return this._opensocket;
     }
 
+    get locks(): never {
+        throw new DOMException('Not implemented', 'DOMException');
+    }
+
     async getBattery(): Promise<BatteryManager> {
         if (!this._battery) {
             this._battery = new BatteryManagerImpl();

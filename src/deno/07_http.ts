@@ -38,13 +38,13 @@ async function connectHttpProxy(
     
     connectReq += `\r\n`;
     
-    await socket.write(engine.encodeString(connectReq));
+    socket.write(engine.encodeString(connectReq));
 
-    const buf = new Uint8Array(1024);
+    const buf = new Uint8Array(4096);
     const n = await socket.read(buf);
-    if (!n) {
+    if (n === 0) {
         socket.close();
-        throw new Error('Proxy connection closed');
+        throw new Error('Proxy CONNECT failed: EOF');
     }
 
     const response = engine.decodeString(buf.subarray(0, n));

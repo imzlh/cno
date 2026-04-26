@@ -89,6 +89,7 @@ export class Socket extends Duplex {
     private _keepAlive: boolean = false;
     private _keepAliveDelay: number = 0;
     private _noDelay: boolean = false;
+    private _pendingData: Uint8Array | null = null;
 
     bytesRead: number = 0;
     bytesWritten: number = 0;
@@ -304,6 +305,8 @@ export class Socket extends Duplex {
         this._destroyed = true;
         this.readyState = 'closed';
 
+        this._pendingData = null;
+
         if (this._tcp) {
             try {
                 this._tcp.close();
@@ -323,19 +326,51 @@ export class Socket extends Duplex {
         if (!this._tcp || this._destroyed) return;
 
         const buffer = new Uint8Array(size);
-        this._tcp.read(buffer).then((bytesRead) => {
-            if (bytesRead === null) {
+
+        const handleRead = (data: Uint8Array | null | undefined, err?: CModuleError.Error) => {
+            // @ts-ignore
+            this._tcp!.onread = null;
+            // @ts-ignore
+            this._tcp!.stopRead();
+
+            if (data === undefined) {
+                if (err) {
+                    this.emit('error', err);
+                }
+                return;
+            }
+            if (data === null) {
                 // @ts-ignore - push exists on Readable side of Duplex
                 this.push(null);
                 this.emit('end');
-            } else {
-                this.bytesRead += bytesRead;
-                // @ts-ignore - push exists on Readable side of Duplex
-                this.push(buffer.slice(0, bytesRead));
+                return;
             }
-        }).catch((err) => {
-            this.emit('error', err);
-        });
+
+            let toPush: Uint8Array;
+            if (this._pendingData) {
+                const combined = new Uint8Array(this._pendingData.byteLength + data.byteLength);
+                combined.set(this._pendingData);
+                combined.set(data, this._pendingData.byteLength);
+                this._pendingData = null;
+                toPush = combined;
+            } else {
+                toPush = data;
+            }
+
+            if (toPush.length > size) {
+                this._pendingData = toPush.subarray(size);
+                toPush = toPush.subarray(0, size);
+            }
+
+            this.bytesRead += toPush.byteLength;
+            // @ts-ignore - push exists on Readable side of Duplex
+            this.push(toPush);
+        };
+
+        // @ts-ignore
+        this._tcp.onread = handleRead;
+        // @ts-ignore
+        this._tcp.startRead();
     }
 
     protected _write(chunk: any, encoding: BufferEncoding, callback: (error?: Error | null) => void): void {

@@ -1,3 +1,4 @@
+import { TimerOptions } from "node:timers";
 import { assert } from "../utils/assert";
 
 const crypto = import.meta.use('crypto');
@@ -63,18 +64,29 @@ globalThis.confirm = function(msg) {
 globalThis.TextEncoder = text.Encoder;
 globalThis.TextDecoder = text.Decoder;
 
-globalThis.setTimeout = function(cb, timeout, ...args) {
+// @ts-ignore - __promisify__ is defined next
+globalThis.setTimeout = function(cb: string | ((...args: any[]) => void), delay?: number | undefined, ...args: any[]) {
     if (typeof cb == 'string') {
         throw new Error('string argument is not allowed for setTimeout for security reasons.');
     }
     return timer.setTimeout(() => {
         cb(...args);
-    }, timeout ?? 0);
+    }, delay ?? 0);
 }
-globalThis.clearTimeout = globalThis.clearInterval = function(id) {
+globalThis.setTimeout.__promisify__ = <T = void>(delay?: number | undefined, value?: T | undefined, options?: TimerOptions | undefined): Promise<T> => new Promise(rs => {
+    const fd = timer.setTimeout(() => {
+        rs(value!);
+    }, delay ?? 0);
+    if (options?.signal) {
+        options.signal.addEventListener('abort', () => timer.clearTimeout(fd));
+    }
+});
+// @ts-ignore - webapi
+globalThis.clearTimeout = globalThis.clearInterval = function(id: number) {
     if (!id) return;
     timer.clearTimeout(id);
 }
+// @ts-ignore - webapi
 globalThis.setInterval = function(cb, timeout, ...args) {
     if (typeof cb == 'string') {
         throw new Error('string argument is not allowed for setTimeout for security reasons.');
@@ -87,6 +99,13 @@ globalThis.setInterval = function(cb, timeout, ...args) {
 globalThis.structuredClone = function(v, opt){
     return engine.deserialize(engine.serialize(v));
 }
+
+globalThis.queueMicrotask = function(callback: () => void) {
+    if (typeof callback !== 'function') {
+        throw new TypeError('callback is not a function');
+    }
+    Promise.resolve().then(callback);
+};
 
 globalThis.reportError = function(e) {
     const error = e instanceof Error ? e : new Error(String(e));

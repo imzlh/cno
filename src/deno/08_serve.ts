@@ -433,6 +433,14 @@ function createWebSocketFromServerConnection(conn: Promise<ServerConnection>): W
             return await conn.read(size);
         },
 
+        onReadable(callback: (data: Uint8Array | null) => void, errHandler?: (err: Error) => void): void {
+            conn.onReadable(callback, errHandler);
+        },
+
+        stopReading(): void {
+            conn.stopReading();
+        },
+
         markActive() { },
         markIdle() { },
 

@@ -4,7 +4,6 @@
  */
 
 const os = import.meta.use('os');
-const sys = import.meta.use('sys');
 const engine = import.meta.use('engine');
 const signal = import.meta.use('signals');
 const proc = import.meta.use('process');
@@ -171,6 +170,7 @@ const envProxy = new Proxy({} as NodeJS.ProcessEnv, {
 // Process 对象
 // ============================================================================
 
+const uname = os.uname();
 export const process: NodeJS.Process = {
     // 标准流 - 简化实现
     stdout: null as any,
@@ -178,8 +178,8 @@ export const process: NodeJS.Process = {
     stdin: null as any,
 
     // 命令行参数
-    argv: [sys.exePath, ...sys.args.slice(1)],
-    argv0: sys.args[0] ?? sys.exePath,
+    argv: [os.exePath, ...os.args.slice(1)],
+    argv0: os.args[0] ?? os.exePath,
     execArgv: [],
 
     // 进程信息
@@ -188,7 +188,7 @@ export const process: NodeJS.Process = {
 
     // 平台信息
     arch: (() => {
-        const machine = os.uname().machine;
+        const machine = uname.machine;
         switch (machine) {
             case 'x86_64':
             case 'amd64':
@@ -207,7 +207,7 @@ export const process: NodeJS.Process = {
     })(),
 
     platform: (() => {
-        const platform = sys.platform;
+        const platform = os.uname().sysname;
         switch (platform) {
             case 'linux':
                 return 'linux';
@@ -244,7 +244,7 @@ export const process: NodeJS.Process = {
     exitCode: undefined,
 
     // 执行路径
-    execPath: sys.exePath,
+    execPath: os.exePath,
 
     // 标题
     title: 'node',
@@ -512,6 +512,8 @@ export const process: NodeJS.Process = {
 
     listeners: () => [],
     rawListeners: () => [],
+
+    traceProcessWarnings: false
 };
 
 export default process;

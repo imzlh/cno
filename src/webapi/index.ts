@@ -47,17 +47,8 @@ await import('./streams');
 //     Reflect.set(globalThis, key, stream[key]);
 // }
 
-
-// blob
-// @ts-ignore
-const { Blob, File, FileReader } = await import('blob-polyfill');
-Reflect.set(globalThis, 'Blob', Blob);
-Reflect.set(globalThis, 'File', File);
-Reflect.set(globalThis, 'FileReader', FileReader);
-
-// formdata
-const { FormData } = await import('formdata-polyfill/esm.min');
-Reflect.set(globalThis, 'FormData', FormData);
+// formdata, blob, etc
+await import('./formdata');
 
 // abort-signal polyfill
 await import('./abort');
@@ -103,6 +94,9 @@ onEvent((eventName, eventData) => {
     return false;
 });
 
+// formdata, blob, etc
+await import('./formdata');
+
 // worker
 await import('./worker');
 
@@ -131,11 +125,11 @@ await import('./wasm');
 // storage
 await import('./storage');
 
+// BroadcastChannel
+await import('./broadcast-channel');
+
 // Intl (partial support)
 await import('./intl');
-
-// navigator
-await import('./navigator');
 
 // temporal
 // const { Temporal } = await import('temporal-polyfill');

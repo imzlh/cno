@@ -22,15 +22,18 @@ export class HttpRequestBuilder {
     private headers: globalThis.Headers = new Headers();
     private body: Uint8Array | null = null;
     private useFullUrl: boolean = false;
+    private httpVersion: string = '1.1';
 
     constructor(url: string | URL, options?: {
         method?: HttpMethod;
         headers?: HeadersInit;
         body?: BodyInit | null;
         proxy?: boolean;
+        httpVersion?: string;
     }) {
         this.url = typeof url === 'string' ? new URL(url) : url;
         this.useFullUrl = options?.proxy || false;
+        this.httpVersion = options?.httpVersion || '1.1';
 
         if (options?.method) {
             this.method = options.method.toUpperCase() as HttpMethod;
@@ -133,10 +136,10 @@ export class HttpRequestBuilder {
         }
 
         // 构建请求行
-        const path = this.useFullUrl 
+        const path = this.useFullUrl
             ? this.url.toString()  // Full URL for proxy
             : this.url.pathname + this.url.search;
-        let request = `${this.method} ${path} HTTP/1.1\r\n`;
+        let request = `${this.method} ${path} HTTP/${this.httpVersion}\r\n`;
 
         // 添加头部
         for (const [key, value] of this.headers) {

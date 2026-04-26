@@ -11,11 +11,7 @@ const symbolGetPipe = Symbol('Stream.getPipe');
 export const useWritable = (pipe: CModuleStreams.Stream) => new WritableStream({
     write: async (chunk, control) => {
         try {
-            let written = 0;
-            while (written < chunk.length) {
-                const n = await pipe.write(chunk.subarray(written));
-                written += n;
-            }
+            await pipe.write(chunk);
         } catch (e) {
             control.error(wrapFSErr(e as any));
         }
@@ -30,10 +26,10 @@ export const useReadable = (pipe: CModuleStreams.Stream) => new ReadableStream({
         try {
             const buf = malloc(controller);
             const n = await pipe.read(buf);
-            if (n === null) {
+            if (n === 0) {
                 controller.close();
             } else {
-                controller.enqueue(buf.subarray(0, n));
+                controller.enqueue(buf.slice(0, n));
             }
         } catch (e) {
             controller.error(wrapFSErr(e as any));
@@ -55,8 +51,8 @@ class Conn<T extends Deno.Addr = Deno.Addr> implements Deno.Conn<T> {
     }
 
     @wrap
-    async read(p: Uint8Array): Promise<number | null> {
-        return this.pipe.read(p);
+    read(p: Uint8Array): Promise<number | null> {
+        return this.pipe.read(p).then(n => n === 0 ? null : n);
     }
 
     @wrap
@@ -95,7 +91,7 @@ class Conn<T extends Deno.Addr = Deno.Addr> implements Deno.Conn<T> {
         return this.pipe.close();
     }
 
-    [symbolGetPipe](){
+    [symbolGetPipe]() {
         return this.pipe;
     }
 }
@@ -172,15 +168,11 @@ class TlsConn implements Deno.TlsConn {
     }
 
     @wrap
-    private async output() {
+    private output() {
         const obuf = this.$pipe.getOutput();
         if (!obuf || obuf.byteLength === 0) return;
         const buf = new Uint8Array(obuf);
-        let written = 0;
-        while (written < buf.byteLength) {
-            const n = await this.$rawPipe.write(buf.subarray(written));
-            written += n;
-        }
+        return this.$rawPipe.write(buf);
     }
 
     get readable(): ReadableStream {
@@ -248,7 +240,7 @@ class Listener implements Deno.Listener {
         protected $pipe: CModuleStreams.Stream,
         protected $isTCP: boolean,
         protected $addr: Deno.Addr
-    ) {}
+    ) { }
 
     @wrap
     async accept(): Promise<Deno.Conn<Deno.Addr>> {
@@ -290,32 +282,26 @@ class Listener implements Deno.Listener {
 
 function toConn(sslpipe: CModuleSSL.Pipe, pipe: CModuleStreams.TCP): Deno.TlsConn {
     let handshake = false;
-    const hsProm = Promise.withResolvers<Deno.TlsHandshakeInfo>();
-    (async () => {
-        const buf = new Uint8Array(2048);
-        try {
-            while (true) {
-                const n = await pipe.read(buf);
-                if (n === null) break;
-                sslpipe.feed(buf.subarray(0, n));
-                if (!handshake && sslpipe.handshake()) {
-                    handshake = true;
-                    hsProm.resolve({
-                        alpnProtocol: sslpipe.alpnProtocol()
-                    });
-                }
+    return new TlsConn(sslpipe, pipe, new Promise<Deno.TlsHandshakeInfo>((resolve, reject) => {
+        pipe.onread = (res, err) => {
+            if (!res){
+                reject(err ?? (new Error('TLS failed to handshake: EOF')));
+                pipe.stopRead();
+                return;
             }
-            if (!handshake) {
-                hsProm.reject(new Error('TLS handshake failed: connection closed'));
-            }
-        } catch (e) {
-            if (!handshake) {
-                hsProm.reject(e);
+            sslpipe.feed(res);
+            if (!handshake && sslpipe.handshake()) {
+                handshake = true;
+                pipe.stopRead();
+                // @ts-ignore
+                pipe.onread = null;
+                resolve({
+                    alpnProtocol: sslpipe.alpnProtocol()
+                });
             }
         }
-    })();
-
-    return new TlsConn(sslpipe, pipe, hsProm.promise);
+        pipe.startRead();
+    }));
 }
 
 class TcpListener extends Listener implements Deno.TcpListener {
@@ -354,7 +340,7 @@ class TlsListener extends Listener implements Deno.TlsListener {
     }
 
     @wrap
-    async* [Symbol.asyncIterator](){
+    async*[Symbol.asyncIterator]() {
         while (true) {
             const conn = await this.accept();
             yield conn;
@@ -536,7 +522,7 @@ Object.assign(Deno, wrapFSns({
         return listener;
     },
 
-    async startTls(conn, opt){
+    async startTls(conn, opt) {
         // @ts-ignore
         const pipe = conn[symbolGetPipe]?.() as CModuleStreams.TCP;
         const sslctx = new ssl.Context({

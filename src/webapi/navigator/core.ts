@@ -1,10 +1,10 @@
 const os = import.meta.use('os');
-const sys = import.meta.use('sys');
 const engine = import.meta.use('engine');
 
+const uname = os.uname();
 function getPlatform(): string {
-    const platform = sys.platform;
-    const machine = os.uname().machine;
+    const platform = uname.sysname;
+    const machine = uname.machine;
 
     switch (platform) {
         case 'linux':
@@ -19,9 +19,9 @@ function getPlatform(): string {
 }
 
 function getUserAgent(): string {
-    const platform = sys.platform;
-    const machine = os.uname().machine;
-    const version = sys.version;
+    const platform = uname.sysname;
+    const machine = uname.machine;
+    const version = engine.versions.core;
 
     const archMap: Record<string, string> = {
         x86_64: 'x86_64',

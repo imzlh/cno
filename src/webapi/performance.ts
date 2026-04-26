@@ -329,7 +329,7 @@ class PerformanceObserver {
     }
 }
 
-// ==================== Performance ===================f=
+// ==================== Performance ====================
 
 class Performance extends EventTarget implements globalThis.Performance {
     #entries: globalThis.PerformanceEntry[] = [];
@@ -339,6 +339,26 @@ class Performance extends EventTarget implements globalThis.Performance {
     #timeOrigin: number;
     #resourceTimingBufferSize: number = 250;
     #navigationTiming: PerformanceNavigationTiming;
+
+    get nodeTiming(): never {
+        throw new DOMException('Not implemented', 'DOMException');
+    }
+
+    markResourceTiming(): never {
+        throw new DOMException('Not implemented', 'DOMException');
+    }
+
+    eventLoopUtilization(): never {
+        throw new DOMException('Not implemented', 'DOMException');
+    }
+
+    timerify(): never {
+        throw new DOMException('Not implemented', 'DOMException');
+    }
+
+    onresourcetimingbufferfull(): never {
+        throw new DOMException('Not implemented', 'DOMException');
+    }
 
     // Navigation Timing (deprecated but widely used)
     readonly timing: {

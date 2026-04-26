@@ -60,15 +60,26 @@ export class Stream {
     @wrap
     async write(data: Uint8Array) {
         lock(this.fd);
-        let w = this.stream.write(data);
+        let w = await this.stream.write(data);
         unlock(this.fd);
         return w;
     }
 
     @wrap
-    async read(buf: Uint8Array): Promise<number | null> {
+    async read(buf: Uint8Array<ArrayBuffer>): Promise<number | null> {
         lock(this.fd);
-        const r = this.stream.read(buf);
+        let r;
+        if (this.type == 'file') {
+            r = await (this.stream as FSFile).read(buf);
+        } else {
+            const stream = (this.stream as CModuleStreams.Stream);
+            try {
+                const n = await stream.read(buf);
+                r = n === 0 ? null : n;
+            } catch (e) {
+                r = 0;
+            }
+        }
         unlock(this.fd);
         return r;
     }
@@ -101,18 +112,34 @@ export class Stream {
 
     @wrap
     createReadStream(): ReadableStream {
-        return new ReadableStream({
+        const stream = this.stream as CModuleStreams.Stream;
+        if (this.type == 'file') return new ReadableStream({
             pull: async ctrl => {
                 try{
                     const buf = malloc(ctrl);
                     lock(this.fd);
-                    const readed = await this.stream.read(buf);
+                    const readed = await (this.stream as FSFile).read(buf);
                     if (!readed) ctrl.close();
                     else ctrl.enqueue(buf.slice(0, readed));
                 }catch(e){
                     ctrl.error(e);
                 } finally {
                     unlock(this.fd);
+                }
+            }
+        });
+        else return new ReadableStream({
+            async pull(controller) {
+                try {
+                    const buf = malloc(controller);
+                    const n = await stream.read(buf);
+                    if (n === 0) {
+                        controller.close();
+                    } else {
+                        controller.enqueue(buf.slice(0, n));
+                    }
+                } catch (e) {
+                    controller.error(e);
                 }
             }
         });
@@ -124,11 +151,7 @@ export class Stream {
             write: async (chunk, control) => {
                 try {
                     lock(this.fd);
-                    let written = 0;
-                    while (written < chunk.length) {
-                        const n = await this.write(chunk.subarray(written));
-                        written += n;
-                    }
+                    if (!await this.write(chunk)) control.error(new Error('EOF'));
                 } catch (e) {
                     control.error(e);
                 } finally {
@@ -170,7 +193,7 @@ Object.assign(Deno, {
         },
 
         read(p) {
-            return stdin.read(p);
+            return stdin.read(p as Uint8Array<ArrayBuffer>);
         },
 
         readSync(p) {

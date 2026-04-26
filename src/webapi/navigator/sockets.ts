@@ -11,6 +11,7 @@ class TCPSocketImpl implements TCPSocket {
     private _closedResolve!: () => void;
     private _closed: Promise<void>;
     private _buffer: Uint8Array;
+    private _pendingData: Uint8Array | null = null;
 
     constructor(options: SocketOptions) {
         const isV4 = !options.remoteAddress?.includes(':');
@@ -22,19 +23,53 @@ class TCPSocketImpl implements TCPSocket {
         });
 
         this._readable = new ReadableStream<Uint8Array>({
-            pull: async (controller) => {
-                try {
-                    const nread = await this._tcp.read(this._buffer);
-                    if (nread === null || nread === 0) {
-                        controller.close();
-                    } else {
-                        controller.enqueue(this._buffer.slice(0, nread));
+            start: (controller) => {
+                const processData = (data: Uint8Array) => {
+                    if (data.length === 0) {
+                        // @ts-ignore
+                        this._tcp.startRead();
+                        return;
                     }
-                } catch (e) {
-                    controller.error(e);
-                }
+                    const n = Math.min(data.byteLength, this._buffer.byteLength);
+                    this._buffer.set(data.subarray(0, n));
+                    controller.enqueue(this._buffer.slice(0, n));
+                    if (data.byteLength > n) {
+                        this._pendingData = data.subarray(n);
+                    }
+                    // @ts-ignore
+                    this._tcp.startRead();
+                };
+
+                // @ts-ignore
+                this._tcp.onread = (data: Uint8Array | null | undefined, err?: CModuleError.Error) => {
+                    if (data === undefined) {
+                        if (err) {
+                            controller.error(err);
+                        }
+                        return;
+                    }
+                    if (data === null) {
+                        controller.close();
+                        return;
+                    }
+                    if (this._pendingData) {
+                        const combined = new Uint8Array(this._pendingData.byteLength + data.byteLength);
+                        combined.set(this._pendingData);
+                        combined.set(data, this._pendingData.byteLength);
+                        this._pendingData = null;
+                        processData(combined);
+                    } else {
+                        processData(data);
+                    }
+                };
+                // @ts-ignore
+                this._tcp.startRead();
             },
             cancel: () => {
+                // @ts-ignore
+                this._tcp.onread = null;
+                this._tcp.stopRead();
+                this._pendingData = null;
                 this.close();
             },
         });

@@ -1,5 +1,5 @@
 import { malloc } from "../utils/malloc";
-import { asToDenoStat, toDenoStat, toString } from "./02_fs";
+import { toDenoStat, toString } from "./02_fs";
 import { wrapFsClassDec as wrap, wrapFSns, wrapFSErr } from "../utils/wrap";
 
 const fs = import.meta.use('fs');
@@ -146,7 +146,7 @@ export class FSFile implements Deno.FsFile {
 
     @wrap
     async stat(): Promise<Deno.FileInfo> {
-        return asToDenoStat(await this.$handle.stat());
+        return toDenoStat(await this.$handle.stat());
     }
 
     @wrap

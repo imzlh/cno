@@ -2,7 +2,6 @@ import { errors } from "./01_errors";
 import packageJson from '../../package.json';
 
 const os = import.meta.use('os');
-const sys = import.meta.use('sys');
 const engine = import.meta.use('engine');
 const signal = import.meta.use('signals');
 const console = import.meta.use('console');
@@ -320,13 +319,14 @@ function createBenchFunction(): {
     };
 }
 
+const uname = os.uname();
 Object.defineProperty(globalThis, "Deno", {
     value: {
         errors,
 
         pid: os.pid,
         ppid: os.ppid,
-        args: sys.args.slice(1),    // remove self
+        args: os.args.slice(1),    // remove self
         env: {
             get: safeGetEnv,
             set: os.setenv,
@@ -343,10 +343,10 @@ Object.defineProperty(globalThis, "Deno", {
         exit: code => os.exit(code == 0 ? Deno.exitCode : code ?? 0),
         exitCode: 0,
         build: {
-            arch: os.uname().machine,
-            os: sys.platform,
+            arch: uname.machine,
+            os: uname.sysname,
             standalone: false,
-            target: `${os.uname().machine}-unknown-${sys.platform}`,
+            target: `${uname.machine}-unknown-${os.uname().sysname}`,
             vendor: "cno"
         },
         version: {
@@ -361,7 +361,7 @@ Object.defineProperty(globalThis, "Deno", {
             // @ts-ignore - cts api
             return globalThis.__mainScript; 
         },
-        execPath: () => sys.exePath,
+        execPath: () => os.exePath,
         noColor: safeGetEnv("NO_COLOR") === "1",
         memoryUsage: () => {
             const memory = os.memoryUsage();

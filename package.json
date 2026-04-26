@@ -5,6 +5,7 @@
   "main": "src/main.ts",
   "type": "module",
   "scripts": {
+    "type-check": "tsc --noEmit",
     "build": "esbuild src/main.ts --bundle --platform=node --target=es2024 --format=esm --outfile=dist.js",
     "min-build": "esbuild src/main.ts --bundle --platform=node --target=es2024 --format=esm --minify --outfile=dist.min.js",
     "bundle": "cjsc -b cjs -s -e dist.js"
@@ -19,7 +20,6 @@
     "@formatjs/intl-displaynames": "^7.0.6",
     "@formatjs/intl-numberformat": "^9.0.7",
     "@formatjs/intl-relativetimeformat": "^12.0.7",
-    "@types/node": "^25.3.0",
     "buffer": "^6.0.3",
     "headers-polyfill": "^4.0.3",
     "sucrase": "^3.35.1",
@@ -28,6 +28,7 @@
     "whatwg-url": "^15.1.0"
   },
   "devDependencies": {
+    "@types/node": "^25.3.0",
     "esbuild": "^0.27.0"
   }
 }

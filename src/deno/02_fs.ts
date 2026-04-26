@@ -12,35 +12,7 @@ import { errors } from "./01_errors";
 
 export const toString = (e: URL | string) => e instanceof URL ? e.pathname : e;
 
-const dateOrNull = (t?: number | null) => t ? new Date(t) : null;
-export function toDenoStat(stat: CModuleFS.Stats) {
-    return {
-        atime: dateOrNull(stat.atime),
-        // todo: add birthtime
-        birthtime: dateOrNull(stat.atime),
-        ctime: dateOrNull(stat.ctime),
-        mtime: dateOrNull(stat.mtime),
-        size: stat.size,
-        isFile: stat.isFile,
-        isDirectory: stat.isDirectory,
-        isSymlink: stat.isSymbolicLink,
-        dev: stat.dev,
-        ino: stat.ino,
-        mode: stat.mode,
-        nlink: stat.nlink,
-        uid: stat.uid,
-        gid: stat.gid,
-        rdev: stat.rdev,
-        blksize: stat.blksize,
-        blocks: stat.blocks,
-        // todo: add this is* fields
-        isBlockDevice: false,
-        isCharDevice: false,
-        isFifo: false,
-        isSocket: false,
-    } satisfies Deno.FileInfo;
-}
-export function asToDenoStat(stat: CModuleAsyncFS.StatResult) {
+export function toDenoStat(stat: CModuleAsyncFS.StatResult) {
     return {
         ...stat,
         isSymlink: !!stat.isSymbolicLink,
@@ -484,7 +456,7 @@ Object.assign(Deno, wrapFSns({
     },
 
     async lstat(path) {
-        return asToDenoStat(await asfs.lstat(toString(path)));
+        return toDenoStat(await asfs.lstat(toString(path)));
     },
 
     lstatSync(path) {
@@ -579,7 +551,7 @@ Object.assign(Deno, wrapFSns({
 
     async stat(path) {
         const st = await asfs.stat(toString(path));
-        return asToDenoStat(st);
+        return toDenoStat(st);
     },
 
     statSync(path) {

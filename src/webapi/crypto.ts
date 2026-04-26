@@ -422,6 +422,34 @@ class SubtleCrypto implements globalThis.SubtleCrypto {
             throw new Error(`Unsupported curve for ECDSA: ${keyAlg.namedCurve}`);
         }
 
+        // HMAC
+        if (alg.name === 'HMAC') {
+            const params = algorithm as EcdsaParams;
+            const keyAlg = keyImpl.algorithm as HmacKeyAlgorithm;
+            const hashAlg = normalizeAlgorithm(params.hash);
+
+            let computedHmac: ArrayBuffer;
+            if (hashAlg.name === 'SHA-256') {
+                computedHmac = crypto.hmacSha256(keyImpl._handle, dataBuffer);
+            } else if (hashAlg.name === 'SHA-512') {
+                computedHmac = crypto.hmacSha512(keyImpl._handle, dataBuffer);
+            } else {
+                throw new Error(`Unsupported hash for HMAC: ${hashAlg.name}`);
+            }
+
+            if (computedHmac.byteLength !== signatureBuffer.byteLength) {
+                return false;
+            }
+
+            let result = 0;
+            const a = new Uint8Array(computedHmac);
+            const b = new Uint8Array(signatureBuffer);
+            for (let i = 0; i < a.length; i++) {
+                result |= a[i] ^ b[i];
+            }
+            return result === 0;
+        }
+
         throw new Error(`Unsupported verification algorithm: ${alg.name}`);
     }
 
@@ -470,17 +498,11 @@ class SubtleCrypto implements globalThis.SubtleCrypto {
         // AES-GCM
         if (alg.name === 'AES-GCM') {
             const params = algorithm as AesGcmParams;
-            const keyAlg = keyImpl.algorithm as AesKeyAlgorithm;
             const iv = toArrayBuffer(params.iv);
             const aad = params.additionalData ? toArrayBuffer(params.additionalData) : undefined;
 
-            if (keyAlg.length === 128) {
-                return crypto.aes128GcmEncrypt(keyImpl._handle, iv, dataBuffer);
-            }
-            if (keyAlg.length === 256) {
-                return crypto.aes256GcmEncrypt(keyImpl._handle, iv, dataBuffer);
-            }
-            throw new Error(`Unsupported AES key length: ${keyAlg.length}`);
+            const result = crypto.gcmEncrypt(keyImpl._handle, iv, dataBuffer, aad, params.tagLength);
+            return result.ciphertext;
         }
 
         throw new Error(`Unsupported encryption algorithm: ${alg.name}`);
@@ -533,14 +555,18 @@ class SubtleCrypto implements globalThis.SubtleCrypto {
             const params = algorithm as AesGcmParams;
             const keyAlg = keyImpl.algorithm as AesKeyAlgorithm;
             const iv = toArrayBuffer(params.iv);
+            const aad = params.additionalData ? toArrayBuffer(params.additionalData) : undefined;
 
-            if (keyAlg.length === 128) {
-                return crypto.aes128GcmDecrypt(keyImpl._handle, iv, dataBuffer);
+            const ciphertextWithTag = dataBuffer;
+            const tagLength = params.tagLength ?? 16;
+            const ciphertext = ciphertextWithTag.slice(0, ciphertextWithTag.byteLength - tagLength);
+            const tag = ciphertextWithTag.slice(ciphertextWithTag.byteLength - tagLength);
+
+            const result = crypto.gcmDecrypt(keyImpl._handle, iv, ciphertext, tag, aad);
+            if (!result.verified) {
+                throw new DOMException('AES-GCM decryption failed: authentication tag mismatch', 'OperationError');
             }
-            if (keyAlg.length === 256) {
-                return crypto.aes256GcmDecrypt(keyImpl._handle, iv, dataBuffer);
-            }
-            throw new Error(`Unsupported AES key length: ${keyAlg.length}`);
+            return result.plaintext;
         }
 
         throw new Error(`Unsupported decryption algorithm: ${alg.name}`);
@@ -560,7 +586,14 @@ class SubtleCrypto implements globalThis.SubtleCrypto {
             throw new Error('Base key cannot be used for key derivation');
         }
 
-        const bits = await this.deriveBits(algorithm, baseKey, 256);
+        const derivedAlg = normalizeAlgorithm(derivedKeyAlgorithm);
+        let length = 256;
+
+        if ('length' in derivedAlg && typeof (derivedAlg as any).length === 'number') {
+            length = (derivedAlg as any).length;
+        }
+
+        const bits = await this.deriveBits(algorithm, baseKey, length);
         return this.importKey('raw', bits, derivedKeyAlgorithm, extractable, keyUsages);
     }
 

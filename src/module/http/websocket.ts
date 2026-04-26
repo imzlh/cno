@@ -1,6 +1,7 @@
 const crypto = import.meta.use('crypto');
 const engine = import.meta.use('engine');
 const timers = import.meta.use('timers');
+const algo = import.meta.use('algorithm');
 
 import { assert } from '../../utils/assert';
 import { connectionManager, Connection, type ConnectionLike } from './connection';
@@ -169,10 +170,9 @@ class SendQueue {
             const maskKey = new Uint8Array(crypto.randomBytes(4));
             frame.set(maskKey, offset);
             offset += 4;
-
-            for (let i = 0; i < payload.length; i++) {
-                frame[offset + i] = payload[i] ^ maskKey[i % 4];
-            }
+            const maskbuf = algo.ws_mask(frame.subarray(offset), maskKey);
+            frame.set(maskbuf, offset);
+            offset += payloadLength;
         } else {
             frame.set(payload, offset);
         }
@@ -264,6 +264,8 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
             this._readyState = WebSocketReadyState.CONNECTING;
 
             urlOrConnection.then(conn => {
+                if (this._readyState === WebSocketReadyState.CLOSED) return;
+
                 this._readyState = WebSocketReadyState.OPEN;
                 this.connection = conn;
                 this.sendQueue = new SendQueue(conn, false, () => this.handleClose(WebSocketCloseCode.ABNORMAL, 'Connection closed'));
@@ -275,6 +277,9 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
                     this.startReceiving();
                     this.startPingTimer();
                 });
+            }).catch(err => {
+                this._readyState = WebSocketReadyState.CLOSED;
+                this.emitError(err instanceof Error ? err : new Error('Connection failed'));
             });
         }
     }
@@ -388,27 +393,36 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
         return crypto.base64Encode(random);
     }
 
-    private async startReceiving(): Promise<void> {
-        try {
-            while (this._readyState === WebSocketReadyState.OPEN && this.connection) {
-                const data = await this.connection.read();
+    private startReceiving(): void {
+        if (!this.connection) return;
 
-                if (data === null) {
-                    this.handleClose(WebSocketCloseCode.ABNORMAL, 'Connection closed');
-                    break;
-                }
+        let receiving = true;
 
-                if (data.length === 0) continue;
+        const processData = (data: Uint8Array | null) => {
+            if (!receiving) return;
 
-                this.receiveBuffer.push(data);
-                this.processFrames();
+            if (data === null) {
+                receiving = false;
+                this.handleClose(WebSocketCloseCode.ABNORMAL, 'Connection closed');
+                return;
             }
-        } catch (err) {
+
+            if (data.length === 0) return;
+
+            this.receiveBuffer.push(data);
+            this.processFrames();
+        };
+
+        const handleError = (err: Error) => {
+            if (!receiving) return;
+            receiving = false;
             if (this._readyState !== WebSocketReadyState.CLOSED) {
-                this.emitError(err as Error);
+                this.emitError(err);
                 this.close(WebSocketCloseCode.ABNORMAL, 'Read error');
             }
-        }
+        };
+
+        this.connection.onReadable(processData, handleError);
     }
 
     private processFrames(): void {
@@ -453,6 +467,11 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
             offset = 4;
         } else if (payloadLength === 127) {
             if (totalLength < 10) return null;
+            const highBits = (buffer[2] << 24) | (buffer[3] << 16) | (buffer[4] << 8) | buffer[5];
+            if (highBits !== 0) {
+                this.close(WebSocketCloseCode.MESSAGE_TOO_BIG, 'Frame payload too large');
+                return null;
+            }
             payloadLength = (buffer[6] << 24) | (buffer[7] << 16) | (buffer[8] << 8) | buffer[9];
             offset = 10;
         }
@@ -542,17 +561,17 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
 
         if (typeof data === 'string') {
             const payload = engine.encodeString(data);
-            this.sendFrame(OpCode.TEXT, payload).catch(() => {});
+            this.sendFrame(OpCode.TEXT, payload).catch(() => { this.close(WebSocketCloseCode.ABNORMAL, 'Send failed'); });
         } else if (data instanceof Blob) {
             data.arrayBuffer().then(buffer => {
                 const payload = new Uint8Array(buffer);
-                this.sendFrame(OpCode.BINARY, payload).catch(() => {});
-            });
+                this.sendFrame(OpCode.BINARY, payload).catch(() => { this.close(WebSocketCloseCode.ABNORMAL, 'Send failed'); });
+            }).catch(() => { this.close(WebSocketCloseCode.ABNORMAL, 'Blob conversion failed'); });
         } else {
             const payload: Uint8Array = data instanceof ArrayBuffer
                 ? new Uint8Array(data)
                 : new Uint8Array(data.buffer as ArrayBuffer, data.byteOffset, data.byteLength);
-            this.sendFrame(OpCode.BINARY, payload).catch(() => {});
+            this.sendFrame(OpCode.BINARY, payload).catch(() => { this.close(WebSocketCloseCode.ABNORMAL, 'Send failed'); });
         }
     }
 
@@ -565,12 +584,8 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
         await this.sendQueue.enqueue(frame);
     }
 
-    private unmask(data: Uint8Array, maskKey: Uint8Array): Uint8Array {
-        const unmasked = new Uint8Array(data.length);
-        for (let i = 0; i < data.length; i++) {
-            unmasked[i] = data[i] ^ maskKey[i % 4];
-        }
-        return unmasked;
+    private unmask(data: Uint8Array, maskKey: Uint8Array) {
+        return algo.ws_mask(data, maskKey);
     }
 
     public close(code: number = WebSocketCloseCode.NORMAL, reason: string = ''): void {
@@ -706,7 +721,7 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
 
     addEventListener<K extends keyof WebSocketEventMap>(
         type: K,
-        listener: (this: WebSocket, ev: WebSocketEventMap[K]) => any,
+        listener: any,
         options?: boolean | AddEventListenerOptions
     ): void {
         super.addEventListener(type, listener as any, options);
@@ -714,7 +729,7 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
 
     removeEventListener<K extends keyof WebSocketEventMap>(
         type: K,
-        listener: (this: WebSocket, ev: WebSocketEventMap[K]) => any,
+        listener: any,
         options?: boolean | EventListenerOptions
     ): void {
         super.removeEventListener(type, listener as any, options);
@@ -736,7 +751,7 @@ export class WebSocketStream {
     private ws: WebSocket;
     private readableController: ReadableStreamController<string | Uint8Array> | null = null;
     private _openedResolve!: (value: WebSocketStreamConnection) => void;
-    private _openedReject!: (reason: Error) => void;
+    private _openedReject: ((reason: Error) => void) | null = null;
     private _closedResolve!: (value: { closeCode: number; reason: string }) => void;
     private _closeCode = WebSocketCloseCode.NO_STATUS;
     private _closeReason = '';
@@ -760,18 +775,25 @@ export class WebSocketStream {
             });
         });
 
-        this.ws.addEventListener('message', (event) => {
+        this.ws.addEventListener('message', async (event: MessageEvent) => {
             if (this.readableController) {
-                const data = event.data;
-                if (typeof data === 'string') {
-                    this.readableController.enqueue(engine.encodeString(data));
-                } else if (data instanceof ArrayBuffer) {
-                    this.readableController.enqueue(new Uint8Array(data));
+                try {
+                    const data = event.data;
+                    if (typeof data === 'string') {
+                        this.readableController.enqueue(engine.encodeString(data));
+                    } else if (data instanceof ArrayBuffer) {
+                        this.readableController.enqueue(new Uint8Array(data));
+                    } else if (data instanceof Blob) {
+                        const buffer = await data.arrayBuffer();
+                        this.readableController.enqueue(new Uint8Array(buffer));
+                    }
+                } catch (err) {
+                    this.ws.close(WebSocketCloseCode.ABNORMAL, 'Message processing failed');
                 }
             }
         });
 
-        this.ws.addEventListener('close', (e) => {
+        this.ws.addEventListener('close', (e: CloseEvent) => {
             this._closeCode = e.code;
             this._closeReason = e.reason;
 
@@ -788,9 +810,13 @@ export class WebSocketStream {
             });
         });
 
-        this.ws.addEventListener('error', (e) => {
+        this.ws.addEventListener('error', (e: ErrorEvent) => {
             const error = new Error('WebSocket connection failed');
-            this._openedReject(error);
+
+            if (this._openedReject) {
+                this._openedReject(error);
+                this._openedReject = null;
+            }
 
             if (this.readableController) {
                 try {

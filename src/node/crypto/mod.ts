@@ -307,10 +307,10 @@ export function createCipherivGCM(algorithm: string, key: ArrayBuffer | Uint8Arr
             return encodeOutput(result, outputEncoding);
         },
         final(outputEncoding?: string) {
-            const { ciphertext, tag } = gcm.final();
+            const { data, tag } = gcm.final();
             // 存储tag供getAuthTag使用
             (this as any)._tag = tag;
-            return encodeOutput(ciphertext, outputEncoding);
+            return encodeOutput(data, outputEncoding);
         },
         getAuthTag() {
             return (this as any)._tag || new ArrayBuffer(0);
@@ -338,8 +338,8 @@ export function createDecipherivGCM(algorithm: string, key: ArrayBuffer | Uint8A
             return encodeOutput(result, outputEncoding);
         },
         final(outputEncoding?: string) {
-            const { ciphertext, tag } = gcm.final();
-            return encodeOutput(ciphertext, outputEncoding);
+            const { data, tag } = gcm.final();
+            return encodeOutput(data, outputEncoding);
         },
     };
 }
