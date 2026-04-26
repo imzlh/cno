@@ -3,9 +3,9 @@ import { TcpSocket } from "./socket";
 import { ServerConnection, type RequestHandler } from "./server-conn";
 
 const streams = import.meta.use("streams");
-const ssl     = import.meta.use("ssl");
-const timers  = import.meta.use("timers");
-const http    = import.meta.use('http');
+const ssl = import.meta.use("ssl");
+const timers = import.meta.use("timers");
+const http = import.meta.use('http');
 
 /* ------------------------------------------------------------------ */
 /* Types                                                              */
@@ -15,7 +15,7 @@ export interface ServerConfig {
     hostname?: string;
     port: number;
     cert?: string;              // Path to TLS certificate
-    key?:  string;              // Path to TLS private key
+    key?: string;              // Path to TLS private key
     keepAliveTimeout?: number;  // ms — default 5000
     maxRequestsPerConnection?: number;  // default 100
     requestTimeout?: number;    // ms — default 30000
@@ -28,25 +28,25 @@ export type { RequestHandler, HttpRequest, HttpResponse } from "./server-conn";
 /* ------------------------------------------------------------------ */
 
 export class Server {
-    public readonly config:  Required<ServerConfig>;
+    public readonly config: Required<ServerConfig>;
     public readonly handler: RequestHandler;
 
-    private listener:    CModuleStreams.TCP | null = null;
-    private sslContext:  CModuleSSL.Context | null = null;
-    private connections: Set<ServerConnection>     = new Set();
-    private listening    = false;
-    private accepting    = false;
+    private listener: CModuleStreams.TCP | null = null;
+    private sslContext: CModuleSSL.Context | null = null;
+    private connections: Set<ServerConnection> = new Set();
+    private listening = false;
+    private accepting = false;
 
     constructor(handler: RequestHandler, config: ServerConfig) {
         this.handler = handler;
-        this.config  = {
-            hostname                : config.hostname                ?? "0.0.0.0",
-            port                    : config.port,
-            cert                    : config.cert                    ?? "",
-            key                     : config.key                     ?? "",
-            keepAliveTimeout        : config.keepAliveTimeout        ?? 5000,
+        this.config = {
+            hostname: config.hostname ?? "0.0.0.0",
+            port: config.port,
+            cert: config.cert ?? "",
+            key: config.key ?? "",
+            keepAliveTimeout: config.keepAliveTimeout ?? 5000,
             maxRequestsPerConnection: config.maxRequestsPerConnection ?? 100,
-            requestTimeout          : config.requestTimeout          ?? 30000,
+            requestTimeout: config.requestTimeout ?? 30000,
         };
     }
 
@@ -57,7 +57,7 @@ export class Server {
             this.sslContext = new ssl.Context({
                 mode: "server",
                 cert: this.config.cert,
-                key:  this.config.key
+                key: this.config.key
             });
         }
 
@@ -73,21 +73,17 @@ export class Server {
         const protocol = this.sslContext ? "https" : "http";
         console.debug(`Server listening on ${protocol}://${this.config.hostname}:${this.config.port}`);
 
-        while (this.listening && this.listener) {
-            try {
-                const socket = await this.listener.accept() as CModuleStreams.TCP;
-                socket.setNoDelay(true);
-                socket.setKeepAlive(true, 1000);
-                this.handleConnection(socket).catch(err => {
-                    if (!TcpSocket.isDisconnectError(err)) {
-                        console.error("Connection error:", err);
-                    }
-                });
-            } catch (err) {
-                if (this.listening) console.error("Accept error:", err);
-                break;
-            }
-        }
+        this.listener!.onconnection = (err, client) => {
+            if (err || !client) return console.error("Accept error:", err);
+            const socket = client as CModuleStreams.TCP;
+            socket.setNoDelay(true);
+            socket.setKeepAlive(true, 1000);
+            this.handleConnection(socket).catch(err => {
+                if (!TcpSocket.isDisconnectError(err)) {
+                    console.error("Connection error:", err);
+                }
+            });
+        };
     }
 
     close(): void {
@@ -116,8 +112,8 @@ export class Server {
                 await conn.serverHandshake(this.sslContext);
             }
 
-            let keepAlive     = true;
-            let firstRequest  = true;
+            let keepAlive = true;
+            let firstRequest = true;
 
             while (keepAlive && !conn.isClosed() && !conn.isUpgraded()) {
                 const timeoutMs = firstRequest
@@ -128,7 +124,7 @@ export class Server {
                 const tid = timers.setTimeout(() => { timedOut = true; conn.close(); }, timeoutMs);
 
                 try {
-                    keepAlive    = await conn.handleRequest();
+                    keepAlive = await conn.handleRequest();
                     firstRequest = false;
                     if (conn.isClosed()) keepAlive = false;
                 } catch (err: any) {

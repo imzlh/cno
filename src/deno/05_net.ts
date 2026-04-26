@@ -37,9 +37,12 @@ export const useReadable = (pipe: CModuleStreams.Stream) => new ReadableStream({
     }
 });
 
+const kRawPipe = Symbol('Stream.rawPipe');
+
 class Conn<T extends Deno.Addr = Deno.Addr> implements Deno.Conn<T> {
     protected $readable: ReadableStream;
     protected $writable: WritableStream;
+    [kRawPipe]: CModuleStreams.Stream;
 
     constructor(
         protected readonly pipe: CModuleStreams.Stream,
@@ -48,6 +51,7 @@ class Conn<T extends Deno.Addr = Deno.Addr> implements Deno.Conn<T> {
     ) {
         this.$readable = useReadable(pipe);
         this.$writable = useWritable(pipe);
+        this[kRawPipe] = pipe;
     }
 
     @wrap
@@ -236,15 +240,37 @@ class UnixConn extends Conn<Deno.UnixAddr> implements Deno.UnixConn {
 }
 
 class Listener implements Deno.Listener {
+    private $acceptQueue: CModuleStreams.Stream[] = [];
+    private $acceptPromise?: PromiseWithResolvers<CModuleStreams.Stream>;
     constructor(
         protected $pipe: CModuleStreams.Stream,
         protected $isTCP: boolean,
         protected $addr: Deno.Addr
-    ) { }
+    ) {
+        $pipe.onconnection = (err, client) => {
+            if (err || !client) {
+                if (this.$acceptPromise) {
+                    this.$acceptPromise.reject(err ?? (new Error('Accept error')));
+                    this.$acceptPromise = undefined;
+                }
+                return;
+            }
+            if (this.$acceptPromise) {
+                this.$acceptPromise.resolve(client);
+                this.$acceptPromise = undefined;
+                return;
+            }
+            this.$acceptQueue.push(client);
+        };
+    }
 
     @wrap
     async accept(): Promise<Deno.Conn<Deno.Addr>> {
-        const conn = await this.$pipe.accept();
+        let conn = this.$acceptQueue.shift();
+        if (!conn) {
+            this.$acceptPromise = Promise.withResolvers();
+            conn = await this.$acceptPromise.promise;
+        }
         return this.$isTCP
             ? new TcpConn(conn as CModuleStreams.TCP)
             : new UnixConn(conn as CModuleStreams.Pipe, (this.$addr as Deno.UnixAddr).path);
@@ -330,13 +356,14 @@ class TlsListener extends Listener implements Deno.TlsListener {
 
     @wrap
     async accept(): Promise<Deno.TlsConn> {
-        const conn = await this.$pipe.accept();
+        const conn = await super.accept();
 
         // create SSLPipe
         const sslpipe = new ssl.Pipe(this.sslCtx, {
             servername: (this.$addr as Deno.NetAddr).hostname
         });
-        return toConn(sslpipe, conn as CModuleStreams.TCP);
+        // @ts-ignore - Conn
+        return toConn(sslpipe, conn[kRawPipe]);
     }
 
     @wrap

@@ -134,14 +134,14 @@ class ResponseAdapter {
         this.headersSent = true;
 
         if (hasBody) {
-    const reader = response.body!.getReader();
-    try {
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            await this.coreRes.write(value);
-        }
-    } catch (err) {
+            const reader = response.body!.getReader();
+            try {
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    await this.coreRes.write(value);
+                }
+            } catch (err) {
                 this.coreRes.close();
                 throw err;
             } finally {

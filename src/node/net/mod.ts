@@ -310,7 +310,7 @@ export class Socket extends Duplex {
         if (this._tcp) {
             try {
                 this._tcp.close();
-            } catch {}
+            } catch { }
             this._tcp = null;
         }
 
@@ -472,42 +472,38 @@ export class Server extends EventEmitter {
         return this;
     }
 
-    private async _acceptLoop(): Promise<void> {
-        while (this._listening && this._tcp) {
-            try {
-                const clientTcp = await this._tcp.accept();
-                const socket = new Socket();
-                (socket as any)._tcp = clientTcp;
-                socket.readyState = 'open';
+    private _acceptLoop(): Promise<void> {
+        return new Promise((rs, rj) => this._tcp!.onconnection = (error, clientTcp) => {
+            if (!connect || !clientTcp) return rj(error);
+            if (!this._listening) return rs();
+            
+            const socket = new Socket();
+            (socket as any)._tcp = clientTcp;
+            socket.readyState = 'open';
 
-                const localInfo = (clientTcp as CModuleStreams.TCP).getsockname();
-                socket.localAddress = localInfo.ip;
-                socket.localPort = localInfo.port;
+            const localInfo = (clientTcp as CModuleStreams.TCP).getsockname();
+            socket.localAddress = localInfo.ip;
+            socket.localPort = localInfo.port;
 
-                const remoteInfo = (clientTcp as CModuleStreams.TCP).getpeername();
-                socket.remoteAddress = remoteInfo.ip;
-                socket.remotePort = remoteInfo.port;
-                socket.remoteFamily = `IPv${remoteInfo.family}`;
+            const remoteInfo = (clientTcp as CModuleStreams.TCP).getpeername();
+            socket.remoteAddress = remoteInfo.ip;
+            socket.remotePort = remoteInfo.port;
+            socket.remoteFamily = `IPv${remoteInfo.family}`;
 
-                this._connections.add(socket);
+            this._connections.add(socket);
+            this.connections = this._connections.size;
+
+            socket.on('close', () => {
+                this._connections.delete(socket);
                 this.connections = this._connections.size;
+            });
 
-                socket.on('close', () => {
-                    this._connections.delete(socket);
-                    this.connections = this._connections.size;
-                });
-
-                if (this._pauseOnConnect) {
-                    socket.pause();
-                }
-
-                this.emit('connection', socket);
-            } catch (err) {
-                if (this._listening) {
-                    this.emit('error', err);
-                }
+            if (this._pauseOnConnect) {
+                socket.pause();
             }
-        }
+
+            this.emit('connection', socket);
+        });
     }
 
     address(): AddressInfo | string | null {
@@ -536,7 +532,7 @@ export class Server extends EventEmitter {
         if (this._tcp) {
             try {
                 this._tcp.close();
-            } catch {}
+            } catch { }
             this._tcp = null;
         }
 

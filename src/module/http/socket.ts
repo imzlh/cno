@@ -13,6 +13,7 @@ import { wrapFsClassDec as wrap } from "../../utils/wrap";
 const streams = import.meta.use("streams");
 const ssl     = import.meta.use("ssl");
 const error   = import.meta.use("error");
+const engine = import.meta.use("engine");
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
@@ -111,8 +112,13 @@ export class TcpSocket {
             return;
         }
 
-        const written = this.sslPipe.write(data);
-        if (written < 0) throw new Error(`SSL_write failed: ${written}`);
+        console.log(`write ${data.length} bytes:`, engine.decodeString(data));
+        let offset = 0;
+        while (offset < data.length) {
+            const written = this.sslPipe.write(data.subarray(offset));
+            if (written < 0) throw new Error(`SSL_write failed: ${written}`);
+            offset += written;
+        }
 
         const encrypted = this.sslPipe.getOutput();
         if (encrypted) await this.socket.write(new Uint8Array(encrypted));

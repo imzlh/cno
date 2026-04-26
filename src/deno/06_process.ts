@@ -136,7 +136,7 @@ class Process implements Deno.ChildProcess {
     }
 
     @wrap
-    resize(cols: number, rows: number): Promise<void> {
+    async resize(cols: number, rows: number): Promise<void> {
         const stdin = this.$proc.stdin?.fileno();
         assert(stdin, "stdin is not piped");
         return pty.resize(stdin, cols, rows);

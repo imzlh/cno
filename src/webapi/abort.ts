@@ -124,3 +124,6 @@ export {
     AbortController,
     AbortSignal,
 };
+
+Reflect.set(globalThis, 'AbortController', AbortController);
+Reflect.set(globalThis, 'AbortSignal', AbortSignal);
