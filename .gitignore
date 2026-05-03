@@ -1,4 +1,4 @@
-*lock*
+*.lock
 test.json
 cjs
 node_modules/
