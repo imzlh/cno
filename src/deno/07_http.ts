@@ -1,10 +1,10 @@
 const ssl = import.meta.use('ssl');
 const streams = import.meta.use('streams');
 const engine = import.meta.use('engine');
-const dns = import.meta.use('dns');
 const os = import.meta.use('os');
 
 import { wrapFsClassDec as wrap } from '../utils/wrap';
+import { dnsCache } from '../module/http/dns-cache';
 
 /**
  * HTTP proxy connection - CONNECT tunnel
@@ -16,7 +16,7 @@ async function connectHttpProxy(
     basicAuth?: string
 ): Promise<CModuleStreams.TCP> {
     // DNS resolution for proxy
-    const addrs = await dns.resolve(proxyUrl.hostname, { family: os.AF_UNSPEC });
+    const addrs = await dnsCache.resolve(proxyUrl.hostname, { family: os.AF_UNSPEC });
     if (!addrs || !addrs.length) {
         throw new Error(`DNS resolution failed for proxy ${proxyUrl.hostname}`);
     }
@@ -38,7 +38,7 @@ async function connectHttpProxy(
     
     connectReq += `\r\n`;
     
-    socket.write(engine.encodeString(connectReq));
+    await socket.write(engine.encodeString(connectReq));
 
     const buf = new Uint8Array(4096);
     const n = await socket.read(buf);
@@ -169,7 +169,7 @@ export class HttpClient {
         
         if (proxyUrl && !isSecure) {
             // HTTP through proxy - connect to proxy server
-            const addrs = await dns.resolve(proxyUrl.hostname, { family: os.AF_UNSPEC });
+            const addrs = await dnsCache.resolve(proxyUrl.hostname, { family: os.AF_UNSPEC });
             if (!addrs || !addrs.length) {
                 throw new Error(`DNS resolution failed for proxy ${proxyUrl.hostname}`);
             }
@@ -187,7 +187,7 @@ export class HttpClient {
             return connectHttpProxy(proxyUrl, hostname, port, auth || undefined);
         } else {
             // Direct connection - DNS resolution
-            const addrs = await dns.resolve(hostname, { family: os.AF_UNSPEC });
+            const addrs = await dnsCache.resolve(hostname, { family: os.AF_UNSPEC });
             if (!addrs || !addrs.length) {
                 throw new Error(`DNS resolution failed for ${hostname}`);
             }

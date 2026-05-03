@@ -32,20 +32,37 @@ export class TcpSocket {
     private _readErrHandler: ((err: Error) => void) | null = null;
 
     private setupReadCallback(): void {
+        // Stop any previous read mode (e.g. promise-based TcpSocket.read())
+        // before switching to callback-based onread mode.
+        try { this.socket.stopRead(); } catch { /* ignore */ }
         // @ts-ignore - onread is not in type definition but exists at runtime
         this.socket.onread = (data: Uint8Array | null | undefined, err?: CModuleError.Error) => {
-            if (data === undefined && err) {
-                this._readErrHandler?.(err);
-                // @ts-ignore
-                this.socket.onread = null;
-            } else {
-                this._readCallback?.(data ?? null);
-                if (data !== null && this._readCallback) {
+            if (data === undefined) {
+                if (err) {
+                    this._readErrHandler?.(err);
+                    // @ts-ignore
+                    this.socket.onread = null;
+                }
+                return;
+            }
+            if (data === null) {
+                this._readCallback?.(null);
+                return;
+            }
+            this._readCallback?.(data);
+            if (this._readCallback) {
+                try {
                     this.socket.startRead();
+                } catch (e: any) {
+                    if (e.code !== 'EALREADY') throw e;
                 }
             }
         };
-        this.socket.startRead();
+        try {
+            this.socket.startRead();
+        } catch (e: any) {
+            if (e.code !== 'EALREADY') throw e;
+        }
     }
 
     onReadable(callback: (data: Uint8Array | null) => void, errHandler?: (err: Error) => void): void {
@@ -112,7 +129,6 @@ export class TcpSocket {
             return;
         }
 
-        console.log(`write ${data.length} bytes:`, engine.decodeString(data));
         let offset = 0;
         while (offset < data.length) {
             const written = this.sslPipe.write(data.subarray(offset));

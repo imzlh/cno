@@ -349,7 +349,8 @@ export const parseStackFrame = (
 export function fromError(error: any): ErrorEvent {
     if (!(error instanceof Error)) {
         return new ErrorEvent('error', {
-            message: String(error),
+            error,
+            message: String(error)
         });
     }
     const infoLine = error.stack?.split('\n')[0].trim();
@@ -362,6 +363,7 @@ export function fromError(error: any): ErrorEvent {
     if (!match) {
         return new ErrorEvent('error', {
             message: error.message,
+            error
         });
     }
     return new ErrorEvent('error', {

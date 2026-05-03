@@ -80,7 +80,7 @@ export class EventSource extends EventTarget {
                 port,
                 protocol: url.protocol as 'http:' | 'https:',
                 keepAlive: true, // SSE uses persistent connection
-                timeout: 0 // No timeout for SSE
+                timeout: 30000 // Connection timeout for SSE
             });
 
             // Build request

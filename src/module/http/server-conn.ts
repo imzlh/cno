@@ -71,6 +71,48 @@ const HTTP_METHODS = [
 /* ServerConnection                                                   */
 /* ------------------------------------------------------------------ */
 
+const HEADER_CAPS: Record<string, string> = {
+    "www-authenticate": "WWW-Authenticate",
+    "content-md5": "Content-MD5",
+    "te": "TE",
+    "dnt": "DNT",
+    "etag": "ETag",
+    "x-xss-protection": "X-XSS-Protection",
+    "x-content-type-options": "X-Content-Type-Options",
+    "x-frame-options": "X-Frame-Options",
+    "x-powered-by": "X-Powered-By",
+    "x-ua-compatible": "X-UA-Compatible",
+    "x-dns-prefetch-control": "X-DNS-Prefetch-Control",
+    "x-requested-with": "X-Requested-With",
+    "x-forwarded-for": "X-Forwarded-For",
+    "x-forwarded-host": "X-Forwarded-Host",
+    "x-forwarded-proto": "X-Forwarded-Proto",
+    "x-real-ip": "X-Real-IP",
+    "content-security-policy": "Content-Security-Policy",
+    "access-control-allow-origin": "Access-Control-Allow-Origin",
+    "access-control-allow-methods": "Access-Control-Allow-Methods",
+    "access-control-allow-headers": "Access-Control-Allow-Headers",
+    "access-control-allow-credentials": "Access-Control-Allow-Credentials",
+    "access-control-expose-headers": "Access-Control-Expose-Headers",
+    "access-control-max-age": "Access-Control-Max-Age",
+    "access-control-request-method": "Access-Control-Request-Method",
+    "access-control-request-headers": "Access-Control-Request-Headers",
+    "strict-transport-security": "Strict-Transport-Security",
+    "public-key-pins": "Public-Key-Pins",
+    "content-security-policy-report-only": "Content-Security-Policy-Report-Only",
+    "sec-websocket-key": "Sec-WebSocket-Key",
+    "sec-websocket-version": "Sec-WebSocket-Version",
+    "sec-websocket-accept": "Sec-WebSocket-Accept",
+    "sec-websocket-protocol": "Sec-WebSocket-Protocol",
+    "sec-websocket-extensions": "Sec-WebSocket-Extensions",
+};
+
+function capitalizeHeader(name: string): string {
+    const lower = name.toLowerCase();
+    if (HEADER_CAPS[lower]) return HEADER_CAPS[lower];
+    return lower.split("-").map(w => w.charAt(0).toUpperCase() + w.slice(1)).join("-");
+}
+
 export class ServerConnection extends TcpSocket {
     private state:  State  = State.IDLE;
     private server: Server;
@@ -96,6 +138,7 @@ export class ServerConnection extends TcpSocket {
     // Keep-alive
     private requestCount = 0;
     private keepAlive    = true;
+    private requestHttpVersion = "1.1";
 
     constructor(socket: CModuleStreams.TCP, server: Server) {
         super(socket);
@@ -124,7 +167,11 @@ export class ServerConnection extends TcpSocket {
             if (len > 8192) throw new Error("HTTP header value too long");
             const value = decode(buf, off, len);
             const existing = this.headers.get(this.headerField);
-            this.headers.set(this.headerField, existing ? `${existing}, ${value}` : value);
+            if (this.headerField === 'set-cookie') {
+                this.headers.set(this.headerField, existing ? `${existing}\n${value}` : value);
+            } else {
+                this.headers.set(this.headerField, existing ? `${existing}, ${value}` : value);
+            }
         };
 
         this.parser.onHeadersComplete = () => {
@@ -235,6 +282,8 @@ export class ServerConnection extends TcpSocket {
                 body:        bodyStream
             };
 
+            this.requestHttpVersion = req.httpVersion;
+
             const res: HttpResponse = {
                 writeHead: this.writeHead.bind(this),
                 write:     this.writeData.bind(this),
@@ -261,7 +310,7 @@ export class ServerConnection extends TcpSocket {
                         if (data.length === 0) continue;
                         this.parser.execute(data.buffer.slice(data.byteOffset, data.byteLength + data.byteOffset));
                         if (this.parser.state.eof) break;
-                        if (this.bodyRead > 10 * 1024 * 1024) break; // safety limit
+                        if (this.bodyRead > 10 * 1024 * 1024) { this.keepAlive = false; break; }
                     }
                 } catch { /* ignore drain errors */ }
             }
@@ -274,9 +323,9 @@ export class ServerConnection extends TcpSocket {
                 !this.isUpgraded();
 
         } catch (err: any) {
-            // if (!TcpSocket.isDisconnectError(err)) {
+            if (!TcpSocket.isDisconnectError(err)) {
                 console.error("Request handling error:", err);
-            // }
+            }
             if (!this.headersSent && !this.isClosed()) {
                 try {
                     await this.writeHead(500, "Internal Server Error", {});
@@ -300,14 +349,12 @@ export class ServerConnection extends TcpSocket {
             this.chunkedEncoding = true;
         }
 
-        // Bug fix: respect keepAlive when injecting Connection header
-        let raw = `HTTP/1.1 ${status} ${statusText}\r\n`;
+        let raw = `HTTP/${this.requestHttpVersion} ${status} ${statusText}\r\n`;
         if (!headers["connection"]) {
             raw += this.keepAlive ? "Connection: keep-alive\r\n" : "Connection: close\r\n";
         }
         for (const [k, v] of Object.entries(headers)) {
-            const title = k.split("-").map(w => w.charAt(0).toUpperCase() + w.slice(1)).join("-");
-            raw += `${title}: ${v}\r\n`;
+            raw += `${capitalizeHeader(k)}: ${v}\r\n`;
         }
         raw += "\r\n";
 
@@ -320,8 +367,13 @@ export class ServerConnection extends TcpSocket {
         if (this.responseEnded) throw new Error("Response already ended");
 
         if (!this.headersSent) {
-            this.chunkedEncoding = true;
-            await this.writeHead(200, "OK", { "transfer-encoding": "chunked" });
+            if (this.requestHttpVersion === "1.0") {
+                this.keepAlive = false;
+                await this.writeHead(200, "OK", {});
+            } else {
+                this.chunkedEncoding = true;
+                await this.writeHead(200, "OK", { "transfer-encoding": "chunked" });
+            }
         }
 
         const data = typeof chunk === "string" ? engine.encodeString(chunk) : chunk;

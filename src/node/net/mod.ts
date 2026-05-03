@@ -171,11 +171,11 @@ export class Socket extends Duplex {
             this._connecting = false;
             this.readyState = 'open';
 
-            const localInfo = this._tcp!.getsockname();
+            const localInfo = this._tcp!.sockname;
             this.localAddress = localInfo.ip;
             this.localPort = localInfo.port;
 
-            const remoteInfo = this._tcp!.getpeername();
+            const remoteInfo = this._tcp!.peername;
             this.remoteAddress = remoteInfo.ip;
             this.remotePort = remoteInfo.port;
             this.remoteFamily = `IPv${remoteInfo.family}`;
@@ -233,7 +233,7 @@ export class Socket extends Duplex {
 
     address(): AddressInfo | {} {
         if (!this._tcp) return {};
-        const info = this._tcp.getsockname();
+        const info = this._tcp.sockname;
         return {
             address: info.ip,
             family: `IPv${info.family}`,
@@ -451,8 +451,7 @@ export class Server extends EventEmitter {
         try {
             this._tcp.bind({ ip: host, port: port ?? 0 });
             this._tcp.listen(backlog);
-
-            const info = this._tcp.getsockname();
+            const info = this._tcp.sockname;
             this._address = {
                 address: info.ip,
                 family: `IPv${info.family}`,
@@ -481,11 +480,11 @@ export class Server extends EventEmitter {
             (socket as any)._tcp = clientTcp;
             socket.readyState = 'open';
 
-            const localInfo = (clientTcp as CModuleStreams.TCP).getsockname();
+            const localInfo = (clientTcp as CModuleStreams.TCP).sockname;
             socket.localAddress = localInfo.ip;
             socket.localPort = localInfo.port;
 
-            const remoteInfo = (clientTcp as CModuleStreams.TCP).getpeername();
+            const remoteInfo = (clientTcp as CModuleStreams.TCP).peername;
             socket.remoteAddress = remoteInfo.ip;
             socket.remotePort = remoteInfo.port;
             socket.remoteFamily = `IPv${remoteInfo.family}`;

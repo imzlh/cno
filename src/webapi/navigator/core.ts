@@ -7,12 +7,12 @@ function getPlatform(): string {
     const machine = uname.machine;
 
     switch (platform) {
-        case 'linux':
+        case 'Linux':
             return machine === 'x86_64' ? 'Linux x86_64' : `Linux ${machine}`;
-        case 'darwin':
+        case 'Darwin':
             return machine === 'arm64' ? 'MacIntel' : 'MacIntel';
-        case 'win32':
-            return 'Win32';
+        case 'Windows_NT':
+            return 'win32';
         default:
             return `${platform} ${machine}`;
     }
@@ -35,11 +35,11 @@ function getUserAgent(): string {
     const arch = archMap[machine] || machine;
 
     switch (platform) {
-        case 'linux':
+        case 'Linux':
             return `Mozilla/5.0 (X11; Linux ${arch}) AppleWebKit/537.36 (KHTML, like Gecko) denort/${version} Safari/537.36`;
-        case 'darwin':
+        case 'Darwin':
             return `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) denort/${version} Safari/537.36`;
-        case 'win32':
+        case 'Windows_NT':
             return `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) denort/${version} Safari/537.36`;
         default:
             return `Mozilla/5.0 (${platform}; ${arch}) AppleWebKit/537.36 (KHTML, like Gecko) denort/${version} Safari/537.36`;

@@ -71,8 +71,7 @@ onEvent((eventName, eventData) => {
             break;
         case EventType.JOB_EXCEPTION:
             // @ts-ignore
-            event = fromError(eventData[0]);
-            console.log(eventName, eventData);
+            event = fromError(eventData);
             event.preventDefault(); // prevent default error event
             break;
         case EventType.UNHANDLED_REJECTION:

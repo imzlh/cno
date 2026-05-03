@@ -209,19 +209,19 @@ export const process: NodeJS.Process = {
     platform: (() => {
         const platform = os.uname().sysname;
         switch (platform) {
-            case 'linux':
+            case 'Linux':
                 return 'linux';
-            case 'darwin':
+            case 'Darwin':
                 return 'darwin';
-            case 'win32':
+            case 'Windows_NT':
                 return 'win32';
-            case 'freebsd':
+            case 'Freebsd':
                 return 'freebsd';
-            case 'openbsd':
+            case 'Openbsd':
                 return 'openbsd';
-            case 'sunos':
+            case 'Sunos':
                 return 'sunos';
-            case 'aix':
+            case 'Aix':
                 return 'aix';
             default:
                 return platform as NodeJS.Platform;

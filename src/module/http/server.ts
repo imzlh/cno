@@ -44,9 +44,9 @@ export class Server {
             port: config.port,
             cert: config.cert ?? "",
             key: config.key ?? "",
-            keepAliveTimeout: config.keepAliveTimeout ?? 5000,
+            keepAliveTimeout: config.keepAliveTimeout ?? 60000,
             maxRequestsPerConnection: config.maxRequestsPerConnection ?? 100,
-            requestTimeout: config.requestTimeout ?? 30000,
+            requestTimeout: config.requestTimeout ?? 300000,
         };
     }
 
@@ -96,7 +96,7 @@ export class Server {
     }
 
     address(): { ip: string; port: number } | null {
-        return this.listener?.getsockname() ?? null;
+        return this.listener?.sockname ?? null;
     }
 
     /* -------------------------------------------------------------- */
@@ -116,6 +116,10 @@ export class Server {
             let firstRequest = true;
 
             while (keepAlive && !conn.isClosed() && !conn.isUpgraded()) {
+                // First request uses requestTimeout; subsequent requests on a
+                // keep-alive connection use keepAliveTimeout.  The timeout covers
+                // both waiting for the next request to arrive *and* handling it,
+                // so keepAliveTimeout must be large enough for normal request processing.
                 const timeoutMs = firstRequest
                     ? this.config.requestTimeout
                     : this.config.keepAliveTimeout;

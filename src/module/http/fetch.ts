@@ -101,40 +101,43 @@ export class Request implements globalThis.Request {
         if (bodySource instanceof ReadableStream)
             return bodySource as ReadableStream<Uint8Array>;
 
-        return new ReadableStream({
-            start: async (controller) => {
-                try {
-                    if (typeof bodySource === 'string') {
-                        controller.enqueue(engine.encodeString(bodySource));
-                    } else if (bodySource instanceof Uint8Array) {
-                        controller.enqueue(bodySource as Uint8Array);
-                    } else if (bodySource instanceof ArrayBuffer) {
-                        controller.enqueue(new Uint8Array(bodySource));
-                    } else if (bodySource instanceof Blob) {
-                        const buffer = await bodySource.arrayBuffer();
-                        controller.enqueue(new Uint8Array(buffer));
-                    } else if (bodySource instanceof ReadableStream) {
-                        const reader = bodySource.getReader();
-                        try {
-                            while (true) {
-                                const { done, value } = await reader.read();
-                                if (done) break;
-                                controller.enqueue(value as Uint8Array);
-                            }
-                        } finally {
-                            reader.releaseLock();
-                        }
-                    } else if (bodySource instanceof URLSearchParams) {
-                        controller.enqueue(engine.encodeString(bodySource.toString()));
-                    } else if (bodySource instanceof FormData) {
-                        throw new Error('FormData not yet implemented');
-                    } else {
-                        controller.enqueue(engine.encodeString(JSON.stringify(bodySource)));
-                    }
+        let data: Uint8Array | null = null;
+
+        if (typeof bodySource === 'string') {
+            data = engine.encodeString(bodySource);
+        } else if (bodySource instanceof Uint8Array) {
+            data = bodySource as Uint8Array;
+        } else if (bodySource instanceof ArrayBuffer) {
+            data = new Uint8Array(bodySource);
+        } else if (bodySource instanceof URLSearchParams) {
+            data = engine.encodeString(bodySource.toString());
+        } else if (bodySource instanceof Blob) {
+            return new ReadableStream({
+                pull: async (controller) => {
+                    const buffer = await bodySource.arrayBuffer();
+                    controller.enqueue(new Uint8Array(buffer));
                     controller.close();
-                } catch (err) {
-                    controller.error(err);
                 }
+            });
+        } else if (bodySource instanceof FormData) {
+            throw new Error('FormData not yet implemented');
+        } else {
+            data = engine.encodeString(JSON.stringify(bodySource));
+        }
+
+        if (data !== null) {
+            const captured = data;
+            return new ReadableStream({
+                start(controller) {
+                    controller.enqueue(captured);
+                    controller.close();
+                }
+            });
+        }
+
+        return new ReadableStream({
+            start(controller) {
+                controller.close();
             }
         });
     }
@@ -170,6 +173,7 @@ export class Request implements globalThis.Request {
         if (this._bodyBuffer) return this._bodyBuffer;
         if (!this.body) return null;
 
+        this.bodyUsed = true;
         const chunks: Uint8Array[] = [];
         const reader = this.body.getReader();
 
@@ -327,7 +331,14 @@ export class Response implements globalThis.Response {
             throw new TypeError('Already read');
         }
 
-        const response = new Response(this._bodyBuffer, {
+        let clonedBody: BodyInit | null = this._bodyBuffer;
+        if (clonedBody === null && this.body) {
+            const [stream1, stream2] = this.body.tee();
+            Object.defineProperty(this, 'body', { value: stream1, writable: false, configurable: true });
+            clonedBody = stream2;
+        }
+
+        const response = new Response(clonedBody, {
             status: this.status,
             statusText: this.statusText,
             headers: this.headers

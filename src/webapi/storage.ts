@@ -67,10 +67,11 @@ class StorageEvent extends Event {
 // ============================================================================
 
 class Storage {
-    private db!: CModuleSQLite3.Sqlite3Handle;
+    private db: CModuleSQLite3.Sqlite3Handle | null = null;
     private options: Required<StorageOptions>;
     private eventListeners: Map<string, Set<Function>> = new Map();
     private stmtCache: Map<string, CModuleSQLite3.Sqlite3Stmt> = new Map();
+    private _initialized = false;
 
     // Prepared statement cache keys
     private static readonly STMT_GET = 'get';
@@ -91,6 +92,16 @@ class Storage {
             path: ':memory:',
             ...(options ?? {})
         };
+    }
+
+    private getDb(): CModuleSQLite3.Sqlite3Handle {
+        return this.db!;
+    }
+
+    private ensureDb(): void {
+        if (this._initialized) return;
+        this._initialized = true;
+
         if (this.options.path !== ':memory:') {
             this.ensureStorageDirectory();
         }
@@ -174,43 +185,39 @@ class Storage {
             throw new Error(`Failed to open storage database at ${this.options.path}: ${error}`);
         }
 
+        const db = this.getDb();
+
         if (isMemory) {
-            this.db.exec('PRAGMA foreign_keys=ON;');
+            db.exec('PRAGMA foreign_keys=ON;');
             return;
         }
 
         if (this.options.useWAL) {
             try {
-                this.db.exec('PRAGMA journal_mode=WAL;');
+                db.exec('PRAGMA journal_mode=WAL;');
                 this.log('Enabled WAL mode');
             } catch (e) {
                 this.log('Failed to enable WAL mode:', e);
             }
         }
 
-        // Set synchronous mode for better performance
-        this.db.exec('PRAGMA synchronous=NORMAL;');
+        db.exec('PRAGMA synchronous=NORMAL;');
 
-        // Enable auto vacuum if requested
         if (this.options.autoVacuum) {
-            this.db.exec('PRAGMA auto_vacuum=INCREMENTAL;');
+            db.exec('PRAGMA auto_vacuum=INCREMENTAL;');
         }
 
-        // Set cache size (negative value = KB)
-        this.db.exec('PRAGMA cache_size=-2000;'); // 2MB cache
+        db.exec('PRAGMA cache_size=-2000;');
 
-        // Enable foreign keys
-        this.db.exec('PRAGMA foreign_keys=ON;');
+        db.exec('PRAGMA foreign_keys=ON;');
     }
 
-    /**
-     * Initialize database schema
-     */
     private initializeSchema(): void {
         this.log('Initializing schema');
 
-        // Create storage table with proper indexes
-        this.db.exec(`
+        const db = this.getDb();
+
+        db.exec(`
             CREATE TABLE IF NOT EXISTS storage (
                 key TEXT PRIMARY KEY NOT NULL,
                 value TEXT NOT NULL,
@@ -220,22 +227,19 @@ class Storage {
             ) WITHOUT ROWID;
         `);
 
-        // Create index on updated_at for efficient cleanup
-        this.db.exec(`
+        db.exec(`
             CREATE INDEX IF NOT EXISTS idx_storage_updated 
             ON storage(updated_at);
         `);
 
-        // Create metadata table for storage info
-        this.db.exec(`
+        db.exec(`
             CREATE TABLE IF NOT EXISTS storage_metadata (
                 key TEXT PRIMARY KEY NOT NULL,
                 value TEXT NOT NULL
             ) WITHOUT ROWID;
         `);
 
-        // Insert initial metadata
-        const stmt = this.db.prepare(`
+        const stmt = db.prepare(`
             INSERT OR IGNORE INTO storage_metadata (key, value)
             VALUES ('version', '1'), ('name', ?);
         `);
@@ -245,53 +249,45 @@ class Storage {
         this.log('Schema initialized');
     }
 
-    /**
-     * Prepare commonly used SQL statements
-     */
     private prepareStatements(): void {
-        // Get item
+        const db = this.getDb();
+
         this.stmtCache.set(
             Storage.STMT_GET,
-            this.db.prepare('SELECT value FROM storage WHERE key = ?')
+            db.prepare('SELECT value FROM storage WHERE key = ?')
         );
 
-        // Set item (upsert)
         this.stmtCache.set(
             Storage.STMT_SET,
-            this.db.prepare(`
+            db.prepare(`
                 INSERT OR REPLACE INTO storage (key, value, size, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?)
             `)
         );
 
-        // Delete item
         this.stmtCache.set(
             Storage.STMT_DELETE,
-            this.db.prepare('DELETE FROM storage WHERE key = ?')
+            db.prepare('DELETE FROM storage WHERE key = ?')
         );
 
-        // Clear all
         this.stmtCache.set(
             Storage.STMT_CLEAR,
-            this.db.prepare('DELETE FROM storage')
+            db.prepare('DELETE FROM storage')
         );
 
-        // Get all keys
         this.stmtCache.set(
             Storage.STMT_KEYS,
-            this.db.prepare('SELECT key FROM storage ORDER BY key')
+            db.prepare('SELECT key FROM storage ORDER BY key')
         );
 
-        // Count items
         this.stmtCache.set(
             Storage.STMT_COUNT,
-            this.db.prepare('SELECT COUNT(*) as count FROM storage')
+            db.prepare('SELECT COUNT(*) as count FROM storage')
         );
 
-        // Get total size
         this.stmtCache.set(
             Storage.STMT_SIZE,
-            this.db.prepare('SELECT COALESCE(SUM(size), 0) as total FROM storage')
+            db.prepare('SELECT COALESCE(SUM(size), 0) as total FROM storage')
         );
     }
 
@@ -347,7 +343,7 @@ class Storage {
     private getCreatedTimeForUpdate(key: string, now: number): number {
         try {
             // Try to get existing created_at
-            const existingStmt = this.db.prepare('SELECT created_at FROM storage WHERE key = ?');
+            const existingStmt = this.getDb().prepare('SELECT created_at FROM storage WHERE key = ?');
             const result = existingStmt.all([key]);
             existingStmt.finalize();
             
@@ -370,6 +366,7 @@ class Storage {
      * Get number of items in storage
      */
     get length(): number {
+        this.ensureDb();
         try {
             const stmt = this.stmtCache.get(Storage.STMT_COUNT)!;
             const result = stmt.all([]);
@@ -384,6 +381,7 @@ class Storage {
      * Get item by key
      */
     getItem(key: string): string | null {
+        this.ensureDb();
         try {
             const stmt = this.stmtCache.get(Storage.STMT_GET)!;
             const result = stmt.all([key]);
@@ -403,6 +401,7 @@ class Storage {
      * Set item
      */
     setItem(key: string, value: string): void {
+        this.ensureDb();
         try {
             // Convert value to string (Web Storage API behavior)
             const stringValue = String(value);
@@ -441,6 +440,7 @@ class Storage {
      * Remove item
      */
     removeItem(key: string): void {
+        this.ensureDb();
         try {
             // Get old value for event
             const oldValue = this.getItem(key);
@@ -467,6 +467,7 @@ class Storage {
      * Clear all items
      */
     clear(): void {
+        this.ensureDb();
         try {
             const stmt = this.stmtCache.get(Storage.STMT_CLEAR)!;
             stmt.run([]);
@@ -478,7 +479,7 @@ class Storage {
 
             // Optimize database after clear 
             if (this.options.autoVacuum && this.options.path !== ':memory:') {
-                this.db.exec('PRAGMA incremental_vacuum;');
+                this.getDb().exec('PRAGMA incremental_vacuum;');
             }
         } catch (error) {
             this.log('Error clearing storage:', error);
@@ -490,6 +491,7 @@ class Storage {
      * Get key at index (for iteration)
      */
     key(index: number): string | null {
+        this.ensureDb();
         try {
             if (index < 0) return null;
 
@@ -515,6 +517,7 @@ class Storage {
      * Get all keys
      */
     keys(): string[] {
+        this.ensureDb();
         try {
             const stmt = this.stmtCache.get(Storage.STMT_KEYS)!;
             const result = stmt.all([]);
@@ -529,8 +532,9 @@ class Storage {
      * Get all values
      */
     values(): string[] {
+        this.ensureDb();
         try {
-            const stmt = this.db.prepare('SELECT value FROM storage ORDER BY key');
+            const stmt = this.getDb().prepare('SELECT value FROM storage ORDER BY key');
             const result = stmt.all([]);
             stmt.finalize();
             return result.map(row => row.value as string);
@@ -544,8 +548,9 @@ class Storage {
      * Get all entries
      */
     entries(): Array<[string, string]> {
+        this.ensureDb();
         try {
-            const stmt = this.db.prepare('SELECT key, value FROM storage ORDER BY key');
+            const stmt = this.getDb().prepare('SELECT key, value FROM storage ORDER BY key');
             const result = stmt.all([]);
             stmt.finalize();
             return result.map(row => [row.key as string, row.value as string]);
@@ -566,6 +571,7 @@ class Storage {
      * Get storage statistics
      */
     getStats(): StorageStats {
+        this.ensureDb();
         try {
             const countStmt = this.stmtCache.get(Storage.STMT_COUNT)!;
             const sizeStmt = this.stmtCache.get(Storage.STMT_SIZE)!;
@@ -589,14 +595,15 @@ class Storage {
      * Optimize database (vacuum and analyze)
      */
     optimize(): void {
+        this.ensureDb();
         try {
             this.log('Optimizing database');
 
             if (this.options.autoVacuum && this.options.path !== ':memory:') {
-                this.db.exec('PRAGMA incremental_vacuum;');
+                this.getDb().exec('PRAGMA incremental_vacuum;');
             }
 
-            this.db.exec('ANALYZE;');
+            this.getDb().exec('ANALYZE;');
 
             this.log('Database optimized');
         } catch (error) {
@@ -631,14 +638,16 @@ class Storage {
         try {
             this.log('Closing storage');
 
-            // Finalize all prepared statements
             for (const stmt of this.stmtCache.values()) {
                 stmt.finalize();
             }
             this.stmtCache.clear();
 
-            // Close database
-            this.db.close();
+            if (this.db) {
+                this.db.close();
+                this.db = null;
+            }
+            this._initialized = false;
 
             this.log('Storage closed');
         } catch (error) {
@@ -718,16 +727,19 @@ class StorageManager {
     /**
      * Get default storage path
      */
-    private getDefaultPath(name: string) {
-        const hash = crypto.base64Encode(crypto.md5(engine.encodeString(os.cwd)));
-        let path;
-        try {
-            const homeDir = os.getenv('HOME') ?? os.cwd;
-            path = `${homeDir}/.storage/${hash}/${name}.db`;
-        } catch {
-            path = `${os.tmpdir}/.storage/${hash}/${name}.db`;
+    private getDefaultPath(name: string): string {
+        const genenv = (env: string) => {
+            try{
+                return os.getenv(env) || '';
+            } catch (error) {
+                return '';
+            }
         }
-        return path;
+        const cwd = os.cwd || os.tmpDir || '/tmp';
+        const hash = crypto.hexEncode(crypto.md5(engine.encodeString(cwd)));
+        const homeDir = genenv('HOME') || os.tmpDir || cwd;
+        const baseDir = `${homeDir}/.storage/${hash}`;
+        return `${baseDir}/${name}.db`;
     }
 
     /**

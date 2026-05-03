@@ -83,10 +83,6 @@ class SendQueue {
     }
 
     enqueue(data: Uint8Array): Promise<void> {
-        if (!this.connection) {
-            return Promise.reject(new Error('WebSocket is not open'));
-        }
-
         if (this._bufferedAmount + data.length > MAX_BUFFERED_AMOUNT) {
             return Promise.reject(new Error('WebSocket buffer is full'));
         }
@@ -95,8 +91,13 @@ class SendQueue {
 
         return new Promise((resolve, reject) => {
             this.queue.push({ data, resolve, reject });
-            this.drain();
+            if (this.connection) this.drain();
         });
+    }
+
+    setConnection(conn: ConnectionLike): void {
+        this.connection = conn;
+        if (this.queue.length > 0) this.drain();
     }
 
     private async drain(): Promise<void> {
@@ -160,9 +161,9 @@ class SendQueue {
             frame[offset++] = 0;
             frame[offset++] = 0;
             frame[offset++] = 0;
-            frame[offset++] = (payloadLength >> 24) & 0xFF;
-            frame[offset++] = (payloadLength >> 16) & 0xFF;
-            frame[offset++] = (payloadLength >> 8) & 0xFF;
+            frame[offset++] = (payloadLength / 0x1000000) & 0xFF;
+            frame[offset++] = (payloadLength / 0x10000) & 0xFF;
+            frame[offset++] = (payloadLength / 0x100) & 0xFF;
             frame[offset++] = payloadLength & 0xFF;
         }
 
@@ -222,8 +223,10 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
     private fragmentOpcode: OpCode | null = null;
     private pingInterval: number | null = null;
     private pongTimeout: number | null = null;
+    private _wsKey: string = '';
     private closeCode: number = WebSocketCloseCode.NO_STATUS;
     private closeReason: string = '';
+    private _closeTimer: number | null = null;
     private sendQueue: SendQueue;
 
     public onopen: ((this: globalThis.WebSocket, ev: Event) => any) | null = null;
@@ -245,11 +248,10 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
     constructor(urlOrConnection: string | Promise<ConnectionLike>, protocolsOrIsServer?: string | string[] | true) {
         super();
 
-        this.sendQueue = new SendQueue(null, true, () => this.handleClose(WebSocketCloseCode.ABNORMAL, 'Connection closed'));
-
         if (typeof urlOrConnection === 'string') {
             this.url = urlOrConnection;
             this.isClient = true;
+            this.sendQueue = new SendQueue(null, true, () => this.handleClose(WebSocketCloseCode.ABNORMAL, 'Connection closed'));
 
             const protocols = protocolsOrIsServer as string | string[] | undefined;
             if (protocols) {
@@ -260,6 +262,7 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
         } else {
             this.url = '';
             this.isClient = false;
+            this.sendQueue = new SendQueue(null, false, () => this.handleClose(WebSocketCloseCode.ABNORMAL, 'Connection closed'));
             this.pendingConnection = urlOrConnection;
             this._readyState = WebSocketReadyState.CONNECTING;
 
@@ -268,7 +271,7 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
 
                 this._readyState = WebSocketReadyState.OPEN;
                 this.connection = conn;
-                this.sendQueue = new SendQueue(conn, false, () => this.handleClose(WebSocketCloseCode.ABNORMAL, 'Connection closed'));
+                this.sendQueue.setConnection(conn);
 
                 this.dispatchEvent(new Event('open'));
                 this.onopen?.(new Event('open'));
@@ -316,13 +319,13 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
 
     private async sendHandshake(url: URL): Promise<void> {
         assert(this.connection, "Connection is not established");
-        const key = this.generateWebSocketKey();
+        this._wsKey = this.generateWebSocketKey();
 
         const headers = new Headers({
             'Upgrade': 'websocket',
             'Connection': 'Upgrade',
             'Sec-WebSocket-Version': '13',
-            'Sec-WebSocket-Key': key
+            'Sec-WebSocket-Key': this._wsKey
         });
 
         if (this.protocol) {
@@ -363,6 +366,12 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
                     return;
                 }
 
+                const expectedAccept = this.computeAcceptKey(this._wsKey);
+                if (accept !== expectedAccept) {
+                    reject(new Error('Invalid Sec-WebSocket-Accept header'));
+                    return;
+                }
+
                 resolved = true;
                 resolve();
             };
@@ -391,6 +400,12 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
     private generateWebSocketKey(): string {
         const random = crypto.randomBytes(16);
         return crypto.base64Encode(random);
+    }
+
+    private computeAcceptKey(key: string): string {
+        const magic = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+        const hash = crypto.sha1(engine.encodeString(key + magic));
+        return crypto.base64Encode(hash);
     }
 
     private startReceiving(): void {
@@ -467,12 +482,12 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
             offset = 4;
         } else if (payloadLength === 127) {
             if (totalLength < 10) return null;
-            const highBits = (buffer[2] << 24) | (buffer[3] << 16) | (buffer[4] << 8) | buffer[5];
+            const highBits = buffer[2] * 0x1000000 + buffer[3] * 0x10000 + buffer[4] * 0x100 + buffer[5];
             if (highBits !== 0) {
                 this.close(WebSocketCloseCode.MESSAGE_TOO_BIG, 'Frame payload too large');
                 return null;
             }
-            payloadLength = (buffer[6] << 24) | (buffer[7] << 16) | (buffer[8] << 8) | buffer[9];
+            payloadLength = buffer[6] * 0x1000000 + buffer[7] * 0x10000 + buffer[8] * 0x100 + buffer[9];
             offset = 10;
         }
 
@@ -487,7 +502,7 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
 
         let payload = buffer.slice(offset, offset + payloadLength);
 
-        if (masked && maskKey) {
+        if (masked && maskKey && payload.length > 0) {
             payload = this.unmask(payload, maskKey);
         }
 
@@ -604,7 +619,8 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
         }
 
         this.sendFrame(OpCode.CLOSE, payload).then(() => {
-            timers.setTimeout(() => {
+            this._closeTimer = timers.setTimeout(() => {
+                this._closeTimer = null;
                 this.handleClose(code, reason);
             }, 1000);
         }).catch(() => {
@@ -635,6 +651,11 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
 
     private handleClose(code: number, reason: string): void {
         if (this._readyState === WebSocketReadyState.CLOSED) return;
+
+        if (this._closeTimer !== null) {
+            timers.clearTimeout(this._closeTimer);
+            this._closeTimer = null;
+        }
 
         this._readyState = WebSocketReadyState.CLOSED;
         this.closeCode = code;

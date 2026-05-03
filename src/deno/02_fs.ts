@@ -520,14 +520,14 @@ Object.assign(Deno, wrapFSns({
 
     async makeTempDir(opt) {
         const rand = Math.floor(Math.random() * 1e9).toString(36);
-        const tmp = join(opt?.dir ?? os.tmpdir, opt?.prefix ?? 'deno', opt?.suffix ?? rand);
+        const tmp = join(opt?.dir ?? os.tmpDir, opt?.prefix ?? 'deno', opt?.suffix ?? rand);
         await mkdirRecursive(tmp, 755);
         return tmp;
     },
 
     makeTempDirSync(opt) {
         const rand = Math.floor(Math.random() * 1e9).toString(36);
-        const tmp = join(opt?.dir ?? os.tmpdir, opt?.prefix ?? 'deno', opt?.suffix ?? rand);
+        const tmp = join(opt?.dir ?? os.tmpDir, opt?.prefix ?? 'deno', opt?.suffix ?? rand);
         mkdirRecursiveSync(tmp, 755);
         return tmp;
     },
@@ -560,18 +560,22 @@ Object.assign(Deno, wrapFSns({
     },
 
     async makeTempFile(opt) {
+        const dir = opt?.dir ?? os.tmpDir;
+        const prefix = opt?.prefix ?? 'cno-';
+        const suffix = opt?.suffix ?? '';
         const randomValue = Math.floor(Math.random() * 1e9).toString(36);
-        const path = join(opt?.dir ?? os.tmpdir, opt?.prefix ?? 'cno', opt?.suffix ?? 'cno-')
-            + randomValue;
+        const path = join(dir, prefix + randomValue + suffix);
         const f = await asfs.open(path, 'w', 0o644);
         await f.close();
         return path;
     },
 
     makeTempFileSync(opt) {
+        const dir = opt?.dir ?? os.tmpDir;
+        const prefix = opt?.prefix ?? 'cno-';
+        const suffix = opt?.suffix ?? '';
         const randomValue = Math.floor(Math.random() * 1e9).toString(36);
-        const path = join(opt?.dir ?? os.tmpdir, opt?.prefix ?? 'cno', opt?.suffix ?? 'cno-')
-            + randomValue;
+        const path = join(dir, prefix + randomValue + suffix);
         const fd = fs.open(path, 'w', 0o644);
         fs.close(fd);
         return path;

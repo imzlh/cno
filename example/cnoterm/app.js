@@ -199,10 +199,12 @@ class TerminalManager {
         const fitAddon = new FitAddon.FitAddon();
         const webLinksAddon = new WebLinksAddon.WebLinksAddon();
         const searchAddon = new SearchAddon.SearchAddon();
+        const webglAddon = new WebglAddon.WebglAddon();
 
         term.loadAddon(fitAddon);
         term.loadAddon(webLinksAddon);
         term.loadAddon(searchAddon);
+        term.loadAddon(webglAddon);
         term.open(tab.wrapperElement);
 
         // 设置终端事件监听

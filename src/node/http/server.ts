@@ -389,13 +389,15 @@ export class ServerResponseImpl extends OutgoingMessageImpl implements ServerRes
 
     writeProcessingContinue(): void {
         if (this._tcp && !this.headersSent) {
-            this._tcp.write(engine.encodeString('HTTP/1.1 100 Continue\r\n\r\n'));
+            const version = this.req?.httpVersion || '1.1';
+            this._tcp.write(engine.encodeString(`HTTP/${version} 100 Continue\r\n\r\n`));
         }
     }
 
     writeEarlyHints(hints: Record<string, string | string[]>, callback?: () => void): void {
         if (this._tcp && !this.headersSent) {
-            let message = 'HTTP/1.1 103 Early Hints\r\n';
+            const version = this.req?.httpVersion || '1.1';
+            let message = `HTTP/${version} 103 Early Hints\r\n`;
             for (const [key, value] of Object.entries(hints)) {
                 if (Array.isArray(value)) {
                     for (const v of value) message += `${key}: ${v}\r\n`;
@@ -411,7 +413,8 @@ export class ServerResponseImpl extends OutgoingMessageImpl implements ServerRes
     protected _sendHeaders(): void {
         if (this.headersSent || !this._tcp) return;
 
-        let headerStr = `HTTP/1.1 ${this.statusCode} ${this.statusMessage}\r\n`;
+        const version = (this as any).req?.httpVersion || '1.1';
+        let headerStr = `HTTP/${version} ${this.statusCode} ${this.statusMessage}\r\n`;
         headerStr += this._formatHeaders();
         headerStr += '\r\n';
 

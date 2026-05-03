@@ -3,12 +3,9 @@ import { assert } from "../utils/assert";
 
 const crypto = import.meta.use('crypto');
 const engine = import.meta.use('engine');
-const text = import.meta.use('text');
+const text = import.meta.use('text')!;
 const os = import.meta.use('os');
-const fs = import.meta.use('fs');
 const timer = import.meta.use('timers');
-
-assert(text, 'text module is not available');
 
 globalThis.atob = function(str) {
     const dec = crypto.base64Decode(str);
@@ -25,10 +22,9 @@ globalThis.alert = function(msg) {
 }
 
 globalThis.prompt = function(msg) {
-    fs.setBlocking(os.STDIN_FILENO, true);
-    fs.setBlocking(os.STDOUT_FILENO, true);
-    
-    assert(fs.write(os.STDOUT_FILENO, 
+    const { stdin, stdout } = Deno; // here we should import deno.std*
+                                    // however will cause circular dependency
+    assert(stdout.writeSync(
         engine.encodeString(msg ? msg + ' ' : '? ')), "write() operation failed");
     
     const decoder = new TextDecoder();
@@ -36,21 +32,16 @@ globalThis.prompt = function(msg) {
     let line = '';
     
     while (true) {
-        const n = fs.read(os.STDIN_FILENO, chunk);
+        const n = stdin.readSync(chunk);
         if (!n) break;  // EOF
         
         line += decoder.decode(chunk.subarray(0, n), { stream: true });
         
         const newlineIdx = line.indexOf('\n');
         if (newlineIdx !== -1) {
-            fs.setBlocking(os.STDIN_FILENO, false);
-            fs.setBlocking(os.STDOUT_FILENO, false);
             return line.substring(0, newlineIdx).replace(/\r$/, '');
         }
     }
-    
-    fs.setBlocking(os.STDIN_FILENO, false);
-    fs.setBlocking(os.STDOUT_FILENO, false);
     
     line += decoder.decode();
     return line.replace(/\r?\n$/, '') || null;

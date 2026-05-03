@@ -424,15 +424,16 @@ class SubtleCrypto implements globalThis.SubtleCrypto {
 
         // HMAC
         if (alg.name === 'HMAC') {
-            const params = algorithm as EcdsaParams;
             const keyAlg = keyImpl.algorithm as HmacKeyAlgorithm;
-            const hashAlg = normalizeAlgorithm(params.hash);
+            const hashAlg = normalizeAlgorithm(keyAlg.hash);
 
             let computedHmac: ArrayBuffer;
             if (hashAlg.name === 'SHA-256') {
                 computedHmac = crypto.hmacSha256(keyImpl._handle, dataBuffer);
             } else if (hashAlg.name === 'SHA-512') {
                 computedHmac = crypto.hmacSha512(keyImpl._handle, dataBuffer);
+            } else if (hashAlg.name === 'SHA-1') {
+                computedHmac = crypto.hmacSha1(keyImpl._handle, dataBuffer);
             } else {
                 throw new Error(`Unsupported hash for HMAC: ${hashAlg.name}`);
             }
@@ -502,7 +503,12 @@ class SubtleCrypto implements globalThis.SubtleCrypto {
             const aad = params.additionalData ? toArrayBuffer(params.additionalData) : undefined;
 
             const result = crypto.gcmEncrypt(keyImpl._handle, iv, dataBuffer, aad, params.tagLength);
-            return result.ciphertext;
+            const ciphertext = new Uint8Array(result.ciphertext);
+            const tag = new Uint8Array(result.tag);
+            const output = new Uint8Array(ciphertext.length + tag.length);
+            output.set(ciphertext, 0);
+            output.set(tag, ciphertext.length);
+            return output.buffer;
         }
 
         throw new Error(`Unsupported encryption algorithm: ${alg.name}`);

@@ -386,7 +386,7 @@ Object.defineProperty(globalThis, "Deno", {
                 swapFree: 0
             };
         },
-        hostname: () => os.hostname,
+        hostname: () => os.hostName,
         loadavg: os.loadavg,
         osRelease: () => os.uname().release,
         osUptime: () => os.uptime(),
@@ -490,7 +490,7 @@ Object.defineProperty(globalThis, "Deno", {
 // then import polyfills
 await import('./02_fs');
 await import('./03_fopen');
-await import('./04_stdio');
+export const { stdin, stdout, stderr } = await import('./04_stdio');
 await import('./05_net');
 await import('./06_process');
 await import('./07_http');

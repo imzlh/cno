@@ -8,6 +8,7 @@ import { ServerConnection } from '../module/http/server-conn';
 import { WebSocket, createWebSocketFromConnection } from '../module/http/websocket';
 import { assert } from '../utils/assert';
 import { wrapFsClassDec as wrap, wrapFSns } from "../utils/wrap";
+import { errors } from './01_errors';
 
 const crypto = import.meta.use('crypto');
 const engine = import.meta.use('engine');
@@ -32,10 +33,9 @@ interface WebSocketResponse extends Response {
 /**
  * Convert core HttpRequest to Web API Request
  */
-function createWebRequest(coreReq: HttpRequest, connInfo: { hostname: string; port: number }): Request {
-    // Build full URL
+function createWebRequest(coreReq: HttpRequest, connInfo: { hostname: string; port: number; secure: boolean }): Request {
     const host = coreReq.headers.get('host') || `${connInfo.hostname}:${connInfo.port}`;
-    const protocol = 'http:'; // Server will be HTTP or HTTPS, but Request constructor needs valid URL
+    const protocol = connInfo.secure ? 'https:' : 'http:';
     const url = new URL(coreReq.url, `${protocol}//${host}`);
 
     // Convert headers
@@ -87,7 +87,7 @@ class ResponseAdapter {
             const length = parseInt(contentLength, 10);
             assert(!isNaN(length), `Invalid Content-Length: ${contentLength}`);
             assert(length >= 0, `Content-Length must be non-negative: ${length}`);
-            if (contentLength) assert(res.body, "Body must exist if Content-Length is specified");
+            if (length > 0) assert(res.body, "Body must exist if Content-Length > 0");
         }
 
         // no Transfer-Encoding and Content-Length(mutex)
@@ -271,7 +271,8 @@ function serve(
                 const addr = coreServer.address();
                 const webRequest = createWebRequest(req, {
                     hostname: addr?.ip || '0.0.0.0',
-                    port: addr?.port || options.port || 8000
+                    port: addr?.port || options.port || 8000,
+                    secure: !!(coreServer as any).sslContext
                 });
 
                 // Create connection info
@@ -294,7 +295,8 @@ function serve(
                 await adapter.sendResponse(webResponse);
 
             } catch (error) {
-                console.error('Request handler error:', error);
+                if (!(error instanceof errors.ConnectionReset))
+                    console.error('Request handler error:', error);
 
                 // Send 500 error
                 try {
@@ -311,7 +313,9 @@ function serve(
             hostname: options.hostname || '0.0.0.0',
             port: options.port || 8000,
             cert: ('cert' in options) ? options.cert as string : undefined,
-            key: ('key' in options) ? options.key as string : undefined
+            key: ('key' in options) ? options.key as string : undefined,
+            keepAliveTimeout: ('keepAliveTimeout' in options) ? options.keepAliveTimeout as number : undefined,
+            requestTimeout: ('requestTimeout' in options) ? options.requestTimeout as number : undefined,
         }
     );
 

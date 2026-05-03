@@ -11,7 +11,7 @@ const text = import.meta.use('text');
 const pty = import.meta.use('pty');
 const engine = import.meta.use('engine');
 
-const pipe = (type?: Deno.CommandOptions['stdout']): CModuleProcess.SpawnOptions['stdout'] =>
+const pipe = (type?: Deno.CommandOptions['stdout']): CModuleProcess.SpawnOptions<false>['stdout'] =>
     type == 'piped' ? 'pipe' : (type == 'null' ? 'ignore' : 'inherit');
 
 class RStream extends ReadableStream<Uint8Array<ArrayBuffer>> implements Deno.SubprocessReadableStream {
@@ -137,9 +137,9 @@ class Process implements Deno.ChildProcess {
 
     @wrap
     async resize(cols: number, rows: number): Promise<void> {
-        const stdin = this.$proc.stdin?.fileno();
+        const stdin = this.$proc.stdin?.fileno;
         assert(stdin, "stdin is not piped");
-        return pty.resize(stdin, cols, rows);
+        return this.$proc.resize(cols, rows);
     }
 }
 

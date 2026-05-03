@@ -196,10 +196,10 @@ export const constants = {
 // ============================================================================
 
 /** 空设备的路径 */
-export const devNull = uname.sysname === 'win32' ? '\\\\.\\NUL' : '/dev/null';
+export const devNull = uname.sysname === 'Windows_NT' ? '\\\\.\\NUL' : '/dev/null';
 
 /** 操作系统特定的行尾标记 */
-export const EOL = uname.sysname === 'win32' ? '\r\n' : '\n';
+export const EOL = uname.sysname === 'Windows_NT' ? '\r\n' : '\n';
 
 // ============================================================================
 // 函数实现
@@ -209,7 +209,7 @@ export const EOL = uname.sysname === 'win32' ? '\r\n' : '\n';
  * 返回操作系统的主机名
  */
 export function hostname(): string {
-    return os.hostname;
+    return os.hostName;
 }
 
 /**
@@ -312,7 +312,7 @@ export function networkInterfaces(): NodeJS.Dict<NetworkInterfaceInfo[]> {
  * 返回当前用户的主目录路径
  */
 export function homedir(): string {
-    return os.homedir;
+    return os.homeDir;
 }
 
 export interface UserInfoOptions {
@@ -329,7 +329,7 @@ export function userInfo(options?: UserInfoOptions): UserInfo<string> {
         uid: info.userId,
         gid: info.groupId,
         shell: info.shell,
-        homedir: info.homeDir ?? os.homedir,
+        homedir: info.homeDir ?? os.homeDir,
     };
 }
 
@@ -383,21 +383,21 @@ export function version(): string {
 export function platform(): NodeJS.Platform {
     const platform = uname.sysname;
     switch (platform) {
-        case 'linux':
+        case 'Linux':
             return 'linux';
-        case 'darwin':
+        case 'Darwin':
             return 'darwin';
-        case 'win32':
+        case 'Windows_NT':
             return 'win32';
-        case 'freebsd':
+        case 'Freebsd':
             return 'freebsd';
-        case 'openbsd':
+        case 'Openbsd':
             return 'openbsd';
-        case 'sunos':
+        case 'Sunos':
             return 'sunos';
-        case 'aix':
+        case 'Aix':
             return 'aix';
-        case 'android':
+        case 'Android':
             return 'android';
         default:
             return platform as NodeJS.Platform;
@@ -415,7 +415,7 @@ export function machine(): string {
  * 返回临时文件的默认目录
  */
 export function tmpdir(): string {
-    return os.tmpdir;
+    return os.tmpDir;
 }
 
 /**

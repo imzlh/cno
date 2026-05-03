@@ -2,9 +2,9 @@ import { wrapFsClassDec as wrap } from "../../utils/wrap";
 import { assert } from "../../utils/assert";
 import { HttpClient } from "../../deno/07_http";
 import { TcpSocket } from "./socket";
+import { dnsCache } from "./dns-cache";
 
 const ssl    = import.meta.use("ssl");
-const dns    = import.meta.use("dns");
 const os     = import.meta.use("os");
 const timers = import.meta.use("timers");
 const asfs   = import.meta.use("asyncfs");
@@ -143,7 +143,7 @@ export class Connection extends TcpSocket implements ConnectionLike {
                     this.config.hostname, this.config.port, isSecure
                 );
             } else {
-                const addrs = await dns.resolve(this.config.hostname, { family: os.AF_UNSPEC });
+                const addrs = await dnsCache.resolve(this.config.hostname, { family: os.AF_UNSPEC });
                 if (!addrs?.length) throw new Error(`DNS resolution failed for ${this.config.hostname}`);
                 const addr = addrs.find((a: any) => a.family === 4) || addrs[0];
                 assert(addr, `No IP address found for ${this.config.hostname}`);
@@ -156,8 +156,8 @@ export class Connection extends TcpSocket implements ConnectionLike {
                     await this.clientHandshake(clientCtx, this.config.hostname);
                 } else {
                     const caPath = await findSystemCaPath();
-                    if (!caPath) console.warn("No system CA bundle found - disabling certificate verification");
-                    const ctx = new ssl.Context({ mode: "client", verify: !!caPath, ca: caPath ?? undefined });
+                    if (!caPath) throw new Error("No system CA bundle found - cannot verify TLS certificates. Set caCerts in HttpClientOptions to provide custom CA certificates.");
+                    const ctx = new ssl.Context({ mode: "client", verify: true, ca: caPath });
                     await this.clientHandshake(ctx, this.config.hostname);
                 }
             }
@@ -217,6 +217,11 @@ export class Connection extends TcpSocket implements ConnectionLike {
 
 export class ConnectionManager {
     private pools = new Map<string, Connection[]>();
+    private waiters = new Map<string, Array<{
+        resolve: (c: Connection) => void;
+        reject: (e: Error) => void;
+        timeoutId: number;
+    }>>();
 
     private defaultConfig: Partial<ConnectionConfig> = {
         timeout: 30000, keepAlive: true, keepAliveTimeout: 5000, maxSockets: 10
@@ -254,11 +259,36 @@ export class ConnectionManager {
     release(cfg: ConnectionConfig, conn: Connection): void {
         if (conn.isClosed()) { this.removeConnection(cfg, conn); return; }
         conn.markIdle();
+        this.notifyWaiters(this.getKey(cfg));
+    }
+
+    private notifyWaiters(key: string): void {
+        const queue = this.waiters.get(key);
+        if (!queue || queue.length === 0) return;
+
+        const pool = this.pools.get(key);
+        if (!pool) return;
+
+        const available = pool.find(c => c.isAvailable());
+        if (!available) return;
+
+        const waiter = queue.shift()!;
+        timers.clearTimeout(waiter.timeoutId);
+        if (queue.length === 0) this.waiters.delete(key);
+        available.markActive();
+        waiter.resolve(available);
     }
 
     closeAll(): void {
         for (const pool of this.pools.values()) for (const c of pool) c.close();
         this.pools.clear();
+        for (const queue of this.waiters.values()) {
+            for (const w of queue) {
+                timers.clearTimeout(w.timeoutId);
+                w.reject(new Error("Connection pool closed"));
+            }
+        }
+        this.waiters.clear();
     }
 
     getStats(): Record<string, { total: number; idle: number; active: number }> {
@@ -276,19 +306,22 @@ export class ConnectionManager {
     @wrap
     private async waitForConnection(key: string, cfg: ConnectionConfig): Promise<Connection> {
         return new Promise((resolve, reject) => {
-            const timeout = timers.setTimeout(() => {
-                timers.clearInterval(interval);
+            const timeoutId = timers.setTimeout(() => {
+                const queue = this.waiters.get(key);
+                if (queue) {
+                    const idx = queue.findIndex(w => w.reject === reject);
+                    if (idx !== -1) queue.splice(idx, 1);
+                    if (queue.length === 0) this.waiters.delete(key);
+                }
                 reject(new Error("Connection pool timeout"));
             }, cfg.timeout || 30000);
-            const interval = timers.setInterval(() => {
-                const avail = (this.pools.get(key) || []).find(c => c.isAvailable());
-                if (avail) {
-                    timers.clearTimeout(timeout);
-                    timers.clearInterval(interval);
-                    avail.markActive();
-                    resolve(avail);
-                }
-            }, 100);
+
+            let queue = this.waiters.get(key);
+            if (!queue) {
+                queue = [];
+                this.waiters.set(key, queue);
+            }
+            queue.push({ resolve, reject, timeoutId });
         });
     }
 

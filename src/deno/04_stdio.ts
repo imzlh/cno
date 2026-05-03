@@ -107,7 +107,7 @@ export class Stream {
 
     get size(){
         if (this.type != 'tty') throw new Error('Only TTY streams have a size');
-        return (this.stream as CModuleStreams.TTY).getWinSize();
+        return (this.stream as CModuleStreams.TTY).size;
     }
 
     @wrap
@@ -178,9 +178,9 @@ export class Stream {
     }
 }
 
-const stdin = new Stream(os.STDIN_FILENO, true);
-const stdout = new Stream(os.STDOUT_FILENO, false);
-const stderr = new Stream(os.STDERR_FILENO, false);
+export const stdin = new Stream(os.STDIN_FILENO, true);
+export const stdout = new Stream(os.STDOUT_FILENO, false);
+export const stderr = new Stream(os.STDERR_FILENO, false);
 
 Object.assign(Deno, {
     stdin: {

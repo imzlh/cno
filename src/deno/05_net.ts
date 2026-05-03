@@ -2,9 +2,11 @@ import { malloc } from "../utils/malloc";
 import { wrapFsClassDec as wrap, wrapFSErr, wrapFSns } from "../utils/wrap";
 
 const os = import.meta.use('os');
-const dns = import.meta.use('dns');
 const stream = import.meta.use('streams');
 const ssl = import.meta.use('ssl');
+const dns = import.meta.use('dns');
+
+import { dnsCache } from '../module/http/dns-cache';
 
 const symbolGetPipe = Symbol('Stream.getPipe');
 
@@ -110,7 +112,7 @@ class TcpConn extends Conn<Deno.NetAddr> implements Deno.TcpConn {
     constructor(
         pipe: CModuleStreams.TCP
     ) {
-        super(pipe, addrinfo2deno(pipe.getsockname()), addrinfo2deno(pipe.getpeername()));
+        super(pipe, addrinfo2deno(pipe.sockname), addrinfo2deno(pipe.peername));
     }
 
     @wrap
@@ -167,8 +169,8 @@ class TlsConn implements Deno.TlsConn {
                 }
             }
         });
-        this.localAddr = addrinfo2deno(this.$rawPipe.getsockname());
-        this.remoteAddr = addrinfo2deno(this.$rawPipe.getpeername());
+        this.localAddr = addrinfo2deno(this.$rawPipe.sockname);
+        this.remoteAddr = addrinfo2deno(this.$rawPipe.peername);
     }
 
     @wrap
@@ -404,7 +406,7 @@ Object.assign(Deno, wrapFSns({
             case "CNAME":
             case "NS":
             case "PTR":
-                return info.filter(i => i.type == dns[type]).map(i => i.name);
+                return info.filter((i: any) => i.type == dns[type]).map((i: any) => i.name);
             case "CAA":
                 // @ts-ignore
                 return info.filter<CModuleDNS.CaaAnswer>(i => i.type == dns.CAA).map(i => ({
@@ -462,7 +464,7 @@ Object.assign(Deno, wrapFSns({
             case 'tcp':
                 const host = options.hostname ?? '0.0.0.0';
                 const tcp = new stream.TCP(host.includes(':') ? os.AF_INET6 : os.AF_INET);
-                const dnsanswer = await dns.resolve(host, { family: host.includes(':') ? 6 : 4 });
+                const dnsanswer = await dnsCache.resolve(host, { family: host.includes(':') ? 6 : 4 });
                 const ip = dnsanswer[0]?.ip;
                 if (!ip) throw new Error(`Could not resolve hostname ${host}`);
                 await tcp.connect({ ip, port: options.port });

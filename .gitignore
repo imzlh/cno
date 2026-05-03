@@ -7,3 +7,6 @@ types/
 dist.js
 dist.min.js
 compile.js
+example/netease/netease.cookie
+.vscode/
+.codeartsdoer/

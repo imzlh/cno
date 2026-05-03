@@ -223,7 +223,7 @@ export function spawn(command: string, argsOrOptions?: string[] | SpawnOptions, 
         command = shell;
     }
 
-    const spawnOpts: CModuleProcess.SpawnOptions = {
+    const spawnOpts: CModuleProcess.SpawnOptions<false> = {
         cwd: opts.cwd,
         env: opts.env,
         uid: opts.uid,
@@ -422,7 +422,7 @@ export interface ExecSyncResult {
 }
 
 export function spawnSync(command: string, args?: string[], options?: SpawnOptions): SpawnSyncResult {
-    const opts: CModuleProcess.SpawnOptions = {
+    const opts: CModuleProcess.SpawnOptions<false> = {
         cwd: options?.cwd,
         env: options?.env,
         uid: options?.uid,

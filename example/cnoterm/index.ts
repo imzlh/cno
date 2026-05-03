@@ -8,6 +8,10 @@ import { load as loadEnv } from "jsr:@std/dotenv";
 import { join, normalize } from "jsr:@std/path";
 import { contentType } from "jsr:@std/media-types";
 
+globalThis.addEventListener('error', e => {
+    console.error(e.error);
+});
+
 // ============================================================================
 // 配置管理
 // ============================================================================

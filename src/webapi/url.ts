@@ -370,6 +370,11 @@ class URL implements globalThis.URL {
             this.#host = baseUrl.#host;
             this.#port = baseUrl.#port;
             this.#path = [...baseUrl.#path];
+            if (input && !input.startsWith('/')) {
+                if (this.#path.length > 0) {
+                    this.#path.pop();
+                }
+            }
         }
 
         // 解析 path
@@ -469,12 +474,16 @@ class URL implements globalThis.URL {
 
         const segments = path.split('/');
         for (const segment of segments) {
-            if (segment === '.') {
+            if (segment === '' || segment === '.') {
                 continue;
             }
             if (segment === '..') {
-                if (this.#path.length > 0 && this.#path[this.#path.length - 1] !== '..') {
-                    this.#path.pop();
+                if (isSpecial) {
+                    if (this.#path.length > 0 && this.#path[this.#path.length - 1] !== '..') {
+                        this.#path.pop();
+                    }
+                } else {
+                    this.#path.push('..');
                 }
             } else {
                 this.#path.push(segment);
@@ -673,7 +682,7 @@ class URL implements globalThis.URL {
     toString(): string {
         let result = this.#scheme + ':';
 
-        if (this.#host || this.#scheme === 'file') {
+        if (this.#host || this.#scheme === 'file' || (this.#scheme in SPECIAL_SCHEMES)) {
             result += '//';
             if (this.#username || this.#password) {
                 result += percentEncode(this.#username, USERINFO_ENCODE_SET);

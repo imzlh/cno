@@ -92,26 +92,36 @@ export class HttpRequestBuilder {
                 this.headers.set('content-type', body.type);
             }
         } else if (body instanceof FormData) {
-            // 简化的 FormData 处理（实际需要 multipart/form-data 编码）
-            const boundary = '----FormBoundary' + Math.random().toString(36);
-            let formBody = '';
+            const boundary = '----FormBoundary' + Math.random().toString(36).substring(2);
+            const parts: Uint8Array[] = [];
+            const encoder = new TextEncoder();
 
             for (const [key, value] of body as any) {
-                formBody += `--${boundary}\r\n`;
+                let headers = `--${boundary}\r\n`;
                 if (typeof value === 'string') {
-                    formBody += `Content-Disposition: form-data; name="${key}"\r\n\r\n`;
-                    formBody += `${value}\r\n`;
+                    headers += `Content-Disposition: form-data; name="${key}"\r\n\r\n`;
+                    parts.push(encoder.encode(headers));
+                    parts.push(encoder.encode(value));
+                    parts.push(encoder.encode('\r\n'));
                 } else if (value instanceof Blob) {
                     const fileName = (value as any).name || 'file';
-                    formBody += `Content-Disposition: form-data; name="${key}"; filename="${fileName}"\r\n`;
-                    formBody += `Content-Type: ${value.type || 'application/octet-stream'}\r\n\r\n`;
+                    headers += `Content-Disposition: form-data; name="${key}"; filename="${fileName}"\r\n`;
+                    headers += `Content-Type: ${value.type || 'application/octet-stream'}\r\n\r\n`;
+                    parts.push(encoder.encode(headers));
                     const buffer = await value.arrayBuffer();
-                    formBody += engine.decodeString(new Uint8Array(buffer)) + '\r\n';
+                    parts.push(new Uint8Array(buffer));
+                    parts.push(encoder.encode('\r\n'));
                 }
             }
-            formBody += `--${boundary}--\r\n`;
+            parts.push(encoder.encode(`--${boundary}--\r\n`));
 
-            this.body = engine.encodeString(formBody);
+            const totalLength = parts.reduce((sum, p) => sum + p.length, 0);
+            this.body = new Uint8Array(totalLength);
+            let offset = 0;
+            for (const part of parts) {
+                this.body.set(part, offset);
+                offset += part.length;
+            }
             this.headers.set('content-type', `multipart/form-data; boundary=${boundary}`);
         } else {
             this.setBody(body);
@@ -370,7 +380,7 @@ export function normalizeMethod(method: string): HttpMethod {
     ];
 
     if (!validMethods.includes(normalized as HttpMethod)) {
-        throw new Error(`Invalid HTTP method: ${method}`);
+        return method as HttpMethod;
     }
 
     return normalized as HttpMethod;
@@ -421,6 +431,8 @@ export function methodHasBody(method: HttpMethod): boolean {
 const STATUS_TEXT_MAP: Record<number, string> = {
     100: 'Continue',
     101: 'Switching Protocols',
+    102: 'Processing',
+    103: 'Early Hints',
     200: 'OK',
     201: 'Created',
     202: 'Accepted',
@@ -428,12 +440,16 @@ const STATUS_TEXT_MAP: Record<number, string> = {
     204: 'No Content',
     205: 'Reset Content',
     206: 'Partial Content',
+    207: 'Multi-Status',
+    208: 'Already Reported',
+    226: 'IM Used',
     300: 'Multiple Choices',
     301: 'Moved Permanently',
     302: 'Found',
     303: 'See Other',
     304: 'Not Modified',
     305: 'Use Proxy',
+    306: 'Unused',
     307: 'Temporary Redirect',
     308: 'Permanent Redirect',
     400: 'Bad Request',
@@ -457,6 +473,8 @@ const STATUS_TEXT_MAP: Record<number, string> = {
     418: 'I\'m a teapot',
     421: 'Misdirected Request',
     422: 'Unprocessable Entity',
+    423: 'Locked',
+    424: 'Failed Dependency',
     425: 'Too Early',
     426: 'Upgrade Required',
     428: 'Precondition Required',
@@ -469,6 +487,12 @@ const STATUS_TEXT_MAP: Record<number, string> = {
     503: 'Service Unavailable',
     504: 'Gateway Timeout',
     505: 'HTTP Version Not Supported',
+    506: 'Variant Also Negotiates',
+    507: 'Insufficient Storage',
+    508: 'Loop Detected',
+    509: 'Bandwidth Limit Exceeded',
+    510: 'Not Extended',
+    511: 'Network Authentication Required',
 };
 
 export function strstatus(code: number): string {

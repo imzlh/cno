@@ -8,6 +8,7 @@ const timers = import.meta.use('timers');
 const http = import.meta.use('http');
 
 import { Socket } from '../net';
+import { dnsCache } from '../../module/http/dns-cache';
 import { OutgoingMessageImpl, IncomingMessageImpl, OutgoingHttpHeaders, IncomingHttpHeaders } from './server';
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
@@ -142,9 +143,13 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
             : this._options.port || (this.protocol === 'https:' ? 443 : 80);
 
         try {
-            const family = this.host.includes(':') ? 10 : 2;
-            this._tcp = new streams.TCP(family);
-            await this._tcp.connect({ ip: this.host, port });
+            const isIPv6 = this.host.includes(':');
+            const addrs = await dnsCache.resolve(this.host, { family: isIPv6 ? 10 : 0 });
+            if (!addrs?.length) throw new Error(`DNS resolution failed for ${this.host}`);
+            const addr = addrs.find((a: any) => a.family === (isIPv6 ? 10 : 4)) || addrs[0];
+
+            this._tcp = new streams.TCP(addr.family === 10 ? 10 : 2);
+            await this._tcp.connect({ ip: addr.ip, port });
             this._tcp.setNoDelay(true);
 
             if (this._aborted) {

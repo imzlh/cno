@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>网易云音乐下载器</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- Top Bar -->
+<div class="top-bar">
+    <h1>网易云音乐下载器</h1>
+</div>
+
+<!-- Tab Bar -->
+<div class="tab-bar">
+    <button class="tab active" data-tab="search">
+        <span class="icon">🔍</span>搜索
+    </button>
+    <button class="tab" data-tab="quick">
+        <span class="icon">⚡</span>快速下载
+    </button>
+    <button class="tab" data-tab="queue">
+        <span class="icon">📋</span>任务队列
+    </button>
+    <button class="tab" data-tab="settings">
+        <span class="icon">⚙️</span>设置
+    </button>
+</div>
+
+<!-- Tab: 搜索 -->
+<div class="tab-content active" id="tab-search">
+    <!-- Cookie -->
+    <div class="card">
+        <div class="card-title">🔑 登录状态</div>
+        <div class="search-row">
+            <div class="text-field">
+                <input type="text" id="cookieInput" placeholder="粘贴 Cookie (MUSIC_U=...)">
+            </div>
+            <button class="btn btn-primary" onclick="setCookie()">设置</button>
+            <button class="btn btn-tonal" onclick="checkLogin()">刷新</button>
+        </div>
+        <div id="loginStatus" style="font-size:.875rem;color:var(--on-surface-variant)">未登录</div>
+    </div>
+
+    <!-- 搜索 -->
+    <div class="card">
+        <div class="card-title">🔍 搜索歌曲 / 歌手</div>
+        <div class="search-row">
+            <div class="text-field">
+                <input type="text" id="searchInput" placeholder="输入关键词..." onkeydown="if(event.key==='Enter')doSearch()">
+            </div>
+            <select id="searchType">
+                <option value="1">歌曲</option>
+                <option value="100">歌手</option>
+                <option value="10">专辑</option>
+                <option value="1000">歌单</option>
+            </select>
+            <button class="btn btn-primary" onclick="doSearch()">搜索</button>
+        </div>
+        <div id="searchResults"></div>
+    </div>
+</div>
+
+<!-- Tab: 快速下载 -->
+<div class="tab-content" id="tab-quick">
+    <div class="card">
+        <div class="card-title">⚡ 通过 ID 下载</div>
+        <div class="text-field">
+            <input type="text" id="quickIds" placeholder="输入 ID，多个用逗号分隔">
+        </div>
+        <div style="display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.5rem">
+            <button class="btn btn-tonal" onclick="quickDownload('song')">🎵 下载歌曲</button>
+            <button class="btn btn-tonal" onclick="quickDownload('playlist')">📋 下载歌单</button>
+            <button class="btn btn-tonal" onclick="quickDownload('album')">💿 下载专辑</button>
+        </div>
+    </div>
+
+    <div class="card">
+        <div class="card-title">🎤 歌手操作</div>
+        <div class="text-field">
+            <input type="text" id="artistId" placeholder="歌手 ID">
+        </div>
+        <div style="display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.5rem">
+            <button class="btn btn-tonal" onclick="artistTop50()">🔥 热门 50 首</button>
+            <button class="btn btn-tonal" onclick="artistAllAlbums()">💿 全部专辑</button>
+            <button class="btn btn-tonal" onclick="showArtistAlbums()">📂 选择专辑</button>
+        </div>
+        <div id="artistAlbumsArea" style="margin-top:1rem"></div>
+    </div>
+</div>
+
+<!-- Tab: 任务队列 -->
+<div class="tab-content" id="tab-queue">
+    <div class="card">
+        <div class="card-title" style="justify-content:space-between">
+            <span>📋 下载任务</span>
+            <div style="display:flex;gap:.5rem;align-items:center">
+                <span id="queueCount" class="chip chip-info">0</span>
+                <button class="btn btn-text btn-sm" onclick="refreshQueue()">刷新</button>
+            </div>
+        </div>
+        <div id="queueList" class="queue-list">
+            <div class="empty-state">
+                <div class="icon">📭</div>
+                <p>暂无下载任务</p>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Tab: 设置 -->
+<div class="tab-content" id="tab-settings">
+    <div class="card">
+        <div class="card-title">⚙️ 下载设置</div>
+        <div class="settings-grid">
+            <div class="setting-item">
+                <label>音质</label>
+                <select id="cfgQuality"></select>
+            </div>
+            <div class="setting-item">
+                <label>输出格式</label>
+                <select id="cfgFormat"></select>
+            </div>
+            <div class="setting-item">
+                <label>并发数</label>
+                <select id="cfgConcurrency">
+                    <option value="1">1</option>
+                    <option value="2">2</option>
+                    <option value="3">3</option>
+                    <option value="4">4</option>
+                </select>
+            </div>
+            <div class="setting-item">
+                <label>输出目录</label>
+                <select id="cfgOutputDir">
+                    <option value="musicout/">musicout/</option>
+                    <option value="download/">download/</option>
+                </select>
+            </div>
+        </div>
+        <div class="checkbox-row">
+            <label class="checkbox-label"><input type="checkbox" id="cfgCover" checked> 嵌入封面</label>
+            <label class="checkbox-label"><input type="checkbox" id="cfgLyric" checked> 保存歌词</label>
+        </div>
+    </div>
+</div>
+
+<div id="snackbar" class="snackbar"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
