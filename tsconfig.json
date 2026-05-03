@@ -8,7 +8,7 @@
         // See also https://aka.ms/tsconfig/module
         "module": "esnext",
         "target": "esnext",
-        "moduleResolution": "node10",
+        "moduleResolution": "bundler",
         "resolveJsonModule": true,
         "allowSyntheticDefaultImports": true,
         // "types": [],
