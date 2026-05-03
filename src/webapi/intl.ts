@@ -376,22 +376,65 @@ class PluralRules implements Intl.PluralRules {
 class Locale implements Intl.Locale {
     baseName: string;
     language: string;
-    
+    region: string | undefined;
+    script: string | undefined;
+    caseFirst: 'upper' | 'lower' | 'false' | undefined;
+    collation: string | undefined;
+    calendar: string | undefined;
+    hourCycle: 'h11' | 'h12' | 'h23' | 'h24' | undefined;
+    numberingSystem: string | undefined;
+
     constructor(tag: string) {
         this.baseName = tag;
         this.language = tag.split('-')[0];
+        const parts = tag.split('-');
+        this.region = parts.length > 1 && parts[1].length === 2 ? parts[1] : '';
+        this.script = '';
+        this.caseFirst = 'false';
+        this.collation = undefined;
+        this.calendar = undefined;
+        this.hourCycle = undefined;
+        this.numberingSystem = undefined;
     }
-    
+
     toString(): string {
         return this.baseName;
     }
-    
+
     maximize(): Intl.Locale {
         return this;
     }
-    
+
     minimize(): Intl.Locale {
         return this;
+    }
+
+    getCalendars(): string[] {
+        return ['gregory'];
+    }
+
+    getCollations(): string[] {
+        return ['default'];
+    }
+
+    getHourCycles(): string[] {
+        return ['h12'];
+    }
+
+    getNumberingSystems(): string[] {
+        return ['latn'];
+    }
+
+    getTextInfo(): { direction: 'ltr' | 'rtl' } {
+        return { direction: 'ltr' };
+    }
+
+    getTimeZones(): string[] | undefined {
+        return undefined;
+    }
+
+    getWeekInfo(): { firstDay: number; weekend: number[]; minimalDays: number } {
+        return { firstDay: 1, weekend: [6, 7], minimalDays: 1 };
     }
 }
 

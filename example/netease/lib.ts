@@ -218,7 +218,7 @@ export class DownloadEngine {
             log.success(`${song.name} [${source.level}] ${formatSize(source.size)}`);
             return true;
         } catch (e) {
-            log.error(`${song.name}: ${(e as Error).message} ${e.stack}`);
+            log.error(`${song.name}: ${(e as Error).message}`);
             try { await Deno.remove(outputPath); } catch { /* */ }
             return false;
         } finally {
