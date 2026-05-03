@@ -21,4 +21,12 @@ jobs:
 
       - run: pnpm install
 
+      - name: clone types
+        run: |
+          mkdir -p types
+          cd types
+          git clone https://github.com/imzlh/circu.js
+          mv circu.js/types/* .
+          wget https://github.com/denoland/deno/releases/download/v2.7.14/lib.deno.d.ts
+
       - run: pnpm run type-check
