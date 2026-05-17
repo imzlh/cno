@@ -1,5 +1,6 @@
 import { Headers } from "headers-polyfill";
 import { assert } from "../../utils/assert";
+import { version } from "../../../package.json"
 
 const http = import.meta.use('http');
 const engine = import.meta.use('engine');
@@ -23,6 +24,12 @@ export class HttpRequestBuilder {
     private body: Uint8Array | null = null;
     private useFullUrl: boolean = false;
     private httpVersion: string = '1.1';
+
+    static DEFAULT_HEADER = {
+        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "accept-language": "zh-CN,zh;q=0.9",
+        "user-agent": "CNO/" + version
+    }
 
     constructor(url: string | URL, options?: {
         method?: HttpMethod;
@@ -141,8 +148,10 @@ export class HttpRequestBuilder {
             this.headers.set('content-length', String(this.body.length));
         }
 
-        if (!this.headers.has('user-agent')) {
-            this.headers.set('user-agent', 'circu.js/cno');
+        for (const [key, value] of Object.entries(HttpRequestBuilder.DEFAULT_HEADER)) {
+            if (!this.headers.has(key)) {
+                this.headers.set(key, value);
+            }
         }
 
         // 构建请求行
@@ -153,7 +162,7 @@ export class HttpRequestBuilder {
 
         // 添加头部
         for (const [key, value] of this.headers) {
-            request += `${key}: ${value}\r\n`;
+            if (key && value) request += `${key}: ${value}\r\n`;
         }
 
         // 结束头部

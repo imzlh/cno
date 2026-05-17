@@ -4,6 +4,7 @@
  */
 
 const proc = import.meta.use('process');
+const os = import.meta.use('os');
 
 import { EventEmitter } from '../events';
 import { Writable, Readable } from '../stream';
@@ -186,13 +187,27 @@ class ChildProcessImpl extends EventEmitter implements ChildProcess {
 
     disconnect(): void {
         this.connected = false;
+        // Close stdin/stdout/stderr to signal disconnect
+        if (this.stdin) { this.stdin.end(); this.stdin = null; }
+        if (this.stdout) { this.stdout.destroy(); this.stdout = null; }
+        if (this.stderr) { this.stderr.destroy(); this.stderr = null; }
+        this.emit('disconnect');
     }
 
-    unref(): void {}
+    unref(): void {
+        // Best-effort: C module doesn't expose unref per child process
+    }
 
-    ref(): void {}
+    ref(): void {
+        // Best-effort
+    }
 
-    send(message: any, sendHandle?: any, options?: any, callback?: (error: Error | null) => void): boolean {
+    send(message: any, _sendHandle?: any, _options?: any, callback?: (error: Error | null) => void): boolean {
+        // No IPC channel established (spawn doesn't create one by default)
+        const err = new Error('IPC channel is not enabled for this child process. Use { stdio: [\'inherit\', \'inherit\', \'ipc\'] } to enable.') as NodeJS.ErrnoException;
+        err.code = 'ERR_IPC_CHANNEL_CLOSED';
+        if (callback) { callback(err); return false; }
+        this.emit('error', err);
         return false;
     }
 }
@@ -218,7 +233,8 @@ export function spawn(command: string, argsOrOptions?: string[] | SpawnOptions, 
 
     // 处理 shell 选项
     if (opts.shell) {
-        const shell = typeof opts.shell === 'string' ? opts.shell : '/bin/sh';
+        const defaultShell = os.uname().sysname === 'Windows_NT' ? 'cmd.exe' : '/bin/sh';
+        const shell = typeof opts.shell === 'string' ? opts.shell : defaultShell;
         args = ['-c', args.length > 0 ? `${command} ${args.join(' ')}` : command];
         command = shell;
     }
@@ -435,14 +451,33 @@ export function spawnSync(command: string, args?: string[], options?: SpawnOptio
     try {
         // @ts-ignore
         const child = proc.spawn(command, args ?? [], opts);
+
+        const readPipe = (pipe: any): string => {
+            if (!pipe) return '';
+            const chunks: Uint8Array[] = [];
+            const buf = new Uint8Array(4096);
+            while (true) {
+                try {
+                    const n = pipe.readSync(buf);
+                    if (n === null || n === 0) break;
+                    chunks.push(buf.subarray(0, n));
+                } catch { break; }
+            }
+            const total = chunks.reduce((s, c) => s + c.length, 0);
+            const result = new Uint8Array(total);
+            let off = 0;
+            for (const c of chunks) { result.set(c, off); off += c.length; }
+            return new TextDecoder().decode(result);
+        };
+
         const info = child.waitSync();
 
         return {
             pid: child.pid,
             status: info.exit_status,
             signal: info.term_signal,
-            stdout: '',
-            stderr: '',
+            stdout: readPipe(child.stdout),
+            stderr: readPipe(child.stderr),
         };
     } catch (err) {
         return {
@@ -452,7 +487,8 @@ export function spawnSync(command: string, args?: string[], options?: SpawnOptio
 }
 
 export function execSync(command: string, options?: ExecOptions): Buffer | string {
-    const result = spawnSync('/bin/sh', ['-c', command], options);
+    const defaultShell = os.uname().sysname === 'Windows_NT' ? 'cmd.exe' : '/bin/sh';
+    const result = spawnSync(defaultShell, ['-c', command], options);
     if (result.error) throw result.error;
     if (result.status !== 0) {
         throw new Error(`Command failed: ${command}`);

@@ -141,7 +141,7 @@ export function notStrictEqual(actual: unknown, expected: unknown, message?: str
     }
 }
 
-function _deepEqual(actual: unknown, expected: unknown, strict: boolean, skipPrototype: boolean = false): boolean {
+function _deepEqual(actual: unknown, expected: unknown, strict: boolean, skipPrototype: boolean = false, seen?: WeakSet<object>): boolean {
     if (Object.is(actual, expected)) return true;
     if (!strict && actual == expected) return true;
     if (actual === null || expected === null) return false;
@@ -149,6 +149,12 @@ function _deepEqual(actual: unknown, expected: unknown, strict: boolean, skipPro
         return strict ? Object.is(actual, expected) : actual == expected;
     }
     if (typeof actual !== 'object' || typeof expected !== 'object') return false;
+
+    // Circular reference protection
+    const _seen = seen ?? new WeakSet();
+    if (_seen.has(actual as object) || _seen.has(expected as object)) return true;
+    _seen.add(actual as object);
+    _seen.add(expected as object);
 
     if (!skipPrototype && Object.getPrototypeOf(actual) !== Object.getPrototypeOf(expected)) {
         return false;
@@ -172,7 +178,7 @@ function _deepEqual(actual: unknown, expected: unknown, strict: boolean, skipPro
     if (actual instanceof Map && expected instanceof Map) {
         if (actual.size !== expected.size) return false;
         for (const [key, value] of actual) {
-            if (!expected.has(key) || !_deepEqual(value, expected.get(key), strict, skipPrototype)) return false;
+            if (!expected.has(key) || !_deepEqual(value, expected.get(key), strict, skipPrototype, _seen)) return false;
         }
         return true;
     }
@@ -191,7 +197,7 @@ function _deepEqual(actual: unknown, expected: unknown, strict: boolean, skipPro
 
     for (const key of actualKeys) {
         if (!Object.prototype.hasOwnProperty.call(expected, key)) return false;
-        if (!_deepEqual((actual as any)[key], (expected as any)[key], strict, skipPrototype)) return false;
+        if (!_deepEqual((actual as any)[key], (expected as any)[key], strict, skipPrototype, _seen)) return false;
     }
 
     if (strict) {
@@ -200,7 +206,7 @@ function _deepEqual(actual: unknown, expected: unknown, strict: boolean, skipPro
         if (actualSymbols.length !== expectedSymbols.length) return false;
         for (const sym of actualSymbols) {
             if (!Object.prototype.hasOwnProperty.call(expected, sym)) return false;
-            if (!_deepEqual((actual as any)[sym], (expected as any)[sym], strict, skipPrototype)) return false;
+            if (!_deepEqual((actual as any)[sym], (expected as any)[sym], strict, skipPrototype, _seen)) return false;
         }
     }
     return true;

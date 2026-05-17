@@ -208,6 +208,7 @@ export class TcpSocket {
         this.pending = null;
         this.stopReading();
         try { this.sslPipe?.shutdown(); } catch { /* ignore */ }
+        this.sslPipe = null;
         try { this.socket.close();      } catch { /* ignore */ }
     }
 

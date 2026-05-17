@@ -1,26 +1,10 @@
-# Build node polyfill, and install it to ~/.cno/node/
-
-JSC ?= cts
-DST_DIR = $(HOME)/.cts/node
-SRC_DIR = src/node
-
-
-.SILENT:
-
-SRCS = $(shell find $(SRC_DIR) -name "*.ts" -type f 2>/dev/null)
-OBJS = $(patsubst $(SRC_DIR)/%.ts,$(DST_DIR)/%.ts.jsc,$(SRCS))
+# Cross-platform Node.js polyfill builder
+# Uses cts compile.js directly — no Node.js dependency
 
 .PHONY: all clean
 
-all: $(DST_DIR) $(OBJS)
-
-$(DST_DIR):
-	mkdir -p $@
-
-$(DST_DIR)/%.ts.jsc: $(SRC_DIR)/%.ts
-	@mkdir -p $(dir $@)
-	cp $< $(DST_DIR)/$*.ts
-	$(JSC) compile.js $(SRC_DIR)/$*.ts node:$* $(DST_DIR)/$*.ts.jsc
+all:
+	cts compile.js --all
 
 clean:
-	rm -rf $(DST_DIR)
+	cts compile.js --all --clean

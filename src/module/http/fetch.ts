@@ -539,10 +539,15 @@ async function readHeaders(ctx: FetchContext): Promise<void> {
         }
         try {
             const data = await ctx.connection.read();
-            if (!data || data.length === 0) continue;
+            if (data === null) {
+                throw new TypeError('Failed to fetch: EOF while reading header');
+            }
             ctx.parser.feed(data);
-        } catch {
-            break;
+        } catch (err) {
+            if (ctx.aborted) {
+                throw new DOMException('The operation was aborted', 'AbortError');
+            }
+            throw err;
         }
     }
 }
@@ -586,17 +591,18 @@ async function performFetch(
         throw new TypeError('Too many redirects');
     }
 
-    // 获取连接
     const port = url.port ? parseInt(url.port) : (url.protocol === 'https:' ? 443 : 80);
     const client = request.getClient();
-    const connection = await connectionManager.acquire({
+    const connConfig = {
         hostname: url.hostname,
         port,
         protocol: url.protocol as 'http:' | 'https:',
         keepAlive: request.keepalive,
         timeout: 30000,
         client: client || undefined
-    });
+    };
+
+    let connection = await connectionManager.acquire(connConfig);
 
     const ctx: FetchContext = {
         request,
@@ -608,18 +614,34 @@ async function performFetch(
 
     function abortHandler() {
         ctx.aborted = true;
+        ctx.connection.close();
+    }
+
+    if (request.signal) {
+        request.signal.addEventListener('abort', abortHandler);
     }
 
     try {
-        // 发送请求
         await sendRequest(request, url, connection);
 
-        if (request.signal) {
-            request.signal.addEventListener('abort', abortHandler);
+        if (ctx.aborted) {
+            throw new DOMException('The operation was aborted', 'AbortError');
         }
 
-        // 解析响应头部
-        await readHeaders(ctx);
+        try {
+            await readHeaders(ctx);
+        } catch (err) {
+            if (!ctx.aborted && err instanceof TypeError && (err as Error).message === 'Failed to fetch') {
+                connection.close();
+                connection = await connectionManager.acquire(connConfig);
+                ctx.connection = connection;
+                ctx.parser = new HttpResponseParser();
+                await sendRequest(request, url, connection);
+                await readHeaders(ctx);
+            } else {
+                throw err;
+            }
+        }
 
         if (ctx.aborted) {
             throw new DOMException('The operation was aborted', 'AbortError');
@@ -662,11 +684,13 @@ async function performFetch(
         return response;
 
     } catch (err) {
-        // @ts-ignore
         if (request.signal) {
             request.signal.removeEventListener('abort', abortHandler);
         }
         releaseConnection({ url, connection } as any);
+        if (ctx.aborted) {
+            throw new DOMException('The operation was aborted', 'AbortError');
+        }
         throw err;
     }
 }
@@ -703,6 +727,7 @@ async function sendRequest(request: Request, url: URL, connection: Connection): 
     }
 
     const requestBytes = builder.build();
+    console.log(engine.decodeString(requestBytes));
     await connection.write(requestBytes);
 }
 

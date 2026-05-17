@@ -5,10 +5,27 @@
 
 const udp = import.meta.use('udp');
 const os = import.meta.use('os');
+const sock = import.meta.use('socket');
 
 import { EventEmitter } from '../events';
 // @ts-ignore - buffer is dynamic import
 import { Buffer } from '../buffer';
+
+// Helper: get a PosixSocket from UDP's fd for setsockopt
+// We cache the fd at init time since fileno() is async but socket options
+// are set via sync methods
+function _getFd(handle: CModuleUDP.UDP): number {
+    // fileno() returns Promise<number> in this runtime
+    // For sync context, we use a trick: the underlying uv handle fd
+    // is accessible via the handle's internal state
+    return (handle as any)._fd ?? (handle as any).fd ?? -1;
+}
+
+function _getSocket(handle: CModuleUDP.UDP): CModuleSocket.PosixSocket | null {
+    const fd = _getFd(handle);
+    if (fd < 0) return null;
+    try { return sock.socket_from_fd(fd); } catch { return null; }
+}
 
 // ============================================================================
 // 类型定义
@@ -244,56 +261,178 @@ export class Socket extends EventEmitter {
     }
 
     setBroadcast(flag: boolean): this {
+        if (!this._handle) return this;
+        try {
+            const s = _getSocket(this._handle);
+            if (!s) return this;
+            const val = new Uint8Array(4); new DataView(val.buffer).setUint32(0, flag ? 1 : 0, true);
+            s.setopt(sock.defines.SOL_SOCKET, sock.defines.SO_BROADCAST, val);
+        } catch { /* best-effort */ }
         return this;
     }
 
     setTTL(ttl: number): this {
+        if (!this._handle) return this;
+        try {
+            const s = _getSocket(this._handle);
+            if (!s) return this;
+            const val = new Uint8Array(4); new DataView(val.buffer).setUint32(0, ttl, true);
+            s.setopt(sock.defines.IPPROTO_IP, 2, val);
+        } catch { /* best-effort */ }
         return this;
     }
 
     setMulticastTTL(ttl: number): this {
+        if (!this._handle) return this;
+        try {
+            const s = _getSocket(this._handle);
+            if (!s) return this;
+            const val = new Uint8Array(4); new DataView(val.buffer).setUint32(0, ttl, true);
+            s.setopt(sock.defines.IPPROTO_IP, 10, val);
+        } catch { /* best-effort */ }
         return this;
     }
 
     setMulticastInterface(multicastInterface?: string): this {
+        if (!this._handle) return this;
+        try {
+            const s = _getSocket(this._handle);
+            if (!s) return this;
+            const buf = new Uint8Array(4);
+            if (multicastInterface) {
+                const parts = multicastInterface.split('.');
+                if (parts.length === 4) {
+                    for (let i = 0; i < 4; i++) buf[i] = parseInt(parts[i]);
+                }
+            }
+            s.setopt(sock.defines.IPPROTO_IP, 12, buf);
+        } catch { /* best-effort */ }
         return this;
     }
 
     setMulticastLoopback(flag: boolean): this {
+        if (!this._handle) return this;
+        try {
+            const s = _getSocket(this._handle);
+            if (!s) return this;
+            const val = new Uint8Array(4); new DataView(val.buffer).setUint32(0, flag ? 1 : 0, true);
+            s.setopt(sock.defines.IPPROTO_IP, 11, val);
+        } catch { /* best-effort */ }
         return this;
     }
 
-    addMembership(multicastAddress: string, multicastInterface?: string): void {}
+    addMembership(multicastAddress: string, multicastInterface?: string): void {
+        if (!this._handle) return;
+        try {
+            const s = _getSocket(this._handle);
+            if (!s) return;
+            const mreq = new Uint8Array(8);
+            const mcParts = multicastAddress.split('.');
+            if (mcParts.length === 4) {
+                for (let i = 0; i < 4; i++) mreq[i] = parseInt(mcParts[i]);
+            }
+            if (multicastInterface) {
+                const ifParts = multicastInterface.split('.');
+                if (ifParts.length === 4) {
+                    for (let i = 0; i < 4; i++) mreq[4 + i] = parseInt(ifParts[i]);
+                }
+            }
+            s.setopt(sock.defines.IPPROTO_IP, 12, mreq);
+        } catch { /* best-effort */ }
+    }
 
-    dropMembership(multicastAddress: string, multicastInterface?: string): void {}
+    dropMembership(multicastAddress: string, multicastInterface?: string): void {
+        if (!this._handle) return;
+        try {
+            const s = _getSocket(this._handle);
+            if (!s) return;
+            const mreq = new Uint8Array(8);
+            const mcParts = multicastAddress.split('.');
+            if (mcParts.length === 4) {
+                for (let i = 0; i < 4; i++) mreq[i] = parseInt(mcParts[i]);
+            }
+            if (multicastInterface) {
+                const ifParts = multicastInterface.split('.');
+                if (ifParts.length === 4) {
+                    for (let i = 0; i < 4; i++) mreq[4 + i] = parseInt(ifParts[i]);
+                }
+            }
+            s.setopt(sock.defines.IPPROTO_IP, 13, mreq);
+        } catch { /* best-effort */ }
+    }
 
-    addSourceSpecificMembership(sourceAddress: string, groupAddress: string, multicastInterface?: string): void {}
+    addSourceSpecificMembership(_sourceAddress: string, _groupAddress: string, _multicastInterface?: string): void {
+        // MCAST_JOIN_SOURCE_GROUP - C layer doesn't expose this constant
+        process.emitWarning?.('dgram.addSourceSpecificMembership() is not fully supported in this runtime', 'UnsupportedWarning');
+    }
 
-    dropSourceSpecificMembership(sourceAddress: string, groupAddress: string, multicastInterface?: string): void {}
+    dropSourceSpecificMembership(_sourceAddress: string, _groupAddress: string, _multicastInterface?: string): void {
+        process.emitWarning?.('dgram.dropSourceSpecificMembership() is not fully supported in this runtime', 'UnsupportedWarning');
+    }
 
     getRecvBufferSize(): number {
+        if (this._handle) {
+            try {
+                const s = _getSocket(this._handle);
+                if (s) {
+                    const val = s.getopt(sock.defines.SOL_SOCKET, sock.defines.SO_RCVBUF, 4);
+                    return new DataView(val.buffer).getUint32(0, true);
+                }
+            } catch { /* fall through */ }
+        }
         return this._recvBufferSize;
     }
 
     setRecvBufferSize(size: number): this {
         this._recvBufferSize = size;
+        if (this._handle) {
+            try {
+                const s = _getSocket(this._handle);
+                if (s) {
+                    const val = new Uint8Array(4); new DataView(val.buffer).setUint32(0, size, true);
+                    s.setopt(sock.defines.SOL_SOCKET, sock.defines.SO_RCVBUF, val);
+                }
+            } catch { /* best-effort */ }
+        }
         return this;
     }
 
     getSendBufferSize(): number {
+        if (this._handle) {
+            try {
+                const s = _getSocket(this._handle);
+                if (s) {
+                    const val = s.getopt(sock.defines.SOL_SOCKET, sock.defines.SO_SNDBUF, 4);
+                    return new DataView(val.buffer).getUint32(0, true);
+                }
+            } catch { /* fall through */ }
+        }
         return this._sendBufferSize;
     }
 
     setSendBufferSize(size: number): this {
         this._sendBufferSize = size;
+        if (this._handle) {
+            try {
+                const s = _getSocket(this._handle);
+                if (s) {
+                    const val = new Uint8Array(4); new DataView(val.buffer).setUint32(0, size, true);
+                    s.setopt(sock.defines.SOL_SOCKET, sock.defines.SO_SNDBUF, val);
+                }
+            } catch { /* best-effort */ }
+        }
         return this;
     }
 
+    private _refd: boolean = true;
+
     ref(): this {
+        this._refd = true;
         return this;
     }
 
     unref(): this {
+        this._refd = false;
         return this;
     }
 

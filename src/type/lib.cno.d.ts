@@ -184,4 +184,122 @@ declare namespace CNO {
         function createSelfSignedCert(options?: { commonName?: string; days?: number }): SelfSignedCertResult;
         function loadPEM(data: string, type?: string): { subject?: string; type?: string; bits?: number } | null;
     }
+
+    /* ================================================================ */
+    /*  LLHTTP  (HTTP/1.x parser + formatter, no Deno/Web equivalent)   */
+    /* ================================================================ */
+
+    export type HttpMethod =
+        | 'DELETE' | 'GET' | 'HEAD' | 'POST' | 'PUT' | 'CONNECT'
+        | 'OPTIONS' | 'TRACE' | 'COPY' | 'LOCK' | 'MKCOL' | 'MOVE'
+        | 'PROPFIND' | 'PROPPATCH' | 'SEARCH' | 'UNLOCK' | 'BIND'
+        | 'REBIND' | 'UNBIND' | 'ACL' | 'REPORT' | 'MKACTIVITY'
+        | 'CHECKOUT' | 'MERGE' | 'MSEARCH' | 'NOTIFY' | 'SUBSCRIBE'
+        | 'UNSUBSCRIBE' | 'PATCH' | 'PURGE' | 'MKCALENDAR' | 'LINK' | 'UNLINK';
+
+    export interface HttpParserResult {
+        errno: number;
+        name: string;
+        reason: string | null;
+        bytesConsumed: number;
+    }
+
+    export interface HttpParserState {
+        type: 'request' | 'response';
+        httpMajor: number;
+        httpMinor: number;
+        statusCode: number;
+        method: HttpMethod;
+        upgrade: boolean;
+        keepAlive: boolean;
+    }
+
+    export interface HttpParserEvents {
+        onUrl?(url: string): void;
+        onStatus?(status: string): void;
+        onHeaderField?(field: string): void;
+        onHeaderValue?(value: string): void;
+        onHeadersComplete?(state: HttpParserState): void;
+        onBody?(chunk: Uint8Array): void;
+        onMessageComplete?(): void;
+        onChunkHeader?(length: number): void;
+        onChunkComplete?(): void;
+    }
+
+    export interface HttpParser {
+        execute(data: Uint8Array | ArrayBuffer): HttpParserResult;
+        finish(): HttpParserResult;
+        pause(): void;
+        resume(): void;
+        reset(type?: 'request' | 'response'): void;
+        readonly state: HttpParserState;
+    }
+
+    /** Structured HTTP request with streaming body */
+    export interface HttpRequestMessage {
+        method: HttpMethod;
+        url: string;
+        httpVersion: string;
+        headers: Headers;
+        body: ReadableStream<Uint8Array> | null;
+        upgrade: boolean;
+        keepAlive: boolean;
+    }
+
+    /** Structured HTTP response with streaming body */
+    export interface HttpResponseMessage {
+        statusCode: number;
+        statusText: string;
+        httpVersion: string;
+        headers: Headers;
+        body: ReadableStream<Uint8Array> | null;
+        keepAlive: boolean;
+    }
+
+    /** Streaming HTTP/1.x parser — feed bytes, get complete messages via onMessage */
+    export interface StreamingHttpParser {
+        feed(data: Uint8Array | ArrayBuffer): void;
+        pause(): void;
+        resume(): void;
+        reset(): void;
+        readonly expectContinue: boolean;
+    }
+
+    /** Format options for HTTP message serialization */
+    export interface HttpFormatOptions {
+        httpVersion?: string;
+        noContentLength?: boolean;
+    }
+
+    export namespace llhttp {
+        // Low-level: event-driven parser
+        function createRequestParser(events: HttpParserEvents): HttpParser;
+        function createResponseParser(events: HttpParserEvents): HttpParser;
+
+        // High-level: streaming parser with structured output
+        function createRequestStreamParser(onMessage: (msg: HttpRequestMessage) => void, onError?: (err: Error) => void): StreamingHttpParser;
+        function createResponseStreamParser(onMessage: (msg: HttpResponseMessage) => void, onError?: (err: Error) => void): StreamingHttpParser;
+
+        // One-shot parse
+        function parseRequest(data: Uint8Array | ArrayBuffer): HttpRequestMessage;
+        function parseResponse(data: Uint8Array | ArrayBuffer): HttpResponseMessage;
+
+        // Format: structured data → raw bytes
+        function formatRequestHead(method: HttpMethod, url: string, headers: Headers, options?: HttpFormatOptions): Uint8Array;
+        function formatResponseHead(statusCode: number, statusText: string, headers: Headers, options?: HttpFormatOptions): Uint8Array;
+        function formatRequest(method: HttpMethod, url: string, headers: Headers, body?: Uint8Array | string, options?: HttpFormatOptions): Uint8Array;
+        function formatResponse(statusCode: number, statusText: string, headers: Headers, body?: Uint8Array | string, options?: HttpFormatOptions): Uint8Array;
+
+        // Web API interop
+        function toWebRequest(msg: HttpRequestMessage, base?: string | URL): Request;
+        function toWebResponse(msg: HttpResponseMessage): Response;
+        function fromWebRequest(req: Request): HttpRequestMessage;
+        function fromWebResponse(res: Response): HttpResponseMessage;
+
+        // Utilities
+        function strerr(errno: number): string;
+        function strstatus(statusCode: number): string;
+
+        const METHODS: HttpMethod[];
+    }
 }

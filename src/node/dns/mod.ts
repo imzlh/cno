@@ -5,6 +5,7 @@
 
 const dns = import.meta.use('dns');
 const os = import.meta.use('os');
+import { toErrnoException } from '../_internal/errno';
 
 // ============================================================================
 // 常量
@@ -128,11 +129,11 @@ export function lookup(hostname: string, options?: any, callback?: any): void {
                 if (addr) {
                     callback(null, addr.ip, addr.family);
                 } else {
-                    callback(new Error(`ENOTFOUND ${hostname}`), '', 0);
+                    callback(toErrnoException(new Error(`ENOTFOUND ${hostname}`), 'lookup', hostname), '', 0);
                 }
             }
         },
-        err => callback(err)
+        err => callback(toErrnoException(err, 'lookup', hostname))
     );
 }
 
@@ -140,7 +141,12 @@ export function lookupSync(hostname: string, options?: LookupOptions): string | 
     const family = options?.family ?? 0;
     const all = options?.all ?? false;
 
-    const addresses = dns.resolveSync(hostname, { family: family === 0 ? os.AF_UNSPEC : family === 4 ? os.AF_INET : os.AF_INET6 });
+    let addresses: CModuleStreams.AddressInfo[];
+    try {
+        addresses = dns.resolveSync(hostname, { family: family === 0 ? os.AF_UNSPEC : family === 4 ? os.AF_INET : os.AF_INET6 });
+    } catch (err) {
+        throw toErrnoException(err, 'lookup', hostname);
+    }
 
     if (all) {
         return addresses.map(a => ({ address: a.ip, family: a.family }));
@@ -223,7 +229,7 @@ export function resolve(hostname: string, rrtype?: any, callback?: any): void {
                 callback(null, answers);
             }
         },
-        err => callback(err)
+        err => callback(toErrnoException(err, 'resolve', hostname))
     );
 }
 
@@ -247,7 +253,7 @@ export function resolve4(hostname: string, options?: any, callback?: any): void 
                 callback(null, answers.map((a: any) => a.address));
             }
         },
-        err => callback(err)
+        err => callback(toErrnoException(err, 'resolve4'))
     );
 }
 
@@ -267,7 +273,7 @@ export function resolve6(hostname: string, options?: any, callback?: any): void 
                 callback(null, answers.map((a: any) => a.address));
             }
         },
-        err => callback(err)
+        err => callback(toErrnoException(err, 'resolve6'))
     );
 }
 
@@ -290,7 +296,7 @@ export function resolveNs(hostname: string, callback: (err: NodeJS.ErrnoExceptio
 export function resolveTxt(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[][]) => void): void {
     dns.query(hostname, dns.TXT).then(
         answers => callback(null, answers.map((a: any) => [a.txt])),
-        err => callback(err, [])
+        err => callback(toErrnoException(err, 'resolveTxt'), [])
     );
 }
 
@@ -324,20 +330,20 @@ export function reverse(ip: string, callback: (err: NodeJS.ErrnoException | null
 // setServers / getServers
 // ============================================================================
 
+let _dnsServers: string[] = [];
+
 export function setServers(servers: string[]): void {
-    // 简化实现，不实际设置
+    _dnsServers = servers;
 }
 
 export function getServers(): string[] {
-    return ['8.8.8.8', '8.8.4.4'];
+    return _dnsServers.length > 0 ? [..._dnsServers] : ['8.8.8.8', '8.8.4.4'];
 }
 
-// ============================================================================
-// setDefaultResultOrder
-// ============================================================================
+let _defaultResultOrder: 'ipv4first' | 'verbatim' = 'ipv4first';
 
 export function setDefaultResultOrder(order: 'ipv4first' | 'verbatim'): void {
-    // 简化实现
+    _defaultResultOrder = order;
 }
 
 // ============================================================================

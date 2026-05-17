@@ -6,6 +6,7 @@ const engine = import.meta.use('engine');
 const text = import.meta.use('text')!;
 const os = import.meta.use('os');
 const timer = import.meta.use('timers');
+const streams = import.meta.use('streams');
 
 globalThis.atob = function(str) {
     const dec = crypto.base64Decode(str);
@@ -22,8 +23,7 @@ globalThis.alert = function(msg) {
 }
 
 globalThis.prompt = function(msg) {
-    const { stdin, stdout } = Deno; // here we should import deno.std*
-                                    // however will cause circular dependency
+    const { stdin, stdout } = streams as any as Record<string, CModuleStreams.Stream>;
     assert(stdout.writeSync(
         engine.encodeString(msg ? msg + ' ' : '? ')), "write() operation failed");
     
@@ -37,9 +37,9 @@ globalThis.prompt = function(msg) {
         
         line += decoder.decode(chunk.subarray(0, n), { stream: true });
         
-        const newlineIdx = line.indexOf('\n');
+        const newlineIdx = line.lastIndexOf('\n');
         if (newlineIdx !== -1) {
-            return line.substring(0, newlineIdx).replace(/\r$/, '');
+            return line.substring(0, newlineIdx).replace('\r', '').trim();
         }
     }
     

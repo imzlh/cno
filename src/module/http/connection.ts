@@ -3,11 +3,15 @@ import { assert } from "../../utils/assert";
 import { HttpClient } from "../../deno/07_http";
 import { TcpSocket } from "./socket";
 import { dnsCache } from "./dns-cache";
+import { join } from "../../utils/path";
 
-const ssl    = import.meta.use("ssl");
-const os     = import.meta.use("os");
-const timers = import.meta.use("timers");
-const asfs   = import.meta.use("asyncfs");
+const ssl     = import.meta.use("ssl");
+const os      = import.meta.use("os");
+const timers  = import.meta.use("timers");
+const asfs    = import.meta.use("asyncfs");
+const windows = import.meta.use("win32");
+const crypto  = import.meta.use("crypto");
+const engine  = import.meta.use("engine");
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
@@ -54,7 +58,7 @@ export interface ConnectionLike {
 async function findSystemCaPath(): Promise<string | null> {
     const sysname = os.uname().sysname;
     
-    const candidates: string[] = (() => {
+    const candidates: string[] = await (async () => {
         switch (sysname) {
             case "Linux": return [
                 // Debian/Ubuntu
@@ -84,13 +88,13 @@ async function findSystemCaPath(): Promise<string | null> {
                 "/usr/local/etc/openssl@3/cert.pem",
                 "/System/Library/OpenSSL/certs",
             ];
-            case "Windows_NT": return [
-                "C:\\Windows\\System32\\curl-ca-bundle.crt",  // Windows 10+
-                "C:\\Program Files\\Git\\mingw64\\ssl\\cert.pem",
-                "C:\\Program Files\\Git\\mingw32\\ssl\\cert.pem",
-                "C:\\Program Files\\OpenSSL-Win64\\bin\\curl-ca-bundle.crt",
-                "C:\\Program Files\\OpenSSL\\bin\\curl-ca-bundle.crt",
-            ];
+            case "Windows_NT": 
+                // most windows has no CA-bundle. We should generate one.
+                const tmp = join(os.tmpDir, "cno-cert-" + crypto.randomUUID() + '.pem');
+                const fh = await asfs.open(tmp, 'w', 0o600);
+                await fh.write(engine.encodeString(windows!.exportCerts().join("\n")));
+                await fh.close();
+                return [tmp];
             case "FreeBSD": return [
                 "/usr/local/share/certs/ca-root-nss.crt",     // ca_root_nss
                 "/usr/local/openssl/cert.pem",
@@ -124,6 +128,7 @@ export class Connection extends TcpSocket implements ConnectionLike {
     public state:    ConnectionState = ConnectionState.CONNECTING;
     public lastUsed: number          = Date.now();
     public requests: number          = 0;
+    public onClose:  (() => void) | null = null;
 
     private idleTimer: number | null = null;
     private config: ConnectionConfig;
@@ -152,6 +157,7 @@ export class Connection extends TcpSocket implements ConnectionLike {
 
             if (isSecure) {
                 const clientCtx = this.config.client?.getSSLContext();
+                console.debug('[ssl] start handshake')
                 if (clientCtx) {
                     await this.clientHandshake(clientCtx, this.config.hostname);
                 } else {
@@ -162,8 +168,12 @@ export class Connection extends TcpSocket implements ConnectionLike {
                 }
             }
 
-            this.state = ConnectionState.IDLE;
-            this.startIdleTimer();
+            this.socket.onclose = () => {
+                if (this.state === ConnectionState.CLOSED) return;
+                this.stopIdleTimer();
+                this.state = ConnectionState.CLOSED;
+                this.onClose?.();
+            };
         } catch (err) {
             this.state = ConnectionState.CLOSED;
             throw err;
@@ -190,6 +200,7 @@ export class Connection extends TcpSocket implements ConnectionLike {
         this.stopIdleTimer();
         super.close();
         this.state = ConnectionState.CLOSED;
+        this.onClose?.();
     }
 
     isAvailable(): boolean { return this.state === ConnectionState.IDLE; }
@@ -240,7 +251,7 @@ export class ConnectionManager {
 
         this.cleanupPool(key);
 
-        const pool = this.pools.get(key) || [];
+        let pool = this.pools.get(key) || [];
         const available = pool.find(c => c.isAvailable());
         if (available) { available.markActive(); return available; }
 
@@ -249,10 +260,11 @@ export class ConnectionManager {
         }
 
         const conn = new Connection(fullCfg);
-        await conn.connect();
-        conn.markActive();
+        conn.onClose = () => this.removeConnection(fullCfg, conn);
         pool.push(conn);
         this.pools.set(key, pool);
+        await conn.connect();
+        conn.markActive();
         return conn;
     }
 

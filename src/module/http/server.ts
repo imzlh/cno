@@ -36,6 +36,8 @@ export class Server {
     private connections: Set<ServerConnection> = new Set();
     private listening = false;
     private accepting = false;
+    private draining = false;
+    private drainResolve: (() => void) | null = null;
 
     constructor(handler: RequestHandler, config: ServerConfig) {
         this.handler = handler;
@@ -75,6 +77,10 @@ export class Server {
 
         this.listener!.onconnection = (err, client) => {
             if (err || !client) return console.error("Accept error:", err);
+            if (this.draining) {
+                client.close();
+                return;
+            }
             const socket = client as CModuleStreams.TCP;
             socket.setNoDelay(true);
             socket.setKeepAlive(true, 1000);
@@ -93,6 +99,29 @@ export class Server {
         this.connections.clear();
         this.listener?.close();
         this.listener = null;
+    }
+
+    async shutdown(): Promise<void> {
+        if (this.draining) return;
+        this.draining = true;
+
+        const drainPromise = new Promise<void>(resolve => {
+            this.drainResolve = resolve;
+        });
+
+        this.listener?.close();
+        this.listener = null;
+        this.listening = false;
+
+        for (const conn of this.connections) {
+            conn.close();
+        }
+
+        if (this.connections.size === 0) {
+            this.drainResolve!();
+        }
+
+        return drainPromise;
     }
 
     address(): { ip: string; port: number } | null {
@@ -146,6 +175,9 @@ export class Server {
         } finally {
             if (!conn.isUpgraded()) conn.close();
             this.connections.delete(conn);
+            if (this.draining && this.connections.size === 0) {
+                this.drainResolve?.();
+            }
         }
     }
 }

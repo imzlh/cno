@@ -36,7 +36,15 @@ interface WebSocketResponse extends Response {
 function createWebRequest(coreReq: HttpRequest, connInfo: { hostname: string; port: number; secure: boolean }): Request {
     const host = coreReq.headers.get('host') || `${connInfo.hostname}:${connInfo.port}`;
     const protocol = connInfo.secure ? 'https:' : 'http:';
-    const url = new URL(coreReq.url, `${protocol}//${host}`);
+    const base = `${protocol}//${host}`;
+
+    let rawUrl = coreReq.url;
+    if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(rawUrl)) {
+        const parsed = new URL(rawUrl);
+        rawUrl = parsed.pathname + parsed.search + parsed.hash;
+    }
+
+    const url = new URL(rawUrl, base);
 
     // Convert headers
     const headers = new Headers();
@@ -215,7 +223,7 @@ class DenoHttpServer implements Deno.HttpServer<Deno.NetAddr> {
     }
 
     async shutdown(): Promise<void> {
-        this.server.close();
+        await this.server.shutdown();
         this.finishedResolve();
     }
 
@@ -295,8 +303,9 @@ function serve(
                 await adapter.sendResponse(webResponse);
 
             } catch (error) {
-                if (!(error instanceof errors.ConnectionReset))
-                    console.error('Request handler error:', error);
+                if (!(error instanceof errors.ConnectionReset)) {
+                    console.error('Request handler error:', error, '\n', (error as Error).stack);
+                }
 
                 // Send 500 error
                 try {

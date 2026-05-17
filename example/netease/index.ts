@@ -1,5 +1,5 @@
 import { ensureDir } from "jsr:@std/fs@^1.0.10/ensure-dir";
-import { api, DownloadEngine, DownloadOptions, setCookie, log, colors, showStats, removeIllegalPath, formatDuration } from "./lib.ts";
+import { api, DownloadEngine, DownloadOptions, setCookie, log, colors, showStats, removeIllegalPath, normalizeDir, formatDuration } from "./lib.ts";
 import { AUDIO_QUALITIES, OUTPUT_FORMATS } from "./types.ts";
 import type { ISongDetail } from "./api/types.ts";
 
@@ -127,7 +127,7 @@ async function handleSearchArtist(engine: DownloadEngine) {
         switch (prompt("选择: ")?.trim()) {
             case "1": {
                 const td = await api.getArtistSongs(artist.id) as any;
-                const folder = `musicout/歌手_${artist.name}_热门50首/`;
+                const folder = normalizeDir(`${engine.getOpts().outputDir}歌手_${removeIllegalPath(artist.name)}_热门50首`);
                 await ensureDir(folder);
                 const stats = await downloadList(engine, (td?.data?.hotSongs || []) as ISongDetail[], folder);
                 showStats(`${artist.name} - 热门50首`, stats, folder);
@@ -141,7 +141,7 @@ async function handleSearchArtist(engine: DownloadEngine) {
                 const ai = parseInt(prompt("选择: ") || "0") - 1;
                 if (ai >= 0 && ai < albums.length) {
                     const { songs, album } = await getAlbumSongs(albums[ai].id);
-                    const folder = `musicout/专辑_${album.name}/`;
+                    const folder = normalizeDir(`${engine.getOpts().outputDir}专辑_${removeIllegalPath(album.name)}`);
                     await ensureDir(folder);
                     const stats = await downloadList(engine, songs, folder);
                     showStats(album.name, stats, folder);
@@ -179,7 +179,7 @@ async function handleDownloadPlaylist(engine: DownloadEngine) {
             const sd = await api.getSongDetail(ids.slice(i, i + 50)) as any;
             allSongs.push(...(sd?.data?.songs || []));
         }
-        const folder = `musicout/歌单_${p.name}/`;
+        const folder = normalizeDir(`${engine.getOpts().outputDir}歌单_${removeIllegalPath(p.name)}`);
         await ensureDir(folder);
         const stats = await downloadList(engine, allSongs, folder);
         showStats(p.name, stats, folder);
@@ -193,7 +193,7 @@ async function handleDownloadAlbum(engine: DownloadEngine) {
         const id = Number(input.match(/\d+/)?.[0]);
         if (!id) break;
         const { songs, album } = await getAlbumSongs(id);
-        const folder = `musicout/专辑_${album.name}/`;
+        const folder = normalizeDir(`${engine.getOpts().outputDir}专辑_${removeIllegalPath(album.name)}`);
         await ensureDir(folder);
         const stats = await downloadList(engine, songs, folder);
         showStats(album.name, stats, folder);
@@ -222,7 +222,7 @@ async function downloadAllAlbums(engine: DownloadEngine, artistId: number, artis
     const albums = ad?.data?.hotAlbums || [];
     log.info(`${artistName}: ${albums.length} 张专辑`);
     const total = { total: 0, success: 0, failed: 0 };
-    const folder = `musicout/歌手_${artistName}_全部专辑/`;
+    const folder = normalizeDir(`${engine.getOpts().outputDir}歌手_${removeIllegalPath(artistName)}_全部专辑`);
     await ensureDir(folder);
     for (const album of albums) {
         const { songs } = await getAlbumSongs(album.id);

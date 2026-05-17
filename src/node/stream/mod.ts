@@ -42,16 +42,20 @@ export class Stream extends EventEmitter {
     destroyed: boolean = false;
 
     pipe<T extends Writable>(destination: T, options?: PipeOptions): T {
+        const src = this as any;
+        let drained = true;
         this.on('data', (chunk) => {
             if (!destination.write(chunk)) {
-                // @ts-ignore - pause may not exist on all streams
-                this.pause?.();
+                drained = false;
+                src.pause?.();
             }
         });
 
         destination.on('drain', () => {
-            // @ts-ignore - resume may not exist on all streams
-            this.resume?.();
+            if (!drained) {
+                drained = true;
+                src.resume?.();
+            }
         });
 
         if (options?.end !== false) {
@@ -207,9 +211,36 @@ export class Readable extends Stream {
         if (!state.flowing) {
             state.flowing = true;
             this.emit('resume');
-            this._read(state.highWaterMark);
+            this._readAndResolve();
         }
         return this;
+    }
+
+    private _readAndResolve(): void {
+        const state = this._readableState;
+        if (!state.flowing || state.ended) return;
+
+        // Drain buffered data first
+        while (state.flowing && state.buffer.length > 0) {
+            const chunk = state.buffer.shift();
+            this.readableLength = state.buffer.length;
+            this.emit('data', chunk);
+        }
+
+        if (state.ended && !state.endEmitted) {
+            state.endEmitted = true;
+            this.readableEnded = true;
+            this.emit('end');
+            return;
+        }
+
+        if (state.flowing) {
+            try {
+                this._read(state.highWaterMark);
+            } catch (err) {
+                this.emit('error', err);
+            }
+        }
     }
 
     isPaused(): boolean {
@@ -217,16 +248,45 @@ export class Readable extends Stream {
     }
 
     unpipe(destination?: Writable): this {
+        // Best-effort: remove from internal pipe list if present
+        const state = this._readableState as any;
+        if (state.pipes) {
+            if (destination) {
+                const idx = state.pipes.indexOf(destination);
+                if (idx !== -1) state.pipes.splice(idx, 1);
+            } else {
+                state.pipes = [];
+            }
+        }
         return this;
     }
 
     unshift(chunk: any, encoding?: BufferEncoding): boolean {
         const state = this._readableState;
-        state.buffer.unshift(chunk);
-        return true;
+        if (typeof chunk === 'string') {
+            chunk = Buffer.from(chunk, encoding || state.defaultEncoding);
+        }
+        // Clear 'end' state since we're pushing data back
+        if (state.endEmitted) {
+            state.endEmitted = false;
+            this.readableEnded = false;
+            this.readable = true;
+        }
+        return this.push(chunk);
     }
 
     wrap(stream: any): this {
+        // Wrap a legacy readable stream (EventEmitter with 'data'/'end'/'error')
+        if (stream && typeof stream.on === 'function') {
+            stream.on('data', (chunk: any) => {
+                if (!this.push(chunk)) {
+                    stream.pause && stream.pause();
+                }
+            });
+            stream.on('end', () => { this.push(null); });
+            stream.on('error', (err: Error) => { this.destroy(err); });
+            if (stream.resume) stream.resume();
+        }
         return this;
     }
 
@@ -235,7 +295,11 @@ export class Readable extends Stream {
 
         if (chunk === null) {
             state.ended = true;
-            if (state.buffer.length === 0 && !state.endEmitted) {
+            if (state.flowing && !state.endEmitted) {
+                state.endEmitted = true;
+                this.readableEnded = true;
+                this.emit('end');
+            } else if (state.buffer.length === 0 && !state.endEmitted) {
                 state.endEmitted = true;
                 this.readableEnded = true;
                 this.emit('end');
@@ -243,12 +307,15 @@ export class Readable extends Stream {
             return false;
         }
 
-        state.buffer.push(chunk);
-        this.readableLength = state.buffer.length;
-
         if (state.flowing) {
             this.emit('data', chunk);
+            // Keep reading if still flowing
+            queueMicrotask(() => this._readAndResolve());
+            return false;
         }
+
+        state.buffer.push(chunk);
+        this.readableLength = state.buffer.length;
 
         return state.buffer.length < state.highWaterMark;
     }
@@ -330,6 +397,7 @@ export class Writable extends Stream {
         decodeStrings: boolean;
         defaultEncoding: BufferEncoding;
         destroyed: boolean;
+        awaitDrain: number;
     };
 
     constructor(options?: WritableOptions) {
@@ -348,6 +416,7 @@ export class Writable extends Stream {
             decodeStrings: true,
             defaultEncoding: 'utf8',
             destroyed: false,
+            awaitDrain: 0,
         };
 
         if (options?.write) {
@@ -377,9 +446,67 @@ export class Writable extends Stream {
         state.buffer.push({ chunk, encoding: encoding as BufferEncoding, callback: callback ?? (() => {}) });
         this.writableLength = state.buffer.length;
 
-        this._write(chunk, encoding as BufferEncoding, callback ?? (() => {}));
+        if (!state.writing) {
+            this._writeBuffered();
+        }
 
         return state.buffer.length < state.highWaterMark;
+    }
+
+    private _writeBuffered(): void {
+        const state = this._writableState;
+        if (state.writing || state.buffer.length === 0) return;
+
+        state.writing = true;
+        const { chunk, encoding, callback } = state.buffer[0];
+
+        this._write(chunk, encoding, (err) => {
+            state.writing = false;
+            state.buffer.shift();
+            this.writableLength = state.buffer.length;
+
+            if (err) {
+                this.emit('error', err);
+                callback(err);
+                return;
+            }
+
+            callback();
+
+            if (state.buffer.length > 0) {
+                this._writeBuffered();
+            } else if (state.ended && !state.finished) {
+                this._doFinal();
+            } else {
+                if (state.awaitDrain > 0) {
+                    state.awaitDrain = 0;
+                    this.emit('drain');
+                }
+            }
+        });
+    }
+
+    private _doFinal(): void {
+        const state = this._writableState;
+        if (state.finished) return;
+
+        const finish = () => {
+            state.finished = true;
+            this.writableFinished = true;
+            this.emit('finish');
+        };
+
+        if (this._final) {
+            this._final((err) => {
+                if (err) {
+                    this.emit('error', err);
+                } else {
+                    finish();
+                }
+            });
+        } else {
+            finish();
+        }
     }
 
     setDefaultEncoding(encoding: BufferEncoding): this {
@@ -400,8 +527,10 @@ export class Writable extends Stream {
         const state = this._writableState;
 
         if (chunk !== null && chunk !== undefined) {
-            this.write(chunk, encoding);
+            this.write(chunk, encoding as BufferEncoding);
         }
+
+        if (state.ended) return this;
 
         state.ended = true;
         this.writableEnded = true;
@@ -410,19 +539,11 @@ export class Writable extends Stream {
             this.once('finish', callback);
         }
 
-        this._final?.((err) => {
-            if (err) {
-                this.emit('error', err);
-            } else {
-                state.finished = true;
-                this.writableFinished = true;
-                this.emit('finish');
-            }
-        }) ?? (() => {
-            state.finished = true;
-            this.writableFinished = true;
-            this.emit('finish');
-        })();
+        if (state.writing || state.buffer.length > 0) {
+            // Will call _doFinal after buffer drains in _writeBuffered
+        } else {
+            this._doFinal();
+        }
 
         return this;
     }
@@ -466,27 +587,62 @@ export class Writable extends Stream {
 // ============================================================================
 
 export class Duplex extends Writable {
-    readable: boolean = true;
+    readable: boolean;
     readableEnded: boolean = false;
     readableFlowing: boolean | null = null;
     readableHighWaterMark: number;
     readableLength: number = 0;
     readableObjectMode: boolean;
+    readableEncoding: BufferEncoding | null = null;
+    readableAborted: boolean = false;
+    readableDidRead: boolean = false;
 
-    protected _readableState: any;
+    protected _readableState: {
+        buffer: any[];
+        objectMode: boolean;
+        highWaterMark: number;
+        flowing: boolean | null;
+        ended: boolean;
+        endEmitted: boolean;
+        reading: boolean;
+        sync: boolean;
+        needReadable: boolean;
+        emittedReadable: boolean;
+        readableListening: boolean;
+        resumeScheduled: boolean;
+        destroyed: boolean;
+        defaultEncoding: BufferEncoding;
+        awaitDrain: number;
+        readingMore: boolean;
+        decoder: any;
+        encoding: BufferEncoding | null;
+    };
 
     constructor(options?: DuplexOptions) {
         super(options);
+        this.readable = options?.readable ?? true;
         this.readableObjectMode = options?.objectMode ?? false;
         this.readableHighWaterMark = options?.highWaterMark ?? (this.readableObjectMode ? 16 : 16384);
 
         this._readableState = {
             buffer: [],
+            encoding: options?.encoding ?? null,
             objectMode: this.readableObjectMode,
             highWaterMark: this.readableHighWaterMark,
             flowing: null,
             ended: false,
             endEmitted: false,
+            reading: false,
+            sync: true,
+            needReadable: false,
+            emittedReadable: false,
+            readableListening: false,
+            resumeScheduled: false,
+            destroyed: false,
+            defaultEncoding: 'utf8',
+            awaitDrain: 0,
+            readingMore: false,
+            decoder: null,
         };
 
         if (options?.read) {
@@ -494,8 +650,144 @@ export class Duplex extends Writable {
         }
     }
 
+    read(n?: number): any {
+        if (!this.readable) return null;
+        const state = this._readableState;
+
+        if (state.buffer.length === 0) {
+            if (state.ended) {
+                return null;
+            }
+            state.needReadable = true;
+            return null;
+        }
+
+        const chunk = state.buffer.shift();
+        this.readableLength = state.buffer.length;
+
+        if (state.ended && state.buffer.length === 0 && !state.endEmitted) {
+            state.endEmitted = true;
+            this.readableEnded = true;
+            this.emit('end');
+        }
+
+        return chunk;
+    }
+
+    setEncoding(enc: BufferEncoding): this {
+        this.readableEncoding = enc;
+        return this;
+    }
+
+    pause(): this {
+        if (!this.readable) return this;
+        const state = this._readableState;
+        if (state.flowing !== false) {
+            state.flowing = false;
+            this.emit('pause');
+        }
+        return this;
+    }
+
+    resume(): this {
+        if (!this.readable) return this;
+        const state = this._readableState;
+        if (!state.flowing) {
+            state.flowing = true;
+            this.emit('resume');
+            this._duplexReadAndResolve();
+        }
+        return this;
+    }
+
+    private _duplexReadAndResolve(): void {
+        const state = this._readableState;
+        if (!state.flowing || state.ended) return;
+
+        while (state.flowing && state.buffer.length > 0) {
+            const chunk = state.buffer.shift();
+            this.readableLength = state.buffer.length;
+            this.emit('data', chunk);
+        }
+
+        if (state.ended && !state.endEmitted) {
+            state.endEmitted = true;
+            this.readableEnded = true;
+            this.emit('end');
+            return;
+        }
+
+        if (state.flowing) {
+            try {
+                this._read(state.highWaterMark);
+            } catch (err) {
+                this.emit('error', err);
+            }
+        }
+    }
+
+    isPaused(): boolean {
+        return this._readableState.flowing === false;
+    }
+
+    unpipe(destination?: Writable): this {
+        return this;
+    }
+
+    unshift(chunk: any, encoding?: BufferEncoding): boolean {
+        const state = this._readableState;
+        state.buffer.unshift(chunk);
+        return true;
+    }
+
+    push(chunk: any, encoding?: BufferEncoding): boolean {
+        if (!this.readable) return false;
+        const state = this._readableState;
+
+        if (chunk === null) {
+            state.ended = true;
+            if (state.flowing && !state.endEmitted) {
+                state.endEmitted = true;
+                this.readableEnded = true;
+                this.emit('end');
+            } else if (state.buffer.length === 0 && !state.endEmitted) {
+                state.endEmitted = true;
+                this.readableEnded = true;
+                this.emit('end');
+            }
+            return false;
+        }
+
+        if (state.flowing) {
+            this.emit('data', chunk);
+            queueMicrotask(() => this._duplexReadAndResolve());
+            return false;
+        }
+
+        state.buffer.push(chunk);
+        this.readableLength = state.buffer.length;
+
+        return state.buffer.length < state.highWaterMark;
+    }
+
+    protected _read(size: number): void {
+        // Default: no-op, subclass should override
+    }
+
     static fromSource(source: any): Duplex {
         return new Duplex();
+    }
+
+    destroy(error?: Error | null): this {
+        if (this.destroyed) return this;
+        this.destroyed = true;
+        this.readable = false;
+        this.writable = false;
+        if (error) {
+            this.emit('error', error);
+        }
+        this.emit('close');
+        return this;
     }
 }
 
@@ -520,11 +812,6 @@ export class Transform extends Duplex {
     }
 
     protected _flush?(callback: (error?: Error | null, data?: any) => void): void;
-
-    push(chunk: any, encoding?: BufferEncoding): boolean {
-        // @ts-ignore - push exists on Readable side of Duplex
-        return super.push(chunk, encoding);
-    }
 }
 
 // ============================================================================

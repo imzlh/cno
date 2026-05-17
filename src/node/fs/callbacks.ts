@@ -7,6 +7,7 @@ const fs = import.meta.use('fs');
 const asfs = import.meta.use('asyncfs');
 const engine = import.meta.use('engine');
 import { toUint8Array, decodeBuffer, toNodeStat, toNodeStatAsync, toNodeDirent, toNodeDirentAsync, parseFlags, pathToString, removeRecursiveSync, removeRecursive, mkdirRecursiveSync, mkdirRecursive } from './utils';
+import { toErrnoException } from '../_internal/errno';
 
 // ============================================================================
 // 类型定义
@@ -21,10 +22,10 @@ type NoParamCallback = (err: NodeJS.ErrnoException | null) => void;
 // 辅助函数
 // ============================================================================
 
-function callbackify<T>(promise: Promise<T>, callback: (err: NodeJS.ErrnoException | null, result?: T) => void): void {
+function callbackify<T>(promise: Promise<T>, callback: (err: NodeJS.ErrnoException | null, result?: T) => void, syscall?: string, path?: string): void {
     promise.then(
         result => callback(null, result),
-        err => callback(err)
+        err => callback(toErrnoException(err, syscall, path))
     );
 }
 
@@ -63,11 +64,11 @@ export function readFile(path: PathLike | number, options?: any, callback?: any)
     asfs.readFile(pathStr).then(
         buffer => {
             const result = encoding
-                ? engine.decodeString(buffer as Uint8Array<ArrayBuffer>) 
+                ? engine.decodeString(buffer as Uint8Array<ArrayBuffer>)
                 : Buffer.from(buffer);
             callback(null, result);
         },
-        err => callback(err)
+        err => callback(toErrnoException(err, 'readFile', pathStr))
     );
 }
 
@@ -96,11 +97,11 @@ export function writeFile(path: PathLike | number, data: any, options?: any, cal
     asfs.open(pathStr, flag as any, mode).then(
         handle => {
             handle.write(buffer).then(
-                () => handle.close().then(() => callback(null), callback),
-                err => handle.close().then(() => callback(err), () => callback(err))
+                () => handle.close().then(() => callback(null), err => callback(toErrnoException(err, 'writeFile', pathStr))),
+                err => handle.close().then(() => callback(toErrnoException(err, 'writeFile', pathStr)), () => callback(toErrnoException(err, 'writeFile', pathStr)))
             );
         },
-        callback
+        err => callback(toErrnoException(err, 'writeFile', pathStr))
     );
 }
 
@@ -128,11 +129,11 @@ export function appendFile(path: PathLike | number, data: any, options?: any, ca
     asfs.open(pathStr, 'a', mode).then(
         handle => {
             handle.write(buffer).then(
-                () => handle.close().then(() => callback(null), callback),
-                err => handle.close().then(() => callback(err), () => callback(err))
+                () => handle.close().then(() => callback(null), err => callback(toErrnoException(err, 'appendFile', pathStr))),
+                err => handle.close().then(() => callback(toErrnoException(err, 'appendFile', pathStr)), () => callback(toErrnoException(err, 'appendFile', pathStr)))
             );
         },
-        callback
+        err => callback(toErrnoException(err, 'appendFile', pathStr))
     );
 }
 
@@ -163,7 +164,7 @@ export function stat(path: PathLike, options?: any, callback?: any): void {
     const pathStr = pathToString(path as string | URL);
     asfs.stat(pathStr).then(
         st => callback(null, toNodeStatAsync(st)),
-        callback
+        err => callback(toErrnoException(err, 'stat', pathStr))
     );
 }
 
@@ -182,7 +183,7 @@ export function lstat(path: PathLike, options?: any, callback?: any): void {
     const pathStr = pathToString(path as string | URL);
     asfs.lstat(pathStr).then(
         st => callback(null, toNodeStatAsync(st)),
-        callback
+        err => callback(toErrnoException(err, 'lstat', pathStr))
     );
 }
 
@@ -197,7 +198,12 @@ export function fstat(fd: number, options?: any, callback?: any): void {
         callback = options;
         options = {};
     }
-    callback(new Error('fstat is not supported'));
+    try {
+        const st = fs.stat(`/proc/self/fd/${fd}`);
+        callback(null, toNodeStat(st));
+    } catch (err) {
+        callback(toErrnoException(err, 'fstat', `/proc/self/fd/${fd}`));
+    }
 }
 
 export function access(path: PathLike, callback: NoParamCallback): void;
@@ -211,7 +217,7 @@ export function access(path: PathLike, mode?: any, callback?: any): void {
     const pathStr = pathToString(path as string | URL);
     asfs.stat(pathStr).then(
         () => callback(null),
-        callback
+        err => callback(toErrnoException(err, 'access', pathStr))
     );
 }
 
@@ -232,9 +238,9 @@ export function mkdir(path: PathLike, options?: any, callback?: any): void {
     const recursive = typeof options === 'object' ? options?.recursive : false;
 
     if (recursive) {
-        mkdirRecursive(pathStr, mode).then(() => callback(null), callback);
+        mkdirRecursive(pathStr, mode).then(() => callback(null), err => callback(toErrnoException(err, 'mkdir', pathStr)));
     } else {
-        asfs.mkdir(pathStr, mode).then(() => callback(null), callback);
+        asfs.mkdir(pathStr, mode).then(() => callback(null), err => callback(toErrnoException(err, 'mkdir', pathStr)));
     }
 }
 
@@ -249,9 +255,9 @@ export function rmdir(path: PathLike, options?: any, callback?: any): void {
     const pathStr = pathToString(path as string | URL);
 
     if (options?.recursive) {
-        removeRecursive(pathStr).then(() => callback(null), callback);
+        removeRecursive(pathStr).then(() => callback(null), err => callback(toErrnoException(err, 'rmdir', pathStr)));
     } else {
-        asfs.rmdir(pathStr).then(() => callback(null), callback);
+        asfs.rmdir(pathStr).then(() => callback(null), err => callback(toErrnoException(err, 'rmdir', pathStr)));
     }
 }
 
@@ -269,17 +275,17 @@ export function rm(path: PathLike, options?: any, callback?: any): void {
         stats => {
             if (stats.isDirectory) {
                 if (options?.recursive) {
-                    removeRecursive(pathStr).then(() => callback(null), callback);
+                    removeRecursive(pathStr).then(() => callback(null), err => callback(toErrnoException(err, 'rm', pathStr)));
                 } else {
-                    asfs.rmdir(pathStr).then(() => callback(null), callback);
+                    asfs.rmdir(pathStr).then(() => callback(null), err => callback(toErrnoException(err, 'rm', pathStr)));
                 }
             } else {
-                asfs.unlink(pathStr).then(() => callback(null), callback);
+                asfs.unlink(pathStr).then(() => callback(null), err => callback(toErrnoException(err, 'rm', pathStr)));
             }
         },
         err => {
             if (!options?.force) {
-                callback(err);
+                callback(toErrnoException(err, 'rm', pathStr));
             } else {
                 callback(null);
             }
@@ -321,7 +327,7 @@ export function readdir(path: PathLike, options?: any, callback?: any): void {
                 await dirHandle.close();
             }
         },
-        callback
+        err => callback(toErrnoException(err, 'readdir', pathStr))
     );
 }
 
@@ -331,13 +337,15 @@ export function readdir(path: PathLike, options?: any, callback?: any): void {
 
 export function unlink(path: PathLike, callback: NoParamCallback): void {
     const pathStr = pathToString(path as string | URL);
-    asfs.unlink(pathStr).then(() => callback(null), callback);
+    asfs.unlink(pathStr).then(() => callback(null), err => callback(toErrnoException(err, 'unlink', pathStr)));
 }
 
 export function rename(oldPath: PathLike, newPath: PathLike, callback: NoParamCallback): void {
-    asfs.rename(pathToString(oldPath as string | URL), pathToString(newPath as string | URL)).then(
+    const oldStr = pathToString(oldPath as string | URL);
+    const newStr = pathToString(newPath as string | URL);
+    asfs.rename(oldStr, newStr).then(
         () => callback(null),
-        callback
+        err => callback(toErrnoException(err, 'rename', oldStr))
     );
 }
 
@@ -349,9 +357,10 @@ export function copyFile(src: PathLike, dest: PathLike, mode?: any, callback?: a
         mode = 0;
     }
 
-    asfs.copyFile(pathToString(src as string | URL), pathToString(dest as string | URL)).then(
+    const srcStr = pathToString(src as string | URL);
+    asfs.copyFile(srcStr, pathToString(dest as string | URL)).then(
         () => callback(null),
-        callback
+        err => callback(toErrnoException(err, 'copyFile', srcStr))
     );
 }
 
@@ -367,11 +376,11 @@ export function truncate(path: PathLike, len?: any, callback?: any): void {
     asfs.open(pathStr, 'r+').then(
         handle => {
             handle.truncate(len ?? 0).then(
-                () => handle.close().then(() => callback(null), callback),
-                err => handle.close().then(() => callback(err), () => callback(err))
+                () => handle.close().then(() => callback(null), err => callback(toErrnoException(err, 'truncate', pathStr))),
+                err => handle.close().then(() => callback(toErrnoException(err, 'truncate', pathStr)), () => callback(toErrnoException(err, 'truncate', pathStr)))
             );
         },
-        callback
+        err => callback(toErrnoException(err, 'truncate', pathStr))
     );
 }
 
@@ -391,9 +400,10 @@ export function ftruncate(fd: number, len?: any, callback?: any): void {
 // ============================================================================
 
 export function link(existingPath: PathLike, newPath: PathLike, callback: NoParamCallback): void {
-    asfs.link(pathToString(existingPath as string | URL), pathToString(newPath as string | URL)).then(
+    const existingStr = pathToString(existingPath as string | URL);
+    asfs.link(existingStr, pathToString(newPath as string | URL)).then(
         () => callback(null),
-        callback
+        err => callback(toErrnoException(err, 'link', existingStr))
     );
 }
 
@@ -459,9 +469,10 @@ export function realpath(path: PathLike, options?: any, callback?: any): void {
 // ============================================================================
 
 export function chmod(path: PathLike, mode: Mode, callback: NoParamCallback): void {
-    asfs.chmod(pathToString(path as string | URL), modeToNumber(mode)!).then(
+    const pathStr = pathToString(path as string | URL);
+    asfs.chmod(pathStr, modeToNumber(mode)!).then(
         () => callback(null),
-        callback
+        err => callback(toErrnoException(err, 'chmod', pathStr))
     );
 }
 
@@ -471,12 +482,15 @@ export function fchmod(fd: number, mode: Mode, callback: NoParamCallback): void 
 }
 
 export function lchmod(path: PathLike, mode: Mode, callback: NoParamCallback): void {
-    // lchmod 只在 macOS 上实现
-    callback(new Error('lchmod is not supported'));
+    // lchmod: best-effort via chmod (C layer doesn't distinguish symlink chmod)
+    const pathStr = pathToString(path as string | URL);
+    fs.chmod(pathStr, modeToNumber(mode)!);
+    callback(null);
 }
 
 export function chown(path: PathLike, uid: number, gid: number, callback: NoParamCallback): void {
-    asfs.chown(pathToString(path as string | URL), uid, gid).then(() => callback(null), callback);
+    const __pathStr = pathToString(path as string | URL);
+    asfs.chown(__pathStr, uid, gid).then(() => callback(null), err => callback(toErrnoException(err, 'chown', __pathStr)));
 }
 
 export function fchown(fd: number, uid: number, gid: number, callback: NoParamCallback): void {
@@ -485,7 +499,8 @@ export function fchown(fd: number, uid: number, gid: number, callback: NoParamCa
 }
 
 export function lchown(path: PathLike, uid: number, gid: number, callback: NoParamCallback): void {
-    asfs.lchown(pathToString(path as string | URL), uid, gid).then(() => callback(null), callback);
+    const pathStr = pathToString(path as string | URL);
+    asfs.lchown(pathStr, uid, gid).then(() => callback(null), err => callback(toErrnoException(err, 'lchown', pathStr)));
 }
 
 // ============================================================================
@@ -493,23 +508,31 @@ export function lchown(path: PathLike, uid: number, gid: number, callback: NoPar
 // ============================================================================
 
 export function utimes(path: PathLike, atime: TimeLike, mtime: TimeLike, callback: NoParamCallback): void {
+    const pathStr = pathToString(path as string | URL);
     asfs.utime(
-        pathToString(path as string | URL),
+        pathStr,
         timeToNumber(atime) / 1000,
         timeToNumber(mtime) / 1000
-    ).then(() => callback(null), callback);
+    ).then(() => callback(null), err => callback(toErrnoException(err, 'utimes', pathStr)));
 }
 
 export function futimes(fd: number, atime: TimeLike, mtime: TimeLike, callback: NoParamCallback): void {
-    callback(new Error('futimes is not supported'));
+    const fdPath = `/proc/self/fd/${fd}`;
+    try {
+        fs.utimes(fdPath, timeToNumber(atime) / 1000, timeToNumber(mtime) / 1000);
+        callback(null);
+    } catch (err) {
+        callback(toErrnoException(err, 'futimes', fdPath));
+    }
 }
 
 export function lutimes(path: PathLike, atime: TimeLike, mtime: TimeLike, callback: NoParamCallback): void {
+    const pathStr = pathToString(path as string | URL);
     asfs.lutime(
-        pathToString(path as string | URL),
+        pathStr,
         timeToNumber(atime) / 1000,
         timeToNumber(mtime) / 1000
-    ).then(() => callback(null), callback);
+    ).then(() => callback(null), err => callback(toErrnoException(err, 'lutimes', pathStr)));
 }
 
 // ============================================================================
@@ -532,7 +555,7 @@ export function open(path: PathLike, flags?: any, mode?: any, callback?: any): v
     const pathStr = pathToString(path as string | URL);
     asfs.open(pathStr, parseFlags(flags) as any, modeToNumber(mode)).then(
         handle => callback(null, handle.fileno()),
-        callback
+        err => callback(toErrnoException(err, 'open', pathStr))
     );
 }
 
@@ -558,7 +581,7 @@ export function read(
         }
         callback(null, bytesRead, buffer);
     } catch (err) {
-        callback(err as NodeJS.ErrnoException, 0, buffer);
+        callback(toErrnoException(err, 'read'), 0, buffer);
     }
 }
 
@@ -600,7 +623,7 @@ export function write(fd: number, buffer: any, offset?: any, length?: any, posit
         }
         callback(null, written, buffer);
     } catch (err) {
-        callback(err as NodeJS.ErrnoException, 0, buffer);
+        callback(toErrnoException(err, 'write'), 0, buffer);
     }
 }
 
@@ -630,7 +653,8 @@ export function statfs(path: PathLike, options?: any, callback?: any): void {
         options = {};
     }
 
-    asfs.statFs(pathToString(path as string | URL)).then(
+    const pathStr = pathToString(path as string | URL);
+    asfs.statFs(pathStr).then(
         result => {
             callback(null, {
                 type: result.type,
@@ -642,7 +666,7 @@ export function statfs(path: PathLike, options?: any, callback?: any): void {
                 ffree: result.ffree,
             });
         },
-        callback
+        err => callback(toErrnoException(err, 'statfs', pathStr))
     );
 }
 
@@ -710,6 +734,6 @@ export function opendir(path: PathLike, options?: any, callback?: any): void {
 
             callback(null, dir);
         },
-        callback
+        err => callback(toErrnoException(err, 'opendir', pathStr))
     );
 }

@@ -313,19 +313,21 @@ class URL implements globalThis.URL {
     #parse(input: string, base?: string | globalThis.URL): void {
         input = String(input).trim();
 
-        // 处理特殊格式
-        if (this.#isWindowsPath(input)) {
-            this.#parseWindowsPath(input);
-            return;
-        }
-
-        if (this.#isUnixPath(input)) {
-            this.#parseUnixPath(input);
-            return;
-        }
-
         // 标准 URL 解析
         const baseUrl = base ? (typeof base === 'string' ? new URL(base) : base as URL) : null;
+
+        // 处理特殊格式（仅当无 base URL 时）
+        if (!baseUrl) {
+            if (this.#isWindowsPath(input)) {
+                this.#parseWindowsPath(input);
+                return;
+            }
+
+            if (this.#isUnixPath(input)) {
+                this.#parseUnixPath(input);
+                return;
+            }
+        }
 
         // 提取 fragment
         const fragmentIndex = input.indexOf('#');
@@ -346,6 +348,9 @@ class URL implements globalThis.URL {
         if (schemeMatch) {
             this.#scheme = schemeMatch[1].toLowerCase();
             input = input.slice(schemeMatch[0].length);
+            while (input.startsWith(':')) {
+                input = input.slice(1);
+            }
         } else if (baseUrl) {
             this.#scheme = baseUrl.#scheme;
         } else {

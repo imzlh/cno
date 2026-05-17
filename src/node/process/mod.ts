@@ -3,10 +3,32 @@
  * 提供当前 Node.js 进程的信息和控制能力
  */
 
+import { EventEmitter } from '../events';
+import { Readable, Writable } from '../stream';
+import type { Stream as StdioStream } from '../../deno/04_stdio';
+
 const os = import.meta.use('os');
 const engine = import.meta.use('engine');
-const signal = import.meta.use('signals');
+const sig = import.meta.use('signals');
 const proc = import.meta.use('process');
+const streams = import.meta.use('streams');
+const { stdin: denoStdin, stdout: denoStdout, stderr: denoStderr } = streams as any as Record<string, StdioStream>;
+
+// ============================================================================
+// 命令行参数
+// ============================================================================
+
+const os_args = (function () {
+    const { args } = os;
+    for (let i = 0; i < args.length; i++) {
+        if (args[i][0] == '-') {
+            if (args[i][1] == '-') i++;
+        } else {
+            return args.slice(i);
+        }
+    }
+    return [];
+})();
 
 // ============================================================================
 // 辅助函数
@@ -21,21 +43,150 @@ function safeGetEnv(env: string): string | undefined {
 }
 
 // ============================================================================
-// hrtime 实现
+// 标准流 - 复用 deno/04_stdio 共享单例
 // ============================================================================
 
-const hrtimeStart = Date.now();
+class ProcessWriteStream extends Writable {
+    #stdio: StdioStream;
+
+    constructor(stdio: StdioStream) {
+        super({
+            write: (chunk: any, encoding: string, callback: (error?: Error | null) => void) => {
+                const data = typeof chunk === 'string' ? engine.encodeString(chunk) : chunk;
+                stdio.write(data).then(() => callback(), callback);
+            },
+            final: (callback: (error?: Error | null) => void) => {
+                callback();
+            },
+        });
+        this.#stdio = stdio;
+    }
+
+    get fd(): number { return this.#stdio.fd; }
+
+    get isTTY(): boolean { return this.#stdio.isTTY; }
+
+    get columns(): number | undefined {
+        if (!this.#stdio.isTTY) return undefined;
+        try { return this.#stdio.size.width; } catch { return undefined; }
+    }
+
+    get rows(): number | undefined {
+        if (!this.#stdio.isTTY) return undefined;
+        try { return this.#stdio.size.height; } catch { return undefined; }
+    }
+
+    getColorDepth(env?: Record<string, string>): number {
+        if (!this.isTTY) return 1;
+        const forceColor = (env ?? process.env)['FORCE_COLOR'];
+        if (forceColor === '0') return 1;
+        if (forceColor === '1' || forceColor === '') return 4;
+        if (forceColor === '2') return 8;
+        if (forceColor === '3') return 24;
+        const term = (env ?? process.env)['TERM'] ?? '';
+        if (term === 'dumb') return 1;
+        if (/screen|^xterm|^vt100|^vt220|^rxvt|color|ansi|cygwin|linux/i.test(term)) return 16;
+        if (/^tmux([0-9]+)?$/i.test(term)) return 16;
+        return 4;
+    }
+
+    hasColors(depth?: number, env?: Record<string, string>): boolean {
+        if (depth === undefined) return this.isTTY;
+        return this.getColorDepth(env) >= depth;
+    }
+
+    writeSync(data: Uint8Array | string): number {
+        return this.#stdio.writeSync(typeof data === 'string' ? engine.encodeString(data) : data);
+    }
+
+    clearLine(dir: number, callback?: () => void): boolean {
+        const codes = dir === -1 ? '\x1b[1K' : dir === 1 ? '\x1b[0K' : '\x1b[2K';
+        this.write(codes, () => callback?.());
+        return true;
+    }
+
+    cursorTo(x: number, y?: number, callback?: () => void): boolean {
+        const code = y !== undefined ? `\x1b[${y + 1};${x + 1}H` : `\x1b[${x + 1}G`;
+        this.write(code, () => callback?.());
+        return true;
+    }
+
+    moveCursor(dx: number, dy: number, callback?: () => void): boolean {
+        let code = '';
+        if (dx > 0) code += `\x1b[${dx}C`;
+        else if (dx < 0) code += `\x1b[${-dx}D`;
+        if (dy > 0) code += `\x1b[${dy}B`;
+        else if (dy < 0) code += `\x1b[${-dy}A`;
+        this.write(code, () => callback?.());
+        return true;
+    }
+
+    getWindowSize(): [number, number] {
+        return [this.columns ?? 80, this.rows ?? 24];
+    }
+}
+
+class ProcessReadStream extends Readable {
+    #stdio: StdioStream;
+    #isRaw: boolean = false;
+
+    constructor(stdio: StdioStream) {
+        super({ highWaterMark: 64 * 1024 });
+        this.#stdio = stdio;
+        this._read = this.#doRead.bind(this);
+    }
+
+    async #doRead(size: number): Promise<void> {
+        try {
+            const buf = new Uint8Array(size);
+            const n = await this.#stdio.read(buf as Uint8Array<ArrayBuffer>);
+            if (n === null) {
+                this.push(null);
+            } else {
+                this.push(buf.subarray(0, n));
+            }
+        } catch (e) {
+            this.destroy(e as any);
+        }
+    }
+
+    get fd(): number { return this.#stdio.fd; }
+
+    get isTTY(): boolean { return this.#stdio.isTTY; }
+
+    get isRaw(): boolean { return this.#isRaw; }
+
+    setRawMode(mode: boolean): this {
+        this.#stdio.setRaw(mode);
+        this.#isRaw = mode;
+        return this;
+    }
+
+    readSync(buf: Uint8Array): number | null {
+        return this.#stdio.readSync(buf);
+    }
+}
+
+// ============================================================================
+// hrtime 实现 (基于 performance.now 高精度)
+// ============================================================================
+
+const hrtimeOrigin = typeof performance !== 'undefined' ? performance.now() : Date.now();
 
 function hrtime(time?: [number, number]): [number, number] {
-    const now = Date.now() - hrtimeStart;
-    const seconds = Math.floor(now / 1000);
-    const nanoseconds = (now % 1000) * 1e6;
+    const nowMicro = typeof performance !== 'undefined'
+        ? performance.now() - hrtimeOrigin
+        : Date.now() - hrtimeOrigin;
+    const totalNs = Math.round(nowMicro * 1e6);
+    const seconds = Math.floor(totalNs / 1e9);
+    const nanoseconds = totalNs % 1e9;
 
     if (time) {
-        const diffSeconds = seconds - time[0];
-        const diffNanoseconds = nanoseconds - time[1];
+        let diffSeconds = seconds - time[0];
+        let diffNanoseconds = nanoseconds - time[1];
         if (diffNanoseconds < 0) {
-            return [diffSeconds - 1, diffNanoseconds + 1e9];
+            diffSeconds -= 1;
+            diffNanoseconds += 1e9;
         }
         return [diffSeconds, diffNanoseconds];
     }
@@ -56,7 +207,7 @@ function memoryUsage(): NodeJS.MemoryUsage {
     const memory = os.memoryUsage();
     return {
         rss: memory['os.rss'],
-        heapTotal: memory['used'],
+        heapTotal: memory['os.total'] - memory['os.free'],
         heapUsed: memory['used'],
         external: memory['vm.used'],
         arrayBuffers: memory['buffer.used'],
@@ -71,23 +222,40 @@ memoryUsage.rss = function (): number {
 // cpuUsage 实现
 // ============================================================================
 
-let lastCpuTime = Date.now();
+let lastCpuUsage = { user: 0, system: 0 };
 
 function cpuUsage(previousValue?: NodeJS.CpuUsage): NodeJS.CpuUsage {
-    const now = Date.now();
-    const diff = now - lastCpuTime;
+    const cpus = os.cpuInfo();
+    if (cpus.length === 0) return { user: 0, system: 0 };
+
+    // Aggregate across all cores
+    let totalUser = 0, totalNice = 0, totalSys = 0, totalIdle = 0;
+    for (const cpu of cpus) {
+        totalUser += cpu.times.user;
+        totalNice += cpu.times.nice;
+        totalSys += cpu.times.sys;
+        totalIdle += cpu.times.idle;
+    }
+
+    const current = {
+        user: (totalUser + totalNice) * 1e6,  // ms → μs
+        system: totalSys * 1e6,
+    };
 
     if (previousValue) {
         return {
-            user: diff * 1000 - previousValue.system,
-            system: previousValue.system,
+            user: current.user - (previousValue.user || 0),
+            system: current.system - (previousValue.system || 0),
         };
     }
 
-    return {
-        user: diff * 1000,
-        system: 0,
+    // First call: return delta since last call, or zero if first ever
+    const result = {
+        user: current.user - lastCpuUsage.user,
+        system: current.system - lastCpuUsage.system,
     };
+    lastCpuUsage = { user: current.user, system: current.system };
+    return result;
 }
 
 // ============================================================================
@@ -97,8 +265,9 @@ function cpuUsage(previousValue?: NodeJS.CpuUsage): NodeJS.CpuUsage {
 const signalMap: Map<NodeJS.Signals, Map<() => void, CModuleSignals.SignalHandler>> = new Map();
 
 function addSignalListener(signalName: NodeJS.Signals, listener: () => void): void {
-    // @ts-ignore
-    const sigint = signal.signals[signalName];
+    if (signalName == 'SIGBREAK' || signalName == 'SIGIOT' || signalName == 'SIGPOLL' || signalName == 'SIGSTKFLT' || signalName == 'SIGUNUSED' || signalName == 'SIGLOST' || signalName == 'SIGINFO') 
+        throw new Error('The requested signal is not supported.');
+    const sigint = sig.signals[signalName];
     if (typeof sigint !== 'number') {
         throw new Error(`Invalid signal: ${signalName}`);
     }
@@ -112,13 +281,14 @@ function addSignalListener(signalName: NodeJS.Signals, listener: () => void): vo
         return;
     }
 
-    const ret = signal.signal(sigint, listener);
+    const ret = sig.signal(sigint, listener);
     map.set(listener, ret);
 }
 
 function removeSignalListener(signalName: NodeJS.Signals, listener: () => void): void {
-    // @ts-ignore
-    const sigint = signal.signals[signalName];
+    if (signalName == 'SIGBREAK' || signalName == 'SIGIOT' || signalName == 'SIGPOLL' || signalName == 'SIGSTKFLT' || signalName == 'SIGUNUSED' || signalName == 'SIGLOST' || signalName == 'SIGINFO') 
+        throw new Error('The requested signal is not supported.');
+    const sigint = sig.signals[signalName];
     if (typeof sigint !== 'number') {
         throw new Error(`Invalid signal: ${signalName}`);
     }
@@ -167,26 +337,86 @@ const envProxy = new Proxy({} as NodeJS.ProcessEnv, {
 });
 
 // ============================================================================
+// Process EventEmitter
+// ============================================================================
+
+class ProcessEventEmitter extends EventEmitter {
+    #exitListeners: (() => void)[] = [];
+    #beforeExitListeners: (() => void)[] = [];
+
+    override emit(event: string | Symbol, ...args: any[]): boolean {
+        if (event === 'exit') {
+            for (const cb of this.#exitListeners) {
+                try { cb.apply(null, args as []); } catch {}
+            }
+            return this.#exitListeners.length > 0;
+        }
+        if (event === 'beforeExit') {
+            for (const cb of this.#beforeExitListeners) {
+                try { cb.apply(null, args as []); } catch {}
+            }
+            return this.#beforeExitListeners.length > 0;
+        }
+        if (typeof event == 'string' && (event.startsWith('SIG') || event.startsWith('sig'))) {
+            return super.emit(event, ...args);
+        }
+        return super.emit(event.toString(), ...args);
+    }
+
+    override on(event: string | symbol, listener: any): this {
+        if (typeof event === 'string' && (event.startsWith('SIG') || event.startsWith('sig'))) {
+            addSignalListener(event as NodeJS.Signals, listener);
+        }
+        return super.on(event, listener);
+    }
+
+    override once(event: string | symbol, listener: any): this {
+        if (typeof event === 'string' && (event.startsWith('SIG') || event.startsWith('sig'))) {
+            const onceListener = () => {
+                listener();
+                removeSignalListener(event as NodeJS.Signals, onceListener);
+            };
+            addSignalListener(event as NodeJS.Signals, onceListener);
+            return super.once(event, listener);
+        }
+        return super.once(event, listener);
+    }
+
+    override off(event: string | symbol, listener: any): this {
+        if (typeof event === 'string' && (event.startsWith('SIG') || event.startsWith('sig'))) {
+            removeSignalListener(event as NodeJS.Signals, listener);
+        }
+        return super.off(event, listener);
+    }
+}
+
+const processEE = new ProcessEventEmitter();
+
+// ============================================================================
+// 标准流实例
+// ============================================================================
+
+const stdoutStream = new ProcessWriteStream(denoStdout);
+const stderrStream = new ProcessWriteStream(denoStderr);
+const stdinStream = new ProcessReadStream(denoStdin);
+
+// ============================================================================
 // Process 对象
 // ============================================================================
 
 const uname = os.uname();
 export const process: NodeJS.Process = {
-    // 标准流 - 简化实现
-    stdout: null as any,
-    stderr: null as any,
-    stdin: null as any,
+    stdout: stdoutStream as any,
+    stderr: stderrStream as any,
+    stdin: stdinStream as any,
 
-    // 命令行参数
-    argv: [os.exePath, ...os.args.slice(1)],
-    argv0: os.args[0] ?? os.exePath,
+    argv: [os.exePath, ...os_args.slice(1)],
+    argv0: os_args[0] ?? os.exePath,
     execArgv: [],
 
-    // 进程信息
     pid: os.pid,
     ppid: os.ppid,
 
-    // 平台信息
     arch: (() => {
         const machine = uname.machine;
         switch (machine) {
@@ -228,41 +458,35 @@ export const process: NodeJS.Process = {
         }
     })(),
 
-    // 环境变量
     env: envProxy,
 
-    // 工作目录
     cwd: () => os.cwd,
     chdir: (directory: string) => os.chdir(directory),
 
-    // 退出
     exit: (code?: number): never => {
+        processEE.emit('exit', code ?? 0);
         os.exit(code ?? 0);
         throw new Error('unreachable');
     },
 
     exitCode: undefined,
 
-    // 执行路径
     execPath: os.exePath,
 
-    // 标题
     title: 'node',
 
-    // 版本信息
     version: 'v20.0.0',
     versions: {
         node: '20.0.0',
         v8: engine.versions.quickjs,
         modules: '120',
         http_parser: '2.0',
-        uv: '1.0',
-        zlib: '1.0',
+        uv: engine.versions.uv,
+        zlib: engine.versions.zlib,
         ares: '1.0',
-        openssl: '3.0',
+        openssl: engine.versions.openssl,
     },
 
-    // 配置
     config: {
         target_defaults: {
             cflags: [],
@@ -290,13 +514,11 @@ export const process: NodeJS.Process = {
         },
     },
 
-    // 发布信息
     release: {
         name: 'node',
         lts: 'Iron',
     },
 
-    // 特性
     features: {
         debug: false,
         uv: true,
@@ -311,58 +533,37 @@ export const process: NodeJS.Process = {
         typescript: false,
     },
 
-    // 内存使用
     memoryUsage,
 
-    // CPU 使用
     cpuUsage,
 
-    // 高精度时间
     hrtime,
 
-    // 运行时间
     uptime: () => os.uptime(),
 
-    // 信号处理
-    on: ((event: string, listener: any) => {
-        if (event.startsWith('SIG') || event.startsWith('sig')) {
-            addSignalListener(event as NodeJS.Signals, listener);
-        }
-    }) as any,
+    on: processEE.on.bind(processEE) as any,
+    off: processEE.off.bind(processEE) as any,
+    once: processEE.once.bind(processEE) as any,
+    emit: processEE.emit.bind(processEE) as any,
+    addListener: processEE.on.bind(processEE) as any,
+    removeListener: processEE.off.bind(processEE) as any,
 
-    off: ((event: string, listener: any) => {
-        if (event.startsWith('SIG') || event.startsWith('sig')) {
-            removeSignalListener(event as NodeJS.Signals, listener);
-        }
-    }) as any,
+    removeAllListeners: processEE.removeAllListeners.bind(processEE) as any,
+    prependListener: processEE.prependListener.bind(processEE) as any,
+    prependOnceListener: processEE.prependOnceListener.bind(processEE) as any,
 
-    once: ((event: string, listener: any) => {
-        const onceListener = () => {
-            listener();
-            removeSignalListener(event as NodeJS.Signals, onceListener);
-        };
-        addSignalListener(event as NodeJS.Signals, onceListener);
-    }) as any,
+    listenerCount: ((event: string | symbol) => processEE.listenerCount(event)) as any,
+    eventNames: () => processEE.eventNames(),
+    listeners: ((event: string | symbol) => processEE.listeners(event)) as any,
+    rawListeners: ((event: string | symbol) => processEE.rawListeners(event)) as any,
 
-    emit: ((event: string, ...args: any[]) => {
-        // 简化实现
-        return false;
-    }) as any,
+    getMaxListeners: () => processEE.getMaxListeners(),
+    setMaxListeners: ((n: number) => { processEE.setMaxListeners(n); return process; }) as any,
 
-    addListener: ((event: string, listener: any) => {
-        return process.on(event as NodeJS.Signals, listener);
-    }) as any,
-
-    removeListener: ((event: string, listener: any) => {
-        return process.off(event as NodeJS.Signals, listener);
-    }) as any,
-
-    // 权限
     permission: {
         has: () => true,
     },
 
-    // 报告
     report: {
         compact: false,
         directory: '',
@@ -376,32 +577,27 @@ export const process: NodeJS.Process = {
         writeReport: () => '',
     },
 
-    // 资源使用
-    resourceUsage: () => ({
-        fsRead: 0,
-        fsWrite: 0,
-        involuntaryContextSwitches: 0,
-        ipcReceived: 0,
-        ipcSent: 0,
-        majorPageFault: 0,
-        maxRSS: 0,
-        minorPageFault: 0,
-        sharedMemorySize: 0,
-        signalsCount: 0,
-        swappedOut: 0,
-        systemCPUTime: 0,
-        unsharedDataSize: 0,
-        unsharedStackSize: 0,
-        userCPUTime: 0,
-        voluntaryContextSwitches: 0,
-    }),
+    resourceUsage: () => {
+        const mem = os.memoryUsage();
+        const cpus = os.cpuInfo();
+        let totalUser = 0, totalSys = 0;
+        for (const cpu of cpus) { totalUser += cpu.times.user + cpu.times.nice; totalSys += cpu.times.sys; }
+        return {
+            fsRead: 0, fsWrite: 0,
+            involuntaryContextSwitches: 0, ipcReceived: 0, ipcSent: 0,
+            majorPageFault: 0, maxRSS: mem['os.rss'],
+            minorPageFault: 0, sharedMemorySize: 0, signalsCount: 0, swappedOut: 0,
+            systemCPUTime: totalSys * 1e6,
+            unsharedDataSize: 0, unsharedStackSize: 0,
+            userCPUTime: totalUser * 1e6,
+            voluntaryContextSwitches: 0,
+        };
+    },
 
-    // 警告
     emitWarning: (warning: string | Error, options?: any) => {
         console.warn(warning);
     },
 
-    // 其他方法
     getuid: () => os.userInfo.userId,
     getgid: () => os.userInfo.groupId,
     geteuid: () => os.userInfo.userId,
@@ -412,57 +608,37 @@ export const process: NodeJS.Process = {
     setegid: () => { throw new Error('setegid is not supported'); },
     setgroups: () => { throw new Error('setgroups is not supported'); },
 
-    // umask
     umask: (mask?: number | string) => {
-        return 0o022;
+        if (mask === undefined) return 0o022;
+        // Best-effort: C layer doesn't expose umask, store and return previous
+        const prev = 0o022;
+        try { (os as any).umask?.(typeof mask === 'string' ? parseInt(mask, 8) : mask); } catch {}
+        return prev;
     },
 
-    // nextTick
     nextTick: (callback: Function, ...args: any[]) => {
         queueMicrotask(() => callback(...args));
     },
 
-    // 断开
     connected: false,
     disconnect: () => {},
 
-    // 发送消息
     send: () => false,
 
-    // 通道
     channel: null as any,
 
-    // 杀进程
     kill: (pid: number, signal?: string | number) => {
         proc.kill(pid, signal as any);
         return true;
     },
 
-    // abort
     abort: (): never => {
-        os.exit(134); // SIGABRT
-        throw new Error('unreachable')
+        os.exit(134);
+        throw new Error('unreachable');
     },
 
-    // 事件监听器数量
-    listenerCount: () => 0,
-
-    // 最大监听器
-    getMaxListeners: () => 10,
-    setMaxListeners: (n: number) => process,
-
-    // 主模块
     mainModule: undefined,
 
-    // 事件
-    eventNames: () => [],
-    prependListener: () => process,
-    prependOnceListener: () => process,
-    removeAllListeners: () => process,
-    setUncaughtExceptionCaptureCallback: () => {},
-    hasUncaughtExceptionCaptureCallback: () => false,
-
-    // 缺失的属性
     debugPort: 5858,
 
     dlopen: (module: object, filename: string, flags?: number) => {
@@ -510,8 +686,8 @@ export const process: NodeJS.Process = {
     constrainedMemory: () => 0,
     availableMemory: () => 0,
 
-    listeners: () => [],
-    rawListeners: () => [],
+    setUncaughtExceptionCaptureCallback: (cb: ((err: Error) => void) | null) => {},
+    hasUncaughtExceptionCaptureCallback: () => false,
 
     traceProcessWarnings: false
 };

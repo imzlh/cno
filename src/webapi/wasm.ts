@@ -80,8 +80,8 @@ class Module {
         return wasm.moduleImports(module._native) as any;
     }
 
-    static customSections(_module: Module, _sectionName: string): ArrayBuffer[] {
-        return [];
+    static customSections(module: Module, sectionName: string): ArrayBuffer[] {
+        return [wasm.moduleCustomSections(module._native, sectionName)!];
     }
 }
 
@@ -92,22 +92,31 @@ class Module {
 class Memory {
     _instance: CModuleWASM.Instance | null;
     _buffer: ArrayBuffer | null;
+    _cachedBuffer: ArrayBuffer | null;
     _maxPages: number | undefined;
 
     constructor(descriptor: { initial: number; maximum?: number; shared?: boolean }) {
         this._instance = null;
         this._buffer = new ArrayBuffer(descriptor.initial * 65536);
+        this._cachedBuffer = this._buffer;
         this._maxPages = descriptor.maximum;
     }
 
     get buffer(): ArrayBuffer {
-        if (this._instance) return wasm.getMemoryBuffer(this._instance);
+        if (this._instance) {
+            if (!this._cachedBuffer) {
+                this._cachedBuffer = wasm.getMemoryBuffer(this._instance);
+            }
+            return this._cachedBuffer;
+        }
         return this._buffer!;
     }
 
     grow(delta: number): number {
         if (this._instance) {
-            return wrapWasmError(() => wasm.growMemory(this._instance!, delta));
+            const result = wrapWasmError(() => wasm.growMemory(this._instance!, delta));
+            this._cachedBuffer = wasm.getMemoryBuffer(this._instance!);
+            return result;
         }
         const oldPages = this._buffer!.byteLength / 65536;
         const newPages = oldPages + delta;
@@ -115,6 +124,7 @@ class Memory {
         const newBuffer = new ArrayBuffer(newPages * 65536);
         new Uint8Array(newBuffer).set(new Uint8Array(this._buffer!));
         this._buffer = newBuffer;
+        this._cachedBuffer = newBuffer;
         return oldPages;
     }
 }
@@ -122,6 +132,9 @@ class Memory {
 // ============================================================================
 // Table
 // ============================================================================
+
+const VALID_GLOBAL_TYPES = new Set(['i32', 'i64', 'f32', 'f64']);
+const VALID_ELEMENT_TYPES = new Set(['anyfunc', 'funcref', 'externref']);
 
 class Table {
     _instance: CModuleWASM.Instance | null;
@@ -131,6 +144,9 @@ class Table {
     _maxSize: number | undefined;
 
     constructor(descriptor: { element: string; initial: number; maximum?: number }) {
+        if (!VALID_ELEMENT_TYPES.has(descriptor.element)) {
+            throw new TypeError(`Invalid table element type: '${descriptor.element}'`);
+        }
         this._instance = null;
         this._name = null;
         this._element = descriptor.element;
@@ -144,14 +160,28 @@ class Table {
     }
 
     get(index: number): any {
-        if (this._instance) return wasm.tableGet(this._instance, this._name!, index);
-        return index < this._array.length ? this._array[index] : undefined;
+        if (this._instance) {
+            if (index >= wasm.tableSize(this._instance, this._name!)) {
+                throw new RangeError('index out of bounds');
+            }
+            return wasm.tableGet(this._instance, this._name!, index);
+        }
+        if (index >= this._array.length) {
+            throw new RangeError('index out of bounds');
+        }
+        return this._array[index];
     }
 
     set(index: number, value: any): void {
         if (this._instance) {
+            if (index >= wasm.tableSize(this._instance, this._name!)) {
+                throw new RangeError('index out of bounds');
+            }
             wasm.tableSet(this._instance, this._name!, index, value);
             return;
+        }
+        if (index >= this._array.length) {
+            throw new RangeError('index out of bounds');
         }
         this._array[index] = value;
     }
@@ -180,6 +210,10 @@ class Global {
     _type: string;
 
     constructor(descriptor: { value: string; mutable: boolean }, initialValue: CModuleWASM.WasmValue) {
+        if (!VALID_GLOBAL_TYPES.has(descriptor.value)) {
+            throw new TypeError(`Invalid global type: '${descriptor.value}'`);
+        }
+        validateGlobalValue(descriptor.value, initialValue);
         this._instance = null;
         this._name = null;
         this._type = descriptor.value;
@@ -194,6 +228,7 @@ class Global {
 
     set value(newValue: CModuleWASM.WasmValue) {
         if (!this._mutable) throw new TypeError('Global is immutable');
+        validateGlobalValue(this._type, newValue);
         if (this._instance) {
             wasm.setGlobal(this._instance, this._name!, newValue);
             return;
@@ -203,6 +238,27 @@ class Global {
 
     valueOf(): CModuleWASM.WasmValue {
         return this.value;
+    }
+}
+
+function validateGlobalValue(type: string, value: any): void {
+    switch (type) {
+        case 'i32':
+            if (typeof value !== 'number' || !Number.isInteger(value)) {
+                throw new TypeError('Global value must be an integer for i32 type');
+            }
+            break;
+        case 'i64':
+            if (typeof value !== 'bigint') {
+                throw new TypeError('Global value must be a BigInt for i64 type');
+            }
+            break;
+        case 'f32':
+        case 'f64':
+            if (typeof value !== 'number') {
+                throw new TypeError('Global value must be a number for f32/f64 type');
+            }
+            break;
     }
 }
 
@@ -221,6 +277,7 @@ class Instance {
         }
         this._instance = wrapWasmError(() => wasm.buildInstance(nativeModule));
         this._exports = createExports(this._instance, nativeModule);
+        Object.freeze(this._exports);
     }
 
     get exports(): Record<string, any> {
@@ -239,35 +296,36 @@ function resolveImportObject(
     const imports = wasm.moduleImports(nativeModule);
     const functionDescs: CModuleWASM.ImportFunctionDescriptor[] = [];
     const globalDescs: CModuleWASM.GlobalImportDescriptor[] = [];
+    const memoryDescs: { module: string; name: string; memory: Memory }[] = [];
+    const tableDescs: { module: string; name: string; table: Table }[] = [];
     let wasiSet = false;
 
     for (const imp of imports) {
+        const isWasi = imp.module === 'wasi_snapshot_preview1' || imp.module === 'wasi_unstable';
         const moduleObj = importObject[imp.module];
-        if (!moduleObj) {
-            if (imp.module === 'wasi_snapshot_preview1' || imp.module === 'wasi_unstable') {
-                if (!wasiSet) {
-                    wasm.setWasiOptions(nativeModule, [], null, null);
-                    wasiSet = true;
-                }
-            }
-            continue;
-        }
-        const value = moduleObj[imp.name];
+        const value = moduleObj ? moduleObj[imp.name] : undefined;
+
         if (value === undefined) {
-            if (imp.module === 'wasi_snapshot_preview1' || imp.module === 'wasi_unstable') {
+            if (isWasi) {
                 if (!wasiSet) {
                     wasm.setWasiOptions(nativeModule, [], null, null);
                     wasiSet = true;
                 }
+                continue;
             }
-            continue;
+            throw new LinkError(
+                `import object field '${imp.module}.${imp.name}' is not provided`
+            );
         }
 
         switch (imp.kind) {
             case 'function':
-                if (typeof value === 'function') {
-                    functionDescs.push({ module: imp.module, name: imp.name, func: value });
+                if (typeof value !== 'function') {
+                    throw new LinkError(
+                        `import object field '${imp.module}.${imp.name}' is not a Function`
+                    );
                 }
+                functionDescs.push({ module: imp.module, name: imp.name, func: value });
                 break;
             case 'global':
                 if (value instanceof Global) {
@@ -289,8 +347,20 @@ function resolveImportObject(
                 }
                 break;
             case 'memory':
+                if (!(value instanceof Memory)) {
+                    throw new LinkError(
+                        `import object field '${imp.module}.${imp.name}' is not a WebAssembly.Memory`
+                    );
+                }
+                memoryDescs.push({ module: imp.module, name: imp.name, memory: value });
                 break;
             case 'table':
+                if (!(value instanceof Table)) {
+                    throw new LinkError(
+                        `import object field '${imp.module}.${imp.name}' is not a WebAssembly.Table`
+                    );
+                }
+                tableDescs.push({ module: imp.module, name: imp.name, table: value });
                 break;
         }
     }
@@ -301,6 +371,15 @@ function resolveImportObject(
     if (globalDescs.length > 0) {
         wrapWasmError(() => wasm.resolveGlobalImports(nativeModule, globalDescs));
     }
+    wrapWasmError(() => wasm.resolveMemoryImports(nativeModule, memoryDescs.map(e => ({
+        ...e, initial: 1
+    }))));
+    wrapWasmError(() => wasm.resolveTableImports(nativeModule, tableDescs.map(e => ({
+        module: e.module,
+        name: e.name,
+        element: e.table._element as 'funcref' | 'externref',
+        initial: e.table._array.length,
+    }))));
 }
 
 function inferGlobalType(value: any): 'i32' | 'i64' | 'f32' | 'f64' {
@@ -331,6 +410,7 @@ function createExports(
                 const mem = Object.create(Memory.prototype) as Memory;
                 mem._instance = instance;
                 mem._buffer = null;
+                mem._cachedBuffer = null;
                 mem._maxPages = undefined;
                 result[exp.name] = mem;
                 break;
@@ -378,6 +458,8 @@ if (wasm) {
         LinkError,
         RuntimeError,
 
+        [Symbol.toStringTag]: 'WebAssembly',
+
         validate(bufferSource: BufferSource): boolean {
             return wasm.validate(toArrayBuffer(bufferSource));
         },
@@ -401,7 +483,9 @@ if (wasm) {
         },
 
         async compileStreaming(source: Response | Promise<Response>): Promise<Module> {
-            const buffer = await (await source).arrayBuffer();
+            const response = await source;
+            validateWasmMimeType(response);
+            const buffer = await response.arrayBuffer();
             return new Module(buffer);
         },
 
@@ -409,10 +493,21 @@ if (wasm) {
             source: Response | Promise<Response>,
             importObject?: Record<string, Record<string, any>>
         ): Promise<{ module: Module; instance: Instance }> {
-            const buffer = await (await source).arrayBuffer();
+            const response = await source;
+            validateWasmMimeType(response);
+            const buffer = await response.arrayBuffer();
             const module = new Module(buffer);
             const instance = new Instance(module, importObject);
             return { module, instance };
         },
     } as any;
+}
+
+function validateWasmMimeType(response: Response): void {
+    const contentType = response.headers.get('Content-Type') || '';
+    if (!contentType.includes('application/wasm')) {
+        throw new TypeError(
+            `Invalid MIME type: expected 'application/wasm', got '${contentType}'`
+        );
+    }
 }

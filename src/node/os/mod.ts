@@ -5,6 +5,8 @@
  */
 
 const os = import.meta.use('os');
+const sig = import.meta.use('signals');
+const err = import.meta.use('error');
 
 const uname = os.uname();
 export interface CpuInfo {
@@ -54,124 +56,13 @@ export type NetworkInterfaceInfo = NetworkInterfaceInfoIPv4 | NetworkInterfaceIn
 export const constants = {
     UV_UDP_REUSEADDR: 0,
 
-    signals: {
-        SIGHUP: 1,
-        SIGINT: 2,
-        SIGQUIT: 3,
-        SIGILL: 4,
-        SIGTRAP: 5,
-        SIGABRT: 6,
-        SIGIOT: 6,
-        SIGBUS: 7,
-        SIGFPE: 8,
-        SIGKILL: 9,
-        SIGUSR1: 10,
-        SIGSEGV: 11,
-        SIGUSR2: 12,
-        SIGPIPE: 13,
-        SIGALRM: 14,
-        SIGTERM: 15,
-        SIGCHLD: 17,
-        SIGSTKFLT: 16,
-        SIGCONT: 18,
-        SIGSTOP: 19,
-        SIGTSTP: 20,
-        SIGTTIN: 21,
-        SIGTTOU: 22,
-        SIGURG: 23,
-        SIGXCPU: 24,
-        SIGXFSZ: 25,
-        SIGVTALRM: 26,
-        SIGPROF: 27,
-        SIGWINCH: 28,
-        SIGIO: 29,
-        SIGPOLL: 29,
-        SIGPWR: 30,
-        SIGSYS: 31,
-        SIGUNUSED: 31,
-    } as { [key in NodeJS.Signals]: number },
+    signals: Object.fromEntries(
+        Object.entries(sig.signals).map(([k, v]) => [k, v])
+    ) as { [key in NodeJS.Signals]: number },
 
-    errno: {
-        E2BIG: 1,
-        EACCES: 2,
-        EADDRINUSE: 3,
-        EADDRNOTAVAIL: 4,
-        EAFNOSUPPORT: 5,
-        EAGAIN: 6,
-        EALREADY: 7,
-        EBADF: 8,
-        EBADMSG: 9,
-        EBUSY: 10,
-        ECANCELED: 11,
-        ECHILD: 12,
-        ECONNABORTED: 13,
-        ECONNREFUSED: 14,
-        ECONNRESET: 15,
-        EDEADLK: 16,
-        EDESTADDRREQ: 17,
-        EDOM: 18,
-        EDQUOT: 19,
-        EEXIST: 20,
-        EFAULT: 21,
-        EFBIG: 22,
-        EHOSTUNREACH: 23,
-        EIDRM: 24,
-        EILSEQ: 25,
-        EINPROGRESS: 26,
-        EINTR: 27,
-        EINVAL: 28,
-        EIO: 29,
-        EISCONN: 30,
-        EISDIR: 31,
-        ELOOP: 32,
-        EMFILE: 33,
-        EMLINK: 34,
-        EMSGSIZE: 35,
-        EMULTIHOP: 36,
-        ENAMETOOLONG: 37,
-        ENETDOWN: 38,
-        ENETRESET: 39,
-        ENETUNREACH: 40,
-        ENFILE: 41,
-        ENOBUFS: 42,
-        ENODATA: 43,
-        ENODEV: 44,
-        ENOENT: 45,
-        ENOEXEC: 46,
-        ENOLCK: 47,
-        ENOLINK: 48,
-        ENOMEM: 49,
-        ENOMSG: 50,
-        ENOPROTOOPT: 51,
-        ENOSPC: 52,
-        ENOSR: 53,
-        ENOSTR: 54,
-        ENOSYS: 55,
-        ENOTCONN: 56,
-        ENOTDIR: 57,
-        ENOTEMPTY: 58,
-        ENOTSOCK: 59,
-        ENOTSUP: 60,
-        ENOTTY: 61,
-        ENXIO: 62,
-        EOPNOTSUPP: 63,
-        EOVERFLOW: 64,
-        EPERM: 65,
-        EPIPE: 66,
-        EPROTO: 67,
-        EPROTONOSUPPORT: 68,
-        EPROTOTYPE: 69,
-        ERANGE: 70,
-        EROFS: 71,
-        ESPIPE: 72,
-        ESRCH: 73,
-        ESTALE: 74,
-        ETIME: 75,
-        ETIMEDOUT: 76,
-        ETXTBSY: 77,
-        EWOULDBLOCK: 78,
-        EXDEV: 79,
-    },
+    errno: Object.fromEntries(
+        Object.entries(err.errno).filter(([k]) => k !== 'OK' && k !== 'UNKNOWN')
+    ) as any,
 
     dlopen: {
         RTLD_LAZY: 1,
@@ -422,25 +313,27 @@ export function tmpdir(): string {
  * 返回 CPU 的字节序
  */
 export function endianness(): 'BE' | 'LE' {
-    // 大多数现代系统都是小端序
     const buffer = new ArrayBuffer(2);
     new Uint16Array(buffer)[0] = 1;
     return new Uint8Array(buffer)[0] === 1 ? 'LE' : 'BE';
 }
 
-/**
- * 获取进程调度优先级
- */
 export function getPriority(pid?: number): number {
-    // 简化实现，返回默认优先级
-    return 0;
+    try {
+        return (os as any).getPriority?.(pid ?? 0) ?? 0;
+    } catch {
+        throw new RangeError(`getPriority ${pid} is not a valid pid`);
+    }
 }
 
-/**
- * 设置进程调度优先级
- */
 export function setPriority(priority: number): void;
 export function setPriority(pid: number, priority: number): void;
 export function setPriority(pidOrPriority: number, priority?: number): void {
-    // 简化实现，不实际设置
+    const pid = priority !== undefined ? pidOrPriority : 0;
+    const prio = priority ?? pidOrPriority;
+    try {
+        (os as any).setPriority?.(pid, prio);
+    } catch {
+        throw new RangeError(`setPriority ${prio} is out of range`);
+    }
 }

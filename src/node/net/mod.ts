@@ -79,6 +79,7 @@ export interface ListenOptions {
 
 export class Socket extends Duplex {
     private _tcp: CModuleStreams.TCP | null = null;
+    private _stream: CModuleStreams.Pipe | null = null;
     private _connecting: boolean = false;
     private _destroyed: boolean = false;
     private _readable: boolean = true;
@@ -86,10 +87,11 @@ export class Socket extends Duplex {
     private _address: AddressInfo | null = null;
     private _remoteAddress: AddressInfo | null = null;
     private _timeout: number | null = null;
+    private _timeoutId: any = null;
     private _keepAlive: boolean = false;
     private _keepAliveDelay: number = 0;
     private _noDelay: boolean = false;
-    private _pendingData: Uint8Array | null = null;
+    private _readBuffer: Uint8Array = new Uint8Array(65536);
 
     bytesRead: number = 0;
     bytesWritten: number = 0;
@@ -105,7 +107,6 @@ export class Socket extends Duplex {
         super({ allowHalfOpen: options?.allowHalfOpen });
 
         if (options?.fd) {
-            // 从现有 fd 创建
             this._tcp = new streams.TCP();
             this.readyState = 'open';
         }
@@ -152,7 +153,25 @@ export class Socket extends Duplex {
             }
         } else {
             // Unix socket path
-            throw new Error('Unix socket not supported yet');
+            this.connecting = true;
+            this._connecting = true;
+            this.readyState = 'opening';
+
+            const pipe = new streams.Pipe();
+            pipe.connect(host as string).then(() => {
+                this._stream = pipe;
+                this.connecting = false;
+                this._connecting = false;
+                this.readyState = 'open';
+                this.emit('connect');
+                if (connectListener) connectListener();
+                this._startPipeRead();
+            }).catch((err: any) => {
+                this.emit('error', err);
+                this.destroy();
+            });
+
+            return this;
         }
 
         this.connecting = true;
@@ -186,6 +205,9 @@ export class Socket extends Duplex {
 
             this.emit('connect');
             if (connectListener) connectListener();
+
+            // Start reading automatically after connect
+            this.resume();
         }).catch((err) => {
             this.emit('error', err);
             this.destroy();
@@ -194,22 +216,55 @@ export class Socket extends Duplex {
         return this;
     }
 
+    private _startPipeRead(): void {
+        if (!this._stream) return;
+        this._stream.onread = (result: any, error: any) => {
+            if (error) { this.emit('error', error); return; }
+            if (result === null || result === undefined) {
+                this.push(null);
+                this.emit('end');
+                return;
+            }
+            this.bytesRead += result.byteLength;
+            this.push(result);
+        };
+        this._stream.startRead();
+    }
+
     setEncoding(encoding?: BufferEncoding): this {
+        if (encoding) this.readableEncoding = encoding;
         return this;
     }
 
     pause(): this {
+        const state = this._readableState;
+        if (state.flowing !== false) {
+            state.flowing = false;
+            this.emit('pause');
+        }
+        if (this._tcp) this._tcp.stopRead();
         return this;
     }
 
     resume(): this {
+        const state = this._readableState;
+        if (!state.flowing) {
+            state.flowing = true;
+            this.emit('resume');
+        }
+        if (this._tcp) this._startTcpRead();
+        if (this._stream) this._stream.startRead();
         return this;
     }
 
     setTimeout(timeout: number, callback?: () => void): this {
         this._timeout = timeout;
-        if (callback) {
-            this.once('timeout', callback);
+        if (this._timeoutId) clearTimeout(this._timeoutId);
+        if (timeout > 0) {
+            this._timeoutId = setTimeout(() => {
+                this.emit('timeout');
+                if (callback) callback();
+            }, timeout);
         }
         return this;
     }
@@ -232,86 +287,107 @@ export class Socket extends Duplex {
     }
 
     address(): AddressInfo | {} {
-        if (!this._tcp) return {};
-        const info = this._tcp.sockname;
-        return {
-            address: info.ip,
-            family: `IPv${info.family}`,
-            port: info.port,
-        };
+        if (this._tcp) {
+            const info = this._tcp.sockname;
+            return {
+                address: info.ip,
+                family: `IPv${info.family}`,
+                port: info.port,
+            };
+        }
+        return this._address || {};
     }
 
     unref(): this {
+        if (this._tcp) this._tcp.unref();
         return this;
     }
 
     ref(): this {
+        if (this._tcp) this._tcp.ref();
         return this;
     }
 
-    write(data: Uint8Array | string, encodingOrCb?: BufferEncoding | ((err?: Error) => void), cb?: (err?: Error) => void): boolean {
-        if (this._destroyed) {
-            const callback = typeof encodingOrCb === 'function' ? encodingOrCb : cb;
-            callback?.(new Error('Socket is destroyed'));
-            return false;
-        }
+    /** Sustained TCP read loop driven by Duplex _read */
+    private _startTcpRead(): void {
+        if (!this._tcp || this._destroyed) return;
 
-        let encoding: BufferEncoding = 'utf8';
-        let callback: ((err?: Error) => void) | undefined;
+        (this._tcp as any).onread = (result: any, error: any) => {
+            if (error) {
+                this.emit('error', error);
+                return;
+            }
+            if (result === null || result === undefined) {
+                this.push(null);
+                this.emit('end');
+                return;
+            }
+            const data = result as Uint8Array;
+            this.bytesRead += data.byteLength;
+            this.push(data);
+        };
 
-        if (typeof encodingOrCb === 'function') {
-            callback = encodingOrCb;
-        } else if (typeof encodingOrCb === 'string') {
-            encoding = encodingOrCb;
-            callback = cb;
-        }
-
-        const buffer = typeof data === 'string' ? new TextEncoder().encode(data) : data;
-
-        if (!this._tcp) {
-            callback?.(new Error('Socket not connected'));
-            return false;
-        }
-
-        this._tcp.write(buffer).then((written) => {
-            this.bytesWritten += written;
-            callback?.();
-        }).catch((err) => {
-            callback?.(err);
-            this.emit('error', err);
-        });
-
-        return true;
+        (this._tcp as any).startRead();
     }
 
-    end(data?: Uint8Array | string, encoding?: BufferEncoding | (() => void), cb?: () => void): this {
-        if (data) {
-            this.write(data, typeof encoding === 'function' ? undefined : encoding);
+    /** Duplex _read — called when consumer wants data */
+    protected _read(size: number): void {
+        if (this._destroyed) return;
+        if (this._tcp) {
+            this._startTcpRead();
+        } else if (this._stream) {
+            this._startPipeRead();
         }
+    }
+
+    /** Duplex _write — called by _writeBuffered with one chunk at a time */
+    protected _write(chunk: any, encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
+        if (this._destroyed) {
+            callback(new Error('Socket is destroyed'));
+            return;
+        }
+
+        const buffer = typeof chunk === 'string' ? new TextEncoder().encode(chunk) : chunk as Uint8Array;
 
         if (this._tcp) {
-            this._tcp.shutdown().then(() => {
-                this.emit('end');
-                this.emit('finish');
-                this.destroy();
+            this._tcp.write(buffer).then((written: number) => {
+                this.bytesWritten += written;
+                callback();
+            }).catch((err: Error) => {
+                callback(err);
             });
+        } else if (this._stream) {
+            this._stream.write(buffer).then(() => {
+                this.bytesWritten += buffer.byteLength;
+                callback();
+            }).catch((err: Error) => {
+                callback(err);
+            });
+        } else {
+            callback(new Error('Socket not connected'));
         }
-
-        return this;
     }
 
     destroy(error?: Error): this {
         if (this._destroyed) return this;
         this._destroyed = true;
         this.readyState = 'closed';
+        this.readable = false;
+        this.writable = false;
 
-        this._pendingData = null;
+        if (this._timeoutId) {
+            clearTimeout(this._timeoutId);
+            this._timeoutId = null;
+        }
 
         if (this._tcp) {
-            try {
-                this._tcp.close();
-            } catch { }
+            try { this._tcp.close(); } catch {}
             this._tcp = null;
+        }
+
+        if (this._stream) {
+            try { this._stream.close(); } catch {}
+            this._stream = null;
         }
 
         if (error) {
@@ -321,61 +397,6 @@ export class Socket extends Duplex {
 
         return this;
     }
-
-    protected _read(size: number): void {
-        if (!this._tcp || this._destroyed) return;
-
-        const buffer = new Uint8Array(size);
-
-        const handleRead = (data: Uint8Array | null | undefined, err?: CModuleError.Error) => {
-            // @ts-ignore
-            this._tcp!.onread = null;
-            // @ts-ignore
-            this._tcp!.stopRead();
-
-            if (data === undefined) {
-                if (err) {
-                    this.emit('error', err);
-                }
-                return;
-            }
-            if (data === null) {
-                // @ts-ignore - push exists on Readable side of Duplex
-                this.push(null);
-                this.emit('end');
-                return;
-            }
-
-            let toPush: Uint8Array;
-            if (this._pendingData) {
-                const combined = new Uint8Array(this._pendingData.byteLength + data.byteLength);
-                combined.set(this._pendingData);
-                combined.set(data, this._pendingData.byteLength);
-                this._pendingData = null;
-                toPush = combined;
-            } else {
-                toPush = data;
-            }
-
-            if (toPush.length > size) {
-                this._pendingData = toPush.subarray(size);
-                toPush = toPush.subarray(0, size);
-            }
-
-            this.bytesRead += toPush.byteLength;
-            // @ts-ignore - push exists on Readable side of Duplex
-            this.push(toPush);
-        };
-
-        // @ts-ignore
-        this._tcp.onread = handleRead;
-        // @ts-ignore
-        this._tcp.startRead();
-    }
-
-    protected _write(chunk: any, encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
-        this.write(chunk, encoding, callback);
-    }
 }
 
 // ============================================================================
@@ -384,6 +405,7 @@ export class Socket extends Duplex {
 
 export class Server extends EventEmitter {
     private _tcp: CModuleStreams.TCP | null = null;
+    private _pipe: CModuleStreams.Pipe | null = null;
     private _listening: boolean = false;
     private _connections: Set<Socket> = new Set();
     private _maxConnections: number = 0;
@@ -435,7 +457,26 @@ export class Server extends EventEmitter {
                 else if (typeof arg === 'function') listeningListener = arg;
             }
         } else if (typeof portOrPathOrOptions === 'string') {
-            throw new Error('Unix socket not supported yet');
+            const pipePath = portOrPathOrOptions;
+            this._pipe = new streams.Pipe();
+            try {
+                this._pipe.bind(pipePath);
+                this._pipe.listen(backlog ?? 511);
+                this._pipe.onconnection = (error: any, client: any) => {
+                    if (error) { this.emit('error', error); return; }
+                    const socket = new Socket({ allowHalfOpen: this._allowHalfOpen });
+                    (socket as any)._stream = client;
+                    socket.emit('connect');
+                    this.emit('connection', socket);
+                };
+                this._address = { address: pipePath, family: 'Unix', port: -1 };
+                this._listening = true;
+                if (listeningListener) this.once('listening', listeningListener);
+                this.emit('listening');
+            } catch (err: any) {
+                this.emit('error', err);
+            }
+            return this;
         } else if (typeof portOrPathOrOptions === 'object') {
             const options = portOrPathOrOptions as ListenOptions;
             port = options.port;
@@ -473,7 +514,7 @@ export class Server extends EventEmitter {
 
     private _acceptLoop(): Promise<void> {
         return new Promise((rs, rj) => this._tcp!.onconnection = (error, clientTcp) => {
-            if (!connect || !clientTcp) return rj(error);
+            if (error || !clientTcp) return rj(error);
             if (!this._listening) return rs();
             
             const socket = new Socket();
@@ -499,6 +540,8 @@ export class Server extends EventEmitter {
 
             if (this._pauseOnConnect) {
                 socket.pause();
+            } else {
+                socket.resume();
             }
 
             this.emit('connection', socket);
@@ -542,10 +585,12 @@ export class Server extends EventEmitter {
     }
 
     ref(): this {
+        if (this._tcp) this._tcp.ref();
         return this;
     }
 
     unref(): this {
+        if (this._tcp) this._tcp.unref();
         return this;
     }
 }

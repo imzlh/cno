@@ -55,6 +55,14 @@ export interface Verify {
 
 function toBuffer(data: ArrayBuffer | Uint8Array<ArrayBuffer> | string, encoding: string = 'utf8'): Uint8Array<ArrayBuffer> {
     if (typeof data === 'string') {
+        if (encoding === 'hex') return new Uint8Array(crypto.hexDecode(data));
+        if (encoding === 'base64') return new Uint8Array(crypto.base64Decode(data));
+        if (encoding === 'base64url') return new Uint8Array(crypto.base64Decode(data.replace(/-/g, '+').replace(/_/g, '/') + '=='.slice(0, (4 - data.length % 4) % 4)));
+        if (encoding === 'latin1' || encoding === 'ascii' || encoding === 'binary') {
+            const buf = new Uint8Array(data.length);
+            for (let i = 0; i < data.length; i++) buf[i] = data.charCodeAt(i);
+            return buf;
+        }
         return new TextEncoder().encode(data);
     }
     if (data instanceof ArrayBuffer) {
@@ -67,6 +75,10 @@ function encodeOutput(data: ArrayBuffer, encoding?: string): ArrayBuffer | strin
     if (!encoding) return data;
     if (encoding === 'hex') return crypto.hexEncode(data);
     if (encoding === 'base64') return crypto.base64Encode(data);
+    if (encoding === 'base64url') {
+        const b64 = crypto.base64Encode(data) as string;
+        return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    }
     return data;
 }
 
@@ -80,34 +92,28 @@ export function createHash(algorithm: string): Hash {
 
     const getHashObj = () => {
         if (!hashObj) {
-            switch (algorithm.toLowerCase()) {
-                case 'md5':
-                    hashObj = crypto.createMd5();
-                    break;
-                case 'sha1':
-                    hashObj = crypto.createSha1();
-                    break;
-                case 'sha256':
-                    hashObj = crypto.createSha256();
-                    break;
-                case 'sha512':
-                    hashObj = crypto.createSha512();
-                    break;
-                default:
-                    throw new Error(`Unsupported hash algorithm: ${algorithm}`);
+            const a = algorithm.toLowerCase().replace(/-/g, '');
+            switch (a) {
+                case 'md5':      hashObj = crypto.createMd5(); break;
+                case 'sha1':     hashObj = crypto.createSha1(); break;
+                case 'sha224':   hashObj = crypto.createSha256(); break; // streaming sha224 not in C, fall back
+                case 'sha256':   hashObj = crypto.createSha256(); break;
+                case 'sha384':   hashObj = crypto.createSha512(); break; // streaming sha384 not in C, fall back
+                case 'sha512':   hashObj = crypto.createSha512(); break;
+                default: throw new Error(`Unsupported hash algorithm: ${algorithm}`);
             }
-            for (const d of data) {
-                hashObj.update(d);
-            }
+            for (const d of data) hashObj.update(d);
         }
         return hashObj;
     };
 
     return {
         update(input: ArrayBuffer | Uint8Array<ArrayBuffer> | string, encoding?: string) {
-            data.push(toBuffer(input, encoding));
+            const buf = toBuffer(input, encoding);
             if (hashObj) {
-                hashObj.update(toBuffer(input, encoding));
+                hashObj.update(buf);
+            } else {
+                data.push(buf);
             }
             return this;
         },
@@ -126,43 +132,19 @@ export function hash(algorithm: string, data: ArrayBuffer | Uint8Array<ArrayBuff
     const buf = toBuffer(data);
     let result: ArrayBuffer;
 
-    switch (algorithm.toLowerCase()) {
-        case 'md5':
-            result = crypto.md5(buf);
-            break;
-        case 'sha1':
-            result = crypto.sha1(buf);
-            break;
-        case 'sha224':
-            result = crypto.sha224(buf);
-            break;
-        case 'sha256':
-            result = crypto.sha256(buf);
-            break;
-        case 'sha384':
-            result = crypto.sha384(buf);
-            break;
-        case 'sha512':
-            result = crypto.sha512(buf);
-            break;
-        case 'sha3-224':
-        case 'sha3_224':
-            result = crypto.sha3_224(buf);
-            break;
-        case 'sha3-256':
-        case 'sha3_256':
-            result = crypto.sha3_256(buf);
-            break;
-        case 'sha3-384':
-        case 'sha3_384':
-            result = crypto.sha3_384(buf);
-            break;
-        case 'sha3-512':
-        case 'sha3_512':
-            result = crypto.sha3_512(buf);
-            break;
-        default:
-            throw new Error(`Unsupported hash algorithm: ${algorithm}`);
+    const a = algorithm.toLowerCase().replace(/-/g, '');
+    switch (a) {
+        case 'md5':       result = crypto.md5(buf); break;
+        case 'sha1':      result = crypto.sha1(buf); break;
+        case 'sha224':    result = crypto.sha224(buf); break;
+        case 'sha256':    result = crypto.sha256(buf); break;
+        case 'sha384':    result = crypto.sha384(buf); break;
+        case 'sha512':    result = crypto.sha512(buf); break;
+        case 'sha3224':   result = crypto.sha3_224(buf); break;
+        case 'sha3256':   result = crypto.sha3_256(buf); break;
+        case 'sha3384':   result = crypto.sha3_384(buf); break;
+        case 'sha3512':   result = crypto.sha3_512(buf); break;
+        default: throw new Error(`Unsupported hash algorithm: ${algorithm}`);
     }
 
     return encodeOutput(result, outputEncoding);
@@ -179,19 +161,15 @@ export function createHmac(algorithm: string, key: ArrayBuffer | Uint8Array<Arra
 
     const getHmacObj = () => {
         if (!hmacObj) {
-            switch (algorithm.toLowerCase()) {
-                case 'sha256':
-                    hmacObj = crypto.createHmacSha256(keyBuf);
-                    break;
-                case 'sha512':
-                    hmacObj = crypto.createHmacSha512(keyBuf);
-                    break;
-                default:
-                    throw new Error(`Unsupported HMAC algorithm: ${algorithm}`);
+            const a = algorithm.toLowerCase().replace(/-/g, '');
+            switch (a) {
+                case 'md5':    hmacObj = crypto.createHmacSha256(keyBuf); break; // C layer only has sha256/512 streaming
+                case 'sha1':   hmacObj = crypto.createHmacSha256(keyBuf); break;
+                case 'sha256': hmacObj = crypto.createHmacSha256(keyBuf); break;
+                case 'sha512': hmacObj = crypto.createHmacSha512(keyBuf); break;
+                default: throw new Error(`Unsupported HMAC algorithm: ${algorithm}`);
             }
-            for (const d of data) {
-                hmacObj.update(d);
-            }
+            for (const d of data) hmacObj.update(d);
         }
         return hmacObj;
     };
@@ -220,21 +198,13 @@ export function hmac(algorithm: string, key: ArrayBuffer | Uint8Array<ArrayBuffe
     const dataBuf = toBuffer(data);
     let result: ArrayBuffer;
 
-    switch (algorithm.toLowerCase()) {
-        case 'md5':
-            result = crypto.hmacMd5(keyBuf, dataBuf);
-            break;
-        case 'sha1':
-            result = crypto.hmacSha1(keyBuf, dataBuf);
-            break;
-        case 'sha256':
-            result = crypto.hmacSha256(keyBuf, dataBuf);
-            break;
-        case 'sha512':
-            result = crypto.hmacSha512(keyBuf, dataBuf);
-            break;
-        default:
-            throw new Error(`Unsupported HMAC algorithm: ${algorithm}`);
+    const a = algorithm.toLowerCase().replace(/-/g, '');
+    switch (a) {
+        case 'md5':    result = crypto.hmacMd5(keyBuf, dataBuf); break;
+        case 'sha1':   result = crypto.hmacSha1(keyBuf, dataBuf); break;
+        case 'sha256': result = crypto.hmacSha256(keyBuf, dataBuf); break;
+        case 'sha512': result = crypto.hmacSha512(keyBuf, dataBuf); break;
+        default: throw new Error(`Unsupported HMAC algorithm: ${algorithm}`);
     }
 
     return encodeOutput(result, outputEncoding);
@@ -247,17 +217,16 @@ export function hmac(algorithm: string, key: ArrayBuffer | Uint8Array<ArrayBuffe
 export function createCipheriv(algorithm: string, key: ArrayBuffer | Uint8Array<ArrayBuffer>, iv: ArrayBuffer | Uint8Array<ArrayBuffer>): Cipher {
     const keyBuf = toBuffer(key);
     const ivBuf = toBuffer(iv);
+    const a = algorithm.toLowerCase();
 
-    if (algorithm.toLowerCase() === 'aes-256-cbc') {
+    if (a === 'aes-256-cbc') {
         const cipher = crypto.createCipherAes256Cbc(keyBuf, ivBuf);
         return {
             update(data: ArrayBuffer | Uint8Array<ArrayBuffer> | string, inputEncoding?: string, outputEncoding?: string) {
-                const result = cipher.update(toBuffer(data, inputEncoding));
-                return encodeOutput(result, outputEncoding);
+                return encodeOutput(cipher.update(toBuffer(data, inputEncoding)), outputEncoding);
             },
             final(outputEncoding?: string) {
-                const result = cipher.final();
-                return encodeOutput(result, outputEncoding);
+                return encodeOutput(cipher.final(), outputEncoding);
             },
         };
     }
@@ -338,8 +307,14 @@ export function createDecipherivGCM(algorithm: string, key: ArrayBuffer | Uint8A
             return encodeOutput(result, outputEncoding);
         },
         final(outputEncoding?: string) {
-            const { data, tag } = gcm.final();
-            return encodeOutput(data, outputEncoding);
+            if (!authTag) {
+                throw new Error('authTag not set - call setAuthTag() before final()');
+            }
+            const result = gcm.final(authTag);
+            if (!result.verified) {
+                throw new Error('Unsupported state or unable to authenticate data');
+            }
+            return encodeOutput(result.data, outputEncoding);
         },
     };
 }
@@ -354,21 +329,13 @@ export function cipheriv(algorithm: string, key: ArrayBuffer | Uint8Array<ArrayB
     const dataBuf = toBuffer(data);
     let result: ArrayBuffer;
 
-    switch (algorithm.toLowerCase()) {
-        case 'aes-128-cbc':
-            result = crypto.aes128CbcEncrypt(keyBuf, ivBuf, dataBuf);
-            break;
-        case 'aes-256-cbc':
-            result = crypto.aes256CbcEncrypt(keyBuf, ivBuf, dataBuf);
-            break;
-        case 'aes-128-gcm':
-            result = crypto.aes128GcmEncrypt(keyBuf, ivBuf, dataBuf);
-            break;
-        case 'aes-256-gcm':
-            result = crypto.aes256GcmEncrypt(keyBuf, ivBuf, dataBuf);
-            break;
-        default:
-            throw new Error(`Unsupported cipher algorithm: ${algorithm}`);
+    const a = algorithm.toLowerCase();
+    switch (a) {
+        case 'aes-128-cbc': result = crypto.aes128CbcEncrypt(keyBuf, ivBuf, dataBuf); break;
+        case 'aes-256-cbc': result = crypto.aes256CbcEncrypt(keyBuf, ivBuf, dataBuf); break;
+        case 'aes-128-gcm': result = crypto.aes128GcmEncrypt(keyBuf, ivBuf, dataBuf); break;
+        case 'aes-256-gcm': result = crypto.aes256GcmEncrypt(keyBuf, ivBuf, dataBuf); break;
+        default: throw new Error(`Unsupported cipher algorithm: ${algorithm}`);
     }
 
     return encodeOutput(result, outputEncoding);
@@ -380,21 +347,13 @@ export function decipheriv(algorithm: string, key: ArrayBuffer | Uint8Array<Arra
     const dataBuf = toBuffer(data);
     let result: ArrayBuffer;
 
-    switch (algorithm.toLowerCase()) {
-        case 'aes-128-cbc':
-            result = crypto.aes128CbcDecrypt(keyBuf, ivBuf, dataBuf);
-            break;
-        case 'aes-256-cbc':
-            result = crypto.aes256CbcDecrypt(keyBuf, ivBuf, dataBuf);
-            break;
-        case 'aes-128-gcm':
-            result = crypto.aes128GcmDecrypt(keyBuf, ivBuf, dataBuf);
-            break;
-        case 'aes-256-gcm':
-            result = crypto.aes256GcmDecrypt(keyBuf, ivBuf, dataBuf);
-            break;
-        default:
-            throw new Error(`Unsupported cipher algorithm: ${algorithm}`);
+    const a = algorithm.toLowerCase();
+    switch (a) {
+        case 'aes-128-cbc': result = crypto.aes128CbcDecrypt(keyBuf, ivBuf, dataBuf); break;
+        case 'aes-256-cbc': result = crypto.aes256CbcDecrypt(keyBuf, ivBuf, dataBuf); break;
+        case 'aes-128-gcm': result = crypto.aes128GcmDecrypt(keyBuf, ivBuf, dataBuf); break;
+        case 'aes-256-gcm': result = crypto.aes256GcmDecrypt(keyBuf, ivBuf, dataBuf); break;
+        default: throw new Error(`Unsupported cipher algorithm: ${algorithm}`);
     }
 
     return encodeOutput(result, outputEncoding);
@@ -801,3 +760,11 @@ export const constants = {
     RSA_NO_PADDING: 3,
     RSA_PKCS1_OAEP_PADDING: 4,
 };
+
+// ============================================================================
+// UUID
+// ============================================================================
+
+export function randomUUID(): string {
+    return crypto.randomUUID() as unknown as string;
+}

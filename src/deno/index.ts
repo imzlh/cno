@@ -1,5 +1,6 @@
 import { errors } from "./01_errors";
 import packageJson from '../../package.json';
+import { os_args } from "../utils/args";
 
 const os = import.meta.use('os');
 const engine = import.meta.use('engine');
@@ -326,7 +327,7 @@ Object.defineProperty(globalThis, "Deno", {
 
         pid: os.pid,
         ppid: os.ppid,
-        args: os.args.slice(1),    // remove self
+        args: os_args!.slice(1),    // remove self
         env: {
             get: safeGetEnv,
             set: os.setenv,

@@ -31,7 +31,7 @@ function tryLock(fd: number) {
 export class Stream {
     protected type: 'pipe' | 'tty' | 'file';
     protected stream: AnyStream;
-    protected fd: number;
+    readonly fd: number;
 
     constructor(fd: number, read = true) {
         const type = os.guessHandle(fd);
@@ -77,7 +77,7 @@ export class Stream {
                 const n = await stream.read(buf);
                 r = n === 0 ? null : n;
             } catch (e) {
-                r = 0;
+                r = null;
             }
         }
         unlock(this.fd);
@@ -181,6 +181,11 @@ export class Stream {
 export const stdin = new Stream(os.STDIN_FILENO, true);
 export const stdout = new Stream(os.STDOUT_FILENO, false);
 export const stderr = new Stream(os.STDERR_FILENO, false);
+Object.defineProperties(pipe, {
+    stdin: { value: stdin },
+    stdout: { value: stdout },
+    stderr: { value: stderr }
+})
 
 Object.assign(Deno, {
     stdin: {

@@ -90,7 +90,13 @@ export function domainToASCII(domain: string): string {
 }
 
 export function domainToUnicode(domain: string): string {
-    return domainToASCII(domain);
+    try {
+        // Try to decode punycode: if hostname differs from input, it had punycode
+        const url = new URL(`https://${domain}`);
+        return url.hostname;
+    } catch {
+        return domain;
+    }
 }
 
 export function fileURLToPath(url: string | URL): string {

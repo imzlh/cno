@@ -9,7 +9,10 @@
     "build": "esbuild src/main.ts --bundle --platform=node --target=es2024 --format=esm --outfile=dist.js",
     "min-build": "esbuild src/main.ts --bundle --platform=node --target=es2024 --format=esm --minify --outfile=dist.min.js",
     "bundle": "cjsc -b cjs -s -e dist.js",
-    "install-node": "esbuild utils/compile.ts --bundle --target=es2024 --format=esm --outfile=compile.js && make"
+    "install-node": "cts utils/compile.ts --all",
+    "install-node-cjs": "esbuild utils/compile.ts --bundle --target=es2024 --format=esm --outfile=compile.js && cjs compile.js --all",
+    "install-node:clean": "cts utils/compile.ts --all --clean",
+    "install-node-cjs:clean": "esbuild utils/compile.ts --bundle --target=es2024 --format=esm --outfile=compile.js && cjs compile.js --all --clean"
   },
   "keywords": [],
   "author": "",

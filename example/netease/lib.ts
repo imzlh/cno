@@ -26,8 +26,23 @@ export const log = {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-export const removeIllegalPath = (path: string) =>
-    path?.replaceAll(/[\/:*?"<>|]/gi, "_") ?? "";
+export const removeIllegalPath = (path: string) => {
+    if (!path) return "";
+    const s = path
+        .replace(/[\x00-\x1f\x7f]/g, "")
+        .replace(/\s*[\\/:*?"<>|]\s*/gi, "_")
+        .replace(/_{2,}/g, "_")
+        .trimEnd()
+        .replace(/\.+$/, "");
+    return s || "_";
+};
+
+const SEP = Deno.build.os === "windows" ? "\\" : "/";
+
+export const normalizeDir = (dir: string): string => {
+    const d = dir.replace(/[\\/]+$/g, "");
+    return d + SEP;
+};
 
 export function formatDuration(ms: number): string {
     const totalSec = Math.floor(ms / 1000);
@@ -166,7 +181,7 @@ export class DownloadEngine {
     }
 
     async downloadSong(song: ISongDetail, folder?: string): Promise<boolean> {
-        const dir = folder ?? this.opts.outputDir;
+        const dir = normalizeDir(folder ?? this.opts.outputDir);
         // Ensure output directory exists
         try { await ensureDir(dir); } catch { /* ignore */ }
 
@@ -212,7 +227,8 @@ export class DownloadEngine {
             if (!result.success) throw new Error(new TextDecoder().decode(result.stderr));
 
             if (lyric?.data?.lrc?.lyric) {
-                await Deno.writeTextFile(`${dir}${songName}.lrc`, lyric.data.lrc.lyric);
+                const lrcPath = `${dir}${songName}.lrc`;
+                await Deno.writeTextFile(lrcPath, lyric.data.lrc.lyric);
             }
 
             log.success(`${song.name} [${source.level}] ${formatSize(source.size)}`);

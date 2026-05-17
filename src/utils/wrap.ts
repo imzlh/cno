@@ -67,6 +67,7 @@ export function wrapFSErr(e: CModuleError.Error): Error {
 }
 
 function __rethrow(e: any, stack: string) {
+    if (typeof e != "object") throw e;
     Object.defineProperty(e, 'stack', { value: stack });
     throw e;
 }

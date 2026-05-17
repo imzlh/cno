@@ -6,6 +6,12 @@ const asfs = import.meta.use('asyncfs');
 const engine = import.meta.use('engine');
 import { FileHandle } from 'fs/promises';
 import { toUint8Array, decodeBuffer, toNodeStatAsync, toNodeDirentAsync, parseFlags, pathToString, removeRecursive, mkdirRecursive } from './utils';
+import { toErrnoException, wrapPromise } from '../_internal/errno';
+
+// 辅助：包装 asyncfs 调用，自动转换 errno → ErrnoException
+function w<T>(promise: Promise<T>, syscall: string, path: string): Promise<T> {
+    return wrapPromise(promise, syscall, path);
+}
 import { StatFsOptions, Stats } from 'fs';
 
 // ============================================================================
@@ -146,7 +152,7 @@ class FileHandleImpl implements FileHandle {
 export async function readFile(path: PathLike | number, options?: { encoding?: BufferEncoding | null; flag?: string | number } | BufferEncoding): Promise<string | Uint8Array> {
     const pathStr = typeof path === 'number' ? `fd:${path}` : pathToString(path as string | URL);
     const encoding = typeof options === 'string' ? options : options?.encoding;
-    const buffer = await asfs.readFile(pathStr);
+    const buffer = await w(asfs.readFile(pathStr), 'readFile', pathStr);
     return decodeBuffer(buffer, encoding);
 }
 
@@ -156,7 +162,7 @@ export async function writeFile(path: PathLike | number, data: string | Uint8Arr
     const flag = typeof options === 'object' ? parseFlags(options?.flag) : 'w';
     const buffer = toUint8Array(data);
 
-    const handle = await asfs.open(pathStr, flag as any, mode);
+    const handle = await w(asfs.open(pathStr, flag as any, mode), 'writeFile', pathStr);
     try {
         await handle.write(buffer);
     } finally {
@@ -169,7 +175,7 @@ export async function appendFile(path: PathLike | number, data: string | Uint8Ar
     const mode = typeof options === 'object' ? modeToNumber(options?.mode) : typeof options === 'number' ? options : undefined;
     const buffer = toUint8Array(data);
 
-    const handle = await asfs.open(pathStr, 'a', mode);
+    const handle = await w(asfs.open(pathStr, 'a', mode), 'appendFile', pathStr);
     try {
         await handle.write(buffer);
     } finally {
@@ -183,16 +189,16 @@ export async function appendFile(path: PathLike | number, data: string | Uint8Ar
 
 export async function access(path: PathLike, mode?: number): Promise<void> {
     const pathStr = pathToString(path as string | URL);
-    await asfs.stat(pathStr);
+    await w(asfs.stat(pathStr), 'stat', pathStr);
 }
 
 export async function stat(path: PathLike, options?: { bigint?: boolean }): Promise<import('fs').Stats> {
-    const st = await asfs.stat(pathToString(path as string | URL));
+    const st = await w(asfs.stat(pathToString(path as string | URL)), 'stat', pathToString(path as string | URL));
     return toNodeStatAsync(st);
 }
 
 export async function lstat(path: PathLike, options?: { bigint?: boolean }): Promise<import('fs').Stats> {
-    const st = await asfs.lstat(pathToString(path as string | URL));
+    const st = await w(asfs.lstat(pathToString(path as string | URL)), 'lstat', pathToString(path as string | URL));
     return toNodeStatAsync(st);
 }
 
@@ -210,7 +216,7 @@ export async function mkdir(path: PathLike, options?: { mode?: number; recursive
         return pathStr;
     }
 
-    await asfs.mkdir(pathStr, mode);
+    await w(asfs.mkdir(pathStr, mode), 'mkdir', pathStr);
     return undefined;
 }
 
@@ -220,7 +226,7 @@ export async function rmdir(path: PathLike, options?: { recursive?: boolean; max
     if (options?.recursive) {
         await removeRecursive(pathStr);
     } else {
-        await asfs.rmdir(pathStr);
+        await w(asfs.rmdir(pathStr), 'rmdir', pathStr);
     }
 }
 
@@ -228,16 +234,16 @@ export async function rm(path: PathLike, options?: { force?: boolean; recursive?
     const pathStr = pathToString(path as string | URL);
 
     try {
-        const stats = await asfs.lstat(pathStr);
+        const stats = await w(asfs.lstat(pathStr), 'lstat', pathStr);
 
         if (stats.isDirectory) {
             if (options?.recursive) {
                 await removeRecursive(pathStr);
             } else {
-                await asfs.rmdir(pathStr);
+                await w(asfs.rmdir(pathStr), 'rmdir', pathStr);
             }
         } else {
-            await asfs.unlink(pathStr);
+            await w(asfs.unlink(pathStr), 'unlink', pathStr);
         }
     } catch (err) {
         if (!options?.force) {
@@ -250,7 +256,7 @@ export async function readdir(path: PathLike, options?: { encoding?: BufferEncod
     const pathStr = pathToString(path as string | URL);
     const withFileTypes = typeof options === 'object' ? options?.withFileTypes : false;
 
-    const dirHandle = await asfs.readDir(pathStr);
+    const dirHandle = await w(asfs.readDir(pathStr), 'readdir', pathStr);
     const entries: import('fs').Dirent[] = [];
 
     try {
@@ -270,7 +276,7 @@ export async function readdir(path: PathLike, options?: { encoding?: BufferEncod
 
 export async function opendir(path: PathLike, options?: { encoding?: BufferEncoding; bufferSize?: number }): Promise<import('fs').Dir> {
     const pathStr = pathToString(path as string | URL);
-    const dirHandle = await asfs.readDir(pathStr);
+    const dirHandle = await w(asfs.readDir(pathStr), 'readdir', pathStr);
     let closed = false;
 
     const dir: import('fs').Dir = {
@@ -322,19 +328,20 @@ export async function opendir(path: PathLike, options?: { encoding?: BufferEncod
 // ============================================================================
 
 export async function unlink(path: PathLike): Promise<void> {
-    await asfs.unlink(pathToString(path as string | URL));
+    const __p = pathToString(path as string | URL);
+    try { await asfs.unlink(__p); } catch (e) { throw toErrnoException(e, 'unlink', __p); }
 }
 
 export async function rename(oldPath: PathLike, newPath: PathLike): Promise<void> {
-    await asfs.rename(pathToString(oldPath as string | URL), pathToString(newPath as string | URL));
+    await w(asfs.rename(pathToString(oldPath as string | URL), pathToString(newPath as string | URL)), 'rename', pathToString(oldPath as string | URL));
 }
 
 export async function copyFile(src: PathLike, dest: PathLike, mode?: number): Promise<void> {
-    await asfs.copyFile(pathToString(src as string | URL), pathToString(dest as string | URL));
+    await w(asfs.copyFile(pathToString(src as string | URL), pathToString(dest as string | URL)), 'copyFile', pathToString(src as string | URL));
 }
 
 export async function truncate(path: PathLike, len?: number): Promise<void> {
-    const handle = await asfs.open(pathToString(path as string | URL), 'r+');
+    const handle = await w(asfs.open(pathToString(path as string | URL), 'r+'), 'truncate', pathToString(path as string | URL));
     try {
         await handle.truncate(len ?? 0);
     } finally {
@@ -347,21 +354,21 @@ export async function truncate(path: PathLike, len?: number): Promise<void> {
 // ============================================================================
 
 export async function link(existingPath: PathLike, newPath: PathLike): Promise<void> {
-    await asfs.link(pathToString(existingPath as string | URL), pathToString(newPath as string | URL));
+    await w(asfs.link(pathToString(existingPath as string | URL), pathToString(newPath as string | URL)), 'link', pathToString(existingPath as string | URL));
 }
 
 export async function symlink(target: PathLike, path: PathLike, type?: 'file' | 'dir' | 'junction'): Promise<void> {
     const symlinkType = type === 'dir' ? asfs.SymlinkType.DIR : asfs.SymlinkType.JUNCTION;
-    await asfs.symlink(pathToString(target as string | URL), pathToString(path as string | URL), symlinkType);
+    await w(asfs.symlink(pathToString(target as string | URL), pathToString(path as string | URL), symlinkType), 'symlink', pathToString(path as string | URL));
 }
 
 export async function readlink(path: PathLike, options?: { encoding?: BufferEncoding | 'buffer' } | BufferEncoding): Promise<string | Uint8Array> {
-    const result = await asfs.readLink(pathToString(path as string | URL));
+    const result = await w(asfs.readLink(pathToString(path as string | URL)), 'readlink', pathToString(path as string | URL));
     return result;
 }
 
 export async function realpath(path: PathLike, options?: { encoding?: BufferEncoding | 'buffer' } | BufferEncoding): Promise<string> {
-    return await asfs.realPath(pathToString(path as string | URL));
+    return await w(asfs.realPath(pathToString(path as string | URL)), 'realpath', pathToString(path as string | URL));
 }
 
 // ============================================================================
@@ -369,15 +376,15 @@ export async function realpath(path: PathLike, options?: { encoding?: BufferEnco
 // ============================================================================
 
 export async function chmod(path: PathLike, mode: Mode): Promise<void> {
-    await asfs.chmod(pathToString(path as string | URL), modeToNumber(mode)!);
+    await w(asfs.chmod(pathToString(path as string | URL), modeToNumber(mode)!), 'chmod', pathToString(path as string | URL));
 }
 
 export async function chown(path: PathLike, uid: number, gid: number): Promise<void> {
-    await asfs.chown(pathToString(path as string | URL), uid, gid);
+    await w(asfs.chown(pathToString(path as string | URL), uid, gid), 'chown', pathToString(path as string | URL));
 }
 
 export async function lchown(path: PathLike, uid: number, gid: number): Promise<void> {
-    await asfs.lchown(pathToString(path as string | URL), uid, gid);
+    await w(asfs.lchown(pathToString(path as string | URL), uid, gid), 'lchown', pathToString(path as string | URL));
 }
 
 // ============================================================================
@@ -385,11 +392,11 @@ export async function lchown(path: PathLike, uid: number, gid: number): Promise<
 // ============================================================================
 
 export async function utimes(path: PathLike, atime: TimeLike, mtime: TimeLike): Promise<void> {
-    await asfs.utime(pathToString(path as string | URL), timeToNumber(atime) / 1000, timeToNumber(mtime) / 1000);
+    await w(asfs.utime(pathToString(path as string | URL), timeToNumber(atime) / 1000, timeToNumber(mtime) / 1000), 'utimes', pathToString(path as string | URL));
 }
 
 export async function lutimes(path: PathLike, atime: TimeLike, mtime: TimeLike): Promise<void> {
-    await asfs.lutime(pathToString(path as string | URL), timeToNumber(atime) / 1000, timeToNumber(mtime) / 1000);
+    await w(asfs.lutime(pathToString(path as string | URL), timeToNumber(atime) / 1000, timeToNumber(mtime) / 1000), 'lutimes', pathToString(path as string | URL));
 }
 
 // ============================================================================
@@ -397,7 +404,7 @@ export async function lutimes(path: PathLike, atime: TimeLike, mtime: TimeLike):
 // ============================================================================
 
 export async function statfs(path: PathLike, options?: { bigint?: boolean }): Promise<import('fs').StatsFs> {
-    const result = await asfs.statFs(pathToString(path as string | URL));
+    const result = await w(asfs.statFs(pathToString(path as string | URL)), 'statfs', pathToString(path as string | URL));
     return {
         type: result.type,
         bsize: result.bsize,
@@ -416,7 +423,7 @@ export async function statfs(path: PathLike, options?: { bigint?: boolean }): Pr
 export async function open(path: PathLike, flags?: string | number, mode?: Mode): Promise<FileHandleImpl> {
     const flag = parseFlags(flags);
     const modeNum = modeToNumber(mode);
-    const handle = await asfs.open(pathToString(path as string | URL), flag as any, modeNum);
+    const handle = await w(asfs.open(pathToString(path as string | URL), flag as any, modeNum), 'open', pathToString(path as string | URL));
     return new FileHandleImpl(handle.fileno(), handle);
 }
 
@@ -433,7 +440,7 @@ export async function mkdtemp(prefix: string, options?: { encoding?: BufferEncod
     const encoding = typeof options === 'string' ? options : options?.encoding;
     const randomStr = Math.random().toString(36).substring(2, 10);
     const dirPath = prefix + randomStr;
-    await asfs.mkdir(dirPath);
+    await w(asfs.mkdir(dirPath), 'mkdir', dirPath);
     return dirPath;
 }
 
@@ -449,19 +456,63 @@ export async function mkdtempDisposable(prefix: string, options?: { encoding?: B
 
 export function watch(path: PathLike, options?: { persistent?: boolean; recursive?: boolean; encoding?: BufferEncoding; signal?: AbortSignal }): AsyncIterableIterator<{ eventType: string; filename: string | null }> {
     const pathStr = pathToString(path as string | URL);
-    
+    const fswatch = import.meta.use('fswatch');
+    const signal = options?.signal;
+
+    let watcher: CModuleFSWatch.FsWatcher | null = null;
+    let queue: Array<{ eventType: string; filename: string | null }> = [];
+    let resolveNext: ((value: IteratorResult<{ eventType: string; filename: string | null }>) => void) | null = null;
+    let closed = false;
+
+    const pushEvent = (event: { eventType: string; filename: string | null }) => {
+        if (closed) return;
+        if (resolveNext) {
+            const r = resolveNext;
+            resolveNext = null;
+            r({ done: false, value: event });
+        } else {
+            queue.push(event);
+        }
+    };
+
+    const close = async () => {
+        if (closed) return;
+        closed = true;
+        if (watcher) {
+            await watcher.close();
+            watcher = null;
+        }
+        if (resolveNext) {
+            resolveNext({ done: true, value: undefined as any });
+            resolveNext = null;
+        }
+    };
+
+    fswatch.watch(pathStr, (filename: string, event: string) => {
+        pushEvent({ eventType: event, filename });
+    }).then(w => { watcher = w; }).catch(() => { close(); });
+
+    if (signal) {
+        signal.addEventListener('abort', () => { close(); }, { once: true });
+        if (signal.aborted) close();
+    }
+
     return {
         [Symbol.asyncIterator]() {
             return this;
         },
         async next() {
-            // 简化实现，实际需要 fswatch
-            return new Promise((resolve, reject) => {
-                // 占位实现
-                setTimeout(() => {
-                    resolve({ done: true, value: undefined as any });
-                }, 1000);
+            if (closed) return { done: true, value: undefined as any };
+            if (queue.length > 0) {
+                return { done: false, value: queue.shift()! };
+            }
+            return new Promise((resolve) => {
+                resolveNext = resolve;
             });
+        },
+        async return() {
+            await close();
+            return { done: true, value: undefined as any };
         },
     } as AsyncIterableIterator<{ eventType: string; filename: string | null }>;
 }
@@ -471,34 +522,32 @@ export async function cp(source: PathLike, destination: PathLike, opts?: { force
     const destStr = pathToString(destination as string | URL);
     
     try {
-        const stats = await asfs.lstat(srcStr);
-        
+        const stats = await w(asfs.lstat(srcStr), 'cp', srcStr);
+
         if (stats.isDirectory) {
-            // 递归复制目录
-            await asfs.mkdir(destStr);
-            const dir = await asfs.readDir(srcStr);
+            await w(asfs.mkdir(destStr), 'cp', destStr);
+            const dir = await w(asfs.readDir(srcStr), 'cp', srcStr);
             try {
                 for await (const entry of dir) {
                     const srcPath = srcStr + '/' + entry.name;
                     const destPath = destStr + '/' + entry.name;
-                    
+
                     if (opts?.filter) {
                         const shouldCopy = await opts.filter(srcPath, destPath);
                         if (!shouldCopy) continue;
                     }
-                    
+
                     await cp(srcPath, destPath, opts);
                 }
             } finally {
                 await dir.close();
             }
         } else {
-            // 复制文件
             if (opts?.filter) {
                 const shouldCopy = await opts.filter(srcStr, destStr);
                 if (!shouldCopy) return;
             }
-            await asfs.copyFile(srcStr, destStr);
+            await w(asfs.copyFile(srcStr, destStr), 'cp', srcStr);
         }
     } catch (err) {
         if (!opts?.force) {
@@ -507,9 +556,79 @@ export async function cp(source: PathLike, destination: PathLike, opts?: { force
     }
 }
 
+function globToRegex(pattern: string): RegExp {
+    let regex = '';
+    let i = 0;
+    while (i < pattern.length) {
+        const c = pattern[i];
+        if (c === '*') {
+            if (pattern[i + 1] === '*') {
+                if (pattern[i + 2] === '/') {
+                    regex += '(?:.*/)?';
+                    i += 3;
+                } else {
+                    regex += '.*';
+                    i += 2;
+                }
+            } else {
+                regex += '[^/]*';
+                i++;
+            }
+        } else if (c === '?') {
+            regex += '[^/]';
+            i++;
+        } else if (c === '[') {
+            const j = pattern.indexOf(']', i);
+            if (j === -1) { regex += '\\['; i++; }
+            else { regex += pattern.slice(i, j + 1).replace(/\\/g, '\\\\'); i = j + 1; }
+        } else if (c === '{') {
+            const j = pattern.indexOf('}', i);
+            if (j === -1) { regex += '\\{'; i++; }
+            else {
+                const inner = pattern.slice(i + 1, j).split(',').map(s => globToRegex(s).source).join('|');
+                regex += `(?:${inner})`;
+                i = j + 1;
+            }
+        } else if ('.+^$|()\\'.includes(c)) {
+            regex += '\\' + c;
+            i++;
+        } else {
+            regex += c;
+            i++;
+        }
+    }
+    return new RegExp('^' + regex + '$');
+}
+
 export async function* glob(pattern: string | readonly string[], options?: { cwd?: string; exclude?: string | string[]; withFileTypes?: boolean }): AsyncIterableIterator<string> {
-    // 简化实现，实际需要 glob 匹配
-    throw new Error('glob is not implemented');
+    const patterns = Array.isArray(pattern) ? pattern : [pattern];
+    const cwd = options?.cwd ?? '.';
+    const excludes = options?.exclude ? (Array.isArray(options.exclude) ? options.exclude : [options.exclude]) : [];
+    const regexes = patterns.map(p => globToRegex(p));
+    const excludeRegexes = excludes.map(p => globToRegex(p));
+
+    async function* walk(dir: string): AsyncIterableIterator<string> {
+        let entries: string[];
+        try {
+            const dirIter = await w(asfs.readDir(dir), 'readdir', dir);
+            entries = [];
+            for await (const entry of dirIter as any) {
+                entries.push(entry.name);
+            }
+        }
+        catch { return; }
+        for (const name of entries) {
+            const full = dir + '/' + name;
+            const rel = full.slice(cwd.length + 1);
+            let stat: any;
+            try { stat = await w(asfs.lstat(full), 'lstat', full); } catch { continue; }
+            if (excludeRegexes.some(r => r.test(rel))) continue;
+            if (regexes.some(r => r.test(rel))) yield rel;
+            if (stat.isDirectory()) yield* walk(full);
+        }
+    }
+
+    yield* walk(cwd);
 }
 
 // 导出 constants

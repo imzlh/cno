@@ -120,8 +120,8 @@ export interface OutgoingHttpHeaders extends NodeJS.Dict<OutgoingHttpHeader> {
 }
 
 export interface IncomingMessage extends Readable {
-    socket: Socket;
-    connection: Socket;
+    socket: Socket | null;
+    connection: Socket | null;
     httpVersion: string;
     httpVersionMajor: number;
     httpVersionMinor: number;
@@ -142,7 +142,7 @@ export interface IncomingMessage extends Readable {
 }
 
 export class IncomingMessageImpl extends Readable implements IncomingMessage {
-    socket: Socket;
+    socket: Socket | null;
     httpVersion: string = '1.1';
     httpVersionMajor: number = 1;
     httpVersionMinor: number = 1;
@@ -159,17 +159,17 @@ export class IncomingMessageImpl extends Readable implements IncomingMessage {
     statusCode?: number;
     statusMessage?: string;
 
-    constructor(socket: Socket) {
+    constructor(socket: Socket | null) {
         super();
         this.socket = socket;
     }
 
-    get connection(): Socket {
+    get connection(): Socket | null {
         return this.socket;
     }
 
     setTimeout(msecs: number, callback?: () => void): this {
-        this.socket.setTimeout(msecs, callback);
+        this.socket?.setTimeout(msecs, callback);
         return this;
     }
 
@@ -637,7 +637,7 @@ export class ServerImpl extends NetServer implements Server {
         }
 
         const handler = async (req: HttpRequest, res: HttpResponse) => {
-            const incoming = new IncomingMessageImpl(null as any);
+            const incoming = new IncomingMessageImpl(null);
             incoming.method = req.method;
             incoming.url = req.url;
             incoming.httpVersion = req.httpVersion;
@@ -673,13 +673,15 @@ export class ServerImpl extends NetServer implements Server {
             const originalEnd = response.end.bind(response);
             response.end = ((...args: any[]) => {
                 const result = originalEnd(...args);
-                const headers: Record<string, string> = {};
-                for (const [key, value] of Object.entries(response.getHeaders())) {
-                    if (value !== undefined) {
-                        headers[key] = Array.isArray(value) ? value.join(', ') : String(value);
+                if (!response.headersSent) {
+                    const headers: Record<string, string> = {};
+                    for (const [key, value] of Object.entries(response.getHeaders())) {
+                        if (value !== undefined) {
+                            headers[key] = Array.isArray(value) ? value.join(', ') : String(value);
+                        }
                     }
+                    res.writeHead(response.statusCode, response.statusMessage, headers);
                 }
-                res.writeHead(response.statusCode, response.statusMessage, headers);
                 return result;
             }) as any;
 

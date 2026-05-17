@@ -4,6 +4,7 @@
 
 const fs = import.meta.use('fs');
 import { toUint8Array, decodeBuffer, toNodeStat, toNodeDirent, parseFlags, pathToString, removeRecursiveSync, mkdirRecursiveSync } from './utils';
+import { wrapSync } from '../_internal/errno';
 
 // ============================================================================
 // 类型定义
@@ -33,7 +34,7 @@ function timeToNumber(time: TimeLike): number {
 export function readFileSync(path: PathLike | number, options?: { encoding?: BufferEncoding | null; flag?: string | number } | BufferEncoding): string | Uint8Array {
     const pathStr = typeof path === 'number' ? `fd:${path}` : pathToString(path as string | URL);
     const encoding = typeof options === 'string' ? options : options?.encoding;
-    const buffer = new Uint8Array(fs.readFile(pathStr));
+    const buffer = wrapSync(() => new Uint8Array(fs.readFile(pathStr)), 'readFileSync', pathStr);
     return decodeBuffer(buffer, encoding);
 }
 
@@ -41,18 +42,20 @@ export function writeFileSync(path: PathLike | number, data: string | Uint8Array
     const pathStr = typeof path === 'number' ? `fd:${path}` : pathToString(path as string | URL);
     const mode = typeof options === 'object' ? modeToNumber(options?.mode) : typeof options === 'number' ? options : undefined;
     const buffer = toUint8Array(data);
-    fs.writeFile(pathStr, buffer.buffer as ArrayBuffer, mode);
+    wrapSync(() => fs.writeFile(pathStr, buffer.buffer as ArrayBuffer, mode), 'writeFileSync', pathStr);
 }
 
 export function appendFileSync(path: PathLike | number, data: string | Uint8Array | ArrayBuffer, options?: { encoding?: BufferEncoding | null; mode?: Mode; flag?: string | number } | BufferEncoding | number): void {
     const pathStr = typeof path === 'number' ? `fd:${path}` : pathToString(path as string | URL);
-    const fd = fs.open(pathStr, 'a');
-    try {
-        const buffer = toUint8Array(data);
-        fs.write(fd, buffer);
-    } finally {
-        fs.close(fd);
-    }
+    wrapSync(() => {
+        const fd = fs.open(pathStr, 'a');
+        try {
+            const buffer = toUint8Array(data);
+            fs.write(fd, buffer);
+        } finally {
+            fs.close(fd);
+        }
+    }, 'appendFileSync', pathStr);
 }
 
 // ============================================================================
@@ -60,27 +63,32 @@ export function appendFileSync(path: PathLike | number, data: string | Uint8Arra
 // ============================================================================
 
 export function existsSync(path: PathLike): boolean {
-    return fs.exists(pathToString(path as string | URL));
+    const pathStr = pathToString(path as string | URL);
+    return wrapSync(() => fs.exists(pathStr), 'existsSync', pathStr);
 }
 
 export function statSync(path: PathLike, options?: { bigint?: boolean; throwIfNoEntry?: boolean }): import('fs').Stats {
     const pathStr = pathToString(path as string | URL);
-    const st = fs.stat(pathStr);
+    const st = wrapSync(() => fs.stat(pathStr), 'statSync', pathStr);
     return toNodeStat(st);
 }
 
 export function lstatSync(path: PathLike, options?: { bigint?: boolean; throwIfNoEntry?: boolean }): import('fs').Stats {
     const pathStr = pathToString(path as string | URL);
-    const st = fs.lstat(pathStr);
+    const st = wrapSync(() => fs.lstat(pathStr), 'lstatSync', pathStr);
     return toNodeStat(st);
 }
 
 export function fstatSync(fd: number, options?: { bigint?: boolean }): import('fs').Stats {
-    throw new Error('fstatSync is not supported');
+    // C layer doesn't have sync fstat by fd; use /proc/self/fd/ on Linux
+    const fdPath = `/proc/self/fd/${fd}`;
+    const st = wrapSync(() => fs.stat(fdPath), 'fstatSync', fdPath);
+    return toNodeStat(st);
 }
 
 export function accessSync(path: PathLike, mode?: number): void {
-    fs.access(pathToString(path as string | URL), mode ?? fs.F_OK);
+    const pathStr = pathToString(path as string | URL);
+    wrapSync(() => fs.access(pathStr, mode ?? fs.F_OK), 'accessSync', pathStr);
 }
 
 // ============================================================================
@@ -97,7 +105,7 @@ export function mkdirSync(path: PathLike, options?: { mode?: number; recursive?:
         return pathStr;
     }
 
-    fs.mkdir(pathStr, mode);
+    wrapSync(() => fs.mkdir(pathStr, mode), 'mkdirSync', pathStr);
     return undefined;
 }
 
@@ -107,7 +115,7 @@ export function rmdirSync(path: PathLike, options?: { recursive?: boolean; maxRe
     if (options?.recursive) {
         removeRecursiveSync(pathStr);
     } else {
-        fs.rmdir(pathStr);
+        wrapSync(() => fs.rmdir(pathStr), 'rmdirSync', pathStr);
     }
 }
 
@@ -115,16 +123,16 @@ export function rmSync(path: PathLike, options?: { force?: boolean; recursive?: 
     const pathStr = pathToString(path as string | URL);
 
     try {
-        const stats = fs.lstat(pathStr);
+        const stats = wrapSync(() => fs.lstat(pathStr), 'rmSync', pathStr);
 
         if (stats.isDirectory) {
             if (options?.recursive) {
                 removeRecursiveSync(pathStr);
             } else {
-                fs.rmdir(pathStr);
+                wrapSync(() => fs.rmdir(pathStr), 'rmSync', pathStr);
             }
         } else {
-            fs.unlink(pathStr);
+            wrapSync(() => fs.unlink(pathStr), 'rmSync', pathStr);
         }
     } catch (err) {
         if (!options?.force) {
@@ -136,7 +144,7 @@ export function rmSync(path: PathLike, options?: { force?: boolean; recursive?: 
 export function readdirSync(path: PathLike, options?: { encoding?: BufferEncoding | 'buffer'; withFileTypes?: boolean; recursive?: boolean } | BufferEncoding): string[] | import('fs').Dirent[] {
     const pathStr = pathToString(path as string | URL);
     const withFileTypes = typeof options === 'object' ? options?.withFileTypes : false;
-    const entries = fs.readdir(pathStr);
+    const entries = wrapSync(() => fs.readdir(pathStr), 'readdirSync', pathStr);
 
     if (withFileTypes) {
         return entries.map(name => {
@@ -170,13 +178,9 @@ export function opendirSync(path: PathLike, options?: { encoding?: BufferEncodin
             return toNodeDirent(name, stat);
         },
 
-        async close(): Promise<void> {
-            // No-op for sync implementation
-        },
+        async close(): Promise<void> {},
 
-        closeSync(): void {
-            // No-op for sync implementation
-        },
+        closeSync(): void {},
 
         [Symbol.asyncIterator](): AsyncIterableIterator<import('fs').Dirent> {
             return {
@@ -203,23 +207,28 @@ export function opendirSync(path: PathLike, options?: { encoding?: BufferEncodin
 // ============================================================================
 
 export function unlinkSync(path: PathLike): void {
-    fs.unlink(pathToString(path as string | URL));
+    const pathStr = pathToString(path as string | URL);
+    wrapSync(() => fs.unlink(pathStr), 'unlinkSync', pathStr);
 }
 
 export function renameSync(oldPath: PathLike, newPath: PathLike): void {
-    fs.rename(pathToString(oldPath as string | URL), pathToString(newPath as string | URL));
+    const oldStr = pathToString(oldPath as string | URL);
+    const newStr = pathToString(newPath as string | URL);
+    wrapSync(() => fs.rename(oldStr, newStr), 'renameSync', oldStr);
 }
 
 export function copyFileSync(src: PathLike, dest: PathLike, mode?: number): void {
-    fs.copy(pathToString(src as string | URL), pathToString(dest as string | URL));
+    const srcStr = pathToString(src as string | URL);
+    wrapSync(() => fs.copy(srcStr, pathToString(dest as string | URL)), 'copyFileSync', srcStr);
 }
 
 export function truncateSync(path: PathLike, len?: number): void {
-    fs.truncate(pathToString(path as string | URL), len ?? 0);
+    const pathStr = pathToString(path as string | URL);
+    wrapSync(() => fs.truncate(pathStr, len ?? 0), 'truncateSync', pathStr);
 }
 
 export function ftruncateSync(fd: number, len?: number): void {
-    fs.ftruncate(fd, len ?? 0);
+    wrapSync(() => fs.ftruncate(fd, len ?? 0), 'ftruncateSync', `/proc/self/fd/${fd}`);
 }
 
 // ============================================================================
@@ -227,21 +236,25 @@ export function ftruncateSync(fd: number, len?: number): void {
 // ============================================================================
 
 export function linkSync(existingPath: PathLike, newPath: PathLike): void {
-    fs.link(pathToString(existingPath as string | URL), pathToString(newPath as string | URL));
+    const existingStr = pathToString(existingPath as string | URL);
+    wrapSync(() => fs.link(existingStr, pathToString(newPath as string | URL)), 'linkSync', existingStr);
 }
 
 export function symlinkSync(target: PathLike, path: PathLike, type?: 'file' | 'dir' | 'junction'): void {
-    fs.symlink(pathToString(target as string | URL), pathToString(path as string | URL));
+    const pathStr = pathToString(path as string | URL);
+    wrapSync(() => fs.symlink(pathToString(target as string | URL), pathStr), 'symlinkSync', pathStr);
 }
 
 export function readlinkSync(path: PathLike, options?: { encoding?: BufferEncoding | 'buffer' } | BufferEncoding): string | Uint8Array {
-    const result = fs.readlink(pathToString(path as string | URL));
+    const pathStr = pathToString(path as string | URL);
+    const result = wrapSync(() => fs.readlink(pathStr), 'readlinkSync', pathStr);
     const encoding = typeof options === 'string' ? options : options?.encoding;
     return encoding ? result : result;
 }
 
 export function realpathSync(path: PathLike, options?: { encoding?: BufferEncoding | 'buffer' } | BufferEncoding): string {
-    return fs.realpath(pathToString(path as string | URL));
+    const pathStr = pathToString(path as string | URL);
+    return wrapSync(() => fs.realpath(pathStr), 'realpathSync', pathStr);
 }
 
 // ============================================================================
@@ -249,28 +262,33 @@ export function realpathSync(path: PathLike, options?: { encoding?: BufferEncodi
 // ============================================================================
 
 export function chmodSync(path: PathLike, mode: Mode): void {
-    fs.chmod(pathToString(path as string | URL), modeToNumber(mode)!);
+    const pathStr = pathToString(path as string | URL);
+    wrapSync(() => fs.chmod(pathStr, modeToNumber(mode)!), 'chmodSync', pathStr);
 }
 
 export function fchmodSync(fd: number, mode: Mode): void {
-    fs.fchmod(fd, modeToNumber(mode)!);
+    wrapSync(() => fs.fchmod(fd, modeToNumber(mode)!), 'fchmodSync', `/proc/self/fd/${fd}`);
 }
 
 export function lchmodSync(path: PathLike, mode: Mode): void {
-    throw new Error('lchmodSync is not supported');
+    // lchmod is macOS-only; best-effort via chmod
+    const pathStr = pathToString(path as string | URL);
+    wrapSync(() => fs.chmod(pathStr, modeToNumber(mode)!), 'lchmodSync', pathStr);
 }
 
 export function chownSync(path: PathLike, uid: number, gid: number): void {
-    fs.chown(pathToString(path as string | URL), uid, gid);
+    const pathStr = pathToString(path as string | URL);
+    wrapSync(() => fs.chown(pathStr, uid, gid), 'chownSync', pathStr);
 }
 
 export function fchownSync(fd: number, uid: number, gid: number): void {
-    fs.fchown(fd, uid, gid);
+    wrapSync(() => fs.fchown(fd, uid, gid), 'fchownSync', `/proc/self/fd/${fd}`);
 }
 
 export function lchownSync(path: PathLike, uid: number, gid: number): void {
-    // lchown 需要特殊处理
-    throw new Error('lchownSync is not supported');
+    // C layer doesn't have sync lchown; best-effort via chown (follows symlink)
+    const pathStr = pathToString(path as string | URL);
+    wrapSync(() => fs.chown(pathStr, uid, gid), 'lchownSync', pathStr);
 }
 
 // ============================================================================
@@ -278,11 +296,14 @@ export function lchownSync(path: PathLike, uid: number, gid: number): void {
 // ============================================================================
 
 export function utimesSync(path: PathLike, atime: TimeLike, mtime: TimeLike): void {
-    fs.utimes(pathToString(path as string | URL), timeToNumber(atime) / 1000, timeToNumber(mtime) / 1000);
+    const pathStr = pathToString(path as string | URL);
+    wrapSync(() => fs.utimes(pathStr, timeToNumber(atime) / 1000, timeToNumber(mtime) / 1000), 'utimesSync', pathStr);
 }
 
 export function lutimesSync(path: PathLike, atime: TimeLike, mtime: TimeLike): void {
-    throw new Error('lutimesSync is not supported');
+    // C layer doesn't have sync lutimes; best-effort via utimes (follows symlink)
+    const pathStr = pathToString(path as string | URL);
+    wrapSync(() => fs.utimes(pathStr, timeToNumber(atime) / 1000, timeToNumber(mtime) / 1000), 'lutimesSync', pathStr);
 }
 
 // ============================================================================
@@ -290,37 +311,40 @@ export function lutimesSync(path: PathLike, atime: TimeLike, mtime: TimeLike): v
 // ============================================================================
 
 export function openSync(path: PathLike, flags?: string | number, mode?: Mode): number {
-    return fs.open(pathToString(path as string | URL), parseFlags(flags), modeToNumber(mode));
+    const pathStr = pathToString(path as string | URL);
+    return wrapSync(() => fs.open(pathStr, parseFlags(flags), modeToNumber(mode)), 'openSync', pathStr);
 }
 
 export function closeSync(fd: number): void {
-    fs.close(fd);
+    wrapSync(() => fs.close(fd), 'closeSync', `/proc/self/fd/${fd}`);
 }
 
 export function readSync(fd: number, buffer: Uint8Array, offset: number, length: number, position?: number | null): number {
+    const fdPath = `/proc/self/fd/${fd}`;
     if (position !== null && position !== undefined) {
-        return fs.pread(fd, buffer.subarray(offset, offset + length), position);
+        return wrapSync(() => fs.pread(fd, buffer.subarray(offset, offset + length), position), 'readSync', fdPath);
     }
-    return fs.read(fd, buffer.subarray(offset, offset + length));
+    return wrapSync(() => fs.read(fd, buffer.subarray(offset, offset + length)), 'readSync', fdPath);
 }
 
 export function writeSync(fd: number, buffer: Uint8Array | string, offset?: number, length?: number, position?: number | null): number {
     const data = typeof buffer === 'string' ? toUint8Array(buffer) : buffer;
     const actualOffset = offset ?? 0;
     const actualLength = length ?? data.length;
+    const fdPath = `/proc/self/fd/${fd}`;
 
     if (position !== null && position !== undefined) {
-        return fs.pwrite(fd, data.subarray(actualOffset, actualOffset + actualLength), position);
+        return wrapSync(() => fs.pwrite(fd, data.subarray(actualOffset, actualOffset + actualLength), position), 'writeSync', fdPath);
     }
-    return fs.write(fd, data.subarray(actualOffset, actualOffset + actualLength));
+    return wrapSync(() => fs.write(fd, data.subarray(actualOffset, actualOffset + actualLength)), 'writeSync', fdPath);
 }
 
 export function fsyncSync(fd: number): void {
-    fs.fsync(fd);
+    wrapSync(() => fs.fsync(fd), 'fsyncSync', `/proc/self/fd/${fd}`);
 }
 
 export function fdatasyncSync(fd: number): void {
-    fs.fdatasync(fd);
+    wrapSync(() => fs.fdatasync(fd), 'fdatasyncSync', `/proc/self/fd/${fd}`);
 }
 
 // ============================================================================
@@ -328,7 +352,7 @@ export function fdatasyncSync(fd: number): void {
 // ============================================================================
 
 export function flockSync(fd: number, operation: number): void {
-    fs.flock(fd, operation);
+    wrapSync(() => fs.flock(fd, operation), 'flockSync', `/proc/self/fd/${fd}`);
 }
 
 // ============================================================================
@@ -355,32 +379,29 @@ export function cpSync(src: PathLike, dest: PathLike, options?: CopyOptionsSync)
     const srcStr = pathToString(src as string | URL);
     const destStr = pathToString(dest as string | URL);
 
-    const srcStat = fs.stat(srcStr);
+    const srcStat = wrapSync(() => fs.stat(srcStr), 'cpSync', srcStr);
 
     if (srcStat.isDirectory) {
         if (!options?.recursive) {
             throw new Error('Cannot copy directory without recursive option');
         }
 
-        // 创建目标目录
         if (!fs.exists(destStr)) {
             fs.mkdir(destStr, srcStat.mode);
         }
 
-        // 递归复制
         const entries = fs.readdir(srcStr);
         for (const entry of entries) {
             cpSync(`${srcStr}/${entry}`, `${destStr}/${entry}`, options);
         }
     } else {
-        // 复制文件
         if (fs.exists(destStr) && !options?.force) {
             if (options?.errorOnExist) {
-                throw new Error(`File already exists: ${destStr}`);
+                throw new Error(`File exists: ${destStr}`);
             }
             return;
         }
 
-        fs.copy(srcStr, destStr);
+        wrapSync(() => fs.copy(srcStr, destStr), 'cpSync', srcStr);
     }
 }

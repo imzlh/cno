@@ -97,6 +97,16 @@ export function gunzipSync(buffer: ArrayBuffer | Uint8Array, options?: ZlibOptio
 }
 
 export function unzipSync(buffer: ArrayBuffer | Uint8Array, options?: ZlibOptions): Uint8Array {
+    const buf = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+    // Auto-detect format by magic number
+    if (buf[0] === 0x1f && buf[1] === 0x8b) {
+        return new Uint8Array(zlib.gunzip(buffer));
+    }
+    if (buf[0] === 0x78 && (buf[1] === 0x01 || buf[1] === 0x5e || buf[1] === 0x9c || buf[1] === 0xda)) {
+        return new Uint8Array(zlib.inflate(buffer));
+    }
+    // Try gunzip first, then inflate
+    try { return new Uint8Array(zlib.gunzip(buffer)); } catch {}
     return new Uint8Array(zlib.inflate(buffer));
 }
 
@@ -110,12 +120,14 @@ export function deflate(buffer: ArrayBuffer | Uint8Array, optionsOrCallback: Zli
     const opts = typeof optionsOrCallback === 'function' ? {} : optionsOrCallback;
     const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
     
-    try {
-        const result = deflateSync(buffer, opts);
-        cb?.(null, result);
-    } catch (err) {
-        cb?.(err as Error);
-    }
+    queueMicrotask(() => {
+        try {
+            const result = deflateSync(buffer, opts);
+            cb?.(null, result);
+        } catch (err) {
+            cb?.(err as Error);
+        }
+    });
 }
 
 export function deflateRaw(buffer: ArrayBuffer | Uint8Array, callback: CompressCallback): void;
@@ -124,12 +136,14 @@ export function deflateRaw(buffer: ArrayBuffer | Uint8Array, optionsOrCallback: 
     const opts = typeof optionsOrCallback === 'function' ? {} : optionsOrCallback;
     const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
     
-    try {
-        const result = deflateRawSync(buffer, opts);
-        cb?.(null, result);
-    } catch (err) {
-        cb?.(err as Error);
-    }
+    queueMicrotask(() => {
+        try {
+            const result = deflateRawSync(buffer, opts);
+            cb?.(null, result);
+        } catch (err) {
+            cb?.(err as Error);
+        }
+    });
 }
 
 export function gzip(buffer: ArrayBuffer | Uint8Array, callback: CompressCallback): void;
@@ -138,12 +152,14 @@ export function gzip(buffer: ArrayBuffer | Uint8Array, optionsOrCallback: ZlibOp
     const opts = typeof optionsOrCallback === 'function' ? {} : optionsOrCallback;
     const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
     
-    try {
-        const result = gzipSync(buffer, opts);
-        cb?.(null, result);
-    } catch (err) {
-        cb?.(err as Error);
-    }
+    queueMicrotask(() => {
+        try {
+            const result = gzipSync(buffer, opts);
+            cb?.(null, result);
+        } catch (err) {
+            cb?.(err as Error);
+        }
+    });
 }
 
 export function inflate(buffer: ArrayBuffer | Uint8Array, callback: CompressCallback): void;
@@ -152,12 +168,14 @@ export function inflate(buffer: ArrayBuffer | Uint8Array, optionsOrCallback: Zli
     const opts = typeof optionsOrCallback === 'function' ? {} : optionsOrCallback;
     const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
     
-    try {
-        const result = inflateSync(buffer, opts);
-        cb?.(null, result);
-    } catch (err) {
-        cb?.(err as Error);
-    }
+    queueMicrotask(() => {
+        try {
+            const result = inflateSync(buffer, opts);
+            cb?.(null, result);
+        } catch (err) {
+            cb?.(err as Error);
+        }
+    });
 }
 
 export function inflateRaw(buffer: ArrayBuffer | Uint8Array, callback: CompressCallback): void;
@@ -166,12 +184,14 @@ export function inflateRaw(buffer: ArrayBuffer | Uint8Array, optionsOrCallback: 
     const opts = typeof optionsOrCallback === 'function' ? {} : optionsOrCallback;
     const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
     
-    try {
-        const result = inflateRawSync(buffer, opts);
-        cb?.(null, result);
-    } catch (err) {
-        cb?.(err as Error);
-    }
+    queueMicrotask(() => {
+        try {
+            const result = inflateRawSync(buffer, opts);
+            cb?.(null, result);
+        } catch (err) {
+            cb?.(err as Error);
+        }
+    });
 }
 
 export function gunzip(buffer: ArrayBuffer | Uint8Array, callback: CompressCallback): void;
@@ -180,12 +200,14 @@ export function gunzip(buffer: ArrayBuffer | Uint8Array, optionsOrCallback: Zlib
     const opts = typeof optionsOrCallback === 'function' ? {} : optionsOrCallback;
     const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
     
-    try {
-        const result = gunzipSync(buffer, opts);
-        cb?.(null, result);
-    } catch (err) {
-        cb?.(err as Error);
-    }
+    queueMicrotask(() => {
+        try {
+            const result = gunzipSync(buffer, opts);
+            cb?.(null, result);
+        } catch (err) {
+            cb?.(err as Error);
+        }
+    });
 }
 
 export function unzip(buffer: ArrayBuffer | Uint8Array, callback: CompressCallback): void;
@@ -194,12 +216,14 @@ export function unzip(buffer: ArrayBuffer | Uint8Array, optionsOrCallback: ZlibO
     const opts = typeof optionsOrCallback === 'function' ? {} : optionsOrCallback;
     const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
     
-    try {
-        const result = unzipSync(buffer, opts);
-        cb?.(null, result);
-    } catch (err) {
-        cb?.(err as Error);
-    }
+    queueMicrotask(() => {
+        try {
+            const result = unzipSync(buffer, opts);
+            cb?.(null, result);
+        } catch (err) {
+            cb?.(err as Error);
+        }
+    });
 }
 
 // ============================================================================
