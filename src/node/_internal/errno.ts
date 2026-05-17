@@ -1,16 +1,16 @@
 /**
- * Node.js errno 错误封装工具
- * 将 C 模块的 errno 错误（CModuleError.Error，带负值的 .code）
- * 转换为 Node.js 的 ErrnoException（带字符串 .code 如 "ENOENT"）
+ * Node.js errno error wrapper utility
+ * Wraps C module errno errors (CModuleError.Error with negative .code)
+ * to Node.js ErrnoException (with string .code like "ENOENT")
  *
- * 参考 Deno 的 wrapFSErr 实现（src/utils/wrap.ts），
- * 但输出 Node.js 风格的 ErrnoException 而非 Deno errors。
+ * References Deno wrapFSErr implementation (src/utils/wrap.ts),
+ * but outputs Node.js-style ErrnoException instead of Deno errors.
  */
 
 const error = import.meta.use('error');
 
-// errno 值 → Node.js 错误码字符串 的映射
-// 仅包含 CModuleError.errno 类型中实际定义的常量
+// errno value -> Node.js error code string mapping
+// Only includes constants actually defined in CModuleError.errno
 const errnoToString: Record<number, string> = {
     [error.errno.EACCES]:       'EACCES',
     [error.errno.EADDRINUSE]:   'EADDRINUSE',
@@ -57,7 +57,7 @@ const errnoToString: Record<number, string> = {
     [error.errno.ENOTEMPTY]:    'ENOTEMPTY',
     [error.errno.ENOTSOCK]:     'ENOTSOCK',
     [error.errno.ENOTSUP]:      'ENOTSUP',
-    // EOPNOTSUPP === ENOTSUP (-4051), 已在上方映射
+    // EOPNOTSUPP === ENOTSUP (-4051), already mapped above
     [error.errno.EPROTO]:       'EPROTO',
     [error.errno.EPROTONOSUPPORT]: 'EPROTONOSUPPORT',
     [error.errno.EPROTOTYPE]:   'EPROTOTYPE',
@@ -90,10 +90,10 @@ const errnoToString: Record<number, string> = {
 };
 
 /**
- * 将 C 模块的 errno 错误转换为 Node.js ErrnoException
- * @param e - C 模块错误（CModuleError.Error，.code 为负值 errno）
- * @param syscall - 可选，系统调用名称（如 'open', 'read'）
- * @param path - 可选，文件路径
+ * Convert C module errno error to Node.js ErrnoException
+ * @param e - C module error (CModuleError.Error with negative .code errno)
+ * @param syscall - optional, system call name (e.g. "open", "read")
+ * @param path - optional, file path
  * @returns NodeJS.ErrnoException
  */
 export function toErrnoException(
@@ -101,12 +101,12 @@ export function toErrnoException(
     syscall?: string,
     path?: string
 ): NodeJS.ErrnoException {
-    // 如果已经是 ErrnoException（字符串 .code），直接返回
+    // If already ErrnoException (string .code), return directly
     if (e instanceof Error && (e as any).code && typeof (e as any).code === 'string') {
         return e as NodeJS.ErrnoException;
     }
 
-    // 非 CModuleError.Error（没有 .code 数字 errno）
+    // Not CModuleError.Error (no numeric .code errno)
     if (!(e instanceof Error) || typeof (e as any).code !== 'number') {
         const err = new Error((e as Error)?.message ?? String(e)) as NodeJS.ErrnoException;
         err.code = 'UNKNOWN';
@@ -117,7 +117,7 @@ export function toErrnoException(
     }
 
     const cErr = e as CModuleError.Error & Error;
-    const errnoValue = cErr.code; // 负值，如 -4061
+    const errnoValue = cErr.code; // negative value, e.g. -4061
     const codeStr = errnoToString[errnoValue] ?? `UNKNOWN(${errnoValue})`;
     const message = cErr.message || error.strerror(errnoValue) || 'Unknown error';
 
@@ -128,7 +128,7 @@ export function toErrnoException(
     if (syscall) err.syscall = syscall;
     if (path) err.path = path;
 
-    // 保留原始 stack
+    // Preserve original stack
     if (cErr.stack) {
         err.stack = cErr.stack;
     }
@@ -137,7 +137,7 @@ export function toErrnoException(
 }
 
 /**
- * 将返回 C 模块 errno 错误的 Promise 转换为在 reject 时返回 ErrnoException
+ * Convert Promise returning C module errno error to reject with ErrnoException
  */
 export function wrapPromise<T>(
     promise: Promise<T>,
@@ -150,7 +150,7 @@ export function wrapPromise<T>(
 }
 
 /**
- * 将可能同步抛出 C 模块 errno 错误的函数调用转换为抛出 ErrnoException
+ * Convert function call that may synchronously throw C module errno error to throw ErrnoException
  */
 export function wrapSync<T>(
     fn: () => T,

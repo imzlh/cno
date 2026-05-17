@@ -1,5 +1,5 @@
 /**
- * Node.js url 模块
+ * Node.js url module
  */
 
 const { URL, URLSearchParams } = globalThis;

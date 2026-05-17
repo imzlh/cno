@@ -1,5 +1,5 @@
 /**
- * Node.js fs 模块 - 同步操作
+ * Node.js fs module - sync operations
  */
 
 const fs = import.meta.use('fs');
@@ -7,7 +7,7 @@ import { toUint8Array, decodeBuffer, toNodeStat, toNodeDirent, parseFlags, pathT
 import { wrapSync } from '../_internal/errno';
 
 // ============================================================================
-// 类型定义
+// Type definitions
 // ============================================================================
 
 type PathLike = string | URL | Buffer;
@@ -28,7 +28,7 @@ function timeToNumber(time: TimeLike): number {
 }
 
 // ============================================================================
-// 文件读写
+// File read/write
 // ============================================================================
 
 export function readFileSync(path: PathLike | number, options?: { encoding?: BufferEncoding | null; flag?: string | number } | BufferEncoding): string | Uint8Array {
@@ -59,7 +59,7 @@ export function appendFileSync(path: PathLike | number, data: string | Uint8Arra
 }
 
 // ============================================================================
-// 文件状态
+// File status
 // ============================================================================
 
 export function existsSync(path: PathLike): boolean {
@@ -92,7 +92,7 @@ export function accessSync(path: PathLike, mode?: number): void {
 }
 
 // ============================================================================
-// 目录操作
+// Directory operations
 // ============================================================================
 
 export function mkdirSync(path: PathLike, options?: { mode?: number; recursive?: boolean } | number): string | undefined {
@@ -203,7 +203,7 @@ export function opendirSync(path: PathLike, options?: { encoding?: BufferEncodin
 }
 
 // ============================================================================
-// 文件操作
+// File operations
 // ============================================================================
 
 export function unlinkSync(path: PathLike): void {
@@ -232,7 +232,7 @@ export function ftruncateSync(fd: number, len?: number): void {
 }
 
 // ============================================================================
-// 链接操作
+// Link operations
 // ============================================================================
 
 export function linkSync(existingPath: PathLike, newPath: PathLike): void {
@@ -258,7 +258,7 @@ export function realpathSync(path: PathLike, options?: { encoding?: BufferEncodi
 }
 
 // ============================================================================
-// 权限操作
+// Permission operations
 // ============================================================================
 
 export function chmodSync(path: PathLike, mode: Mode): void {
@@ -292,7 +292,7 @@ export function lchownSync(path: PathLike, uid: number, gid: number): void {
 }
 
 // ============================================================================
-// 时间操作
+// Time operations
 // ============================================================================
 
 export function utimesSync(path: PathLike, atime: TimeLike, mtime: TimeLike): void {
@@ -307,7 +307,7 @@ export function lutimesSync(path: PathLike, atime: TimeLike, mtime: TimeLike): v
 }
 
 // ============================================================================
-// 底层文件描述符操作
+// Low-level file descriptor operations
 // ============================================================================
 
 export function openSync(path: PathLike, flags?: string | number, mode?: Mode): number {
@@ -348,7 +348,7 @@ export function fdatasyncSync(fd: number): void {
 }
 
 // ============================================================================
-// 文件锁定
+// File locking
 // ============================================================================
 
 export function flockSync(fd: number, operation: number): void {

@@ -1,6 +1,7 @@
 import { Headers } from "headers-polyfill";
 import { assert } from "../../utils/assert";
 import { version } from "../../../package.json"
+import { StreamingDecompressor } from "./zlib";
 
 const http = import.meta.use('http');
 const engine = import.meta.use('engine');
@@ -27,6 +28,7 @@ export class HttpRequestBuilder {
 
     static DEFAULT_HEADER = {
         "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "accept-encoding": "gzip, deflate",
         "accept-language": "zh-CN,zh;q=0.9",
         "user-agent": "CNO/" + version
     }
@@ -219,6 +221,7 @@ export class HttpResponseParser {
     private currentHeaderField: string = '';
     private completed: boolean = false;
     private headersComplete: boolean = false;
+    private decompressor: StreamingDecompressor | null = null;
 
     // 回调钩子
     public onHeadersComplete?: (statusCode: number, headers: globalThis.Headers) => void;
@@ -263,12 +266,23 @@ export class HttpResponseParser {
             if(!this.statusText) {
                 this.statusText = http.strstatus(this.statusCode);
             }
+
+            // 根据 Content-Encoding 创建解压器
+            const ce = this.headers.get('content-encoding');
+            if (ce) {
+                this.decompressor = new StreamingDecompressor(ce);
+            }
+
             this.onHeadersComplete?.(this.statusCode, this.headers);
         };
 
         // 响应体数据
         this.parser.onBody = (buf, off, len) => {
-            const view = new Uint8Array(buf as ArrayBuffer).slice(off, off + len);
+            let view = new Uint8Array(buf as ArrayBuffer).slice(off, off + len);
+            // 透明解压
+            if (this.decompressor?.isActive) {
+                view = this.decompressor.decompress(view);
+            }
             if(!this.onData) this.bodyChunks.push(view);    // 缓存
             this.onData?.(view);
         };
@@ -360,9 +374,10 @@ export class HttpResponseParser {
         this.currentHeaderField = '';
         this.completed = false;
         this.headersComplete = false;
+        this.decompressor = null;
 
         // 重置回调
-        this.onComplete = this.onData = 
+        this.onComplete = this.onData =
         this.onError = this.onHeadersComplete = undefined;
     }
 }

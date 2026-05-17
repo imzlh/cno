@@ -1,5 +1,5 @@
 /**
- * Node.js http 模块
+ * Node.js http module
  */
 
 export { STATUS_CODES, METHODS } from './server';

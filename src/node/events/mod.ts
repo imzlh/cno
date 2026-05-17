@@ -1,10 +1,10 @@
 /**
- * Node.js events 模块
- * 实现事件发射器模式
+ * Node.js events module
+ * EventEmitter pattern implementation
  */
 
 // ============================================================================
-// 类型定义
+// Type definitions
 // ============================================================================
 
 type EventMap<T> = Record<keyof T, any[]>;
@@ -26,7 +26,7 @@ export interface EventEmitterAsyncResourceOptions extends EventEmitterOptions {
 }
 
 // ============================================================================
-// EventEmitter 类
+// EventEmitter class
 // ============================================================================
 
 export class EventEmitter<T extends EventMap<T> = any> {
@@ -45,7 +45,7 @@ export class EventEmitter<T extends EventMap<T> = any> {
     }
 
     // ============================================================================
-    // 事件监听
+    // Event listening
     // ============================================================================
 
     addListener<E extends string | symbol>(eventName: E, listener: Listener<T, E>): this {
@@ -65,12 +65,12 @@ export class EventEmitter<T extends EventMap<T> = any> {
 
         listeners.push({ listener, once: false });
 
-        // 发射 newListener 事件
+        // Emit newListener event
         if (eventName !== 'newListener') {
             this.emit('newListener', eventName, listener);
         }
 
-        // 检查 maxListeners 警告
+        // Check maxListeners warning
         if (listeners.length > this._maxListeners && this._maxListeners !== 0) {
             console.warn(
                 `Possible EventEmitter memory leak detected. ${listeners.length} ${String(eventName)} listeners added. Use emitter.setMaxListeners() to increase limit`
@@ -131,7 +131,7 @@ export class EventEmitter<T extends EventMap<T> = any> {
     }
 
     // ============================================================================
-    // 移除监听器
+    // Remove listeners
     // ============================================================================
 
     removeListener<E extends string | symbol>(eventName: E, listener: Listener<T, E>): this {
@@ -168,7 +168,7 @@ export class EventEmitter<T extends EventMap<T> = any> {
     }
 
     // ============================================================================
-    // 发射事件
+    // Emit events
     // ============================================================================
 
     emit<E extends string | symbol>(eventName: E, ...args: any[]): boolean {
@@ -184,10 +184,10 @@ export class EventEmitter<T extends EventMap<T> = any> {
             return false;
         }
 
-        // 复制一份以防止在迭代时修改
+        // Copy to prevent modification during iteration
         const toCall = [...listeners];
 
-        // 移除 once 监听器
+        // Remove once listeners
         for (let i = listeners.length - 1; i >= 0; i--) {
             if (listeners[i].once) {
                 listeners.splice(i, 1);
@@ -198,7 +198,7 @@ export class EventEmitter<T extends EventMap<T> = any> {
             this._events.delete(eventName);
         }
 
-        // 调用监听器
+        // Invoke listeners
         for (const { listener } of toCall) {
             try {
                 const result = listener(...args);
@@ -219,7 +219,7 @@ export class EventEmitter<T extends EventMap<T> = any> {
     }
 
     // ============================================================================
-    // 查询方法
+    // Query methods
     // ============================================================================
 
     eventNames(): Array<string | symbol> {
@@ -261,7 +261,7 @@ export class EventEmitter<T extends EventMap<T> = any> {
     }
 
     // ============================================================================
-    // 静态方法
+    // Static methods
     // ============================================================================
 
     static getEventListeners(emitter: EventEmitter | EventTarget, name: string | symbol): Function[] {
@@ -371,7 +371,7 @@ export class EventEmitterAsyncResource extends EventEmitter {
 }
 
 // ============================================================================
-// 辅助函数
+// Helper functions
 // ============================================================================
 
 export function getEventListeners(emitter: EventEmitter | EventTarget, name: string | symbol): Function[] {

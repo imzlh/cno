@@ -1,5 +1,5 @@
 /**
- * Node.js assert 模块
+ * Node.js assert module
  */
 
 export type AssertPredicate = RegExp | (new () => object) | ((thrown: unknown) => boolean) | object | Error;

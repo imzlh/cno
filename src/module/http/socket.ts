@@ -86,6 +86,10 @@ export class TcpSocket {
     /**
      * Read plaintext from socket (SSL-aware).
      * Returns null on EOF.
+     *
+     * NOTE: TLS records may span multiple TCP segments. We must loop
+     * reading from TCP until SSL can decrypt a complete record, or until
+     * the connection is genuinely closed (n === 0).
      */
     @wrap
     async read(size = READ_SIZE): Promise<Uint8Array | null> {
@@ -95,26 +99,34 @@ export class TcpSocket {
             return (n === 0) ? null : buf.subarray(0, n);
         }
 
+        // 1. Try to drain any already-decrypted plaintext
         const buffered = this.sslRead(size);
         if (buffered) return buffered;
 
+        // 2. Feed any pending (leftover) ciphertext first
         if (this.pending) {
             const plain = this.feedAndRead(this.pending, size);
             this.pending = null;
             if (plain) return plain;
         }
 
+        // 3. Loop: read ciphertext from TCP → feed into SSL → try to read plaintext
+        //    Repeat until we get plaintext or the connection closes.
         const buf = new Uint8Array(size);
-        const n = await this.socket.read(buf);
-        if (n === 0) return null;
+        while (true) {
+            const n = await this.socket.read(buf);
+            if (n === 0) return null;   // genuine EOF
 
-        const cipher = buf.subarray(0, n);
-        const consumed = this.feedCipher(cipher);
-        if (consumed < cipher.length) {
-            this.pending = cipher.subarray(consumed);
+            const cipher = buf.subarray(0, n);
+            const consumed = this.feedCipher(cipher);
+            if (consumed < cipher.length) {
+                this.pending = cipher.subarray(consumed);
+            }
+
+            const plain = this.sslRead(size);
+            if (plain) return plain;
+            // SSL needs more data → keep reading from TCP
         }
-
-        return this.sslRead(size);
     }
 
     /**

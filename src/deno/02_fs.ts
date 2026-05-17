@@ -440,11 +440,15 @@ Object.assign(Deno, wrapFSns({
     },
 
     renameSync(oldPath, newPath) {
-        fs.rename(toString(oldPath), toString(newPath));
+        const np = toString(newPath);
+        if (fs.exists(np)) fs.unlink(np);
+        return fs.rename(toString(oldPath), np);
     },
 
-    rename(oldPath, newPath) {
-        return asfs.rename(toString(oldPath), toString(newPath));
+    async rename(oldPath, newPath) {
+        const np = toString(newPath);
+        try { await asfs.unlink(np); } catch {};
+        return asfs.rename(toString(oldPath), np);
     },
 
     copyFile(from, to) {

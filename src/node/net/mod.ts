@@ -1,6 +1,6 @@
 /**
- * Node.js net 模块
- * 基于 CModuleStreams 实现 TCP 网络
+ * Node.js net module
+ * Based on CModuleStreams for TCP networking
  */
 
 const streams = import.meta.use('streams');
@@ -10,7 +10,7 @@ import { EventEmitter } from '../events';
 import { Duplex, Readable, Writable } from '../stream';
 
 // ============================================================================
-// 类型定义
+// Type definitions
 // ============================================================================
 
 export interface AddressInfo {
@@ -596,7 +596,7 @@ export class Server extends EventEmitter {
 }
 
 // ============================================================================
-// 工厂函数
+// Factory functions
 // ============================================================================
 
 export function createServer(options?: ServerOpts, connectionListener?: (socket: Socket) => void): Server {
@@ -650,13 +650,13 @@ export function isIPv4(input: string): boolean {
 }
 
 export function isIPv6(input: string): boolean {
-    // 简化的 IPv6 检测
+    // Simplified IPv6 detection
     if (input.includes(':')) {
         const parts = input.split(':');
         if (parts.length < 3 || parts.length > 8) return false;
-        // 检查每个部分
+        // Check each part
         for (const part of parts) {
-            if (part === '') continue; // 允许 :: 
+            if (part === '') continue; // allow ::
             if (!/^[0-9a-fA-F]{1,4}$/.test(part)) return false;
         }
         return true;

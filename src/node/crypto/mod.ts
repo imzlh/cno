@@ -1,12 +1,12 @@
 /**
- * Node.js crypto 模块
- * 基于 CModuleCrypto 实现
+ * Node.js crypto module
+ * Based on CModuleCrypto implementation
  */
 
 const crypto = import.meta.use('crypto');
 
 // ============================================================================
-// 类型定义
+// Type definitions
 // ============================================================================
 
 export interface Hash {
@@ -50,7 +50,7 @@ export interface Verify {
 }
 
 // ============================================================================
-// 辅助函数
+// Helper functions
 // ============================================================================
 
 function toBuffer(data: ArrayBuffer | Uint8Array<ArrayBuffer> | string, encoding: string = 'utf8'): Uint8Array<ArrayBuffer> {
@@ -125,7 +125,7 @@ export function createHash(algorithm: string): Hash {
 }
 
 // ============================================================================
-// hash - 一次性哈希
+// hash - one-shot hash
 // ============================================================================
 
 export function hash(algorithm: string, data: ArrayBuffer | Uint8Array<ArrayBuffer> | string, outputEncoding?: string): ArrayBuffer | string {
@@ -190,7 +190,7 @@ export function createHmac(algorithm: string, key: ArrayBuffer | Uint8Array<Arra
 }
 
 // ============================================================================
-// hmac - 一次性 HMAC
+// hmac - one-shot HMAC
 // ============================================================================
 
 export function hmac(algorithm: string, key: ArrayBuffer | Uint8Array<ArrayBuffer> | string, data: ArrayBuffer | Uint8Array<ArrayBuffer> | string, outputEncoding?: string): ArrayBuffer | string {
@@ -277,7 +277,7 @@ export function createCipherivGCM(algorithm: string, key: ArrayBuffer | Uint8Arr
         },
         final(outputEncoding?: string) {
             const { data, tag } = gcm.final();
-            // 存储tag供getAuthTag使用
+            // Store tag for getAuthTag
             (this as any)._tag = tag;
             return encodeOutput(data, outputEncoding);
         },
@@ -320,7 +320,7 @@ export function createDecipherivGCM(algorithm: string, key: ArrayBuffer | Uint8A
 }
 
 // ============================================================================
-// 加密解密 - 一次性
+// Encryption/Decryption - one-shot
 // ============================================================================
 
 export function cipheriv(algorithm: string, key: ArrayBuffer | Uint8Array<ArrayBuffer>, iv: ArrayBuffer | Uint8Array<ArrayBuffer>, data: ArrayBuffer | Uint8Array<ArrayBuffer>, outputEncoding?: string): ArrayBuffer | string {
@@ -752,7 +752,7 @@ export function crc32(data: ArrayBuffer | Uint8Array<ArrayBuffer> | string): num
 }
 
 // ============================================================================
-// 编码工具
+// Encoding utilities
 // ============================================================================
 
 export const constants = {

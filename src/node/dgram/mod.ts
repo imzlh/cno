@@ -1,6 +1,6 @@
 /**
- * Node.js dgram 模块
- * 基于 CModuleUDP 实现 UDP 数据报
+ * Node.js dgram module
+ * Based on CModuleUDP for UDP datagrams
  */
 
 const udp = import.meta.use('udp');
@@ -28,7 +28,7 @@ function _getSocket(handle: CModuleUDP.UDP): CModuleSocket.PosixSocket | null {
 }
 
 // ============================================================================
-// 类型定义
+// Type definitions
 // ============================================================================
 
 export interface AddressInfo {
@@ -63,7 +63,7 @@ export interface SocketOptions {
 }
 
 // ============================================================================
-// Socket 类
+// Socket class
 // ============================================================================
 
 export class Socket extends EventEmitter {
@@ -96,7 +96,7 @@ export class Socket extends EventEmitter {
     bind(port?: number, address?: string, callback?: () => void): this;
     bind(options: BindOptions, callback?: () => void): this;
     bind(portOrOptions?: number | BindOptions, addressOrCallback?: string | (() => void), callback?: () => void): this {
-        // 异步执行绑定
+        // Asynchronously bind
         this._doBind(portOrOptions, addressOrCallback, callback);
         return this;
     }
@@ -145,7 +145,7 @@ export class Socket extends EventEmitter {
             this.emit('listening');
             cb?.();
 
-            // 开始接收
+            // Start receiving
             this._startRecv();
         } catch (err) {
             this.emit('error', err);
@@ -181,7 +181,7 @@ export class Socket extends EventEmitter {
     send(msg: string | Uint8Array | Array<string | Uint8Array>, port: number, address?: string, callback?: (error: Error | null, bytes?: number) => void): this;
     send(msg: string | Uint8Array | Array<string | Uint8Array>, port: number, address: string, callback: (error: Error | null, bytes?: number) => void): this;
     send(msg: string | Uint8Array | Array<string | Uint8Array>, port: number, addressOrCallback?: string | ((error: Error | null, bytes?: number) => void), callback?: (error: Error | null, bytes?: number) => void): this {
-        // 异步执行发送
+        // Asynchronously send
         this._doSend(msg, port, addressOrCallback, callback);
         return this;
     }
@@ -453,7 +453,7 @@ export class Socket extends EventEmitter {
 }
 
 // ============================================================================
-// 工厂函数
+// Factory functions
 // ============================================================================
 
 export function createSocket(type: 'udp4' | 'udp6', callback?: (msg: Uint8Array, rinfo: RemoteInfo) => void): Socket;

@@ -1,6 +1,6 @@
 /**
- * Node.js fs 模块 - 回调风格 API
- * 所有异步操作都支持回调函数
+ * Node.js fs module - callback-style API
+ * All async operations support callback functions
  */
 
 const fs = import.meta.use('fs');
@@ -10,7 +10,7 @@ import { toUint8Array, decodeBuffer, toNodeStat, toNodeStatAsync, toNodeDirent, 
 import { toErrnoException } from '../_internal/errno';
 
 // ============================================================================
-// 类型定义
+// Type definitions
 // ============================================================================
 
 type PathLike = string | URL | Buffer;
@@ -19,7 +19,7 @@ type Mode = number | string;
 type NoParamCallback = (err: NodeJS.ErrnoException | null) => void;
 
 // ============================================================================
-// 辅助函数
+// Helper functions
 // ============================================================================
 
 function callbackify<T>(promise: Promise<T>, callback: (err: NodeJS.ErrnoException | null, result?: T) => void, syscall?: string, path?: string): void {
@@ -43,7 +43,7 @@ function timeToNumber(time: TimeLike): number {
 }
 
 // ============================================================================
-// 文件读写 - 回调风格
+// File read/write - callback style
 // ============================================================================
 
 export function readFile(
@@ -138,7 +138,7 @@ export function appendFile(path: PathLike | number, data: any, options?: any, ca
 }
 
 // ============================================================================
-// 文件状态 - 回调风格
+// File status - callback style
 // ============================================================================
 
 export function exists(path: PathLike, callback: (exists: boolean) => void): void {
@@ -222,7 +222,7 @@ export function access(path: PathLike, mode?: any, callback?: any): void {
 }
 
 // ============================================================================
-// 目录操作 - 回调风格
+// Directory operations - callback style
 // ============================================================================
 
 export function mkdir(path: PathLike, callback: NoParamCallback): void;
@@ -332,7 +332,7 @@ export function readdir(path: PathLike, options?: any, callback?: any): void {
 }
 
 // ============================================================================
-// 文件操作 - 回调风格
+// File operations - callback style
 // ============================================================================
 
 export function unlink(path: PathLike, callback: NoParamCallback): void {
@@ -396,7 +396,7 @@ export function ftruncate(fd: number, len?: any, callback?: any): void {
 }
 
 // ============================================================================
-// 链接操作 - 回调风格
+// Link operations - callback style
 // ============================================================================
 
 export function link(existingPath: PathLike, newPath: PathLike, callback: NoParamCallback): void {
@@ -465,7 +465,7 @@ export function realpath(path: PathLike, options?: any, callback?: any): void {
 }
 
 // ============================================================================
-// 权限操作 - 回调风格
+// Permission operations - callback style
 // ============================================================================
 
 export function chmod(path: PathLike, mode: Mode, callback: NoParamCallback): void {
@@ -504,7 +504,7 @@ export function lchown(path: PathLike, uid: number, gid: number, callback: NoPar
 }
 
 // ============================================================================
-// 时间操作 - 回调风格
+// Time operations - callback style
 // ============================================================================
 
 export function utimes(path: PathLike, atime: TimeLike, mtime: TimeLike, callback: NoParamCallback): void {
@@ -536,7 +536,7 @@ export function lutimes(path: PathLike, atime: TimeLike, mtime: TimeLike, callba
 }
 
 // ============================================================================
-// 文件描述符操作 - 回调风格
+// File descriptor operations - callback style
 // ============================================================================
 
 export function open(path: PathLike, callback: (err: NodeJS.ErrnoException | null, fd: number) => void): void;
@@ -638,7 +638,7 @@ export function fdatasync(fd: number, callback: NoParamCallback): void {
 }
 
 // ============================================================================
-// statfs - 回调风格
+// statfs - callback style
 // ============================================================================
 
 export function statfs(path: PathLike, callback: (err: NodeJS.ErrnoException | null, stats: import('fs').StatsFs) => void): void;
@@ -671,7 +671,7 @@ export function statfs(path: PathLike, options?: any, callback?: any): void {
 }
 
 // ============================================================================
-// opendir - 回调风格
+// opendir - callback style
 // ============================================================================
 
 export function opendir(path: PathLike, callback: (err: NodeJS.ErrnoException | null, dir: import('fs').Dir) => void): void;

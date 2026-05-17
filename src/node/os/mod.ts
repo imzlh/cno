@@ -1,7 +1,7 @@
 /**
- * Node.js os 模块
- * 提供操作系统相关的实用方法和属性
- * 类型定义参考 @types/node/os.d.ts
+ * Node.js os module
+ * Operating system-related utility methods and properties
+ * Type definitions reference: @types/node/os.d.ts
  */
 
 const os = import.meta.use('os');
@@ -50,7 +50,7 @@ export interface UserInfo<T> {
 export type NetworkInterfaceInfo = NetworkInterfaceInfoIPv4 | NetworkInterfaceInfoIPv6;
 
 // ============================================================================
-// 常量
+// Constants
 // ============================================================================
 
 export const constants = {
@@ -83,84 +83,84 @@ export const constants = {
 };
 
 // ============================================================================
-// 常量属性
+// Constant properties
 // ============================================================================
 
-/** 空设备的路径 */
+/** Path of the null device */
 export const devNull = uname.sysname === 'Windows_NT' ? '\\\\.\\NUL' : '/dev/null';
 
-/** 操作系统特定的行尾标记 */
+/** Operating system-specific end-of-line marker */
 export const EOL = uname.sysname === 'Windows_NT' ? '\r\n' : '\n';
 
 // ============================================================================
-// 函数实现
+// Function implementations
 // ============================================================================
 
 /**
- * 返回操作系统的主机名
+ * Returns the operating system hostname
  */
 export function hostname(): string {
     return os.hostName;
 }
 
 /**
- * 返回包含 1、5 和 15 分钟平均负载的数组
+ * Returns an array containing the 1, 5, and 15 minute load averages
  */
 export function loadavg(): number[] {
     return os.loadavg();
 }
 
 /**
- * 返回系统正常运行时间（秒）
+ * Returns the system uptime in seconds
  */
 export function uptime(): number {
     return os.uptime();
 }
 
 /**
- * 返回可用系统内存量（字节）
+ * Returns the amount of free system memory in bytes
  */
 export function freemem(): number {
     return os.memoryUsage()['os.free'];
 }
 
 /**
- * 返回系统总内存量（字节）
+ * Returns the total amount of system memory in bytes
  */
 export function totalmem(): number {
     return os.memoryUsage()['os.total'];
 }
 
 /**
- * 返回 CPU 信息数组
+ * Returns an array of CPU information
  */
 export function cpus(): CpuInfo[] {
     return os.cpuInfo();
 }
 
 /**
- * 返回程序应使用的默认并行度估计值
+ * Returns an estimate of the default parallelism a program should use
  */
 export function availableParallelism(): number {
     return os.availableParallelism();
 }
 
 /**
- * 返回操作系统名称
+ * Returns the operating system name
  */
 export function type(): string {
     return uname.sysname;
 }
 
 /**
- * 返回操作系统发行版本
+ * Returns the operating system release
  */
 export function release(): string {
     return uname.release;
 }
 
 /**
- * 返回网络接口信息
+ * Returns network interface information
  */
 export function networkInterfaces(): NodeJS.Dict<NetworkInterfaceInfo[]> {
     const interfaces = os.networkInterfaces();
@@ -200,7 +200,7 @@ export function networkInterfaces(): NodeJS.Dict<NetworkInterfaceInfo[]> {
 }
 
 /**
- * 返回当前用户的主目录路径
+ * Returns the home directory of the current user
  */
 export function homedir(): string {
     return os.homeDir;
@@ -211,7 +211,7 @@ export interface UserInfoOptions {
 }
 
 /**
- * 返回当前有效用户的信息
+ * Returns information about the current effective user
  */
 export function userInfo(options?: UserInfoOptions): UserInfo<string> {
     const info = os.userInfo;
@@ -225,11 +225,11 @@ export function userInfo(options?: UserInfoOptions): UserInfo<string> {
 }
 
 /**
- * 返回 Node.js 二进制文件编译时的操作系统 CPU 架构
+ * Returns the operating system CPU architecture for which the Node.js binary was compiled
  */
 export function arch(): NodeJS.Architecture {
     const machine = uname.machine;
-    // 映射到 Node.js 架构名称
+    // Map to Node.js architecture names
     switch (machine) {
         case 'x86_64':
         case 'amd64':
@@ -262,14 +262,14 @@ export function arch(): NodeJS.Architecture {
 }
 
 /**
- * 返回内核版本字符串
+ * Returns the kernel version string
  */
 export function version(): string {
         return uname.version;
 }
 
 /**
- * 返回操作系统平台字符串
+ * Returns the operating system platform string
  */
 export function platform(): NodeJS.Platform {
     const platform = uname.sysname;
@@ -296,21 +296,21 @@ export function platform(): NodeJS.Platform {
 }
 
 /**
- * 返回机器类型字符串
+ * Returns the machine type string
  */
 export function machine(): string {
     return uname.machine;
 }
 
 /**
- * 返回临时文件的默认目录
+ * Returns the default directory for temporary files
  */
 export function tmpdir(): string {
     return os.tmpDir;
 }
 
 /**
- * 返回 CPU 的字节序
+ * Returns the byte order of the CPU
  */
 export function endianness(): 'BE' | 'LE' {
     const buffer = new ArrayBuffer(2);

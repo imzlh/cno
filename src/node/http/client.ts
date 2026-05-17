@@ -1,5 +1,5 @@
 /**
- * Node.js http 模块 - 客户端实现
+ * Node.js http module - client implementation
  */
 
 const engine = import.meta.use('engine');
@@ -173,6 +173,10 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
 
             if (!this.hasHeader('user-agent')) {
                 this.setHeader('User-Agent', 'Node.js/http');
+            }
+
+            if (!this.hasHeader('accept-encoding')) {
+                this.setHeader('Accept-Encoding', 'gzip, deflate');
             }
 
             if (!this.hasHeader('connection')) {

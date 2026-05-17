@@ -8,14 +8,14 @@ import { FileHandle } from 'fs/promises';
 import { toUint8Array, decodeBuffer, toNodeStatAsync, toNodeDirentAsync, parseFlags, pathToString, removeRecursive, mkdirRecursive } from './utils';
 import { toErrnoException, wrapPromise } from '../_internal/errno';
 
-// 辅助：包装 asyncfs 调用，自动转换 errno → ErrnoException
+// Helper: wrap asyncfs calls, auto-convert errno to ErrnoException
 function w<T>(promise: Promise<T>, syscall: string, path: string): Promise<T> {
     return wrapPromise(promise, syscall, path);
 }
 import { StatFsOptions, Stats } from 'fs';
 
 // ============================================================================
-// 类型定义
+// Type definitions
 // ============================================================================
 
 type PathLike = string | URL | Buffer;
@@ -36,7 +36,7 @@ function timeToNumber(time: TimeLike): number {
 }
 
 // ============================================================================
-// FileHandle 实现
+// FileHandle implementation
 // ============================================================================
 
 class FileHandleImpl implements FileHandle {
@@ -146,7 +146,7 @@ class FileHandleImpl implements FileHandle {
 }
 
 // ============================================================================
-// 文件读写
+// File read/write
 // ============================================================================
 
 export async function readFile(path: PathLike | number, options?: { encoding?: BufferEncoding | null; flag?: string | number } | BufferEncoding): Promise<string | Uint8Array> {
@@ -184,7 +184,7 @@ export async function appendFile(path: PathLike | number, data: string | Uint8Ar
 }
 
 // ============================================================================
-// 文件状态
+// File status
 // ============================================================================
 
 export async function access(path: PathLike, mode?: number): Promise<void> {
@@ -203,7 +203,7 @@ export async function lstat(path: PathLike, options?: { bigint?: boolean }): Pro
 }
 
 // ============================================================================
-// 目录操作
+// Directory operations
 // ============================================================================
 
 export async function mkdir(path: PathLike, options?: { mode?: number; recursive?: boolean } | number): Promise<string | undefined> {
@@ -324,7 +324,7 @@ export async function opendir(path: PathLike, options?: { encoding?: BufferEncod
 }
 
 // ============================================================================
-// 文件操作
+// File operations
 // ============================================================================
 
 export async function unlink(path: PathLike): Promise<void> {
@@ -350,7 +350,7 @@ export async function truncate(path: PathLike, len?: number): Promise<void> {
 }
 
 // ============================================================================
-// 链接操作
+// Link operations
 // ============================================================================
 
 export async function link(existingPath: PathLike, newPath: PathLike): Promise<void> {
@@ -372,7 +372,7 @@ export async function realpath(path: PathLike, options?: { encoding?: BufferEnco
 }
 
 // ============================================================================
-// 权限操作
+// Permission operations
 // ============================================================================
 
 export async function chmod(path: PathLike, mode: Mode): Promise<void> {
@@ -388,7 +388,7 @@ export async function lchown(path: PathLike, uid: number, gid: number): Promise<
 }
 
 // ============================================================================
-// 时间操作
+// Time operations
 // ============================================================================
 
 export async function utimes(path: PathLike, atime: TimeLike, mtime: TimeLike): Promise<void> {
@@ -417,7 +417,7 @@ export async function statfs(path: PathLike, options?: { bigint?: boolean }): Pr
 }
 
 // ============================================================================
-// 打开文件
+// Open file
 // ============================================================================
 
 export async function open(path: PathLike, flags?: string | number, mode?: Mode): Promise<FileHandleImpl> {
@@ -428,11 +428,11 @@ export async function open(path: PathLike, flags?: string | number, mode?: Mode)
 }
 
 // ============================================================================
-// 缺失的导出
+// Missing exports
 // ============================================================================
 
 export async function lchmod(path: PathLike, mode: Mode): Promise<void> {
-    // lchmod 通常不被支持，简化实现
+    // lchmod is typically not supported, simplified implementation
     await chmod(path, mode);
 }
 
@@ -631,5 +631,5 @@ export async function* glob(pattern: string | readonly string[], options?: { cwd
     yield* walk(cwd);
 }
 
-// 导出 constants
+// Export constants
 export { constants } from './constants';

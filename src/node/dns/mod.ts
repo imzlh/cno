@@ -1,6 +1,6 @@
 /**
- * Node.js dns 模块
- * 基于 CModuleDNS 实现
+ * Node.js dns module
+ * Based on CModuleDNS implementation
  */
 
 const dns = import.meta.use('dns');
@@ -8,7 +8,7 @@ const os = import.meta.use('os');
 import { toErrnoException } from '../_internal/errno';
 
 // ============================================================================
-// 常量
+// Constants
 // ============================================================================
 
 export const NODATA = 'ENODATA';
@@ -37,7 +37,7 @@ export const ADDRGETNETWORKPARAMS = 'EADDRGETNETWORKPARAMS';
 export const CANCELLED = 'ECANCELLED';
 
 // ============================================================================
-// 解析选项
+// Resolution options
 // ============================================================================
 
 export interface ResolveOptions {
@@ -60,7 +60,7 @@ export interface LookupAllOptions extends LookupOptions {
 }
 
 // ============================================================================
-// 解析记录类型
+// Resolution record types
 // ============================================================================
 
 export interface MxRecord {
@@ -104,7 +104,7 @@ export interface AnyRecord {
 }
 
 // ============================================================================
-// lookup - 基础域名解析
+// lookup - basic name resolution
 // ============================================================================
 
 export function lookup(hostname: string, callback: (err: NodeJS.ErrnoException | null, address: string, family: number) => void): void;
@@ -156,7 +156,7 @@ export function lookupSync(hostname: string, options?: LookupOptions): string | 
 }
 
 // ============================================================================
-// resolve - 解析特定类型记录
+// resolve - resolve specific record types
 // ============================================================================
 
 export function resolve(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
@@ -321,7 +321,7 @@ export function resolveNaptr(hostname: string, callback: (err: NodeJS.ErrnoExcep
 // ============================================================================
 
 export function reverse(ip: string, callback: (err: NodeJS.ErrnoException | null, hostnames: string[]) => void): void {
-    // 反向 DNS 查询
+    // Reverse DNS lookup
     const ptrName = ip.split('.').reverse().join('.') + '.in-addr.arpa';
     resolve(ptrName, 'PTR', callback);
 }

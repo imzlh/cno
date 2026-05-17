@@ -1,5 +1,5 @@
 /**
- * Node.js fs 模块 - 异步操作
+ * Node.js fs module - async operations
  */
 
 const asfs = import.meta.use('asyncfs');
@@ -9,7 +9,7 @@ import { toUint8Array, decodeBuffer, toNodeStatAsync, toNodeDirentAsync, parseFl
 import { Stats } from 'fs';
 
 // ============================================================================
-// 文件读写
+// File read/write
 // ============================================================================
 
 export async function readFile(path: string | URL | number, options?: { encoding?: BufferEncoding | null; flag?: string | number } | BufferEncoding): Promise<string | Uint8Array> {
@@ -47,7 +47,7 @@ export async function appendFile(path: string | URL | number, data: string | Uin
 }
 
 // ============================================================================
-// 文件状态
+// File status
 // ============================================================================
 
 export async function exists(path: string | URL): Promise<boolean> {
@@ -70,13 +70,13 @@ export async function lstat(path: string | URL, options?: { bigint?: boolean }):
 }
 
 export async function access(path: string | URL, mode?: number): Promise<void> {
-    // asyncfs 没有 access，用 stat 模拟
+    // asyncfs has no access, simulate with stat
     const pathStr = pathToString(path);
     await asfs.stat(pathStr);
 }
 
 // ============================================================================
-// 目录操作
+// Directory operations
 // ============================================================================
 
 export async function mkdir(path: string | URL, options?: { mode?: number; recursive?: boolean } | number): Promise<string | undefined> {
@@ -197,7 +197,7 @@ export async function opendir(path: string | URL, options?: { encoding?: BufferE
 }
 
 // ============================================================================
-// 文件操作
+// File operations
 // ============================================================================
 
 export async function unlink(path: string | URL): Promise<void> {
@@ -222,7 +222,7 @@ export async function truncate(path: string | URL, len?: number): Promise<void> 
 }
 
 // ============================================================================
-// 链接操作
+// Link operations
 // ============================================================================
 
 export async function link(existingPath: string | URL, newPath: string | URL): Promise<void> {
@@ -244,7 +244,7 @@ export async function realpath(path: string | URL, options?: { encoding?: Buffer
 }
 
 // ============================================================================
-// 权限操作
+// Permission operations
 // ============================================================================
 
 export async function chmod(path: string | URL, mode: number | string): Promise<void> {
@@ -257,7 +257,7 @@ export async function chown(path: string | URL, uid: number, gid: number): Promi
 }
 
 // ============================================================================
-// 时间操作
+// Time operations
 // ============================================================================
 
 export async function utimes(path: string | URL, atime: number | Date | string, mtime: number | Date | string): Promise<void> {
@@ -267,7 +267,7 @@ export async function utimes(path: string | URL, atime: number | Date | string, 
 }
 
 // ============================================================================
-// FileHandle 实现
+// FileHandle implementation
 // ============================================================================
 
 class FileHandleImpl implements FileHandle {
@@ -380,7 +380,7 @@ class FileHandleImpl implements FileHandle {
 }
 
 // ============================================================================
-// 打开文件
+// Open file
 // ============================================================================
 
 export async function open(path: string | URL, flags?: string | number, mode?: number | string) {

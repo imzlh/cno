@@ -1,6 +1,6 @@
 /**
- * Node.js process 模块
- * 提供当前 Node.js 进程的信息和控制能力
+ * Node.js process module
+ * Provides current Node.js process information and control
  */
 
 import { EventEmitter } from '../events';
@@ -15,7 +15,7 @@ const streams = import.meta.use('streams');
 const { stdin: denoStdin, stdout: denoStdout, stderr: denoStderr } = streams as any as Record<string, StdioStream>;
 
 // ============================================================================
-// 命令行参数
+// Command line arguments
 // ============================================================================
 
 const os_args = (function () {
@@ -31,7 +31,7 @@ const os_args = (function () {
 })();
 
 // ============================================================================
-// 辅助函数
+// Helper functions
 // ============================================================================
 
 function safeGetEnv(env: string): string | undefined {
@@ -43,7 +43,7 @@ function safeGetEnv(env: string): string | undefined {
 }
 
 // ============================================================================
-// 标准流 - 复用 deno/04_stdio 共享单例
+// Standard streams - reuse deno/04_stdio shared singleton
 // ============================================================================
 
 class ProcessWriteStream extends Writable {
@@ -168,7 +168,7 @@ class ProcessReadStream extends Readable {
 }
 
 // ============================================================================
-// hrtime 实现 (基于 performance.now 高精度)
+// hrtime implementation (high-precision based on performance.now)
 // ============================================================================
 
 const hrtimeOrigin = typeof performance !== 'undefined' ? performance.now() : Date.now();
@@ -200,7 +200,7 @@ hrtime.bigint = function (): bigint {
 };
 
 // ============================================================================
-// memoryUsage 实现
+// memoryUsage implementation
 // ============================================================================
 
 function memoryUsage(): NodeJS.MemoryUsage {
@@ -219,7 +219,7 @@ memoryUsage.rss = function (): number {
 };
 
 // ============================================================================
-// cpuUsage 实现
+// cpuUsage implementation
 // ============================================================================
 
 let lastCpuUsage = { user: 0, system: 0 };
@@ -259,7 +259,7 @@ function cpuUsage(previousValue?: NodeJS.CpuUsage): NodeJS.CpuUsage {
 }
 
 // ============================================================================
-// 信号处理
+// Signal handling
 // ============================================================================
 
 const signalMap: Map<NodeJS.Signals, Map<() => void, CModuleSignals.SignalHandler>> = new Map();
@@ -304,7 +304,7 @@ function removeSignalListener(signalName: NodeJS.Signals, listener: () => void):
 }
 
 // ============================================================================
-// 环境变量
+// Environment variables
 // ============================================================================
 
 const envProxy = new Proxy({} as NodeJS.ProcessEnv, {
@@ -393,7 +393,7 @@ class ProcessEventEmitter extends EventEmitter {
 const processEE = new ProcessEventEmitter();
 
 // ============================================================================
-// 标准流实例
+// Standard stream instances
 // ============================================================================
 
 const stdoutStream = new ProcessWriteStream(denoStdout);
@@ -401,7 +401,7 @@ const stderrStream = new ProcessWriteStream(denoStderr);
 const stdinStream = new ProcessReadStream(denoStdin);
 
 // ============================================================================
-// Process 对象
+// Process object
 // ============================================================================
 
 const uname = os.uname();

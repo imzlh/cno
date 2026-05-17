@@ -35,7 +35,7 @@ export interface PipeOptions {
 }
 
 // ============================================================================
-// Stream 基类
+// Stream base class
 // ============================================================================
 
 export class Stream extends EventEmitter {
@@ -829,7 +829,7 @@ export class PassThrough extends Transform {
 }
 
 // ============================================================================
-// 工厂函数
+// Factory functions
 // ============================================================================
 
 export function ReadableFrom(iterable: Iterable<any> | AsyncIterable<any>, options?: ReadableOptions): Readable {

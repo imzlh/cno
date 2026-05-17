@@ -1,6 +1,6 @@
 /**
- * Node.js child_process 模块
- * 基于 CModuleProcess 实现
+ * Node.js child_process module
+ * Based on CModuleProcess implementation
  */
 
 const proc = import.meta.use('process');
@@ -10,7 +10,7 @@ import { EventEmitter } from '../events';
 import { Writable, Readable } from '../stream';
 
 // ============================================================================
-// 类型定义
+// Type definitions
 // ============================================================================
 
 export interface SpawnOptions {
@@ -64,7 +64,7 @@ export interface ChildProcess extends EventEmitter {
 }
 
 // ============================================================================
-// ChildProcess 类
+// ChildProcess class
 // ============================================================================
 
 class ChildProcessImpl extends EventEmitter implements ChildProcess {
@@ -97,25 +97,25 @@ class ChildProcessImpl extends EventEmitter implements ChildProcess {
         this.spawnfile = command;
         this.spawnargs = args;
 
-        // 设置 stdin
+        // Set stdin
         if (process.stdin) {
             this._stdin = this._createWritable(process.stdin);
             this.stdin = this._stdin;
         }
 
-        // 设置 stdout
+        // Set stdout
         if (process.stdout) {
             this._stdout = this._createReadable(process.stdout);
             this.stdout = this._stdout;
         }
 
-        // 设置 stderr
+        // Set stderr
         if (process.stderr) {
             this._stderr = this._createReadable(process.stderr);
             this.stderr = this._stderr;
         }
 
-        // 异步等待进程退出
+        // Asynchronously wait for process exit
         this._waitExit();
     }
 
@@ -231,7 +231,7 @@ export function spawn(command: string, argsOrOptions?: string[] | SpawnOptions, 
         opts = argsOrOptions;
     }
 
-    // 处理 shell 选项
+    // Handle shell options
     if (opts.shell) {
         const defaultShell = os.uname().sysname === 'Windows_NT' ? 'cmd.exe' : '/bin/sh';
         const shell = typeof opts.shell === 'string' ? opts.shell : defaultShell;
@@ -247,7 +247,7 @@ export function spawn(command: string, argsOrOptions?: string[] | SpawnOptions, 
         detached: opts.detached,
     };
 
-    // 处理 stdio
+    // Handle stdio
     if (opts.stdio) {
         if (Array.isArray(opts.stdio)) {
             spawnOpts.stdin = opts.stdio[0] as any;

@@ -1,12 +1,12 @@
 /**
- * Node.js zlib 模块
- * 基于 CModuleZLib 实现
+ * Node.js zlib module
+ * Based on CModuleZLib implementation
  */
 
 const zlib = import.meta.use('zlib');
 
 // ============================================================================
-// 常量导出
+// Constant exports
 // ============================================================================
 
 // Compression Levels
@@ -31,7 +31,7 @@ export const FINISH = zlib.FINISH;
 export const BLOCK = zlib.BLOCK;
 
 // ============================================================================
-// 类型定义
+// Type definitions
 // ============================================================================
 
 export interface ZlibOptions {
@@ -58,7 +58,7 @@ export interface BrotliOptions {
 export type CompressCallback = (err: Error | null, result?: Uint8Array) => void;
 
 // ============================================================================
-// 内部辅助函数
+// Internal helper functions
 // ============================================================================
 
 function toUint8Array(data: ArrayBuffer | Uint8Array): Uint8Array {
@@ -66,7 +66,7 @@ function toUint8Array(data: ArrayBuffer | Uint8Array): Uint8Array {
 }
 
 // ============================================================================
-// 同步压缩/解压
+// Sync compress/decompress
 // ============================================================================
 
 export function deflateSync(buffer: ArrayBuffer | Uint8Array, options?: ZlibOptions): Uint8Array {
@@ -111,7 +111,7 @@ export function unzipSync(buffer: ArrayBuffer | Uint8Array, options?: ZlibOption
 }
 
 // ============================================================================
-// 异步压缩/解压（回调风格）
+// Async compress/decompress (callback style)
 // ============================================================================
 
 export function deflate(buffer: ArrayBuffer | Uint8Array, callback: CompressCallback): void;
@@ -227,7 +227,7 @@ export function unzip(buffer: ArrayBuffer | Uint8Array, optionsOrCallback: ZlibO
 }
 
 // ============================================================================
-// 流式压缩/解压
+// Stream compress/decompress
 // ============================================================================
 
 import { Transform, TransformOptions } from '../stream';
@@ -405,7 +405,7 @@ export class Unzip extends Transform {
 }
 
 // ============================================================================
-// 工厂函数
+// Factory functions
 // ============================================================================
 
 export function createDeflate(options?: ZlibOptions): Deflate {
@@ -444,7 +444,7 @@ export function createUnzip(options?: ZlibOptions): Unzip {
 }
 
 // ============================================================================
-// 校验和
+// Checksum
 // ============================================================================
 
 export function crc32(data: ArrayBuffer | Uint8Array, value?: number): number {
@@ -456,7 +456,7 @@ export function adler32(data: ArrayBuffer | Uint8Array, value?: number): number 
 }
 
 // ============================================================================
-// 常量
+// Constants
 // ============================================================================
 
 export const constants = {

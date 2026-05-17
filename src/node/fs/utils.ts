@@ -1,5 +1,5 @@
 /**
- * fs 模块内部工具函数
+ * fs module internal utility functions
  */
 
 import { Stats } from 'fs';
@@ -10,7 +10,7 @@ const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
 
 // ============================================================================
-// 数据转换
+// Data conversion
 // ============================================================================
 
 export function toUint8Array(data: string | Uint8Array | ArrayBuffer): Uint8Array<ArrayBuffer> {
@@ -31,7 +31,7 @@ export function decodeBuffer(buffer: Uint8Array<ArrayBuffer>, encoding?: BufferE
 }
 
 // ============================================================================
-// Stats 转换
+// Stats conversion
 // ============================================================================
 
 export function toNodeStat(stat: CModuleFS.Stats): import('fs').Stats {
@@ -95,7 +95,7 @@ export async function toNodeStatAsync(stat: CModuleAsyncFS.StatResult): Promise<
 }
 
 // ============================================================================
-// Dirent 转换
+// Dirent conversion
 // ============================================================================
 
 export function toNodeDirent(name: string, stat: CModuleFS.Stats): import('fs').Dirent {
@@ -127,7 +127,7 @@ export function toNodeDirentAsync(ent: CModuleAsyncFS.DirEnt): import('fs').Dire
 }
 
 // ============================================================================
-// 标志解析
+// Flag parsing
 // ============================================================================
 
 export function parseFlags(flag?: string | number): CModuleFS.OpenFlags {
@@ -147,7 +147,7 @@ export function parseFlags(flag?: string | number): CModuleFS.OpenFlags {
 }
 
 // ============================================================================
-// 路径处理
+// Path handling
 // ============================================================================
 
 export function pathToString(path: string | URL): string {
@@ -155,7 +155,7 @@ export function pathToString(path: string | URL): string {
 }
 
 // ============================================================================
-// 递归删除
+// Recursive deletion
 // ============================================================================
 
 export function removeRecursiveSync(targetPath: string): void {
@@ -192,7 +192,7 @@ export async function removeRecursive(targetPath: string): Promise<void> {
 }
 
 // ============================================================================
-// 递归创建目录
+// Recursive directory creation
 // ============================================================================
 
 export function mkdirRecursiveSync(pathStr: string, mode?: number): void {

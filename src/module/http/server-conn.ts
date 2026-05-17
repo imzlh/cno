@@ -14,6 +14,7 @@ import { assert } from "../../utils/assert";
 import { wrapFsClassDec as wrap } from "../../utils/wrap";
 import { TcpSocket } from "./socket";
 import type { Server } from "./server";
+import { parseAcceptEncoding, pickEncoding, shouldCompress, createCompressor } from "./zlib";
 
 const http   = import.meta.use("http");
 const engine = import.meta.use("engine");
@@ -135,6 +136,10 @@ export class ServerConnection extends TcpSocket {
     private responseEnded  = false;
     private chunkedEncoding = false;
 
+    // Content-Encoding compression
+    private compressEncoding: 'gzip' | 'deflate' | null = null;
+    private compressor: ((data: Uint8Array) => Uint8Array) | null = null;
+
     // Keep-alive
     private requestCount = 0;
     private keepAlive    = true;
@@ -182,6 +187,13 @@ export class ServerConnection extends TcpSocket {
             const version = `${this.parser.state.httpMajor}.${this.parser.state.httpMinor}`;
             // Bug fix: respect keepAlive per actual request/version
             this.keepAlive = version === "1.1" ? conn !== "close" : conn === "keep-alive";
+
+            // 解析 Accept-Encoding，选择压缩算法
+            const ae = this.headers.get("accept-encoding");
+            if (ae) {
+                const supported = parseAcceptEncoding(ae);
+                this.compressEncoding = pickEncoding(supported);
+            }
 
             const cl = this.headers.get("content-length");
             const te = this.headers.get("transfer-encoding");
@@ -232,6 +244,8 @@ export class ServerConnection extends TcpSocket {
         this.headersSent    = false;
         this.responseEnded  = false;
         this.chunkedEncoding = false;
+        this.compressEncoding = null;
+        this.compressor     = null;
 
         let destState = State.RESPONDING;
         try {
@@ -349,6 +363,18 @@ export class ServerConnection extends TcpSocket {
             this.chunkedEncoding = true;
         }
 
+        // 自动压缩：如果客户端支持、用户未设 Content-Encoding、Content-Type 适合压缩
+        if (this.compressEncoding && !headers["content-encoding"] && !this.chunkedEncoding) {
+            const ct = headers["content-type"];
+            if (!ct || shouldCompress(ct)) {
+                this.compressor = createCompressor(this.compressEncoding);
+                headers["content-encoding"] = this.compressEncoding;
+                // 压缩后 Content-Length 会变，移除它（用 chunked 或不设）
+                delete headers["content-length"];
+                this.chunkedEncoding = true;
+            }
+        }
+
         let raw = `HTTP/${this.requestHttpVersion} ${status} ${statusText}\r\n`;
         if (!headers["connection"]) {
             raw += this.keepAlive ? "Connection: keep-alive\r\n" : "Connection: close\r\n";
@@ -376,7 +402,12 @@ export class ServerConnection extends TcpSocket {
             }
         }
 
-        const data = typeof chunk === "string" ? engine.encodeString(chunk) : chunk;
+        let data = typeof chunk === "string" ? engine.encodeString(chunk) : chunk;
+
+        // 压缩 body
+        if (this.compressor) {
+            data = this.compressor(data);
+        }
 
         if (this.chunkedEncoding) {
             await this.write(engine.encodeString(data.length.toString(16) + "\r\n"));
@@ -402,6 +433,8 @@ export class ServerConnection extends TcpSocket {
             this.chunkedEncoding = false;
         }
 
+        this.compressor = null;
+        this.compressEncoding = null;
         this.responseEnded = true;
         this.state         = State.IDLE;
     }

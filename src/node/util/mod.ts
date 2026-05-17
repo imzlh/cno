@@ -1,12 +1,12 @@
 /**
- * Node.js util 模块
- * 实用工具函数
+ * Node.js util module
+ * Utility functions
  */
 
 const console = import.meta.use('console');
 
 // ============================================================================
-// 类型判断
+// Type checks
 // ============================================================================
 
 export function isBoolean(value: unknown): value is boolean {
@@ -70,7 +70,7 @@ export function isBuffer(value: unknown): value is Uint8Array {
 }
 
 // ============================================================================
-// 格式化
+// Formatting
 // ============================================================================
 
 export function format(format?: string, ...args: any[]): string {
@@ -123,7 +123,7 @@ export function format(format?: string, ...args: any[]): string {
         }
     }
 
-    // 添加剩余参数
+    // Append remaining arguments
     while (argIndex < args.length) {
         result += ' ' + inspect(args[argIndex++]);
     }
@@ -184,7 +184,7 @@ inspect.defaultOptions = defaultInspectOptions;
 inspect.custom = Symbol.for('nodejs.util.inspect.custom');
 
 // ============================================================================
-// 继承
+// Inheritance
 // ============================================================================
 
 export function inherits(constructor: Function, superConstructor: Function): void {
@@ -382,7 +382,7 @@ export namespace types {
     }
 
     export function isProxy(value: unknown): boolean {
-        return false; // 简化实现
+        return false; // simplified implementation
     }
 
     export function isRegExp(value: unknown): value is RegExp {

@@ -55,9 +55,34 @@ export interface ConnectionLike {
 /* ------------------------------------------------------------------ */
 /* CA Certificate Discovery                                           */
 /* ------------------------------------------------------------------ */
+
+// Cache the generated Windows CA bundle path to avoid regenerating on every connection.
+let windowsCaCache: string | null = null;
+let windowsCaPromise: Promise<string | null> | null = null;
+
+async function generateWindowsCaBundle(): Promise<string | null> {
+    // Most Windows systems have no CA bundle file. Generate one from the Windows certificate store.
+    const tmpDir = os.tmpDir || os.tmpdir?.() || 'C:\\Windows\\Temp';
+    // Use platform-appropriate separator
+    const tmp = tmpDir + '\\cno-ca-bundle.pem';
+
+    try {
+        const certs = windows!.exportCerts();
+        if (!certs || certs.length === 0) return null;
+
+        const pemContent = certs.join("\n");
+        const fh = await asfs.open(tmp, 'w', 0o600);
+        await fh.write(engine.encodeString(pemContent));
+        await fh.close();
+        return tmp;
+    } catch {
+        return null;
+    }
+}
+
 async function findSystemCaPath(): Promise<string | null> {
     const sysname = os.uname().sysname;
-    
+
     const candidates: string[] = await (async () => {
         switch (sysname) {
             case "Linux": return [
@@ -88,13 +113,7 @@ async function findSystemCaPath(): Promise<string | null> {
                 "/usr/local/etc/openssl@3/cert.pem",
                 "/System/Library/OpenSSL/certs",
             ];
-            case "Windows_NT": 
-                // most windows has no CA-bundle. We should generate one.
-                const tmp = join(os.tmpDir, "cno-cert-" + crypto.randomUUID() + '.pem');
-                const fh = await asfs.open(tmp, 'w', 0o600);
-                await fh.write(engine.encodeString(windows!.exportCerts().join("\n")));
-                await fh.close();
-                return [tmp];
+            case "Windows_NT": return []; // handled below with caching
             case "FreeBSD": return [
                 "/usr/local/share/certs/ca-root-nss.crt",     // ca_root_nss
                 "/usr/local/openssl/cert.pem",
@@ -113,10 +132,25 @@ async function findSystemCaPath(): Promise<string | null> {
             const stat = await asfs.stat(path);
             if (stat.isFile) return path;
             if (stat.isDirectory && path.includes("certs")) {
-                return path; 
+                return path;
             }
         } catch { /* not found */ }
     }
+
+    // Windows: generate CA bundle from system certificate store (cached)
+    if (sysname === "Windows_NT") {
+        if (windowsCaCache) return windowsCaCache;
+        // Deduplicate concurrent calls
+        if (!windowsCaPromise) {
+            windowsCaPromise = generateWindowsCaBundle().then(result => {
+                windowsCaCache = result;
+                windowsCaPromise = null;
+                return result;
+            });
+        }
+        return windowsCaPromise;
+    }
+
     return null;
 }
 
