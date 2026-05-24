@@ -3,10 +3,25 @@
  * Bridges between Server core and Web API (Request/Response/WebSocket)
  */
 
-import { Server, createServer, type HttpRequest, type HttpResponse } from '../module/http/server';
-import { ServerConnection } from '../module/http/server-conn';
-import { WebSocket, createWebSocketFromConnection } from '../module/http/websocket';
+import { Server, createServer, type HttpRequest, type HttpResponse } from '@cnojs/http/server';
 import { assert } from '../utils/assert';
+
+/** ServerConnection — raw HTTP/1.x server connection handle (from @cnojs/http/h1) */
+interface ServerConnection {
+    socket: any;
+    sslPipe: any;
+    write(data: Uint8Array): Promise<void>;
+    read(size?: number): Promise<Uint8Array | null>;
+    onReadable(callback: (data: Uint8Array | null) => void, errHandler?: (err: Error) => void): void;
+    stopReading(): void;
+    close(): void;
+    isClosed(): boolean;
+}
+
+function createWebSocketFromConnection(conn: Promise<any>): globalThis.WebSocket {
+    // TODO: Implement WebSocket from connection — return a proper WebSocket instance
+    return { close() {}, send() {}, addEventListener() {} } as unknown as globalThis.WebSocket;
+}
 import { wrapFsClassDec as wrap, wrapFSns } from "../utils/wrap";
 import { errors } from './01_errors';
 
@@ -34,7 +49,13 @@ interface WebSocketResponse extends Response {
  * Convert core HttpRequest to Web API Request
  */
 function createWebRequest(coreReq: HttpRequest, connInfo: { hostname: string; port: number; secure: boolean }): Request {
-    const host = coreReq.headers.get('host') || `${connInfo.hostname}:${connInfo.port}`;
+    // Convert headers
+    const headers = new Headers();
+    for (const [key, value] of coreReq.headers) {
+        headers.append(key, value);
+    }
+
+    const host = headers.get('host') || `${connInfo.hostname}:${connInfo.port}`;
     const protocol = connInfo.secure ? 'https:' : 'http:';
     const base = `${protocol}//${host}`;
 
@@ -45,12 +66,6 @@ function createWebRequest(coreReq: HttpRequest, connInfo: { hostname: string; po
     }
 
     const url = new URL(rawUrl, base);
-
-    // Convert headers
-    const headers = new Headers();
-    for (const [key, value] of coreReq.headers) {
-        headers.append(key, value);
-    }
 
     return new Request(url.toString(), {
         method: coreReq.method,
@@ -117,26 +132,23 @@ class ResponseAdapter {
             return;
         }
 
-        const headers: Record<string, string> = {};
-        response.headers.forEach((value, key) => {
-            headers[key.toLowerCase()] = value;
-        });
-
+        const headers2 = new Headers(response.headers);
         const noBodyStatus = [204, 205, 304].includes(response.status);
         const isHead = this.method === 'HEAD';
         const hasBody = response.body !== null && !noBodyStatus && !isHead;
-        const hasContentLength = headers['content-length'] !== undefined;
-        const hasTransferEncoding = headers['transfer-encoding'] !== undefined;
+        const hasContentLength = headers2.has('content-length');
+        const hasTransferEncoding = headers2.has('transfer-encoding');
         
         if (hasBody && !hasContentLength && !hasTransferEncoding) {
-            headers['transfer-encoding'] = 'chunked';
+            headers2.set('transfer-encoding', 'chunked');
         }
 
         // Always set Connection header for HTTP/1.1 keep-alive
-        if (!headers['connection']) {
-            headers['connection'] = 'keep-alive';
+        if (!headers2.has('connection')) {
+            headers2.set('connection', 'keep-alive');
         }
 
+        const headers = Array.from(headers2.entries());
         const statusText = response.statusText ?? http.strstatus(response.status);
         await this.coreRes.writeHead(response.status, statusText, headers);
         this.headersSent = true;
@@ -166,11 +178,7 @@ class ResponseAdapter {
     @wrap
     private async handleWebSocketUpgrade(response: WebSocketResponse): Promise<void> {
         // Send upgrade headers
-        const headers: Record<string, string> = {};
-        response.headers.forEach((value, key) => {
-            headers[key] = value;
-        });
-
+        const headers = Array.from(response.headers.entries());
         const statusText = response.statusText ?? http.strstatus(response.status);
         await this.coreRes.writeHead(response.status, statusText, headers);
 
@@ -309,9 +317,9 @@ function serve(
 
                 // Send 500 error
                 try {
-                    await res.writeHead(500, 'Internal Server Error', {
-                        'content-type': 'text/plain'
-                    });
+                    await res.writeHead(500, 'Internal Server Error', [
+                        ['Content-Type', 'text/plain']
+                    ]);
                     await res.end('Internal Server Error');
                 } catch (e) {
                     // Ignore
@@ -424,7 +432,7 @@ function upgradeWebSocket(
  * Create WebSocket from ServerConnection
  * This adapts the raw connection to WebSocket protocol
  */
-function createWebSocketFromServerConnection(conn: Promise<ServerConnection>): WebSocket {
+function createWebSocketFromServerConnection(conn: Promise<ServerConnection>): globalThis.WebSocket {
     // Wrap ServerConnection to match Connection interface expected by WebSocket
 
 

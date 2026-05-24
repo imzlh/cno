@@ -103,14 +103,14 @@ await import('./worker');
 const { Headers } = await import('headers-polyfill');
 Reflect.set(globalThis, 'Headers', Headers);
 
-// fetch & xhr polyfill
-await import('../module/http/fetch');
+// fetch & xhr polyfill (CNO secondary wrapping layer)
+await import('./fetch');
 
-// sse(EventSource) polyfill
-await import('../module/http/sse');
+// sse(EventSource) polyfill (CNO secondary wrapping layer)
+await import('./sse');
 
-// websocket
-await import('../module/http/websocket');
+// websocket (CNO secondary wrapping layer)
+await import('./websocket');
 
 // crypto
 await import('./crypto');
@@ -129,6 +129,9 @@ await import('./broadcast-channel');
 
 // Intl (partial support)
 await import('./intl');
+
+// webtransport (QUIC)
+await import('./webtransport');
 
 // temporal
 // const { Temporal } = await import('temporal-polyfill');

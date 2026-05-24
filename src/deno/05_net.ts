@@ -6,7 +6,7 @@ const stream = import.meta.use('streams');
 const ssl = import.meta.use('ssl');
 const dns = import.meta.use('dns');
 
-import { dnsCache } from '../module/http/dns-cache';
+import { dnsCache } from '@cnojs/http/dns-cache';
 
 const symbolGetPipe = Symbol('Stream.getPipe');
 

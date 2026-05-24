@@ -1,7 +1,13 @@
 /**
- * Node.js module module (stub)
- * Module system utilities
+ * Node.js module module
+ * Based on cts CJS loader via cts.internal symbol
  */
+
+const CTS_INTERNAL = (globalThis as any)[Symbol.for('cts.internal')] as {
+    mkRequire: (parentPath: string, parentMod: any) => NodeJS.Require;
+    builtinModules: string[];
+    cache: Map<string, any>;
+} | undefined;
 
 export interface SourceMap {
     payload: any;
@@ -9,6 +15,9 @@ export interface SourceMap {
 }
 
 export function createRequire(filename: string | URL): NodeJS.Require {
+    if (CTS_INTERNAL) {
+        return CTS_INTERNAL.mkRequire(filename.toString(), undefined);
+    }
     return require;
 }
 
@@ -26,9 +35,11 @@ export function _pathFilename(filename: string): string {
     return filename;
 }
 
-export const builtinModules: string[] = [];
+export const builtinModules: string[] = CTS_INTERNAL?.builtinModules ?? [];
 
-export const _cache: Record<string, any> = {};
+export const _cache: Record<string, any> = CTS_INTERNAL?.cache
+    ? Object.fromEntries(CTS_INTERNAL.cache) as Record<string, any>
+    : {};
 
 export const _extensions: Record<string, (module: any, filename: string) => void> = {
     '.js'() {},
@@ -43,7 +54,7 @@ export function findSourceMap(_path: string, _error?: Error): SourceMap | undefi
 export const globalPaths: string[] = [];
 
 export function isBuiltin(moduleName: string): boolean {
-    return builtinModules.includes(moduleName);
+    return builtinModules.includes(moduleName) || builtinModules.includes(moduleName.startsWith('node:') ? moduleName.slice(5) : moduleName);
 }
 
 export function syncBuiltinESMExports(): void {}

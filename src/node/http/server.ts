@@ -4,7 +4,7 @@ const text = import.meta.use('text');
 
 import { Readable, Writable } from '../stream';
 import { Socket, Server as NetServer, AddressInfo } from '../net';
-import type { HttpRequest, HttpResponse } from '../../module/http/server';
+import type { HttpRequest, HttpResponse } from '@cnojs/http/server';
 
 // @ts-ignore cno namespace
 const { createServer: createHttpServer } = http.__cno as import('http');
@@ -656,15 +656,9 @@ export class ServerImpl extends NetServer implements Server {
             }
 
             if (req.body) {
-                req.body.pipeTo(new WritableStream({
-                    write(chunk) {
-                        incoming.push(chunk);
-                    },
-                    close() {
-                        incoming.push(null);
-                        incoming.complete = true;
-                    }
-                })).catch(() => {});
+                incoming.push(req.body);
+                incoming.push(null);
+                incoming.complete = true;
             }
 
             const response = new ServerResponseImpl();
@@ -674,13 +668,13 @@ export class ServerImpl extends NetServer implements Server {
             response.end = ((...args: any[]) => {
                 const result = originalEnd(...args);
                 if (!response.headersSent) {
-                    const headers: Record<string, string> = {};
+                    const rawHeaders: Array<[string, string]> = [];
                     for (const [key, value] of Object.entries(response.getHeaders())) {
                         if (value !== undefined) {
-                            headers[key] = Array.isArray(value) ? value.join(', ') : String(value);
+                            rawHeaders.push([key, Array.isArray(value) ? value.join(', ') : String(value)]);
                         }
                     }
-                    res.writeHead(response.statusCode, response.statusMessage, headers);
+                    res.writeHead(response.statusCode, response.statusMessage, rawHeaders);
                 }
                 return result;
             }) as any;

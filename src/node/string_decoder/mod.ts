@@ -3,11 +3,13 @@
  * Decodes buffer data into strings preserving multi-byte characters
  */
 
+const { Decoder } = import.meta.use('text');
+
 export class StringDecoder {
     private _encoding: string;
     private _buffer: Uint8Array;
 
-    constructor(encoding: BufferEncoding = 'utf8') {
+    constructor(encoding: string = 'utf8') {
         this._encoding = encoding;
         this._buffer = new Uint8Array(0);
     }
@@ -18,7 +20,7 @@ export class StringDecoder {
         combined.set(this._buffer);
         combined.set(data, this._buffer.length);
 
-        const decoder = new TextDecoder(this._encoding, { stream: true });
+        const decoder = new Decoder(this._encoding, { stream: true });
         const result = decoder.decode(combined);
         this._buffer = new Uint8Array(0);
         return result;
@@ -30,12 +32,12 @@ export class StringDecoder {
             const combined = new Uint8Array(this._buffer.length + data.length);
             combined.set(this._buffer);
             combined.set(data, this._buffer.length);
-            const decoder = new TextDecoder(this._encoding);
+            const decoder = new Decoder(this._encoding);
             const result = decoder.decode(combined);
             this._buffer = new Uint8Array(0);
             return result;
         }
-        const decoder = new TextDecoder(this._encoding);
+        const decoder = new Decoder(this._encoding);
         const result = decoder.decode(this._buffer);
         this._buffer = new Uint8Array(0);
         return result;

@@ -19,6 +19,8 @@
   "license": "MIT",
   "packageManager": "pnpm@10.17.1",
   "dependencies": {
+    "@cnojs/http": "workspace:../http",
+    "@cnojs/quic": "workspace:../ext-quic",
     "@formatjs/intl": "^4.0.6",
     "@formatjs/intl-datetimeformat": "^7.0.6",
     "@formatjs/intl-displaynames": "^7.0.6",

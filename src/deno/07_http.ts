@@ -4,7 +4,7 @@ const engine = import.meta.use('engine');
 const os = import.meta.use('os');
 
 import { wrapFsClassDec as wrap } from '../utils/wrap';
-import { dnsCache } from '../module/http/dns-cache';
+import { dnsCache } from '@cnojs/http/dns-cache';
 
 /**
  * HTTP proxy connection - CONNECT tunnel

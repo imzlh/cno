@@ -6,10 +6,12 @@ const engine = import.meta.use('engine');
 const streams = import.meta.use('streams');
 const timers = import.meta.use('timers');
 const http = import.meta.use('http');
+const ssl = import.meta.use('ssl');
 
 import { Socket } from '../net';
-import { dnsCache } from '../../module/http/dns-cache';
+import { dnsCache } from '@cnojs/http/dns-cache';
 import { OutgoingMessageImpl, IncomingMessageImpl, OutgoingHttpHeaders, IncomingHttpHeaders } from './server';
+import { TLSSocket, SecureContext } from '../tls';
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
@@ -76,6 +78,7 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
     path: string = '/';
 
     private _tcp: CModuleStreams.TCP | null = null;
+    private _tlsSocket: TLSSocket | null = null;
     private _options: ClientRequestArgs;
     private _callback: ((res: IncomingMessageImpl) => void) | null = null;
     private _aborted: boolean = false;
@@ -157,11 +160,35 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
                 return;
             }
 
-            const socket = new Socket();
-            (socket as any)._tcp = this._tcp;
-            this.socket = socket;
+            // TLS handshake for HTTPS
+            if (this.protocol === 'https:') {
+                const secureContext = new SecureContext({
+                    ca: (this._options as any).ca,
+                    cert: (this._options as any).cert,
+                    key: (this._options as any).key,
+                    ciphers: (this._options as any).ciphers,
+                });
+                const tlsSocket = new TLSSocket(this._tcp, {
+                    isServer: false,
+                    rejectUnauthorized: (this._options as any).rejectUnauthorized ?? true,
+                    secureContext,
+                    servername: (this._options as any).servername ?? this.host,
+                });
+                await new Promise<void>((resolve, reject) => {
+                    tlsSocket.on('secureConnect', resolve);
+                    tlsSocket.on('error', reject);
+                    setTimeout(() => reject(new Error('TLS handshake timeout')), 10000);
+                });
+                this._tlsSocket = tlsSocket;
+                this.socket = tlsSocket as any;
+            } else {
+                const socket = new Socket();
+                (socket as any)._tcp = this._tcp;
+                this.socket = socket;
+            }
+
             this._socketAssigned = true;
-            this.emit('socket', socket);
+            this.emit('socket', this.socket);
 
             if (!this.hasHeader('host')) {
                 this.setHeader('Host', port === 80 || port === 443 ? this.host : `${this.host}:${port}`);
@@ -192,11 +219,12 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
             requestLine += this._formatHeaders();
             requestLine += '\r\n';
 
-            await this._tcp.write(engine.encodeString(requestLine));
+            const writeTarget = this._tlsSocket ?? this._tcp;
+            await writeTarget.write(engine.encodeString(requestLine));
             this.headersSent = true;
 
             for (const chunk of this._requestBody) {
-                await this._tcp.write(chunk);
+                await writeTarget.write(chunk);
             }
             this._bodySent = true;
 
@@ -206,14 +234,14 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
         }
     }
 
-    private async _readResponse(): Promise<void> {
+    private _readResponse(): void {
         if (!this._tcp) return;
 
         const parser = new http.Parser(http.RESPONSE);
         const res = new IncomingMessageImpl(this.socket!);
         this._response = res;
-        let headersComplete = false;
         let currentHeaderField = '';
+        const pendingChunks: Uint8Array[] = [];
 
         const decode = (buf: any, off: number, len: number) =>
             engine.decodeString(new Uint8Array(buf as ArrayBuffer).slice(off, off + len));
@@ -243,7 +271,6 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
         };
 
         parser.onHeadersComplete = () => {
-            headersComplete = true;
             res.statusCode = parser.state.status;
             res.httpVersion = `${parser.state.httpMajor}.${parser.state.httpMinor}`;
             res.httpVersionMajor = parser.state.httpMajor;
@@ -251,65 +278,80 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
 
             this.emit('response', res);
             if (this._callback) this._callback(res);
+
+            // Flush any chunks that arrived during header parsing
+            for (const chunk of pendingChunks) {
+                res.push(chunk);
+            }
+            pendingChunks.length = 0;
         };
 
         parser.onBody = (buf, off, len) => {
             const data = new Uint8Array(buf as ArrayBuffer).slice(off, off + len);
-            res.push(data);
+            if (res.statusCode === 0) {
+                pendingChunks.push(data); // headers not complete yet, buffer
+            } else {
+                res.push(data);
+            }
         };
 
         parser.onMessageComplete = () => {
             res.push(null);
             res.complete = true;
+            this._cleanup();
         };
 
-        const buffer = new Uint8Array(65536);
-
-        const readLoop = async () => {
-            while (!this._aborted) {
-                let toParse: Uint8Array;
-
-                if (this._pendingData) {
-                    toParse = this._pendingData;
-                    this._pendingData = null;
-
-                    const n = await this._tcp!.read(buffer);
-                    if (n === 0) {
-                        this._cleanup();
-                        return;
-                    }
-                    const combined = new Uint8Array(toParse.byteLength + n);
-                    combined.set(toParse);
-                    combined.set(buffer.subarray(0, n), toParse.byteLength);
-                    toParse = combined;
-                } else {
-                    const n = await this._tcp!.read(buffer);
-                    if (n === 0) {
-                        this._cleanup();
-                        return;
-                    }
-                    toParse = buffer.subarray(0, n);
-                }
-
-                const result = parser.execute(toParse.buffer.slice(toParse.byteOffset, toParse.byteOffset + toParse.byteLength));
+        // Determine the data source: TLS socket (event-driven) or plain TCP (async read)
+        if (this._tlsSocket) {
+            this._tlsSocket.on('data', (chunk: Uint8Array) => {
+                if (this._aborted) return;
+                const ab = chunk.buffer instanceof SharedArrayBuffer
+                    ? new Uint8Array(chunk).buffer
+                    : chunk.buffer;
+                const result = parser.execute(ab.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength));
                 if (result.errno !== 0) {
                     this._cleanup();
-                    return;
                 }
-
-                // @ts-ignore - remainder exists at runtime
-                const remainder = result.remainder as number;
-                if (remainder > 0) {
-                    const parsedLength = toParse.byteLength - remainder;
-                    this._pendingData = toParse.subarray(parsedLength);
+            });
+            this._tlsSocket.on('end', () => { this._cleanup(); });
+            this._tlsSocket.on('error', (err: Error) => {
+                if (!this._aborted) this.emit('error', err);
+                this._cleanup();
+            });
+        } else {
+            const buffer = new Uint8Array(65536);
+            const readLoop = async () => {
+                while (!this._aborted) {
+                    let toParse: Uint8Array;
+                    if (this._pendingData) {
+                        toParse = this._pendingData;
+                        this._pendingData = null;
+                        const n = await this._tcp!.read(buffer);
+                        if (n === 0) { this._cleanup(); return; }
+                        const combined = new Uint8Array(toParse.byteLength + n);
+                        combined.set(toParse);
+                        combined.set(buffer.subarray(0, n), toParse.byteLength);
+                        toParse = combined;
+                    } else {
+                        const n = await this._tcp!.read(buffer);
+                        if (n === 0) { this._cleanup(); return; }
+                        toParse = buffer.subarray(0, n);
+                    }
+                    const result = parser.execute(toParse.buffer.slice(toParse.byteOffset, toParse.byteOffset + toParse.byteLength));
+                    if (result.errno !== 0) { this._cleanup(); return; }
+                    // @ts-ignore - remainder exists at runtime
+                    const remainder = result.remainder as number;
+                    if (remainder > 0) {
+                        const parsedLength = toParse.byteLength - remainder;
+                        this._pendingData = toParse.subarray(parsedLength);
+                    }
                 }
-            }
-        };
-
-        readLoop().catch((err) => {
-            if (!this._aborted) this.emit('error', err);
-            this._cleanup();
-        });
+            };
+            readLoop().catch((err) => {
+                if (!this._aborted) this.emit('error', err);
+                this._cleanup();
+            });
+        }
     }
 
     write(chunk: any, encodingOrCb?: BufferEncoding | ((err?: Error) => void), cb?: (err?: Error) => void): boolean {
@@ -366,6 +408,10 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
             this._timeoutId = null;
         }
         this._pendingData = null;
+        if (this._tlsSocket) {
+            try { this._tlsSocket.destroy(); } catch {}
+            this._tlsSocket = null;
+        }
         if (this._tcp) {
             try { this._tcp.close(); } catch {}
             this._tcp = null;

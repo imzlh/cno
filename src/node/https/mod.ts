@@ -28,7 +28,7 @@ const os = import.meta.use('os');
 const engine = import.meta.use('engine');
 const httpParser = import.meta.use('http');
 const timers = import.meta.use('timers');
-import { dnsCache } from '../../module/http/dns-cache';
+import { dnsCache } from '@cnojs/http/dns-cache';
 
 // ============================================================================
 // HTTPS Server
