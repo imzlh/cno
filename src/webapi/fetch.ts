@@ -193,12 +193,12 @@ function createResponseBodyStream(ctx: FetchContext): ReadableStream<Uint8Array>
 async function readHeaders(ctx: FetchContext): Promise<void> {
     while (!ctx.h1Conn.parser.isHeadersComplete) {
         if (ctx.aborted) throw new DOMException('The operation was aborted', 'AbortError');
-        try { const data = await ctx.connection.read(); if (data === null) throw new TypeError('Failed to fetch: EOF while reading header'); ctx.h1Conn.parser.feed(data); }
+        try { const data = await ctx.connection.readAsync(); if (data === null) throw new TypeError('Failed to fetch: EOF while reading header'); ctx.h1Conn.parser.feed(data); }
         catch (err) { if (ctx.aborted) throw new DOMException('The operation was aborted', 'AbortError'); throw err; }
     }
 }
 
-async function readBody(ctx: FetchContext): Promise<void> { if (ctx.aborted) return; const data = await ctx.connection.read(); if (ctx.aborted || !data) return; ctx.h1Conn.parser.feed(data); }
+async function readBody(ctx: FetchContext): Promise<void> { if (ctx.aborted) return; const data = await ctx.connection.readAsync(); if (ctx.aborted || !data) return; ctx.h1Conn.parser.feed(data); }
 
 function releaseConnection(ctx: Partial<FetchContext>): void {
     const { url, connection } = ctx; assert(url && connection, "invalid connection");
@@ -208,14 +208,13 @@ function releaseConnection(ctx: Partial<FetchContext>): void {
 
 async function sendRequest(request: Request, url: URL, connection: Connection): Promise<any> {
     const bodyBuffer = await request.getBodyBuffer();
-    const isUsingProxy = false; // TODO: proxy support
     const headers: Array<[string, string]> = [];
     request.headers.forEach((v: string, k: string) => headers.push([k, v]));
     const builder = new HttpRequestBuilder({
         method: request.method, path: url.pathname + url.search,
         host: url.host, httpVersion: '1.1', headers, body: bodyBuffer,
     });
-    await connection.write(builder.build());
+    await connection.writeAsync(builder.build());
     return { parser: new HttpResponseParser() };
 }
 
@@ -230,7 +229,7 @@ async function performFetch(request: Request, url: URL, redirectCount = 0): Prom
     if (redirectCount > 20) throw new TypeError('Too many redirects');
     const port = url.port ? parseInt(url.port) : (url.protocol === 'https:' ? 443 : 80);
     const connConfig = { hostname: url.hostname, port, protocol: url.protocol as 'http:' | 'https:', keepAlive: request.keepalive, timeout: 30000 };
-    let connection = await connectionManager.acquire(connConfig);
+    let connection = await connectionManager.acquireAsync(connConfig);
 
     const h1Conn = { parser: new HttpResponseParser() };
     const ctx: FetchContext = { request, url, connection, h1Conn, aborted: false };
@@ -243,8 +242,8 @@ async function performFetch(request: Request, url: URL, redirectCount = 0): Prom
         if (ctx.aborted) throw new DOMException('The operation was aborted', 'AbortError');
         try { await readHeaders(ctx); }
         catch (err) {
-            if (!ctx.aborted && err instanceof TypeError && (err as Error).message === 'Failed to fetch') {
-                connection.close(); connection = await connectionManager.acquire(connConfig);
+            if (!ctx.aborted && err instanceof TypeError && (err as Error).message.startsWith('Failed to fetch')) {
+                connection.close(); connection = await connectionManager.acquireAsync(connConfig);
                 ctx.connection = connection; h1Conn.parser = new HttpResponseParser();
                 await sendRequest(request, url, connection); await readHeaders(ctx);
             } else throw err;
