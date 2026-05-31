@@ -172,22 +172,23 @@ export class Agent extends HttpAgent {
         });
 
         const family = host.includes(':') ? os.AF_INET6 : os.AF_INET;
-        const tcp = new streams.TCP(family);
 
-        const tlsSocket = new TLSSocket(tcp, {
-            isServer: false,
-            rejectUnauthorized: (options as any).rejectUnauthorized ?? true,
-            secureContext,
-            servername: (options as any).servername ?? host,
-        });
+        dnsCache.resolve(host, { family }).then((addrs: any[]) => {
+            if (!addrs?.length) throw new Error(`DNS resolution failed for ${host}`);
+            const addr = addrs.find((a: any) => a.family === (family === os.AF_INET6 ? 6 : 4)) || addrs[0];
+            const tcp = new streams.TCP(family);
+            const tlsSocket = new TLSSocket(tcp, {
+                isServer: false,
+                rejectUnauthorized: (options as any).rejectUnauthorized ?? true,
+                secureContext,
+                servername: (options as any).servername ?? host,
+            });
+            tcp.connect({ ip: addr.ip, port }).then(() => {
+                tlsSocket.on('secureConnect', () => callback(null, tlsSocket));
+            }).catch((err: Error) => { callback(err, null); });
+        }).catch((err: Error) => { callback(err, null); });
 
-        tcp.connect({ ip: host, port }).then(() => {
-            tlsSocket.on('secureConnect', () => callback(null, tlsSocket));
-        }).catch((err: Error) => {
-            callback(err, tlsSocket);
-        });
-
-        return tlsSocket;
+        return null;
     }
 }
 

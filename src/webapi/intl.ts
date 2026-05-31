@@ -383,6 +383,7 @@ class Locale implements Intl.Locale {
     calendar: string | undefined;
     hourCycle: 'h11' | 'h12' | 'h23' | 'h24' | undefined;
     numberingSystem: string | undefined;
+    variants: string | undefined;
 
     constructor(tag: string) {
         this.baseName = tag;

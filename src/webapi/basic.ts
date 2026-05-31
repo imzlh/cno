@@ -1,5 +1,5 @@
-import { TimerOptions } from "node:timers";
-import { assert } from "../utils/assert";
+import type { TimerOptions } from "node:timers";
+import type { Stream } from "../deno/04_stdio";
 
 const crypto = import.meta.use('crypto');
 const engine = import.meta.use('engine');
@@ -23,28 +23,39 @@ globalThis.alert = function(msg) {
 }
 
 globalThis.prompt = function(msg) {
-    const { stdin, stdout } = streams as any as Record<string, CModuleStreams.Stream>;
-    assert(stdout.writeSync(
-        engine.encodeString(msg ? msg + ' ' : '? ')), "write() operation failed");
-    
-    const decoder = new TextDecoder();
-    const chunk = new Uint8Array(1024);
-    let line = '';
-    
-    while (true) {
-        const n = stdin.readSync(chunk);
-        if (!n) break;  // EOF
-        
-        line += decoder.decode(chunk.subarray(0, n), { stream: true });
-        
-        const newlineIdx = line.lastIndexOf('\n');
-        if (newlineIdx !== -1) {
-            return line.substring(0, newlineIdx).replace('\r', '').trim();
-        }
+    const promptStr = msg != null ? String(msg) + ' ' : '? ';
+    const { stdin: _stdin, stdout: _stdout } = streams as any as Record<string, Stream>;
+    const stdin = _stdin.__stream as CModuleStreams.TTY, stdout = _stdout.__stream;
+
+    if (!_stdin.isTTY) {
+        return null;    // note: deno doesn't support prompt() when not in TTY
     }
-    
-    line += decoder.decode();
-    return line.replace(/\r?\n$/, '') || null;
+
+    // If another subsystem (like the REPL) already owns the TTY in raw mode,
+    // stop its read loop before changing modes to avoid libuv continuing to
+    // deliver raw key events on the old read watcher.
+    const prevMode: number = stdin.mode;
+    const reading = !!stdin.onread;
+    if (reading) stdin.stopRead();
+    stdin.mode = streams.TTY_MODE_NORMAL;
+    engine.waitPromise(stdout.write(engine.encodeString(promptStr)));
+
+    const chunk = new Uint8Array(4096);
+    try {
+        let line = '';
+        while (true) {
+            const n = engine.waitPromise(stdin.read(chunk));
+            if (!n) break;
+            line += engine.decodeString(chunk.subarray(0, n));
+            // Normal mode delivers a full line ending with \n
+            let nl = line.indexOf('\n');
+            if (nl !== -1) return line.slice(0, nl).replace(/\r$/, '') || null;
+        }
+        return line.replace(/\r?\n$/, '') || null;
+    } finally {
+        stdin.mode = prevMode;
+        if (reading) stdin.startRead();
+    }
 }
 
 globalThis.confirm = function(msg) {
@@ -78,7 +89,7 @@ globalThis.clearTimeout = globalThis.clearInterval = function(id: number) {
     timer.clearTimeout(id);
 }
 // @ts-ignore - webapi
-globalThis.setInterval = function(cb, timeout, ...args) {
+globalThis.setInterval = function<any>(cb, timeout, ...args) {
     if (typeof cb == 'string') {
         throw new Error('string argument is not allowed for setTimeout for security reasons.');
     }

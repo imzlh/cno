@@ -6,23 +6,24 @@ const sqlite3 = import.meta.use('sqlite3');
 const fs = import.meta.use('fs');
 
 import {
-    KvKey,
     KvKeyPart,
     RawKey,
     InternalEntry,
-    serializeKey,
-    deserializeKey,
     serializeValue,
     deserializeValue,
     generateVersionstamp,
-    keyStartsWith,
-    validateKey,
-    validateValue,
+    compareRawKeys,
+    cursorToRawKey,
+    deserializeLegacyKey,
+    serializeKey,
+    rawKeyToCursor,
 } from './types';
+
+const { setInterval, clearInterval } = import.meta.use('timers');
 
 const CREATE_TABLE_SQL = `
 CREATE TABLE IF NOT EXISTS kv_entries (
-    key TEXT PRIMARY KEY,
+    key BLOB PRIMARY KEY,
     value BLOB NOT NULL,
     versionstamp TEXT NOT NULL,
     expire_at INTEGER,
@@ -38,8 +39,8 @@ const DELETE_SQL = `DELETE FROM kv_entries WHERE key = ?`;
 const COUNT_SQL = `SELECT COUNT(*) as count FROM kv_entries WHERE key >= ? AND key < ?`;
 const CLEANUP_SQL = `DELETE FROM kv_entries WHERE expire_at IS NOT NULL AND expire_at < ?`;
 const DELETE_PREFIX_SQL = `DELETE FROM kv_entries WHERE key >= ? AND key < ?`;
-const LIST_SQL = `SELECT key, value, versionstamp, expire_at FROM kv_entries WHERE key >= ? AND key < ? ORDER BY key ASC`;
-const LIST_REVERSE_SQL = `SELECT key, value, versionstamp, expire_at FROM kv_entries WHERE key >= ? AND key < ? ORDER BY key DESC`;
+const LIST_SQL = `SELECT key, value, versionstamp, expire_at FROM kv_entries WHERE key >= ? AND key < ? ORDER BY key ASC LIMIT ?`;
+const LIST_REVERSE_SQL = `SELECT key, value, versionstamp, expire_at FROM kv_entries WHERE key >= ? AND key < ? ORDER BY key DESC LIMIT ?`;
 
 export class KvDatabase {
     private db: CModuleSQLite3.Sqlite3Handle | null = null;
@@ -72,15 +73,15 @@ export class KvDatabase {
         this.db.exec('PRAGMA temp_store = MEMORY');
 
         this.db.exec(CREATE_TABLE_SQL);
-
+        this.migrateLegacyKeys();
         this.cleanup();
-        
+
         this.cleanupTimer = setInterval(() => this.cleanup(), 60000);
     }
 
     private mkdirRecursive(path: string): void {
         if (!path || path === '.') return;
-        
+
         const parts = path.split('/').filter(p => p);
         let current = path.startsWith('/') ? '/' : '';
 
@@ -126,6 +127,37 @@ export class KvDatabase {
         }
     }
 
+    private migrateLegacyKeys(): void {
+        try {
+            const db = this.getDb();
+            const stmt = db.prepare(`SELECT key, value, versionstamp, expire_at, created_at FROM kv_entries`);
+            const rows = stmt.all();
+            stmt.finalize();
+
+            const legacyRows = rows.filter((row: any) => typeof row.key === 'string');
+            if (!legacyRows.length) return;
+
+            db.exec('BEGIN IMMEDIATE');
+            try {
+                const del = db.prepare(`DELETE FROM kv_entries WHERE key = ?`);
+                const ins = db.prepare(`INSERT OR REPLACE INTO kv_entries (key, value, versionstamp, expire_at, created_at) VALUES (?, ?, ?, ?, ?)`);
+                for (const row of legacyRows) {
+                    const key = serializeKey(deserializeLegacyKey(row.key));
+                    del.run([row.key]);
+                    ins.run([key, row.value, row.versionstamp, row.expire_at, row.created_at]);
+                }
+                del.finalize();
+                ins.finalize();
+                db.exec('COMMIT');
+            } catch (error) {
+                try { db.exec('ROLLBACK'); } catch {}
+                throw error;
+            }
+        } catch {
+            // Ignore migration failures and continue with existing data.
+        }
+    }
+
     get(rawKey: RawKey): InternalEntry | null {
         this.cleanup();
         return this._getInternal(rawKey);
@@ -141,16 +173,13 @@ export class KvDatabase {
 
         const row = rows[0];
         const expireAt = row.expire_at;
-        
-        if (expireAt !== null && expireAt < Date.now()) {
-            return null;
-        }
+        if (expireAt !== null && expireAt < Date.now()) return null;
 
         return {
-            key: row.key,
+            key: new Uint8Array(row.key),
             value: new Uint8Array(row.value),
             versionstamp: row.versionstamp,
-            expireAt: expireAt,
+            expireAt,
         };
     }
 
@@ -194,53 +223,34 @@ export class KvDatabase {
         startKey: RawKey,
         endKey: RawKey,
         options: { reverse?: boolean; limit?: number; cursor?: string } = {}
-    ): { entries: InternalEntry[]; cursor: string | null } {
+    ): { entries: InternalEntry[]; cursor: RawKey | null } {
         const db = this.getDb();
-        const sql = options.reverse ? LIST_REVERSE_SQL : LIST_SQL;
-        
         const limit = options.limit ?? 500;
-        const sqlWithLimit = sql + ` LIMIT ${limit + 1}`;
-        
-        const stmt = db.prepare(sqlWithLimit);
-        let rows = stmt.all([startKey, endKey]);
+        const stmt = db.prepare(options.reverse ? LIST_REVERSE_SQL : LIST_SQL);
+        let rows = stmt.all([startKey, endKey, limit + 8]);
         stmt.finalize();
 
         const now = Date.now();
-        rows = rows.filter((row: any) => {
-            if (row.expire_at !== null && row.expire_at < now) {
-                return false;
-            }
-            return true;
-        });
+        rows = rows.filter((row: any) => row.expire_at === null || row.expire_at > now);
 
         if (options.cursor) {
-            const cursorKey = options.cursor;
-            let found = false;
+            const cursorKey = cursorToRawKey(options.cursor);
             rows = rows.filter((row: any) => {
-                if (found) return true;
-                if (options.reverse) {
-                    if (row.key < cursorKey) {
-                        found = true;
-                        return true;
-                    }
-                } else {
-                    if (row.key > cursorKey) {
-                        found = true;
-                        return true;
-                    }
-                }
-                return false;
+                const key = new Uint8Array(row.key);
+                return options.reverse
+                    ? compareRawKeys(key, cursorKey) < 0
+                    : compareRawKeys(key, cursorKey) > 0;
             });
         }
 
-        let nextCursor: string | null = null;
+        let nextCursor: RawKey | null = null;
         if (rows.length > limit) {
-            nextCursor = rows[limit - 1].key;
+            nextCursor = new Uint8Array(rows[limit - 1].key);
             rows = rows.slice(0, limit);
         }
 
         const entries = rows.map((row: any) => ({
-            key: row.key,
+            key: new Uint8Array(row.key),
             value: new Uint8Array(row.value),
             versionstamp: row.versionstamp,
             expireAt: row.expire_at,
@@ -249,21 +259,21 @@ export class KvDatabase {
         return { entries, cursor: nextCursor };
     }
 
-    atomic(operations: Array<{ 
-        type: 'check' | 'set' | 'delete' | 'sum' | 'max' | 'min'; 
-        key: RawKey; 
-        versionstamp?: string | null; 
-        value?: Uint8Array; 
+    atomic(operations: Array<{
+        type: 'check' | 'set' | 'delete' | 'sum' | 'max' | 'min';
+        key: RawKey;
+        versionstamp?: string | null;
+        value?: Uint8Array;
         expireIn?: number;
         operand?: KvKeyPart;
     }>): { success: boolean; versionstamp?: string } {
         const db = this.getDb();
-        
+
         db.exec('BEGIN IMMEDIATE');
-        
+
         try {
             let finalVersionstamp = '';
-            
+
             for (const op of operations) {
                 switch (op.type) {
                     case 'check': {
@@ -293,22 +303,15 @@ export class KvDatabase {
                     case 'sum': {
                         const current = this._getInternal(op.key);
                         let currentValue: number | bigint = 0;
-                        
                         if (current) {
                             const val = deserializeValue(current.value);
                             if (typeof val === 'number') currentValue = val;
                             else if (typeof val === 'bigint') currentValue = val;
                         }
-                        
                         const operand = op.operand as number | bigint;
-                        let newValue: number | bigint;
-                        
-                        if (typeof currentValue === 'bigint' || typeof operand === 'bigint') {
-                            newValue = BigInt(currentValue) + BigInt(operand);
-                        } else {
-                            newValue = currentValue + operand;
-                        }
-                        
+                        const newValue = (typeof currentValue === 'bigint' || typeof operand === 'bigint')
+                            ? BigInt(currentValue) + BigInt(operand)
+                            : currentValue + operand;
                         const versionstamp = generateVersionstamp();
                         const stmt = db.prepare(SET_SQL);
                         stmt.run([op.key, serializeValue(newValue), versionstamp, null]);
@@ -319,16 +322,12 @@ export class KvDatabase {
                     case 'max': {
                         const current = this._getInternal(op.key);
                         let currentValue: number | bigint = op.operand as number | bigint;
-                        
                         if (current) {
                             const val = deserializeValue(current.value);
-                            if (typeof val === 'number' || typeof val === 'bigint') {
-                                if (BigInt(val) > BigInt(currentValue)) {
-                                    currentValue = val as number | bigint;
-                                }
+                            if ((typeof val === 'number' || typeof val === 'bigint') && BigInt(val) > BigInt(currentValue)) {
+                                currentValue = val as number | bigint;
                             }
                         }
-                        
                         const versionstamp = generateVersionstamp();
                         const stmt = db.prepare(SET_SQL);
                         stmt.run([op.key, serializeValue(currentValue), versionstamp, null]);
@@ -339,16 +338,12 @@ export class KvDatabase {
                     case 'min': {
                         const current = this._getInternal(op.key);
                         let currentValue: number | bigint = op.operand as number | bigint;
-                        
                         if (current) {
                             const val = deserializeValue(current.value);
-                            if (typeof val === 'number' || typeof val === 'bigint') {
-                                if (BigInt(val) < BigInt(currentValue)) {
-                                    currentValue = val as number | bigint;
-                                }
+                            if ((typeof val === 'number' || typeof val === 'bigint') && BigInt(val) < BigInt(currentValue)) {
+                                currentValue = val as number | bigint;
                             }
                         }
-                        
                         const versionstamp = generateVersionstamp();
                         const stmt = db.prepare(SET_SQL);
                         stmt.run([op.key, serializeValue(currentValue), versionstamp, null]);
@@ -358,10 +353,10 @@ export class KvDatabase {
                     }
                 }
             }
-            
+
             db.exec('COMMIT');
-            return { 
-                success: true, 
+            return {
+                success: true,
                 versionstamp: finalVersionstamp || '00000000000000000000'
             };
         } catch (err) {
@@ -376,14 +371,12 @@ export class KvDatabase {
 }
 
 export function getEndKeyForPrefix(prefix: RawKey): RawKey {
-    const key = prefix;
-    const chars = key.split('');
-    for (let i = chars.length - 1; i >= 0; i--) {
-        const code = chars[i].charCodeAt(0);
-        if (code < 0x10FFFF) {
-            chars[i] = String.fromCharCode(code + 1);
-            return chars.join('');
+    const key = prefix.slice();
+    for (let i = key.length - 1; i >= 0; i--) {
+        if (key[i] < 0xFF) {
+            key[i]++;
+            return key.slice(0, i + 1);
         }
     }
-    return key + '\u{10FFFF}';
+    return new Uint8Array([...key, 0xFF]);
 }

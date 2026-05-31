@@ -28,7 +28,14 @@ import { AtomicOperation } from './atomic';
 export { Kv, KvListIterator, AtomicOperation };
 export * from './types';
 
-const DEFAULT_KV_PATH = '.deno/kv.db';
+const DEFAULT_KV_PATH = '.deno/kv.db.cnodb';
+
+function normalizeKvPath(path?: string): string {
+    if (path === undefined) return DEFAULT_KV_PATH;
+    if (path === '' || path === ':memory:') return path;
+    if (path.endsWith('.cnodb')) return path;
+    return `${path}.cnodb`;
+}
 
 export class KvError extends Error {
     constructor(message: string) {
@@ -66,7 +73,7 @@ export class KvClosedError extends KvError {
 }
 
 async function openKv(path?: string): Promise<Deno.Kv> {
-    const kv = new Kv(path);
+    const kv = new Kv(normalizeKvPath(path));
     await kv.open();
     return kv as unknown as Deno.Kv;
 }

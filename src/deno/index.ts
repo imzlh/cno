@@ -496,6 +496,7 @@ await import('./05_net');
 await import('./06_process');
 await import('./07_http');
 await import('./08_serve');
+await import('./09_cron');
 
 // unstable APIs
 await import('./kv');

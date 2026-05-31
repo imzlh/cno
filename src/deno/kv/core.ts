@@ -5,6 +5,7 @@ import {
     KvKey, KvEntryMaybe, KvSetOptions,
     KvQueueOptions, serializeKey, serializeValue,
     deserializeValue,
+    rawKeyToCursor,
     validateKey,
     validateValue
 } from './types';
@@ -13,8 +14,8 @@ import { createListIterator } from './iterator';
 import { AtomicOperation } from './atomic';
 
 const QUEUE_PREFIX = '__kv_queue__';
-const QUEUE_DELAYED_PREFIX = '__kv_queue_delayed__';
 const MAX_QUEUE_DELAY = 30 * 24 * 60 * 60 * 1000; // 30 days
+const { setInterval, clearInterval } = import.meta.use('timers');
 
 interface WatchSubscription {
     keys: KvKey[];
@@ -260,6 +261,7 @@ export class Kv implements Deno.Kv {
                 
                 const initialValues = keys.map(key => {
                     const rawKey = serializeKey(key);
+                    const keyId = rawKeyToCursor(rawKey);
                     const entry = self.db.get(rawKey);
                     
                     let value: KvEntryMaybe<unknown>;
@@ -270,14 +272,14 @@ export class Kv implements Deno.Kv {
                             value: deserializedValue,
                             versionstamp: entry.versionstamp,
                         };
-                        lastValues.set(rawKey, { versionstamp: entry.versionstamp, value: deserializedValue });
+                        lastValues.set(keyId, { versionstamp: entry.versionstamp, value: deserializedValue });
                     } else {
                         value = {
                             key,
                             value: null,
                             versionstamp: null,
                         };
-                        lastValues.set(rawKey, { versionstamp: null, value: null });
+                        lastValues.set(keyId, { versionstamp: null, value: null });
                     }
                     
                     return value;
@@ -369,14 +371,15 @@ export class Kv implements Deno.Kv {
 
     private notifyWatchers(changedKey: KvKey): void {
         const rawChangedKey = serializeKey(changedKey);
+        const changedKeyId = rawKeyToCursor(rawChangedKey);
         
         for (const sub of this.watchSubscriptions) {
             try {
-                const keyIndex = sub.keys.findIndex(k => serializeKey(k) === rawChangedKey);
+                const keyIndex = sub.keys.findIndex(k => rawKeyToCursor(serializeKey(k)) === changedKeyId);
                 if (keyIndex === -1) continue;
                 
                 const entry = this.db.get(rawChangedKey);
-                const lastValue = sub.lastValues.get(rawChangedKey);
+                const lastValue = sub.lastValues.get(changedKeyId);
                 
                 const newVersionstamp = entry?.versionstamp ?? null;
                 if (lastValue && lastValue.versionstamp === newVersionstamp) {
@@ -385,14 +388,15 @@ export class Kv implements Deno.Kv {
                 
                 const values = sub.keys.map(key => {
                     const rawKey = serializeKey(key);
+                    const keyId = rawKeyToCursor(rawKey);
                     const e = this.db.get(rawKey);
                     
                     if (e) {
                         const v = deserializeValue(e.value);
-                        sub.lastValues.set(rawKey, { versionstamp: e.versionstamp, value: v });
+                        sub.lastValues.set(keyId, { versionstamp: e.versionstamp, value: v });
                         return { key, value: v, versionstamp: e.versionstamp };
                     } else {
-                        sub.lastValues.set(rawKey, { versionstamp: null, value: null });
+                        sub.lastValues.set(keyId, { versionstamp: null, value: null });
                         return { key, value: null, versionstamp: null };
                     }
                 });

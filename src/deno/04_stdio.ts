@@ -5,7 +5,7 @@ import { FSFile } from "./03_fopen";
 const os = import.meta.use('os');
 const pipe = import.meta.use('streams');
 const fs = import.meta.use('asyncfs');
-const syncfs = import.meta.use('fs');
+const engine = import.meta.use('engine');
 
 type AnyStream = CModuleStreams.Pipe | CModuleStreams.TTY | Deno.FsFile;
 
@@ -48,6 +48,9 @@ export class Stream {
             case "tty":
                 this.stream = new pipe.TTY(fd, read);
                 this.type = 'tty';
+                try {
+                    this.stream.mode = pipe.TTY_MODE_NORMAL;
+                } catch {}
             break;
             case "file":
                 this.stream = new FSFile(fs.newStdioFile('stdio', fd));
@@ -90,7 +93,7 @@ export class Stream {
             tryLock(this.fd);
             return (this.stream as FSFile).readSync(buf);
         } else {
-            return syncfs.read(this.fd, buf);
+            return engine.waitPromise(this.stream.read(buf));
         }
     }
 
@@ -100,8 +103,7 @@ export class Stream {
             tryLock(this.fd);
             return (this.stream as FSFile).writeSync(data);
         } else {
-            // fixme: use other method to write sync
-            return syncfs.write(this.fd, data);
+            return engine.waitPromise(this.stream.write(data));
         }
     }
 
@@ -172,9 +174,12 @@ export class Stream {
     @wrap
     setRaw(mode: boolean) {
         if (this.type != 'tty') throw new Error('Only TTY streams can be set raw');
-        (this.stream as CModuleStreams.TTY).setMode(
-            mode ? pipe.TTY_MODE_RAW : pipe.TTY_MODE_NORMAL
-        )
+        (this.stream as CModuleStreams.TTY).mode =
+            mode ? pipe.TTY_MODE_RAW_VT : pipe.TTY_MODE_NORMAL;
+    }
+
+    get __stream() {
+        return this.stream;
     }
 }
 

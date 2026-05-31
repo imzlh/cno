@@ -8,6 +8,7 @@ import { EventEmitter } from '../events';
 const os = import.meta.use('os');
 const streams = import.meta.use('streams');
 const syncfs = import.meta.use('fs');
+const engine = import.meta.use('engine');
 
 const isInputTTY = os.guessHandle(os.STDIN_FILENO) === 'tty';
 const isOutputTTY = os.guessHandle(os.STDOUT_FILENO) === 'tty';
@@ -89,7 +90,7 @@ export class Interface extends EventEmitter {
 
         if (this._terminal && this._inputStream) {
             try {
-                (this._inputStream as CModuleStreams.TTY).setMode(streams.TTY_MODE_RAW);
+                (this._inputStream as CModuleStreams.TTY).mode = streams.TTY_MODE_RAW;
                 this._rawMode = true;
             } catch {}
         }
@@ -130,7 +131,7 @@ export class Interface extends EventEmitter {
     private _writeOutput(data: string): void {
         if (this._outputStream) {
             try {
-                this._outputStream.writeSync(new TextEncoder().encode(data));
+                engine.waitPromise(this._outputStream.write(new TextEncoder().encode(data)));
             } catch {}
         }
     }
@@ -350,7 +351,7 @@ export class Interface extends EventEmitter {
         this._closed = true;
         if (this._rawMode && this._inputStream) {
             try {
-                (this._inputStream as CModuleStreams.TTY).setMode(streams.TTY_MODE_NORMAL);
+                (this._inputStream as CModuleStreams.TTY).mode = streams.TTY_MODE_NORMAL;
             } catch {}
             this._rawMode = false;
         }

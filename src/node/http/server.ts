@@ -440,9 +440,13 @@ export class ServerResponseImpl extends OutgoingMessageImpl implements ServerRes
         this._bodyLength += data.length;
 
         if (this.chunkedEncoding && this._tcp) {
-            this._tcp.write(engine.encodeString(data.length.toString(16) + '\r\n'));
-            this._tcp.write(data);
-            this._tcp.write(engine.encodeString('\r\n'));
+            const header = engine.encodeString(data.length.toString(16) + '\r\n');
+            const trailer = engine.encodeString('\r\n');
+            const frame = new Uint8Array(header.length + data.length + trailer.length);
+            frame.set(header, 0);
+            frame.set(data, header.length);
+            frame.set(trailer, header.length + data.length);
+            this._tcp.write(frame);
         } else if (this._tcp) {
             this._tcp.write(data);
         }

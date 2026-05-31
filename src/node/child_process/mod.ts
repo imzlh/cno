@@ -5,6 +5,7 @@
 
 const proc = import.meta.use('process');
 const os = import.meta.use('os');
+const engine = import.meta.use('engine');
 
 import { EventEmitter } from '../events';
 import { Writable, Readable } from '../stream';
@@ -458,8 +459,8 @@ export function spawnSync(command: string, args?: string[], options?: SpawnOptio
             const buf = new Uint8Array(4096);
             while (true) {
                 try {
-                    const n = pipe.readSync(buf);
-                    if (n === null || n === 0) break;
+                    const n = engine.waitPromise<null | number>(pipe.read(buf));
+                    if (!n) break;
                     chunks.push(buf.subarray(0, n));
                 } catch { break; }
             }

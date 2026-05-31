@@ -59,6 +59,7 @@
     "include": [
         "src/**/*",
         "node_modules/@types/node/index.d.ts",
-        "types/**/*.d.ts"
+        "types/**/*.d.ts",
+        "lib.deno.d.ts"
     ]
 }

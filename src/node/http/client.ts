@@ -87,7 +87,6 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
     private _bodySent: boolean = false;
     private _socketAssigned: boolean = false;
     private _response: IncomingMessageImpl | null = null;
-    private _pendingData: Uint8Array | null = null;
 
     constructor(url: string | URL | ClientRequestArgs, cb?: (res: IncomingMessageImpl) => void) {
         super();
@@ -203,7 +202,7 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
             }
 
             if (!this.hasHeader('accept-encoding')) {
-                this.setHeader('Accept-Encoding', 'gzip, deflate');
+                this.setHeader('Accept-Encoding', 'gzip');
             }
 
             if (!this.hasHeader('connection')) {
@@ -320,30 +319,28 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
             });
         } else {
             const buffer = new Uint8Array(65536);
+            let pending: Uint8Array | null = null;
             const readLoop = async () => {
                 while (!this._aborted) {
+                    const n = await this._tcp!.read(buffer);
+                    if (n === 0) { this._cleanup(); return; }
                     let toParse: Uint8Array;
-                    if (this._pendingData) {
-                        toParse = this._pendingData;
-                        this._pendingData = null;
-                        const n = await this._tcp!.read(buffer);
-                        if (n === 0) { this._cleanup(); return; }
-                        const combined = new Uint8Array(toParse.byteLength + n);
-                        combined.set(toParse);
-                        combined.set(buffer.subarray(0, n), toParse.byteLength);
+                    if (pending) {
+                        // Prepend pending remainder from previous parse
+                        const combined = new Uint8Array(pending.byteLength + n);
+                        combined.set(pending);
+                        combined.set(buffer.subarray(0, n), pending.byteLength);
+                        pending = null;
                         toParse = combined;
                     } else {
-                        const n = await this._tcp!.read(buffer);
-                        if (n === 0) { this._cleanup(); return; }
                         toParse = buffer.subarray(0, n);
                     }
                     const result = parser.execute(toParse.buffer.slice(toParse.byteOffset, toParse.byteOffset + toParse.byteLength));
                     if (result.errno !== 0) { this._cleanup(); return; }
-                    // @ts-ignore - remainder exists at runtime
-                    const remainder = result.remainder as number;
-                    if (remainder > 0) {
-                        const parsedLength = toParse.byteLength - remainder;
-                        this._pendingData = toParse.subarray(parsedLength);
+                    const consumed = (result as any).consumed as number | undefined;
+                    if (consumed !== undefined && consumed < toParse.byteLength) {
+                        // Copy unparsed remainder — toParse may be a view of the reused buffer
+                        pending = new Uint8Array(toParse.subarray(consumed));
                     }
                 }
             };
@@ -407,7 +404,6 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
             timers.clearTimeout(this._timeoutId);
             this._timeoutId = null;
         }
-        this._pendingData = null;
         if (this._tlsSocket) {
             try { this._tlsSocket.destroy(); } catch {}
             this._tlsSocket = null;

@@ -6,22 +6,12 @@
  * Merged from: cno/src/module/http/websocket.ts
  */
 
-import { connectionManager } from "@cnojs/http/connection";
+import { connectionManager, type ConnectionLike } from "@cnojs/http/connection";
 import { HttpRequestBuilder, HttpResponseParser } from "@cnojs/http/h1";
 import { Headers } from "headers-polyfill";
 import { assert } from "../utils/assert";
 
 /** ConnectionLike — minimal connection interface for WebSocket upgrade */
-interface ConnectionLike {
-    socket: any;
-    sslPipe: any;
-    write(data: Uint8Array): Promise<void>;
-    read(size?: number): Promise<Uint8Array | null>;
-    onReadable(callback: (data: Uint8Array | null) => void, errHandler?: (err: Error) => void): void;
-    stopReading(): void;
-    close(): void;
-    isClosed(): boolean;
-}
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
@@ -79,7 +69,7 @@ class SendQueue {
         while (this.queue.length > 0 && this.connection) {
             const item = this.queue.shift()!;
             try {
-                await this.connection.write(item.data);
+                await this.connection.writeAsync(item.data);
                 this._bufferedAmount -= item.data.length; item.resolve();
             } catch (e) {
                 this._bufferedAmount -= item.data.length; item.reject(e as Error);
@@ -202,7 +192,7 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
             const isSecure = url.protocol === 'wss:';
             const port = url.port ? parseInt(url.port) : (isSecure ? 443 : 80);
 
-            this.connection = await connectionManager.acquire({
+            this.connection = await connectionManager.acquireAsync({
                 hostname: url.hostname, port, protocol: isSecure ? 'https:' : 'http:', keepAlive: false
             });
 
@@ -226,7 +216,7 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
         if (this.protocol) headers.set('Sec-WebSocket-Protocol', this.protocol);
         const rawHeaders: Array<[string, string]> = [];
         headers.forEach((v: string, k: string) => rawHeaders.push([k, v]));
-        await this.connection.write(new HttpRequestBuilder({ method: 'GET', path: url.pathname + url.search, host: url.host, headers: rawHeaders }).build());
+            await this.connection.writeAsync(new HttpRequestBuilder({ method: 'GET', path: url.pathname + url.search, host: url.host, headers: rawHeaders }).build());
     }
 
     private async receiveHandshake(): Promise<void> {
@@ -247,7 +237,7 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
             (async () => {
                 try {
                     while (!resolved && this.connection) {
-                        const data = await this.connection.read();
+                        const data = await this.connection.readAsync();
                         if (null === data) { if (!resolved) reject(new Error('Connection closed during handshake')); break; }
                         parser.feed(data);
                     }
@@ -261,18 +251,21 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
 
     private startReceiving(): void {
         if (!this.connection) return;
-        let receiving = true;
-        const processData = (data: Uint8Array | null) => {
-            if (!receiving) return;
-            if (data === null) { receiving = false; this.handleClose(WebSocketCloseCode.ABNORMAL, 'Connection closed'); return; }
-            if (data.length === 0) return;
-            this.receiveBuffer.push(data); this.processFrames();
-        };
-        const handleError = (err: Error) => {
-            if (!receiving) return; receiving = false;
-            if (this._readyState !== WebSocketReadyState.CLOSED) { this.emitError(err); this.close(WebSocketCloseCode.ABNORMAL, 'Read error'); }
-        };
-        this.connection.onReadable(processData, handleError);
+        const conn = this.connection;
+        (async () => {
+            try {
+                while (this._readyState !== WebSocketReadyState.CLOSED) {
+                    const data = await conn.readAsync();
+                    if (data === null) { this.handleClose(WebSocketCloseCode.ABNORMAL, 'Connection closed'); break; }
+                    if (data.length === 0) continue;
+                    this.receiveBuffer.push(data); this.processFrames();
+                }
+            } catch (err) {
+                if (this._readyState !== WebSocketReadyState.CLOSED) {
+                    this.emitError(err as Error); this.close(WebSocketCloseCode.ABNORMAL, 'Read error');
+                }
+            }
+        })();
     }
 
     private processFrames(): void {

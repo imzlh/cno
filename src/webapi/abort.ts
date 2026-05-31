@@ -1,3 +1,5 @@
+const { setTimeout } = import.meta.use('timers');
+
 class AbortSignal extends EventTarget implements globalThis.AbortSignal {
     #aborted = false;
     #reason: any = undefined;

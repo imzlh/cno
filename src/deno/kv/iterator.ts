@@ -4,10 +4,11 @@
 
 import {
     KvKey,
+    cursorToRawKey,
     deserializeKey,
     deserializeValue,
+    rawKeyToCursor,
     serializeKey,
-    keyStartsWith,
     validateKey,
 } from './types';
 import { KvDatabase, getEndKeyForPrefix } from './db';
@@ -26,7 +27,7 @@ export class KvListIterator<T = unknown> implements AsyncIterableIterator<Deno.K
     private nextCursor: string | null = null;
     private done = false;
     private count = 0;
-    private _currentCursor: string = '';
+    private _currentCursor = '';
 
     constructor(db: KvDatabase, selector: Deno.KvListSelector, options: Deno.KvListOptions = {}) {
         this.db = db;
@@ -57,7 +58,7 @@ export class KvListIterator<T = unknown> implements AsyncIterableIterator<Deno.K
         if (this.buffer.length > 0) {
             const entry = this.buffer.shift()!;
             this.count++;
-            this._currentCursor = serializeKey(entry.key as KvKey);
+            this._currentCursor = rawKeyToCursor(serializeKey(entry.key as KvKey));
             return { done: false, value: entry };
         }
 
@@ -69,36 +70,35 @@ export class KvListIterator<T = unknown> implements AsyncIterableIterator<Deno.K
     }
 
     private async fetchBatch(): Promise<void> {
-        let startKey: string;
-        let endKey: string;
+        let startKey: Uint8Array;
+        let endKey: Uint8Array;
 
         if ('prefix' in this.selector) {
             const prefixKey = serializeKey(this.selector.prefix);
-            
-            if ('start' in this.selector && this.selector.start) {
-                startKey = serializeKey(this.selector.start);
-            } else {
-                startKey = prefixKey;
-            }
-            
-            if ('end' in this.selector && this.selector.end) {
-                endKey = serializeKey(this.selector.end);
-            } else {
-                endKey = getEndKeyForPrefix(prefixKey);
-            }
+            startKey = ('start' in this.selector && this.selector.start)
+                ? serializeKey(this.selector.start)
+                : prefixKey;
+            endKey = ('end' in this.selector && this.selector.end)
+                ? serializeKey(this.selector.end)
+                : getEndKeyForPrefix(prefixKey);
         } else if (this.selector.start && this.selector.end) {
             startKey = serializeKey(this.selector.start);
             endKey = serializeKey(this.selector.end);
         } else {
-            startKey = '\x00';
-            endKey = '\u{10FFFF}';
+            startKey = new Uint8Array(0);
+            endKey = new Uint8Array([0xFF]);
         }
 
-        const batchLimit = Math.min(
-            this.options.batchSize,
-            this.options.limit - this.count
-        );
-        
+        if (this.nextCursor) {
+            const cursorKey = cursorToRawKey(this.nextCursor);
+            if (this.options.reverse) {
+                endKey = cursorKey;
+            } else {
+                startKey = getEndKeyForPrefix(cursorKey);
+            }
+        }
+
+        const batchLimit = Math.min(this.options.batchSize, this.options.limit - this.count);
         if (batchLimit <= 0) {
             this.done = true;
             return;
@@ -107,36 +107,16 @@ export class KvListIterator<T = unknown> implements AsyncIterableIterator<Deno.K
         const result = this.db.list(startKey, endKey, {
             reverse: this.options.reverse,
             limit: batchLimit,
-            cursor: this.nextCursor || undefined,
         });
 
-        let entries = result.entries;
-        
-        if ('prefix' in this.selector) {
-            const prefixKey = this.selector.prefix;
-            entries = entries.filter(e => {
-                const key = deserializeKey(e.key);
-                return keyStartsWith(key, prefixKey);
-            });
-        }
+        this.buffer = result.entries.map(entry => ({
+            key: deserializeKey(entry.key),
+            value: deserializeValue<T>(entry.value),
+            versionstamp: entry.versionstamp,
+        }));
 
-        this.buffer = entries
-            .filter(e => e.expireAt === null || e.expireAt > Date.now())
-            .map(e => ({
-                key: deserializeKey(e.key),
-                value: deserializeValue<T>(e.value),
-                versionstamp: e.versionstamp,
-            }));
-
-        if (result.cursor) {
-            this.nextCursor = result.cursor;
-        } else {
-            this.done = true;
-        }
-
-        if (entries.length === 0) {
-            this.done = true;
-        }
+        this.nextCursor = result.cursor ? rawKeyToCursor(result.cursor) : null;
+        this.done = !result.cursor || this.buffer.length === 0;
     }
 }
 
@@ -154,6 +134,6 @@ export function createListIterator<T = unknown>(
     if ('end' in selector && selector.end) {
         validateKey(selector.end);
     }
-    
+
     return new KvListIterator<T>(db, selector, options);
 }

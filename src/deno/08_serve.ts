@@ -312,17 +312,15 @@ function serve(
 
             } catch (error) {
                 if (!(error instanceof errors.ConnectionReset)) {
-                    console.error('Request handler error:', error, '\n', (error as Error).stack);
-                }
-
-                // Send 500 error
-                try {
-                    await res.writeHead(500, 'Internal Server Error', [
-                        ['Content-Type', 'text/plain']
-                    ]);
-                    await res.end('Internal Server Error');
-                } catch (e) {
-                    // Ignore
+                    // Send 500 error
+                    try {
+                        await res.writeHead(500, 'Internal Server Error', [
+                            ['Content-Type', 'text/plain']
+                        ]);
+                        await res.end('Internal Server Error');
+                    } catch (e) {
+                        // Ignore
+                    }
                 }
             }
         },

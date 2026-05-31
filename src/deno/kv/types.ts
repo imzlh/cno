@@ -3,6 +3,10 @@
  * Based on Deno 1.40+ KV API
  */
 
+const engine = import.meta.use('engine');
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
+
 export type KvKeyPart = string | number | bigint | boolean | Uint8Array;
 export type KvKey = readonly KvKeyPart[];
 
@@ -75,7 +79,7 @@ export interface KvWatchOptions {
     raw?: boolean;
 }
 
-export type RawKey = string;
+export type RawKey = Uint8Array;
 
 export interface InternalEntry {
     key: RawKey;
@@ -92,12 +96,12 @@ const KEY_PART_TYPE_ORDER: Record<string, number> = {
     'Uint8Array': 4,
 };
 
-const TYPE_PREFIXES: Record<string, string> = {
-    'boolean': '\x00',
-    'number': '\x01',
-    'bigint': '\x02',
-    'string': '\x03',
-    'Uint8Array': '\x04',
+const TYPE_PREFIXES: Record<string, number> = {
+    'boolean': 0x10,
+    'number': 0x20,
+    'bigint': 0x30,
+    'string': 0x40,
+    'Uint8Array': 0x50,
 };
 
 let versionstampCounter = 0;
@@ -116,7 +120,7 @@ export function generateVersionstamp(): string {
     return `${timestamp}${counter}0000`;
 }
 
-export function serializeKey(key: Deno.KvKey): RawKey {
+export function serializeLegacyKey(key: Deno.KvKey): string {
     return JSON.stringify(key, (_, v) => {
         if (typeof v === 'bigint') return { __kv_type: 'bigint', value: v.toString() };
         if (v instanceof Uint8Array) return { __kv_type: 'Uint8Array', value: Array.from(v) };
@@ -124,7 +128,7 @@ export function serializeKey(key: Deno.KvKey): RawKey {
     });
 }
 
-export function deserializeKey(rawKey: RawKey): Deno.KvKey {
+export function deserializeLegacyKey(rawKey: string): Deno.KvKey {
     return JSON.parse(rawKey, (_, v) => {
         if (v && typeof v === 'object' && v.__kv_type) {
             switch (v.__kv_type) {
@@ -136,7 +140,214 @@ export function deserializeKey(rawKey: RawKey): Deno.KvKey {
     }) as Deno.KvKey;
 }
 
-const JSON_SERIALIZER = (_key: string, v: unknown): unknown => {
+function appendBytes(target: number[], bytes: Uint8Array): void {
+    for (const byte of bytes) target.push(byte);
+}
+
+function encodeEscapedBytes(target: number[], bytes: Uint8Array): void {
+    for (const byte of bytes) {
+        if (byte === 0) target.push(0, 0xFF);
+        else target.push(byte);
+    }
+    target.push(0, 0);
+}
+
+function decodeEscapedBytes(data: Uint8Array, offset: number): { bytes: Uint8Array; offset: number } {
+    const out: number[] = [];
+    while (offset < data.length) {
+        const byte = data[offset++]!;
+        if (byte !== 0) {
+            out.push(byte);
+            continue;
+        }
+        if (offset >= data.length) throw new TypeError('Invalid escaped key encoding');
+        const next = data[offset++]!;
+        if (next === 0xFF) {
+            out.push(0);
+            continue;
+        }
+        if (next === 0) {
+            return { bytes: new Uint8Array(out), offset };
+        }
+        throw new TypeError('Invalid escaped key encoding');
+    }
+    throw new TypeError('Unexpected end of key encoding');
+}
+
+function encodeNumber(value: number): Uint8Array {
+    const out = new Uint8Array(8);
+    new DataView(out.buffer).setFloat64(0, Object.is(value, -0) ? 0 : value, false);
+    if (value < 0) {
+        for (let i = 0; i < out.length; i++) out[i] = (~out[i]) & 0xFF;
+    } else {
+        out[0] ^= 0x80;
+    }
+    return out;
+}
+
+function decodeNumber(data: Uint8Array, offset: number): { value: number; offset: number } {
+    const bytes = data.slice(offset, offset + 8);
+    if (bytes.length !== 8) throw new TypeError('Invalid number key encoding');
+    const negative = (bytes[0] & 0x80) === 0;
+    if (negative) {
+        for (let i = 0; i < bytes.length; i++) bytes[i] = (~bytes[i]) & 0xFF;
+    } else {
+        bytes[0] ^= 0x80;
+    }
+    return {
+        value: new DataView(bytes.buffer, bytes.byteOffset, 8).getFloat64(0, false),
+        offset: offset + 8,
+    };
+}
+
+function bigintToBytes(value: bigint): Uint8Array {
+    let hex = value.toString(16);
+    if (hex.length === 0) hex = '0';
+    if (hex.length % 2) hex = `0${hex}`;
+    const out = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+    return out.length ? out : new Uint8Array([0]);
+}
+
+function bytesToBigint(bytes: Uint8Array): bigint {
+    let hex = '';
+    for (const byte of bytes) hex += byte.toString(16).padStart(2, '0');
+    return BigInt(`0x${hex || '0'}`);
+}
+
+function u32be(value: number): Uint8Array {
+    const out = new Uint8Array(4);
+    new DataView(out.buffer).setUint32(0, value, false);
+    return out;
+}
+
+function readU32be(data: Uint8Array, offset: number): { value: number; offset: number } {
+    if (offset + 4 > data.length) throw new TypeError('Invalid bigint key encoding');
+    return {
+        value: new DataView(data.buffer, data.byteOffset + offset, 4).getUint32(0, false),
+        offset: offset + 4,
+    };
+}
+
+function encodeBigint(value: bigint): Uint8Array {
+    const negative = value < 0n;
+    const magnitude = bigintToBytes(negative ? -value : value);
+    const out: number[] = [TYPE_PREFIXES.bigint, negative ? 0x00 : 0x01];
+    appendBytes(out, u32be(negative ? 0xFFFFFFFF - magnitude.length : magnitude.length));
+    if (negative) {
+        for (const byte of magnitude) out.push((~byte) & 0xFF);
+    } else {
+        appendBytes(out, magnitude);
+    }
+    return new Uint8Array(out);
+}
+
+function decodeBigint(data: Uint8Array, offset: number): { value: bigint; offset: number } {
+    if (offset >= data.length) throw new TypeError('Invalid bigint key encoding');
+    const sign = data[offset++]!;
+    const lenInfo = readU32be(data, offset);
+    offset = lenInfo.offset;
+    const length = sign === 0x00 ? 0xFFFFFFFF - lenInfo.value : lenInfo.value;
+    const bytes = data.slice(offset, offset + length);
+    if (bytes.length !== length) throw new TypeError('Invalid bigint key payload');
+    if (sign === 0x00) {
+        for (let i = 0; i < bytes.length; i++) bytes[i] = (~bytes[i]) & 0xFF;
+        return { value: -bytesToBigint(bytes), offset: offset + length };
+    }
+    return { value: bytesToBigint(bytes), offset: offset + length };
+}
+
+export function serializeKey(key: Deno.KvKey): RawKey {
+    const out: number[] = [];
+    for (const part of key) {
+        const type = getKeyPartType(part as KvKeyPart);
+        switch (type) {
+            case 'boolean':
+                out.push(TYPE_PREFIXES.boolean, (part as boolean) ? 1 : 0);
+                break;
+            case 'number':
+                out.push(TYPE_PREFIXES.number);
+                appendBytes(out, encodeNumber(part as number));
+                break;
+            case 'bigint':
+                appendBytes(out, encodeBigint(part as bigint));
+                break;
+            case 'string':
+                out.push(TYPE_PREFIXES.string);
+                encodeEscapedBytes(out, textEncoder.encode(part as string));
+                break;
+            case 'Uint8Array':
+                out.push(TYPE_PREFIXES.Uint8Array);
+                encodeEscapedBytes(out, part as Uint8Array);
+                break;
+            default:
+                throw new TypeError(`Unsupported key part type: ${type}`);
+        }
+    }
+    return new Uint8Array(out);
+}
+
+export function deserializeKey(rawKey: RawKey): Deno.KvKey {
+    const key: KvKeyPart[] = [];
+    let offset = 0;
+    while (offset < rawKey.length) {
+        const tag = rawKey[offset++]!;
+        switch (tag) {
+            case TYPE_PREFIXES.boolean:
+                if (offset >= rawKey.length) throw new TypeError('Invalid boolean key encoding');
+                key.push(rawKey[offset++] === 1);
+                break;
+            case TYPE_PREFIXES.number: {
+                const decoded = decodeNumber(rawKey, offset);
+                key.push(decoded.value);
+                offset = decoded.offset;
+                break;
+            }
+            case TYPE_PREFIXES.bigint: {
+                const decoded = decodeBigint(rawKey, offset);
+                key.push(decoded.value);
+                offset = decoded.offset;
+                break;
+            }
+            case TYPE_PREFIXES.string: {
+                const decoded = decodeEscapedBytes(rawKey, offset);
+                key.push(textDecoder.decode(decoded.bytes));
+                offset = decoded.offset;
+                break;
+            }
+            case TYPE_PREFIXES.Uint8Array: {
+                const decoded = decodeEscapedBytes(rawKey, offset);
+                key.push(decoded.bytes);
+                offset = decoded.offset;
+                break;
+            }
+            default:
+                throw new TypeError(`Unknown key tag: ${tag}`);
+        }
+    }
+    return key as Deno.KvKey;
+}
+
+export function rawKeyToCursor(rawKey: RawKey): string {
+    return Array.from(rawKey, byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+export function cursorToRawKey(cursor: string): RawKey {
+    if (cursor.length % 2 !== 0) throw new TypeError('Invalid cursor');
+    const out = new Uint8Array(cursor.length / 2);
+    for (let i = 0; i < out.length; i++) out[i] = parseInt(cursor.slice(i * 2, i * 2 + 2), 16);
+    return out;
+}
+
+export function compareRawKeys(a: RawKey, b: RawKey): number {
+    const len = Math.min(a.length, b.length);
+    for (let i = 0; i < len; i++) {
+        if (a[i] !== b[i]) return a[i] - b[i];
+    }
+    return a.length - b.length;
+}
+
+const LEGACY_JSON_SERIALIZER = (_key: string, v: unknown): unknown => {
     if (typeof v === 'bigint') return { __kv_type: 'bigint', value: v.toString() };
     if (v instanceof Uint8Array) return { __kv_type: 'Uint8Array', value: Array.from(v) };
     if (v instanceof Date) return { __kv_type: 'Date', value: v.toISOString() };
@@ -156,7 +367,7 @@ function isKvSerializedValue(v: unknown): v is KvSerializedValue {
     return v !== null && typeof v === 'object' && '__kv_type' in v;
 }
 
-const JSON_DESERIALIZER = (_key: string, v: unknown): unknown => {
+const LEGACY_JSON_DESERIALIZER = (_key: string, v: unknown): unknown => {
     if (isKvSerializedValue(v)) {
         switch (v.__kv_type) {
             case 'bigint': return BigInt(v.value as string);
@@ -171,13 +382,21 @@ const JSON_DESERIALIZER = (_key: string, v: unknown): unknown => {
 };
 
 export function serializeValue(value: unknown): Uint8Array {
-    const json = JSON.stringify(value, JSON_SERIALIZER);
-    return new TextEncoder().encode(json);
+    return engine.serialize(value);
 }
 
 export function deserializeValue<T>(data: Uint8Array): T {
-    const json = new TextDecoder().decode(data);
-    return JSON.parse(json, JSON_DESERIALIZER) as T;
+    try {
+        return engine.deserialize(new Uint8Array(data)) as T;
+    } catch {
+        const json = textDecoder.decode(data);
+        return JSON.parse(json, LEGACY_JSON_DESERIALIZER) as T;
+    }
+}
+
+export function serializeLegacyValue(value: unknown): Uint8Array {
+    const json = JSON.stringify(value, LEGACY_JSON_SERIALIZER);
+    return textEncoder.encode(json);
 }
 
 export function compareKeys(a: KvKey, b: KvKey): number {
@@ -192,11 +411,11 @@ export function compareKeys(a: KvKey, b: KvKey): number {
 export function compareKeyPart(a: KvKeyPart, b: KvKeyPart): number {
     const typeA = getKeyPartType(a);
     const typeB = getKeyPartType(b);
-    
+
     if (typeA !== typeB) {
         return KEY_PART_TYPE_ORDER[typeA] - KEY_PART_TYPE_ORDER[typeB];
     }
-    
+
     switch (typeA) {
         case 'boolean':
             return (a as boolean) === (b as boolean) ? 0 : (a as boolean) ? 1 : -1;
@@ -208,7 +427,7 @@ export function compareKeyPart(a: KvKeyPart, b: KvKeyPart): number {
             return numA - numB;
         }
         case 'bigint':
-            return Number((a as bigint) - (b as bigint));
+            return (a as bigint) < (b as bigint) ? -1 : ((a as bigint) > (b as bigint) ? 1 : 0);
         case 'string':
             return (a as string).localeCompare(b as string);
         case 'Uint8Array': {
@@ -254,36 +473,12 @@ export function keyPartsEqual(a: Deno.KvKeyPart, b: Deno.KvKeyPart): boolean {
     return false;
 }
 
-export function encodeKeyPart(part: Deno.KvKeyPart): string {
-    const type = getKeyPartType(part as KvKeyPart);
-    const prefix = TYPE_PREFIXES[type];
-    
-    switch (type) {
-        case 'boolean':
-            return prefix + ((part as boolean) ? '\x01' : '\x00');
-        case 'number': {
-            const buf = new ArrayBuffer(8);
-            new DataView(buf).setFloat64(0, part as number, false);
-            return prefix + String.fromCharCode(...new Uint8Array(buf));
-        }
-        case 'bigint': {
-            const str = (part as bigint).toString(16);
-            const sign = (part as bigint) >= 0n ? '\x01' : '\x00';
-            return prefix + sign + str.padStart(32, '0');
-        }
-        case 'string':
-            return prefix + (part as string);
-        case 'Uint8Array': {
-            const arr = part as Uint8Array;
-            return prefix + String.fromCharCode(...arr);
-        }
-        default:
-            return prefix;
-    }
+export function encodeKeyPart(part: Deno.KvKeyPart): Uint8Array {
+    return serializeKey([part]);
 }
 
-export function encodeKey(key: Deno.KvKey): string {
-    return key.map(encodeKeyPart).join('\x00');
+export function encodeKey(key: Deno.KvKey): Uint8Array {
+    return serializeKey(key);
 }
 
 export function isValidKeyPart(part: unknown): part is Deno.KvKeyPart {

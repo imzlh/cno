@@ -96,7 +96,8 @@ class ProcessWriteStream extends Writable {
     }
 
     writeSync(data: Uint8Array | string): number {
-        return this.#stdio.writeSync(typeof data === 'string' ? engine.encodeString(data) : data);
+        const d = typeof data === 'string' ? engine.encodeString(data) : data;
+        return this.#stdio.writeSync(d);
     }
 
     clearLine(dir: number, callback?: () => void): boolean {
@@ -162,7 +163,7 @@ class ProcessReadStream extends Readable {
         return this;
     }
 
-    readSync(buf: Uint8Array): number | null {
+    readSync(buf: Uint8Array<ArrayBuffer>): number | null {
         return this.#stdio.readSync(buf);
     }
 }
