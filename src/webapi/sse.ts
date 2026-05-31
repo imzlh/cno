@@ -8,7 +8,9 @@
 import { Headers } from "headers-polyfill";
 import { connectionManager, type Connection } from "@cnojs/http/connection";
 import { HttpRequestBuilder, HttpResponseParser } from "@cnojs/http/h1";
-import { assert } from "../utils/assert";
+
+const engine = import.meta.use('engine');
+const timers = import.meta.use('timers');
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
@@ -54,11 +56,15 @@ export class EventSource extends EventTarget {
             const url = new URL(this.url);
             const port = url.port ? parseInt(url.port) : (url.protocol === 'https:' ? 443 : 80);
 
-            this.connection = await connectionManager.acquire({
+            this.connection = await connectionManager.acquireAsync({
                 hostname: url.hostname, port,
                 protocol: url.protocol as 'http:' | 'https:',
                 keepAlive: true, timeout: 30000
             });
+            if (this.readyState === EventSourceReadyState.CLOSED) {
+                this.closeConnection();
+                return;
+            }
 
             const headers = new Headers();
             headers.set('accept', 'text/event-stream');
@@ -68,7 +74,7 @@ export class EventSource extends EventTarget {
             const rawHeaders: Array<[string, string]> = [];
             headers.forEach((v: string, k: string) => rawHeaders.push([k, v]));
             const builder = new HttpRequestBuilder({ method: 'GET', path: url.pathname + url.search, host: url.host, headers: rawHeaders });
-            await this.connection.write(builder.build());
+            await this.connection.writeAsync(builder.build());
 
             this.parser = new HttpResponseParser();
             this.setupParser();
@@ -97,12 +103,12 @@ export class EventSource extends EventTarget {
         if (!this.connection || !this.parser) return;
         try {
             while (!this.parser.isHeadersComplete) {
-                const data = await this.connection.read();
+                const data = await this.connection.readAsync();
                 if (!data || data.length === 0) throw new Error('Connection closed while reading headers');
                 this.parser.feed(data);
             }
             while (this.readyState !== EventSourceReadyState.CLOSED) {
-                const data = await this.connection.read();
+                const data = await this.connection.readAsync();
                 if (!data || data.length === 0) { this.reconnect(); return; }
                 this.parser.feed(data);
             }
@@ -215,7 +221,3 @@ export class EventSource extends EventTarget {
 }
 
 Reflect.set(globalThis, 'EventSource', EventSource);
-
-// --- C++ module references ---
-declare const engine: { decodeString(data: Uint8Array): string };
-declare const timers: typeof CModuleTimers;

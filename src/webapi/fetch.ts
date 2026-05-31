@@ -17,6 +17,41 @@ export type ProgressCallback = (now: number, total: number) => void;
 
 const MAX_REDIRECTS = 8;
 
+function abortError(signal?: AbortSignal): any {
+    return signal?.reason ?? new DOMException('The operation was aborted', 'AbortError');
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+    if (signal?.aborted) throw abortError(signal);
+}
+
+function raceWithAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined, onAbort?: () => void): Promise<T> {
+    if (!signal) return promise;
+    if (signal.aborted) {
+        try { onAbort?.(); } catch {}
+        return Promise.reject(abortError(signal));
+    }
+    return new Promise<T>((resolve, reject) => {
+        let settled = false;
+        const cleanup = () => signal.removeEventListener('abort', onSignalAbort);
+        const settle = (fn: () => void) => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            fn();
+        };
+        const onSignalAbort = () => settle(() => {
+            try { onAbort?.(); } catch {}
+            reject(abortError(signal));
+        });
+        signal.addEventListener('abort', onSignalAbort, { once: true });
+        promise.then(
+            (value) => settle(() => resolve(value)),
+            (error) => settle(() => reject(error)),
+        );
+    });
+}
+
 function mergeChunks(chunks: Uint8Array[]): Uint8Array {
     if (chunks.length === 0) return new Uint8Array(0);
     if (chunks.length === 1) return chunks[0]!;
@@ -171,50 +206,116 @@ export class Response implements globalThis.Response {
 /* Async fetch                                                        */
 /* ================================================================== */
 
-interface FetchContext { request: Request; url: URL; connection: Connection; h1Conn: any; aborted: boolean; }
+interface FetchContext {
+    request: Request;
+    url: URL;
+    connection: Connection;
+    h1Conn: any;
+    aborted: boolean;
+    connectionHandled: boolean;
+}
+
+function closeConnection(ctx: Partial<FetchContext>): void {
+    const connection = ctx.connection;
+    if (!connection || ctx.connectionHandled) return;
+    ctx.connectionHandled = true;
+    try { connection.close(); } catch {}
+}
 
 function createResponseBodyStream(ctx: FetchContext): ReadableStream<Uint8Array> {
     return new ReadableStream({
         start: async (controller: any) => {
+            let settled = false;
+            const finish = (kind: 'close' | 'error', err?: Error) => {
+                if (settled) return;
+                settled = true;
+                ctx.request.signal?.removeEventListener('abort', onAbort);
+                if (kind === 'close') {
+                    try { controller.close(); } catch {}
+                    releaseConnection(ctx);
+                } else {
+                    try { controller.error(err); } catch {}
+                    closeConnection(ctx);
+                }
+            };
+            const onAbort = () => {
+                ctx.aborted = true;
+                finish('error', abortError(ctx.request.signal));
+            };
             try {
-                if (ctx.aborted) { controller.close(); return; }
-                ctx.h1Conn.parser.onData = (chunk: Uint8Array) => { if (!ctx.aborted) controller.enqueue(chunk); };
+                if (ctx.aborted) {
+                    finish('error', abortError(ctx.request.signal));
+                    return;
+                }
+                ctx.request.signal?.addEventListener('abort', onAbort, { once: true });
+                ctx.h1Conn.parser.onData = (chunk: Uint8Array) => {
+                    if (!ctx.aborted && !settled) controller.enqueue(chunk);
+                };
                 for (const chunk of ctx.h1Conn.parser.getBodyChunks()) controller.enqueue(chunk);
-                if (ctx.h1Conn.parser.isCompleted) { controller.close(); releaseConnection(ctx); return; }
-                ctx.h1Conn.parser.onComplete = () => { controller.close(); releaseConnection(ctx); };
-                ctx.h1Conn.parser.onError = (err: Error) => { if (!ctx.aborted) controller.error(err); };
-            } catch (err) { if (!ctx.aborted) controller.error(err); }
+                if (ctx.h1Conn.parser.isCompleted) {
+                    finish('close');
+                    return;
+                }
+                ctx.h1Conn.parser.onComplete = () => { finish('close'); };
+                ctx.h1Conn.parser.onError = (err: Error) => {
+                    if (!ctx.aborted) finish('error', err);
+                };
+            } catch (err) {
+                if (!ctx.aborted) finish('error', err as Error);
+            }
         },
-        async pull(controller: any) { if (ctx.aborted) { controller.close(); return; } await readBody(ctx); },
-        cancel: () => { ctx.aborted = true; ctx.connection?.close(); }
+        async pull(controller: any) {
+            if (ctx.aborted) {
+                controller.error(abortError(ctx.request.signal));
+                return;
+            }
+            await readBody(ctx);
+        },
+        cancel: () => {
+            ctx.aborted = true;
+            closeConnection(ctx);
+        }
     });
 }
 
 async function readHeaders(ctx: FetchContext): Promise<void> {
     while (!ctx.h1Conn.parser.isHeadersComplete) {
-        if (ctx.aborted) throw new DOMException('The operation was aborted', 'AbortError');
-        try { const data = await ctx.connection.readAsync(); if (data === null) throw new TypeError('Failed to fetch: EOF while reading header'); ctx.h1Conn.parser.feed(data); }
-        catch (err) { if (ctx.aborted) throw new DOMException('The operation was aborted', 'AbortError'); throw err; }
+        throwIfAborted(ctx.request.signal);
+        try {
+            const data = await raceWithAbort(ctx.connection.readAsync(), ctx.request.signal, () => { try { ctx.connection.close(); } catch {} });
+            if (data === null) throw new TypeError('Failed to fetch: EOF while reading header');
+            ctx.h1Conn.parser.feed(data);
+        } catch (err) {
+            if (ctx.aborted || ctx.request.signal?.aborted) throw abortError(ctx.request.signal);
+            throw err;
+        }
     }
 }
 
-async function readBody(ctx: FetchContext): Promise<void> { if (ctx.aborted) return; const data = await ctx.connection.readAsync(); if (ctx.aborted || !data) return; ctx.h1Conn.parser.feed(data); }
+async function readBody(ctx: FetchContext): Promise<void> {
+    throwIfAborted(ctx.request.signal);
+    const data = await raceWithAbort(ctx.connection.readAsync(), ctx.request.signal, () => { try { ctx.connection.close(); } catch {} });
+    if (ctx.aborted || !data) return;
+    ctx.h1Conn.parser.feed(data);
+}
 
 function releaseConnection(ctx: Partial<FetchContext>): void {
+    if (ctx.connectionHandled) return;
     const { url, connection } = ctx; assert(url && connection, "invalid connection");
+    ctx.connectionHandled = true;
     const port = url.port ? parseInt(url.port) : (url.protocol === 'https:' ? 443 : 80);
     connectionManager.release({ hostname: url.hostname, port, protocol: url.protocol as 'http:' | 'https:' }, connection);
 }
 
 async function sendRequest(request: Request, url: URL, connection: Connection): Promise<any> {
-    const bodyBuffer = await request.getBodyBuffer();
+    const bodyBuffer = await raceWithAbort(request.getBodyBuffer(), request.signal);
     const headers: Array<[string, string]> = [];
     request.headers.forEach((v: string, k: string) => headers.push([k, v]));
     const builder = new HttpRequestBuilder({
         method: request.method, path: url.pathname + url.search,
         host: url.host, httpVersion: '1.1', headers, body: bodyBuffer,
     });
-    await connection.writeAsync(builder.build());
+    await raceWithAbort(connection.writeAsync(builder.build()), request.signal, () => { try { connection.close(); } catch {} });
     return { parser: new HttpResponseParser() };
 }
 
@@ -229,26 +330,28 @@ async function performFetch(request: Request, url: URL, redirectCount = 0): Prom
     if (redirectCount > 20) throw new TypeError('Too many redirects');
     const port = url.port ? parseInt(url.port) : (url.protocol === 'https:' ? 443 : 80);
     const connConfig = { hostname: url.hostname, port, protocol: url.protocol as 'http:' | 'https:', keepAlive: request.keepalive, timeout: 30000 };
-    let connection = await connectionManager.acquireAsync(connConfig);
+    let connection = await raceWithAbort(connectionManager.acquireAsync(connConfig), request.signal);
 
     const h1Conn = { parser: new HttpResponseParser() };
-    const ctx: FetchContext = { request, url, connection, h1Conn, aborted: false };
+    const ctx: FetchContext = { request, url, connection, h1Conn, aborted: false, connectionHandled: false };
 
-    function abortHandler() { ctx.aborted = true; ctx.connection.close(); }
+    function abortHandler() { ctx.aborted = true; closeConnection(ctx); }
     if (request.signal) request.signal.addEventListener('abort', abortHandler);
 
     try {
+        throwIfAborted(request.signal);
         await sendRequest(request, url, connection);
-        if (ctx.aborted) throw new DOMException('The operation was aborted', 'AbortError');
+        throwIfAborted(request.signal);
         try { await readHeaders(ctx); }
         catch (err) {
             if (!ctx.aborted && err instanceof TypeError && (err as Error).message.startsWith('Failed to fetch')) {
-                connection.close(); connection = await connectionManager.acquireAsync(connConfig);
-                ctx.connection = connection; h1Conn.parser = new HttpResponseParser();
+                closeConnection(ctx);
+                connection = await raceWithAbort(connectionManager.acquireAsync(connConfig), request.signal);
+                ctx.connection = connection; ctx.connectionHandled = false; h1Conn.parser = new HttpResponseParser();
                 await sendRequest(request, url, connection); await readHeaders(ctx);
             } else throw err;
         }
-        if (ctx.aborted) throw new DOMException('The operation was aborted', 'AbortError');
+        throwIfAborted(request.signal);
 
         const statusCode = h1Conn.parser.getStatusCode();
         const statusText = h1Conn.parser.getStatusText();
@@ -268,8 +371,8 @@ async function performFetch(request: Request, url: URL, redirectCount = 0): Prom
         return response;
     } catch (err) {
         if (request.signal) request.signal.removeEventListener('abort', abortHandler);
-        releaseConnection({ url, connection } as any);
-        if (ctx.aborted) throw new DOMException('The operation was aborted', 'AbortError');
+        closeConnection(ctx);
+        if (ctx.aborted || request.signal?.aborted) throw abortError(request.signal);
         throw err;
     }
 }
@@ -277,7 +380,7 @@ async function performFetch(request: Request, url: URL, redirectCount = 0): Prom
 export async function fetchAsync(input: any, init?: any): Promise<Response> {
     if (input instanceof URL) input = input.href;
     const request = new Request(input, init);
-    if (request.signal?.aborted) throw new DOMException('The operation was aborted', 'AbortError');
+    throwIfAborted(request.signal);
     const url = new URL(request.url);
     if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new TypeError(`Unsupported protocol: ${url.protocol}`);
     return performFetch(request, url);
