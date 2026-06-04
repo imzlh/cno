@@ -5,7 +5,6 @@
 
 const proc = import.meta.use('process');
 const os = import.meta.use('os');
-const engine = import.meta.use('engine');
 
 import { EventEmitter } from '../events';
 import { Writable, Readable } from '../stream';
@@ -29,6 +28,8 @@ export interface SpawnOptions {
     signal?: AbortSignal;
     timeout?: number;
     killSignal?: string | number;
+    input?: string | ArrayBuffer | Uint8Array;
+    encoding?: BufferEncoding | 'buffer' | null;
 }
 
 export interface SpawnOptionsWithStdioTuple<
@@ -447,39 +448,36 @@ export function spawnSync(command: string, args?: string[], options?: SpawnOptio
         stdin: 'pipe',
         stdout: 'pipe',
         stderr: 'pipe',
+        input: options?.input,
     };
 
+    if (options?.stdio) {
+        if (Array.isArray(options.stdio)) {
+            opts.stdin = options.stdio[0] as any;
+            opts.stdout = options.stdio[1] as any;
+            opts.stderr = options.stdio[2] as any;
+        } else {
+            opts.stdin = options.stdio as any;
+            opts.stdout = options.stdio as any;
+            opts.stderr = options.stdio as any;
+        }
+    }
+
     try {
-        // @ts-ignore
-        const child = proc.spawn(command, args ?? [], opts);
-
-        const readPipe = (pipe: any): string => {
-            if (!pipe) return '';
-            const chunks: Uint8Array[] = [];
-            const buf = new Uint8Array(4096);
-            while (true) {
-                try {
-                    const n = engine.waitPromise<null | number>(pipe.read(buf));
-                    if (!n) break;
-                    chunks.push(buf.subarray(0, n));
-                } catch { break; }
-            }
-            const total = chunks.reduce((s, c) => s + c.length, 0);
-            const result = new Uint8Array(total);
-            let off = 0;
-            for (const c of chunks) { result.set(c, off); off += c.length; }
-            return new TextDecoder().decode(result);
+        const result = proc.spawnSync(command, args ?? [], opts) as any;
+        const encoding = options?.encoding ?? 'utf8';
+        const convert = (value: ArrayBuffer | null | undefined): any => {
+            if (value == null) return value;
+            const bytes = new Uint8Array(value);
+            if (encoding === 'buffer' || encoding === null) return bytes;
+            return new TextDecoder(encoding as string).decode(bytes);
         };
-
-        const info = child.waitSync();
-
-        return {
-            pid: child.pid,
-            status: info.exit_status,
-            signal: info.term_signal,
-            stdout: readPipe(child.stdout),
-            stderr: readPipe(child.stderr),
-        };
+        result.stdout = convert(result.stdout);
+        result.stderr = convert(result.stderr);
+        if (result.output) {
+            result.output = [result.output[0], result.stdout, result.stderr];
+        }
+        return result;
     } catch (err) {
         return {
             error: err as Error,

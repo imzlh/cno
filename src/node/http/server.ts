@@ -1,4 +1,4 @@
-const engine = import.meta.use('engine');
+﻿const engine = import.meta.use('engine');
 const http = import.meta.use('http');
 const text = import.meta.use('text');
 
@@ -6,8 +6,6 @@ import { Readable, Writable } from '../stream';
 import { Socket, Server as NetServer, AddressInfo } from '../net';
 import type { HttpRequest, HttpResponse } from '@cnojs/http/server';
 
-// @ts-ignore cno namespace
-const { createServer: createHttpServer } = http.__cno as import('http');
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
@@ -690,6 +688,8 @@ export class ServerImpl extends NetServer implements Server {
             }
         };
 
+        const createHttpServer = (http.__cno as import('http') | undefined)?.createServer;
+        if (!createHttpServer) throw new Error('Native HTTP server is unavailable');
         this._httpServer = createHttpServer(handler, {
             port: port ?? 0,
             hostname: host,
@@ -737,3 +737,4 @@ export function validateHeaderValue(name: string, value: string): void {
         throw new TypeError(`Invalid character in header content ["${name}"]`);
     }
 }
+

@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Node.js https module
  * Reuses http server/client architecture with TLS (TLSSocket) wrapping
  */
@@ -24,11 +24,11 @@ import {
 import { ClientRequestArgs, Agent as HttpAgent } from '../http/client';
 
 const streams = import.meta.use('streams');
+const dns = import.meta.use('dns');
 const os = import.meta.use('os');
 const engine = import.meta.use('engine');
 const httpParser = import.meta.use('http');
 const timers = import.meta.use('timers');
-import { dnsCache } from '@cnojs/http/dns-cache';
 
 // ============================================================================
 // HTTPS Server
@@ -173,7 +173,7 @@ export class Agent extends HttpAgent {
 
         const family = host.includes(':') ? os.AF_INET6 : os.AF_INET;
 
-        dnsCache.resolve(host, { family }).then((addrs: any[]) => {
+        dns.resolve(host, { family }).then((addrs: any[]) => {
             if (!addrs?.length) throw new Error(`DNS resolution failed for ${host}`);
             const addr = addrs.find((a: any) => a.family === (family === os.AF_INET6 ? 6 : 4)) || addrs[0];
             const tcp = new streams.TCP(family);
@@ -280,7 +280,7 @@ class HttpsClientRequest extends OutgoingMessageImpl {
 
         try {
             const isIPv6 = this.host.includes(':');
-            const addrs = await dnsCache.resolve(this.host, { family: isIPv6 ? 10 : 0 });
+            const addrs = await dns.resolve(this.host, { family: isIPv6 ? 10 : 0 });
             if (!addrs?.length) throw new Error(`DNS resolution failed for ${this.host}`);
             const addr = addrs.find((a: any) => a.family === (isIPv6 ? 10 : 4)) || addrs[0];
 
@@ -535,3 +535,4 @@ export default {
     createSecureContext,
     getCiphers,
 };
+

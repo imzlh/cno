@@ -4,6 +4,7 @@
  */
 
 import { malloc } from "../utils/malloc";
+import { osShell } from "../utils/platform";
 import { wrapFSErr } from "../utils/wrap";
 
 const process = import.meta.use('process');
@@ -38,15 +39,6 @@ class PtyProcess implements CNO.PtyPipe {
     #readable: ReadableStream<Uint8Array>;
     #writable: WritableStream<Uint8Array>;
 
-    static getSystemShell(): string {
-        const platform = os.uname().sysname;
-        if (platform === 'Windows_NT' || platform.startsWith('MSYS')) {
-            return os.getenv('COMSPEC') || 'cmd.exe';
-        } else {
-            return os.getenv('SHELL') || '/bin/sh';
-        }
-    }
-
     constructor(opts: CNO.OpenptyOptions) {
         if (opts.argv !== undefined && !Array.isArray(opts.argv)) {
             throw new TypeError('argv must be an array of strings');
@@ -70,7 +62,7 @@ class PtyProcess implements CNO.PtyPipe {
         if (opts.argv && opts.argv.length > 0) {
             this.#proc = process.spawn(opts.argv, spawnOpts);
         } else {
-            this.#proc = process.spawn([opts.name ?? PtyProcess.getSystemShell(), ...(opts.argv ?? [])], spawnOpts);
+            this.#proc = process.spawn([opts.name ?? osShell, ...(opts.argv ?? [])], spawnOpts);
         }
         this.#readable = pipeToReadable(this.#proc.readable!);
         this.#writable = pipeToWritable(this.#proc.writable!);

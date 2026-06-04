@@ -38,13 +38,13 @@ globalThis.prompt = function(msg) {
     const reading = !!stdin.onread;
     if (reading) stdin.stopRead();
     stdin.mode = streams.TTY_MODE_NORMAL;
-    engine.waitPromise(stdout.write(engine.encodeString(promptStr)));
+    stdout.writeSync(engine.encodeString(promptStr));
 
     const chunk = new Uint8Array(4096);
     try {
         let line = '';
         while (true) {
-            const n = engine.waitPromise(stdin.read(chunk));
+            const n = stdin.readSync(chunk);
             if (!n) break;
             line += engine.decodeString(chunk.subarray(0, n));
             // Normal mode delivers a full line ending with \n

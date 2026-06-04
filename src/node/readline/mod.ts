@@ -3,6 +3,7 @@
  * Based on circu.js streams TTY/Pipe for terminal I/O
  */
 
+import type { Stream } from '../../deno/04_stdio';
 import { EventEmitter } from '../events';
 
 const os = import.meta.use('os');
@@ -10,8 +11,7 @@ const streams = import.meta.use('streams');
 const syncfs = import.meta.use('fs');
 const engine = import.meta.use('engine');
 
-const isInputTTY = os.guessHandle(os.STDIN_FILENO) === 'tty';
-const isOutputTTY = os.guessHandle(os.STDOUT_FILENO) === 'tty';
+const { stdin, stdout } = streams as any as Record<string, Stream>;
 
 function writeAnsi(fd: number, seq: string): void {
     const data = new TextEncoder().encode(seq);
@@ -63,10 +63,9 @@ export class Interface extends EventEmitter {
     private _closed = false;
     private _paused = false;
     private _rawMode = false;
+    private _prevMode = streams.TTY_MODE_RAW;
     private _inputFd: number;
     private _outputFd: number;
-    private _inputStream: CModuleStreams.Stream | null = null;
-    private _outputStream: CModuleStreams.Stream | null = null;
     private _readBuf = new Uint8Array(4096);
     private _lineBuf: string[] = [];
     private _reading = false;
@@ -81,45 +80,19 @@ export class Interface extends EventEmitter {
         this._completer = opts.completer;
         this._inputFd = os.STDIN_FILENO;
         this._outputFd = os.STDOUT_FILENO;
-        this._terminal = opts.terminal ?? isInputTTY;
+        this._terminal = opts.terminal ?? stdin.isTTY;
         this._historySize = Math.max(opts.historySize ?? 30, 0);
         this._removeHistoryDups = opts.removeHistoryDuplicates ?? true;
         this._prompt = opts.prompt ?? '> ';
 
-        this._setupInputStreams();
-
-        if (this._terminal && this._inputStream) {
-            try {
-                (this._inputStream as CModuleStreams.TTY).mode = streams.TTY_MODE_RAW;
-                this._rawMode = true;
-            } catch {}
-        }
-
         if (opts.prompt) this._displayPrompt();
         if (!this._paused) this._startRead();
-    }
 
-    private _setupInputStreams(): void {
-        try {
-            const inputType = os.guessHandle(this._inputFd);
-            if (inputType === 'tty') {
-                this._inputStream = new streams.TTY(this._inputFd, true);
-            } else {
-                const pipe = new streams.Pipe();
-                pipe.open(this._inputFd);
-                this._inputStream = pipe;
-            }
-        } catch {}
-
-        try {
-            const outputType = os.guessHandle(this._outputFd);
-            if (outputType === 'tty') {
-                this._outputStream = new streams.TTY(this._outputFd, false);
-            } else {
-                const pipe = new streams.Pipe();
-                pipe.open(this._outputFd);
-                this._outputStream = pipe;
-            }
+        if (stdin.isTTY)  try {
+            const stream = stdin.__stream as CModuleStreams.TTY;
+            this._prevMode = stream.mode;
+            stream.mode = streams.TTY_MODE_RAW_VT;
+            this._rawMode = true;
         } catch {}
     }
 
@@ -129,10 +102,12 @@ export class Interface extends EventEmitter {
     }
 
     private _writeOutput(data: string): void {
-        if (this._outputStream) {
-            try {
-                engine.waitPromise(this._outputStream.write(new TextEncoder().encode(data)));
-            } catch {}
+        const buf = engine.encodeString(data);
+        let write = 0;
+        while (write < buf.length) {
+            const n = stdout.writeSync(buf.subarray(write));
+            if (!n) throw new Error('Write failed');
+            write += n;
         }
     }
 
@@ -149,10 +124,9 @@ export class Interface extends EventEmitter {
     }
 
     private _getColumns(): number {
-        if (this._outputStream && 'size' in this._outputStream) {
-            return (this._outputStream as CModuleStreams.TTY).size.width;
-        }
-        return 80;
+        if (!stdin.isTTY) return 80;
+        const stream = stdin.__stream as CModuleStreams.TTY;
+        return stream.size.width;
     }
 
     private _startRead(): void {
@@ -349,10 +323,8 @@ export class Interface extends EventEmitter {
     close(): void {
         if (this._closed) return;
         this._closed = true;
-        if (this._rawMode && this._inputStream) {
-            try {
-                (this._inputStream as CModuleStreams.TTY).mode = streams.TTY_MODE_NORMAL;
-            } catch {}
+        if (this._rawMode) {
+            (stdin.__stream as CModuleStreams.TTY).mode = this._prevMode;
             this._rawMode = false;
         }
         this.emit('close');

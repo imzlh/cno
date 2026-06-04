@@ -1,4 +1,5 @@
 import { malloc } from "../utils/malloc";
+import { isUnixCompatible, isWindows } from "../utils/platform";
 import { wrapFsClassDec as wrap } from "../utils/wrap";
 import { FSFile } from "./03_fopen";
 
@@ -6,6 +7,7 @@ const os = import.meta.use('os');
 const pipe = import.meta.use('streams');
 const fs = import.meta.use('asyncfs');
 const engine = import.meta.use('engine');
+const sfs = import.meta.use('fs');
 
 type AnyStream = CModuleStreams.Pipe | CModuleStreams.TTY | Deno.FsFile;
 
@@ -35,6 +37,8 @@ export class Stream {
 
     constructor(fd: number, read = true) {
         const type = os.guessHandle(fd);
+        
+        this.fd = fd;
         switch (type) {
             // normal pipe
             case "udp":
@@ -51,13 +55,16 @@ export class Stream {
                 try {
                     this.stream.mode = pipe.TTY_MODE_NORMAL;
                 } catch {}
+                if (isWindows && !isUnixCompatible) {
+                    // Sync should use $CONIN instead
+                    this.fd = sfs.open('CONIN$', 'r', 0);
+                }
             break;
             case "file":
                 this.stream = new FSFile(fs.newStdioFile('stdio', fd));
                 this.type = 'file';
             break;
         }
-        this.fd = fd;
     }
 
     @wrap
@@ -93,7 +100,7 @@ export class Stream {
             tryLock(this.fd);
             return (this.stream as FSFile).readSync(buf);
         } else {
-            return engine.waitPromise(this.stream.read(buf));
+            return sfs.read(this.fd, buf);
         }
     }
 
@@ -103,7 +110,7 @@ export class Stream {
             tryLock(this.fd);
             return (this.stream as FSFile).writeSync(data);
         } else {
-            return engine.waitPromise(this.stream.write(data));
+            return sfs.write(this.fd, data);
         }
     }
 

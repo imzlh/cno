@@ -1,21 +1,16 @@
-/**
- * CNO secondary wrapping layer — Web API fetch/Request/Response.
+﻿/**
+ * CNO secondary wrapping layer 鈥?Web API fetch/Request/Response.
  *
- * Maps WebAPI types onto @cnojs/http low-level protocol primitives.
+ * Maps WebAPI fetch/Request/Response onto @cnojs/http's curl-backed client.
  */
 
 import { Headers } from "headers-polyfill";
-import { connectionManager } from "@cnojs/http/connection";
-import type { Connection } from "@cnojs/http/connection";
-import { HttpRequestBuilder, HttpResponseParser } from "@cnojs/http/h1";
-import { assert } from "../utils/assert";
+import { fetchSync as httpFetchSync } from "@cnojs/http/client";
 const engine = import.meta.use('engine');
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
 export type ProgressCallback = (now: number, total: number) => void;
-
-const MAX_REDIRECTS = 8;
 
 function abortError(signal?: AbortSignal): any {
     return signal?.reason ?? new DOMException('The operation was aborted', 'AbortError');
@@ -23,33 +18,6 @@ function abortError(signal?: AbortSignal): any {
 
 function throwIfAborted(signal?: AbortSignal): void {
     if (signal?.aborted) throw abortError(signal);
-}
-
-function raceWithAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined, onAbort?: () => void): Promise<T> {
-    if (!signal) return promise;
-    if (signal.aborted) {
-        try { onAbort?.(); } catch {}
-        return Promise.reject(abortError(signal));
-    }
-    return new Promise<T>((resolve, reject) => {
-        let settled = false;
-        const cleanup = () => signal.removeEventListener('abort', onSignalAbort);
-        const settle = (fn: () => void) => {
-            if (settled) return;
-            settled = true;
-            cleanup();
-            fn();
-        };
-        const onSignalAbort = () => settle(() => {
-            try { onAbort?.(); } catch {}
-            reject(abortError(signal));
-        });
-        signal.addEventListener('abort', onSignalAbort, { once: true });
-        promise.then(
-            (value) => settle(() => resolve(value)),
-            (error) => settle(() => reject(error)),
-        );
-    });
 }
 
 function mergeChunks(chunks: Uint8Array[]): Uint8Array {
@@ -61,7 +29,6 @@ function mergeChunks(chunks: Uint8Array[]): Uint8Array {
     return merged;
 }
 
-/** Convert Array<[string, string]> to Headers */
 function rawHeadersToHeaders(raw: Array<[string, string]>): Headers {
     const h = new Headers();
     for (const [k, v] of raw) h.append(k, v);
@@ -206,173 +173,35 @@ export class Response implements globalThis.Response {
 /* Async fetch                                                        */
 /* ================================================================== */
 
-interface FetchContext {
-    request: Request;
-    url: URL;
-    connection: Connection;
-    h1Conn: any;
-    aborted: boolean;
-    connectionHandled: boolean;
+function headersToRecord(headers: Headers): Record<string, string> {
+    const out: Record<string, string> = {};
+    headers.forEach((value: string, key: string) => { out[key] = value; });
+    return out;
 }
 
-function closeConnection(ctx: Partial<FetchContext>): void {
-    const connection = ctx.connection;
-    if (!connection || ctx.connectionHandled) return;
-    ctx.connectionHandled = true;
-    try { connection.close(); } catch {}
-}
-
-function createResponseBodyStream(ctx: FetchContext): ReadableStream<Uint8Array> {
-    return new ReadableStream({
-        start: async (controller: any) => {
-            let settled = false;
-            const finish = (kind: 'close' | 'error', err?: Error) => {
-                if (settled) return;
-                settled = true;
-                ctx.request.signal?.removeEventListener('abort', onAbort);
-                if (kind === 'close') {
-                    try { controller.close(); } catch {}
-                    releaseConnection(ctx);
-                } else {
-                    try { controller.error(err); } catch {}
-                    closeConnection(ctx);
-                }
-            };
-            const onAbort = () => {
-                ctx.aborted = true;
-                finish('error', abortError(ctx.request.signal));
-            };
-            try {
-                if (ctx.aborted) {
-                    finish('error', abortError(ctx.request.signal));
-                    return;
-                }
-                ctx.request.signal?.addEventListener('abort', onAbort, { once: true });
-                ctx.h1Conn.parser.onData = (chunk: Uint8Array) => {
-                    if (!ctx.aborted && !settled) controller.enqueue(chunk);
-                };
-                for (const chunk of ctx.h1Conn.parser.getBodyChunks()) controller.enqueue(chunk);
-                if (ctx.h1Conn.parser.isCompleted) {
-                    finish('close');
-                    return;
-                }
-                ctx.h1Conn.parser.onComplete = () => { finish('close'); };
-                ctx.h1Conn.parser.onError = (err: Error) => {
-                    if (!ctx.aborted) finish('error', err);
-                };
-            } catch (err) {
-                if (!ctx.aborted) finish('error', err as Error);
-            }
-        },
-        async pull(controller: any) {
-            if (ctx.aborted) {
-                controller.error(abortError(ctx.request.signal));
-                return;
-            }
-            await readBody(ctx);
-        },
-        cancel: () => {
-            ctx.aborted = true;
-            closeConnection(ctx);
-        }
-    });
-}
-
-async function readHeaders(ctx: FetchContext): Promise<void> {
-    while (!ctx.h1Conn.parser.isHeadersComplete) {
-        throwIfAborted(ctx.request.signal);
-        try {
-            const data = await raceWithAbort(ctx.connection.readAsync(), ctx.request.signal, () => { try { ctx.connection.close(); } catch {} });
-            if (data === null) throw new TypeError('Failed to fetch: EOF while reading header');
-            ctx.h1Conn.parser.feed(data);
-        } catch (err) {
-            if (ctx.aborted || ctx.request.signal?.aborted) throw abortError(ctx.request.signal);
-            throw err;
-        }
-    }
-}
-
-async function readBody(ctx: FetchContext): Promise<void> {
-    throwIfAborted(ctx.request.signal);
-    const data = await raceWithAbort(ctx.connection.readAsync(), ctx.request.signal, () => { try { ctx.connection.close(); } catch {} });
-    if (ctx.aborted || !data) return;
-    ctx.h1Conn.parser.feed(data);
-}
-
-function releaseConnection(ctx: Partial<FetchContext>): void {
-    if (ctx.connectionHandled) return;
-    const { url, connection } = ctx; assert(url && connection, "invalid connection");
-    ctx.connectionHandled = true;
-    const port = url.port ? parseInt(url.port) : (url.protocol === 'https:' ? 443 : 80);
-    connectionManager.release({ hostname: url.hostname, port, protocol: url.protocol as 'http:' | 'https:' }, connection);
-}
-
-async function sendRequest(request: Request, url: URL, connection: Connection): Promise<any> {
-    const bodyBuffer = await raceWithAbort(request.getBodyBuffer(), request.signal);
-    const headers: Array<[string, string]> = [];
-    request.headers.forEach((v: string, k: string) => headers.push([k, v]));
-    const builder = new HttpRequestBuilder({
-        method: request.method, path: url.pathname + url.search,
-        host: url.host, httpVersion: '1.1', headers, body: bodyBuffer,
-    });
-    await raceWithAbort(connection.writeAsync(builder.build()), request.signal, () => { try { connection.close(); } catch {} });
-    return { parser: new HttpResponseParser() };
-}
-
-async function handleRedirect(request: Request, url: URL, location: string, statusCode: number, redirectCount: number): Promise<Response> {
-    const redirectUrl = new URL(location, url);
-    let redirectMethod = request.method;
-    if (statusCode === 303 || ((statusCode === 301 || statusCode === 302) && request.method === 'POST')) redirectMethod = 'GET';
-    return performFetch(new Request(redirectUrl.href, { method: redirectMethod, headers: request.headers, body: redirectMethod === 'GET' ? null : (request as any)._bodySource, credentials: request.credentials, cache: request.cache, redirect: request.redirect, signal: request.signal }), redirectUrl, redirectCount + 1);
-}
-
-async function performFetch(request: Request, url: URL, redirectCount = 0): Promise<Response> {
-    if (redirectCount > 20) throw new TypeError('Too many redirects');
-    const port = url.port ? parseInt(url.port) : (url.protocol === 'https:' ? 443 : 80);
-    const connConfig = { hostname: url.hostname, port, protocol: url.protocol as 'http:' | 'https:', keepAlive: request.keepalive, timeout: 30000 };
-    let connection = await raceWithAbort(connectionManager.acquireAsync(connConfig), request.signal);
-
-    const h1Conn = { parser: new HttpResponseParser() };
-    const ctx: FetchContext = { request, url, connection, h1Conn, aborted: false, connectionHandled: false };
-
-    function abortHandler() { ctx.aborted = true; closeConnection(ctx); }
-    if (request.signal) request.signal.addEventListener('abort', abortHandler);
+async function performFetch(request: Request, url: URL): Promise<Response> {
+    throwIfAborted(request.signal);
+    const body = await request.getBodyBuffer();
+    throwIfAborted(request.signal);
 
     try {
-        throwIfAborted(request.signal);
-        await sendRequest(request, url, connection);
-        throwIfAborted(request.signal);
-        try { await readHeaders(ctx); }
-        catch (err) {
-            if (!ctx.aborted && err instanceof TypeError && (err as Error).message.startsWith('Failed to fetch')) {
-                closeConnection(ctx);
-                connection = await raceWithAbort(connectionManager.acquireAsync(connConfig), request.signal);
-                ctx.connection = connection; ctx.connectionHandled = false; h1Conn.parser = new HttpResponseParser();
-                await sendRequest(request, url, connection); await readHeaders(ctx);
-            } else throw err;
-        }
+        const result = httpFetchSync(url.href, undefined, {
+            method: request.method,
+            headers: headersToRecord(request.headers),
+            body,
+            signal: request.signal,
+        });
         throwIfAborted(request.signal);
 
-        const statusCode = h1Conn.parser.getStatusCode();
-        const statusText = h1Conn.parser.getStatusText();
-        const rawHeaders = h1Conn.parser.getHeaders();
-        const headers = rawHeadersToHeaders(rawHeaders);
-
-        if (request.redirect === 'follow' && statusCode >= 300 && statusCode < 400) {
-            const location = headers.get('location');
-            if (location) { releaseConnection(ctx); if (request.signal) request.signal.removeEventListener('abort', abortHandler); return handleRedirect(request, url, location, statusCode, redirectCount); }
-        }
-
-        const bodyStream = createResponseBodyStream(ctx);
-        const response = new Response(bodyStream, { status: statusCode, statusText, headers });
-        if (request.signal) request.signal.removeEventListener('abort', abortHandler);
+        const response = new Response(result.body, {
+            status: result.status,
+            headers: rawHeadersToHeaders(result.headers),
+        });
         Object.defineProperty(response, 'url', { value: url.href });
-        Object.defineProperty(response, 'redirected', { value: redirectCount > 0 });
+        Object.defineProperty(response, 'redirected', { value: false });
         return response;
     } catch (err) {
-        if (request.signal) request.signal.removeEventListener('abort', abortHandler);
-        closeConnection(ctx);
-        if (ctx.aborted || request.signal?.aborted) throw abortError(request.signal);
+        if (request.signal?.aborted) throw abortError(request.signal);
         throw err;
     }
 }
@@ -389,3 +218,4 @@ export async function fetchAsync(input: any, init?: any): Promise<Response> {
 Reflect.set(globalThis, 'fetch', fetchAsync);
 Reflect.set(globalThis, 'Response', Response);
 Reflect.set(globalThis, 'Request', Request);
+

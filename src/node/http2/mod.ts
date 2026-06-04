@@ -1,11 +1,11 @@
-/**
+﻿/**
  * Node.js http2 module
  * Built on nghttp2 (via @cnojs/http/ext-h2) + TLSSocket
  *
  * Implements the Node.js http2 API:
- *   - connect(authority, options) → ClientHttp2Session
- *   - createServer(options, onRequest) → Http2Server (cleartext, h2c)
- *   - createSecureServer(options, onRequest) → Http2SecureServer (TLS + ALPN)
+ *   - connect(authority, options) 鈫?ClientHttp2Session
+ *   - createServer(options, onRequest) 鈫?Http2Server (cleartext, h2c)
+ *   - createSecureServer(options, onRequest) 鈫?Http2SecureServer (TLS + ALPN)
  *   - Http2Session / Http2Stream events
  *   - constants object
  */
@@ -17,18 +17,18 @@ import { TLSSocket, SecureContext, TlsServerOptions } from '../tls';
 import type CModuleExternalHTTP2 from '@cnojs/http/ext-h2';
 
 const streams = import.meta.use('streams');
+const dns = import.meta.use('dns');
 const os = import.meta.use('os');
 const ssl = import.meta.use('ssl');
 const engine = import.meta.use('engine');
 const nghttp2 = import.meta.use('@cnojs/http/ext-h2') as unknown as typeof CModuleExternalHTTP2;
-import { dnsCache } from '@cnojs/http/dns-cache';
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 type NgSession = InstanceType<typeof nghttp2.Session>;
 type NgHeader = CModuleExternalHTTP2.Header;
 
 // ============================================================================
-// Constants — mirror Node.js http2.constants
+// Constants 鈥?mirror Node.js http2.constants
 // ============================================================================
 
 export const constants = {
@@ -113,7 +113,7 @@ function ngToIncoming(headers: NgHeader[]): IncomingHttpHeaders {
 }
 
 // ============================================================================
-// Http2Stream — Duplex stream over an HTTP/2 stream
+// Http2Stream 鈥?Duplex stream over an HTTP/2 stream
 // ============================================================================
 
 export interface StreamPriorityOptions {
@@ -251,7 +251,7 @@ export class Http2Stream extends Duplex {
 }
 
 // ============================================================================
-// ClientHttp2Stream — extends Http2Stream with client-specific methods
+// ClientHttp2Stream 鈥?extends Http2Stream with client-specific methods
 // ============================================================================
 
 export class ClientHttp2Stream extends Http2Stream {
@@ -269,7 +269,7 @@ export class ClientHttp2Stream extends Http2Stream {
 }
 
 // ============================================================================
-// ServerHttp2Stream — extends Http2Stream with server-specific methods
+// ServerHttp2Stream 鈥?extends Http2Stream with server-specific methods
 // ============================================================================
 
 export class ServerHttp2Stream extends Http2Stream {
@@ -322,7 +322,7 @@ export class ServerHttp2Stream extends Http2Stream {
 }
 
 // ============================================================================
-// Http2Session — wraps nghttp2.Session, attaches to a Duplex (TLSSocket / TCP)
+// Http2Session 鈥?wraps nghttp2.Session, attaches to a Duplex (TLSSocket / TCP)
 // ============================================================================
 
 export interface Http2SessionOptions {
@@ -524,7 +524,7 @@ export abstract class Http2Session extends EventEmitter {
         try { this._ngSession.goaway(code, opaqueData); } catch {}
     }
 
-    /** Close session — sends GOAWAY then closes socket */
+    /** Close session 鈥?sends GOAWAY then closes socket */
     close(callback?: () => void): void {
         if (this._closed) { callback?.(); return; }
         this._closed = true;
@@ -557,7 +557,7 @@ export abstract class Http2Session extends EventEmitter {
         return this;
     }
 
-    // ── Internal helpers for streams ───────────────────────────────────────
+    // 鈹€鈹€ Internal helpers for streams 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     _sendData(streamId: number, data: Uint8Array, endStream: boolean): void {
         this._ngSession.sendData(streamId, data, endStream);
@@ -646,7 +646,7 @@ export class ServerHttp2Session extends Http2Session {
 }
 
 // ============================================================================
-// connect() — client API
+// connect() 鈥?client API
 // ============================================================================
 
 export interface ClientSessionOptions extends Http2SessionOptions {
@@ -716,7 +716,7 @@ export function connect(
         (async () => {
             try {
                 const isIPv6 = host.includes(':');
-                const addrs = await dnsCache.resolve(host, { family: isIPv6 ? 10 : 0 });
+                const addrs = await dns.resolve(host, { family: isIPv6 ? 10 : 0 });
                 if (!addrs?.length) throw new Error(`DNS resolution failed for ${host}`);
                 const addr = addrs.find((a: any) => a.family === (isIPv6 ? 10 : 4)) || addrs[0];
                 await tcp.connect({ ip: addr.ip, port });
@@ -749,7 +749,7 @@ export function connect(
 }
 
 // ============================================================================
-// Server — Http2Server (cleartext h2c) and Http2SecureServer (TLS + ALPN)
+// Server 鈥?Http2Server (cleartext h2c) and Http2SecureServer (TLS + ALPN)
 // ============================================================================
 
 export interface ServerOptions extends Http2SessionOptions {
@@ -764,7 +764,7 @@ export interface SecureServerOptions extends ServerOptions, TlsServerOptions {
 type RequestListener = (request: Http2ServerRequest, response: Http2ServerResponse) => void;
 
 /**
- * HTTP/2 cleartext server (h2c) — TCP only, no TLS.
+ * HTTP/2 cleartext server (h2c) 鈥?TCP only, no TLS.
  * Use createSecureServer for production (TLS + ALPN required by browsers).
  */
 export class Http2Server extends EventEmitter {
@@ -884,7 +884,7 @@ export class Http2SecureServer extends Http2Server {
         tlsSocket.once('secureConnect', () => {
             const proto = tlsSocket.alpnProtocol;
             if (proto && proto !== 'h2') {
-                // ALPN selected http/1.1 — fall through (caller should hand off)
+                // ALPN selected http/1.1 鈥?fall through (caller should hand off)
                 this.emit('unknownProtocol', tlsSocket);
                 return;
             }
@@ -908,7 +908,7 @@ export class Http2SecureServer extends Http2Server {
 }
 
 // ============================================================================
-// Compatibility API — Http2ServerRequest / Http2ServerResponse (Node.js shape)
+// Compatibility API 鈥?Http2ServerRequest / Http2ServerResponse (Node.js shape)
 // ============================================================================
 
 export class Http2ServerRequest extends Duplex {
@@ -1110,3 +1110,4 @@ export default {
     Http2ServerRequest,
     Http2ServerResponse,
 };
+

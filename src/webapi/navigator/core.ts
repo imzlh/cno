@@ -14,6 +14,9 @@ function getPlatform(): string {
         case 'Windows_NT':
             return 'win32';
         default:
+            if (machine.includes('MSYS') || machine.includes('MINGW')) {
+                return 'win32';
+            }
             return `${platform} ${machine}`;
     }
 }

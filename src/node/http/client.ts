@@ -1,17 +1,16 @@
-/**
+﻿/**
  * Node.js http module - client implementation
  */
 
 const engine = import.meta.use('engine');
+const dns = import.meta.use('dns');
 const streams = import.meta.use('streams');
 const timers = import.meta.use('timers');
 const http = import.meta.use('http');
 const ssl = import.meta.use('ssl');
 
 import { Socket } from '../net';
-import { dnsCache } from '@cnojs/http/dns-cache';
 import { OutgoingMessageImpl, IncomingMessageImpl, OutgoingHttpHeaders, IncomingHttpHeaders } from './server';
-import { TLSSocket, SecureContext } from '../tls';
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
@@ -78,7 +77,6 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
     path: string = '/';
 
     private _tcp: CModuleStreams.TCP | null = null;
-    private _tlsSocket: TLSSocket | null = null;
     private _options: ClientRequestArgs;
     private _callback: ((res: IncomingMessageImpl) => void) | null = null;
     private _aborted: boolean = false;
@@ -146,7 +144,7 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
 
         try {
             const isIPv6 = this.host.includes(':');
-            const addrs = await dnsCache.resolve(this.host, { family: isIPv6 ? 10 : 0 });
+            const addrs = await dns.resolve(this.host, { family: isIPv6 ? 10 : 0 });
             if (!addrs?.length) throw new Error(`DNS resolution failed for ${this.host}`);
             const addr = addrs.find((a: any) => a.family === (isIPv6 ? 10 : 4)) || addrs[0];
 
@@ -159,32 +157,9 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
                 return;
             }
 
-            // TLS handshake for HTTPS
-            if (this.protocol === 'https:') {
-                const secureContext = new SecureContext({
-                    ca: (this._options as any).ca,
-                    cert: (this._options as any).cert,
-                    key: (this._options as any).key,
-                    ciphers: (this._options as any).ciphers,
-                });
-                const tlsSocket = new TLSSocket(this._tcp, {
-                    isServer: false,
-                    rejectUnauthorized: (this._options as any).rejectUnauthorized ?? true,
-                    secureContext,
-                    servername: (this._options as any).servername ?? this.host,
-                });
-                await new Promise<void>((resolve, reject) => {
-                    tlsSocket.on('secureConnect', resolve);
-                    tlsSocket.on('error', reject);
-                    setTimeout(() => reject(new Error('TLS handshake timeout')), 10000);
-                });
-                this._tlsSocket = tlsSocket;
-                this.socket = tlsSocket as any;
-            } else {
-                const socket = new Socket();
-                (socket as any)._tcp = this._tcp;
-                this.socket = socket;
-            }
+            const socket = new Socket();
+            (socket as any)._tcp = this._tcp;
+            this.socket = socket;
 
             this._socketAssigned = true;
             this.emit('socket', this.socket);
@@ -218,7 +193,7 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
             requestLine += this._formatHeaders();
             requestLine += '\r\n';
 
-            const writeTarget = this._tlsSocket ?? this._tcp;
+            const writeTarget = this._tcp;
             await writeTarget.write(engine.encodeString(requestLine));
             this.headersSent = true;
 
@@ -300,29 +275,12 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
             this._cleanup();
         };
 
-        // Determine the data source: TLS socket (event-driven) or plain TCP (async read)
-        if (this._tlsSocket) {
-            this._tlsSocket.on('data', (chunk: Uint8Array) => {
-                if (this._aborted) return;
-                const ab = chunk.buffer instanceof SharedArrayBuffer
-                    ? new Uint8Array(chunk).buffer
-                    : chunk.buffer;
-                const result = parser.execute(ab.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength));
-                if (result.errno !== 0) {
-                    this._cleanup();
-                }
-            });
-            this._tlsSocket.on('end', () => { this._cleanup(); });
-            this._tlsSocket.on('error', (err: Error) => {
-                if (!this._aborted) this.emit('error', err);
-                this._cleanup();
-            });
-        } else {
-            const buffer = new Uint8Array(65536);
+        const tcp = this._tcp;
+        const buffer = new Uint8Array(65536);
             let pending: Uint8Array | null = null;
             const readLoop = async () => {
-                while (!this._aborted) {
-                    const n = await this._tcp!.read(buffer);
+                while (!this._aborted && tcp) {
+                    const n = await tcp.read(buffer);
                     if (n === 0) { this._cleanup(); return; }
                     let toParse: Uint8Array;
                     if (pending) {
@@ -339,7 +297,7 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
                     if (result.errno !== 0) { this._cleanup(); return; }
                     const consumed = (result as any).consumed as number | undefined;
                     if (consumed !== undefined && consumed < toParse.byteLength) {
-                        // Copy unparsed remainder — toParse may be a view of the reused buffer
+                        // Copy unparsed remainder 鈥?toParse may be a view of the reused buffer
                         pending = new Uint8Array(toParse.subarray(consumed));
                     }
                 }
@@ -348,7 +306,6 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
                 if (!this._aborted) this.emit('error', err);
                 this._cleanup();
             });
-        }
     }
 
     write(chunk: any, encodingOrCb?: BufferEncoding | ((err?: Error) => void), cb?: (err?: Error) => void): boolean {
@@ -403,10 +360,6 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
         if (this._timeoutId) {
             timers.clearTimeout(this._timeoutId);
             this._timeoutId = null;
-        }
-        if (this._tlsSocket) {
-            try { this._tlsSocket.destroy(); } catch {}
-            this._tlsSocket = null;
         }
         if (this._tcp) {
             try { this._tcp.close(); } catch {}
@@ -550,3 +503,6 @@ export function get(options: ClientRequestArgs | string | URL, callback?: (res: 
     req.end();
     return req;
 }
+
+
+
