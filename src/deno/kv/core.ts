@@ -120,7 +120,7 @@ export class Kv implements Deno.Kv {
         }
     }
 
-    getMany<T extends readonly unknown[]>(
+    async getMany<T extends readonly unknown[]>(
         keys: readonly [...{ [K in keyof T]: KvKey }],
         options?: { consistency?: Deno.KvConsistencyLevel }
     ): Promise<{ [K in keyof T]: Deno.KvEntryMaybe<T[K]> }> {
@@ -149,7 +149,7 @@ export class Kv implements Deno.Kv {
             }
         });
         
-        return Promise.resolve(results as any);
+        return results as { [K in keyof T]: Deno.KvEntryMaybe<T[K]> };
     }
 
     set(key: KvKey, value: unknown, options?: KvSetOptions): Promise<{ ok: true; versionstamp: string }> {

@@ -18,12 +18,10 @@ interface ServerConnection {
     isClosed(): boolean;
 }
 
-function createWebSocketFromConnection(conn: Promise<any>): globalThis.WebSocket {
-    // TODO: Implement WebSocket from connection — return a proper WebSocket instance
-    return { close() {}, send() {}, addEventListener() {} } as unknown as globalThis.WebSocket;
-}
+import { createWebSocketFromConnection } from "../webapi/websocket";
 import { wrapFsClassDec as wrap, wrapFSns } from "../utils/wrap";
 import { errors } from './01_errors';
+import { ISocket } from '@cnojs/http/socket';
 
 const crypto = import.meta.use('crypto');
 const engine = import.meta.use('engine');
@@ -288,7 +286,7 @@ function serve(
                 const webRequest = createWebRequest(req, {
                     hostname: addr?.ip || '0.0.0.0',
                     port: addr?.port || options.port || 8000,
-                    secure: !!(coreServer as any).sslContext
+                    secure: coreServer.isSecure
                 });
 
                 // Create connection info
@@ -431,49 +429,12 @@ function upgradeWebSocket(
  * This adapts the raw connection to WebSocket protocol
  */
 function createWebSocketFromServerConnection(conn: Promise<ServerConnection>): globalThis.WebSocket {
-    // Wrap ServerConnection to match Connection interface expected by WebSocket
-
-
     // Create WebSocket in server mode
-    return createWebSocketFromConnection(conn.then(conn => ({
-        socket: conn.socket,
-        sslPipe: conn.sslPipe,
-        state: 'active' as any,
-        lastUsed: Date.now(),
-        requests: 0,
-
-        async connect() { },
-
-        async write(data: Uint8Array) {
-            await conn.write(data);
+    return createWebSocketFromConnection(conn.then(c => ({
+        ...c,
+        async clientHandshake(ctx, servername) {
+            return; // here we already handled handshake, so just a stub enough
         },
-
-        async read(size?: number): Promise<Uint8Array | null> {
-            return await conn.read(size);
-        },
-
-        onReadable(callback: (data: Uint8Array | null) => void, errHandler?: (err: Error) => void): void {
-            conn.onReadable(callback, errHandler);
-        },
-
-        stopReading(): void {
-            conn.stopReading();
-        },
-
-        markActive() { },
-        markIdle() { },
-
-        close() {
-            conn.close();
-        },
-
-        isAvailable() {
-            return false;
-        },
-
-        isClosed() {
-            return conn.isClosed();
-        }
     })));
 }
 

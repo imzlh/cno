@@ -206,9 +206,9 @@ export function resolve(hostname: string, rrtype?: any, callback?: any): void {
             } else if (rrtype === 'PTR') {
                 callback(null, answers.map((a: any) => a.ptr));
             } else if (rrtype === 'SOA') {
-                const a = answers[0] as any;
+                const a = answers[0] as CModuleDNS.SoaAnswer;
                 callback(null, {
-                    nsname: a.primary,
+                    nsname: a.name,
                     hostmaster: a.admin,
                     serial: a.serial,
                     refresh: a.refresh,

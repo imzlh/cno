@@ -264,6 +264,7 @@ export function createCipherivGCM(algorithm: string, key: ArrayBuffer | Uint8Arr
     const ivBuf = toBuffer(iv);
     const gcm = new crypto.GCM('encrypt', keyBuf.buffer as ArrayBuffer, ivBuf.buffer);
     let aadSet = false;
+    let ctag: ArrayBuffer | undefined;
 
     return {
         setAAD(aad: ArrayBuffer | Uint8Array<ArrayBuffer>) {
@@ -278,11 +279,11 @@ export function createCipherivGCM(algorithm: string, key: ArrayBuffer | Uint8Arr
         final(outputEncoding?: string) {
             const { data, tag } = gcm.final();
             // Store tag for getAuthTag
-            (this as any)._tag = tag;
+            ctag = tag;
             return encodeOutput(data, outputEncoding);
         },
         getAuthTag() {
-            return (this as any)._tag || new ArrayBuffer(0);
+            return ctag || new ArrayBuffer(0);
         },
     };
 }

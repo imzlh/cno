@@ -6,8 +6,8 @@
  */
 
 import { Headers } from "headers-polyfill";
-import { connectionManager, type Connection } from "@cnojs/http/connection";
-import { HttpRequestBuilder, HttpResponseParser } from "@cnojs/http/h1";
+import { HttpResponseParser } from "@cnojs/http/h1";
+import { connectTcp, buildRequest, readHeaders, type IHttpSocket } from "../utils/http";
 
 const engine = import.meta.use('engine');
 const timers = import.meta.use('timers');
@@ -33,7 +33,7 @@ export class EventSource extends EventTarget {
     public onmessage: ((this: EventSource, ev: MessageEvent) => any) | null = null;
     public onerror: ((this: EventSource, ev: Event) => any) | null = null;
 
-    private connection: Connection | null = null;
+    private connection: IHttpSocket | null = null;
     private parser: HttpResponseParser | null = null;
     private reconnectTimer: number | null = null;
     private reconnectDelay: number = 3000;
@@ -54,13 +54,8 @@ export class EventSource extends EventTarget {
     private async connect(): Promise<void> {
         try {
             const url = new URL(this.url);
-            const port = url.port ? parseInt(url.port) : (url.protocol === 'https:' ? 443 : 80);
 
-            this.connection = await connectionManager.acquireAsync({
-                hostname: url.hostname, port,
-                protocol: url.protocol as 'http:' | 'https:',
-                keepAlive: true, timeout: 30000
-            });
+            this.connection = await connectTcp(url);
             if (this.readyState === EventSourceReadyState.CLOSED) {
                 this.closeConnection();
                 return;
@@ -71,50 +66,43 @@ export class EventSource extends EventTarget {
             headers.set('cache-control', 'no-cache');
             if (this.lastEventId) headers.set('last-event-id', this.lastEventId);
 
-            const rawHeaders: Array<[string, string]> = [];
-            headers.forEach((v: string, k: string) => rawHeaders.push([k, v]));
-            const builder = new HttpRequestBuilder({ method: 'GET', path: url.pathname + url.search, host: url.host, headers: rawHeaders });
-            await this.connection.writeAsync(builder.build());
+            await this.connection.write(buildRequest({ method: 'GET', url, headers }));
 
             this.parser = new HttpResponseParser();
-            this.setupParser();
-            await this.readResponse();
-        } catch (err) { this.handleError(err as Error); }
-    }
+            const { status, headers: resHeaders } = await readHeaders(this.connection, this.parser);
 
-    private setupParser(): void {
-        if (!this.parser) return;
-
-        this.parser.onHeadersComplete = (status, headers) => {
             if (status !== 200) { this.fail(); return; }
-            const contentType = headers.find(([n]) => n === 'content-type')?.[1];
+            const contentType = resHeaders.find(([n]) => n === 'content-type')?.[1];
             if (!contentType || !contentType.includes('text/event-stream')) { this.fail(); return; }
+
             this.readyState = EventSourceReadyState.OPEN;
             this.dispatchEvent(new Event('open'));
             this.onopen?.call(this, new Event('open'));
-        };
 
-        this.parser.onData = (chunk) => { this.processChunk(chunk); };
-        this.parser.onComplete = () => { this.reconnect(); };
-        this.parser.onError = (err) => { this.handleError(err); };
+            // Process any body data that arrived in the same chunk as headers
+            const pending = this.parser.getBodyChunks();
+            for (const chunk of pending) this.processChunk(chunk);
+
+            // Switch to event-driven body reading
+            this.setupBodyReader();
+        } catch (err) { this.handleError(err as Error); }
     }
 
-    private async readResponse(): Promise<void> {
+    private setupBodyReader(): void {
         if (!this.connection || !this.parser) return;
-        try {
-            while (!this.parser.isHeadersComplete) {
-                const data = await this.connection.readAsync();
-                if (!data || data.length === 0) throw new Error('Connection closed while reading headers');
-                this.parser.feed(data);
-            }
-            while (this.readyState !== EventSourceReadyState.CLOSED) {
-                const data = await this.connection.readAsync();
-                if (!data || data.length === 0) { this.reconnect(); return; }
-                this.parser.feed(data);
-            }
-        } catch (err) {
-            if (this.readyState !== EventSourceReadyState.CLOSED) this.handleError(err as Error);
-        }
+        const conn = this.connection;
+        const parser = this.parser;
+
+        parser.onData = (chunk) => { this.processChunk(chunk); };
+        parser.onComplete = () => { this.reconnect(); };
+        parser.onError = (err) => { this.handleError(err); };
+
+        conn.onReadable(data => {
+            if (!data) { this.reconnect(); return; }
+            parser.feed(data);
+        }, err => {
+            if (this.readyState !== EventSourceReadyState.CLOSED) this.handleError(err);
+        });
     }
 
     private processChunk(chunk: Uint8Array): void {
@@ -186,9 +174,7 @@ export class EventSource extends EventTarget {
 
     private closeConnection(): void {
         if (this.connection) {
-            const url = new URL(this.url);
-            const port = url.port ? parseInt(url.port) : (url.protocol === 'https:' ? 443 : 80);
-            connectionManager.release({ hostname: url.hostname, port, protocol: url.protocol as 'http:' | 'https:' }, this.connection);
+            try { this.connection.close(); } catch { }
             this.connection = null;
         }
         this.parser = null;

@@ -1,4 +1,4 @@
-import { fromError, CustomEvent, PromiseRejectionEvent, EventTarget } from './events';
+import { fromError, PromiseRejectionEvent, EventTarget } from './events';
 
 const { onEvent, EventType } = import.meta.use('engine');
 
@@ -29,6 +29,9 @@ await import('./console');
 
 // basic
 await import('./basic');
+
+// events
+await import('./events');
 
 // URL polyfill
 await import('./url');

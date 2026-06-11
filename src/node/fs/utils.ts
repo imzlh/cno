@@ -130,7 +130,7 @@ export function toNodeDirentAsync(ent: CModuleAsyncFS.DirEnt): import('fs').Dire
 // Flag parsing
 // ============================================================================
 
-export function parseFlags(flag?: string | number): CModuleFS.OpenFlags {
+export function parseFlags(flag?: string | number): Exclude<CModuleFS.OpenFlags, number> {
     if (typeof flag === 'number') {
         if (flag & fs.OPEN_APPEND) return 'a';
         if (flag & fs.OPEN_CREAT) {

@@ -128,7 +128,7 @@ class ChildProcessImpl extends EventEmitter implements ChildProcess {
                 pipe.write(data).then(() => callback()).catch(callback);
             },
             final(callback: (error?: Error | null) => void) {
-                pipe.shutdown().then(() => callback()).catch(callback);
+                try{ pipe.shutdown(); } finally { callback(); }
             },
         });
     }
@@ -252,13 +252,13 @@ export function spawn(command: string, argsOrOptions?: string[] | SpawnOptions, 
     // Handle stdio
     if (opts.stdio) {
         if (Array.isArray(opts.stdio)) {
-            spawnOpts.stdin = opts.stdio[0] as any;
-            spawnOpts.stdout = opts.stdio[1] as any;
-            spawnOpts.stderr = opts.stdio[2] as any;
+            spawnOpts.stdin = opts.stdio[0] ?? 'inherit';
+            spawnOpts.stdout = opts.stdio[1] ?? 'inherit';
+            spawnOpts.stderr = opts.stdio[2] ?? 'inherit';
         } else {
-            spawnOpts.stdin = opts.stdio as any;
-            spawnOpts.stdout = opts.stdio as any;
-            spawnOpts.stderr = opts.stdio as any;
+            spawnOpts.stdin = opts.stdio;
+            spawnOpts.stdout = opts.stdio;
+            spawnOpts.stderr = opts.stdio;
         }
     } else {
         spawnOpts.stdin = 'pipe';
@@ -369,7 +369,9 @@ export function execFile(
         cb = argsOrOptionsOrCallback;
     } else if (argsOrOptionsOrCallback) {
         opts = argsOrOptionsOrCallback;
-        cb = optionsOrCallback as any;
+        if (typeof optionsOrCallback === 'function') {
+            cb = optionsOrCallback;
+        }
     }
 
     const child = spawn(file, args, {
@@ -453,18 +455,18 @@ export function spawnSync(command: string, args?: string[], options?: SpawnOptio
 
     if (options?.stdio) {
         if (Array.isArray(options.stdio)) {
-            opts.stdin = options.stdio[0] as any;
-            opts.stdout = options.stdio[1] as any;
-            opts.stderr = options.stdio[2] as any;
+            opts.stdin = options.stdio[0] ?? 'inherit';
+            opts.stdout = options.stdio[1] ?? 'inherit';
+            opts.stderr = options.stdio[2] ?? 'inherit';
         } else {
-            opts.stdin = options.stdio as any;
-            opts.stdout = options.stdio as any;
-            opts.stderr = options.stdio as any;
+            opts.stdin = options.stdio;
+            opts.stdout = options.stdio;
+            opts.stderr = options.stdio;
         }
     }
 
     try {
-        const result = proc.spawnSync(command, args ?? [], opts) as any;
+        const result = proc.spawnSync(command, args ?? [], opts);
         const encoding = options?.encoding ?? 'utf8';
         const convert = (value: ArrayBuffer | null | undefined): any => {
             if (value == null) return value;
@@ -472,12 +474,17 @@ export function spawnSync(command: string, args?: string[], options?: SpawnOptio
             if (encoding === 'buffer' || encoding === null) return bytes;
             return new TextDecoder(encoding as string).decode(bytes);
         };
-        result.stdout = convert(result.stdout);
-        result.stderr = convert(result.stderr);
-        if (result.output) {
-            result.output = [result.output[0], result.stdout, result.stderr];
-        }
-        return result;
+        const stdout = convert(result.stdout);
+        const stderr = convert(result.stderr);
+        return {
+            pid: result.pid,
+            output: [result.output?.[0] ?? null, stdout, stderr],
+            stdout,
+            stderr,
+            status: result.status,
+            signal: result.signal,
+            error: result.error,
+        } as SpawnSyncResult;
     } catch (err) {
         return {
             error: err as Error,

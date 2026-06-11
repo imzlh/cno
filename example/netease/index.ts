@@ -13,7 +13,7 @@ export default async function main() {
     log.info(`输出目录: ${opts.outputDir}`);
     try {
         setCookie(await Deno.readTextFile("netease.cookie"));
-        const d = await api.getLoginStatus() as any;
+        const d = await api.getLoginStatus();
         if (d?.data?.profile) log.success(`已登录: ${d.data.profile.nickname}`);
         else log.warning("Cookie 可能已过期");
     } catch { log.info("未登录"); }
@@ -59,7 +59,7 @@ async function handleLogin() {
     if (!c?.trim()) return;
     setCookie(c.trim());
     await Deno.writeTextFile("netease.cookie", c.trim());
-    const d = await api.getLoginStatus() as any;
+    const d = await api.getLoginStatus();
     if (d?.data?.profile) log.success(`登录成功: ${d.data.profile.nickname}`);
     else log.warning("Cookie 可能无效");
 }
@@ -93,7 +93,7 @@ async function handleSearchSong(engine: DownloadEngine) {
     while (true) {
         const kw = prompt("\n歌曲名称 (回车退出): ");
         if (!kw) break;
-        const d = await api.search(kw, 1, 20) as any;
+        const d = await api.search(kw, 1, 20);
         const songs: any[] = d?.result?.songs || [];
         if (!songs.length) { log.warning("未找到"); break; }
         songs.forEach((s, i) => {
@@ -105,7 +105,7 @@ async function handleSearchSong(engine: DownloadEngine) {
         const ids = sel === 'all' ? songs.map(s => s.id)
             : sel.split(',').map(s => parseInt(s.trim()) - 1).filter((i: number) => i >= 0 && i < songs.length).map((i: number) => songs[i].id);
         if (!ids.length) continue;
-        const sd = await api.getSongDetail(ids) as any;
+        const sd = await api.getSongDetail(ids);
         const fullSongs: ISongDetail[] = sd?.data?.songs || sd?.songs || [];
         const stats = await downloadList(engine, fullSongs);
         showStats("下载完成", stats);
@@ -116,7 +116,7 @@ async function handleSearchArtist(engine: DownloadEngine) {
     while (true) {
         const kw = prompt("\n歌手名称 (回车退出): ");
         if (!kw) break;
-        const d = await api.search(kw, 100, 10) as any;
+        const d = await api.search(kw, 100, 10);
         const artists = d?.result?.artists || [];
         if (!artists.length) { log.warning("未找到"); break; }
         artists.forEach((a: any, i: number) => console.log(`  ${i + 1}. ${a.name} (ID:${a.id})`));
@@ -126,7 +126,7 @@ async function handleSearchArtist(engine: DownloadEngine) {
         console.log("1.热门50首 2.全部专辑 3.选择专辑");
         switch (prompt("选择: ")?.trim()) {
             case "1": {
-                const td = await api.getArtistSongs(artist.id) as any;
+                const td = await api.getArtistSongs(artist.id);
                 const folder = normalizeDir(`${engine.getOpts().outputDir}歌手_${removeIllegalPath(artist.name)}_热门50首`);
                 await ensureDir(folder);
                 const stats = await downloadList(engine, (td?.data?.hotSongs || []) as ISongDetail[], folder);
@@ -135,7 +135,7 @@ async function handleSearchArtist(engine: DownloadEngine) {
             }
             case "2": await downloadAllAlbums(engine, artist.id, artist.name); break;
             case "3": {
-                const ad = await api.getArtistAlbums(artist.id) as any;
+                const ad = await api.getArtistAlbums(artist.id);
                 const albums = ad?.data?.hotAlbums || [];
                 albums.forEach((a: any, i: number) => console.log(`  ${i + 1}. ${a.name} (${a.size || 0}首)`));
                 const ai = parseInt(prompt("选择: ") || "0") - 1;
@@ -158,7 +158,7 @@ async function handleDownloadById(engine: DownloadEngine) {
         if (!input) break;
         const id = input.match(/\d+/)?.[0];
         if (!id) { log.error("无效ID"); continue; }
-        const sd = await api.getSongDetail(Number(id)) as any;
+        const sd = await api.getSongDetail(Number(id));
         const songs: ISongDetail[] = sd?.data?.songs || [];
         if (songs.length > 0) await engine.downloadSong(songs[0]);
     }
@@ -170,13 +170,13 @@ async function handleDownloadPlaylist(engine: DownloadEngine) {
         if (!input) break;
         const id = Number(input.match(/\d+/)?.[0]);
         if (!id) break;
-        const d = await api.getPlaylistDetail(id) as any;
+        const d = await api.getPlaylistDetail(id);
         const p = d?.data?.playlist || d?.playlist;
         if (!p) { log.error("无法获取歌单"); break; }
         const ids = (p.trackIds || []).map((t: any) => typeof t === 'number' ? t : t.id);
         const allSongs: ISongDetail[] = [];
         for (let i = 0; i < ids.length; i += 50) {
-            const sd = await api.getSongDetail(ids.slice(i, i + 50)) as any;
+            const sd = await api.getSongDetail(ids.slice(i, i + 50));
             allSongs.push(...(sd?.data?.songs || []));
         }
         const folder = normalizeDir(`${engine.getOpts().outputDir}歌单_${removeIllegalPath(p.name)}`);
@@ -205,20 +205,20 @@ async function handleBatchIds(engine: DownloadEngine) {
     if (!input) return;
     const ids = input.split(',').map(s => s.trim()).filter(Boolean).map(Number);
     if (!ids.length) return;
-    const sd = await api.getSongDetail(ids) as any;
+    const sd = await api.getSongDetail(ids);
     const songs: ISongDetail[] = sd?.data?.songs || [];
     const stats = await downloadList(engine, songs);
     showStats("批量下载完成", stats);
 }
 
 async function getAlbumSongs(id: number) {
-    const d = await api.getAlbum(id) as any;
+    const d = await api.getAlbum(id);
     const data = d?.data || d;
-    return { songs: (data?.songs || []) as ISongDetail[], album: (data?.album || {}) as any };
+    return { songs: (data?.songs || []) as ISongDetail[], album: (data?.album || {}) };
 }
 
 async function downloadAllAlbums(engine: DownloadEngine, artistId: number, artistName: string) {
-    const ad = await api.getArtistAlbums(artistId) as any;
+    const ad = await api.getArtistAlbums(artistId);
     const albums = ad?.data?.hotAlbums || [];
     log.info(`${artistName}: ${albums.length} 张专辑`);
     const total = { total: 0, success: 0, failed: 0 };

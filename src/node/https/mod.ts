@@ -29,6 +29,52 @@ const os = import.meta.use('os');
 const engine = import.meta.use('engine');
 const httpParser = import.meta.use('http');
 const timers = import.meta.use('timers');
+const ssl = import.meta.use('ssl');
+const asfs = import.meta.use('asyncfs');
+const windows = import.meta.use('win32');
+const fs = import.meta.use('fs');
+
+// ---------------------------------------------------------------------------
+// System CA discovery (mirrors http/src/connection.ts findSystemCaPath)
+// ---------------------------------------------------------------------------
+
+let _sysCaCache: string | null | undefined = undefined;
+
+async function getSystemCa(): Promise<string | null> {
+    if (_sysCaCache !== undefined) return _sysCaCache;
+    const sysname = os.uname().sysname;
+    const candidates: string[] = sysname === 'Linux' ? [
+        '/etc/ssl/certs/ca-certificates.crt',
+        '/etc/pki/tls/certs/ca-bundle.crt',
+        '/etc/pki/tls/cert.pem',
+        '/etc/ssl/cert.pem',
+    ] : sysname === 'Darwin' ? [
+        '/etc/ssl/cert.pem',
+        '/opt/homebrew/etc/openssl@3/cert.pem',
+        '/usr/local/etc/openssl@3/cert.pem',
+    ] : sysname === 'FreeBSD' ? [
+        '/usr/local/share/certs/ca-root-nss.crt',
+        '/etc/ssl/cert.pem',
+    ] : [];
+
+    for (const p of candidates) {
+        try { if ((await asfs.stat(p)).isFile) { _sysCaCache = p; return p; } } catch {}
+    }
+
+    if (sysname === 'Windows_NT') {
+        const tmpDir = (os as any).tmpDir || 'C:\\Windows\\Temp';
+        const tmp = tmpDir + '\\cno-ca-bundle.pem';
+        try {
+            const certs = windows!.exportCerts();
+            if (certs?.length) {
+                fs.writeFile(tmp, engine.encodeString(certs.join('\n')), 0o666);
+                _sysCaCache = tmp; return tmp;
+            }
+        } catch {}
+    }
+
+    _sysCaCache = null; return null;
+}
 
 // ============================================================================
 // HTTPS Server
@@ -284,7 +330,7 @@ class HttpsClientRequest extends OutgoingMessageImpl {
             if (!addrs?.length) throw new Error(`DNS resolution failed for ${this.host}`);
             const addr = addrs.find((a: any) => a.family === (isIPv6 ? 10 : 4)) || addrs[0];
 
-            const family = addr.family === 10 ? os.AF_INET6 : os.AF_INET;
+            const family = addr.family === 6 ? os.AF_INET6 : os.AF_INET;
             this._tcp = new streams.TCP(family);
             await this._tcp.connect({ ip: addr.ip, port });
             this._tcp.setNoDelay(true);
@@ -294,8 +340,14 @@ class HttpsClientRequest extends OutgoingMessageImpl {
                 return;
             }
 
+            const rejectUnauthorized = this._options.rejectUnauthorized ?? true;
+            let caPath = this._options.ca as string | undefined;
+            if (!caPath && rejectUnauthorized) {
+                caPath = (await getSystemCa()) ?? undefined;
+            }
+
             const secureContext = new SecureContext({
-                ca: this._options.ca as any,
+                ca: caPath,
                 cert: this._options.cert as any,
                 key: this._options.key as any,
                 ciphers: this._options.ciphers,
@@ -303,7 +355,7 @@ class HttpsClientRequest extends OutgoingMessageImpl {
 
             this._tlsSocket = new TLSSocket(this._tcp, {
                 isServer: false,
-                rejectUnauthorized: this._options.rejectUnauthorized ?? true,
+                rejectUnauthorized,
                 secureContext,
                 servername: this._options.servername ?? this.host,
             });
@@ -312,9 +364,15 @@ class HttpsClientRequest extends OutgoingMessageImpl {
             this.emit('socket', this._tlsSocket);
 
             await new Promise<void>((resolve, reject) => {
-                this._tlsSocket!.on('secureConnect', resolve);
+                this._tlsSocket!.on('secureConnect', () => {
+                    if (rejectUnauthorized && !this._tlsSocket!.authorized) {
+                        reject(this._tlsSocket!.authorizationError ?? new Error('Certificate verification failed'));
+                    } else {
+                        resolve();
+                    }
+                });
                 this._tlsSocket!.on('error', reject);
-                setTimeout(() => reject(new Error('TLS handshake timeout')), 10000);
+                timers.setTimeout(() => reject(new Error('TLS handshake timeout')), 10000);
             });
 
             if (!this.hasHeader('host')) {

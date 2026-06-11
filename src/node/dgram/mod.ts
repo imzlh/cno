@@ -15,10 +15,7 @@ import { Buffer } from '../buffer';
 // We cache the fd at init time since fileno() is async but socket options
 // are set via sync methods
 function _getFd(handle: CModuleUDP.UDP): number {
-    // fileno() returns Promise<number> in this runtime
-    // For sync context, we use a trick: the underlying uv handle fd
-    // is accessible via the handle's internal state
-    return (handle as any)._fd ?? (handle as any).fd ?? -1;
+    return handle.fileno();
 }
 
 function _getSocket(handle: CModuleUDP.UDP): CModuleSocket.PosixSocket | null {
@@ -132,10 +129,10 @@ export class Socket extends EventEmitter {
 
             const flags = this._ipv6Only ? udp.UDP_IPV6ONLY : 0;
 
-            await this._handle!.bind({ ip: address, port });
+            this._handle!.bind({ ip: address, port });
             this._bound = true;
 
-            const sockname = await this._handle!.getsockname();
+            const sockname = this._handle!.getsockname();
             this._address = {
                 address: sockname.ip ?? address,
                 family: this._type === 'udp6' ? 'IPv6' : 'IPv4',
@@ -230,10 +227,10 @@ export class Socket extends EventEmitter {
 
         const addr = address ?? '127.0.0.1';
 
-        await this._handle!.connect({ ip: addr, port });
+        this._handle!.connect({ ip: addr, port });
         this._connected = true;
 
-        const peername = await this._handle!.getpeername();
+        const peername = this._handle!.getpeername();
         this._remoteAddress = {
             address: peername.ip ?? addr,
             family: this._type === 'udp6' ? 'IPv6' : 'IPv4',
@@ -444,7 +441,7 @@ export class Socket extends EventEmitter {
     private async _doClose(callback?: () => void): Promise<void> {
         if (this._handle) {
             this._bound = false;
-            await this._handle.close();
+            this._handle.close();
             this._handle = null;
         }
         this.emit('close');

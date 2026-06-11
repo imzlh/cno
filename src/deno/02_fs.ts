@@ -185,7 +185,7 @@ async function removeRecursive(targetPath: string): Promise<void> {
     }
 }
 
-async function denoWriteAnyFile(path: string | URL, data: string | Uint8Array<ArrayBuffer> | ReadableStream<string | Uint8Array<ArrayBuffer>>, options?: Deno.WriteFileOptions) {
+async function denoWriteAnyFile(path: string | URL, data: string | Uint8Array | ReadableStream<string | Uint8Array>, options?: Deno.WriteFileOptions) {
     let flag = "w";
     if (options?.append) {
         flag = "a";
@@ -214,7 +214,7 @@ async function denoWriteAnyFile(path: string | URL, data: string | Uint8Array<Ar
             const { value, done } = await reader.read();
             if (done) break;
             const n = await fhandle.write(
-                typeof value === "string" ? engine.encodeString(value) : value
+                (typeof value === "string" ? engine.encodeString(value) : value) as Uint8Array<ArrayBuffer>
             );
             if (n === null) {
                 throw new errors.UnexpectedEof("write");
@@ -473,7 +473,7 @@ Object.assign(Deno, wrapFSns({
     },
 
     writeFile(path, data, options) {
-        return denoWriteAnyFile(path, data as any, options);
+        return denoWriteAnyFile(path, data, options);
     },
 
     writeTextFileSync(path, data, options) {

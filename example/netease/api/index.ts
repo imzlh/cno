@@ -162,7 +162,7 @@ export const getSongDetail2 = (ids: number | number[]): Promise<ApiResponse<{ so
     code: res.code,
     songs: res.songs.map(songDetail2Song),
     privileges: res.privileges,
-  })) as any
+  }));
 
 // 获取歌曲URL (旧版，使用 br 码率参数)
 export const getSongUrl = (id: number, br = 999000): Promise<ApiResponse<ISongUrl[]>> => {

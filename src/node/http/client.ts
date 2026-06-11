@@ -7,7 +7,7 @@ const dns = import.meta.use('dns');
 const streams = import.meta.use('streams');
 const timers = import.meta.use('timers');
 const http = import.meta.use('http');
-const ssl = import.meta.use('ssl');
+const os = import.meta.use('os');
 
 import { Socket } from '../net';
 import { OutgoingMessageImpl, IncomingMessageImpl, OutgoingHttpHeaders, IncomingHttpHeaders } from './server';
@@ -144,11 +144,11 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
 
         try {
             const isIPv6 = this.host.includes(':');
-            const addrs = await dns.resolve(this.host, { family: isIPv6 ? 10 : 0 });
+            const addrs = await dns.resolve(this.host, { family: isIPv6 ? os.AF_INET6 : os.AF_INET });
             if (!addrs?.length) throw new Error(`DNS resolution failed for ${this.host}`);
-            const addr = addrs.find((a: any) => a.family === (isIPv6 ? 10 : 4)) || addrs[0];
+            const addr = addrs.find((a: any) => a.family === (isIPv6 ? os.AF_INET6 : os.AF_INET)) || addrs[0];
 
-            this._tcp = new streams.TCP(addr.family === 10 ? 10 : 2);
+            this._tcp = new streams.TCP(addr.family === 6 ? os.AF_INET6 : os.AF_INET);
             await this._tcp.connect({ ip: addr.ip, port });
             this._tcp.setNoDelay(true);
 
@@ -177,7 +177,7 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
             }
 
             if (!this.hasHeader('accept-encoding')) {
-                this.setHeader('Accept-Encoding', 'gzip');
+                this.setHeader('Accept-Encoding', 'identity');
             }
 
             if (!this.hasHeader('connection')) {
@@ -281,7 +281,7 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
             const readLoop = async () => {
                 while (!this._aborted && tcp) {
                     const n = await tcp.read(buffer);
-                    if (n === 0) { this._cleanup(); return; }
+                    if (n === null || n === 0) { this._cleanup(); return; }
                     let toParse: Uint8Array;
                     if (pending) {
                         // Prepend pending remainder from previous parse

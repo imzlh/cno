@@ -25,7 +25,7 @@ export async function writeFile(path: string | URL | number, data: string | Uint
     const flag = typeof options === 'object' ? parseFlags(options?.flag) : 'w';
     const buffer = toUint8Array(data);
 
-    const handle = await asfs.open(pathStr, flag as any, mode);
+    const handle = await asfs.open(pathStr, flag, mode);
     try {
         await handle.write(buffer);
     } finally {
@@ -131,20 +131,21 @@ export async function readdir(path: string | URL, options?: { encoding?: BufferE
 
     const dirHandle = await asfs.readDir(pathStr);
     const entries: import('fs').Dirent[] = [];
+    const names: string[] = [];
 
     try {
         for await (const entry of dirHandle) {
             if (withFileTypes) {
                 entries.push(toNodeDirentAsync(entry));
             } else {
-                entries.push(entry.name as any);
+                names.push(entry.name);
             }
         }
     } finally {
         await dirHandle.close();
     }
 
-    return withFileTypes ? entries : entries.map(e => (e as import('fs').Dirent).name);
+    return withFileTypes ? entries : names;
 }
 
 export async function opendir(path: string | URL, options?: { encoding?: BufferEncoding; bufferSize?: number }): Promise<import('fs').Dir> {

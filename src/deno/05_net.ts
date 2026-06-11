@@ -72,7 +72,7 @@ class Conn<T extends Deno.Addr = Deno.Addr> implements Deno.Conn<T> {
     }
 
     @wrap
-    closeWrite(): Promise<void> {
+    async closeWrite(): Promise<void> {
         return this.pipe.shutdown();
     }
 
@@ -222,7 +222,7 @@ class TlsConn implements Deno.TlsConn {
     }
 
     @wrap
-    closeWrite(): Promise<void> {
+    async closeWrite(): Promise<void> {
         return this.$rawPipe.shutdown();
     }
 

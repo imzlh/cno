@@ -5,7 +5,8 @@ const text = import.meta.use('text');
 import { Readable, Writable } from '../stream';
 import { Socket, Server as NetServer, AddressInfo } from '../net';
 import type { HttpRequest, HttpResponse } from '@cnojs/http/server';
-
+import { IOpaque } from '../_internal/inject';
+const { createServer: createHttpServer } = (http as any).__cno as IOpaque;
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
@@ -688,8 +689,6 @@ export class ServerImpl extends NetServer implements Server {
             }
         };
 
-        const createHttpServer = (http.__cno as import('http') | undefined)?.createServer;
-        if (!createHttpServer) throw new Error('Native HTTP server is unavailable');
         this._httpServer = createHttpServer(handler, {
             port: port ?? 0,
             hostname: host,
