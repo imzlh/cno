@@ -167,6 +167,10 @@ class NumberFormat implements Intl.NumberFormat {
             useGrouping: this.options.useGrouping !== false
         } as Intl.ResolvedNumberFormatOptions;
     }
+    
+    get [Symbol.toStringTag]() {
+        return 'NumberFormat';
+    }
 }
 
 // ============ DateTimeFormat ============
@@ -242,6 +246,10 @@ class DateTimeFormat implements Intl.DateTimeFormat {
             ...this.options
         } as Intl.ResolvedDateTimeFormatOptions;
     }
+    
+    get [Symbol.toStringTag]() {
+        return 'DateTimeFormat';
+    }
 }
 
 // ============ RelativeTimeFormat ============
@@ -292,6 +300,10 @@ class RelativeTimeFormat implements Intl.RelativeTimeFormat {
             numberingSystem: 'latn'
         };
     }
+    
+    get [Symbol.toStringTag]() {
+        return 'RelativeTimeFormat';
+    }
 }
 
 // ============ DisplayNames ============
@@ -323,6 +335,10 @@ class DisplayNames implements Intl.DisplayNames {
             fallback: 'code'
         };
     }
+    
+    get [Symbol.toStringTag]() {
+        return 'DisplayNames';
+    }
 }
 
 // ============ Collator ============
@@ -345,6 +361,10 @@ class Collator implements Intl.Collator {
             numeric: false,
             caseFirst: 'false',
         };
+    }
+    
+    get [Symbol.toStringTag]() {
+        return 'Collator';
     }
 }
 
@@ -369,6 +389,10 @@ class PluralRules implements Intl.PluralRules {
             maximumFractionDigits: 3,
             pluralCategories: ['one', 'other']
         };
+    }
+    
+    get [Symbol.toStringTag]() {
+        return 'PluralRules';
     }
 }
 
@@ -437,6 +461,10 @@ class Locale implements Intl.Locale {
     getWeekInfo(): { firstDay: number; weekend: number[]; minimalDays: number } {
         return { firstDay: 1, weekend: [6, 7], minimalDays: 1 };
     }
+    
+    get [Symbol.toStringTag]() {
+        return 'Locale';
+    }
 }
 
 // ============ ListFormat ============
@@ -470,6 +498,10 @@ class ListFormat implements Intl.ListFormat {
             style: 'long'
         };
     }
+    
+    get [Symbol.toStringTag]() {
+        return 'ListFormat';
+    }
 }
 
 // ============ Segmenter ============
@@ -498,6 +530,10 @@ class Segmenter implements Intl.Segmenter {
             granularity: 'grapheme'
         };
     }
+    
+    get [Symbol.toStringTag]() {
+        return 'Segmenter';
+    }
 }
 
 // ============ Main Intl Object ============
@@ -506,7 +542,7 @@ export class CustomIntl {
     DateTimeFormat = DateTimeFormat;
     RelativeTimeFormat = RelativeTimeFormat;
     DisplayNames = DisplayNames;
-    Collator = Collator as Intl.CollatorConstructor;
+    Collator = Collator;
     PluralRules = PluralRules;
     Locale = Locale;
     ListFormat = ListFormat;
@@ -519,6 +555,10 @@ export class CustomIntl {
     
     supportedValuesOf(_key: string): string[] {
         return ['zh', 'zh-CN', 'zh-TW', 'en', 'en-US', 'en-GB'];
+    }
+    
+    get [Symbol.toStringTag]() {
+        return 'Intl';
     }
 }
 

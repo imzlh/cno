@@ -1,5 +1,6 @@
 import { assert } from "../utils/assert";
 import { dirname } from "../utils/path";
+import { DOMException, StorageEvent } from "./events";
 
 const sqlite3 = import.meta.use('sqlite3');
 const fs = import.meta.use('fs');
@@ -39,27 +40,6 @@ interface StorageStats {
     totalSize: number;
     quota: number;
     available: number;
-}
-
-// ============================================================================
-// Storage Event (for compatibility)
-// ============================================================================
-
-class StorageEvent extends Event {
-    readonly key: string | null;
-    readonly oldValue: string | null;
-    readonly newValue: string | null;
-    readonly url: string;
-    readonly storageArea: Storage | null;
-
-    constructor(type: string, init: StorageEventInit) {
-        super(type);
-        this.key = init.key;
-        this.oldValue = init.oldValue;
-        this.newValue = init.newValue;
-        this.url = init.url;
-        this.storageArea = init.storageArea;
-    }
 }
 
 // ============================================================================
@@ -305,7 +285,7 @@ class Storage {
             newValue,
             url: '',
             storageArea: this
-        });
+        }, true);
 
         const listeners = this.eventListeners.get('storage');
         if (listeners) {
@@ -331,7 +311,7 @@ class Storage {
 
         if (currentSize + additionalSize > this.options.quota) {
             throw new DOMException(
-                `QuotaExceededError: Storage quota exceeded (${currentSize + additionalSize} / ${this.options.quota} bytes)`,
+                `Storage quota exceeded (${currentSize + additionalSize} / ${this.options.quota} bytes)`,
                 'QuotaExceededError'
             );
         }

@@ -6,6 +6,7 @@
 const udp = import.meta.use('udp');
 const os = import.meta.use('os');
 const sock = import.meta.use('socket');
+const engine = import.meta.use('engine');
 
 import { EventEmitter } from '../events';
 // @ts-ignore - buffer is dynamic import
@@ -197,9 +198,9 @@ export class Socket extends EventEmitter {
 
         let data: Uint8Array;
         if (typeof msg === 'string') {
-            data = new TextEncoder().encode(msg);
+            data = engine.encodeString(msg);
         } else if (Array.isArray(msg)) {
-            const buffers = msg.map(m => typeof m === 'string' ? new TextEncoder().encode(m) : m);
+            const buffers = msg.map(m => typeof m === 'string' ? engine.encodeString(m) : m);
             // @ts-ignore - Buffer.concat returns Buffer which is Uint8Array
             data = Buffer.concat(buffers);
         } else {

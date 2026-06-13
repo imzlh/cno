@@ -8,6 +8,7 @@
 import { Headers } from "headers-polyfill";
 import { HttpResponseParser } from "@cnojs/http/h1";
 import { connectTcp, buildRequest, readHeaders, type IHttpSocket } from "../utils/http";
+import { MessageEvent } from "./events";
 
 const engine = import.meta.use('engine');
 const timers = import.meta.use('timers');
@@ -138,7 +139,9 @@ export class EventSource extends EventTarget {
         if (this.idBuffer) this.lastEventId = this.idBuffer;
         const data = this.dataBuffer.join('\n');
         const eventType = this.eventTypeBuffer || 'message';
-        const event = new MessageEvent(eventType, { data, origin: new URL(this.url).origin, lastEventId: this.lastEventId });
+        const event = new MessageEvent(eventType, { 
+            data, origin: new URL(this.url).origin, lastEventId: this.lastEventId
+        }, true);
         this.dispatchEvent(event);
         if (eventType === 'message' && this.onmessage) this.onmessage.call(this, event);
         this.eventTypeBuffer = ''; this.dataBuffer = []; this.idBuffer = '';

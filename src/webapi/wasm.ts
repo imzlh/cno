@@ -45,6 +45,10 @@ class CompileError extends Error {
         super(message);
         this.name = 'CompileError';
     }
+    
+    get [Symbol.toStringTag]() {
+        return 'CompileError';
+    }
 }
 
 class LinkError extends Error {
@@ -52,12 +56,20 @@ class LinkError extends Error {
         super(message);
         this.name = 'LinkError';
     }
+    
+    get [Symbol.toStringTag]() {
+        return 'LinkError';
+    }
 }
 
 class RuntimeError extends Error {
     constructor(message: string) {
         super(message);
         this.name = 'RuntimeError';
+    }
+    
+    get [Symbol.toStringTag]() {
+        return 'RuntimeError';
     }
 }
 
@@ -82,6 +94,10 @@ class Module {
 
     static customSections(module: Module, sectionName: string): ArrayBuffer[] {
         return [wasm.moduleCustomSections(module._native, sectionName)!];
+    }
+    
+    get [Symbol.toStringTag]() {
+        return 'WebAssembly.Module';
     }
 }
 
@@ -126,6 +142,10 @@ class Memory {
         this._buffer = newBuffer;
         this._cachedBuffer = newBuffer;
         return oldPages;
+    }
+    
+    get [Symbol.toStringTag]() {
+        return 'WebAssembly.Memory';
     }
 }
 
@@ -196,6 +216,10 @@ class Table {
         }
         return oldLength;
     }
+    
+    get [Symbol.toStringTag]() {
+        return 'WebAssembly.Table';
+    }
 }
 
 // ============================================================================
@@ -238,6 +262,10 @@ class Global {
 
     valueOf(): CModuleWASM.WasmValue {
         return this.value;
+    }
+    
+    get [Symbol.toStringTag]() {
+        return 'WebAssembly.Global';
     }
 }
 
@@ -282,6 +310,10 @@ class Instance {
 
     get exports(): Record<string, any> {
         return this._exports;
+    }
+    
+    get [Symbol.toStringTag]() {
+        return 'WebAssembly.Instance';
     }
 }
 

@@ -33,6 +33,9 @@ await import('./basic');
 // events
 await import('./events');
 
+// web streams polyfill
+await import('./streams');
+
 // URL polyfill
 await import('./url');
 
@@ -40,8 +43,6 @@ await import('./url');
 // @ts-ignore
 await import('urlpattern-polyfill');
 
-// web streams polyfill
-await import('./streams');
 // @ts-ignore
 // const stream = await import('web-streams-polyfill');
 // for (const key in stream) {
@@ -83,7 +84,7 @@ onEvent((eventName, eventData) => {
                 promise: eventData[0],
                 // @ts-ignore
                 reason: eventData[1]
-            })
+            }, true)
             break;
         case EventType.LOAD:
             event = new Event('load');
@@ -129,6 +130,9 @@ await import('./storage');
 
 // BroadcastChannel
 await import('./broadcast-channel');
+
+// CacheStorage / Cache API
+await import('./cache');
 
 // Intl (partial support)
 await import('./intl');

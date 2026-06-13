@@ -4,8 +4,6 @@
  */
 
 const engine = import.meta.use('engine');
-const textEncoder = new TextEncoder();
-const textDecoder = new TextDecoder();
 
 export type KvKeyPart = string | number | bigint | boolean | Uint8Array;
 export type KvKey = readonly KvKeyPart[];
@@ -83,7 +81,7 @@ export type RawKey = Uint8Array;
 
 export interface InternalEntry {
     key: RawKey;
-    value: Uint8Array;
+    value: Uint8Array<ArrayBuffer>;
     versionstamp: string;
     expireAt: number | null;
 }
@@ -140,11 +138,11 @@ export function deserializeLegacyKey(rawKey: string): Deno.KvKey {
     }) as Deno.KvKey;
 }
 
-function appendBytes(target: number[], bytes: Uint8Array): void {
+function appendBytes(target: number[], bytes: Uint8Array<ArrayBuffer>): void {
     for (const byte of bytes) target.push(byte);
 }
 
-function encodeEscapedBytes(target: number[], bytes: Uint8Array): void {
+function encodeEscapedBytes(target: number[], bytes: Uint8Array<ArrayBuffer>): void {
     for (const byte of bytes) {
         if (byte === 0) target.push(0, 0xFF);
         else target.push(byte);
@@ -152,7 +150,7 @@ function encodeEscapedBytes(target: number[], bytes: Uint8Array): void {
     target.push(0, 0);
 }
 
-function decodeEscapedBytes(data: Uint8Array, offset: number): { bytes: Uint8Array; offset: number } {
+function decodeEscapedBytes(data: Uint8Array<ArrayBuffer>, offset: number): { bytes: Uint8Array<ArrayBuffer>; offset: number } {
     const out: number[] = [];
     while (offset < data.length) {
         const byte = data[offset++]!;
@@ -174,7 +172,7 @@ function decodeEscapedBytes(data: Uint8Array, offset: number): { bytes: Uint8Arr
     throw new TypeError('Unexpected end of key encoding');
 }
 
-function encodeNumber(value: number): Uint8Array {
+function encodeNumber(value: number): Uint8Array<ArrayBuffer> {
     const out = new Uint8Array(8);
     new DataView(out.buffer).setFloat64(0, Object.is(value, -0) ? 0 : value, false);
     if (value < 0) {
@@ -185,7 +183,7 @@ function encodeNumber(value: number): Uint8Array {
     return out;
 }
 
-function decodeNumber(data: Uint8Array, offset: number): { value: number; offset: number } {
+function decodeNumber(data: Uint8Array<ArrayBuffer>, offset: number): { value: number; offset: number } {
     const bytes = data.slice(offset, offset + 8);
     if (bytes.length !== 8) throw new TypeError('Invalid number key encoding');
     const negative = (bytes[0] & 0x80) === 0;
@@ -200,7 +198,7 @@ function decodeNumber(data: Uint8Array, offset: number): { value: number; offset
     };
 }
 
-function bigintToBytes(value: bigint): Uint8Array {
+function bigintToBytes(value: bigint): Uint8Array<ArrayBuffer> {
     let hex = value.toString(16);
     if (hex.length === 0) hex = '0';
     if (hex.length % 2) hex = `0${hex}`;
@@ -209,19 +207,19 @@ function bigintToBytes(value: bigint): Uint8Array {
     return out.length ? out : new Uint8Array([0]);
 }
 
-function bytesToBigint(bytes: Uint8Array): bigint {
+function bytesToBigint(bytes: Uint8Array<ArrayBuffer>): bigint {
     let hex = '';
     for (const byte of bytes) hex += byte.toString(16).padStart(2, '0');
     return BigInt(`0x${hex || '0'}`);
 }
 
-function u32be(value: number): Uint8Array {
+function u32be(value: number): Uint8Array<ArrayBuffer> {
     const out = new Uint8Array(4);
     new DataView(out.buffer).setUint32(0, value, false);
     return out;
 }
 
-function readU32be(data: Uint8Array, offset: number): { value: number; offset: number } {
+function readU32be(data: Uint8Array<ArrayBuffer>, offset: number): { value: number; offset: number } {
     if (offset + 4 > data.length) throw new TypeError('Invalid bigint key encoding');
     return {
         value: new DataView(data.buffer, data.byteOffset + offset, 4).getUint32(0, false),
@@ -229,7 +227,7 @@ function readU32be(data: Uint8Array, offset: number): { value: number; offset: n
     };
 }
 
-function encodeBigint(value: bigint): Uint8Array {
+function encodeBigint(value: bigint): Uint8Array<ArrayBuffer> {
     const negative = value < 0n;
     const magnitude = bigintToBytes(negative ? -value : value);
     const out: number[] = [TYPE_PREFIXES.bigint, negative ? 0x00 : 0x01];
@@ -242,7 +240,7 @@ function encodeBigint(value: bigint): Uint8Array {
     return new Uint8Array(out);
 }
 
-function decodeBigint(data: Uint8Array, offset: number): { value: bigint; offset: number } {
+function decodeBigint(data: Uint8Array<ArrayBuffer>, offset: number): { value: bigint; offset: number } {
     if (offset >= data.length) throw new TypeError('Invalid bigint key encoding');
     const sign = data[offset++]!;
     const lenInfo = readU32be(data, offset);
@@ -274,11 +272,11 @@ export function serializeKey(key: Deno.KvKey): RawKey {
                 break;
             case 'string':
                 out.push(TYPE_PREFIXES.string);
-                encodeEscapedBytes(out, textEncoder.encode(part as string));
+                encodeEscapedBytes(out, engine.encodeString(part as string));
                 break;
             case 'Uint8Array':
                 out.push(TYPE_PREFIXES.Uint8Array);
-                encodeEscapedBytes(out, part as Uint8Array);
+                encodeEscapedBytes(out, part as Uint8Array<ArrayBuffer>);
                 break;
             default:
                 throw new TypeError(`Unsupported key part type: ${type}`);
@@ -287,9 +285,10 @@ export function serializeKey(key: Deno.KvKey): RawKey {
     return new Uint8Array(out);
 }
 
-export function deserializeKey(rawKey: RawKey): Deno.KvKey {
+export function deserializeKey(rk: RawKey): Deno.KvKey {
     const key: KvKeyPart[] = [];
     let offset = 0;
+    const rawKey = rk as Uint8Array<ArrayBuffer>;
     while (offset < rawKey.length) {
         const tag = rawKey[offset++]!;
         switch (tag) {
@@ -311,7 +310,7 @@ export function deserializeKey(rawKey: RawKey): Deno.KvKey {
             }
             case TYPE_PREFIXES.string: {
                 const decoded = decodeEscapedBytes(rawKey, offset);
-                key.push(textDecoder.decode(decoded.bytes));
+                key.push(engine.decodeString(decoded.bytes));
                 offset = decoded.offset;
                 break;
             }
@@ -381,22 +380,22 @@ const LEGACY_JSON_DESERIALIZER = (_key: string, v: unknown): unknown => {
     return v;
 };
 
-export function serializeValue(value: unknown): Uint8Array {
+export function serializeValue(value: unknown): Uint8Array<ArrayBuffer> {
     return engine.serialize(value);
 }
 
-export function deserializeValue<T>(data: Uint8Array): T {
+export function deserializeValue<T>(data: Uint8Array<ArrayBuffer>): T {
     try {
         return engine.deserialize(new Uint8Array(data)) as T;
     } catch {
-        const json = textDecoder.decode(data);
+        const json = engine.decodeString(data);
         return JSON.parse(json, LEGACY_JSON_DESERIALIZER) as T;
     }
 }
 
-export function serializeLegacyValue(value: unknown): Uint8Array {
+export function serializeLegacyValue(value: unknown): Uint8Array<ArrayBuffer> {
     const json = JSON.stringify(value, LEGACY_JSON_SERIALIZER);
-    return textEncoder.encode(json);
+    return engine.encodeString(json);
 }
 
 export function compareKeys(a: KvKey, b: KvKey): number {
@@ -473,12 +472,12 @@ export function keyPartsEqual(a: Deno.KvKeyPart, b: Deno.KvKeyPart): boolean {
     return false;
 }
 
-export function encodeKeyPart(part: Deno.KvKeyPart): Uint8Array {
-    return serializeKey([part]);
+export function encodeKeyPart(part: Deno.KvKeyPart): Uint8Array<ArrayBuffer> {
+    return serializeKey([part]) as Uint8Array<ArrayBuffer>;
 }
 
-export function encodeKey(key: Deno.KvKey): Uint8Array {
-    return serializeKey(key);
+export function encodeKey(key: Deno.KvKey): Uint8Array<ArrayBuffer> {
+    return serializeKey(key) as Uint8Array<ArrayBuffer>;
 }
 
 export function isValidKeyPart(part: unknown): part is Deno.KvKeyPart {

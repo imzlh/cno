@@ -1,4 +1,4 @@
-import { EventTarget } from "./events";
+import { DOMException, EventTarget } from "./events";
 
 // Store native performance.now reference
 const nativePerformanceNow = globalThis.performance?.now?.bind(globalThis.performance) ?? (() => Date.now());

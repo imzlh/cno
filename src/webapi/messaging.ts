@@ -1,4 +1,4 @@
-import { EventTarget, MessageEvent } from './events';
+import { DOMException, EventTarget, MessageEvent } from './events';
 
 const engine = import.meta.use('engine');
 
@@ -51,7 +51,7 @@ export class MessagePort extends EventTarget {
                     const event = new MessageEvent('message', { 
                         data: cloned, 
                         ports: transferred.filter(p => p instanceof MessagePort) as any
-                    });
+                    }, true);
                     otherPort.dispatchEvent(event);
                     otherPort.onmessage?.call(otherPort, event);
                 }
@@ -66,7 +66,7 @@ export class MessagePort extends EventTarget {
         this[startedSymbol] = true;
 
         for (const message of this[messageQueueSymbol]) {
-            const event = new MessageEvent('message', { data: message });
+            const event = new MessageEvent('message', { data: message }, true);
             this.dispatchEvent(event);
             this.onmessage?.call(this, event);
         }

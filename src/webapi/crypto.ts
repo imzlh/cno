@@ -181,6 +181,10 @@ class CryptoKeyImpl implements CryptoKey {
         public usages: KeyUsage[],
         public _handle: ArrayBuffer
     ) { }
+    
+    get [Symbol.toStringTag]() {
+        return 'CryptoKey';
+    }
 }
 
 // ============================================================================

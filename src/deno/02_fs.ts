@@ -10,7 +10,13 @@ import { join } from "../utils/path";
 import { wrapFSns } from "../utils/wrap";
 import { errors } from "./01_errors";
 
-export const toString = (e: URL | string) => e instanceof URL ? e.pathname : e;
+export const toString = (e: URL | string): string => {
+    if (!(e instanceof URL)) return e;
+    let p = decodeURIComponent(e.pathname);
+    // On Windows, file:///C:/foo → pathname is /C:/foo — strip the leading slash
+    if (p.length >= 3 && p[0] === '/' && p[2] === ':') p = p.slice(1);
+    return p;
+};
 
 export function toDenoStat(stat: CModuleAsyncFS.StatResult) {
     return {
@@ -469,7 +475,7 @@ Object.assign(Deno, wrapFSns({
 
     writeFileSync(path, data, options) {
         // todo: options
-        fs.writeFile(toString(path), data.buffer as ArrayBuffer);
+        fs.writeFile(toString(path), data.buffer as ArrayBuffer, options?.mode);
     },
 
     writeFile(path, data, options) {
@@ -478,7 +484,7 @@ Object.assign(Deno, wrapFSns({
 
     writeTextFileSync(path, data, options) {
         // todo: options
-        fs.writeFile(toString(path), engine.encodeString(data).buffer as ArrayBuffer);
+        fs.writeFile(toString(path), engine.encodeString(data).buffer as ArrayBuffer, options?.mode);
     },
 
     writeTextFile(path, data, options) {

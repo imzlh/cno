@@ -5,6 +5,7 @@
 
 const streams = import.meta.use('streams');
 const os = import.meta.use('os');
+const engine = import.meta.use('engine');
 
 import { EventEmitter } from '../events';
 import { Duplex, Readable, Writable } from '../stream';

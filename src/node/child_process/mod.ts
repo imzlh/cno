@@ -5,7 +5,11 @@
 
 const proc = import.meta.use('process');
 const os = import.meta.use('os');
+const signals = import.meta.use('signals');
+const engine = import.meta.use('engine');
+const text = import.meta.use('text');
 
+import { IPCChannel } from '../ipc_channel';
 import { EventEmitter } from '../events';
 import { Writable, Readable } from '../stream';
 
@@ -30,6 +34,8 @@ export interface SpawnOptions {
     killSignal?: string | number;
     input?: string | ArrayBuffer | Uint8Array;
     encoding?: BufferEncoding | 'buffer' | null;
+    /** Enable IPC channel */
+    ipc?: boolean;
 }
 
 export interface SpawnOptionsWithStdioTuple<
@@ -69,6 +75,16 @@ export interface ChildProcess extends EventEmitter {
 // ChildProcess class
 // ============================================================================
 
+function transformSignal(signal?: string | number): number | undefined {
+    if (!signal) return;
+    if (typeof signal === 'string') {
+        if (!(signal in signals.signals)) throw new Error(`Unknown signal: ${signal}`);
+        // @ts-ignore - signal map
+        return signals.signals[signal];
+    }
+    return signal;
+}
+
 class ChildProcessImpl extends EventEmitter implements ChildProcess {
     private _process: CModuleProcess.ChildProcess | null = null;
     private _killed: boolean = false;
@@ -77,6 +93,7 @@ class ChildProcessImpl extends EventEmitter implements ChildProcess {
     private _stdin: Writable | null = null;
     private _stdout: Readable | null = null;
     private _stderr: Readable | null = null;
+    private _ipcChannel: IPCChannel | null = null;
 
     stdin: Writable | null = null;
     stdout: Readable | null = null;
@@ -124,34 +141,34 @@ class ChildProcessImpl extends EventEmitter implements ChildProcess {
     private _createWritable(pipe: CModuleStreams.Pipe): Writable {
         return new Writable({
             write(chunk: any, encoding: BufferEncoding, callback: (error?: Error | null) => void) {
-                const data = chunk instanceof Uint8Array ? chunk : new TextEncoder().encode(chunk);
+                const data = chunk instanceof Uint8Array ? chunk : engine.encodeString(chunk);
                 pipe.write(data).then(() => callback()).catch(callback);
             },
             final(callback: (error?: Error | null) => void) {
-                try{ pipe.shutdown(); } finally { callback(); }
+                try { pipe.shutdown(); } finally { callback(); }
             },
         });
     }
 
     private _createReadable(pipe: CModuleStreams.Pipe): Readable {
-        const readable = new Readable();
+        const readable = new Readable({
+            async read(size) {
+                const chunkSize = size || 65536;
+                const buf = new Uint8Array(chunkSize);
 
-        readable._read = async (size: number) => {
-            const chunkSize = size || 65536;
-            const buf = new Uint8Array(chunkSize);
-
-            try {
-                const n = await pipe.read(buf);
-                if (n === 0) {
+                try {
+                    const n = await pipe.read(buf);
+                    if (n === 0) {
+                        readable.push(null);
+                        return;
+                    }
+                    readable.push(buf.subarray(0, n));
+                } catch (err) {
+                    readable.emit('error', err);
                     readable.push(null);
-                    return;
                 }
-                readable.push(buf.subarray(0, n));
-            } catch (err) {
-                readable.emit('error', err);
-                readable.push(null);
             }
-        };
+        });
 
         return readable;
     }
@@ -180,7 +197,7 @@ class ChildProcessImpl extends EventEmitter implements ChildProcess {
         this.killed = true;
 
         try {
-            this._process.kill(signal as CModuleProcess.Signal || 'SIGTERM');
+            this._process.kill(transformSignal(signal));
             return true;
         } catch {
             return false;
@@ -188,29 +205,64 @@ class ChildProcessImpl extends EventEmitter implements ChildProcess {
     }
 
     disconnect(): void {
-        this.connected = false;
-        // Close stdin/stdout/stderr to signal disconnect
-        if (this.stdin) { this.stdin.end(); this.stdin = null; }
-        if (this.stdout) { this.stdout.destroy(); this.stdout = null; }
-        if (this.stderr) { this.stderr.destroy(); this.stderr = null; }
-        this.emit('disconnect');
+        // Only the IPC channel is torn down on disconnect(). In Node, stdin/stdout/
+        // stderr are independent of the IPC channel and must stay open. Closing the
+        // channel emits 'close', whose handler (registered in _setupIPC) flips
+        // `connected` to false and emits 'disconnect' — so we must not emit it here
+        // again to avoid a duplicate event.
+        if (!this.connected || !this._ipcChannel) return;
+        this._ipcChannel.close();
+        this._ipcChannel = null;
     }
 
     unref(): void {
-        // Best-effort: C module doesn't expose unref per child process
+        // FIXME: C module doesn't expose unref per child process
     }
 
     ref(): void {
-        // Best-effort
+        // FIXME
     }
 
     send(message: any, _sendHandle?: any, _options?: any, callback?: (error: Error | null) => void): boolean {
-        // No IPC channel established (spawn doesn't create one by default)
-        const err = new Error('IPC channel is not enabled for this child process. Use { stdio: [\'inherit\', \'inherit\', \'ipc\'] } to enable.') as NodeJS.ErrnoException;
-        err.code = 'ERR_IPC_CHANNEL_CLOSED';
-        if (callback) { callback(err); return false; }
-        this.emit('error', err);
-        return false;
+        if (!this._ipcChannel || !this._ipcChannel.connected) {
+            const err = new Error('IPC channel is not enabled for this child process. Use { stdio: [\'inherit\', \'inherit\', \'ipc\'] } to enable.') as NodeJS.ErrnoException;
+            err.code = 'ERR_IPC_CHANNEL_CLOSED';
+            if (callback) { callback(err); return false; }
+            this.emit('error', err);
+            return false;
+        }
+
+        try {
+            // Node sends user messages verbatim (no wrapper) so the peer —
+            // including a real node process — receives exactly what was sent.
+            this._ipcChannel.send(message);
+            if (callback) callback(null);
+            return true;
+        } catch (err) {
+            if (callback) callback(err as Error);
+            return false;
+        }
+    }
+
+    /**
+     * Set up IPC channel (called internally when stdio includes 'ipc')
+     */
+    _setupIPC(pipe: CModuleStreams.Pipe): void {
+        this._ipcChannel = new IPCChannel(pipe);
+        this.connected = true;
+
+        this._ipcChannel.on('message', (msg) => {
+            this.emit('message', msg);
+        });
+
+        this._ipcChannel.on('error', (err: Error) => {
+            this.emit('error', err);
+        });
+
+        this._ipcChannel.on('close', () => {
+            this.connected = false;
+            this.emit('disconnect');
+        });
     }
 }
 
@@ -250,15 +302,19 @@ export function spawn(command: string, argsOrOptions?: string[] | SpawnOptions, 
     };
 
     // Handle stdio
+    let hasIPC = false;
     if (opts.stdio) {
         if (Array.isArray(opts.stdio)) {
             spawnOpts.stdin = opts.stdio[0] ?? 'inherit';
             spawnOpts.stdout = opts.stdio[1] ?? 'inherit';
             spawnOpts.stderr = opts.stdio[2] ?? 'inherit';
+            // Check for IPC in any stdio position
+            hasIPC = opts.stdio.includes('ipc' as any);
         } else {
             spawnOpts.stdin = opts.stdio;
             spawnOpts.stdout = opts.stdio;
             spawnOpts.stderr = opts.stdio;
+            hasIPC = (opts.stdio as string) === 'ipc';
         }
     } else {
         spawnOpts.stdin = 'pipe';
@@ -267,9 +323,27 @@ export function spawn(command: string, argsOrOptions?: string[] | SpawnOptions, 
     }
 
     const child = new ChildProcessImpl();
+
+    // Set IPC option in spawn options
+    if (hasIPC) {
+        spawnOpts.ipc = true;
+        // The C layer inherits the IPC endpoint to the child as fd 3. Tell the
+        // child which fd that is via NODE_CHANNEL_FD (Node-compatible), so the
+        // child's process module can wire up process.send()/process.on('message').
+        // When the caller did not pass an explicit env we must start from the
+        // current environment, otherwise the child would lose all inherited vars.
+        const baseEnv = spawnOpts.env ?? os.environ();
+        spawnOpts.env = { ...baseEnv, NODE_CHANNEL_FD: '3' };
+    }
+
     // @ts-ignore
     const process = proc.spawn(command, args, spawnOpts);
     child._init(process, command, args, opts);
+
+    // Set up IPC channel if created
+    if (hasIPC && process.ipc) {
+        child._setupIPC(process.ipc);
+    }
 
     if (opts.signal) {
         // @ts-ignore
@@ -410,10 +484,11 @@ export function execFile(
 
 export function fork(modulePath: string, args?: string[], options?: SpawnOptions): ChildProcess {
     const forkArgs = args ?? [];
-    // @ts-ignore - fork uses ipc channel
+    // Fork automatically sets up IPC channel
     return spawn(process.execPath, [modulePath, ...forkArgs], {
         ...options,
-        stdio: ['pipe', 'pipe', 'pipe'],
+        // @ts-ignore - fork always uses ipc
+        stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
     });
 }
 
@@ -472,7 +547,7 @@ export function spawnSync(command: string, args?: string[], options?: SpawnOptio
             if (value == null) return value;
             const bytes = new Uint8Array(value);
             if (encoding === 'buffer' || encoding === null) return bytes;
-            return new TextDecoder(encoding as string).decode(bytes);
+            return new text.Decoder(encoding).decode(bytes);
         };
         const stdout = convert(result.stdout);
         const stderr = convert(result.stderr);

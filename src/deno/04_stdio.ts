@@ -1,5 +1,5 @@
 import { malloc } from "../utils/malloc";
-import { isUnixCompatible, isWindows } from "../utils/platform";
+import { isPosixCompatible, isWindows } from "../utils/platform";
 import { wrapFsClassDec as wrap } from "../utils/wrap";
 import { FSFile } from "./03_fopen";
 
@@ -55,7 +55,7 @@ export class Stream {
                 try {
                     this.stream.mode = pipe.TTY_MODE_NORMAL;
                 } catch {}
-                if (isWindows && !isUnixCompatible) {
+                if (isWindows && !isPosixCompatible) {
                     // Sync should use $CONIN instead
                     this.fd = sfs.open('CONIN$', 'r', 0);
                 }

@@ -1,3 +1,5 @@
+import { DOMException } from "../webapi/events";
+
 type CronOptions = {
     backoffSchedule?: number[];
     signal?: AbortSignal;

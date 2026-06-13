@@ -7,17 +7,28 @@ const engine = import.meta.use('engine');
 const signal = import.meta.use('signals');
 const console = import.meta.use('console');
 
-function notSupported(): never{
+const kInternal = Symbol('Deno.internal');
+
+function notSupported(): never {
     throw new errors.NotSupported("Not supported");
+}
+
+function toDenoSystemName(name: string): string {
+    if (name.includes('MINGW') || name == 'Windows_NT') return 'windows';
+    if (name == 'macOS') return 'darwin';
+    return 'linux';
 }
 
 const signalMap: Record<string, Map<() => void, CModuleSignals.SignalHandler>> = {};
 
-function safeGetEnv(env: string){
-    try{
+function safeGetEnv(env: string) {
+    try {
         return os.getenv(env);
-    }catch{}
-    return null;
+    } catch { }
+}
+
+export interface IFailedTest extends Deno.TestDefinition {
+    error: Error;
 }
 
 const testRegistry: Deno.TestDefinition[] = [];
@@ -26,8 +37,10 @@ const beforeAllHooks: (() => void | Promise<void>)[] = [];
 const beforeEachHooks: (() => void | Promise<void>)[] = [];
 const afterEachHooks: (() => void | Promise<void>)[] = [];
 const afterAllHooks: (() => void | Promise<void>)[] = [];
-const failedTests: Deno.TestDefinition[] = [];
+const failedTests: IFailedTest[] = [];
 
+const toError = (e: unknown): Error =>
+    e instanceof Error ? e : new Error(String(e));
 function createTestContext(name: string, origin: string, parent?: Deno.TestContext): Deno.TestContext {
     const ctx: Deno.TestContext = {
         name,
@@ -35,7 +48,7 @@ function createTestContext(name: string, origin: string, parent?: Deno.TestConte
         parent,
         async step(definitionOrName: Deno.TestStepDefinition | string | ((t: Deno.TestContext) => void | Promise<void>), fn?: (t: Deno.TestContext) => void | Promise<void>): Promise<boolean> {
             let stepDef: Deno.TestStepDefinition;
-            
+
             if (typeof definitionOrName === 'string') {
                 stepDef = { name: definitionOrName, fn: fn! };
             } else if (typeof definitionOrName === 'function') {
@@ -44,12 +57,12 @@ function createTestContext(name: string, origin: string, parent?: Deno.TestConte
             } else {
                 stepDef = definitionOrName;
             }
-            
+
             if (stepDef.ignore) {
                 console.warn(`  skip ${stepDef.name}`);
                 return false;
             }
-            
+
             const stepCtx = createTestContext(stepDef.name, origin, ctx);
             try {
                 await stepDef.fn(stepCtx);
@@ -57,7 +70,10 @@ function createTestContext(name: string, origin: string, parent?: Deno.TestConte
                 return true;
             } catch (e) {
                 console.error(`  fail ${stepDef.name}`, e);
-                failedTests.push(stepDef);
+                failedTests.push({
+                    ...stepDef,
+                    error: toError(e)
+                });
                 return false;
             }
         }
@@ -68,7 +84,7 @@ function createTestContext(name: string, origin: string, parent?: Deno.TestConte
 function createBenchContext(name: string, origin: string): Deno.BenchContext {
     let startTime = 0;
     let timerActive = false;
-    
+
     return {
         name,
         origin,
@@ -103,7 +119,7 @@ function isBenchDefinition(obj: unknown): obj is Deno.BenchDefinition {
 function createTestFunction(): Deno.DenoTest {
     const testFn = (...args: unknown[]) => {
         let def: Deno.TestDefinition;
-        
+
         if (args.length === 1) {
             const arg = args[0];
             if (isTestDefinition(arg)) {
@@ -116,8 +132,8 @@ function createTestFunction(): Deno.DenoTest {
         } else if (args.length === 2) {
             const [nameOrOptions, fnOrOptions] = args;
             if (typeof nameOrOptions === 'string') {
-                def = { 
-                    name: nameOrOptions, 
+                def = {
+                    name: nameOrOptions,
                     fn: fnOrOptions as (t: Deno.TestContext) => void | Promise<void>
                 };
             } else if (typeof nameOrOptions === 'object' && typeof fnOrOptions === 'function') {
@@ -141,14 +157,14 @@ function createTestFunction(): Deno.DenoTest {
         } else {
             throw new TypeError('Invalid test definition');
         }
-        
+
         registerTest(def);
     };
-    
+
     const testObj = Object.assign(testFn, {
         ignore: (...args: unknown[]) => {
             let def: Deno.TestDefinition;
-            
+
             if (args.length === 1) {
                 const arg = args[0];
                 if (typeof arg === 'object' && arg !== null) {
@@ -161,8 +177,8 @@ function createTestFunction(): Deno.DenoTest {
             } else if (args.length === 2) {
                 const [nameOrOptions, fnOrOptions] = args;
                 if (typeof nameOrOptions === 'string') {
-                    def = { 
-                        name: nameOrOptions, 
+                    def = {
+                        name: nameOrOptions,
                         fn: fnOrOptions as (t: Deno.TestContext) => void | Promise<void>,
                         ignore: true
                     };
@@ -191,10 +207,10 @@ function createTestFunction(): Deno.DenoTest {
             }
             registerTest(def);
         },
-        
+
         only: (...args: unknown[]) => {
             let def: Deno.TestDefinition;
-            
+
             if (args.length === 1) {
                 const arg = args[0];
                 if (typeof arg === 'object' && arg !== null) {
@@ -207,8 +223,8 @@ function createTestFunction(): Deno.DenoTest {
             } else if (args.length === 2) {
                 const [nameOrOptions, fnOrOptions] = args;
                 if (typeof nameOrOptions === 'string') {
-                    def = { 
-                        name: nameOrOptions, 
+                    def = {
+                        name: nameOrOptions,
                         fn: fnOrOptions as (t: Deno.TestContext) => void | Promise<void>,
                         only: true
                     };
@@ -237,24 +253,24 @@ function createTestFunction(): Deno.DenoTest {
             }
             registerTest(def);
         },
-        
+
         beforeAll: (fn: () => void | Promise<void>) => {
             beforeAllHooks.push(fn);
         },
-        
+
         beforeEach: (fn: () => void | Promise<void>) => {
             beforeEachHooks.push(fn);
         },
-        
+
         afterEach: (fn: () => void | Promise<void>) => {
             afterEachHooks.push(fn);
         },
-        
+
         afterAll: (fn: () => void | Promise<void>) => {
             afterAllHooks.push(fn);
         }
     });
-    
+
     return testObj as Deno.DenoTest;
 }
 
@@ -268,7 +284,7 @@ function createBenchFunction(): {
 } {
     const benchFn = (...args: unknown[]) => {
         let def: Deno.BenchDefinition;
-        
+
         if (args.length === 1) {
             const arg = args[0];
             if (isBenchDefinition(arg)) {
@@ -281,8 +297,8 @@ function createBenchFunction(): {
         } else if (args.length === 2) {
             const [nameOrOptions, fnOrOptions] = args;
             if (typeof nameOrOptions === 'string') {
-                def = { 
-                    name: nameOrOptions, 
+                def = {
+                    name: nameOrOptions,
                     fn: fnOrOptions as (b: Deno.BenchContext) => void | Promise<void>
                 };
             } else if (typeof nameOrOptions === 'object' && typeof fnOrOptions === 'function') {
@@ -306,10 +322,10 @@ function createBenchFunction(): {
         } else {
             throw new TypeError('Invalid bench definition');
         }
-        
+
         registerBench(def);
     };
-    
+
     return benchFn as {
         (b: Deno.BenchDefinition): void;
         (name: string, fn: (b: Deno.BenchContext) => void | Promise<void>): void;
@@ -318,6 +334,40 @@ function createBenchFunction(): {
         (options: Omit<Deno.BenchDefinition, "fn">, fn: (b: Deno.BenchContext) => void | Promise<void>): void;
         (options: Omit<Deno.BenchDefinition, "fn" | "name">, fn: (b: Deno.BenchContext) => void | Promise<void>): void;
     };
+}
+
+export async function startTest(contextName = '<core>', test = true, bench = true) {
+    if (test) {
+        const tctx = createTestContext('main', contextName);
+        for (const testItem of testRegistry) try {
+            await tctx.step(testItem);
+        } catch (e) {
+            console.error(`  fail ${testItem.name}`);
+            console.error(e);
+        }
+    }
+
+    if (bench) {
+        const bctx = createBenchContext('main', contextName);
+        bctx.start();
+        for (const benchItem of benchRegistry) try {
+            await benchItem.fn(bctx);
+        } catch (e) {
+            console.error(`  fail ${benchItem.name}`);
+            console.error(e);
+        }
+        bctx.end();
+    }
+
+    if (test) {
+        return failedTests.length === 0;
+    } else {
+        return true;
+    }
+}
+
+export function getFailedTests(): IFailedTest[] { 
+    return failedTests;
 }
 
 const uname = os.uname();
@@ -331,7 +381,7 @@ Object.defineProperty(globalThis, "Deno", {
         env: {
             get: safeGetEnv,
             set: os.setenv,
-            has: (key: string) => safeGetEnv(key)!== null,
+            has: (key: string) => safeGetEnv(key) !== undefined,
             delete: (key: string) => os.unsetenv(key),
             toObject() {
                 const env = {} as Record<string, string>;
@@ -345,7 +395,7 @@ Object.defineProperty(globalThis, "Deno", {
         exitCode: 0,
         build: {
             arch: uname.machine,
-            os: uname.sysname,
+            os: toDenoSystemName(uname.sysname),
             standalone: false,
             target: `${uname.machine}-unknown-${os.uname().sysname}`,
             vendor: "cno"
@@ -358,9 +408,9 @@ Object.defineProperty(globalThis, "Deno", {
         },
         cwd: () => os.cwd,
         chdir: (dir: string) => os.chdir(dir),
-        get mainModule(){
+        get mainModule() {
             // @ts-ignore - cts api
-            return globalThis.__mainScript; 
+            return globalThis.__mainScript;
         },
         execPath: () => os.exePath,
         noColor: safeGetEnv("NO_COLOR") === "1",
@@ -374,7 +424,7 @@ Object.defineProperty(globalThis, "Deno", {
                 rss: memory["os.rss"],
             }
         },
-        systemMemoryInfo(){
+        systemMemoryInfo() {
             const memory = os.memoryUsage();
             return {
                 total: memory["os.total"],
@@ -394,22 +444,22 @@ Object.defineProperty(globalThis, "Deno", {
 
         // permission eco
         permissions: {
-            query(desc){ return Promise.resolve(this.querySync(desc)); },
+            query(desc) { return Promise.resolve(this.querySync(desc)); },
             querySync: desc => ({
-                    state: 'granted',
-                    addEventListener: () => void 0,
-                    removeEventListener: () => void 0,
-                    dispatchEvent: () => true,
-                    onchange: null,
-                    partial: false,
-                }),
+                state: 'granted',
+                addEventListener: () => void 0,
+                removeEventListener: () => void 0,
+                dispatchEvent: () => true,
+                onchange: null,
+                partial: false,
+            }),
             request: notSupported,
             requestSync: notSupported,
             revoke: notSupported,
             revokeSync: notSupported,
         },
 
-        addSignalListener(sig, handler){
+        addSignalListener(sig, handler) {
             // @ts-ignore
             const sigint = signal.signals[sig];
             if (typeof sigint != 'number')
@@ -421,7 +471,7 @@ Object.defineProperty(globalThis, "Deno", {
             signalMap[sig].set(handler, ret);
         },
 
-        removeSignalListener(sig, handler){
+        removeSignalListener(sig, handler) {
             // @ts-ignore
             const sigint = signal.signals[sig];
             if (typeof sigint != 'number')
@@ -432,7 +482,7 @@ Object.defineProperty(globalThis, "Deno", {
             if (ret) ret.close();
         },
 
-        inspect(obj: any, opt){
+        inspect(obj: any, opt) {
             return console.inspect(obj, {
                 colors: opt?.colors ?? Deno.noColor,
                 depth: opt?.depth ?? undefined,
@@ -440,48 +490,47 @@ Object.defineProperty(globalThis, "Deno", {
             });
         },
 
-        refTimer(id){
+        refTimer(id) {
             // todo?
         },
-        unrefTimer(id){
+        unrefTimer(id) {
             // todo?
         },
 
-        uid(){
+        uid() {
             // fixme: this is not work well when suid
             return os.userInfo.userId;
         },
-        gid(){
+        gid() {
             return os.userInfo.groupId;
         },
 
         test: createTestFunction(),
         bench: createBenchFunction(),
-        async __startTest(){
-            const tctx = createTestContext('main', '<core>');
-            for (const testItem of testRegistry) try {
-                await tctx.step(testItem);
-            } catch (e) {
-                console.error(`  fail ${testItem.name}`);
-                console.error(e);
-            }
-            const bctx = createBenchContext('main', '<core>');
-            bctx.start();
-            for (const benchItem of benchRegistry) try {
-                await benchItem.fn(bctx);
-            } catch (e) {
-                console.error(`  fail ${benchItem.name}`);
-                console.error(e);
-            }
-            bctx.end();
-            if (failedTests.length > 0) {
-                console.error('Failed tests:');
+        async __startTest(name = '<core>', executes: 'bench' | 'test' | 'both' = 'both') {
+            let res = true;
+            if (executes == 'both') res = await startTest(name, true, true);
+            else res = await startTest(name, executes == 'test', executes == 'bench');
+            if (!res) {
+                console.log('Failed tests:');
                 for (const failed of failedTests) {
-                    console.error(`  ${failed.name}`);
+                    console.error(failed.name);
                 }
             }
-            return failedTests.length === 0;
-        }
+            return res;
+        },
+
+        // ONLY FOR TEST SUITE!
+        internal: kInternal,
+        [kInternal]: {
+            inspectArgs: (args: any[]) => {
+                return args.map(arg => console.inspect(arg, {
+                    colors: false,
+                    depth: 10,
+                    showHidden: false
+                })).join(' ');
+            },
+        },
     } as Partial<typeof Deno>,
     writable: false,
     enumerable: true,

@@ -174,7 +174,7 @@ class ProcessReadStream extends Readable {
 
 const hrtimeOrigin = typeof performance !== 'undefined' ? performance.now() : Date.now();
 
-function hrtime(time?: [number, number]): [number, number] {
+export function hrtime(time?: [number, number]): [number, number] {
     const nowMicro = typeof performance !== 'undefined'
         ? performance.now() - hrtimeOrigin
         : Date.now() - hrtimeOrigin;
@@ -204,7 +204,7 @@ hrtime.bigint = function (): bigint {
 // memoryUsage implementation
 // ============================================================================
 
-function memoryUsage(): NodeJS.MemoryUsage {
+export function memoryUsage(): NodeJS.MemoryUsage {
     const memory = os.memoryUsage();
     return {
         rss: memory['os.rss'],
@@ -225,7 +225,7 @@ memoryUsage.rss = function (): number {
 
 let lastCpuUsage = { user: 0, system: 0 };
 
-function cpuUsage(previousValue?: NodeJS.CpuUsage): NodeJS.CpuUsage {
+export function cpuUsage(previousValue?: NodeJS.CpuUsage): NodeJS.CpuUsage {
     const cpus = os.cpuInfo();
     if (cpus.length === 0) return { user: 0, system: 0 };
 
@@ -266,7 +266,7 @@ function cpuUsage(previousValue?: NodeJS.CpuUsage): NodeJS.CpuUsage {
 const signalMap: Map<NodeJS.Signals, Map<() => void, CModuleSignals.SignalHandler>> = new Map();
 
 function addSignalListener(signalName: NodeJS.Signals, listener: () => void): void {
-    if (signalName == 'SIGBREAK' || signalName == 'SIGIOT' || signalName == 'SIGPOLL' || signalName == 'SIGSTKFLT' || signalName == 'SIGUNUSED' || signalName == 'SIGLOST' || signalName == 'SIGINFO') 
+    if (signalName == 'SIGBREAK' || signalName == 'SIGIOT' || signalName == 'SIGPOLL' || signalName == 'SIGSTKFLT' || signalName == 'SIGUNUSED' || signalName == 'SIGLOST' || signalName == 'SIGINFO')
         throw new Error('The requested signal is not supported.');
     const sigint = sig.signals[signalName];
     if (typeof sigint !== 'number') {
@@ -287,7 +287,7 @@ function addSignalListener(signalName: NodeJS.Signals, listener: () => void): vo
 }
 
 function removeSignalListener(signalName: NodeJS.Signals, listener: () => void): void {
-    if (signalName == 'SIGBREAK' || signalName == 'SIGIOT' || signalName == 'SIGPOLL' || signalName == 'SIGSTKFLT' || signalName == 'SIGUNUSED' || signalName == 'SIGLOST' || signalName == 'SIGINFO') 
+    if (signalName == 'SIGBREAK' || signalName == 'SIGIOT' || signalName == 'SIGPOLL' || signalName == 'SIGSTKFLT' || signalName == 'SIGUNUSED' || signalName == 'SIGLOST' || signalName == 'SIGINFO')
         throw new Error('The requested signal is not supported.');
     const sigint = sig.signals[signalName];
     if (typeof sigint !== 'number') {
@@ -348,13 +348,13 @@ class ProcessEventEmitter extends EventEmitter {
     override emit(event: string | Symbol, ...args: any[]): boolean {
         if (event === 'exit') {
             for (const cb of this.#exitListeners) {
-                try { cb.apply(null, args as []); } catch {}
+                try { cb.apply(null, args as []); } catch { }
             }
             return this.#exitListeners.length > 0;
         }
         if (event === 'beforeExit') {
             for (const cb of this.#beforeExitListeners) {
-                try { cb.apply(null, args as []); } catch {}
+                try { cb.apply(null, args as []); } catch { }
             }
             return this.#beforeExitListeners.length > 0;
         }
@@ -404,293 +404,444 @@ const stdinStream = new ProcessReadStream(denoStdin);
 // ============================================================================
 // Process object
 // ============================================================================
-
 const uname = os.uname();
-export const process: NodeJS.Process = {
-    stdout: stdoutStream as any,
-    stderr: stderrStream as any,
-    stdin: stdinStream as any,
 
-    argv: [os.exePath, ...os_args.slice(1)],
-    argv0: os_args[0] ?? os.exePath,
-    execArgv: [],
+export const stdout: NodeJS.WriteStream = stdoutStream as any;
+export const stderr: NodeJS.WriteStream = stderrStream as any;
+export const stdin: NodeJS.ReadStream = stdinStream as any;
 
-    pid: os.pid,
-    ppid: os.ppid,
+export const argv: string[] = [os.exePath, ...os_args.slice(1)];
+export const argv0: string = os_args[0] ?? os.exePath;
+export const execArgv: string[] = [];
 
-    arch: (() => {
-        const machine = uname.machine;
-        switch (machine) {
-            case 'x86_64':
-            case 'amd64':
-                return 'x64';
-            case 'i386':
-            case 'i686':
-                return 'ia32';
-            case 'aarch64':
-            case 'arm64':
-                return 'arm64';
-            case 'arm':
-                return 'arm';
-            default:
-                return machine as NodeJS.Architecture;
-        }
-    })(),
+export const pid: number = os.pid;
+export const ppid: number = os.ppid;
 
-    platform: (() => {
-        const platform = os.uname().sysname;
-        switch (platform) {
-            case 'Linux':
-                return 'linux';
-            case 'Darwin':
-                return 'darwin';
-            case 'Windows_NT':
-                return 'win32';
-            case 'Freebsd':
-                return 'freebsd';
-            case 'Openbsd':
-                return 'openbsd';
-            case 'Sunos':
-                return 'sunos';
-            case 'Aix':
-                return 'aix';
-            default:
-                return platform as NodeJS.Platform;
-        }
-    })(),
+export const arch: NodeJS.Architecture = (() => {
+    const machine = uname.machine;
+    switch (machine) {
+        case 'x86_64':
+        case 'amd64':
+            return 'x64';
+        case 'i386':
+        case 'i686':
+            return 'ia32';
+        case 'aarch64':
+        case 'arm64':
+            return 'arm64';
+        case 'arm':
+            return 'arm';
+        default:
+            return machine as NodeJS.Architecture;
+    }
+})();
 
-    env: envProxy,
+export const platform: NodeJS.Platform = (() => {
+    const platform = os.uname().sysname;
+    switch (platform) {
+        case 'Linux':
+            return 'linux';
+        case 'Darwin':
+            return 'darwin';
+        case 'Windows_NT':
+            return 'win32';
+        case 'Freebsd':
+            return 'freebsd';
+        case 'Openbsd':
+            return 'openbsd';
+        case 'Sunos':
+            return 'sunos';
+        case 'Aix':
+            return 'aix';
+        default:
+            return platform as NodeJS.Platform;
+    }
+})();
 
-    cwd: () => os.cwd,
-    chdir: (directory: string) => os.chdir(directory),
+export const env: NodeJS.ProcessEnv = envProxy;
 
-    exit: (code?: number): never => {
-        processEE.emit('exit', code ?? 0);
-        os.exit(code ?? 0);
-        throw new Error('unreachable');
-    },
+export function cwd(): string {
+    return os.cwd;
+}
 
-    exitCode: undefined,
+export function chdir(directory: string): void {
+    os.chdir(directory);
+}
 
-    execPath: os.exePath,
+export function exit(code?: number): never {
+    processEE.emit('exit', code ?? 0);
+    os.exit(code ?? 0);
+    throw new Error('unreachable');
+}
 
-    title: 'node',
+export let exitCode: number | undefined = undefined;
 
-    version: 'v20.0.0',
-    versions: {
-        node: '20.0.0',
-        v8: engine.versions.quickjs,
-        modules: '120',
-        http_parser: '2.0',
-        uv: engine.versions.uv,
-        zlib: engine.versions.zlib,
-        ares: '1.0',
-        openssl: engine.versions.openssl,
-    },
+export const execPath: string = os.exePath;
 
-    config: {
-        target_defaults: {
-            cflags: [],
-            default_configuration: 'Release',
-            defines: [],
-            include_dirs: [],
-            libraries: [],
-        },
-        variables: {
-            clang: 0,
-            host_arch: os.uname().machine,
-            node_install_npm: true,
-            node_install_waf: false,
-            node_prefix: '/usr/local',
-            node_shared_openssl: false,
-            node_shared_v8: false,
-            node_shared_zlib: false,
-            node_use_dtrace: false,
-            node_use_etw: false,
-            node_use_openssl: true,
-            target_arch: os.uname().machine,
-            v8_no_strict_aliasing: 0,
-            v8_use_snapshot: true,
-            visibility: 'default',
-        },
-    },
+export const title: string = 'node';
 
-    release: {
-        name: 'node',
-        lts: 'Iron',
-    },
-
-    features: {
-        debug: false,
-        uv: true,
-        ipv6: true,
-        tls: true,
-        tls_alpn: true,
-        tls_ocsp: true,
-        tls_sni: true,
-        cached_builtins: true,
-        inspector: false,
-        require_module: false,
-        typescript: false,
-    },
-
-    memoryUsage,
-
-    cpuUsage,
-
-    hrtime,
-
-    uptime: () => os.uptime(),
-
-    on: processEE.on.bind(processEE) as any,
-    off: processEE.off.bind(processEE) as any,
-    once: processEE.once.bind(processEE) as any,
-    emit: processEE.emit.bind(processEE) as any,
-    addListener: processEE.on.bind(processEE) as any,
-    removeListener: processEE.off.bind(processEE) as any,
-
-    removeAllListeners: processEE.removeAllListeners.bind(processEE) as any,
-    prependListener: processEE.prependListener.bind(processEE) as any,
-    prependOnceListener: processEE.prependOnceListener.bind(processEE) as any,
-
-    listenerCount: ((event: string | symbol) => processEE.listenerCount(event)) as any,
-    eventNames: () => processEE.eventNames(),
-    listeners: ((event: string | symbol) => processEE.listeners(event)) as any,
-    rawListeners: ((event: string | symbol) => processEE.rawListeners(event)) as any,
-
-    getMaxListeners: () => processEE.getMaxListeners(),
-    setMaxListeners: ((n: number) => { processEE.setMaxListeners(n); return process; }) as any,
-
-    permission: {
-        has: () => true,
-    },
-
-    report: {
-        compact: false,
-        directory: '',
-        filename: '',
-        getReport: () => ({}),
-        reportOnFatalError: false,
-        reportOnSignal: false,
-        reportOnUncaughtException: false,
-        excludeEnv: false,
-        signal: 'SIGUSR2',
-        writeReport: () => '',
-    },
-
-    resourceUsage: () => {
-        const mem = os.memoryUsage();
-        const cpus = os.cpuInfo();
-        let totalUser = 0, totalSys = 0;
-        for (const cpu of cpus) { totalUser += cpu.times.user + cpu.times.nice; totalSys += cpu.times.sys; }
-        return {
-            fsRead: 0, fsWrite: 0,
-            involuntaryContextSwitches: 0, ipcReceived: 0, ipcSent: 0,
-            majorPageFault: 0, maxRSS: mem['os.rss'],
-            minorPageFault: 0, sharedMemorySize: 0, signalsCount: 0, swappedOut: 0,
-            systemCPUTime: totalSys * 1e6,
-            unsharedDataSize: 0, unsharedStackSize: 0,
-            userCPUTime: totalUser * 1e6,
-            voluntaryContextSwitches: 0,
-        };
-    },
-
-    emitWarning: (warning: string | Error, options?: any) => {
-        console.warn(warning);
-    },
-
-    getuid: () => os.userInfo.userId,
-    getgid: () => os.userInfo.groupId,
-    geteuid: () => os.userInfo.userId,
-    getegid: () => os.userInfo.groupId,
-    setuid: () => { throw new Error('setuid is not supported'); },
-    setgid: () => { throw new Error('setgid is not supported'); },
-    seteuid: () => { throw new Error('seteuid is not supported'); },
-    setegid: () => { throw new Error('setegid is not supported'); },
-    setgroups: () => { throw new Error('setgroups is not supported'); },
-
-    umask: (mask?: number | string) => {
-        if (mask === undefined) return 0o022;
-        // Best-effort: C layer doesn't expose umask, store and return previous
-        const prev = 0o022;
-        try { (os as any).umask?.(typeof mask === 'string' ? parseInt(mask, 8) : mask); } catch {}
-        return prev;
-    },
-
-    nextTick: (callback: Function, ...args: any[]) => {
-        queueMicrotask(() => callback(...args));
-    },
-
-    connected: false,
-    disconnect: () => {},
-
-    send: () => false,
-
-    channel: null as any,
-
-    kill: (pid: number, signal?: string | number) => {
-        proc.kill(pid, signal as any);
-        return true;
-    },
-
-    abort: (): never => {
-        os.exit(134);
-        throw new Error('unreachable');
-    },
-
-    mainModule: undefined,
-
-    debugPort: 5858,
-
-    dlopen: (module: object, filename: string, flags?: number) => {
-        throw new Error('process.dlopen is not supported');
-    },
-
-    finalization: {
-        register: <T extends object>(ref: T, callback: (ref: T, event: "exit") => void) => {},
-        registerBeforeExit: <T extends object>(ref: T, callback: (ref: T, event: "beforeExit") => void) => {},
-        unregister: (ref: object) => {},
-    },
-
-    getActiveResourcesInfo: () => [],
-
-    getBuiltinModule: (id: string) => {
-        try {
-            return require(id);
-        } catch {
-            return undefined;
-        }
-    },
-
-    allowedNodeEnvironmentFlags: new Set([
-        '--require', '-r', '--import', '--loader', '--inspect', '--inspect-brk',
-        '--inspect-port', '--abort-on-uncaught-exception', '--no-deprecation',
-        '--trace-deprecation', '--throw-deprecation', '--enable-source-maps',
-    ]),
-
-    throwDeprecation: false,
-    traceDeprecation: false,
-    noDeprecation: undefined,
-
-    ref: (maybeRefable: any) => {},
-    unref: (maybeRefable: any) => {},
-
-    loadEnvFile: (path?: any) => {
-        throw new Error('process.loadEnvFile is not supported');
-    },
-
-    sourceMapsEnabled: false,
-    setSourceMapsEnabled: (value: boolean) => {},
-
-    threadCpuUsage: (previousValue?: NodeJS.CpuUsage) => cpuUsage(previousValue),
-
-    constrainedMemory: () => 0,
-    availableMemory: () => 0,
-
-    setUncaughtExceptionCaptureCallback: (cb: ((err: Error) => void) | null) => {},
-    hasUncaughtExceptionCaptureCallback: () => false,
-
-    traceProcessWarnings: false
+export const version: string = 'v20.0.0';
+export const versions: NodeJS.ProcessVersions = {
+    node: '20.0.0',
+    v8: engine.versions.quickjs,
+    modules: '120',
+    http_parser: '2.0',
+    uv: engine.versions.uv,
+    zlib: engine.versions.zlib,
+    ares: '1.0',
+    openssl: engine.versions.openssl,
 };
 
-export default process;
+export const config: NodeJS.ProcessConfig = {
+    target_defaults: {
+        cflags: [],
+        default_configuration: 'Release',
+        defines: [],
+        include_dirs: [],
+        libraries: [],
+    },
+    variables: {
+        clang: 0,
+        host_arch: os.uname().machine,
+        node_install_npm: true,
+        node_install_waf: false,
+        node_prefix: '/usr/local',
+        node_shared_openssl: false,
+        node_shared_v8: false,
+        node_shared_zlib: false,
+        node_use_dtrace: false,
+        node_use_etw: false,
+        node_use_openssl: true,
+        target_arch: os.uname().machine,
+        v8_no_strict_aliasing: 0,
+        v8_use_snapshot: true,
+        visibility: 'default',
+    },
+};
+
+export const release: NodeJS.ProcessRelease = {
+    name: 'node',
+    lts: 'Iron',
+};
+
+export const features: NodeJS.ProcessFeatures = {
+    debug: false,
+    uv: true,
+    ipv6: true,
+    tls: true,
+    tls_alpn: true,
+    tls_ocsp: true,
+    tls_sni: true,
+    cached_builtins: true,
+    inspector: false,
+    require_module: false,
+    typescript: false,
+};
+
+export function uptime(): number {
+    return os.uptime();
+}
+
+export const on = processEE.on.bind(processEE) as any;
+export const off = processEE.off.bind(processEE) as any;
+export const once = processEE.once.bind(processEE) as any;
+export const emit = processEE.emit.bind(processEE) as any;
+export const addListener = processEE.on.bind(processEE) as any;
+export const removeListener = processEE.off.bind(processEE) as any;
+export const removeAllListeners = processEE.removeAllListeners.bind(processEE) as any;
+export const prependListener = processEE.prependListener.bind(processEE) as any;
+export const prependOnceListener = processEE.prependOnceListener.bind(processEE) as any;
+
+export function listenerCount(event: string | symbol): number {
+    return processEE.listenerCount(event);
+}
+
+export function eventNames(): (string | symbol)[] {
+    return processEE.eventNames();
+}
+
+export function listeners(event: string | symbol): Function[] {
+    return processEE.listeners(event);
+}
+
+export function rawListeners(event: string | symbol): Function[] {
+    return processEE.rawListeners(event);
+}
+
+export function getMaxListeners(): number {
+    return processEE.getMaxListeners();
+}
+
+export function setMaxListeners(n: number): typeof process {
+    processEE.setMaxListeners(n);
+    return process;
+}
+
+export const permission: NodeJS.ProcessPermission = {
+    has: () => true,
+};
+
+export const report: NodeJS.ProcessReport = {
+    compact: false,
+    directory: '',
+    filename: '',
+    getReport: () => ({}),
+    reportOnFatalError: false,
+    reportOnSignal: false,
+    reportOnUncaughtException: false,
+    excludeEnv: false,
+    signal: 'SIGUSR2',
+    writeReport: () => '',
+};
+
+export function resourceUsage(): NodeJS.ResourceUsage {
+    const mem = os.memoryUsage();
+    const cpus = os.cpuInfo();
+    let totalUser = 0, totalSys = 0;
+    for (const cpu of cpus) {
+        totalUser += cpu.times.user + cpu.times.nice;
+        totalSys += cpu.times.sys;
+    }
+    return {
+        fsRead: 0,
+        fsWrite: 0,
+        involuntaryContextSwitches: 0,
+        ipcReceived: 0,
+        ipcSent: 0,
+        majorPageFault: 0,
+        maxRSS: mem['os.rss'],
+        minorPageFault: 0,
+        sharedMemorySize: 0,
+        signalsCount: 0,
+        swappedOut: 0,
+        systemCPUTime: totalSys * 1e6,
+        unsharedDataSize: 0,
+        unsharedStackSize: 0,
+        userCPUTime: totalUser * 1e6,
+        voluntaryContextSwitches: 0,
+    };
+}
+
+export function emitWarning(warning: string | Error, options?: any): void {
+    console.warn(warning);
+}
+
+export function getuid(): number {
+    return os.userInfo.userId;
+}
+
+export function getgid(): number {
+    return os.userInfo.groupId;
+}
+
+export function geteuid(): number {
+    return os.userInfo.userId;
+}
+
+export function getegid(): number {
+    return os.userInfo.groupId;
+}
+
+export function setuid(): void {
+    throw new Error('setuid is not supported');
+}
+
+export function setgid(): void {
+    throw new Error('setgid is not supported');
+}
+
+export function seteuid(): void {
+    throw new Error('seteuid is not supported');
+}
+
+export function setegid(): void {
+    throw new Error('setegid is not supported');
+}
+
+export function setgroups(): void {
+    throw new Error('setgroups is not supported');
+}
+
+export function umask(mask?: number | string): number {
+    if (mask === undefined) return 0o022;
+    const prev = 0o022;
+    try {
+        (os as any).umask?.(typeof mask === 'string' ? parseInt(mask, 8) : mask);
+    } catch { }
+    return prev;
+}
+
+export function nextTick(callback: Function, ...args: any[]): void {
+    queueMicrotask(() => callback(...args));
+}
+
+export let connected: boolean = false;
+
+export let channel: any = null;
+
+export function kill(pid: number, signal?: string | number): boolean {
+    proc.kill(pid, signal as any);
+    return true;
+}
+
+export function abort(): never {
+    os.exit(134);
+    throw new Error('unreachable');
+}
+
+export const mainModule: NodeJS.Module | undefined = undefined;
+
+export const debugPort: number = 5858;
+
+export function dlopen(module: object, filename: string, flags?: number): void {
+    throw new Error('process.dlopen is not supported');
+}
+
+export const finalization = {
+    register: <T extends object>(ref: T, callback: (ref: T, event: "exit") => void) => { },
+    registerBeforeExit: <T extends object>(ref: T, callback: (ref: T, event: "beforeExit") => void) => { },
+    unregister: (ref: object) => { },
+};
+
+export function getActiveResourcesInfo(): string[] {
+    return [];
+}
+
+export function getBuiltinModule(id: string): NodeJS.Module | undefined {
+    try {
+        return require(id);
+    } catch {
+        return undefined;
+    }
+}
+
+export const allowedNodeEnvironmentFlags: Set<string> = new Set([
+    '--require', '-r', '--import', '--loader', '--inspect', '--inspect-brk',
+    '--inspect-port', '--abort-on-uncaught-exception', '--no-deprecation',
+    '--trace-deprecation', '--throw-deprecation', '--enable-source-maps',
+]);
+
+export const throwDeprecation: boolean = false;
+export const traceDeprecation: boolean = false;
+export const noDeprecation: boolean | undefined = undefined;
+
+export function ref(maybeRefable: any): void { }
+
+export function unref(maybeRefable: any): void { }
+
+export function loadEnvFile(path?: any): void {
+    throw new Error('process.loadEnvFile is not supported');
+}
+
+export const sourceMapsEnabled: boolean = false;
+
+export function setSourceMapsEnabled(value: boolean): void { }
+
+export function threadCpuUsage(previousValue?: NodeJS.CpuUsage): NodeJS.CpuUsage {
+    return cpuUsage(previousValue);
+}
+
+export function constrainedMemory(): number {
+    return 0;
+}
+
+export function availableMemory(): number {
+    return 0;
+}
+
+export function setUncaughtExceptionCaptureCallback(cb: ((err: Error) => void) | null): void { }
+
+export function hasUncaughtExceptionCaptureCallback(): boolean {
+    return false;
+}
+
+export const traceProcessWarnings: boolean = false;
+
+// ============================================================================
+// IPC Channel support (for child_process)
+// ============================================================================
+
+import { IPCChannel } from '../ipc_channel';
+
+let _ipcChannel: IPCChannel | null = null;
+
+/**
+ * Set up IPC channel for child process (called by child_process module)
+ */
+export function _setupIPC(pipe: any): void {
+    _ipcChannel = new IPCChannel(pipe);
+    connected = true;
+    channel = _ipcChannel;
+
+    _ipcChannel.on('message', (msg) => {
+        process.emit('message', msg);
+    });
+
+    _ipcChannel.on('error', (err: Error) => {
+        process.emit('error', err);
+    });
+
+    _ipcChannel.on('close', () => {
+        connected = false;
+        channel = null;
+        process.emit('disconnect');
+    });
+}
+
+/**
+ * Send a message to the parent process
+ */
+export function send(message: any, callback?: (error: Error | null) => void): boolean {
+    if (!_ipcChannel || !_ipcChannel.connected) {
+        const err = new Error('IPC channel is not established') as NodeJS.ErrnoException;
+        err.code = 'ERR_IPC_CHANNEL_CLOSED';
+        if (callback) { callback(err); return false; }
+        return false;
+    }
+
+    try {
+        // Node sends user messages verbatim (no wrapper) so that the peer —
+        // including a real node process — receives exactly what was sent.
+        _ipcChannel.send(message);
+        if (callback) callback(null);
+        return true;
+    } catch (err) {
+        if (callback) callback(err as Error);
+        return false;
+    }
+}
+
+/**
+ * Disconnect the IPC channel
+ */
+export function disconnect(): void {
+    if (_ipcChannel) {
+        _ipcChannel.close();
+        _ipcChannel = null;
+    }
+}
+// ============================================================================
+// Child-side IPC bootstrap
+// ----------------------------------------------------------------------------
+// When this process was forked by child_process with an IPC channel, the parent
+// inherits the channel endpoint to this process as fd 3 and exports its number
+// via NODE_CHANNEL_FD. Open that fd as a (now bidirectional, socketpair-backed)
+// pipe and wire up the channel so process.send() and process.on('message') work
+// in the child. This mirrors Node.js, where the child bootstraps its own channel.
+// No-op for normally launched processes (NODE_CHANNEL_FD unset).
+// ============================================================================
+(function bootstrapChildIPC() {
+    const fdStr = safeGetEnv('NODE_CHANNEL_FD');
+    if (!fdStr) return;
+    const fd = parseInt(fdStr, 10);
+    if (!Number.isInteger(fd) || fd < 0) return;
+    try {
+        const pipe = new (streams as any).Pipe();
+        pipe.open(fd);
+        _setupIPC(pipe);
+        // Prevent grandchildren from wrongly inheriting this channel fd.
+        try { os.unsetenv('NODE_CHANNEL_FD'); } catch { /* ignore */ }
+    } catch {
+        // IPC bootstrap failed; the child simply has no usable channel.
+    }
+})();

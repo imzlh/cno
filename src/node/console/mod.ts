@@ -3,8 +3,6 @@
  * Provides the Console class and the global console instance
  */
 
-const internal = import.meta.use('console');
-
 export interface ConsoleOptions {
     stdout: NodeJS.WritableStream;
     stderr?: NodeJS.WritableStream;

@@ -6,10 +6,11 @@
  */
 
 import { Headers } from "headers-polyfill";
-import { EventTarget } from "./events";
+import { DOMException, EventTarget } from "./events";
 
 const curlMod = import.meta.use("curl") as typeof CModuleCURL;
 const engine = import.meta.use("engine");
+const { Encoder, Decoder } = import.meta.use("text");
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
@@ -105,7 +106,7 @@ function responseBodyToBytes(body?: string | ArrayBuffer): Uint8Array {
 
 function serializeBody(body: any): Uint8Array | null {
     if (body === null || body === undefined) return null;
-    if (body instanceof Uint8Array) return body as Uint8Array;
+    if (ArrayBuffer.isView(body)) return new Uint8Array(body.buffer as ArrayBuffer, body.byteOffset, body.byteLength);
     if (body instanceof ArrayBuffer) return new Uint8Array(body) as Uint8Array;
     if (typeof body === 'string') return engine.encodeString(body) as Uint8Array;
     if (body instanceof URLSearchParams) return engine.encodeString(body.toString()) as Uint8Array;
@@ -289,8 +290,12 @@ export class Response implements globalThis.Response {
     async blob(): Promise<Blob> { return new Blob([await this.arrayBuffer()], { type: this.headers.get('content-type') || 'application/octet-stream' }); }
     async formData(): Promise<FormData> { throw new Error('FormData parsing not yet implemented'); }
     async json<T = any>(): Promise<T> { return JSON.parse(await this.text()); }
-    async text(): Promise<string> { return engine.decodeString(new Uint8Array(await this.arrayBuffer())); }
-
+    async text(): Promise<string> {
+        const buf = await this.arrayBuffer();
+        const ct = this.headers.get('content-type') ?? '';
+        const m = ct.match(/charset\s*=\s*["']?([^\s;'"]+)/i);
+        return new Decoder(m?.[1]).decode(buf);
+    }
     static error(): Response { const r = new Response(null, { status: 0, statusText: '' }); Object.defineProperty(r, 'type', { value: 'error' }); return r; }
     static redirect(url: string, status: number = 302): Response { if (![301, 302, 303, 307, 308].includes(status)) throw new RangeError('Invalid redirect status'); const r = new Response(null, { status, headers: { Location: url } }); Object.defineProperty(r, 'type', { value: 'default' }); return r; }
     static json(data: any, init?: any): Response { const body = JSON.stringify(data); const headers = new Headers(init?.headers); if (!headers.has('content-type')) headers.set('content-type', 'application/json'); return new Response(body, { ...init, headers }); }
@@ -312,9 +317,7 @@ async function performFetch(request: Request, url: URL): Promise<Response> {
         .setHeaders(headersToRecord(headersToArray(request.headers)));
 
     // redirect mode
-    if (request.redirect === 'error') {
-        curl.setFollowRedirects(false);
-    } else if (request.redirect === 'manual') {
+    if (request.redirect === 'error' || request.redirect === 'manual') {
         curl.setFollowRedirects(false);
     } else {
         curl.setFollowRedirects(true);
@@ -338,9 +341,7 @@ async function performFetch(request: Request, url: URL): Promise<Response> {
     // AbortSignal directly cancels the underlying curl request
     let abortHandler: (() => void) | null = null;
     if (request.signal) {
-        abortHandler = () => {
-            try { curl.abort(); } catch {}
-        };
+        abortHandler = () => { try { curl.abort(); } catch {} };
         if (request.signal.aborted) {
             curl.abort();
             throw abortError(request.signal);
@@ -348,25 +349,50 @@ async function performFetch(request: Request, url: URL): Promise<Response> {
         request.signal.addEventListener('abort', abortHandler, { once: true });
     }
 
+    // Resolve as soon as headers arrive; stream body via ReadableStream.
+    const headersDone = Promise.withResolvers<{ status: number; headers: string }>();
+    let streamController: ReadableStreamDefaultController<Uint8Array> | null = null;
+
+    curl.onHeadersComplete((status, headers) => {
+        headersDone.resolve({ status, headers });
+    });
+
+    curl.onData((chunk: ArrayBuffer) => {
+        streamController?.enqueue(new Uint8Array(chunk));
+        return false; // don't abort
+    });
+
+    // perform() runs in background; we await headers independently
+    const performPromise = curl.perform().then(
+        () => { streamController?.close(); },
+        (err: Error) => { streamController?.error(err); }
+    );
+
     try {
-        const response = await curl.perform();
+        const { status, headers: rawHeaders } = await headersDone.promise;
         throwIfAborted(request.signal);
 
-        const result = new Response(responseBodyToBytes(response.body), {
-            status: response.status,
-            headers: rawHeadersToHeaders(parseHeaders(response.headers)),
-        });
-        Object.defineProperty(result, 'url', { value: url.href });
+        const responseHeaders = rawHeadersToHeaders(parseHeaders(rawHeaders));
+        const isRedirect = status >= 300 && status < 400;
 
-        // redirect mode: 'error' → throw on redirect
-        const isRedirect = response.status >= 300 && response.status < 400;
         if (request.redirect === 'error' && isRedirect) {
-            throw new TypeError(`Request redirect mode is "error" but received redirect ${response.status}`);
+            curl.abort();
+            throw new TypeError(`Request redirect mode is "error" but received redirect ${status}`);
         }
-        Object.defineProperty(result, 'redirected', { value: isRedirect });
 
+        const bodyStream = new ReadableStream<Uint8Array>({
+            start(controller) { streamController = controller; },
+            cancel() { try { curl.abort(); } catch {} }
+        });
+
+        const result = new Response(bodyStream, { status, headers: responseHeaders });
+        Object.defineProperty(result, 'url', { value: url.href });
+        Object.defineProperty(result, 'redirected', { value: isRedirect });
         return result;
     } catch (err) {
+        curl.abort();
+        // drain so perform() settles and we don't leak the handle
+        await performPromise.catch(() => {});
         if (request.signal?.aborted) throw abortError(request.signal);
         throw err;
     } finally {

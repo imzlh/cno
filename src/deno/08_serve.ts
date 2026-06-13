@@ -5,29 +5,14 @@
 
 import { Server, createServer, type HttpRequest, type HttpResponse } from '@cnojs/http/server';
 import { assert } from '../utils/assert';
-
-/** ServerConnection — raw HTTP/1.x server connection handle (from @cnojs/http/h1) */
-interface ServerConnection {
-    socket: any;
-    sslPipe: any;
-    write(data: Uint8Array): Promise<void>;
-    read(size?: number): Promise<Uint8Array | null>;
-    onReadable(callback: (data: Uint8Array | null) => void, errHandler?: (err: Error) => void): void;
-    stopReading(): void;
-    close(): void;
-    isClosed(): boolean;
-}
-
 import { createWebSocketFromConnection } from "../webapi/websocket";
 import { wrapFsClassDec as wrap, wrapFSns } from "../utils/wrap";
 import { errors } from './01_errors';
-import { ISocket } from '@cnojs/http/socket';
+import type { ISocket } from "@cnojs/http/socket";
 
 const crypto = import.meta.use('crypto');
 const engine = import.meta.use('engine');
 const http = import.meta.use('http');
-
-type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
 /* ------------------------------------------------------------------ */
 /* WebSocket Upgrade Symbol                                           */
@@ -36,7 +21,7 @@ type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 const websocketSymbol = Symbol('deno.serve.websocket');
 
 interface WebSocketResponse extends Response {
-    [websocketSymbol]?: (conn: ServerConnection) => void;
+    [websocketSymbol]?: (conn: ISocket) => void;
 }
 
 /* ------------------------------------------------------------------ */
@@ -48,22 +33,11 @@ interface WebSocketResponse extends Response {
  */
 function createWebRequest(coreReq: HttpRequest, connInfo: { hostname: string; port: number; secure: boolean }): Request {
     // Convert headers
-    const headers = new Headers();
-    for (const [key, value] of coreReq.headers) {
-        headers.append(key, value);
-    }
-
+    const headers = new Headers(coreReq.headers);
     const host = headers.get('host') || `${connInfo.hostname}:${connInfo.port}`;
     const protocol = connInfo.secure ? 'https:' : 'http:';
     const base = `${protocol}//${host}`;
-
-    let rawUrl = coreReq.url;
-    if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(rawUrl)) {
-        const parsed = new URL(rawUrl);
-        rawUrl = parsed.pathname + parsed.search + parsed.hash;
-    }
-
-    const url = new URL(rawUrl, base);
+    const url = new URL(coreReq.url, base);
 
     return new Request(url.toString(), {
         method: coreReq.method,
@@ -233,6 +207,13 @@ class DenoHttpServer implements Deno.HttpServer<Deno.NetAddr> {
         this.finishedResolve();
     }
 
+    then<TResult1 = void, TResult2 = never>(
+        onfulfilled?: ((value: void) => TResult1 | PromiseLike<TResult1>) | null,
+        onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null
+    ): Promise<TResult1 | TResult2> {
+        return this.finishedPromise.then(onfulfilled as any, onrejected);
+    }
+
     [Symbol.asyncDispose](): Promise<void> {
         return this.shutdown();
     }
@@ -338,6 +319,13 @@ function serve(
 
     const httpServer = new DenoHttpServer(coreServer);
 
+    // Handle abort signal
+    if (options.signal) {
+        options.signal.addEventListener('abort', () => {
+            httpServer.shutdown().catch(() => {});
+        }, { once: true });
+    }
+
     // Call onListen callback if provided
     if (options.onListen) {
         options.onListen({
@@ -405,7 +393,7 @@ function upgradeWebSocket(
     }
 
     // Create WebSocket promise
-    const conProm = Promise.withResolvers<ServerConnection>();
+    const conProm = Promise.withResolvers<ISocket>();
 
     // Create upgrade response
     const response = new Response(null, {
@@ -415,7 +403,7 @@ function upgradeWebSocket(
     }) as WebSocketResponse;
 
     // Attach WebSocket handler
-    const ws = createWebSocketFromServerConnection(conProm.promise);
+    const ws = createWebSocketFromISocket(conProm.promise);
     response[websocketSymbol] = c => conProm.resolve(c);
 
     return {
@@ -425,10 +413,10 @@ function upgradeWebSocket(
 }
 
 /**
- * Create WebSocket from ServerConnection
+ * Create WebSocket from ISocket
  * This adapts the raw connection to WebSocket protocol
  */
-function createWebSocketFromServerConnection(conn: Promise<ServerConnection>): globalThis.WebSocket {
+function createWebSocketFromISocket(conn: Promise<ISocket>): globalThis.WebSocket {
     // Create WebSocket in server mode
     return createWebSocketFromConnection(conn.then(c => ({
         ...c,

@@ -1,4 +1,4 @@
-import { EventTarget } from './events';
+import { DOMException, EventTarget, MessageEvent } from './events';
 
 class BroadcastChannelImpl extends EventTarget implements BroadcastChannel {
     readonly name: string;
@@ -21,9 +21,8 @@ class BroadcastChannelImpl extends EventTarget implements BroadcastChannel {
         const event = new MessageEvent('message', {
             data: structuredClone(data),
             bubbles: false,
-            cancelable: false,
-            origin: location.origin,
-        });
+            cancelable: false
+        }, true);
 
         this.dispatchEvent(event);
     }

@@ -1,6 +1,7 @@
 import { assert } from "../utils/assert";
 import { malloc } from "../utils/malloc";
 import { wrapFsClassDec as wrap, wrapFSns } from "../utils/wrap";
+import { ReadableStream } from "../webapi/streams";
 import { toString } from "./02_fs";
 import { useWritable } from "./05_net";
 
@@ -157,12 +158,15 @@ function spawn(path: string, args: string[], options?: Deno.CommandOptions): CMo
 }
 
 class Command implements Deno.Command {
-    private proc: CModuleProcess.ChildProcess; private detached: boolean;
+    private $path: string;
+    private $args: string[];
+    private $options: Deno.CommandOptions | undefined;
+    private detached: boolean;
 
     constructor(command: string | URL, options?: Deno.CommandOptions) {
-        const path = toString(command);
-        const args = options?.args ?? [];
-        this.proc = spawn(path, args, options);
+        this.$path = toString(command);
+        this.$args = options?.args ?? [];
+        this.$options = options;
         this.detached = options?.detached ?? false;
     }
 
@@ -170,9 +174,10 @@ class Command implements Deno.Command {
     async output(): Promise<Deno.CommandOutput> {
         assert(!this.detached, "Detached process cannot be waited");
 
-        const stdo = this.proc.stdout ? new RStream(this.proc.stdout).bytes() : Promise.resolve(new Uint8Array(0));
-        const stde = this.proc.stderr ? new RStream(this.proc.stderr).bytes() : Promise.resolve(new Uint8Array(0));
-        const res = await this.proc.wait();
+        const proc = spawn(this.$path, this.$args, this.$options);
+        const stdo = proc.stdout ? new RStream(proc.stdout).bytes() : Promise.resolve(new Uint8Array(0));
+        const stde = proc.stderr ? new RStream(proc.stderr).bytes() : Promise.resolve(new Uint8Array(0));
+        const res = await proc.wait();
         return {
             code: res.exit_status,
             // @ts-ignore
@@ -187,8 +192,8 @@ class Command implements Deno.Command {
     outputSync(): Deno.CommandOutput {
         assert(!this.detached, "Detached process cannot be waited");
 
-        // TODO: implement reading stdout/stderr data
-        const res = this.proc.waitSync();
+        const proc = spawn(this.$path, this.$args, this.$options);
+        const res = proc.waitSync();
         return {
             code: res.exit_status,
             // @ts-ignore
@@ -203,7 +208,8 @@ class Command implements Deno.Command {
     spawn(): Deno.ChildProcess {
         if (this.detached)
             throw new TypeError("Detached process cannot be spawned");
-        return new Process(this.proc, this.proc.wait());
+        const proc = spawn(this.$path, this.$args, this.$options);
+        return new Process(proc, proc.wait());
     }
 }
 

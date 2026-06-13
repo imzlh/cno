@@ -11,6 +11,7 @@ import { Socket as NetSocket, Server as NetServer } from '../net';
 const streams = import.meta.use('streams');
 const os = import.meta.use('os');
 const ssl = import.meta.use('ssl');
+const engine = import.meta.use('engine');
 
 // ============================================================================
 // Types
@@ -426,7 +427,7 @@ export class TLSSocket extends Duplex {
             return;
         }
 
-        const data = typeof chunk === 'string' ? new TextEncoder().encode(chunk) :
+        const data = typeof chunk === 'string' ? engine.encodeString(chunk) :
             Buffer.isBuffer(chunk) ? new Uint8Array(chunk) : chunk;
 
         // Queue writes until handshake completes

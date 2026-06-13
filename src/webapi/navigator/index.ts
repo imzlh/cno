@@ -4,7 +4,7 @@ import { createPermissions } from './permissions';
 import { createStorageManager } from './storage';
 import { createNetworkInformation } from './connection';
 import { createDirectSockets } from './sockets';
-import { EventTarget } from '../events';
+import { DOMException, EventTarget } from '../events';
 
 const os = import.meta.use('os');
 

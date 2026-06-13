@@ -1,4 +1,4 @@
-import { EventTarget, MessageEvent, ErrorEvent } from "./events";
+import { EventTarget, MessageEvent, ErrorEvent, DOMException } from "./events";
 import { MessagePort, closedSymbol } from "./messaging";
 
 const worker = import.meta.use('worker');
@@ -79,7 +79,7 @@ class Worker extends EventTarget implements globalThis.Worker {
                         filename: rawData.filename ?? '',
                         lineno: rawData.lineno ?? 0,
                         colno: rawData.colno ?? 0
-                    });
+                    }, true);
                     this.#onerror?.(event);
                     this.dispatchEvent(event);
                     return;
@@ -91,14 +91,14 @@ class Worker extends EventTarget implements globalThis.Worker {
                 }
             }
 
-            const event = new MessageEvent('message', { data, ports: ports as any });
+            const event = new MessageEvent('message', { data, ports: ports as any }, true);
             this.#onmessage?.(event);
             this.dispatchEvent(event);
         };
 
         p.onmessageerror = (e: any) => {
             if (this.#terminated) return;
-            const event = new MessageEvent('messageerror', { data: e });
+            const event = new MessageEvent('messageerror', { data: e }, true);
             this.#onmessageerror?.(event);
             this.dispatchEvent(event);
         };
@@ -156,6 +156,10 @@ class Worker extends EventTarget implements globalThis.Worker {
 
     removeEventListener(type: string, listener: any, options?: boolean | EventListenerOptions): void {
         super.removeEventListener(type, listener, options);
+    }
+    
+    get [Symbol.toStringTag]() {
+        return 'Worker';
     }
 }
 
@@ -219,13 +223,13 @@ if (worker.isWorker) {
             }
         }
 
-        const event = new MessageEvent('message', { data, ports: ports as any });
+        const event = new MessageEvent('message', { data, ports: ports as any }, true);
         events.onmessage?.(event);
         self.dispatchEvent(event);
     };
 
     pipe.onmessageerror = (e: any) => {
-        const event = new MessageEvent('messageerror', { data: e });
+        const event = new MessageEvent('messageerror', { data: e }, true);
         events.onmessageerror?.(event);
         self.dispatchEvent(event);
     };

@@ -9,6 +9,7 @@ import { Headers } from "headers-polyfill";
 import { assert } from "../utils/assert";
 import { type ISocket } from "@cnojs/http/socket"
 import { connectTcp, buildRequest, readHeaders } from "../utils/http"
+import { CloseEvent, ErrorEvent, MessageEvent } from "./events";
 
 const engine = import.meta.use('engine');
 const algo = import.meta.use('algorithm');
@@ -38,7 +39,7 @@ export enum WebSocketCloseCode {
 }
 
 interface WebSocketFrame { fin: boolean; opcode: OpCode; masked: boolean; payload: Uint8Array; }
-interface WebSocketEventMap { open: Event; message: MessageEvent; error: ErrorEvent; close: CloseEvent; }
+interface WebSocketEventMap { open: Event; message: MessageEvent; error: ErrorEvent; close: globalThis.CloseEvent; }
 
 const HIGH_WATER_MARK = 64 * 1024;
 const MAX_BUFFERED_AMOUNT = 8 * 1024 * 1024;
@@ -112,7 +113,7 @@ class SendQueue {
         if (masked) {
             const maskKey = new Uint8Array(crypto.randomBytes(4));
             frame.set(maskKey, offset); offset += 4;
-            const maskbuf = algo.ws_mask(frame.subarray(offset), maskKey);
+            const maskbuf = algo.ws_mask(payload, maskKey);
             frame.set(maskbuf, offset); offset += payloadLength;
         } else { frame.set(payload, offset); }
         return frame;
@@ -124,6 +125,10 @@ class SendQueue {
 
     close(): void { this.connection = null; this.flushQueue(new Error('WebSocket closed')); }
     buildControlFrame(opcode: OpCode, payload: Uint8Array): Uint8Array { return this.buildFrame(opcode, payload, true, this.isClient); }
+    
+    get [Symbol.toStringTag]() {
+        return 'SendQueue';
+    }
 }
 
 export class WebSocket extends EventTarget implements globalThis.WebSocket {
@@ -155,10 +160,10 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
     private _closeTimer: number | null = null;
     private sendQueue: SendQueue;
 
-    public onopen: ((this: globalThis.WebSocket, ev: Event) => any) | null = null;
-    public onmessage: ((this: globalThis.WebSocket, ev: MessageEvent) => any) | null = null;
-    public onerror: ((this: globalThis.WebSocket, ev: ErrorEvent | Event) => any) | null = null;
-    public onclose: ((this: globalThis.WebSocket, ev: CloseEvent) => any) | null = null;
+    public onopen: ((this: globalThis.WebSocket, ev: globalThis.Event) => any) | null = null;
+    public onmessage: ((this: globalThis.WebSocket, ev: globalThis.MessageEvent) => any) | null = null;
+    public onerror: ((this: globalThis.WebSocket, ev: globalThis.ErrorEvent | Event) => any) | null = null;
+    public onclose: ((ev: globalThis.CloseEvent) => any) | null = null;
 
     get bufferedAmount(): number { return this.sendQueue.bufferedAmount; }
     get readyState(): WebSocketReadyState { return this._readyState; }
@@ -350,7 +355,7 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
         this._readyState = WebSocketReadyState.CLOSED; this.closeCode = code; this.closeReason = reason;
         this.stopPingTimer(); this.sendQueue.close();
         if (this.connection) { try { this.connection.close(); } catch { } this.connection = null; }
-        const event = new CloseEvent('close', { code, reason, wasClean: code === WebSocketCloseCode.NORMAL });
+        const event = new CloseEvent('close', { code, reason, wasClean: code === WebSocketCloseCode.NORMAL }, true);
         this.dispatchEvent(event); this.onclose?.(event);
     }
 
@@ -375,12 +380,12 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
         let data: any;
         if (opcode === OpCode.TEXT) data = engine.decodeString(payload);
         else data = this.binaryType === 'arraybuffer' ? payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength) : new Blob([payload]);
-        const event = new MessageEvent('message', { data });
+        const event = new MessageEvent('message', { data }, true);
         this.dispatchEvent(event); this.onmessage?.(event);
     }
 
     private emitError(error: Error): void {
-        const event = new ErrorEvent('error', { error, message: error.message });
+        const event = new ErrorEvent('error', { error, message: error.message }, true);
         this.dispatchEvent(event); this.onerror?.(event);
     }
 
@@ -389,6 +394,10 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
     }
     removeEventListener<K extends keyof WebSocketEventMap>(type: K, listener: any, options?: boolean | EventListenerOptions): void {
         super.removeEventListener(type, listener as any, options);
+    }
+    
+    get [Symbol.toStringTag]() {
+        return 'WebSocket';
     }
 }
 
@@ -425,7 +434,7 @@ export class WebSocketStream {
                 } catch (err) { this.ws.close(WebSocketCloseCode.ABNORMAL, 'Message processing failed'); }
             }
         });
-        this.ws.addEventListener('close', (e: CloseEvent) => {
+        this.ws.addEventListener('close', (e: globalThis.CloseEvent) => {
             if (this.readableController) { try { this.readableController.close(); } catch { } this.readableController = null; }
             this._closedResolve({ closeCode: e.code, reason: e.reason });
         });
@@ -471,6 +480,10 @@ export class WebSocketStream {
             close() { self.close(); },
             abort(reason) { self.close({ reason: String(reason) }); }
         }, { highWaterMark: HIGH_WATER_MARK });
+    }
+    
+    get [Symbol.toStringTag]() {
+        return 'WebSocketStream';
     }
 }
 

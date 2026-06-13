@@ -10,11 +10,12 @@ const os = import.meta.use('os');
 const streams = import.meta.use('streams');
 const syncfs = import.meta.use('fs');
 const engine = import.meta.use('engine');
+const text = import.meta.use('text');
 
 const { stdin, stdout } = streams as any as Record<string, Stream>;
 
 function writeAnsi(fd: number, seq: string): void {
-    const data = new TextEncoder().encode(seq);
+    const data = engine.encodeString(seq);
     try { syncfs.write(fd, data); } catch {}
 }
 
@@ -69,6 +70,7 @@ export class Interface extends EventEmitter {
     private _readBuf = new Uint8Array(4096);
     private _lineBuf: string[] = [];
     private _reading = false;
+    private _decoder = new text.Decoder();
 
     constructor(options: ReadLineOptions | NodeJS.ReadableStream) {
         super();
@@ -144,7 +146,7 @@ export class Interface extends EventEmitter {
                 this.emit('close');
                 return;
             }
-            const chunk = new TextDecoder().decode(this._readBuf.subarray(0, n));
+            const chunk = this._decoder.decode(this._readBuf.subarray(0, n));
             this._processInput(chunk);
             this._readLoop();
         } catch {

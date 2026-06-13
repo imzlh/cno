@@ -295,15 +295,16 @@ export class ReadableStream<R = any> implements globalThis.ReadableStream<R> {
         return this.#reader !== null;
     }
 
-    // @ts-ignore - byob is not supported
-    getReader(type?: 'byob' | 'default'): ReadableStreamDefaultReader<R> {
-        assert(type != 'byob', "Byob mode is not supported");
+    getReader(options: { mode: 'byob' }): ReadableStreamBYOBReader;
+    getReader(options?: ReadableStreamGetReaderOptions): ReadableStreamDefaultReader<R>;
+    getReader(options?: ReadableStreamGetReaderOptions): ReadableStreamReader<R> {
+        assert(options?.mode != 'byob', "Byob mode is not supported");
         if (this.locked) {
             throw new TypeError('Stream is already locked');
         }
         this.#reader = new ReadableStreamDefaultReader(this);
         this.#controller._start();
-        return this.#reader;
+        return this.#reader as ReadableStreamReader<R>;
     }
 
     async cancel(reason?: any): Promise<void> {

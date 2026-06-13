@@ -1,4 +1,5 @@
 import { createServer } from "@cnojs/http/server";
+import { Buffer } from "node-buffer";
 
 // opaque
 const engine = import.meta.use('engine');
@@ -16,9 +17,12 @@ let proc_cache: any;
 Object.defineProperty(globalThis, 'process', {
     get() {
         if (!proc_cache) {
-            proc_cache = require('process').process;
+            proc_cache = globalThis['require']('process');
         }
 
         return proc_cache;
     },
 })
+
+// inject global buffer
+Reflect.set(globalThis, 'Buffer', Buffer);

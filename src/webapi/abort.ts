@@ -1,3 +1,5 @@
+import { DOMException } from "./events";
+
 const { setTimeout } = import.meta.use('timers');
 
 class AbortSignal extends EventTarget implements globalThis.AbortSignal {
@@ -101,11 +103,13 @@ class AbortSignal extends EventTarget implements globalThis.AbortSignal {
         const event = new Event('abort');
         this.dispatchEvent(event);
     }
+
+    [Symbol.toStringTag] = 'AbortSignal';
 }
 
 // ==================== AbortController ====================
 
-class AbortController implements AbortController {
+class AbortController implements globalThis.AbortController {
     #signal: AbortSignal;
 
     constructor() {
@@ -119,6 +123,8 @@ class AbortController implements AbortController {
     abort(reason?: any): void {
         this.#signal._abort(reason ?? new DOMException('Aborted', 'AbortError'));
     }
+
+    [Symbol.toStringTag] = 'AbortController';
 }
 
 // ==================== Export ====================

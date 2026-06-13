@@ -262,6 +262,10 @@ class URLSearchParams implements URLSearchParams {
     _getParams(): Array<[string, string]> {
         return [...this.#params];
     }
+    
+    get [Symbol.toStringTag]() {
+        return 'URLSearchParams';
+    }
 }
 
 const SPECIAL_SCHEMES: Record<string, number> = {
@@ -727,6 +731,10 @@ class URL implements globalThis.URL {
 
     static revokeObjectURL(url: string): void {
         throw new Error('revokeObjectURL is not implemented');
+    }
+    
+    get [Symbol.toStringTag]() {
+        return 'URL';
     }
 }
 

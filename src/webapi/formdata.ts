@@ -1,14 +1,15 @@
 import { malloc } from "../utils/malloc";
+import { Buffer } from "node-buffer";
 
 const engine = import.meta.use('engine');
 const asfs = import.meta.use('asyncfs');
 const fs = import.meta.use('fs');
 
-type FormDataEntryValue = File | string;
+type FormDataEntryValue = globalThis.File | string;
 
 // ==================== FormData ====================
 
-class FormDataImpl implements FormData {
+class FormData implements globalThis.FormData {
     #entries: Array<[string, FormDataEntryValue]> = [];
 
     constructor(form?: any) {
@@ -106,19 +107,16 @@ class FormDataImpl implements FormData {
     [Symbol.iterator](): IterableIterator<[string, FormDataEntryValue]> {
         return this.entries();
     }
-
-    // Internal method to get raw entries for serialization
-    _getEntries(): Array<[string, FormDataEntryValue]> {
-        return [...this.#entries];
+    
+    get [Symbol.toStringTag]() {
+        return 'FormData';
     }
-
-    [Symbol.toStringTag] = 'FormData';
 }
 
 // ==================== Blob ====================
 
-class BlobImpl implements Blob {
-    #parts: Array<BufferSource | Blob | string>;
+class Blob implements globalThis.Blob {
+    #parts: Array<BufferSource | globalThis.Blob | string>;
     #type: string;
     #size: number;
 
@@ -139,15 +137,15 @@ class BlobImpl implements Blob {
         return this.#type;
     }
 
-    slice(start?: number, end?: number, contentType?: string): Blob {
+    slice(start?: number, end?: number, contentType?: string): globalThis.Blob {
         const relativeStart = start === undefined ? 0 : normalizeIndex(start, this.#size);
         const relativeEnd = end === undefined ? this.#size : normalizeIndex(end, this.#size);
         const span = Math.max(relativeEnd - relativeStart, 0);
 
         const buffer = this.#toBuffer();
-        const slicedBuffer = buffer.subarray(relativeStart, relativeStart + span).buffer;
+        const sliced = new Uint8Array(buffer.buffer, buffer.byteOffset + relativeStart, span);
 
-        return new BlobImpl([slicedBuffer as ArrayBuffer], { type: contentType ?? '' });
+        return new Blob([new Uint8Array(sliced)], { type: contentType ?? '' });
     }
 
     async arrayBuffer(): Promise<ArrayBuffer> {
@@ -178,13 +176,13 @@ class BlobImpl implements Blob {
         });
     }
 
-    #toBuffer(): Buffer<ArrayBuffer> {
+    #toBuffer(): Buffer {
         const chunks: Uint8Array[] = [];
 
         for (const part of this.#parts) {
             if (typeof part === 'string') {
                 chunks.push(engine.encodeString(part));
-            } else if (part instanceof BlobImpl) {
+            } else if (part instanceof Blob) {
                 chunks.push(part.#toBuffer() as Uint8Array);
             } else if (ArrayBuffer.isView(part)) {
                 chunks.push(new Uint8Array(part.buffer, part.byteOffset, part.byteLength));
@@ -195,13 +193,21 @@ class BlobImpl implements Blob {
 
         return Buffer.concat(chunks);
     }
+
+    get [Symbol.toStringTag]() {
+        return 'Blob';
+    }
+
+    toString() {
+        return `Blob { size: ${this.#size}, type: "${this.#type}" }`
+    }
 }
 
 // ==================== File ====================
 
 const filePathStore = new WeakMap<File, string>();
 
-class FileImpl extends BlobImpl implements File {
+class File extends Blob implements globalThis.File {
     #name: string;
     #lastModified: number;
 
@@ -241,7 +247,7 @@ class FileImpl extends BlobImpl implements File {
         } catch {
         }
 
-        const file = new FileImpl(
+        const file = new File(
             [buffer.buffer as ArrayBuffer],
             fileName,
             {
@@ -258,9 +264,9 @@ class FileImpl extends BlobImpl implements File {
     static fromPathLazy(path: string, options?: {
         type?: string;
         name?: string;
-    }): File {
+    }): globalThis.File {
         const fileName = options?.name ?? path.split('/').pop() ?? 'file';
-        const file = new FileImpl(
+        const file = new File(
             [],
             fileName,
             {
@@ -272,12 +278,12 @@ class FileImpl extends BlobImpl implements File {
         filePathStore.set(file, path);
 
         file.arrayBuffer = async () => {
-            const loaded = await FileImpl.fromPath(path, options);
+            const loaded = await File.fromPath(path, options);
             return loaded.arrayBuffer();
         };
 
         file.text = async () => {
-            const loaded = await FileImpl.fromPath(path, options);
+            const loaded = await File.fromPath(path, options);
             return loaded.text();
         };
 
@@ -316,12 +322,12 @@ class FileImpl extends BlobImpl implements File {
 
 // ==================== Helper Functions ====================
 
-const blobToFile = (blob: Blob, filename?: string): File => {
-    if (blob instanceof FileImpl) {
-        return filename ? new FileImpl([blob], filename, { type: blob.type }) : blob;
+const blobToFile = (blob: Blob, filename?: string): globalThis.File => {
+    if (blob instanceof File) {
+        return filename ? new File([blob], filename, { type: blob.type }) : blob;
     }
 
-    return new FileImpl(
+    return new File(
         [blob],
         filename ?? 'blob',
         { type: blob.type }
@@ -337,13 +343,13 @@ const normalizeType = (type: string): string => {
     return normalized;
 };
 
-const calculateSize = (parts: Array<BufferSource | Blob | string>): number => {
+const calculateSize = (parts: Array<BufferSource | globalThis.Blob | string>): number => {
     let size = 0;
 
     for (const part of parts) {
         if (typeof part === 'string') {
             size += Buffer.byteLength(part, 'utf-8');
-        } else if (part instanceof BlobImpl) {
+        } else if (part instanceof Blob) {
             size += part.size;
         } else if (ArrayBuffer.isView(part)) {
             size += part.byteLength;
@@ -386,12 +392,17 @@ const guessContentType = (filename: string): string => {
     return types[ext ?? ''] ?? 'application/octet-stream';
 };
 
-Reflect.set(globalThis, 'FormData', FormDataImpl);
-Reflect.set(globalThis, 'Blob', BlobImpl);
-Reflect.set(globalThis, 'File', FileImpl);
+// esbuild renames classes that collide with globals (Blob→_Blob, File→_File).
+// Force the correct .name so constructor.name checks pass.
+Object.defineProperty(Blob, 'name', { value: 'Blob', configurable: true });
+Object.defineProperty(File, 'name', { value: 'File', configurable: true });
+
+Reflect.set(globalThis, 'FormData', FormData);
+Reflect.set(globalThis, 'Blob', Blob);
+Reflect.set(globalThis, 'File', File);
 
 export {
-    FormDataImpl as FormData,
-    BlobImpl as Blob,
-    FileImpl as File
+    FormData,
+    Blob,
+    File
 };

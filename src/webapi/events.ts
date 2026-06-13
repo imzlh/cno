@@ -3,8 +3,8 @@ export class Event {
     readonly bubbles: boolean = false;
     readonly cancelable: boolean = true;    // by default, cjs events are cancelable
     readonly composed: boolean = false;
-    readonly eventPhase: 0 = 0; // NONE only
-    readonly isTrusted: boolean = true;
+    readonly eventPhase: 0 = 0;             // NONE only
+    readonly isTrusted: boolean = false;
 
     // Legacy aliases required by TypeScript lib.dom.d.ts
     cancelBubble: boolean = false;
@@ -18,9 +18,10 @@ export class Event {
     private _stopped = false;
     private _prevented = false;
 
-    constructor(type: string, options?: EventInit) {
+    constructor(type: string, options?: EventInit, trust = false) {
         this.type = type;
         Object.assign(this, options);
+        this.isTrusted = trust;
     }
 
     preventDefault(): void {
@@ -57,6 +58,10 @@ export class Event {
         (this as any).type = type;
         (this as any).bubbles = !!bubbles;
         (this as any).cancelable = !!cancelable;
+    }
+    
+    get [Symbol.toStringTag]() {
+        return 'Event';
     }
 }
 
@@ -115,8 +120,8 @@ export class EventTarget {
 
 export class CustomEvent extends Event implements globalThis.CustomEvent {
     public readonly detail: any;
-    constructor(type: string, eventInitDict?: CustomEventInit) {
-        super(type, eventInitDict);
+    constructor(type: string, eventInitDict?: CustomEventInit, trust?: boolean) {
+        super(type, eventInitDict, trust);
         this.detail = eventInitDict?.detail;
     }
 }
@@ -137,8 +142,8 @@ export class ErrorEvent extends Event implements globalThis.ErrorEvent {
     /** Arbitrary payload attached to the error (e.g. the original Error). */
     public readonly error: unknown;
 
-    constructor(type: string, init: ErrorEventInit = {}) {
-        super(type, init);
+    constructor(type: string, init: ErrorEventInit = {}, trust?: boolean) {
+        super(type, init, trust);
 
         this.message = init.message ?? '';
         this.filename = init.filename ?? '';
@@ -155,8 +160,8 @@ export class PromiseRejectionEvent extends Event implements globalThis.PromiseRe
     public readonly reason: any;
     public readonly promise: Promise<any>;
 
-    constructor(type: string, init: PromiseRejectionEventInit) {
-        super(type, init);
+    constructor(type: string, init: PromiseRejectionEventInit, trust?: boolean) {
+        super(type, init, trust);
         this.reason = init.reason;
         this.promise = init.promise;
     }
@@ -167,8 +172,8 @@ export class CloseEvent extends Event implements globalThis.CloseEvent {
     public readonly reason: string;
     public readonly wasClean: boolean;
 
-    constructor(type: string, init: CloseEventInit) {
-        super(type, init);
+    constructor(type: string, init: CloseEventInit, trust?: boolean) {
+        super(type, init, trust);
         this.code = init.code ?? 0;
         this.reason = init.reason ?? '';
         this.wasClean = init.wasClean ?? true;
@@ -182,12 +187,13 @@ export class MessageEvent extends Event implements globalThis.MessageEvent {
     public readonly source = null;
     public readonly ports: MessagePort[];
 
-    initMessageEvent(type: string, bubbles?: boolean, cancelable?: boolean, data?: any, origin?: string, lastEventId?: string, source?: MessageEventSource | null, ports?: MessagePort[]): void {
-        throw new Error('legacy initMessageEvent not implemented');
+    /** @deprecated */
+    initMessageEvent(): void {
+        throw new Error('legacy initMessageEvent deprecated');
     }
 
-    constructor(type: string, init: MessageEventInit) {
-        super(type, init);
+    constructor(type: string, init: MessageEventInit, trust?: boolean) {
+        super(type, init, trust);
         this.data = init.data;
         this.origin = init.origin ?? '';
         this.lastEventId = init.lastEventId ?? '';
@@ -346,25 +352,49 @@ export const parseStackFrame = (
     return { func, file, line: lineNum, col: colNum };
 };
 
+// FIXME: deno don't declared type StorageEvent
+export class StorageEvent extends Event {
+    readonly key: string | null;
+    readonly oldValue: string | null;
+    readonly newValue: string | null;
+    readonly url: string;
+    readonly storageArea: Storage | null;
+
+    constructor(type: string, init?: /* StorageEventInit */ any, trust = false) {
+        super(type, init, trust);
+        this.key        = init?.key        ?? null;
+        this.oldValue   = init?.oldValue   ?? null;
+        this.newValue   = init?.newValue   ?? null;
+        this.url        = init?.url        ?? '';
+        this.storageArea = init?.storageArea ?? null;
+    }
+
+    initStorageEvent(type: string, bubbles?: boolean, cancelable?: boolean, key?: string | null, oldValue?: string | null, newValue?: string | null, url?: string, storageArea?: Storage | null): void {
+        throw new Error('legacy initStorageEvent not implemented');
+    }
+}
+
+Reflect.set(globalThis, 'StorageEvent', StorageEvent);
+
 export function fromError(error: any): ErrorEvent {
     if (!(error instanceof Error)) {
         return new ErrorEvent('error', {
             error,
             message: String(error)
-        });
+        }, true);
     }
     const infoLine = error.stack?.split('\n')[0].trim();
     if (!infoLine) {
         return new ErrorEvent('error', {
             message: error.message,
-        });
+        }, true);
     }
     const match = parseStackFrame(infoLine);
     if (!match) {
         return new ErrorEvent('error', {
             message: error.message,
             error
-        });
+        }, true);
     }
     return new ErrorEvent('error', {
         message: error.message,
@@ -372,5 +402,5 @@ export function fromError(error: any): ErrorEvent {
         lineno: match.line,
         colno: match.col,
         error,
-    });
+    }, true);
 }

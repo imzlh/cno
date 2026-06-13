@@ -1,2 +1,2 @@
 export * from './mod';
-export * as default from './mod';
+export { assert as default } from './mod';
