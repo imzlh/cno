@@ -3,6 +3,23 @@
  * Performance measurement hooks
  */
 
+export const constants = {
+    NODE_PERFORMANCE_ENTRY_TYPE_GC: 'gc',
+    NODE_PERFORMANCE_ENTRY_TYPE_HTTP: 'http',
+    NODE_PERFORMANCE_ENTRY_TYPE_HTTP2: 'http2',
+    NODE_PERFORMANCE_ENTRY_TYPE_NET: 'net',
+    NODE_PERFORMANCE_ENTRY_TYPE_DNS: 'dns',
+    NODE_PERFORMANCE_MILESTONE_TIMESTAMP_RESOLUTION: 1,
+    NODE_PERFORMANCE_GC_MAJOR: 'major',
+    NODE_PERFORMANCE_GC_MINOR: 'minor',
+    NODE_PERFORMANCE_GC_INCREMENTAL: 'incremental',
+    NODE_PERFORMANCE_GC_WEAKCB: 'weakcb',
+};
+
+function now(): number {
+    return globalThis.performance?.now?.() ?? Date.now();
+}
+
 export class PerformanceObserver {
     constructor(_callback: (list: PerformanceObserverEntryList, observer: PerformanceObserver) => void) {}
     observe(_options: { entryTypes?: string[]; type?: string; buffered?: boolean }): void {}
@@ -28,7 +45,7 @@ export class PerformanceNodeTiming {
     readonly entryType = 'node';
     readonly startTime = 0;
     readonly duration = 0;
-    readonly bootstrapComplete: number = performance.now();
+    readonly bootstrapComplete: number = now();
     readonly environment: number = 0;
     readonly idleTime: number = 0;
     readonly loopExit: number = 0;
@@ -37,7 +54,7 @@ export class PerformanceNodeTiming {
 }
 
 export const performance = {
-    now(): number { return globalThis.performance?.now?.() ?? Date.now(); },
+    now,
     mark(name: string): void { globalThis.performance?.mark?.(name); },
     measure(name: string, startMark: string, endMark?: string): void {
         globalThis.performance?.measure?.(name, startMark, endMark);
@@ -52,17 +69,4 @@ export const performance = {
         return { idle: 0, active: 0, utilization: 0 };
     },
     timerify<T extends (...args: any[]) => any>(fn: T): T { return fn; },
-};
-
-export const constants = {
-    NODE_PERFORMANCE_ENTRY_TYPE_GC: 'gc',
-    NODE_PERFORMANCE_ENTRY_TYPE_HTTP: 'http',
-    NODE_PERFORMANCE_ENTRY_TYPE_HTTP2: 'http2',
-    NODE_PERFORMANCE_ENTRY_TYPE_NET: 'net',
-    NODE_PERFORMANCE_ENTRY_TYPE_DNS: 'dns',
-    NODE_PERFORMANCE_MILESTONE_TIMESTAMP_RESOLUTION: 1,
-    NODE_PERFORMANCE_GC_MAJOR: 'major',
-    NODE_PERFORMANCE_GC_MINOR: 'minor',
-    NODE_PERFORMANCE_GC_INCREMENTAL: 'incremental',
-    NODE_PERFORMANCE_GC_WEAKCB: 'weakcb',
 };

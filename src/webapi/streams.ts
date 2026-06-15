@@ -199,6 +199,11 @@ class ReadableStreamController<R = any> implements globalThis.ReadableStreamDefa
 
         await this.#source.cancel?.(reason);
 
+        for (const read of this.#pendingReads) {
+            read.resolve({ value: undefined, done: true });
+        }
+        this.#pendingReads = [];
+
         for (const cb of this.#closedCallbacks) {
             cb.resolve();
         }

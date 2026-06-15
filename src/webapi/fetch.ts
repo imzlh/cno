@@ -13,6 +13,7 @@ const engine = import.meta.use("engine");
 const { Encoder, Decoder } = import.meta.use("text");
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
+const DEFAULT_FETCH_TIMEOUT = 30000;
 
 // ---------------------------------------------------------------------------
 // Connection pool
@@ -45,8 +46,22 @@ function abortError(signal?: AbortSignal): any {
     return signal?.reason ?? new DOMException('The operation was aborted', 'AbortError');
 }
 
+function timeoutError(): any {
+    return new DOMException('The operation timed out', 'TimeoutError');
+}
+
+function isCurlTimeoutError(err: any): boolean {
+    return err?.code === 28 || /\b(timed?\s*out|timeout)\b/i.test(String(err?.message ?? err));
+}
+
 function throwIfAborted(signal?: AbortSignal): void {
     if (signal?.aborted) throw abortError(signal);
+}
+
+function normalizeTimeout(value: any, fallback: number = DEFAULT_FETCH_TIMEOUT): number {
+    const timeout = value === undefined ? fallback : Number(value);
+    if (!Number.isFinite(timeout) || timeout < 0) throw new TypeError('Invalid timeout value');
+    return timeout;
 }
 
 function mergeChunks(chunks: Uint8Array[]): Uint8Array {
@@ -135,6 +150,7 @@ export class Request implements globalThis.Request {
     public readonly referrer: string;
     public readonly referrerPolicy: ReferrerPolicy;
     public readonly signal: AbortSignal;
+    public readonly timeout: number;
     public readonly isHistoryNavigation = false;
     public readonly isReloadNavigation = false;
     public readonly duplex: 'half' = 'half';
@@ -166,6 +182,7 @@ export class Request implements globalThis.Request {
         this.keepalive = init?.keepalive || false; this.mode = init?.mode || 'cors';
         this.redirect = init?.redirect || 'follow'; this.referrer = init?.referrer || 'about:client';
         this.referrerPolicy = init?.referrerPolicy || ''; this.signal = init?.signal ?? new AbortController().signal;
+        this.timeout = normalizeTimeout(init?.timeout, input instanceof Request ? input.timeout : DEFAULT_FETCH_TIMEOUT);
         this.body = this._bodySource ? this.createBodyStream() : null;
         if (['GET', 'HEAD'].includes(this.method) && this.body) throw new TypeError(`Request with ${this.method} method cannot have body`);
     }
@@ -182,7 +199,7 @@ export class Request implements globalThis.Request {
 
     clone(): Request {
         if (this.bodyUsed) throw new TypeError('Already read');
-        return new Request(this.url, { method: this.method, headers: this.headers, body: this._bodySource, cache: this.cache, credentials: this.credentials, integrity: this.integrity, keepalive: this.keepalive, mode: this.mode, redirect: this.redirect, referrer: this.referrer, referrerPolicy: this.referrerPolicy, signal: this.signal });
+        return new Request(this.url, { method: this.method, headers: this.headers, body: this._bodySource, cache: this.cache, credentials: this.credentials, integrity: this.integrity, keepalive: this.keepalive, mode: this.mode, redirect: this.redirect, referrer: this.referrer, referrerPolicy: this.referrerPolicy, signal: this.signal, timeout: this.timeout });
     }
 
     async getBodyBuffer(): Promise<Uint8Array | null> {
@@ -316,6 +333,11 @@ async function performFetch(request: Request, url: URL): Promise<Response> {
         .setMethod(request.method)
         .setHeaders(headersToRecord(headersToArray(request.headers)));
 
+    if (request.timeout > 0) {
+        curl.setTimeout(request.timeout);
+        curl.setConnectTimeout(request.timeout);
+    }
+
     // redirect mode
     if (request.redirect === 'error' || request.redirect === 'manual') {
         curl.setFollowRedirects(false);
@@ -349,24 +371,81 @@ async function performFetch(request: Request, url: URL): Promise<Response> {
         request.signal.addEventListener('abort', abortHandler, { once: true });
     }
 
+    const removeAbortHandler = () => {
+        if (abortHandler && request.signal) {
+            request.signal.removeEventListener('abort', abortHandler);
+            abortHandler = null;
+        }
+    };
+
     // Resolve as soon as headers arrive; stream body via ReadableStream.
     const headersDone = Promise.withResolvers<{ status: number; headers: string }>();
     let streamController: ReadableStreamDefaultController<Uint8Array> | null = null;
+    let bodyCanceled = false;
+    let bodyTerminal: { type: 'close' } | { type: 'error'; error: any } | null = null;
+    const pendingBodyChunks: Uint8Array[] = [];
+
+    const enqueueBodyChunk = (chunk: Uint8Array): boolean => {
+        if (bodyCanceled || bodyTerminal) return true;
+        if (!streamController) {
+            pendingBodyChunks.push(chunk);
+            return false;
+        }
+        try {
+            streamController.enqueue(chunk);
+            return false;
+        } catch {
+            bodyCanceled = true;
+            return true;
+        }
+    };
+
+    const closeBody = () => {
+        if (bodyCanceled || bodyTerminal) return;
+        if (!streamController) {
+            bodyTerminal = { type: 'close' };
+            return;
+        }
+        streamController.close();
+        bodyTerminal = { type: 'close' };
+    };
+
+    const errorBody = (error: any) => {
+        if (bodyCanceled || bodyTerminal) return;
+        if (!streamController) {
+            bodyTerminal = { type: 'error', error };
+            return;
+        }
+        streamController.error(error);
+        bodyTerminal = { type: 'error', error };
+    };
+
+    const startBody = (controller: ReadableStreamDefaultController<Uint8Array>) => {
+        streamController = controller;
+        while (pendingBodyChunks.length > 0) {
+            controller.enqueue(pendingBodyChunks.shift()!);
+        }
+        if (bodyTerminal?.type === 'close') controller.close();
+        else if (bodyTerminal?.type === 'error') controller.error(bodyTerminal.error);
+    };
 
     curl.onHeadersComplete((status, headers) => {
         headersDone.resolve({ status, headers });
     });
 
     curl.onData((chunk: ArrayBuffer) => {
-        streamController?.enqueue(new Uint8Array(chunk));
-        return false; // don't abort
+        return enqueueBodyChunk(new Uint8Array(chunk));
     });
 
     // perform() runs in background; we await headers independently
     const performPromise = curl.perform().then(
-        () => { streamController?.close(); },
-        (err: Error) => { streamController?.error(err); }
-    );
+        closeBody,
+        (err: Error) => {
+            const fetchErr = isCurlTimeoutError(err) ? timeoutError() : err;
+            headersDone.reject(fetchErr);
+            errorBody(fetchErr);
+        }
+    ).finally(removeAbortHandler);
 
     try {
         const { status, headers: rawHeaders } = await headersDone.promise;
@@ -381,8 +460,12 @@ async function performFetch(request: Request, url: URL): Promise<Response> {
         }
 
         const bodyStream = new ReadableStream<Uint8Array>({
-            start(controller) { streamController = controller; },
-            cancel() { try { curl.abort(); } catch {} }
+            start: startBody,
+            cancel() {
+                bodyCanceled = true;
+                pendingBodyChunks.length = 0;
+                try { curl.abort(); } catch {}
+            }
         });
 
         const result = new Response(bodyStream, { status, headers: responseHeaders });
@@ -394,11 +477,8 @@ async function performFetch(request: Request, url: URL): Promise<Response> {
         // drain so perform() settles and we don't leak the handle
         await performPromise.catch(() => {});
         if (request.signal?.aborted) throw abortError(request.signal);
+        if (isCurlTimeoutError(err)) throw timeoutError();
         throw err;
-    } finally {
-        if (abortHandler && request.signal) {
-            request.signal.removeEventListener('abort', abortHandler);
-        }
     }
 }
 

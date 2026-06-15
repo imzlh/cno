@@ -12,6 +12,7 @@
  */
 
 const wasm = import.meta.use('wasm')!;
+const engine = import.meta.use('engine')!;
 
 type BufferSource = ArrayBuffer | ArrayBufferView;
 
@@ -120,9 +121,7 @@ class Memory {
 
     get buffer(): ArrayBuffer {
         if (this._instance) {
-            if (!this._cachedBuffer) {
-                this._cachedBuffer = wasm.getMemoryBuffer(this._instance);
-            }
+            this._cachedBuffer = wasm.getMemoryBuffer(this._instance);
             return this._cachedBuffer;
         }
         return this._buffer!;
@@ -137,8 +136,10 @@ class Memory {
         const oldPages = this._buffer!.byteLength / 65536;
         const newPages = oldPages + delta;
         if (this._maxPages !== undefined && newPages > this._maxPages) return -1;
+        const oldBuffer = this._buffer!;
         const newBuffer = new ArrayBuffer(newPages * 65536);
-        new Uint8Array(newBuffer).set(new Uint8Array(this._buffer!));
+        new Uint8Array(newBuffer).set(new Uint8Array(oldBuffer));
+        engine.detachArrayBuffer(oldBuffer);
         this._buffer = newBuffer;
         this._cachedBuffer = newBuffer;
         return oldPages;
