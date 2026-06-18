@@ -348,7 +348,7 @@ export class Socket extends Duplex {
             return;
         }
 
-        const buffer = typeof chunk === 'string' ? new TextEncoder().encode(chunk) : chunk as Uint8Array;
+        const buffer = typeof chunk === 'string' ? engine.encodeString(chunk) : chunk as Uint8Array;
 
         if (this._tcp) {
             this._tcp.write(buffer).then((written: number) => {

@@ -7,6 +7,7 @@ const text = import.meta.use('text')!;
 const os = import.meta.use('os');
 const timer = import.meta.use('timers');
 const streams = import.meta.use('streams');
+const console = import.meta.use('console');
 
 globalThis.atob = function(str) {
     const dec = crypto.base64Decode(str);

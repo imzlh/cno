@@ -250,7 +250,7 @@ function getTableColumns(data: unknown, columns?: string[]): TableColumn[] {
     const result: TableColumn[] = [];
     for (const [key, width] of cols) {
         if (key === '(index)' || width > key.length) {
-            result.push({ key, width: Math.min(width, 50) + 2 }); // +2 for padding
+            result.push({ key, width: Math.min(width, 50) + 2 }); // +1 for padding
         }
     }
     return result;

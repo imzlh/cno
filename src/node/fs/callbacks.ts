@@ -94,7 +94,7 @@ export function writeFile(path: PathLike | number, data: any, options?: any, cal
     const flag = typeof options === 'object' ? parseFlags(options?.flag) : 'w';
     const buffer = toUint8Array(data);
 
-    asfs.open(pathStr, flag as any, mode).then(
+    asfs.open(pathStr, flag, mode).then(
         handle => {
             handle.write(buffer).then(
                 () => handle.close().then(() => callback(null), err => callback(toErrnoException(err, 'writeFile', pathStr))),
@@ -553,7 +553,7 @@ export function open(path: PathLike, flags?: any, mode?: any, callback?: any): v
     }
 
     const pathStr = pathToString(path as string | URL);
-    asfs.open(pathStr, parseFlags(flags) as any, modeToNumber(mode)).then(
+    asfs.open(pathStr, parseFlags(flags), modeToNumber(mode)).then(
         handle => callback(null, handle.fileno()),
         err => callback(toErrnoException(err, 'open', pathStr))
     );
@@ -575,9 +575,9 @@ export function read(
     try {
         let bytesRead: number;
         if (position !== null && position !== undefined) {
-            bytesRead = fs.pread(fd, buffer.subarray(offset, offset + length) as any, position);
+            bytesRead = fs.pread(fd, buffer.subarray(offset, offset + length), position);
         } else {
-            bytesRead = fs.read(fd, buffer.subarray(offset, offset + length) as any);
+            bytesRead = fs.read(fd, buffer.subarray(offset, offset + length));
         }
         callback(null, bytesRead, buffer);
     } catch (err) {

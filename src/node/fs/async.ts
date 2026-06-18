@@ -387,6 +387,6 @@ class FileHandleImpl implements FileHandle {
 export async function open(path: string | URL, flags?: string | number, mode?: number | string) {
     const flag = parseFlags(flags);
     const modeNum = typeof mode === 'string' ? parseInt(mode, 8) : mode;
-    const handle = await asfs.open(pathToString(path), flag as any, modeNum);
+    const handle = await asfs.open(pathToString(path), flag, modeNum);
     return new FileHandleImpl(handle.fileno(), handle);
 }

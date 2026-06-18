@@ -358,7 +358,7 @@ function buildTable(data: unknown, columns?: string[]): string[] {
     if (cols.length <= 1) return ['(empty)'];
 
     const totalWidth = cols.reduce((sum, c) => sum + c.width + 1, 0);
-    const sep = '\u2500'.repeat(totalWidth - 1);
+    const sep = ''.repeat(totalWidth - 1);
 
     const header = cols.map(c => pad(c.key, c.width)).join('\u2502');
     lines.push('\u250c' + sep + '\u2510');

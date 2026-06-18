@@ -24,6 +24,7 @@
 import { Kv } from './core';
 import { KvListIterator } from './iterator';
 import { AtomicOperation } from './atomic';
+const console = import.meta.use('console');
 
 export { Kv, KvListIterator, AtomicOperation };
 export * from './types';

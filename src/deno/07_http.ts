@@ -5,6 +5,7 @@ const os = import.meta.use('os');
 
 import { wrapFsClassDec as wrap } from '../utils/wrap';
 import { dnsCache } from '@cnojs/http/dns-cache';
+import type { FetchConnectionInfo } from '../utils/network-hooks';
 
 /**
  * HTTP proxy connection - CONNECT tunnel

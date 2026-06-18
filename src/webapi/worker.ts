@@ -144,8 +144,8 @@ class Worker extends EventTarget implements globalThis.Worker {
         }
     }
 
-    terminate(): Promise<void> {
-        if (this.#terminated) return Promise.resolve();
+    terminate(): void {
+        if (this.#terminated) return;
         this.#terminated = true;
         return this.#worker.terminate();
     }

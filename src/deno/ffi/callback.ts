@@ -15,6 +15,7 @@ import {
 import { UnsafePointer, createPointerObject } from './pointer';
 
 const ffi = import.meta.use('ffi');
+const console = import.meta.use('console');
 
 interface CallbackInternal {
     closure: CModuleFFI.FfiClosure;
@@ -152,7 +153,7 @@ export class UnsafeCallback<
         return (...args: Uint8Array[]): Uint8Array => {
             try {
                 const convertedArgs = this.convertArgs(args, definition.parameters);
-                const result = callback(...convertedArgs as any);
+                const result = callback.apply(null, convertedArgs as any[]);
                 return this.convertResult(result, definition.result);
             } catch (err) {
                 console.error('UnsafeCallback error:', err);

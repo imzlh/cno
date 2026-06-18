@@ -4,6 +4,7 @@ const engine = import.meta.use("engine");
 const fswatch = import.meta.use("fswatch");
 const os = import.meta.use("os");
 const error = import.meta.use("error");
+const console = import.meta.use('console');
 
 import { assert } from "../utils/assert";
 import { join } from "../utils/path";

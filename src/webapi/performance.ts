@@ -1,4 +1,5 @@
 import { DOMException, EventTarget } from "./events";
+const console = import.meta.use('console');
 
 // Store native performance.now reference
 const nativePerformanceNow = globalThis.performance?.now?.bind(globalThis.performance) ?? (() => Date.now());

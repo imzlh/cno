@@ -83,7 +83,7 @@ class LLHttpParser implements CNO.HttpParser {
 
     execute(data: Uint8Array | ArrayBuffer): CNO.HttpParserResult {
         const buf = data instanceof ArrayBuffer ? new Uint8Array(data) : data;
-        const r = this.#parser.execute(buf as any);
+        const r = this.#parser.execute(buf);
         return { errno: r.errno, name: r.name, reason: r.reason, bytesConsumed: r.bytesConsumed };
     }
 
@@ -257,7 +257,7 @@ class StreamingParser implements CNO.StreamingHttpParser {
 
     feed(data: Uint8Array | ArrayBuffer): void {
         const buf = data instanceof ArrayBuffer ? new Uint8Array(data) : data;
-        const result = this.#parser.execute(buf as any);
+        const result = this.#parser.execute(buf);
         if (result.errno !== 0 && result.name !== 'HPE_PAUSED_UPGRADE') {
             this.#onError?.(new Error(`HTTP parse error: ${result.reason ?? result.name}`));
         }
@@ -332,7 +332,7 @@ function parseRequest(data: Uint8Array | ArrayBuffer): CNO.HttpRequestMessage {
     };
     parser.onBody = (b, off, len) => { bodyChunks.push(new Uint8Array(b as ArrayBuffer).slice(off, off + len)); };
 
-    const result = parser.execute(buf as any);
+    const result = parser.execute(buf);
     if (result.errno !== 0 && result.name !== 'HPE_PAUSED_UPGRADE') {
         throw new Error(`HTTP parse error: ${result.reason ?? result.name}`);
     }
@@ -370,7 +370,7 @@ function parseResponse(data: Uint8Array | ArrayBuffer): CNO.HttpResponseMessage 
     };
     parser.onBody = (b, off, len) => { bodyChunks.push(new Uint8Array(b as ArrayBuffer).slice(off, off + len)); };
 
-    const result = parser.execute(buf as any);
+    const result = parser.execute(buf);
     if (result.errno !== 0) {
         throw new Error(`HTTP parse error: ${result.reason ?? result.name}`);
     }

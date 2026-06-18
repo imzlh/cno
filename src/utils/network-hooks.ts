@@ -1,0 +1,197 @@
+/**
+ * Network hooks for CDP Network domain.
+ * Setters are called by the debug session's Network domain to observe fetch/WebSocket traffic.
+ * This module is imported by fetch.ts and websocket.ts; the hook functions themselves are
+ * never invoked until a setter registers them.
+ */
+
+// ---- User-Agent / Extra headers override (applied to all fetch requests) ---
+
+let _userAgentOverride: string | null = null;
+let _extraHTTPHeaders: Record<string, string> = {};
+
+export function setUserAgentOverride(ua: string | null): void { _userAgentOverride = ua; }
+export function getUserAgentOverride(): string | null { return _userAgentOverride; }
+export function setExtraHTTPHeaders(headers: Record<string, string>): void { _extraHTTPHeaders = headers; }
+export function getExtraHTTPHeaders(): Record<string, string> { return _extraHTTPHeaders; }
+
+// ---- Fetch hooks -----------------------------------------------------------
+
+export interface FetchRequestInfo {
+    requestId: string;
+    url: string;
+    method: string;
+    headers: Record<string, string>;
+    postData?: Uint8Array | null;  // raw request body bytes
+    timestamp: number;
+}
+
+export interface FetchResponseInfo {
+    requestId: string;
+    url: string;                             // request URL
+    status: number;
+    headers: Record<string, string>;
+    requestHeaders?: Record<string, string>; // headers that were sent
+    connection?: FetchConnectionInfo;        // curl timing available at response time
+    timestamp: number;
+}
+
+export interface FetchDataInfo {
+    requestId: string;
+    data: Uint8Array;
+    timestamp: number;
+}
+
+export interface FetchFinishedInfo {
+    requestId: string;
+    success: boolean;
+    errorText?: string;
+    connection?: FetchConnectionInfo;  // post-request metadata from curl
+    timestamp: number;
+}
+
+export interface FetchConnectionInfo {
+    remoteIPAddress?: string;   // CURLINFO_PRIMARY_IP
+    remotePort?: number;        // CURLINFO_PRIMARY_PORT
+    httpVersion?: number;       // 1=1.0, 2=1.1, 3=2.0
+    totalTime?: number;         // seconds
+    downloadSize?: number;      // bytes
+    timing?: {
+        dnsEnd?: number;
+        connectEnd?: number;
+        sslEnd?: number;
+        sendEnd?: number;
+        receiveHeadersStart?: number;  // STARTTRANSFER_TIME = TTFB
+        /** Phase durations (seconds) from curl. Used to derive per-phase start times. */
+        dnsDuration?: number;
+        connectDuration?: number;
+        sslDuration?: number;
+        sendDuration?: number;
+        receiveHeadersDuration?: number;
+        /** CURLINFO_TOTAL_TIME — full request lifetime incl. body download (seconds). */
+        totalTime?: number;
+        /** CURLINFO_SIZE_DOWNLOAD_T — actual bytes received over the wire. */
+        sizeDownload?: number;
+        /** CURLINFO_NUM_CONNECTS — new connections opened (0 = reused). */
+        numConnects?: number;
+        /** CURLINFO_SSL_VERIFYRESULT — 0 = cert OK. */
+        sslVerifyResult?: number;
+        /** CURLINFO_CONTENT_TYPE — Content-Type from response. */
+        contentType?: string;
+        /** CURLINFO_HEADER_SIZE — response header bytes. */
+        headerSize?: number;
+        /** CURLINFO_REDIRECT_COUNT — number of redirects followed. */
+        redirectCount?: number;
+        /** CURLINFO_REDIRECT_URL — redirect target URL. */
+        redirectUrl?: string;
+    };
+}
+
+export type FetchHook = {
+    onRequest?(info: FetchRequestInfo): void;
+    onResponse?(info: FetchResponseInfo): void;
+    onData?(info: FetchDataInfo): void;
+    onFinished?(info: FetchFinishedInfo): void;
+};
+
+let fetchHook: FetchHook | null = null;
+
+export function setFetchHook(hook: FetchHook | null): void {
+    fetchHook = hook;
+}
+
+export function getFetchHook(): FetchHook | null {
+    return fetchHook;
+}
+
+// ---- WebSocket hooks -------------------------------------------------------
+
+export interface WSCreatedInfo {
+    requestId: string;
+    url: string;
+    timestamp: number;
+}
+
+export interface WSHandshakeInfo {
+    requestId: string;
+    status: number;
+    headers: Array<[string, string]>;
+    timestamp: number;
+}
+
+export interface WSFrameInfo {
+    requestId: string;
+    opcode: number;
+    masked: boolean;
+    payloadData: string;  // base64 for binary, utf8 string for text
+    payloadLength: number;
+    timestamp: number;
+}
+
+export interface WSClosedInfo {
+    requestId: string;
+    code: number;
+    reason: string;
+    timestamp: number;
+}
+
+export type WebSocketHook = {
+    onCreated?(info: WSCreatedInfo): void;
+    onHandshake?(info: WSHandshakeInfo): void;
+    onFrameReceived?(info: WSFrameInfo): void;
+    onFrameSent?(info: WSFrameInfo): void;
+    onClosed?(info: WSClosedInfo): void;
+};
+
+let wsHook: WebSocketHook | null = null;
+
+export function setWebSocketHook(hook: WebSocketHook | null): void {
+    wsHook = hook;
+}
+
+export function getWebSocketHook(): WebSocketHook | null {
+    return wsHook;
+}
+
+// ---- Fetch intercept hook (CDP Fetch domain) --------------------------------
+// Unlike FetchHook (observation only), this hook can pause, modify, fulfill, or
+// fail requests before they reach the network. Used by CDP Fetch domain.
+
+export interface FetchInterceptInfo {
+    requestId: string;
+    url: string;
+    method: string;
+    headers: Record<string, string>;
+    postData?: Uint8Array | null;  // raw request body bytes
+    resourceType?: string;         // "Fetch", "XHR", "Document", etc.
+}
+
+export type InterceptResult = {
+    action: 'continue';       // proceed with (optionally modified) request
+    url?: string;
+    method?: string;
+    headers?: Record<string, string>;
+    postData?: Uint8Array;
+} | {
+    action: 'fulfill';        // return synthetic response
+    responseCode: number;
+    responseHeaders: Array<[string, string]>;
+    body: Uint8Array;
+} | {
+    action: 'fail';           // abort with error
+    reason: string;           // "BlockedByClient", "ConnectionRefused", etc.
+};
+
+export type FetchInterceptHook = {
+    onRequest?(info: FetchInterceptInfo): Promise<InterceptResult | null>;
+};
+
+let fetchInterceptHook: FetchInterceptHook | null = null;
+
+export function setFetchInterceptHook(hook: FetchInterceptHook | null): void {
+    fetchInterceptHook = hook;
+}
+
+export function getFetchInterceptHook(): FetchInterceptHook | null {
+    return fetchInterceptHook;
+}

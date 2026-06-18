@@ -1,3 +1,4 @@
+const console = import.meta.use('console');
 console.log('Start scan and running deno tests');
 console.log('Behavior is same as: cargo run --bin deno -- test --allow-all --location=http://js-unit-tests/foo/bar .');
 

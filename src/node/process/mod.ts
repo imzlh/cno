@@ -12,6 +12,7 @@ const engine = import.meta.use('engine');
 const sig = import.meta.use('signals');
 const proc = import.meta.use('process');
 const streams = import.meta.use('streams');
+const console = import.meta.use('console');
 const { stdin: denoStdin, stdout: denoStdout, stderr: denoStderr } = streams as any as Record<string, StdioStream>;
 
 // ============================================================================

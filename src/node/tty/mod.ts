@@ -1,13 +1,16 @@
+import type { Stream } from '../../deno/04_stdio';
 import { Readable, Writable } from '../stream';
 
 const os = import.meta.use('os');
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
-const nativeStreams = import.meta.use('streams');
+const streams = import.meta.use('streams');
 const timers = import.meta.use('timers');
 
+const { stdin, stdout, stderr } = streams as any as Record<string, Stream>
+
 type Size = { width: number; height: number };
-type NativeTTYRef = { stream: CModuleStreams.TTY; owned: boolean } | null;
+type TTYRef = { stream: CModuleStreams.TTY; owned: boolean };
 
 const RESIZE_POLL_MS = 250;
 
@@ -17,62 +20,30 @@ function validateFd(fd: number): void {
     }
 }
 
-function stdioStream(fd: number): any | null {
-    if (fd === os.STDIN_FILENO) return (nativeStreams as any).stdin ?? null;
-    if (fd === os.STDOUT_FILENO) return (nativeStreams as any).stdout ?? null;
-    if (fd === os.STDERR_FILENO) return (nativeStreams as any).stderr ?? null;
+function stdioStream(fd: number): Stream | null {
+    if (fd === os.STDIN_FILENO) return stdin;
+    if (fd === os.STDOUT_FILENO) return stdout;
+    if (fd === os.STDERR_FILENO) return stderr;
     return null;
 }
 
-function openTTY(fd: number, readable: boolean): NativeTTYRef {
+function openTTY(fd: number, readable: boolean): TTYRef {
     validateFd(fd);
     const shared = stdioStream(fd);
     if (shared?.isTTY && shared.__stream) {
         return { stream: shared.__stream as CModuleStreams.TTY, owned: false };
     }
-    if (!isatty(fd)) return null;
-    try {
-        return { stream: new (nativeStreams as any).TTY(fd, readable) as CModuleStreams.TTY, owned: true };
-    } catch {
-        return null;
-    }
+    if (!isatty(fd)) throw new Error('Not a tty');
+    return { stream: new streams.TTY(fd, readable), owned: true };
 }
 
-function encode(data: Uint8Array | string): Uint8Array {
-    return typeof data === 'string' ? engine.encodeString(data) : data;
-}
-
-function readFd(ref: NativeTTYRef, fd: number, buf: Uint8Array): number | null {
-    if (ref) return ref.stream.readSync(buf);
-    return fs.read(fd, buf);
-}
-
-function writeFd(ref: NativeTTYRef, fd: number, data: Uint8Array | string): number {
-    const bytes = encode(data);
-    if (ref) return ref.stream.writeSync(bytes);
-    return fs.write(fd, bytes);
-}
-
-function closeRef(ref: NativeTTYRef): void {
-    if (!ref?.owned) return;
-    try { ref.stream.close(); } catch {}
-}
-
-function refHandle(ref: NativeTTYRef): void {
-    try { ref?.stream.ref(); } catch {}
-}
-
-function unrefHandle(ref: NativeTTYRef): void {
-    try { ref?.stream.unref(); } catch {}
-}
-
-function ttySize(ref: NativeTTYRef): Size | null {
-    if (!ref) return null;
-    try { return ref.stream.size; } catch { return null; }
+function envValue(env: Record<string, string> | undefined, key: string): string | undefined {
+    if (env && key in env) return env[key];
+    try { return os.getenv(key); } catch { return undefined; }
 }
 
 function sameSize(a: Size | null, b: Size | null): boolean {
-    return a?.width === b?.width && a?.height === b?.height;
+    return a === b || !!(a && b && a.width === b.width && a.height === b.height);
 }
 
 function ansiForClearLine(dir: number): string {
@@ -92,48 +63,44 @@ function ansiForMoveCursor(dx: number, dy: number): string {
     return code;
 }
 
-function envValue(env: Record<string, string> | undefined, key: string): string | undefined {
-    return env?.[key] ?? (globalThis as any).process?.env?.[key];
-}
-
 export function isatty(fd: number): boolean {
     if (!Number.isInteger(fd) || fd < 0) return false;
     try { return os.guessHandle(fd) === 'tty'; } catch { return false; }
 }
 
 export class ReadStream extends Readable {
-    readonly fd: number;
     isRaw = false;
     bytesRead = 0;
-    private readonly ttyRef: NativeTTYRef;
+    private handle: CModuleStreams.TTY;
+    private owned = false;
     private closed = false;
+    readonly isTTY: boolean = true;
 
     constructor(fd: number, options?: any) {
         validateFd(fd);
         super(options);
-        this.fd = fd;
-        this.ttyRef = openTTY(fd, true);
+        const ref = openTTY(fd, true)!;
+        this.handle = ref.stream;
+        this.owned = ref.owned;
+        this.isTTY = os.guessHandle(fd) === 'tty';
         this._read = this.readFromFd.bind(this);
     }
 
-    get isTTY(): boolean { return isatty(this.fd); }
-
     setRawMode(mode: boolean): this {
-        if (!this.ttyRef) return this;
-        this.ttyRef.stream.mode = mode
-            ? nativeStreams.TTY_MODE_RAW_VT
-            : nativeStreams.TTY_MODE_NORMAL;
+        this.handle.mode = mode
+            ? streams.TTY_MODE_RAW_VT
+            : streams.TTY_MODE_NORMAL;
         this.isRaw = mode;
         return this;
     }
 
     ref(): this {
-        refHandle(this.ttyRef);
+        this.handle.ref();
         return this;
     }
 
     unref(): this {
-        unrefHandle(this.ttyRef);
+        this.handle.unref();
         return this;
     }
 
@@ -145,14 +112,14 @@ export class ReadStream extends Readable {
     override destroy(error?: Error | null): this {
         if (this.closed) return this;
         this.closed = true;
-        closeRef(this.ttyRef);
+        if (this.owned) { this.handle.close(); }
         return super.destroy(error);
     }
 
     private readFromFd(size: number): void {
         try {
             const buf = new Uint8Array(size || 64 * 1024);
-            const n = readFd(this.ttyRef, this.fd, buf);
+            const n = this.handle.readSync(buf);
             if (!n) {
                 this.push(null);
                 return;
@@ -168,32 +135,32 @@ export class ReadStream extends Readable {
 export class WriteStream extends Writable {
     readonly fd: number;
     bytesWritten = 0;
-    private readonly ttyRef: NativeTTYRef;
-    private currentSize: Size | null = null;
+    private handle: CModuleStreams.TTY;
+    private owned = false;
+    private currentSize: Size;
     private resizeTimer = 0;
     private closed = false;
 
     constructor(fd: number, options?: any) {
         validateFd(fd);
-        const ttyRef = openTTY(fd, false);
-        let owner: WriteStream;
-        super({
-            ...options,
-            write: (chunk: any, _encoding: BufferEncoding, callback: (error?: Error | null) => void) => {
-                try {
-                    const written = writeFd(ttyRef, fd, typeof chunk === 'string' ? chunk : chunk);
-                    owner.bytesWritten += written;
-                    owner.refreshSize();
-                    callback();
-                } catch (e) {
-                    callback(e as Error);
-                }
-            },
-        });
-        owner = this;
+        super(options);
         this.fd = fd;
-        this.ttyRef = ttyRef;
-        this.currentSize = ttySize(this.ttyRef);
+        const { stream, owned } = openTTY(fd, false);
+        this.currentSize = stream.size;
+        this.handle = stream;
+        this.owned = owned;
+        this._write = this.writeToFd.bind(this);
+    }
+
+    private writeToFd(chunk: any, _encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
+        try {
+            const written = this.handle.writeSync(chunk);
+            this.bytesWritten += written;
+            this.refreshSize();
+            callback();
+        } catch (e) {
+            callback(e as Error);
+        }
     }
 
     get isTTY(): boolean { return isatty(this.fd); }
@@ -264,12 +231,12 @@ export class WriteStream extends Writable {
     }
 
     ref(): this {
-        refHandle(this.ttyRef);
+        this.handle.ref();
         return this;
     }
 
     unref(): this {
-        unrefHandle(this.ttyRef);
+        this.handle.unref();
         return this;
     }
 
@@ -282,7 +249,7 @@ export class WriteStream extends Writable {
         if (this.closed) return this;
         this.closed = true;
         this.stopResizePolling();
-        closeRef(this.ttyRef);
+        if (this.owned) { this.handle.close(); }
         return super.destroy(error);
     }
 
@@ -336,7 +303,7 @@ export class WriteStream extends Writable {
 
     private writeControl(seq: string, callback?: () => void): void {
         try {
-            const written = writeFd(this.ttyRef, this.fd, seq);
+            const written = this.handle.writeSync(engine.encodeString(seq));
             this.bytesWritten += written;
             this.refreshSize();
             callback?.();
@@ -346,7 +313,7 @@ export class WriteStream extends Writable {
     }
 
     private refreshSize(): Size | null {
-        const next = ttySize(this.ttyRef);
+        const next = this.handle.size;
         if (!sameSize(this.currentSize, next)) {
             this.currentSize = next;
             this.emit('resize');
@@ -361,7 +328,7 @@ export class WriteStream extends Writable {
     }
 
     private startResizePolling(): void {
-        if (this.resizeTimer || !this.ttyRef) return;
+        if (this.resizeTimer) return;
         this.resizeTimer = timers.setInterval(() => this.refreshSize(), RESIZE_POLL_MS);
     }
 

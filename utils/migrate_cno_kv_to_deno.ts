@@ -1,5 +1,6 @@
 #!/usr/bin/env -S deno run -A --unstable-kv
 
+const console = import.meta.use('console');
 type KvKeyPart = string | number | bigint | boolean | Uint8Array;
 type KvKey = readonly KvKeyPart[];
 

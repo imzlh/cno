@@ -23,6 +23,7 @@ type CompiledSchedule = {
 };
 
 const timers = import.meta.use('timers');
+const console = import.meta.use('console');
 
 const FIELD_RANGES: Record<CronField, { min: number; max: number }> = {
     minute: { min: 0, max: 59 },

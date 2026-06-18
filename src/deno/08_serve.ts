@@ -211,7 +211,7 @@ class DenoHttpServer implements Deno.HttpServer<Deno.NetAddr> {
         onfulfilled?: ((value: void) => TResult1 | PromiseLike<TResult1>) | null,
         onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null
     ): Promise<TResult1 | TResult2> {
-        return this.finishedPromise.then(onfulfilled as any, onrejected);
+        return this.finishedPromise.then(onfulfilled, onrejected);
     }
 
     [Symbol.asyncDispose](): Promise<void> {

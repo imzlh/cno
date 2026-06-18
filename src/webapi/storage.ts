@@ -7,6 +7,7 @@ const fs = import.meta.use('fs');
 const os = import.meta.use('os');
 const crypto = import.meta.use('crypto');
 const engine = import.meta.use('engine');
+const console = import.meta.use('console');
 
 // ============================================================================
 // Type Definitions

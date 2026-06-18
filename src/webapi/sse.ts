@@ -12,6 +12,7 @@ import { MessageEvent } from "./events";
 
 const engine = import.meta.use('engine');
 const timers = import.meta.use('timers');
+const console = import.meta.use('console');
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 

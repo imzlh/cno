@@ -102,12 +102,12 @@ export function toErrnoException(
     path?: string
 ): NodeJS.ErrnoException {
     // If already ErrnoException (string .code), return directly
-    if (e instanceof Error && (e as any).code && typeof (e as any).code === 'string') {
+    if (e instanceof Error && (e as CModuleError.Error).code && typeof (e as CModuleError.Error).code === 'string') {
         return e as NodeJS.ErrnoException;
     }
 
     // Not CModuleError.Error (no numeric .code errno)
-    if (!(e instanceof Error) || typeof (e as any).code !== 'number') {
+    if (!(e instanceof Error) || typeof (e as CModuleError.Error).code !== 'number') {
         const err = new Error((e as Error)?.message ?? String(e)) as NodeJS.ErrnoException;
         err.code = 'UNKNOWN';
         err.errno = error.errno.UNKNOWN;

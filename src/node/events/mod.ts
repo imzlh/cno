@@ -1,3 +1,4 @@
+const console = import.meta.use('console');
 /**
  * Node.js events module
  * EventEmitter pattern implementation

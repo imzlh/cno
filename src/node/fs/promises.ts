@@ -7,12 +7,12 @@ const engine = import.meta.use('engine');
 import { FileHandle } from 'fs/promises';
 import { toUint8Array, decodeBuffer, toNodeStatAsync, toNodeDirentAsync, parseFlags, pathToString, removeRecursive, mkdirRecursive } from './utils';
 import { toErrnoException, wrapPromise } from '../_internal/errno';
+import type { Dirent, StatFsOptions, Stats } from 'fs';
 
 // Helper: wrap asyncfs calls, auto-convert errno to ErrnoException
 function w<T>(promise: Promise<T>, syscall: string, path: string): Promise<T> {
     return wrapPromise(promise, syscall, path);
 }
-import { StatFsOptions, Stats } from 'fs';
 
 // ============================================================================
 // Type definitions
@@ -162,7 +162,7 @@ export async function writeFile(path: PathLike | number, data: string | Uint8Arr
     const flag = typeof options === 'object' ? parseFlags(options?.flag) : 'w';
     const buffer = toUint8Array(data);
 
-    const handle = await w(asfs.open(pathStr, flag as any, mode), 'writeFile', pathStr);
+    const handle = await w(asfs.open(pathStr, flag, mode), 'writeFile', pathStr);
     try {
         await handle.write(buffer);
     } finally {
@@ -257,7 +257,7 @@ export async function readdir(path: PathLike, options?: { encoding?: BufferEncod
     const withFileTypes = typeof options === 'object' ? options?.withFileTypes : false;
 
     const dirHandle = await w(asfs.readDir(pathStr), 'readdir', pathStr);
-    const entries: import('fs').Dirent[] = [];
+    const entries: Dirent[] = [];
 
     try {
         for await (const entry of dirHandle) {
@@ -423,7 +423,7 @@ export async function statfs(path: PathLike, options?: { bigint?: boolean }): Pr
 export async function open(path: PathLike, flags?: string | number, mode?: Mode): Promise<FileHandleImpl> {
     const flag = parseFlags(flags);
     const modeNum = modeToNumber(mode);
-    const handle = await w(asfs.open(pathToString(path as string | URL), flag as any, modeNum), 'open', pathToString(path as string | URL));
+    const handle = await w(asfs.open(pathToString(path as string | URL), flag, modeNum), 'open', pathToString(path as string | URL));
     return new FileHandleImpl(handle.fileno(), handle);
 }
 
@@ -483,7 +483,7 @@ export function watch(path: PathLike, options?: { persistent?: boolean; recursiv
             watcher = null;
         }
         if (resolveNext) {
-            resolveNext({ done: true, value: undefined as any });
+            resolveNext({ done: true, value: undefined });
             resolveNext = null;
         }
     };
@@ -502,7 +502,7 @@ export function watch(path: PathLike, options?: { persistent?: boolean; recursiv
             return this;
         },
         async next() {
-            if (closed) return { done: true, value: undefined as any };
+            if (closed) return { done: true, value: undefined };
             if (queue.length > 0) {
                 return { done: false, value: queue.shift()! };
             }
@@ -512,7 +512,7 @@ export function watch(path: PathLike, options?: { persistent?: boolean; recursiv
         },
         async return() {
             await close();
-            return { done: true, value: undefined as any };
+            return { done: true, value: undefined };
         },
     } as AsyncIterableIterator<{ eventType: string; filename: string | null }>;
 }
@@ -612,7 +612,7 @@ export async function* glob(pattern: string | readonly string[], options?: { cwd
         try {
             const dirIter = await w(asfs.readDir(dir), 'readdir', dir);
             entries = [];
-            for await (const entry of dirIter as any) {
+            for await (const entry of dirIter) {
                 entries.push(entry.name);
             }
         }

@@ -7,13 +7,83 @@
 
 import { Headers } from "headers-polyfill";
 import { DOMException, EventTarget } from "./events";
+import { version } from "../../package.json";
 
-const curlMod = import.meta.use("curl") as typeof CModuleCURL;
+import { getFetchHook, getUserAgentOverride, getExtraHTTPHeaders, getFetchInterceptHook, type FetchConnectionInfo } from '../utils/network-hooks';
+import { type HttpClient } from '../deno/07_http';
+
+const curlMod = import.meta.use("curl");
+const asyncfs = import.meta.use("asyncfs");
+const os = import.meta.use("os");
 const engine = import.meta.use("engine");
-const { Encoder, Decoder } = import.meta.use("text");
+const { Decoder } = import.meta.use("text");
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 const DEFAULT_FETCH_TIMEOUT = 30000;
+
+// curl.getInfo() returns C module wrapper objects; structured clone (pipe) cannot
+// serialize them — they become [object Object] or fail silently. Coerce every
+// value to a JS primitive at the boundary.
+function curlNum(curl: CModuleCURL.CURL, flag: number): number | undefined {
+    const v = curl.getInfo(flag);
+    return v != null ? Number(v) : undefined;
+}
+function curlStr(curl: CModuleCURL.CURL, flag: number): string | undefined {
+    const v = curl.getInfo(flag);
+    return v != null ? String(v) : undefined;
+}
+
+function buildConnectionInfo(curl: CModuleCURL.CURL, reqStartTime: number): FetchConnectionInfo | undefined {
+    try {
+        const info = curl.getInfo();
+        // Force C-wrapper values to JS primitives.
+        const httpVersion   = Number(info.httpVersion  ?? 0);
+        const totalTime     = Number(info.totalTime    ?? 0);
+        const downloadSize  = Number(info.downloadSize ?? 0);
+
+        // curl timing values are durations (seconds from request start).
+        const dnsDur    = curlNum(curl, curlMod.CURLINFO_NAMELOOKUP_TIME);
+        const connDur   = curlNum(curl, curlMod.CURLINFO_CONNECT_TIME);
+        const sslDur    = curlNum(curl, curlMod.CURLINFO_APPCONNECT_TIME);
+        const sendDur   = curlNum(curl, curlMod.CURLINFO_PRETRANSFER_TIME);
+        const ttfbDur   = curlNum(curl, curlMod.CURLINFO_STARTTRANSFER_TIME);
+        const totalDur  = curlNum(curl, curlMod.CURLINFO_TOTAL_TIME);
+        const sizeDL    = curlNum(curl, curlMod.CURLINFO_SIZE_DOWNLOAD_T);
+        const numConn   = curlNum(curl, curlMod.CURLINFO_NUM_CONNECTS);
+        const sslVerify = curlNum(curl, curlMod.CURLINFO_SSL_VERIFYRESULT);
+        const cType     = curlStr(curl, curlMod.CURLINFO_CONTENT_TYPE);
+        const hdrSize   = curlNum(curl, curlMod.CURLINFO_HEADER_SIZE);
+        const redirCnt  = curlNum(curl, curlMod.CURLINFO_REDIRECT_COUNT);
+        const redirUrl  = curlStr(curl, curlMod.CURLINFO_REDIRECT_URL);
+        return {
+            remoteIPAddress: curlStr(curl, curlMod.CURLINFO_PRIMARY_IP),
+            remotePort:      curlNum(curl, curlMod.CURLINFO_PRIMARY_PORT),
+            httpVersion,
+            totalTime,
+            downloadSize,
+            timing: {
+                dnsEnd:    dnsDur  != null ? reqStartTime + dnsDur  : undefined,
+                connectEnd: connDur != null ? reqStartTime + connDur : undefined,
+                sslEnd:    sslDur  != null ? reqStartTime + sslDur  : undefined,
+                sendEnd:   sendDur != null ? reqStartTime + sendDur : undefined,
+                receiveHeadersStart: ttfbDur != null ? reqStartTime + ttfbDur : undefined,
+                dnsDuration:   dnsDur  ?? undefined,
+                connectDuration: connDur ?? undefined,
+                sslDuration:   sslDur  ?? undefined,
+                sendDuration:  sendDur ?? undefined,
+                receiveHeadersDuration: ttfbDur ?? undefined,
+                totalTime:     totalDur ?? undefined,
+                sizeDownload:  sizeDL   ?? undefined,
+                numConnects:   numConn  ?? undefined,
+                sslVerifyResult: sslVerify ?? undefined,
+                contentType:   cType    ?? undefined,
+                headerSize:    hdrSize  ?? undefined,
+                redirectCount: redirCnt ?? undefined,
+                redirectUrl:   redirUrl ?? undefined,
+            },
+        };
+    } catch { return undefined; }
+}
 
 // ---------------------------------------------------------------------------
 // Connection pool
@@ -217,7 +287,19 @@ export class Request implements globalThis.Request {
     async arrayBuffer(): Promise<ArrayBuffer> { const b = await this.getBodyBuffer(); if (!b) throw new TypeError('Body not available'); return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength); }
     async bytes(): Promise<Uint8Array> { const b = await this.getBodyBuffer(); if (!b) throw new TypeError('Body not available'); return b; }
     async blob(): Promise<Blob> { return new Blob([await this.arrayBuffer()], { type: this.headers.get('content-type') || 'application/octet-stream' }); }
-    async formData(): Promise<FormData> { throw new Error('FormData parsing not yet implemented'); }
+    async formData(): Promise<FormData> {
+        if (this._bodySource instanceof FormData) return this._bodySource;
+        const buf = await this.getBodyBuffer();
+        if (!buf) throw new TypeError('Request body is empty');
+        const ct = this.headers.get('content-type') ?? '';
+        if (ct.includes('multipart/form-data')) {
+            const m = ct.match(/boundary=([^\s;]+)/i);
+            if (!m) throw new TypeError('Missing multipart boundary');
+            return parseMultipart(buf, m[1]);
+        }
+        if (ct.includes('application/x-www-form-urlencoded')) return parseUrlEncoded(buf);
+        throw new TypeError(`Unsupported content type for formData(): ${ct}`);
+    }
     async text(): Promise<string> { return engine.decodeString(new Uint8Array(await this.arrayBuffer())); }
     async json<T = any>(): Promise<T> { return JSON.parse(await this.text()); }
 }
@@ -249,6 +331,74 @@ async function serializeFormData(fd: FormData): Promise<Uint8Array> {
     }
     parts.push(engine.encodeString(`--${boundary}--\r\n`) as Uint8Array);
     return mergeChunks(parts);
+}
+
+function parseUrlEncoded(body: Uint8Array): FormData {
+    const str = engine.decodeString(body);
+    const params = new URLSearchParams(str);
+    const fd = new FormData();
+    for (const [key, value] of params) fd.append(key, value);
+    return fd;
+}
+
+function parseMultipart(body: Uint8Array, boundary: string): FormData {
+    const fd = new FormData();
+    const delimiter = engine.encodeString(`\r\n--${boundary}`) as Uint8Array;
+    let pos = 0;
+
+    // Find first boundary (may or may not have leading CRLF).
+    const firstBnd = engine.encodeString(`--${boundary}`) as Uint8Array;
+    pos = indexOf(body, firstBnd, 0);
+    if (pos < 0) return fd;
+    pos += firstBnd.length;
+
+    while (pos < body.length) {
+        // Skip CRLF after boundary.
+        if (body[pos] === 0x0d && body[pos + 1] === 0x0a) pos += 2;
+        // End boundary check (--).
+        if (body[pos] === 0x2d && body[pos + 1] === 0x2d) break;
+
+        // Parse part headers until blank line.
+        const hdrEnd = indexOf(body, engine.encodeString('\r\n\r\n') as Uint8Array, pos);
+        if (hdrEnd < 0) break;
+        const hdrStr = engine.decodeString(body.subarray(pos, hdrEnd));
+        pos = hdrEnd + 4;
+
+        // Extract name and filename from Content-Disposition.
+        const nameMatch = hdrStr.match(/name="([^"]+)"/);
+        const filenameMatch = hdrStr.match(/filename="([^"]+)"/);
+        const ctMatch = hdrStr.match(/Content-Type:\s*(.+)/i);
+        const name = nameMatch?.[1] ?? '';
+
+        // Find next boundary.
+        const nextBnd = indexOf(body, delimiter, pos);
+        if (nextBnd < 0) break;
+        // Body is everything before the CRLF that precedes the boundary.
+        const partBody = body.subarray(pos, nextBnd);
+        pos = nextBnd + delimiter.length;
+
+        if (filenameMatch) {
+            const ct = ctMatch?.[1]?.trim() || 'application/octet-stream';
+            const blob = new Blob([partBody], { type: ct });
+            // File polyfill: Blob + name.
+            Object.defineProperty(blob, 'name', { value: filenameMatch[1] });
+            fd.append(name, blob as any, filenameMatch[1]);
+        } else {
+            fd.append(name, engine.decodeString(partBody));
+        }
+    }
+    return fd;
+}
+
+function indexOf(haystack: Uint8Array, needle: Uint8Array, from: number): number {
+    outer:
+    for (let i = from; i <= haystack.length - needle.length; i++) {
+        for (let j = 0; j < needle.length; j++) {
+            if (haystack[i + j] !== needle[j]) continue outer;
+        }
+        return i;
+    }
+    return -1;
 }
 
 
@@ -292,7 +442,10 @@ export class Response implements globalThis.Response {
         let clonedBody: any = this._bodyBuffer;
         if (clonedBody === null && this.body) { const [s1, s2] = this.body.tee(); Object.defineProperty(this, 'body', { value: s1, writable: false, configurable: true }); clonedBody = s2; }
         const r = new Response(clonedBody, { status: this.status, statusText: this.statusText, headers: this.headers });
-        Object.defineProperty(r, 'type', { value: this.type }); Object.defineProperty(r, 'url', { value: this.url }); Object.defineProperty(r, 'redirected', { value: this.redirected });
+        Object.defineProperty(r, 'type', { value: this.type });
+        Object.defineProperty(r, 'url', { value: this.url });
+        Object.defineProperty(r, 'redirected', { value: this.redirected });
+        Object.defineProperty(r, 'ok', { value: this.ok });
         return r;
     }
 
@@ -305,7 +458,18 @@ export class Response implements globalThis.Response {
     }
     arrayBuffer(): Promise<ArrayBuffer> { return this.bytes().then((b: Uint8Array) => b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength)); }
     async blob(): Promise<Blob> { return new Blob([await this.arrayBuffer()], { type: this.headers.get('content-type') || 'application/octet-stream' }); }
-    async formData(): Promise<FormData> { throw new Error('FormData parsing not yet implemented'); }
+    async formData(): Promise<FormData> {
+        const buf = await this.arrayBuffer();
+        const bytes = new Uint8Array(buf);
+        const ct = this.headers.get('content-type') ?? '';
+        if (ct.includes('multipart/form-data')) {
+            const m = ct.match(/boundary=([^\s;]+)/i);
+            if (!m) throw new TypeError('Missing multipart boundary');
+            return parseMultipart(bytes, m[1]);
+        }
+        if (ct.includes('application/x-www-form-urlencoded')) return parseUrlEncoded(bytes);
+        throw new TypeError(`Unsupported content type for formData(): ${ct}`);
+    }
     async json<T = any>(): Promise<T> { return JSON.parse(await this.text()); }
     async text(): Promise<string> {
         const buf = await this.arrayBuffer();
@@ -322,6 +486,36 @@ export class Response implements globalThis.Response {
 // fetch() — curl-backed, AbortSignal directly cancels curl
 // ---------------------------------------------------------------------------
 
+let _fetchIdCounter = 0;
+function newRequestId(): string { return `fetch-${++_fetchIdCounter}`; }
+
+/** Write a PEM string to a temp file and return its path. */
+async function writeTempPem(name: string, pem: string) {
+    const path = `${os.tmpDir}/ca-${name}-${Math.random().toString(36).slice(2, 8)}.pem`;
+    const f = await asyncfs.open(path, 'w');
+    await f.write(engine.encodeString(pem));
+    f.close();
+    return path;
+}
+
+/** Apply Deno.HttpClient proxy + mTLS settings to a curl handle. */
+async function applyClientToCurl(curl: CModuleCURL.CURL, client: HttpClient) {
+    const proxyUrl = client.getProxyUrl();
+    if (proxyUrl) {
+        if (!['http', 'https', 'socks4', 'socks4a', 'socks5', 'socks5h'].includes(proxyUrl.protocol))
+            throw new Error(`Unsupported proxy protocol: ${proxyUrl.protocol}`);
+        curl.setProxy(proxyUrl.href, proxyUrl.protocol as any);
+    }
+    // mTLS: HttpClient stores PEM strings; curl needs file paths.
+    const opts = client.options;
+    if (opts.caCerts?.length) {
+        const caPem = opts.caCerts.join('\n');
+        curl.setCABundle(await writeTempPem('ca', caPem));
+    }
+    if (opts.cert) curl.setOpt(curlMod.CURLOPT_SSLCERT, await writeTempPem('cert', opts.cert));
+    if (opts.key) curl.setOpt(curlMod.CURLOPT_SSLKEY, await writeTempPem('key', opts.key));
+}
+
 async function performFetch(request: Request, url: URL): Promise<Response> {
     throwIfAborted(request.signal);
     const body = await request.getBodyBuffer();
@@ -329,9 +523,33 @@ async function performFetch(request: Request, url: URL): Promise<Response> {
 
     const curl = new curlMod.CURL(getCurlPool());
 
+    // If a Deno.HttpClient is attached, apply its proxy/SSL config to curl
+    // instead of reimplementing HTTP on a raw socket.
+    const client = (await import('../deno/07_http')).getRequestClient(request);
+    if (client) {
+        await applyClientToCurl(curl, client);
+    }
+    const netHook = getFetchHook();
+    const interceptHook = getFetchInterceptHook();
+    const requestId = (netHook || interceptHook) ? newRequestId() : '';
+    const ts = () => Date.now() / 1000;
+
+    // Build final headers: request headers + extra CDP headers + UA override
+    const finalHeaders = new Headers(request.headers);
+    const extraHdrs = getExtraHTTPHeaders();
+    for (const [k, v] of Object.entries(extraHdrs))
+        finalHeaders.set(k, v);
+
+    const uaOverride = getUserAgentOverride();
+    if (uaOverride)
+        finalHeaders.set('User-Agent', uaOverride);
+    else if (!finalHeaders.has('User-Agent'))
+        finalHeaders.set('User-Agent', `cno/${version}`);
+
+    const objHeaders = Object.fromEntries(finalHeaders.entries());
     curl.setUrl(url.href)
         .setMethod(request.method)
-        .setHeaders(headersToRecord(headersToArray(request.headers)));
+        .setHeaders(objHeaders);
 
     if (request.timeout > 0) {
         curl.setTimeout(request.timeout);
@@ -429,21 +647,107 @@ async function performFetch(request: Request, url: URL): Promise<Response> {
         else if (bodyTerminal?.type === 'error') controller.error(bodyTerminal.error);
     };
 
+    const followingRedirects = request.redirect !== 'error' && request.redirect !== 'manual';
+    let didRedirect = false;
+    let waitingForFinalHeaders = false; // true between a redirect hop and the final onHeadersComplete
+
     curl.onHeadersComplete((status, headers) => {
+        const isRedirectStatus = status >= 300 && status < 400;
+
+        // When curl follows redirects, onHeadersComplete fires for each hop.
+        // Skip intermediate redirect responses entirely — the netHook and
+        // headersDone should only see the FINAL response.
+        if (isRedirectStatus && followingRedirects) {
+            didRedirect = true;
+            waitingForFinalHeaders = true;
+            // Discard any body chunks accumulated from the redirect response
+            // so the body stream and netHook only contain the final response.
+            pendingBodyChunks.length = 0;
+            return;
+        }
+
+        waitingForFinalHeaders = false;
+
+        if (netHook) {
+            const hdrs: Record<string, string> = {};
+            parseHeaders(headers).forEach(([k, v]) => { hdrs[k] = v; });
+            try {
+                netHook.onResponse?.({
+                    requestId, url: url.href, status, headers: hdrs,
+                    requestHeaders: objHeaders,
+                    connection: buildConnectionInfo(curl, reqStartTime), timestamp: ts()
+                });
+            } catch {}
+        }
+
         headersDone.resolve({ status, headers });
     });
 
     curl.onData((chunk: ArrayBuffer) => {
+        // Skip netHook emission for redirect body data (e.g. 302 HTML page).
+        if (!waitingForFinalHeaders && netHook) {
+            try { netHook.onData?.({ requestId, data: new Uint8Array(chunk), timestamp: ts() }); } catch {}
+        }
         return enqueueBodyChunk(new Uint8Array(chunk));
     });
 
+    // CDP Fetch interception: pause request before sending, let DevTools
+    // modify/fulfill/fail it. Must happen after all curl options are configured
+    // and after AbortSignal is wired, but before perform().
+    if (interceptHook?.onRequest) {
+        const result = await interceptHook.onRequest({
+            requestId, url: url.href, method: request.method,
+            headers: objHeaders, postData: body ?? null,
+        });
+        if (result) {
+            if (result.action === 'fulfill') {
+                removeAbortHandler();
+                try { curl.abort(); } catch {}
+                const resHeaders = new Headers();
+                for (const [k, v] of result.responseHeaders) resHeaders.set(k, v);
+                return new Response(result.body, { status: result.responseCode, headers: resHeaders });
+            }
+            if (result.action === 'fail') {
+                removeAbortHandler();
+                try { curl.abort(); } catch {}
+                throw new TypeError(`Request blocked: ${result.reason}`);
+            }
+            // action === 'continue': apply modifications to the already-configured curl handle
+            if (result.url) curl.setUrl(result.url);
+            if (result.method) curl.setMethod(result.method);
+            if (result.headers) curl.setHeaders(result.headers);
+            if (result.postData) curl.setBody(
+                result.postData.buffer.slice(result.postData.byteOffset, result.postData.byteOffset + result.postData.byteLength) as ArrayBuffer
+            );
+        }
+    }
+
+    // call hook
+    if (netHook) try {
+        netHook.onRequest?.({
+            requestId, url: url.href, method: request.method,
+            headers: objHeaders, postData: body ?? null, timestamp: ts()
+        });
+    } catch {}
+
     // perform() runs in background; we await headers independently
+    const reqStartTime = Date.now() / 1000;  // absolute start for timing delta calc
     const performPromise = curl.perform().then(
-        closeBody,
+        () => {
+            closeBody();
+            if (netHook) {
+                const conn = buildConnectionInfo(curl, reqStartTime);
+                try { netHook.onFinished?.({ requestId, success: true, connection: conn, timestamp: ts() }); } catch {}
+            }
+        },
         (err: Error) => {
             const fetchErr = isCurlTimeoutError(err) ? timeoutError() : err;
             headersDone.reject(fetchErr);
             errorBody(fetchErr);
+            if (netHook) {
+                const conn = buildConnectionInfo(curl, reqStartTime);
+                try { netHook.onFinished?.({ requestId, success: false, errorText: fetchErr.message, connection: conn, timestamp: ts() }); } catch {}
+            }
         }
     ).finally(removeAbortHandler);
 
@@ -469,8 +773,10 @@ async function performFetch(request: Request, url: URL): Promise<Response> {
         });
 
         const result = new Response(bodyStream, { status, headers: responseHeaders });
-        Object.defineProperty(result, 'url', { value: url.href });
-        Object.defineProperty(result, 'redirected', { value: isRedirect });
+        let finalUrl = url.href;
+        try { finalUrl = curl.getInfo(curlMod.CURLINFO_EFFECTIVE_URL) as string || url.href; } catch {}
+        Object.defineProperty(result, 'url', { value: finalUrl });
+        Object.defineProperty(result, 'redirected', { value: didRedirect || isRedirect || finalUrl !== url.href });
         return result;
     } catch (err) {
         curl.abort();

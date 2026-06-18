@@ -16,6 +16,7 @@ import { AtomicOperation } from './atomic';
 const QUEUE_PREFIX = '__kv_queue__';
 const MAX_QUEUE_DELAY = 30 * 24 * 60 * 60 * 1000; // 30 days
 const { setInterval, clearInterval } = import.meta.use('timers');
+const console = import.meta.use('console');
 
 interface WatchSubscription {
     keys: KvKey[];
