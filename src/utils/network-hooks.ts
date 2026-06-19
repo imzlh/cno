@@ -17,12 +17,22 @@ export function getExtraHTTPHeaders(): Record<string, string> { return _extraHTT
 
 // ---- Fetch hooks -----------------------------------------------------------
 
+export interface NetworkCallFrame {
+    functionName: string;
+    scriptId: string;
+    url: string;
+    lineNumber: number;
+    columnNumber: number;
+}
+
 export interface FetchRequestInfo {
     requestId: string;
     url: string;
     method: string;
     headers: Record<string, string>;
     postData?: Uint8Array | null;  // raw request body bytes
+    callFrames?: NetworkCallFrame[];
+    resourceType?: 'Fetch' | 'XHR';
     timestamp: number;
 }
 
@@ -32,6 +42,7 @@ export interface FetchResponseInfo {
     status: number;
     headers: Record<string, string>;
     requestHeaders?: Record<string, string>; // headers that were sent
+    resourceType?: 'Fetch' | 'XHR';
     connection?: FetchConnectionInfo;        // curl timing available at response time
     timestamp: number;
 }
@@ -84,6 +95,13 @@ export interface FetchConnectionInfo {
         redirectCount?: number;
         /** CURLINFO_REDIRECT_URL — redirect target URL. */
         redirectUrl?: string;
+        requestHeadersText?: string;
+        responseHeadersText?: string;
+        debugStart?: number;
+        headerOutStart?: number;
+        dataOutStart?: number;
+        headerInStart?: number;
+        dataInStart?: number;
     };
 }
 
@@ -104,11 +122,64 @@ export function getFetchHook(): FetchHook | null {
     return fetchHook;
 }
 
+// ---- Deno.serve hooks ------------------------------------------------------
+
+export interface ServeRequestInfo {
+    requestId: string;
+    url: string;
+    method: string;
+    headers: Record<string, string>;
+    postData?: Uint8Array | null;
+    callFrames?: NetworkCallFrame[];
+    timestamp: number;
+}
+
+export interface ServeResponseInfo {
+    requestId: string;
+    url: string;
+    status: number;
+    statusText?: string;
+    headers: Record<string, string>;
+    timestamp: number;
+}
+
+export interface ServeDataInfo {
+    requestId: string;
+    data: Uint8Array;
+    timestamp: number;
+}
+
+export interface ServeFinishedInfo {
+    requestId: string;
+    success: boolean;
+    errorText?: string;
+    timestamp: number;
+}
+
+export type ServeHook = {
+    onRequest?(info: ServeRequestInfo): void;
+    onResponse?(info: ServeResponseInfo): void;
+    onData?(info: ServeDataInfo): void;
+    onFinished?(info: ServeFinishedInfo): void;
+};
+
+let serveHook: ServeHook | null = null;
+
+export function setServeHook(hook: ServeHook | null): void {
+    serveHook = hook;
+}
+
+export function getServeHook(): ServeHook | null {
+    return serveHook;
+}
+
 // ---- WebSocket hooks -------------------------------------------------------
 
 export interface WSCreatedInfo {
     requestId: string;
     url: string;
+    requestHeaders?: Array<[string, string]>;
+    callFrames?: NetworkCallFrame[];
     timestamp: number;
 }
 

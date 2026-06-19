@@ -10,11 +10,12 @@ import { assert } from "../utils/assert";
 import { type ISocket } from "@cnojs/http/socket"
 import { connectTcp, buildRequest, readHeaders } from "../utils/http"
 import { CloseEvent, ErrorEvent, MessageEvent } from "./events";
-import { getWebSocketHook, type WSFrameInfo } from '../utils/network-hooks';
+import { getWebSocketHook, type NetworkCallFrame, type WSFrameInfo } from '../utils/network-hooks';
 
 const engine = import.meta.use('engine');
 const algo = import.meta.use('algorithm');
 const crypto = import.meta.use('crypto');
+const debug = import.meta.use('debug');
 const timers = import.meta.use('timers');
 const streams = import.meta.use('streams');
 const ssl = import.meta.use('ssl');
@@ -24,6 +25,27 @@ type IWSSocket = Omit<ISocket, 'serverHandshake' | 'alpnProtocol' | 'read'>;
 
 let _wsIdCounter = 0;
 const wsTs = () => Date.now() / 1000;
+
+function captureWebSocketCallFrames(): NetworkCallFrame[] | undefined {
+    const frames: NetworkCallFrame[] = [];
+    try {
+        const depth = debug.getStackDepth();
+        for (let level = 0; level < Math.min(depth, 32); level++) {
+            try {
+                const info = debug.getFrameInfo(level);
+                if (!info) continue;
+                frames.push({
+                    functionName: info.func?.name || '',
+                    scriptId: info.file,
+                    url: info.file,
+                    lineNumber: Math.max(0, info.line - 1),
+                    columnNumber: Math.max(0, info.column - 1),
+                });
+            } catch {}
+        }
+    } catch {}
+    return frames.length > 0 ? frames : undefined;
+}
 
 export enum OpCode {
     CONTINUATION = 0x0, TEXT = 0x1, BINARY = 0x2,
@@ -195,6 +217,7 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
     private pingInterval: number | null = null;
     private pongTimeout: number | null = null;
     private _wsKey: string = '';
+    private _initiatorCallFrames?: NetworkCallFrame[];
     private closeCode: number = WebSocketCloseCode.NO_STATUS;
     private closeReason: string = '';
     private _closeTimer: number | null = null;
@@ -246,7 +269,8 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
             const wsHook = getWebSocketHook();
             if (wsHook) {
                 this._netRequestId = `ws-${++_wsIdCounter}`;
-                try { wsHook.onCreated?.({ requestId: this._netRequestId, url: this.url, timestamp: wsTs() }); } catch {}
+                this._initiatorCallFrames = captureWebSocketCallFrames();
+                try { wsHook.onCreated?.({ requestId: this._netRequestId, url: this.url, callFrames: this._initiatorCallFrames, timestamp: wsTs() }); } catch {}
             }
 
             this.connection = await connectTcp(url);
@@ -269,6 +293,20 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
             'Sec-WebSocket-Version': '13', 'Sec-WebSocket-Key': this._wsKey
         });
         if (this.protocol) headers.set('Sec-WebSocket-Protocol', this.protocol);
+        if (this._netRequestId) {
+            const wsHook = getWebSocketHook();
+            if (wsHook) {
+                try {
+                    wsHook.onCreated?.({
+                        requestId: this._netRequestId,
+                        url: url.href,
+                        requestHeaders: Array.from(headers.entries()),
+                        callFrames: this._initiatorCallFrames,
+                        timestamp: wsTs(),
+                    });
+                } catch {}
+            }
+        }
         await this.connection.write(buildRequest({ method: 'GET', url, headers }));
     }
 

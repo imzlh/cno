@@ -8,20 +8,67 @@ import { assert } from '../utils/assert';
 import { createWebSocketFromConnection } from "../webapi/websocket";
 import { wrapFsClassDec as wrap, wrapFSns } from "../utils/wrap";
 import { errors } from './01_errors';
+import { getServeHook, type NetworkCallFrame } from '../utils/network-hooks';
 import type { ISocket } from "@cnojs/http/socket";
 
 const crypto = import.meta.use('crypto');
 const engine = import.meta.use('engine');
 const http = import.meta.use('http');
+const debug = import.meta.use('debug');
 
 /* ------------------------------------------------------------------ */
 /* WebSocket Upgrade Symbol                                           */
 /* ------------------------------------------------------------------ */
 
 const websocketSymbol = Symbol('deno.serve.websocket');
+let serveRequestSeq = 0;
 
 interface WebSocketResponse extends Response {
     [websocketSymbol]?: (conn: ISocket) => void;
+}
+
+class ServeResponseWriteError extends Error {}
+
+function serveTs(): number {
+    return Date.now() / 1000;
+}
+
+function newServeRequestId(): string {
+    return `serve-${++serveRequestSeq}`;
+}
+
+function captureServeCallFrames(): NetworkCallFrame[] | undefined {
+    const frames: NetworkCallFrame[] = [];
+    try {
+        const depth = debug.getStackDepth();
+        for (let level = 0; level < Math.min(depth, 32); level++) {
+            try {
+                const info = debug.getFrameInfo(level);
+                if (!info) continue;
+                const fname = info.func?.name || '';
+                frames.push({
+                    functionName: fname,
+                    scriptId: info.file,
+                    url: info.file,
+                    lineNumber: Math.max(0, info.line - 1),
+                    columnNumber: Math.max(0, info.column - 1),
+                });
+            } catch {}
+        }
+    } catch {}
+    return frames.length > 0 ? frames : undefined;
+}
+
+function headersArrayToRecord(headers: Array<[string, string]>): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const [k, v] of headers) out[k] = v;
+    return out;
+}
+
+function headersToRecord(headers: Headers): Record<string, string> {
+    const out: Record<string, string> = {};
+    headers.forEach((value, key) => { out[key] = value; });
+    return out;
 }
 
 /* ------------------------------------------------------------------ */
@@ -51,12 +98,25 @@ function createWebRequest(coreReq: HttpRequest, connInfo: { hostname: string; po
  */
 class ResponseAdapter {
     private coreRes: HttpResponse;
-    private headersSent = false;
+    private finishedEmitted = false;
     private method: string;
+    private requestId: string;
+    private url: string;
 
-    constructor(coreRes: HttpResponse, method: string) {
+    constructor(coreRes: HttpResponse, method: string, requestId: string, url: string) {
         this.coreRes = coreRes;
         this.method = method;
+        this.requestId = requestId;
+        this.url = url;
+    }
+
+    private emitFinished(success: boolean, errorText?: string): void {
+        if (this.finishedEmitted) return;
+        this.finishedEmitted = true;
+        const serveHook = getServeHook();
+        if (serveHook) try {
+            serveHook.onFinished?.({ requestId: this.requestId, success, errorText, timestamp: serveTs() });
+        } catch {}
     }
 
     verify(res: Response): void {
@@ -122,8 +182,18 @@ class ResponseAdapter {
 
         const headers = Array.from(headers2.entries());
         const statusText = response.statusText ?? http.strstatus(response.status);
+        const serveHook = getServeHook();
+        if (serveHook) try {
+            serveHook.onResponse?.({
+                requestId: this.requestId,
+                url: this.url,
+                status: response.status,
+                statusText,
+                headers: headersToRecord(headers2),
+                timestamp: serveTs()
+            });
+        } catch {}
         await this.coreRes.writeHead(response.status, statusText, headers);
-        this.headersSent = true;
 
         if (hasBody) {
             const reader = response.body!.getReader();
@@ -131,17 +201,23 @@ class ResponseAdapter {
                 while (true) {
                     const { done, value } = await reader.read();
                     if (done) break;
+                    if (serveHook) try {
+                        serveHook.onData?.({ requestId: this.requestId, data: value, timestamp: serveTs() });
+                    } catch {}
                     await this.coreRes.write(value);
                 }
             } catch (err) {
+                const message = String((err as Error)?.message ?? err);
+                this.emitFinished(false, message);
                 this.coreRes.close();
-                throw err;
+                throw new ServeResponseWriteError(message);
             } finally {
                 reader.releaseLock();
             }
         }
 
         await this.coreRes.end();
+        this.emitFinished(true);
     }
 
     /**
@@ -152,6 +228,18 @@ class ResponseAdapter {
         // Send upgrade headers
         const headers = Array.from(response.headers.entries());
         const statusText = response.statusText ?? http.strstatus(response.status);
+        const serveHook = getServeHook();
+        if (serveHook) try {
+            serveHook.onResponse?.({
+                requestId: this.requestId,
+                url: this.url,
+                status: response.status,
+                statusText,
+                headers: headersToRecord(response.headers),
+                timestamp: serveTs()
+            });
+            this.emitFinished(true);
+        } catch {}
         await this.coreRes.writeHead(response.status, statusText, headers);
 
         // Upgrade connection
@@ -258,9 +346,14 @@ function serve(
         throw new Deno.errors.NotSupported('Unix socket server not yet implemented');
     }
 
+    const serveCallFrames = getServeHook() ? captureServeCallFrames() : undefined;
+
     // Create core server
     const coreServer = createServer(
         async (req, res) => {
+            const serveHook = getServeHook();
+            const requestId = serveHook ? newServeRequestId() : '';
+            let requestUrl = '';
             try {
                 // Create Web API Request
                 const addr = coreServer.address();
@@ -269,6 +362,18 @@ function serve(
                     port: addr?.port || options.port || 8000,
                     secure: coreServer.isSecure
                 });
+                requestUrl = webRequest.url;
+                if (serveHook) try {
+                    serveHook.onRequest?.({
+                        requestId,
+                        url: requestUrl,
+                        method: req.method,
+                        headers: headersArrayToRecord(req.headers),
+                        postData: req.body ?? null,
+                        callFrames: serveCallFrames,
+                        timestamp: serveTs()
+                    });
+                } catch {}
 
                 // Create connection info
                 const connInfo: Deno.ServeHandlerInfo = {
@@ -286,20 +391,38 @@ function serve(
                     throw new TypeError('Handler must return a Response');
                 }
 
-                const adapter = new ResponseAdapter(res, req.method);
+                const adapter = new ResponseAdapter(res, req.method, requestId, requestUrl);
                 await adapter.sendResponse(webResponse);
 
             } catch (error) {
-                if (!(error instanceof errors.ConnectionReset)) {
+                if (error instanceof ServeResponseWriteError) {
+                    // The adapter already reported loadingFailed and closed the connection.
+                } else if (!(error instanceof errors.ConnectionReset)) {
                     // Send 500 error
                     try {
-                        await res.writeHead(500, 'Internal Server Error', [
-                            ['Content-Type', 'text/plain']
-                        ]);
-                        await res.end('Internal Server Error');
+                        const body = 'Internal Server Error';
+                        const headers: Array<[string, string]> = [['Content-Type', 'text/plain']];
+                        if (serveHook && requestId) {
+                            serveHook.onResponse?.({
+                                requestId,
+                                url: requestUrl,
+                                status: 500,
+                                statusText: 'Internal Server Error',
+                                headers: headersArrayToRecord(headers),
+                                timestamp: serveTs()
+                            });
+                            serveHook.onData?.({ requestId, data: engine.encodeString(body) as Uint8Array, timestamp: serveTs() });
+                        }
+                        await res.writeHead(500, 'Internal Server Error', headers);
+                        await res.end(body);
+                        if (serveHook && requestId) serveHook.onFinished?.({ requestId, success: true, timestamp: serveTs() });
                     } catch (e) {
                         // Ignore
                     }
+                } else if (serveHook && requestId) {
+                    try {
+                        serveHook.onFinished?.({ requestId, success: false, errorText: String((error as Error)?.message ?? error), timestamp: serveTs() });
+                    } catch {}
                 }
             }
         },

@@ -9,13 +9,14 @@ import { Headers } from "headers-polyfill";
 import { DOMException, EventTarget } from "./events";
 import { version } from "../../package.json";
 
-import { getFetchHook, getUserAgentOverride, getExtraHTTPHeaders, getFetchInterceptHook, type FetchConnectionInfo } from '../utils/network-hooks';
+import { getFetchHook, getUserAgentOverride, getExtraHTTPHeaders, getFetchInterceptHook, type FetchConnectionInfo, type NetworkCallFrame } from '../utils/network-hooks';
 import { type HttpClient } from '../deno/07_http';
 
 const curlMod = import.meta.use("curl");
 const asyncfs = import.meta.use("asyncfs");
 const os = import.meta.use("os");
 const engine = import.meta.use("engine");
+const debug = import.meta.use("debug");
 const { Decoder } = import.meta.use("text");
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
@@ -33,7 +34,61 @@ function curlStr(curl: CModuleCURL.CURL, flag: number): string | undefined {
     return v != null ? String(v) : undefined;
 }
 
-function buildConnectionInfo(curl: CModuleCURL.CURL, reqStartTime: number): FetchConnectionInfo | undefined {
+function captureNetworkCallFrames(): NetworkCallFrame[] | undefined {
+    const frames: NetworkCallFrame[] = [];
+    try {
+        const depth = debug.getStackDepth();
+        for (let level = 0; level < Math.min(depth, 32); level++) {
+            try {
+                const info = debug.getFrameInfo(level);
+                if (!info) continue;
+                const fname = info.func?.name || '';
+                frames.push({
+                    functionName: fname,
+                    scriptId: info.file,
+                    url: info.file,
+                    lineNumber: Math.max(0, info.line - 1),
+                    columnNumber: Math.max(0, info.column - 1),
+                });
+            } catch {}
+        }
+    } catch {}
+    return frames.length > 0 ? frames : undefined;
+}
+
+interface CurlDebugTrace {
+    requestHeadersText?: string;
+    responseHeadersText?: string;
+    debugStart?: number;
+    headerOutStart?: number;
+    dataOutStart?: number;
+    headerInStart?: number;
+    dataInStart?: number;
+}
+
+function attachCurlDebugTrace(curl: CModuleCURL.CURL): CurlDebugTrace {
+    const trace: CurlDebugTrace = {};
+    const decoder = new Decoder();
+    curl.onDebug((type, data) => {
+        const now = Date.now() / 1000;
+        if (trace.debugStart == null) trace.debugStart = now;
+        if (type === curlMod.CURLINFO_HEADER_OUT) {
+            if (trace.headerOutStart == null) trace.headerOutStart = now;
+            trace.requestHeadersText = decoder.decode(new Uint8Array(data));
+        } else if (type === curlMod.CURLINFO_HEADER_IN) {
+            if (trace.headerInStart == null) trace.headerInStart = now;
+            const text = decoder.decode(new Uint8Array(data));
+            trace.responseHeadersText = /^HTTP\//i.test(text) ? text : (trace.responseHeadersText ?? '') + text;
+        } else if (type === curlMod.CURLINFO_DATA_OUT) {
+            if (trace.dataOutStart == null) trace.dataOutStart = now;
+        } else if (type === curlMod.CURLINFO_DATA_IN) {
+            if (trace.dataInStart == null) trace.dataInStart = now;
+        }
+    });
+    return trace;
+}
+
+function buildConnectionInfo(curl: CModuleCURL.CURL, reqStartTime: number, trace?: CurlDebugTrace): FetchConnectionInfo | undefined {
     try {
         const info = curl.getInfo();
         // Force C-wrapper values to JS primitives.
@@ -80,6 +135,13 @@ function buildConnectionInfo(curl: CModuleCURL.CURL, reqStartTime: number): Fetc
                 headerSize:    hdrSize  ?? undefined,
                 redirectCount: redirCnt ?? undefined,
                 redirectUrl:   redirUrl ?? undefined,
+                requestHeadersText: trace?.requestHeadersText,
+                responseHeadersText: trace?.responseHeadersText,
+                debugStart: trace?.debugStart,
+                headerOutStart: trace?.headerOutStart,
+                dataOutStart: trace?.dataOutStart,
+                headerInStart: trace?.headerInStart,
+                dataInStart: trace?.dataInStart,
             },
         };
     } catch { return undefined; }
@@ -177,12 +239,6 @@ function headersToArray(headers: Headers): Array<[string, string]> {
  * Convert array of header pairs to Record for curl.setHeaders().
  * Note: duplicates are merged (last wins) — curl API limitation.
  */
-function headersToRecord(headers: Array<[string, string]>): Record<string, string> {
-    const out: Record<string, string> = {};
-    for (const [k, v] of headers) out[k] = v;
-    return out;
-}
-
 function responseBodyToBytes(body?: string | ArrayBuffer): Uint8Array {
     if (!body) return new Uint8Array(0);
     if (typeof body === "string") return engine.encodeString(body) as Uint8Array;
@@ -226,6 +282,7 @@ export class Request implements globalThis.Request {
     public readonly duplex: 'half' = 'half';
     private _bodySource: any = null;
     private _bodyBuffer: Uint8Array | null = null;
+    private _initiatorCallFrames?: NetworkCallFrame[];
 
     constructor(input: any, init?: any) {
         if (input instanceof URL) {
@@ -269,7 +326,17 @@ export class Request implements globalThis.Request {
 
     clone(): Request {
         if (this.bodyUsed) throw new TypeError('Already read');
-        return new Request(this.url, { method: this.method, headers: this.headers, body: this._bodySource, cache: this.cache, credentials: this.credentials, integrity: this.integrity, keepalive: this.keepalive, mode: this.mode, redirect: this.redirect, referrer: this.referrer, referrerPolicy: this.referrerPolicy, signal: this.signal, timeout: this.timeout });
+        const cloned = new Request(this.url, { method: this.method, headers: this.headers, body: this._bodySource, cache: this.cache, credentials: this.credentials, integrity: this.integrity, keepalive: this.keepalive, mode: this.mode, redirect: this.redirect, referrer: this.referrer, referrerPolicy: this.referrerPolicy, signal: this.signal, timeout: this.timeout });
+        cloned._initiatorCallFrames = this._initiatorCallFrames;
+        return cloned;
+    }
+
+    setInitiatorCallFrames(callFrames: NetworkCallFrame[] | undefined): void {
+        this._initiatorCallFrames = callFrames;
+    }
+
+    getInitiatorCallFrames(): NetworkCallFrame[] | undefined {
+        return this._initiatorCallFrames;
     }
 
     async getBodyBuffer(): Promise<Uint8Array | null> {
@@ -530,9 +597,11 @@ async function performFetch(request: Request, url: URL): Promise<Response> {
         await applyClientToCurl(curl, client);
     }
     const netHook = getFetchHook();
+    const curlTrace = netHook ? attachCurlDebugTrace(curl) : undefined;
     const interceptHook = getFetchInterceptHook();
     const requestId = (netHook || interceptHook) ? newRequestId() : '';
     const ts = () => Date.now() / 1000;
+    const reqCallFrames = netHook ? request.getInitiatorCallFrames() : undefined;
 
     // Build final headers: request headers + extra CDP headers + UA override
     const finalHeaders = new Headers(request.headers);
@@ -675,7 +744,8 @@ async function performFetch(request: Request, url: URL): Promise<Response> {
                 netHook.onResponse?.({
                     requestId, url: url.href, status, headers: hdrs,
                     requestHeaders: objHeaders,
-                    connection: buildConnectionInfo(curl, reqStartTime), timestamp: ts()
+                    resourceType: 'Fetch',
+                    connection: buildConnectionInfo(curl, reqStartTime, curlTrace), timestamp: ts()
                 });
             } catch {}
         }
@@ -697,7 +767,7 @@ async function performFetch(request: Request, url: URL): Promise<Response> {
     if (interceptHook?.onRequest) {
         const result = await interceptHook.onRequest({
             requestId, url: url.href, method: request.method,
-            headers: objHeaders, postData: body ?? null,
+            headers: objHeaders, postData: body ?? null, resourceType: 'Fetch',
         });
         if (result) {
             if (result.action === 'fulfill') {
@@ -723,20 +793,20 @@ async function performFetch(request: Request, url: URL): Promise<Response> {
     }
 
     // call hook
+    const reqStartTime = Date.now() / 1000;  // absolute start for timing delta calc
     if (netHook) try {
         netHook.onRequest?.({
             requestId, url: url.href, method: request.method,
-            headers: objHeaders, postData: body ?? null, timestamp: ts()
+            headers: objHeaders, postData: body ?? null, callFrames: reqCallFrames, resourceType: 'Fetch', timestamp: reqStartTime
         });
     } catch {}
 
     // perform() runs in background; we await headers independently
-    const reqStartTime = Date.now() / 1000;  // absolute start for timing delta calc
     const performPromise = curl.perform().then(
         () => {
             closeBody();
             if (netHook) {
-                const conn = buildConnectionInfo(curl, reqStartTime);
+                const conn = buildConnectionInfo(curl, reqStartTime, curlTrace);
                 try { netHook.onFinished?.({ requestId, success: true, connection: conn, timestamp: ts() }); } catch {}
             }
         },
@@ -745,7 +815,7 @@ async function performFetch(request: Request, url: URL): Promise<Response> {
             headersDone.reject(fetchErr);
             errorBody(fetchErr);
             if (netHook) {
-                const conn = buildConnectionInfo(curl, reqStartTime);
+                const conn = buildConnectionInfo(curl, reqStartTime, curlTrace);
                 try { netHook.onFinished?.({ requestId, success: false, errorText: fetchErr.message, connection: conn, timestamp: ts() }); } catch {}
             }
         }
@@ -788,13 +858,19 @@ async function performFetch(request: Request, url: URL): Promise<Response> {
     }
 }
 
-export async function fetchAsync(input: any, init?: any): Promise<Response> {
+export async function fetchAsync(input: any, init?: any, initiatorCallFrames?: NetworkCallFrame[]): Promise<Response> {
     if (input instanceof URL) input = input.href;
     const request = new Request(input, init);
+    request.setInitiatorCallFrames(initiatorCallFrames);
     throwIfAborted(request.signal);
     const url = new URL(request.url);
     if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new TypeError(`Unsupported protocol: ${url.protocol}`);
     return performFetch(request, url);
+}
+
+function fetch(input: any, init?: any): Promise<Response> {
+    const initiatorCallFrames = getFetchHook() ? captureNetworkCallFrames() : undefined;
+    return fetchAsync(input, init, initiatorCallFrames);
 }
 
 // ---------------------------------------------------------------------------
@@ -923,26 +999,23 @@ export class XMLHttpRequest extends EventTarget {
 
         const curl = new curlMod.CURL(getCurlPool());
         this._curl = curl;
-
-        // Build headers from setRequestHeader calls
-        const headers: Array<[string, string]> = [...this._headers];
-
-        // withCredentials: send cookies via Cookie header
-        if (this.withCredentials) {
-            // Cookies would need a cookie jar; placeholder for now
-        }
+        const netHook = getFetchHook();
+        const curlTrace = netHook ? attachCurlDebugTrace(curl) : undefined;
+        const interceptHook = getFetchInterceptHook();
+        const reqId = (netHook || interceptHook) ? newRequestId() : '';
+        const reqCallFrames = netHook ? captureNetworkCallFrames() : undefined;
+        const hdrs: Record<string, string> = {};
+        for (const [k, v] of this._headers) hdrs[k] = v;
 
         // Basic auth from open() user/password
         if (this._user !== null) {
             const auth = engine.encodeString(`${this._user}:${this._password ?? ''}`);
-            // Base64 encode
-            const b64 = btoa(String.fromCharCode(...auth));
-            headers.push(['Authorization', `Basic ${b64}`]);
+            hdrs['Authorization'] = `Basic ${btoa(String.fromCharCode(...auth))}`;
         }
 
         curl.setUrl(this._url)
             .setMethod(this._method)
-            .setHeaders(headersToRecord(headers))
+            .setHeaders(hdrs)
             .setFollowRedirects(true)
             .setMaxRedirects(20);
 
@@ -951,34 +1024,81 @@ export class XMLHttpRequest extends EventTarget {
             curl.setConnectTimeout(this.timeout);
         }
 
-        if (body !== undefined && body !== null) {
-            const data = serializeBody(body);
-            if (data) {
-                curl.setBody(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer);
-            }
+        const bodyBytes = (body !== undefined && body !== null) ? serializeBody(body) : null;
+        if (bodyBytes) {
+            curl.setBody(bodyBytes.buffer.slice(bodyBytes.byteOffset, bodyBytes.byteOffset + bodyBytes.byteLength) as ArrayBuffer);
         }
+
+        // CDP Fetch interception
+        if (interceptHook?.onRequest) {
+            interceptHook.onRequest({
+                requestId: reqId, url: this._url, method: this._method,
+                headers: hdrs, postData: bodyBytes ?? null, resourceType: 'XHR',
+            }).then(result => {
+                if (result?.action === 'fulfill') {
+                    this._handleInterceptedFulfill(result as any);
+                } else if (result?.action === 'fail') {
+                    this.readyState = XHR_DONE;
+                    this._emit('error');
+                    this._emit('loadend');
+                } else {
+                    this._doPerform(curl, netHook, reqId, hdrs, bodyBytes, reqCallFrames, curlTrace);
+                }
+            }).catch(() => this._doPerform(curl, netHook, reqId, hdrs, bodyBytes, reqCallFrames, curlTrace));
+        } else {
+            this._doPerform(curl, netHook, reqId, hdrs, bodyBytes, reqCallFrames, curlTrace);
+        }
+    }
+
+    private _doPerform(curl: CModuleCURL.CURL, netHook: ReturnType<typeof getFetchHook>, reqId: string, hdrs: Record<string, string>, bodyBytes: Uint8Array | null, reqCallFrames?: NetworkCallFrame[], curlTrace?: CurlDebugTrace): void {
+        const ts = () => Date.now() / 1000;
+        const reqStartTime = Date.now() / 1000;
+
+        if (netHook) try {
+            netHook.onRequest?.({ requestId: reqId, url: this._url, method: this._method, headers: hdrs, postData: bodyBytes ?? null, callFrames: reqCallFrames, resourceType: 'XHR', timestamp: reqStartTime });
+        } catch {}
 
         this._setState(XHR_HEADERS_RECEIVED);
 
+        const handleDone = (response: CModuleCURL.Response): void => {
+            if (this._aborted) return;
+            const conn = buildConnectionInfo(curl, reqStartTime, curlTrace);
+
+            // Parse response headers for netHook
+            const resHdrs: Record<string, string> = {};
+            parseHeaders(response.headers).forEach(([k, v]) => { resHdrs[k] = v; });
+
+            if (netHook) try {
+                netHook.onResponse?.({
+                    requestId: reqId, url: this._url, status: response.status,
+                    headers: resHdrs, requestHeaders: hdrs, resourceType: 'XHR', connection: conn, timestamp: ts()
+                });
+                const bytes = responseBodyToBytes(response.body);
+                netHook.onData?.({ requestId: reqId, data: bytes, timestamp: ts() });
+                netHook.onFinished?.({ requestId: reqId, success: true, connection: conn, timestamp: ts() });
+            } catch {}
+
+            this._handleResponse(response);
+        };
+
         if (this._async) {
-            curl.perform().then(response => {
+            curl.perform().then(handleDone).catch(() => {
                 if (this._aborted) return;
-                this._handleResponse(response);
-            }).catch(() => {
-                if (this._aborted) return;
+                if (netHook) try {
+                    netHook.onFinished?.({ requestId: reqId, success: false, errorText: 'network error', timestamp: ts() });
+                } catch {}
                 this.readyState = XHR_DONE;
                 this._emit('error');
                 this._emit('loadend');
             });
         } else {
-            // Synchronous mode
             try {
-                const response = curl.performSync();
-                if (!this._aborted) {
-                    this._handleResponse(response);
-                }
+                handleDone(curl.performSync());
             } catch {
                 if (!this._aborted) {
+                    if (netHook) try {
+                        netHook.onFinished?.({ requestId: reqId, success: false, errorText: 'network error', timestamp: ts() });
+                    } catch {}
                     this.readyState = XHR_DONE;
                     this._emit('error');
                     this._emit('loadend');
@@ -987,14 +1107,39 @@ export class XMLHttpRequest extends EventTarget {
         }
     }
 
+    private _handleInterceptedFulfill(result: { responseCode: number; responseHeaders: Array<[string, string]>; body: Uint8Array }): void {
+        const hdrs: string[] = [];
+        for (const [k, v] of result.responseHeaders) hdrs.push(`${k}: ${v}`);
+        this._responseHeaders = hdrs.join('\r\n');
+        this.status = result.responseCode;
+        this.statusText = '';
+        this.responseURL = this._url;
+        const bytes = result.body;
+        this._applyBody(bytes);
+        this._setState(XHR_LOADING);
+        this._setState(XHR_DONE);
+        this._emit('progress');
+        this._emit('load');
+        this._emit('loadend');
+    }
+
     private _handleResponse(response: CModuleCURL.Response): void {
         this.status = response.status;
         this.statusText = '';
         this._responseHeaders = response.headers;
-        this.responseURL = this._url;
+        try { this.responseURL = this._curl?.getInfo(curlMod.CURLINFO_EFFECTIVE_URL) as string || this._url; } catch { this.responseURL = this._url; }
 
         const bytes = responseBodyToBytes(response.body);
+        this._applyBody(bytes);
 
+        this._setState(XHR_LOADING);
+        this._setState(XHR_DONE);
+        this._emit('progress');
+        this._emit('load');
+        this._emit('loadend');
+    }
+
+    private _applyBody(bytes: Uint8Array): void {
         switch (this.responseType) {
             case '':
             case 'text':
@@ -1015,12 +1160,6 @@ export class XMLHttpRequest extends EventTarget {
                 this._responseText = engine.decodeString(bytes);
                 this._response = this._responseText;
         }
-
-        this._setState(XHR_LOADING);
-        this._setState(XHR_DONE);
-        this._emit('progress');
-        this._emit('load');
-        this._emit('loadend');
     }
 
     get response(): any { return this._response; }
@@ -1031,7 +1170,7 @@ export class XMLHttpRequest extends EventTarget {
 // Register globals
 // ---------------------------------------------------------------------------
 
-Reflect.set(globalThis, 'fetch', fetchAsync);
+Reflect.set(globalThis, 'fetch', fetch);
 Reflect.set(globalThis, 'Response', Response);
 Reflect.set(globalThis, 'Request', Request);
 Reflect.set(globalThis, 'XMLHttpRequest', XMLHttpRequest);
