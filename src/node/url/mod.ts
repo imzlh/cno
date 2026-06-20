@@ -19,7 +19,7 @@ export function parse(urlStr: string, parseQueryString?: boolean, slashesDenoteH
 } {
     const url = new URL(urlStr);
     const result: any = {
-        protocol: url.protocol.replace(':', ''),
+        protocol: url.protocol,
         host: url.host,
         auth: url.username ? (url.password ? `${url.username}:${url.password}` : url.username) : undefined,
         hostname: url.hostname,
@@ -100,10 +100,7 @@ export function domainToUnicode(domain: string): string {
 }
 
 export function fileURLToPath(url: string | URL): string {
-    if (typeof url === 'string' && !url.startsWith('file://')) {
-        url = `file://${url}`;
-    }
-    const parsed = new URL(url);
+    const parsed = typeof url === 'string' ? new URL(url) : url;
     if (parsed.protocol !== 'file:') {
         throw new TypeError('URL must be a file URL');
     }
@@ -111,10 +108,15 @@ export function fileURLToPath(url: string | URL): string {
     let path = decodeURIComponent(parsed.pathname);
 
     if (process.platform === 'win32') {
+        if (parsed.hostname) {
+            return `\\\\${parsed.hostname}${path.replace(/\//g, '\\')}`;
+        }
         if (path.startsWith('/')) {
             path = path.slice(1);
         }
         path = path.replace(/\//g, '\\');
+    } else if (parsed.hostname) {
+        path = `//${parsed.hostname}${path}`;
     }
 
     return path;

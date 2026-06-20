@@ -22,6 +22,19 @@ import {
     METHODS as HTTP_METHODS,
 } from '../http/server';
 import { ClientRequestArgs, Agent as HttpAgent } from '../http/client';
+import {
+    buildNodeServerUrl,
+    buildNodeUrl,
+    captureNodeNetworkCallFrames,
+    concatChunks,
+    getNodeFetchHook,
+    getNodeServeHook,
+    headerEntriesToRecord,
+    nextNodeRequestId,
+    nodeTs,
+    normalizeHeaderRecord,
+    toUint8Array,
+} from '../_internal/network-debug';
 
 const streams = import.meta.use('streams');
 const dns = import.meta.use('dns');
@@ -89,6 +102,7 @@ export interface HttpsServerOptions extends TlsServerOptions {
 export class Server extends EventEmitter {
     #tlsServer: TlsServer;
     #requestListener: ((req: IncomingMessageImpl, res: ServerResponseImpl) => void) | null = null;
+    #requestSerial = 0;
 
     constructor(options?: HttpsServerOptions, requestListener?: (req: IncomingMessageImpl, res: ServerResponseImpl) => void);
     constructor(requestListener?: (req: IncomingMessageImpl, res: ServerResponseImpl) => void);
@@ -105,6 +119,8 @@ export class Server extends EventEmitter {
 
         this.#tlsServer = new TlsServer(options, (tlsSocket: TLSSocket) => {
             if (!this.#requestListener) return;
+            const serveHook = getNodeServeHook();
+            const requestBodyChunks: Uint8Array[] = [];
 
             const incoming = new IncomingMessageImpl(null);
             incoming.socket = tlsSocket as any;
@@ -136,13 +152,90 @@ export class Server extends EventEmitter {
                 incoming.method = HTTP_METHODS[parser.state.method] || 'GET';
             };
             parser.onBody = (buf: any, off: number, len: number) => {
-                incoming.push(new Uint8Array(buf as ArrayBuffer).slice(off, off + len));
+                const chunk = new Uint8Array(buf as ArrayBuffer).slice(off, off + len);
+                requestBodyChunks.push(chunk);
+                incoming.push(chunk);
             };
             parser.onMessageComplete = () => {
                 incoming.push(null);
                 incoming.complete = true;
+                const requestId = nextNodeRequestId('https-serve');
+                const requestHeaders = normalizeHeaderRecord(incoming.headers as Record<string, string | string[] | undefined>);
+                const requestUrl = buildNodeServerUrl('https:', incoming.url, requestHeaders);
+                const requestCallFrames = captureNodeNetworkCallFrames();
+                let finished = false;
+                const finish = (success: boolean, errorText?: string) => {
+                    if (finished) return;
+                    finished = true;
+                    try {
+                        serveHook?.onFinished?.({ requestId, timestamp: nodeTs(), success, errorText });
+                    } catch {}
+                };
+                try {
+                    serveHook?.onRequest?.({
+                        requestId,
+                        timestamp: nodeTs(),
+                        url: requestUrl,
+                        method: incoming.method || 'GET',
+                        headers: requestHeaders,
+                        postData: concatChunks(requestBodyChunks),
+                        callFrames: requestCallFrames,
+                    });
+                } catch {}
+
+                const originalWrite = response.write.bind(response);
+                response.write = ((chunk: any, encodingOrCb?: BufferEncoding | ((err?: Error | null) => void), cb?: (err?: Error | null) => void) => {
+                    const result = originalWrite(chunk, encodingOrCb as any, cb as any);
+                    try {
+                        const data = toUint8Array(chunk, engine.encodeString);
+                        serveHook?.onData?.({ requestId, timestamp: nodeTs(), data });
+                    } catch {}
+                    return result;
+                }) as any;
+
+                let responseReported = false;
+                const reportResponse = () => {
+                    if (responseReported) return;
+                    responseReported = true;
+                    serveHook?.onResponse?.({
+                        requestId,
+                        timestamp: nodeTs(),
+                        url: requestUrl,
+                        status: response.statusCode,
+                        statusText: response.statusMessage,
+                        headers: normalizeHeaderRecord(response.getHeaders()),
+                    });
+                };
+
+                const originalWriteHead = response.writeHead.bind(response);
+                response.writeHead = ((...args: Parameters<typeof originalWriteHead>) => {
+                    const result = originalWriteHead(...args);
+                    try { reportResponse(); } catch {}
+                    return result;
+                }) as typeof response.writeHead;
+
+                const originalEnd = response.end.bind(response);
+                response.end = ((...args: any[]) => {
+                    const result = originalEnd(...args);
+                    try {
+                        reportResponse();
+                        const chunk = args[0];
+                        if (chunk !== undefined) {
+                            const data = toUint8Array(chunk, engine.encodeString);
+                            serveHook?.onData?.({ requestId, timestamp: nodeTs(), data });
+                        }
+                        finish(true);
+                    } catch {}
+                    return result;
+                }) as any;
+
                 if (this.#requestListener) {
-                    this.#requestListener(incoming, response);
+                    try {
+                        this.#requestListener(incoming, response);
+                    } catch (err) {
+                        finish(false, String((err as Error)?.message ?? err));
+                        throw err;
+                    }
                 }
             };
 
@@ -268,6 +361,8 @@ class HttpsClientRequest extends OutgoingMessageImpl {
     private _requestBody: Uint8Array[] = [];
     private _bodySent: boolean = false;
     private _tcp: any = null;
+    private _requestId: string = '';
+    private _requestCallFrames = captureNodeNetworkCallFrames();
 
     constructor(url: string | URL | RequestOptions, cb?: (res: IncomingMessageImpl) => void) {
         super();
@@ -320,6 +415,10 @@ class HttpsClientRequest extends OutgoingMessageImpl {
     }
 
     private async _doRequest(): Promise<void> {
+        const fetchHook = getNodeFetchHook();
+        this._requestId = this._requestId || nextNodeRequestId('https-fetch');
+        const requestStartTime = nodeTs();
+        const requestBody = concatChunks(this._requestBody);
         const port = typeof this._options.port === 'string'
             ? parseInt(this._options.port)
             : this._options.port || 443;
@@ -400,6 +499,19 @@ class HttpsClientRequest extends OutgoingMessageImpl {
             requestLine += this._formatHeaders();
             requestLine += '\r\n';
 
+            try {
+                fetchHook?.onRequest?.({
+                    requestId: this._requestId,
+                    timestamp: requestStartTime,
+                    url: buildNodeUrl(this.protocol, this.host, this.path),
+                    method: this.method,
+                    headers: normalizeHeaderRecord(this.getHeaders()),
+                    postData: requestBody ?? undefined,
+                    callFrames: this._requestCallFrames,
+                    resourceType: 'Fetch',
+                });
+            } catch {}
+
             this._tlsSocket.write(engine.encodeString(requestLine));
             this.headersSent = true;
 
@@ -410,6 +522,14 @@ class HttpsClientRequest extends OutgoingMessageImpl {
 
             this._readResponse();
         } catch (err) {
+            try {
+                fetchHook?.onFinished?.({
+                    requestId: this._requestId,
+                    timestamp: nodeTs(),
+                    success: false,
+                    errorText: String((err as Error)?.message ?? err),
+                });
+            } catch {}
             this.emit('error', err);
         }
     }
@@ -417,6 +537,20 @@ class HttpsClientRequest extends OutgoingMessageImpl {
     private _readResponse(): void {
         if (!this._tlsSocket) return;
 
+        const fetchHook = getNodeFetchHook();
+        let finished = false;
+        const finish = (success: boolean, errorText?: string) => {
+            if (finished) return;
+            finished = true;
+            try {
+                fetchHook?.onFinished?.({
+                    requestId: this._requestId,
+                    timestamp: nodeTs(),
+                    success,
+                    errorText,
+                });
+            } catch {}
+        };
         const parser = new httpParser.Parser(httpParser.RESPONSE);
         const res = new IncomingMessageImpl(null);
         (res as any).socket = this._tlsSocket;
@@ -454,13 +588,27 @@ class HttpsClientRequest extends OutgoingMessageImpl {
 
             this.emit('response', res);
             if (this._callback) this._callback(res);
+            try {
+                fetchHook?.onResponse?.({
+                    requestId: this._requestId,
+                    timestamp: nodeTs(),
+                    url: buildNodeUrl(this.protocol, this.host, this.path),
+                    status: res.statusCode ?? 0,
+                    headers: normalizeHeaderRecord(res.headers as Record<string, string | string[] | undefined>),
+                    requestHeaders: normalizeHeaderRecord(this.getHeaders()),
+                    resourceType: 'Fetch',
+                });
+            } catch {}
         };
         parser.onBody = (buf: any, off: number, len: number) => {
-            res.push(new Uint8Array(buf as ArrayBuffer).slice(off, off + len));
+            const data = new Uint8Array(buf as ArrayBuffer).slice(off, off + len);
+            try { fetchHook?.onData?.({ requestId: this._requestId, timestamp: nodeTs(), data }); } catch {}
+            res.push(data);
         };
         parser.onMessageComplete = () => {
             res.push(null);
             res.complete = true;
+            finish(true);
         };
 
         this._tlsSocket.on('data', (chunk: Uint8Array) => {
@@ -469,6 +617,7 @@ class HttpsClientRequest extends OutgoingMessageImpl {
                 : chunk.buffer;
             const result = parser.execute(ab.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength));
             if (result.errno !== 0) {
+                finish(false, 'HTTP parse error');
                 this._cleanup();
             }
         });
@@ -479,6 +628,7 @@ class HttpsClientRequest extends OutgoingMessageImpl {
 
         this._tlsSocket.on('error', (err: Error) => {
             if (!this._aborted) this.emit('error', err);
+            finish(false, err.message);
             this._cleanup();
         });
     }

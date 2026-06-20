@@ -6,6 +6,16 @@ import { Readable, Writable } from '../stream';
 import { Socket, Server as NetServer, AddressInfo } from '../net';
 import type { HttpRequest, HttpResponse } from '@cnojs/http/server';
 import { IOpaque } from '../_internal/inject';
+import {
+    buildNodeServerUrl,
+    captureNodeNetworkCallFrames,
+    getNodeServeHook,
+    headerEntriesToRecord,
+    nextNodeRequestId,
+    nodeTs,
+    normalizeHeaderRecord,
+    toUint8Array,
+} from '../_internal/network-debug';
 const { createServer: createHttpServer } = (http as any).__cno as IOpaque;
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
@@ -612,6 +622,8 @@ export class ServerImpl extends NetServer implements Server {
     }
 
     listen(arg1?: number | ListenOptions | string, arg2?: string | number | (() => void), arg3?: number | (() => void), arg4?: () => void): this {
+        // Capture call frames HERE — the user's code is on the stack.
+        const listenEntryCallFrames = captureNodeNetworkCallFrames();
         let port: number | undefined;
         let host = '0.0.0.0';
         let backlog: number | undefined;
@@ -640,6 +652,12 @@ export class ServerImpl extends NetServer implements Server {
         }
 
         const handler = async (req: HttpRequest, res: HttpResponse) => {
+            const serveHook = getNodeServeHook();
+            const requestId = nextNodeRequestId('node-serve');
+            const requestStartTime = nodeTs();
+            const requestCallFrames = listenEntryCallFrames ?? captureNodeNetworkCallFrames();
+            const requestHeaders = headerEntriesToRecord(req.headers);
+            const requestUrl = buildNodeServerUrl('http:', req.url, requestHeaders, host);
             const incoming = new IncomingMessageImpl(null);
             incoming.method = req.method;
             incoming.url = req.url;
@@ -666,25 +684,68 @@ export class ServerImpl extends NetServer implements Server {
 
             const response = new ServerResponseImpl();
             response.req = incoming;
+            try {
+                serveHook?.onRequest?.({
+                    requestId,
+                    timestamp: requestStartTime,
+                    url: requestUrl,
+                    method: req.method,
+                    headers: requestHeaders,
+                    postData: req.body ?? undefined,
+                    callFrames: requestCallFrames,
+                });
+            } catch {}
+
+            const originalWrite = response.write.bind(response);
+            response.write = ((chunk: any, encodingOrCb?: BufferEncoding | ((err?: Error | null) => void), cb?: (err?: Error | null) => void) => {
+                const result = originalWrite(chunk, encodingOrCb as any, cb as any);
+                try {
+                    const data = toUint8Array(chunk, engine.encodeString);
+                    serveHook?.onData?.({ requestId, timestamp: nodeTs(), data });
+                } catch {}
+                return result;
+            }) as any;
+
+            let responseReported = false;
+            const reportResponse = () => {
+                if (responseReported) return;
+                responseReported = true;
+                serveHook?.onResponse?.({
+                    requestId,
+                    timestamp: nodeTs(),
+                    url: requestUrl,
+                    status: response.statusCode,
+                    statusText: response.statusMessage,
+                    headers: normalizeHeaderRecord(response.getHeaders()),
+                });
+            };
+
+            const originalWriteHead = response.writeHead.bind(response);
+            response.writeHead = ((...args: Parameters<typeof originalWriteHead>) => {
+                const result = originalWriteHead(...args);
+                try { reportResponse(); } catch {}
+                return result;
+            }) as typeof response.writeHead;
 
             const originalEnd = response.end.bind(response);
             response.end = ((...args: any[]) => {
                 const result = originalEnd(...args);
-                if (!response.headersSent) {
-                    const rawHeaders: Array<[string, string]> = [];
-                    for (const [key, value] of Object.entries(response.getHeaders())) {
-                        if (value !== undefined) {
-                            rawHeaders.push([key, Array.isArray(value) ? value.join(', ') : String(value)]);
-                        }
+                try {
+                    reportResponse();
+                    const chunk = args[0];
+                    if (chunk !== undefined) {
+                        const data = toUint8Array(chunk, engine.encodeString);
+                        serveHook?.onData?.({ requestId, timestamp: nodeTs(), data });
                     }
-                    res.writeHead(response.statusCode, response.statusMessage, rawHeaders);
-                }
+                    serveHook?.onFinished?.({ requestId, timestamp: nodeTs(), success: true });
+                } catch {}
                 return result;
             }) as any;
 
             try {
                 await this._requestListener(incoming, response);
             } catch (err) {
+                try { serveHook?.onFinished?.({ requestId, timestamp: nodeTs(), success: false, errorText: String((err as Error)?.message ?? err) }); } catch {}
                 this.emit('error', err);
             }
         };

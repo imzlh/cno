@@ -243,7 +243,7 @@ class File extends Blob implements globalThis.File {
         let lastModified = Date.now();
         try {
             const stats = await asfs.stat(path);
-            lastModified = stats.mtime?.getTime() ?? Date.now();
+            lastModified = stats.mtim?.getTime() ?? Date.now();
         } catch {
         }
 

@@ -11,6 +11,15 @@ const os = import.meta.use('os');
 
 import { Socket } from '../net';
 import { OutgoingMessageImpl, IncomingMessageImpl, OutgoingHttpHeaders, IncomingHttpHeaders } from './server';
+import {
+    buildNodeUrl,
+    captureNodeNetworkCallFrames,
+    concatChunks,
+    getNodeFetchHook,
+    nextNodeRequestId,
+    nodeTs,
+    normalizeHeaderRecord,
+} from '../_internal/network-debug';
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
@@ -85,6 +94,8 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
     private _bodySent: boolean = false;
     private _socketAssigned: boolean = false;
     private _response: IncomingMessageImpl | null = null;
+    private _requestId: string = '';
+    private _requestCallFrames = captureNodeNetworkCallFrames();
 
     constructor(url: string | URL | ClientRequestArgs, cb?: (res: IncomingMessageImpl) => void) {
         super();
@@ -138,6 +149,10 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
     }
 
     private async _doRequest(): Promise<void> {
+        const fetchHook = getNodeFetchHook();
+        this._requestId = this._requestId || nextNodeRequestId(this.protocol === 'https:' ? 'https-fetch' : 'http-fetch');
+        const requestStartTime = nodeTs();
+        const requestBody = concatChunks(this._requestBody);
         const port = typeof this._options.port === 'string'
             ? parseInt(this._options.port)
             : this._options.port || (this.protocol === 'https:' ? 443 : 80);
@@ -193,6 +208,19 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
             requestLine += this._formatHeaders();
             requestLine += '\r\n';
 
+            try {
+                fetchHook?.onRequest?.({
+                    requestId: this._requestId,
+                    timestamp: requestStartTime,
+                    url: buildNodeUrl(this.protocol, this.host, this.path),
+                    method: this.method,
+                    headers: normalizeHeaderRecord(this.getHeaders()),
+                    postData: requestBody ?? undefined,
+                    callFrames: this._requestCallFrames,
+                    resourceType: 'Fetch',
+                });
+            } catch {}
+
             const writeTarget = this._tcp;
             await writeTarget.write(engine.encodeString(requestLine));
             this.headersSent = true;
@@ -204,6 +232,14 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
 
             this._readResponse();
         } catch (err) {
+            try {
+                fetchHook?.onFinished?.({
+                    requestId: this._requestId,
+                    timestamp: nodeTs(),
+                    success: false,
+                    errorText: String((err as Error)?.message ?? err),
+                });
+            } catch {}
             this.emit('error', err);
         }
     }
@@ -211,6 +247,20 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
     private _readResponse(): void {
         if (!this._tcp) return;
 
+        const fetchHook = getNodeFetchHook();
+        let finished = false;
+        const finish = (success: boolean, errorText?: string) => {
+            if (finished) return;
+            finished = true;
+            try {
+                fetchHook?.onFinished?.({
+                    requestId: this._requestId,
+                    timestamp: nodeTs(),
+                    success,
+                    errorText,
+                });
+            } catch {}
+        };
         const parser = new http.Parser(http.RESPONSE);
         const res = new IncomingMessageImpl(this.socket!);
         this._response = res;
@@ -252,6 +302,17 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
 
             this.emit('response', res);
             if (this._callback) this._callback(res);
+            try {
+                fetchHook?.onResponse?.({
+                    requestId: this._requestId,
+                    timestamp: nodeTs(),
+                    url: buildNodeUrl(this.protocol, this.host, this.path),
+                    status: res.statusCode ?? 0,
+                    headers: normalizeHeaderRecord(res.headers as Record<string, string | string[] | undefined>),
+                    requestHeaders: normalizeHeaderRecord(this.getHeaders()),
+                    resourceType: 'Fetch',
+                });
+            } catch {}
 
             // Flush any chunks that arrived during header parsing
             for (const chunk of pendingChunks) {
@@ -262,6 +323,7 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
 
         parser.onBody = (buf, off, len) => {
             const data = new Uint8Array(buf as ArrayBuffer).slice(off, off + len);
+            try { fetchHook?.onData?.({ requestId: this._requestId, timestamp: nodeTs(), data }); } catch {}
             if (res.statusCode === 0) {
                 pendingChunks.push(data); // headers not complete yet, buffer
             } else {
@@ -272,6 +334,7 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
         parser.onMessageComplete = () => {
             res.push(null);
             res.complete = true;
+            finish(true);
             this._cleanup();
         };
 
@@ -294,7 +357,11 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
                         toParse = buffer.subarray(0, n);
                     }
                     const result = parser.execute(toParse.buffer.slice(toParse.byteOffset, toParse.byteOffset + toParse.byteLength));
-                    if (result.errno !== 0) { this._cleanup(); return; }
+                    if (result.errno !== 0) {
+                        finish(false, 'HTTP parse error');
+                        this._cleanup();
+                        return;
+                    }
                     const consumed = (result as any).consumed as number | undefined;
                     if (consumed !== undefined && consumed < toParse.byteLength) {
                         // Copy unparsed remainder 鈥?toParse may be a view of the reused buffer
@@ -304,6 +371,7 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
             };
             readLoop().catch((err) => {
                 if (!this._aborted) this.emit('error', err);
+                finish(false, String((err as Error)?.message ?? err));
                 this._cleanup();
             });
     }

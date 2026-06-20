@@ -5,6 +5,9 @@
  * never invoked until a setter registers them.
  */
 
+const debug = import.meta.use('debug');
+const HOOK_OFFSET = 2;
+
 // ---- User-Agent / Extra headers override (applied to all fetch requests) ---
 
 let _userAgentOverride: string | null = null;
@@ -23,6 +26,62 @@ export interface NetworkCallFrame {
     url: string;
     lineNumber: number;
     columnNumber: number;
+}
+
+export type NetworkSource = 'fetch' | 'serve';
+
+const INTERNAL_FRAME_PREFIXES = ['<core>', '<devtools>', '<compiled>', '<eval>', 'node:'];
+const INTERNAL_NETWORK_FRAME_RE = /(?:webapi[\\/])?fetch\.ts|(?:webapi[\\/])?websocket\.ts|deno[\\/]08_serve\.ts|network-hooks\.ts|captureNetworkCallFrames|captureServeCallFrames|captureWebSocketCallFrames|performFetch|fetchAsync|_doPerform|Hooks\.installNetwork/;
+
+function frameFunctionName(func: unknown): string {
+    if (!func) return '';
+    if (typeof func === 'object' || typeof func === 'function') {
+        const name = Reflect.get(func, 'name');
+        if (typeof name === 'string' && name) return name;
+    }
+    const text = String(func);
+    return text.match(/^\[class ([^\]]+)\]$/)?.[1]
+        ?? text.match(/^\[Function: ([^\]]+)\]$/)?.[1]
+        ?? '';
+}
+
+function isInternalNetworkCallFrame(file: string, functionName: string): boolean {
+    if (!file) return true;
+    for (const prefix of INTERNAL_FRAME_PREFIXES) {
+        if (file.startsWith(prefix)) return true;
+    }
+    return INTERNAL_NETWORK_FRAME_RE.test(`${file} ${functionName}`);
+}
+
+export function captureUserNetworkCallFrames(
+    maxFrames: number = 32
+): NetworkCallFrame[] | undefined {
+    const frames: NetworkCallFrame[] = [];
+    let started = false;
+    try {
+        const depth = debug.getStackDepth();
+        for (let level = HOOK_OFFSET; level < Math.min(depth, 64); level++) {
+            const info = debug.getFrameInfo(level);
+            if (!info) continue;
+            const file = typeof info.file === 'string' ? info.file : '';
+            const functionName = frameFunctionName(info.func);
+            const internal = isInternalNetworkCallFrame(file, functionName);
+            if (!started) {
+                if (internal) continue;
+                started = true;
+            }
+            if (internal) continue;
+            frames.push({
+                functionName,
+                scriptId: file,
+                url: file,
+                lineNumber: Math.max(0, (info.line ?? 1) - 1),
+                columnNumber: Math.max(0, (info.column ?? 1) - 1),
+            });
+            if (frames.length >= maxFrames) break;
+        }
+    } catch {}
+    return frames.length > 0 ? frames : undefined;
 }
 
 export interface FetchRequestInfo {
@@ -176,6 +235,7 @@ export function getServeHook(): ServeHook | null {
 // ---- WebSocket hooks -------------------------------------------------------
 
 export interface WSCreatedInfo {
+    source: NetworkSource;
     requestId: string;
     url: string;
     requestHeaders?: Array<[string, string]>;
@@ -184,6 +244,7 @@ export interface WSCreatedInfo {
 }
 
 export interface WSHandshakeInfo {
+    source: NetworkSource;
     requestId: string;
     status: number;
     headers: Array<[string, string]>;
@@ -191,6 +252,7 @@ export interface WSHandshakeInfo {
 }
 
 export interface WSFrameInfo {
+    source: NetworkSource;
     requestId: string;
     opcode: number;
     masked: boolean;
@@ -200,6 +262,7 @@ export interface WSFrameInfo {
 }
 
 export interface WSClosedInfo {
+    source: NetworkSource;
     requestId: string;
     code: number;
     reason: string;

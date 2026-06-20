@@ -343,22 +343,7 @@ const envProxy = new Proxy({} as NodeJS.ProcessEnv, {
 // ============================================================================
 
 class ProcessEventEmitter extends EventEmitter {
-    #exitListeners: (() => void)[] = [];
-    #beforeExitListeners: (() => void)[] = [];
-
     override emit(event: string | Symbol, ...args: any[]): boolean {
-        if (event === 'exit') {
-            for (const cb of this.#exitListeners) {
-                try { cb.apply(null, args as []); } catch { }
-            }
-            return this.#exitListeners.length > 0;
-        }
-        if (event === 'beforeExit') {
-            for (const cb of this.#beforeExitListeners) {
-                try { cb.apply(null, args as []); } catch { }
-            }
-            return this.#beforeExitListeners.length > 0;
-        }
         if (typeof event == 'string' && (event.startsWith('SIG') || event.startsWith('sig'))) {
             return super.emit(event, ...args);
         }
@@ -446,13 +431,13 @@ export const platform: NodeJS.Platform = (() => {
             return 'darwin';
         case 'Windows_NT':
             return 'win32';
-        case 'Freebsd':
+        case 'FreeBSD':
             return 'freebsd';
-        case 'Openbsd':
+        case 'OpenBSD':
             return 'openbsd';
-        case 'Sunos':
+        case 'SunOS':
             return 'sunos';
-        case 'Aix':
+        case 'AIX':
             return 'aix';
         default:
             return platform as NodeJS.Platform;
@@ -673,7 +658,7 @@ export function umask(mask?: number | string): number {
 }
 
 export function nextTick(callback: Function, ...args: any[]): void {
-    queueMicrotask(() => callback(...args));
+    setTimeout(() => callback(...args), 0);
 }
 
 export let connected: boolean = false;

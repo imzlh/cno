@@ -13,8 +13,10 @@ export function parse(str: string, sep = '&', eq = '=', options?: { maxKeys?: nu
     for (const pair of str.split(sep)) {
         if (count >= maxKeys) break;
         const idx = pair.indexOf(eq);
-        const key = idx >= 0 ? decode(pair.substring(0, idx)) : decode(pair);
-        const val = idx >= 0 ? decode(pair.substring(idx + eq.length)) : '';
+        const rawKey = idx >= 0 ? pair.substring(0, idx) : pair;
+        const rawVal = idx >= 0 ? pair.substring(idx + eq.length) : '';
+        const key = decode(rawKey.replace(/\+/g, ' '));
+        const val = decode(rawVal.replace(/\+/g, ' '));
         const existing = result[key];
         if (existing !== undefined) {
             result[key] = Array.isArray(existing) ? [...existing, val] : [existing, val];

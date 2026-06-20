@@ -2,30 +2,56 @@
  * Node.js fs module - async operations
  */
 
+const fs = import.meta.use('fs');
 const asfs = import.meta.use('asyncfs');
 const engine = import.meta.use('engine');
 import { FileHandle } from 'fs/promises';
-import { toUint8Array, decodeBuffer, toNodeStatAsync, toNodeDirentAsync, parseFlags, pathToString, removeRecursive, mkdirRecursive } from './utils';
+import { toUint8Array, decodeBuffer, toNodeStatAsync, toNodeDirentAsync, parseFlags, pathToString, splitPathOrFd, removeRecursive, mkdirRecursive } from './utils';
 import { Stats } from 'fs';
 
 // ============================================================================
 // File read/write
 // ============================================================================
 
-export async function readFile(path: string | URL | number, options?: { encoding?: BufferEncoding | null; flag?: string | number } | BufferEncoding): Promise<string | Uint8Array> {
-    const pathStr = typeof path === 'number' ? `fd:${path}` : pathToString(path);
+type PathLike = string | URL | Buffer;
+
+export async function readFile(path: PathLike | number, options?: { encoding?: BufferEncoding | null; flag?: string | number } | BufferEncoding): Promise<string | Uint8Array> {
+    const target = splitPathOrFd(path as PathLike | number);
     const encoding = typeof options === 'string' ? options : options?.encoding;
-    const buffer = await asfs.readFile(pathStr);
+    const buffer = 'fd' in target
+        ? (() => {
+            const chunks: Uint8Array[] = [];
+            const buf = new Uint8Array(64 * 1024);
+            let bytesRead = 0;
+            while ((bytesRead = fs.read(target.fd, buf)) > 0) {
+                chunks.push(buf.slice(0, bytesRead));
+            }
+            const total = chunks.reduce((n, chunk) => n + chunk.length, 0);
+            const out = new Uint8Array(total);
+            let offset = 0;
+            for (const chunk of chunks) {
+                out.set(chunk, offset);
+                offset += chunk.length;
+            }
+            return out;
+        })()
+        : await asfs.readFile(target.path);
     return decodeBuffer(buffer, encoding);
 }
 
-export async function writeFile(path: string | URL | number, data: string | Uint8Array | ArrayBuffer, options?: { encoding?: BufferEncoding | null; mode?: number | string; flag?: string | number } | BufferEncoding | number): Promise<void> {
-    const pathStr = typeof path === 'number' ? `fd:${path}` : pathToString(path);
+export async function writeFile(path: PathLike | number, data: string | Uint8Array | ArrayBuffer, options?: { encoding?: BufferEncoding | null; mode?: number | string; flag?: string | number } | BufferEncoding | number): Promise<void> {
+    const target = splitPathOrFd(path as PathLike | number);
     const mode = typeof options === 'object' ? (typeof options?.mode === 'string' ? parseInt(options.mode, 8) : options?.mode) : typeof options === 'number' ? options : undefined;
     const flag = typeof options === 'object' ? parseFlags(options?.flag) : 'w';
     const buffer = toUint8Array(data);
 
-    const handle = await asfs.open(pathStr, flag, mode);
+    if ('fd' in target) {
+        fs.ftruncate(target.fd, 0);
+        fs.write(target.fd, buffer);
+        return;
+    }
+
+    const handle = await asfs.open(target.path, flag, mode);
     try {
         await handle.write(buffer);
     } finally {
@@ -33,12 +59,17 @@ export async function writeFile(path: string | URL | number, data: string | Uint
     }
 }
 
-export async function appendFile(path: string | URL | number, data: string | Uint8Array | ArrayBuffer, options?: { encoding?: BufferEncoding | null; mode?: number | string; flag?: string | number } | BufferEncoding | number): Promise<void> {
-    const pathStr = typeof path === 'number' ? `fd:${path}` : pathToString(path);
+export async function appendFile(path: PathLike | number, data: string | Uint8Array | ArrayBuffer, options?: { encoding?: BufferEncoding | null; mode?: number | string; flag?: string | number } | BufferEncoding | number): Promise<void> {
+    const target = splitPathOrFd(path as PathLike | number);
     const mode = typeof options === 'object' ? (typeof options?.mode === 'string' ? parseInt(options.mode, 8) : options?.mode) : typeof options === 'number' ? options : undefined;
     const buffer = toUint8Array(data);
 
-    const handle = await asfs.open(pathStr, 'a', mode);
+    if ('fd' in target) {
+        fs.write(target.fd, buffer);
+        return;
+    }
+
+    const handle = await asfs.open(target.path, 'a', mode);
     try {
         await handle.write(buffer);
     } finally {
@@ -50,7 +81,7 @@ export async function appendFile(path: string | URL | number, data: string | Uin
 // File status
 // ============================================================================
 
-export async function exists(path: string | URL): Promise<boolean> {
+export async function exists(path: PathLike): Promise<boolean> {
     try {
         await asfs.stat(pathToString(path));
         return true;
@@ -59,17 +90,17 @@ export async function exists(path: string | URL): Promise<boolean> {
     }
 }
 
-export async function stat(path: string | URL, options?: { bigint?: boolean }): Promise<import('fs').Stats> {
+export async function stat(path: PathLike, options?: { bigint?: boolean }): Promise<import('fs').Stats> {
     const st = await asfs.stat(pathToString(path));
     return toNodeStatAsync(st);
 }
 
-export async function lstat(path: string | URL, options?: { bigint?: boolean }): Promise<import('fs').Stats> {
+export async function lstat(path: PathLike, options?: { bigint?: boolean }): Promise<import('fs').Stats> {
     const st = await asfs.lstat(pathToString(path));
     return toNodeStatAsync(st);
 }
 
-export async function access(path: string | URL, mode?: number): Promise<void> {
+export async function access(path: PathLike, mode?: number): Promise<void> {
     // asyncfs has no access, simulate with stat
     const pathStr = pathToString(path);
     await asfs.stat(pathStr);
@@ -79,7 +110,7 @@ export async function access(path: string | URL, mode?: number): Promise<void> {
 // Directory operations
 // ============================================================================
 
-export async function mkdir(path: string | URL, options?: { mode?: number; recursive?: boolean } | number): Promise<string | undefined> {
+export async function mkdir(path: PathLike, options?: { mode?: number; recursive?: boolean } | number): Promise<string | undefined> {
     const pathStr = pathToString(path);
     const mode = typeof options === 'number' ? options : options?.mode;
     const recursive = typeof options === 'object' ? options?.recursive : false;
@@ -93,7 +124,7 @@ export async function mkdir(path: string | URL, options?: { mode?: number; recur
     return undefined;
 }
 
-export async function rmdir(path: string | URL, options?: { recursive?: boolean }): Promise<void> {
+export async function rmdir(path: PathLike, options?: { recursive?: boolean }): Promise<void> {
     const pathStr = pathToString(path);
 
     if (options?.recursive) {
@@ -103,7 +134,7 @@ export async function rmdir(path: string | URL, options?: { recursive?: boolean 
     }
 }
 
-export async function rm(path: string | URL, options?: { force?: boolean; recursive?: boolean; maxRetries?: number; retryDelay?: number }): Promise<void> {
+export async function rm(path: PathLike, options?: { force?: boolean; recursive?: boolean; maxRetries?: number; retryDelay?: number }): Promise<void> {
     const pathStr = pathToString(path);
 
     try {
@@ -125,7 +156,7 @@ export async function rm(path: string | URL, options?: { force?: boolean; recurs
     }
 }
 
-export async function readdir(path: string | URL, options?: { encoding?: BufferEncoding | 'buffer'; withFileTypes?: boolean; recursive?: boolean } | BufferEncoding): Promise<string[] | import('fs').Dirent[]> {
+export async function readdir(path: PathLike, options?: { encoding?: BufferEncoding | 'buffer'; withFileTypes?: boolean; recursive?: boolean } | BufferEncoding): Promise<string[] | import('fs').Dirent[]> {
     const pathStr = pathToString(path);
     const withFileTypes = typeof options === 'object' ? options?.withFileTypes : false;
 
@@ -148,7 +179,7 @@ export async function readdir(path: string | URL, options?: { encoding?: BufferE
     return withFileTypes ? entries : names;
 }
 
-export async function opendir(path: string | URL, options?: { encoding?: BufferEncoding; bufferSize?: number }): Promise<import('fs').Dir> {
+export async function opendir(path: PathLike, options?: { encoding?: BufferEncoding; bufferSize?: number }): Promise<import('fs').Dir> {
     const pathStr = pathToString(path);
     const dirHandle = await asfs.readDir(pathStr);
     let closed = false;
@@ -201,19 +232,19 @@ export async function opendir(path: string | URL, options?: { encoding?: BufferE
 // File operations
 // ============================================================================
 
-export async function unlink(path: string | URL): Promise<void> {
+export async function unlink(path: PathLike): Promise<void> {
     await asfs.unlink(pathToString(path));
 }
 
-export async function rename(oldPath: string | URL, newPath: string | URL): Promise<void> {
+export async function rename(oldPath: PathLike, newPath: PathLike): Promise<void> {
     await asfs.rename(pathToString(oldPath), pathToString(newPath));
 }
 
-export async function copyFile(src: string | URL, dest: string | URL, mode?: number): Promise<void> {
+export async function copyFile(src: PathLike, dest: PathLike, mode?: number): Promise<void> {
     await asfs.copyFile(pathToString(src), pathToString(dest));
 }
 
-export async function truncate(path: string | URL, len?: number): Promise<void> {
+export async function truncate(path: PathLike, len?: number): Promise<void> {
     const handle = await asfs.open(pathToString(path), 'r+');
     try {
         await handle.truncate(len ?? 0);
@@ -226,21 +257,21 @@ export async function truncate(path: string | URL, len?: number): Promise<void> 
 // Link operations
 // ============================================================================
 
-export async function link(existingPath: string | URL, newPath: string | URL): Promise<void> {
+export async function link(existingPath: PathLike, newPath: PathLike): Promise<void> {
     await asfs.link(pathToString(existingPath), pathToString(newPath));
 }
 
-export async function symlink(target: string | URL, path: string | URL, type?: 'file' | 'dir' | 'junction'): Promise<void> {
+export async function symlink(target: PathLike, path: PathLike, type?: 'file' | 'dir' | 'junction'): Promise<void> {
     const symlinkType = type === 'dir' ? asfs.SymlinkType.DIR : asfs.SymlinkType.JUNCTION;
     await asfs.symlink(pathToString(target), pathToString(path), symlinkType);
 }
 
-export async function readlink(path: string | URL, options?: { encoding?: BufferEncoding | 'buffer' } | BufferEncoding): Promise<string | Uint8Array> {
+export async function readlink(path: PathLike, options?: { encoding?: BufferEncoding | 'buffer' } | BufferEncoding): Promise<string | Uint8Array> {
     const result = await asfs.readLink(pathToString(path));
     return result;
 }
 
-export async function realpath(path: string | URL, options?: { encoding?: BufferEncoding | 'buffer' } | BufferEncoding): Promise<string> {
+export async function realpath(path: PathLike, options?: { encoding?: BufferEncoding | 'buffer' } | BufferEncoding): Promise<string> {
     return await asfs.realPath(pathToString(path));
 }
 
@@ -248,12 +279,12 @@ export async function realpath(path: string | URL, options?: { encoding?: Buffer
 // Permission operations
 // ============================================================================
 
-export async function chmod(path: string | URL, mode: number | string): Promise<void> {
+export async function chmod(path: PathLike, mode: number | string): Promise<void> {
     const modeNum = typeof mode === 'string' ? parseInt(mode, 8) : mode;
     await asfs.chmod(pathToString(path), modeNum);
 }
 
-export async function chown(path: string | URL, uid: number, gid: number): Promise<void> {
+export async function chown(path: PathLike, uid: number, gid: number): Promise<void> {
     await asfs.chown(pathToString(path), uid, gid);
 }
 
@@ -261,7 +292,7 @@ export async function chown(path: string | URL, uid: number, gid: number): Promi
 // Time operations
 // ============================================================================
 
-export async function utimes(path: string | URL, atime: number | Date | string, mtime: number | Date | string): Promise<void> {
+export async function utimes(path: PathLike, atime: number | Date | string, mtime: number | Date | string): Promise<void> {
     const atimeMs = typeof atime === 'number' ? atime : typeof atime === 'string' ? new Date(atime).getTime() : atime.getTime();
     const mtimeMs = typeof mtime === 'number' ? mtime : typeof mtime === 'string' ? new Date(mtime).getTime() : mtime.getTime();
     await asfs.utime(pathToString(path), atimeMs / 1000, mtimeMs / 1000);
@@ -384,7 +415,7 @@ class FileHandleImpl implements FileHandle {
 // Open file
 // ============================================================================
 
-export async function open(path: string | URL, flags?: string | number, mode?: number | string) {
+export async function open(path: PathLike, flags?: string | number, mode?: number | string) {
     const flag = parseFlags(flags);
     const modeNum = typeof mode === 'string' ? parseInt(mode, 8) : mode;
     const handle = await asfs.open(pathToString(path), flag, modeNum);

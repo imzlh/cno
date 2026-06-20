@@ -136,11 +136,21 @@ function applyFormat(format: string, args: unknown[]): { text: string; consumed:
                         continue;
                     case 'd':
                     case 'i':
-                        result += typeof arg === 'bigint' ? String(arg) : String(parseInt(String(arg), 10) || 0);
+                        if (typeof arg === 'bigint') {
+                            result += String(arg);
+                        } else {
+                            const num = Number(arg);
+                            result += isNaN(num) ? 'NaN' : String(Math.floor(num));
+                        }
                         i += 2;
                         continue;
                     case 'f':
-                        result += String(parseFloat(String(arg)) || 0);
+                        if (typeof arg === 'bigint') {
+                            result += String(arg);
+                        } else {
+                            const num = Number(arg);
+                            result += isNaN(num) ? 'NaN' : String(num);
+                        }
                         i += 2;
                         continue;
                     case 'o':
@@ -358,7 +368,7 @@ function buildTable(data: unknown, columns?: string[]): string[] {
     if (cols.length <= 1) return ['(empty)'];
 
     const totalWidth = cols.reduce((sum, c) => sum + c.width + 1, 0);
-    const sep = ''.repeat(totalWidth - 1);
+    const sep = '─'.repeat(totalWidth - 1);
 
     const header = cols.map(c => pad(c.key, c.width)).join('\u2502');
     lines.push('\u250c' + sep + '\u2510');

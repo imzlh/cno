@@ -6,6 +6,7 @@
 const dns = import.meta.use('dns');
 const os = import.meta.use('os');
 import { toErrnoException } from '../_internal/errno';
+import * as promises from './promises';
 
 // ============================================================================
 // Constants
@@ -350,112 +351,4 @@ export function setDefaultResultOrder(order: 'ipv4first' | 'verbatim'): void {
 // promises API
 // ============================================================================
 
-export namespace promises {
-    export function lookup(hostname: string, options?: LookupOptions): Promise<string | Array<{ address: string; family: number }>> {
-        return new Promise((resolve, reject) => {
-            module.exports.lookup(hostname, options ?? {}, (err: any, address: any, family: any) => {
-                if (err) reject(err);
-                else resolve(options?.all ? address : address);
-            });
-        });
-    }
-
-    export function resolve(hostname: string, rrtype?: string): Promise<any> {
-        return new Promise((resolve, reject) => {
-            module.exports.resolve(hostname, rrtype ?? 'A', (err: any, addresses: any) => {
-                if (err) reject(err);
-                else resolve(addresses);
-            });
-        });
-    }
-
-    export function resolve4(hostname: string, options?: { ttl?: boolean }): Promise<string[] | Array<{ address: string; ttl: number }>> {
-        return new Promise((resolve, reject) => {
-            module.exports.resolve4(hostname, options ?? {}, (err: any, addresses: any) => {
-                if (err) reject(err);
-                else resolve(addresses);
-            });
-        });
-    }
-
-    export function resolve6(hostname: string, options?: { ttl?: boolean }): Promise<string[] | Array<{ address: string; ttl: number }>> {
-        return new Promise((resolve, reject) => {
-            module.exports.resolve6(hostname, options ?? {}, (err: any, addresses: any) => {
-                if (err) reject(err);
-                else resolve(addresses);
-            });
-        });
-    }
-
-    export function resolveCname(hostname: string): Promise<string[]> {
-        return new Promise((resolve, reject) => {
-            module.exports.resolveCname(hostname, (err: any, addresses: any) => {
-                if (err) reject(err);
-                else resolve(addresses);
-            });
-        });
-    }
-
-    export function resolveMx(hostname: string): Promise<MxRecord[]> {
-        return new Promise((resolve, reject) => {
-            module.exports.resolveMx(hostname, (err: any, addresses: any) => {
-                if (err) reject(err);
-                else resolve(addresses);
-            });
-        });
-    }
-
-    export function resolveNs(hostname: string): Promise<string[]> {
-        return new Promise((resolve, reject) => {
-            module.exports.resolveNs(hostname, (err: any, addresses: any) => {
-                if (err) reject(err);
-                else resolve(addresses);
-            });
-        });
-    }
-
-    export function resolveTxt(hostname: string): Promise<string[][]> {
-        return new Promise((resolve, reject) => {
-            module.exports.resolveTxt(hostname, (err: any, addresses: any) => {
-                if (err) reject(err);
-                else resolve(addresses);
-            });
-        });
-    }
-
-    export function resolveSrv(hostname: string): Promise<SrvRecord[]> {
-        return new Promise((resolve, reject) => {
-            module.exports.resolveSrv(hostname, (err: any, addresses: any) => {
-                if (err) reject(err);
-                else resolve(addresses);
-            });
-        });
-    }
-
-    export function resolvePtr(hostname: string): Promise<string[]> {
-        return new Promise((resolve, reject) => {
-            module.exports.resolvePtr(hostname, (err: any, addresses: any) => {
-                if (err) reject(err);
-                else resolve(addresses);
-            });
-        });
-    }
-
-    export function resolveSoa(hostname: string): Promise<SoaRecord> {
-        return new Promise((resolve, reject) => {
-            module.exports.resolveSoa(hostname, (err: any, address: any) => {
-                if (err) reject(err);
-                else resolve(address);
-            });
-        });
-    }
-
-    export function reverse(ip: string): Promise<string[]> {
-        return new Promise((resolve, reject) => {
-            module.exports.reverse(ip, (err: any, hostnames: any) => {
-                if (err) reject(err);
-                else resolve(hostnames);
-            });
-        });
-    }
-}
+export { promises };

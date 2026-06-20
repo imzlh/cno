@@ -46,6 +46,16 @@ export interface DecipherGCM {
     final(outputEncoding?: string): ArrayBuffer | string;
 }
 
+export interface GcmEncryptResult {
+    ciphertext: ArrayBuffer;
+    tag: ArrayBuffer;
+}
+
+export interface GcmDecryptResult {
+    plaintext: ArrayBuffer;
+    verified: boolean;
+}
+
 export interface Sign {
     update(input: BinaryInput, encoding?: string): Sign;
     sign(privateKey: ArrayBuffer | Uint8Array, outputEncoding?: string): ArrayBuffer | string;
@@ -89,12 +99,112 @@ function encodeOutput(data: ArrayBuffer, encoding?: string): ArrayBuffer | strin
     return data;
 }
 
+function concatBuffers(chunks: Uint8Array[]): Uint8Array {
+    const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+        out.set(chunk, offset);
+        offset += chunk.length;
+    }
+    return out;
+}
+
+function createBufferedCipher(
+    transform: (data: Uint8Array) => ArrayBuffer,
+): Cipheriv {
+    const chunks: Uint8Array[] = [];
+    return {
+        update(data: BinaryInput, inputEncoding?: string, outputEncoding?: string) {
+            chunks.push(toBuffer(data, inputEncoding));
+            return encodeOutput(new ArrayBuffer(0), outputEncoding);
+        },
+        final(outputEncoding?: string) {
+            return encodeOutput(transform(concatBuffers(chunks)), outputEncoding);
+        },
+    };
+}
+
+function createBufferedDecipher(
+    transform: (data: Uint8Array) => ArrayBuffer,
+): Decipheriv {
+    const chunks: Uint8Array[] = [];
+    return {
+        update(data: BinaryInput, inputEncoding?: string, outputEncoding?: string) {
+            chunks.push(toBuffer(data, inputEncoding));
+            return encodeOutput(new ArrayBuffer(0), outputEncoding);
+        },
+        final(outputEncoding?: string) {
+            return encodeOutput(transform(concatBuffers(chunks)), outputEncoding);
+        },
+    };
+}
+
+function isGcmAlgorithm(algorithm: string): boolean {
+    const a = algorithm.toLowerCase();
+    return a === 'aes-128-gcm' || a === 'aes-256-gcm';
+}
+
+function normalizeHashAlgorithm(algorithm: string): string {
+    return algorithm.toLowerCase().replace(/-/g, '');
+}
+
+function oneShotHmac(algorithm: string, key: Uint8Array, data: Uint8Array): ArrayBuffer {
+    switch (normalizeHashAlgorithm(algorithm)) {
+        case 'md5':
+            return crypto.hmacMd5(key, data);
+        case 'sha1':
+            return crypto.hmacSha1(key, data);
+        case 'sha256':
+            return crypto.hmacSha256(key, data);
+        case 'sha512':
+            return crypto.hmacSha512(key, data);
+        default:
+            throw new Error(`Unsupported HMAC algorithm: ${algorithm}`);
+    }
+}
+
+function createOneShotHmac(algorithm: string, key: Uint8Array): Hmac {
+    const chunks: Uint8Array[] = [];
+    return {
+        update(input: BinaryInput, encoding?: string) {
+            chunks.push(toBuffer(input, encoding));
+            return this;
+        },
+        digest(encoding?: string) {
+            const result = oneShotHmac(algorithm, key, concatBuffers(chunks));
+            return encodeOutput(result, encoding);
+        },
+    };
+}
+
+function readAsymmetricCipherArgs(
+    keyOrOptions: ArrayBuffer | Uint8Array | { key: ArrayBuffer | Uint8Array; oaepHash?: string; oaepLabel?: ArrayBuffer | Uint8Array },
+    data: ArrayBuffer | Uint8Array,
+) {
+    if (keyOrOptions instanceof ArrayBuffer || keyOrOptions instanceof Uint8Array) {
+        return {
+            key: toBuffer(keyOrOptions),
+            data: toBuffer(data),
+            oaepHash: 'sha256',
+            oaepLabel: undefined as Uint8Array | undefined,
+        };
+    }
+
+    return {
+        key: toBuffer(keyOrOptions.key),
+        data: toBuffer(data),
+        oaepHash: keyOrOptions.oaepHash?.toLowerCase() || 'sha256',
+        oaepLabel: keyOrOptions.oaepLabel ? toBuffer(keyOrOptions.oaepLabel) : undefined,
+    };
+}
+
 // ============================================================================
 // createHash
 // ============================================================================
 
 export function createHash(algorithm: string): Hash {
-    const a = algorithm.toLowerCase().replace(/-/g, '');
+    const a = normalizeHashAlgorithm(algorithm);
 
     // Algorithms with native streaming support
     const streamingAlgos: Record<string, () => CModuleCrypto.Hash> = {
@@ -156,7 +266,7 @@ export function hash(algorithm: string, data: ArrayBuffer | Uint8Array | string,
     const buf = toBuffer(data);
     let result: ArrayBuffer;
 
-    const a = algorithm.toLowerCase().replace(/-/g, '');
+    const a = normalizeHashAlgorithm(algorithm);
     switch (a) {
         case 'md5':       result = crypto.md5(buf); break;
         case 'sha1':      result = crypto.sha1(buf); break;
@@ -180,34 +290,31 @@ export function hash(algorithm: string, data: ArrayBuffer | Uint8Array | string,
 
 export function createHmac(algorithm: string, key: ArrayBuffer | Uint8Array | string): Hmac {
     const keyBuf = toBuffer(key);
-    let hmacObj: CModuleCrypto.Hmac | null = null;
-    let data: Uint8Array[] = [];
+    const a = normalizeHashAlgorithm(algorithm);
 
-    const getHmacObj = () => {
-        if (!hmacObj) {
-            const a = algorithm.toLowerCase().replace(/-/g, '');
-            switch (a) {
-                case 'md5':    hmacObj = crypto.createHmacSha256(keyBuf); break; // FIXME: C layer only has sha256/512 streaming
-                case 'sha1':   hmacObj = crypto.createHmacSha256(keyBuf); break; // FIXME: C layer only has sha256/512 streaming
-                case 'sha256': hmacObj = crypto.createHmacSha256(keyBuf); break;
-                case 'sha512': hmacObj = crypto.createHmacSha512(keyBuf); break;
-                default: throw new Error(`Unsupported HMAC algorithm: ${algorithm}`);
-            }
-            for (const d of data) hmacObj.update(d);
-        }
-        return hmacObj;
-    };
+    if (a === 'md5' || a === 'sha1') {
+        return createOneShotHmac(algorithm, keyBuf);
+    }
+
+    let hmacObj: CModuleCrypto.Hmac;
+    switch (a) {
+        case 'sha256':
+            hmacObj = crypto.createHmacSha256(keyBuf);
+            break;
+        case 'sha512':
+            hmacObj = crypto.createHmacSha512(keyBuf);
+            break;
+        default:
+            throw new Error(`Unsupported HMAC algorithm: ${algorithm}`);
+    }
 
     return {
         update(input: ArrayBuffer | Uint8Array | string, encoding?: string) {
-            data.push(toBuffer(input, encoding));
-            if (hmacObj) {
-                hmacObj.update(toBuffer(input, encoding));
-            }
+            hmacObj.update(toBuffer(input, encoding));
             return this;
         },
         digest(encoding?: string) {
-            const result = getHmacObj().digest();
+            const result = hmacObj.digest();
             return encodeOutput(result, encoding);
         },
     };
@@ -220,18 +327,88 @@ export function createHmac(algorithm: string, key: ArrayBuffer | Uint8Array | st
 export function hmac(algorithm: string, key: ArrayBuffer | Uint8Array | string, data: ArrayBuffer | Uint8Array | string, outputEncoding?: string): ArrayBuffer | string {
     const keyBuf = toBuffer(key);
     const dataBuf = toBuffer(data);
-    let result: ArrayBuffer;
-
-    const a = algorithm.toLowerCase().replace(/-/g, '');
-    switch (a) {
-        case 'md5':    result = crypto.hmacMd5(keyBuf, dataBuf); break;
-        case 'sha1':   result = crypto.hmacSha1(keyBuf, dataBuf); break;
-        case 'sha256': result = crypto.hmacSha256(keyBuf, dataBuf); break;
-        case 'sha512': result = crypto.hmacSha512(keyBuf, dataBuf); break;
-        default: throw new Error(`Unsupported HMAC algorithm: ${algorithm}`);
-    }
-
+    const result = oneShotHmac(algorithm, keyBuf, dataBuf);
     return encodeOutput(result, outputEncoding);
+}
+
+export function md5(data: ArrayBuffer | Uint8Array | string): ArrayBuffer {
+    return crypto.md5(toBuffer(data));
+}
+
+export function sha1(data: ArrayBuffer | Uint8Array | string): ArrayBuffer {
+    return crypto.sha1(toBuffer(data));
+}
+
+export function sha224(data: ArrayBuffer | Uint8Array | string): ArrayBuffer {
+    return crypto.sha224(toBuffer(data));
+}
+
+export function sha256(data: ArrayBuffer | Uint8Array | string): ArrayBuffer {
+    return crypto.sha256(toBuffer(data));
+}
+
+export function sha384(data: ArrayBuffer | Uint8Array | string): ArrayBuffer {
+    return crypto.sha384(toBuffer(data));
+}
+
+export function sha512(data: ArrayBuffer | Uint8Array | string): ArrayBuffer {
+    return crypto.sha512(toBuffer(data));
+}
+
+export function sha3_224(data: ArrayBuffer | Uint8Array | string): ArrayBuffer {
+    return crypto.sha3_224(toBuffer(data));
+}
+
+export function sha3_256(data: ArrayBuffer | Uint8Array | string): ArrayBuffer {
+    return crypto.sha3_256(toBuffer(data));
+}
+
+export function sha3_384(data: ArrayBuffer | Uint8Array | string): ArrayBuffer {
+    return crypto.sha3_384(toBuffer(data));
+}
+
+export function sha3_512(data: ArrayBuffer | Uint8Array | string): ArrayBuffer {
+    return crypto.sha3_512(toBuffer(data));
+}
+
+export function createMd5(): CModuleCrypto.Hash {
+    return crypto.createMd5();
+}
+
+export function createSha1(): CModuleCrypto.Hash {
+    return crypto.createSha1();
+}
+
+export function createSha256(): CModuleCrypto.Hash {
+    return crypto.createSha256();
+}
+
+export function createSha512(): CModuleCrypto.Hash {
+    return crypto.createSha512();
+}
+
+export function hmacMd5(key: ArrayBuffer | Uint8Array | string, data: ArrayBuffer | Uint8Array | string): ArrayBuffer {
+    return crypto.hmacMd5(toBuffer(key), toBuffer(data));
+}
+
+export function hmacSha1(key: ArrayBuffer | Uint8Array | string, data: ArrayBuffer | Uint8Array | string): ArrayBuffer {
+    return crypto.hmacSha1(toBuffer(key), toBuffer(data));
+}
+
+export function hmacSha256(key: ArrayBuffer | Uint8Array | string, data: ArrayBuffer | Uint8Array | string): ArrayBuffer {
+    return crypto.hmacSha256(toBuffer(key), toBuffer(data));
+}
+
+export function hmacSha512(key: ArrayBuffer | Uint8Array | string, data: ArrayBuffer | Uint8Array | string): ArrayBuffer {
+    return crypto.hmacSha512(toBuffer(key), toBuffer(data));
+}
+
+export function createHmacSha256(key: ArrayBuffer | Uint8Array | string): CModuleCrypto.Hmac {
+    return crypto.createHmacSha256(toBuffer(key));
+}
+
+export function createHmacSha512(key: ArrayBuffer | Uint8Array | string): CModuleCrypto.Hmac {
+    return crypto.createHmacSha512(toBuffer(key));
 }
 
 // ============================================================================
@@ -242,6 +419,14 @@ export function createCipheriv(algorithm: string, key: ArrayBuffer | Uint8Array,
     const keyBuf = toBuffer(key);
     const ivBuf = toBuffer(iv);
     const a = algorithm.toLowerCase();
+
+    if (isGcmAlgorithm(a)) {
+        return createCipherivGCM(a, keyBuf, ivBuf) as unknown as Cipheriv;
+    }
+
+    if (a === 'aes-128-cbc') {
+        return createBufferedCipher((data) => crypto.aes128CbcEncrypt(keyBuf, ivBuf, data));
+    }
 
     if (a === 'aes-256-cbc') {
         const cipher = crypto.createCipherAes256Cbc(keyBuf, ivBuf);
@@ -261,8 +446,17 @@ export function createCipheriv(algorithm: string, key: ArrayBuffer | Uint8Array,
 export function createDecipheriv(algorithm: string, key: ArrayBuffer | Uint8Array, iv: ArrayBuffer | Uint8Array): Decipheriv {
     const keyBuf = toBuffer(key);
     const ivBuf = toBuffer(iv);
+    const a = algorithm.toLowerCase();
 
-    if (algorithm.toLowerCase() === 'aes-256-cbc') {
+    if (isGcmAlgorithm(a)) {
+        return createDecipherivGCM(a, keyBuf, ivBuf) as unknown as Decipheriv;
+    }
+
+    if (a === 'aes-128-cbc') {
+        return createBufferedDecipher((data) => crypto.aes128CbcDecrypt(keyBuf, ivBuf, data));
+    }
+
+    if (a === 'aes-256-cbc') {
         const decipher = crypto.createDecipherAes256Cbc(keyBuf, ivBuf);
         return {
             update(data: ArrayBuffer | Uint8Array | string, inputEncoding?: string, outputEncoding?: string) {
@@ -279,6 +473,20 @@ export function createDecipheriv(algorithm: string, key: ArrayBuffer | Uint8Arra
     throw new Error(`Unsupported cipher algorithm: ${algorithm}`);
 }
 
+export function createCipherAes256Cbc(
+    key: ArrayBuffer | Uint8Array | string,
+    iv: ArrayBuffer | Uint8Array | string,
+): CModuleCrypto.Cipher {
+    return crypto.createCipherAes256Cbc(toBuffer(key), toBuffer(iv));
+}
+
+export function createDecipherAes256Cbc(
+    key: ArrayBuffer | Uint8Array | string,
+    iv: ArrayBuffer | Uint8Array | string,
+): CModuleCrypto.Cipher {
+    return crypto.createDecipherAes256Cbc(toBuffer(key), toBuffer(iv));
+}
+
 // ============================================================================
 // createCipheriv GCM
 // ============================================================================
@@ -286,14 +494,15 @@ export function createDecipheriv(algorithm: string, key: ArrayBuffer | Uint8Arra
 export function createCipherivGCM(algorithm: string, key: ArrayBuffer | Uint8Array, iv: ArrayBuffer | Uint8Array, options?: { authTagLength?: number }): CipherGCM {
     const keyBuf = toBuffer(key);
     const ivBuf = toBuffer(iv);
+    if (!isGcmAlgorithm(algorithm)) {
+        throw new Error(`Unsupported cipher algorithm: ${algorithm}`);
+    }
     const gcm = new crypto.GCM('encrypt', keyBuf.buffer as ArrayBuffer, ivBuf.buffer as ArrayBuffer);
-    let aadSet = false;
     let ctag: ArrayBuffer | undefined;
 
     return {
         setAAD(aad: ArrayBuffer | Uint8Array) {
             gcm.setAAD(toBuffer(aad).buffer as ArrayBuffer);
-            aadSet = true;
             return this;
         },
         update(data: ArrayBuffer | Uint8Array | string, inputEncoding?: string, outputEncoding?: string) {
@@ -315,6 +524,9 @@ export function createCipherivGCM(algorithm: string, key: ArrayBuffer | Uint8Arr
 export function createDecipherivGCM(algorithm: string, key: ArrayBuffer | Uint8Array, iv: ArrayBuffer | Uint8Array, options?: { authTagLength?: number }): DecipherGCM {
     const keyBuf = toBuffer(key);
     const ivBuf = toBuffer(iv);
+    if (!isGcmAlgorithm(algorithm)) {
+        throw new Error(`Unsupported cipher algorithm: ${algorithm}`);
+    }
     const gcm = new crypto.GCM('decrypt', keyBuf.buffer as ArrayBuffer, ivBuf.buffer as ArrayBuffer);
     let authTag: ArrayBuffer | null = null;
 
@@ -342,6 +554,107 @@ export function createDecipherivGCM(algorithm: string, key: ArrayBuffer | Uint8A
             return encodeOutput(result.data, outputEncoding);
         },
     };
+}
+
+export function gcmEncrypt(
+    key: ArrayBuffer | Uint8Array,
+    iv: ArrayBuffer | Uint8Array,
+    plaintext: ArrayBuffer | Uint8Array,
+    aad?: ArrayBuffer | Uint8Array,
+    tagLength?: number,
+): GcmEncryptResult {
+    const keyBuf = toBuffer(key);
+    const ivBuf = toBuffer(iv);
+    const plaintextBuf = toBuffer(plaintext);
+    const aadBuf = aad ? toBuffer(aad) : undefined;
+    const result = crypto.gcmEncrypt(keyBuf, ivBuf, plaintextBuf, aadBuf, tagLength);
+    return {
+        ciphertext: result.ciphertext,
+        tag: result.tag,
+    };
+}
+
+export function gcmDecrypt(
+    key: ArrayBuffer | Uint8Array,
+    iv: ArrayBuffer | Uint8Array,
+    ciphertext: ArrayBuffer | Uint8Array,
+    tag: ArrayBuffer | Uint8Array,
+    aad?: ArrayBuffer | Uint8Array,
+): GcmDecryptResult {
+    const keyBuf = toBuffer(key);
+    const ivBuf = toBuffer(iv);
+    const ciphertextBuf = toBuffer(ciphertext);
+    const tagBuf = toBuffer(tag);
+    const aadBuf = aad ? toBuffer(aad) : undefined;
+    const result = crypto.gcmDecrypt(keyBuf, ivBuf, ciphertextBuf, tagBuf, aadBuf);
+    return {
+        plaintext: result.plaintext,
+        verified: result.verified,
+    };
+}
+
+export function aes128CbcEncrypt(
+    key: ArrayBuffer | Uint8Array | string,
+    iv: ArrayBuffer | Uint8Array | string,
+    data: ArrayBuffer | Uint8Array | string,
+): ArrayBuffer {
+    return crypto.aes128CbcEncrypt(toBuffer(key), toBuffer(iv), toBuffer(data));
+}
+
+export function aes128CbcDecrypt(
+    key: ArrayBuffer | Uint8Array | string,
+    iv: ArrayBuffer | Uint8Array | string,
+    data: ArrayBuffer | Uint8Array | string,
+): ArrayBuffer {
+    return crypto.aes128CbcDecrypt(toBuffer(key), toBuffer(iv), toBuffer(data));
+}
+
+export function aes256CbcEncrypt(
+    key: ArrayBuffer | Uint8Array | string,
+    iv: ArrayBuffer | Uint8Array | string,
+    data: ArrayBuffer | Uint8Array | string,
+): ArrayBuffer {
+    return crypto.aes256CbcEncrypt(toBuffer(key), toBuffer(iv), toBuffer(data));
+}
+
+export function aes256CbcDecrypt(
+    key: ArrayBuffer | Uint8Array | string,
+    iv: ArrayBuffer | Uint8Array | string,
+    data: ArrayBuffer | Uint8Array | string,
+): ArrayBuffer {
+    return crypto.aes256CbcDecrypt(toBuffer(key), toBuffer(iv), toBuffer(data));
+}
+
+export function aes128GcmEncrypt(
+    key: ArrayBuffer | Uint8Array | string,
+    iv: ArrayBuffer | Uint8Array | string,
+    data: ArrayBuffer | Uint8Array | string,
+): ArrayBuffer {
+    return crypto.aes128GcmEncrypt(toBuffer(key), toBuffer(iv), toBuffer(data));
+}
+
+export function aes128GcmDecrypt(
+    key: ArrayBuffer | Uint8Array | string,
+    iv: ArrayBuffer | Uint8Array | string,
+    data: ArrayBuffer | Uint8Array | string,
+): ArrayBuffer {
+    return crypto.aes128GcmDecrypt(toBuffer(key), toBuffer(iv), toBuffer(data));
+}
+
+export function aes256GcmEncrypt(
+    key: ArrayBuffer | Uint8Array | string,
+    iv: ArrayBuffer | Uint8Array | string,
+    data: ArrayBuffer | Uint8Array | string,
+): ArrayBuffer {
+    return crypto.aes256GcmEncrypt(toBuffer(key), toBuffer(iv), toBuffer(data));
+}
+
+export function aes256GcmDecrypt(
+    key: ArrayBuffer | Uint8Array | string,
+    iv: ArrayBuffer | Uint8Array | string,
+    data: ArrayBuffer | Uint8Array | string,
+): ArrayBuffer {
+    return crypto.aes256GcmDecrypt(toBuffer(key), toBuffer(iv), toBuffer(data));
 }
 
 // ============================================================================
@@ -502,6 +815,24 @@ export function pbkdf2Sync(password: ArrayBuffer | Uint8Array | string, salt: Ar
     return new Uint8Array(result);
 }
 
+export function pbkdf2Sha256(
+    password: ArrayBuffer | Uint8Array | string,
+    salt: ArrayBuffer | Uint8Array | string,
+    iterations: number,
+    keylen: number,
+): ArrayBuffer {
+    return crypto.pbkdf2Sha256(toBuffer(password), toBuffer(salt), iterations, keylen);
+}
+
+export function pbkdf2Sha512(
+    password: ArrayBuffer | Uint8Array | string,
+    salt: ArrayBuffer | Uint8Array | string,
+    iterations: number,
+    keylen: number,
+): ArrayBuffer {
+    return crypto.pbkdf2Sha512(toBuffer(password), toBuffer(salt), iterations, keylen);
+}
+
 // ============================================================================
 // hkdf
 // ============================================================================
@@ -523,6 +854,24 @@ export function hkdf(digest: string, ikm: ArrayBuffer | Uint8Array, salt: ArrayB
 
 export function hkdfSync(digest: string, ikm: ArrayBuffer | Uint8Array, salt: ArrayBuffer | Uint8Array, info: ArrayBuffer | Uint8Array, keylen: number): ArrayBuffer {
     return hkdf(digest, ikm, salt, info, keylen);
+}
+
+export function hkdfSha256(
+    ikm: ArrayBuffer | Uint8Array | string,
+    keylen: number,
+    salt?: ArrayBuffer | Uint8Array | string,
+    info?: ArrayBuffer | Uint8Array | string,
+): ArrayBuffer {
+    return crypto.hkdfSha256(toBuffer(ikm), keylen, salt ? toBuffer(salt) : undefined, info ? toBuffer(info) : undefined);
+}
+
+export function hkdfSha512(
+    ikm: ArrayBuffer | Uint8Array | string,
+    keylen: number,
+    salt?: ArrayBuffer | Uint8Array | string,
+    info?: ArrayBuffer | Uint8Array | string,
+): ArrayBuffer {
+    return crypto.hkdfSha512(toBuffer(ikm), keylen, salt ? toBuffer(salt) : undefined, info ? toBuffer(info) : undefined);
 }
 
 // ============================================================================
@@ -668,6 +1017,18 @@ export function sign(algorithm: string, data: ArrayBuffer | Uint8Array, key: Arr
     }
 }
 
+export function generateRsaKey(bits?: number): CModuleCrypto.RsaKeyPair {
+    return crypto.generateRsaKey(bits);
+}
+
+export function signSha256(key: ArrayBuffer | Uint8Array | string, data: ArrayBuffer | Uint8Array | string): ArrayBuffer {
+    return crypto.signSha256(toBuffer(key), toBuffer(data));
+}
+
+export function signSha512(key: ArrayBuffer | Uint8Array | string, data: ArrayBuffer | Uint8Array | string): ArrayBuffer {
+    return crypto.signSha512(toBuffer(key), toBuffer(data));
+}
+
 export function verify(algorithm: string, data: ArrayBuffer | Uint8Array, key: ArrayBuffer | Uint8Array, signature: ArrayBuffer | Uint8Array): boolean {
     const dataBuf = toBuffer(data);
     const keyBuf = toBuffer(key);
@@ -681,6 +1042,22 @@ export function verify(algorithm: string, data: ArrayBuffer | Uint8Array, key: A
         default:
             throw new Error(`Unsupported verify algorithm: ${algorithm}`);
     }
+}
+
+export function verifySha256(
+    key: ArrayBuffer | Uint8Array | string,
+    data: ArrayBuffer | Uint8Array | string,
+    signature: ArrayBuffer | Uint8Array | string,
+): boolean {
+    return crypto.verifySha256(toBuffer(key), toBuffer(data), toBuffer(signature));
+}
+
+export function verifySha512(
+    key: ArrayBuffer | Uint8Array | string,
+    data: ArrayBuffer | Uint8Array | string,
+    signature: ArrayBuffer | Uint8Array | string,
+): boolean {
+    return crypto.verifySha512(toBuffer(key), toBuffer(data), toBuffer(signature));
 }
 
 // ============================================================================
@@ -752,20 +1129,131 @@ export function ecdhComputeSecret(curve: string, privateKey: ArrayBuffer | Uint8
     }
 }
 
+export function generateEcKeyP256(): CModuleCrypto.EcKeyPair {
+    return crypto.generateEcKeyP256();
+}
+
+export function generateEcKeyP384(): CModuleCrypto.EcKeyPair {
+    return crypto.generateEcKeyP384();
+}
+
+export function generateEcKeyP521(): CModuleCrypto.EcKeyPair {
+    return crypto.generateEcKeyP521();
+}
+
+export function ecdsaSignP256(privateKey: ArrayBuffer | Uint8Array | string, data: ArrayBuffer | Uint8Array | string): ArrayBuffer {
+    return crypto.ecdsaSignP256(toBuffer(privateKey), toBuffer(data));
+}
+
+export function ecdsaSignP384(privateKey: ArrayBuffer | Uint8Array | string, data: ArrayBuffer | Uint8Array | string): ArrayBuffer {
+    return crypto.ecdsaSignP384(toBuffer(privateKey), toBuffer(data));
+}
+
+export function ecdsaSignP521(privateKey: ArrayBuffer | Uint8Array | string, data: ArrayBuffer | Uint8Array | string): ArrayBuffer {
+    return crypto.ecdsaSignP521(toBuffer(privateKey), toBuffer(data));
+}
+
+export function ecdsaVerifyP256(
+    publicKey: ArrayBuffer | Uint8Array | string,
+    data: ArrayBuffer | Uint8Array | string,
+    signature: ArrayBuffer | Uint8Array | string,
+): boolean {
+    return crypto.ecdsaVerifyP256(toBuffer(publicKey), toBuffer(data), toBuffer(signature));
+}
+
+export function ecdsaVerifyP384(
+    publicKey: ArrayBuffer | Uint8Array | string,
+    data: ArrayBuffer | Uint8Array | string,
+    signature: ArrayBuffer | Uint8Array | string,
+): boolean {
+    return crypto.ecdsaVerifyP384(toBuffer(publicKey), toBuffer(data), toBuffer(signature));
+}
+
+export function ecdsaVerifyP521(
+    publicKey: ArrayBuffer | Uint8Array | string,
+    data: ArrayBuffer | Uint8Array | string,
+    signature: ArrayBuffer | Uint8Array | string,
+): boolean {
+    return crypto.ecdsaVerifyP521(toBuffer(publicKey), toBuffer(data), toBuffer(signature));
+}
+
+export function ecdhDeriveP256(
+    privateKey: ArrayBuffer | Uint8Array | string,
+    publicKey: ArrayBuffer | Uint8Array | string,
+): ArrayBuffer {
+    return crypto.ecdhDeriveP256(toBuffer(privateKey), toBuffer(publicKey));
+}
+
+export function ecdhDeriveP384(
+    privateKey: ArrayBuffer | Uint8Array | string,
+    publicKey: ArrayBuffer | Uint8Array | string,
+): ArrayBuffer {
+    return crypto.ecdhDeriveP384(toBuffer(privateKey), toBuffer(publicKey));
+}
+
+export function ecdhDeriveP521(
+    privateKey: ArrayBuffer | Uint8Array | string,
+    publicKey: ArrayBuffer | Uint8Array | string,
+): ArrayBuffer {
+    return crypto.ecdhDeriveP521(toBuffer(privateKey), toBuffer(publicKey));
+}
+
 // ============================================================================
 // RSA-OAEP
 // ============================================================================
 
-export function publicEncrypt(key: ArrayBuffer | Uint8Array, data: ArrayBuffer | Uint8Array): ArrayBuffer {
-    const keyBuf = toBuffer(key);
-    const dataBuf = toBuffer(data);
-    return crypto.rsaOaepSha256Encrypt(keyBuf, dataBuf);
+export function publicEncrypt(
+    key: ArrayBuffer | Uint8Array | { key: ArrayBuffer | Uint8Array; oaepHash?: string; oaepLabel?: ArrayBuffer | Uint8Array },
+    data: ArrayBuffer | Uint8Array,
+): ArrayBuffer {
+    const args = readAsymmetricCipherArgs(key, data);
+    switch (args.oaepHash) {
+        case 'sha256':
+            return crypto.rsaOaepSha256Encrypt(args.key, args.data, args.oaepLabel);
+        case 'sha512':
+            return crypto.rsaOaepSha512Encrypt(args.key, args.data, args.oaepLabel);
+        default:
+            throw new Error(`Unsupported OAEP hash algorithm: ${args.oaepHash}`);
+    }
 }
 
-export function privateDecrypt(key: ArrayBuffer | Uint8Array, data: ArrayBuffer | Uint8Array): ArrayBuffer {
-    const keyBuf = toBuffer(key);
-    const dataBuf = toBuffer(data);
-    return crypto.rsaOaepSha256Decrypt(keyBuf, dataBuf);
+export function privateDecrypt(
+    key: ArrayBuffer | Uint8Array | { key: ArrayBuffer | Uint8Array; oaepHash?: string; oaepLabel?: ArrayBuffer | Uint8Array },
+    data: ArrayBuffer | Uint8Array,
+): ArrayBuffer {
+    const args = readAsymmetricCipherArgs(key, data);
+    switch (args.oaepHash) {
+        case 'sha256':
+            return crypto.rsaOaepSha256Decrypt(args.key, args.data, args.oaepLabel);
+        case 'sha512':
+            return crypto.rsaOaepSha512Decrypt(args.key, args.data, args.oaepLabel);
+        default:
+            throw new Error(`Unsupported OAEP hash algorithm: ${args.oaepHash}`);
+    }
+}
+
+export function rsaOaepSha256Encrypt(key: ArrayBuffer | Uint8Array, data: ArrayBuffer | Uint8Array, label?: ArrayBuffer | Uint8Array): ArrayBuffer {
+    return crypto.rsaOaepSha256Encrypt(toBuffer(key), toBuffer(data), label ? toBuffer(label) : undefined);
+}
+
+export function rsaOaepSha256Decrypt(key: ArrayBuffer | Uint8Array, data: ArrayBuffer | Uint8Array, label?: ArrayBuffer | Uint8Array): ArrayBuffer {
+    return crypto.rsaOaepSha256Decrypt(toBuffer(key), toBuffer(data), label ? toBuffer(label) : undefined);
+}
+
+export function rsaOaepSha512Encrypt(key: ArrayBuffer | Uint8Array, data: ArrayBuffer | Uint8Array, label?: ArrayBuffer | Uint8Array): ArrayBuffer {
+    return crypto.rsaOaepSha512Encrypt(toBuffer(key), toBuffer(data), label ? toBuffer(label) : undefined);
+}
+
+export function rsaOaepSha512Decrypt(key: ArrayBuffer | Uint8Array, data: ArrayBuffer | Uint8Array, label?: ArrayBuffer | Uint8Array): ArrayBuffer {
+    return crypto.rsaOaepSha512Decrypt(toBuffer(key), toBuffer(data), label ? toBuffer(label) : undefined);
+}
+
+export function rsaPssSha256Sign(key: ArrayBuffer | Uint8Array, data: ArrayBuffer | Uint8Array, saltLength?: number): ArrayBuffer {
+    return crypto.rsaPssSha256Sign(toBuffer(key), toBuffer(data), saltLength);
+}
+
+export function rsaPssSha256Verify(key: ArrayBuffer | Uint8Array, data: ArrayBuffer | Uint8Array, signature: ArrayBuffer | Uint8Array, saltLength?: number): boolean {
+    return crypto.rsaPssSha256Verify(toBuffer(key), toBuffer(data), toBuffer(signature), saltLength);
 }
 
 // ============================================================================
@@ -774,6 +1262,22 @@ export function privateDecrypt(key: ArrayBuffer | Uint8Array, data: ArrayBuffer 
 
 export function crc32(data: ArrayBuffer | Uint8Array | string): number {
     return crypto.crc32(toBuffer(data));
+}
+
+export function base64Encode(data: ArrayBuffer | Uint8Array | string): string {
+    return crypto.base64Encode(toBuffer(data));
+}
+
+export function base64Decode(data: string): ArrayBuffer {
+    return crypto.base64Decode(data);
+}
+
+export function hexEncode(data: ArrayBuffer | Uint8Array | string): string {
+    return crypto.hexEncode(toBuffer(data));
+}
+
+export function hexDecode(data: string): ArrayBuffer {
+    return crypto.hexDecode(data);
 }
 
 // ============================================================================

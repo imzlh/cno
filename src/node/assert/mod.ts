@@ -206,7 +206,15 @@ function _deepEqual(actual: unknown, expected: unknown, strict: boolean, skipPro
     if (actual instanceof Set && expected instanceof Set) {
         if (actual.size !== expected.size) return false;
         for (const value of actual) {
-            if (!expected.has(value)) return false;
+            // .has() uses reference equality, so use _deepEqual for objects
+            let found = false;
+            for (const expVal of expected) {
+                if (_deepEqual(value, expVal, strict, skipPrototype, _seen)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return false;
         }
         return true;
     }
@@ -635,14 +643,17 @@ export function partialDeepStrictEqual(actual: unknown, expected: unknown, messa
     }
 }
 
-export function assert(cond: any, message = 'Asserion failed'): asserts cond {
-    if (!cond) throw new Error(message);
+export function assert(cond: any, message = 'Assertion failed'): asserts cond {
+    if (!cond) {
+        throw new AssertionError({
+            actual: cond,
+            expected: true,
+            message: typeof message === 'string' ? message : (message as any)?.message,
+            operator: '==',
+            generatedMessage: !message
+        });
+    }
 }
-
-// ─── CallTracker (Node.js v20+) ─────────────────────────────────────────────
-// Minimal implementation — cno's test runner does not use it internally, but
-// `node:assert` must export it so user code that checks for its presence
-// (e.g. Deno's unit tests) works correctly.
 
 export class CallTracker {
     #calls: Array<{ args: unknown[]; thisArg: unknown }> = [];
@@ -670,6 +681,25 @@ export class CallTracker {
     }
 }
 
-// Expose CallTracker on the assert function itself so `assert.CallTracker`
-// and `assert.default.CallTracker` both resolve (Node.js compat).
+// Mount all assertion methods on the assert function itself
+// so `const a = require('assert'); a.ok(true)` works (Node.js compat).
+(assert as any).ok = ok;
+(assert as any).fail = fail;
+(assert as any).equal = equal;
+(assert as any).notEqual = notEqual;
+(assert as any).strictEqual = strictEqual;
+(assert as any).notStrictEqual = notStrictEqual;
+(assert as any).deepEqual = deepEqual;
+(assert as any).notDeepEqual = notDeepEqual;
+(assert as any).deepStrictEqual = deepStrictEqual;
+(assert as any).notDeepStrictEqual = notDeepStrictEqual;
+(assert as any).throws = throws;
+(assert as any).doesNotThrow = doesNotThrow;
+(assert as any).rejects = rejects;
+(assert as any).doesNotReject = doesNotReject;
+(assert as any).match = match;
+(assert as any).doesNotMatch = doesNotMatch;
+(assert as any).ifError = ifError;
+(assert as any).AssertionError = AssertionError;
 (assert as any).CallTracker = CallTracker;
+(assert as any).partialDeepStrictEqual = partialDeepStrictEqual;

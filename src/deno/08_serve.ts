@@ -6,9 +6,10 @@
 import { Server, createServer, type HttpRequest, type HttpResponse } from '@cnojs/http/server';
 import { assert } from '../utils/assert';
 import { createWebSocketFromConnection } from "../webapi/websocket";
+import { getResponseInitiatorCallFrames, setResponseInitiatorCallFrames } from '../webapi/fetch';
 import { wrapFsClassDec as wrap, wrapFSns } from "../utils/wrap";
 import { errors } from './01_errors';
-import { getServeHook, type NetworkCallFrame } from '../utils/network-hooks';
+import { getServeHook, captureUserNetworkCallFrames, type NetworkCallFrame } from '../utils/network-hooks';
 import type { ISocket } from "@cnojs/http/socket";
 
 const crypto = import.meta.use('crypto');
@@ -38,25 +39,7 @@ function newServeRequestId(): string {
 }
 
 function captureServeCallFrames(): NetworkCallFrame[] | undefined {
-    const frames: NetworkCallFrame[] = [];
-    try {
-        const depth = debug.getStackDepth();
-        for (let level = 0; level < Math.min(depth, 32); level++) {
-            try {
-                const info = debug.getFrameInfo(level);
-                if (!info) continue;
-                const fname = info.func?.name || '';
-                frames.push({
-                    functionName: fname,
-                    scriptId: info.file,
-                    url: info.file,
-                    lineNumber: Math.max(0, info.line - 1),
-                    columnNumber: Math.max(0, info.column - 1),
-                });
-            } catch {}
-        }
-    } catch {}
-    return frames.length > 0 ? frames : undefined;
+    return captureUserNetworkCallFrames(debug);
 }
 
 function headersArrayToRecord(headers: Array<[string, string]>): Record<string, string> {
@@ -102,12 +85,16 @@ class ResponseAdapter {
     private method: string;
     private requestId: string;
     private url: string;
+    private requestHeaders: Array<[string, string]>;
+    private requestCallFrames?: NetworkCallFrame[];
 
-    constructor(coreRes: HttpResponse, method: string, requestId: string, url: string) {
+    constructor(coreRes: HttpResponse, method: string, requestId: string, url: string, requestHeaders: Array<[string, string]>, requestCallFrames?: NetworkCallFrame[]) {
         this.coreRes = coreRes;
         this.method = method;
         this.requestId = requestId;
         this.url = url;
+        this.requestHeaders = requestHeaders;
+        this.requestCallFrames = requestCallFrames;
     }
 
     private emitFinished(success: boolean, errorText?: string): void {
@@ -247,6 +234,15 @@ class ResponseAdapter {
 
         // Execute WebSocket handler
         if (response[websocketSymbol]) {
+            Reflect.set(conn, '__cnoServerWebSocketMeta', {
+                source: 'serve',
+                requestId: this.requestId,
+                url: this.url,
+                requestHeaders: this.requestHeaders,
+                responseStatus: response.status,
+                responseHeaders: headers,
+                callFrames: this.requestCallFrames,
+            });
             response[websocketSymbol]!(conn);
         }
     }
@@ -320,6 +316,9 @@ function serve(
     optionsOrHandler: Deno.ServeOptions | Deno.ServeHandler,
     handler?: Deno.ServeHandler
 ): Deno.HttpServer {
+    // Capture call frames HERE — the user's code is on the stack.
+    // Inside the server callback the stack is all internal infra.
+    const serveEntryCallFrames = captureServeCallFrames();
     let options: Deno.ServeOptions & Deno.ServeTcpOptions & { handler: Deno.ServeHandler };
 
     // Handle overloads
@@ -346,14 +345,15 @@ function serve(
         throw new Deno.errors.NotSupported('Unix socket server not yet implemented');
     }
 
-    const serveCallFrames = getServeHook() ? captureServeCallFrames() : undefined;
-
     // Create core server
     const coreServer = createServer(
         async (req, res) => {
             const serveHook = getServeHook();
             const requestId = serveHook ? newServeRequestId() : '';
+            const requestStartTime = serveTs();
+            const requestEntryCallFrames = serveEntryCallFrames ?? (serveHook ? captureServeCallFrames() : undefined);
             let requestUrl = '';
+            let requestReported = false;
             try {
                 // Create Web API Request
                 const addr = coreServer.address();
@@ -363,17 +363,6 @@ function serve(
                     secure: coreServer.isSecure
                 });
                 requestUrl = webRequest.url;
-                if (serveHook) try {
-                    serveHook.onRequest?.({
-                        requestId,
-                        url: requestUrl,
-                        method: req.method,
-                        headers: headersArrayToRecord(req.headers),
-                        postData: req.body ?? null,
-                        callFrames: serveCallFrames,
-                        timestamp: serveTs()
-                    });
-                } catch {}
 
                 // Create connection info
                 const connInfo: Deno.ServeHandlerInfo = {
@@ -391,7 +380,25 @@ function serve(
                     throw new TypeError('Handler must return a Response');
                 }
 
-                const adapter = new ResponseAdapter(res, req.method, requestId, requestUrl);
+                let responseCallFrames = getResponseInitiatorCallFrames(webResponse) ?? requestEntryCallFrames;
+                if (!responseCallFrames && serveHook) {
+                    responseCallFrames = captureServeCallFrames();
+                    setResponseInitiatorCallFrames(webResponse, responseCallFrames);
+                }
+                if (serveHook && requestId && !requestReported) try {
+                    serveHook.onRequest?.({
+                        requestId,
+                        url: requestUrl,
+                        method: req.method,
+                        headers: headersArrayToRecord(req.headers),
+                        postData: req.body ?? null,
+                        callFrames: requestEntryCallFrames,
+                        timestamp: requestStartTime,
+                    });
+                    requestReported = true;
+                } catch {}
+
+                const adapter = new ResponseAdapter(res, req.method, requestId, requestUrl, req.headers, requestEntryCallFrames);
                 await adapter.sendResponse(webResponse);
 
             } catch (error) {
@@ -402,6 +409,18 @@ function serve(
                     try {
                         const body = 'Internal Server Error';
                         const headers: Array<[string, string]> = [['Content-Type', 'text/plain']];
+                        if (serveHook && requestId && !requestReported) {
+                            serveHook.onRequest?.({
+                                requestId,
+                                url: requestUrl,
+                                method: req.method,
+                                headers: headersArrayToRecord(req.headers),
+                                postData: req.body ?? null,
+                                callFrames: requestEntryCallFrames,
+                                timestamp: requestStartTime,
+                            });
+                            requestReported = true;
+                        }
                         if (serveHook && requestId) {
                             serveHook.onResponse?.({
                                 requestId,
@@ -540,13 +559,22 @@ function upgradeWebSocket(
  * This adapts the raw connection to WebSocket protocol
  */
 function createWebSocketFromISocket(conn: Promise<ISocket>): globalThis.WebSocket {
-    // Create WebSocket in server mode
-    return createWebSocketFromConnection(conn.then(c => ({
-        ...c,
-        async clientHandshake(ctx, servername) {
-            return; // here we already handled handshake, so just a stub enough
-        },
-    })));
+    const serverMeta = conn.then(c => Reflect.get(c, '__cnoServerWebSocketMeta') as {
+        requestId: string;
+        url: string;
+        requestHeaders?: Array<[string, string]>;
+        responseStatus?: number;
+        responseHeaders?: Array<[string, string]>;
+    } | undefined);
+    return createWebSocketFromConnection(
+        conn.then(c => ({
+            ...c,
+            async clientHandshake(ctx, servername) {
+                return; // here we already handled handshake, so just a stub enough
+            },
+        })),
+        serverMeta,
+    );
 }
 
 /* ------------------------------------------------------------------ */

@@ -5,6 +5,7 @@
 import { Stats } from 'fs';
 // @ts-ignore - dynamic import
 import { dirname } from '../path';
+import { fileURLToPath } from '../url';
 
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
@@ -46,14 +47,14 @@ export function toNodeStat(stat: CModuleFS.Stats): import('fs').Stats {
         size: stat.size,
         blksize: stat.blksize,
         blocks: stat.blocks,
-        atimeMs: stat.atime.getTime(),
-        mtimeMs: stat.mtime.getTime(),
-        ctimeMs: stat.ctime.getTime(),
-        birthtimeMs: stat.birthtime.getTime(),
-        atime: stat.atime,
-        mtime: stat.mtime,
-        ctime: stat.ctime,
-        birthtime: stat.birthtime,
+        atimeMs: stat.atim.getTime(),
+        mtimeMs: stat.mtim.getTime(),
+        ctimeMs: stat.ctim.getTime(),
+        birthtimeMs: stat.birthtim.getTime(),
+        atime: stat.atim,
+        mtime: stat.mtim,
+        ctime: stat.ctim,
+        birthtime: stat.birthtim,
         isFile: () => stat.isFile,
         isDirectory: () => stat.isDirectory,
         isBlockDevice: () => false,
@@ -64,35 +65,7 @@ export function toNodeStat(stat: CModuleFS.Stats): import('fs').Stats {
     };
 }
 
-export async function toNodeStatAsync(stat: CModuleAsyncFS.StatResult): Promise<Stats> {
-    return {
-        dev: stat.dev,
-        ino: stat.ino,
-        mode: stat.mode,
-        nlink: stat.nlink,
-        uid: stat.uid,
-        gid: stat.gid,
-        rdev: stat.rdev,
-        size: stat.size,
-        blksize: stat.blksize,
-        blocks: stat.blocks,
-        atimeMs: stat.atime.getTime(),
-        mtimeMs: stat.mtime.getTime(),
-        ctimeMs: stat.ctime.getTime(),
-        birthtimeMs: stat.birthtime.getTime(),
-        atime: stat.atime,
-        mtime: stat.mtime,
-        ctime: stat.ctime,
-        birthtime: stat.birthtime,
-        isFile: () => stat.isFile,
-        isDirectory: () => stat.isDirectory,
-        isBlockDevice: () => stat.isBlockDevice,
-        isCharacterDevice: () => stat.isCharacterDevice,
-        isSymbolicLink: () => stat.isSymbolicLink,
-        isFIFO: () => stat.isFIFO,
-        isSocket: () => stat.isSocket,
-    };
-}
+export const toNodeStatAsync = toNodeStat;
 
 // ============================================================================
 // Dirent conversion
@@ -150,8 +123,25 @@ export function parseFlags(flag?: string | number): Exclude<CModuleFS.OpenFlags,
 // Path handling
 // ============================================================================
 
-export function pathToString(path: string | URL): string {
-    return path instanceof URL ? path.pathname : path;
+export function pathToString(path: string | URL | Uint8Array): string {
+    if (typeof path === 'string') return path;
+    if (path == null) return String(path);
+    if (path instanceof Uint8Array) {
+        return engine.decodeString(path as Uint8Array<ArrayBuffer>);
+    }
+    if (path instanceof URL) {
+        return fileURLToPath(path);
+    }
+    return String(path);
+}
+
+export function splitPathOrFd(path: string | URL | Uint8Array | number): { fd: number } | { path: string } {
+    if (typeof path === 'number') return { fd: path };
+    return { path: pathToString(path) };
+}
+
+export function describeFd(fd: number): string {
+    return `fd:${fd}`;
 }
 
 // ============================================================================

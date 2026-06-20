@@ -3,6 +3,8 @@
  * Based on cts CJS loader via cts.internal symbol
  */
 
+import { fileURLToPath } from '../url';
+
 const CTS_INTERNAL = (globalThis as any)[Symbol.for('cts.internal')] as {
     mkRequire: (parentPath: string, parentMod: any) => NodeJS.Require;
     builtinModules: string[];
@@ -15,8 +17,9 @@ export interface SourceMap {
 }
 
 export function createRequire(filename: string | URL): NodeJS.Require {
+    const parentPath = filename instanceof URL ? fileURLToPath(filename) : filename;
     if (CTS_INTERNAL) {
-        return CTS_INTERNAL.mkRequire(filename.toString(), undefined);
+        return CTS_INTERNAL.mkRequire(parentPath, undefined);
     }
     return require;
 }

@@ -287,9 +287,11 @@ export function spawn(command: string, argsOrOptions?: string[] | SpawnOptions, 
 
     // Handle shell options
     if (opts.shell) {
-        const defaultShell = os.uname().sysname === 'Windows_NT' ? 'cmd.exe' : '/bin/sh';
+        const isWindows = os.uname().sysname === 'Windows_NT';
+        const defaultShell = isWindows ? 'cmd.exe' : '/bin/sh';
         const shell = typeof opts.shell === 'string' ? opts.shell : defaultShell;
-        args = ['-c', args.length > 0 ? `${command} ${args.join(' ')}` : command];
+        const shellArg = isWindows ? '/c' : '-c';
+        args = [shellArg, args.length > 0 ? `${command} ${args.join(' ')}` : command];
         command = shell;
     }
 
@@ -380,7 +382,11 @@ export function exec(command: string, optionsOrCallback?: ExecOptions | ((error:
         cb = callback;
     }
 
-    const child = spawn('/bin/sh', ['-c', command], {
+    const isWindows = os.uname().sysname === 'Windows_NT';
+    const shell = isWindows ? 'cmd.exe' : '/bin/sh';
+    const shellArg = isWindows ? '/c' : '-c';
+
+    const child = spawn(shell, [shellArg, command], {
         ...opts,
         stdio: 'pipe',
     });

@@ -12,6 +12,11 @@ import { EventEmitter } from '../events';
 // @ts-ignore - buffer is dynamic import
 import { Buffer } from '../buffer';
 
+// Platform-specific IP multicast socket options
+const _isWindows = os.uname().sysname === 'Windows_NT';
+const IP_ADD_MEMBERSHIP = _isWindows ? 12 : 35;
+const IP_DROP_MEMBERSHIP = _isWindows ? 13 : 36;
+
 // Helper: get a PosixSocket from UDP's fd for setsockopt
 // We cache the fd at init time since fileno() is async but socket options
 // are set via sync methods
@@ -335,7 +340,7 @@ export class Socket extends EventEmitter {
                     for (let i = 0; i < 4; i++) mreq[4 + i] = parseInt(ifParts[i]);
                 }
             }
-            s.setopt(sock.defines.IPPROTO_IP, 12, mreq);
+            s.setopt(sock.defines.IPPROTO_IP, IP_ADD_MEMBERSHIP, mreq);
         } catch { /* best-effort */ }
     }
 
@@ -355,7 +360,7 @@ export class Socket extends EventEmitter {
                     for (let i = 0; i < 4; i++) mreq[4 + i] = parseInt(ifParts[i]);
                 }
             }
-            s.setopt(sock.defines.IPPROTO_IP, 13, mreq);
+            s.setopt(sock.defines.IPPROTO_IP, IP_DROP_MEMBERSHIP, mreq);
         } catch { /* best-effort */ }
     }
 

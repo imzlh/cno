@@ -22,6 +22,10 @@ export const toString = (e: URL | string): string => {
 export function toDenoStat(stat: CModuleAsyncFS.StatResult) {
     return {
         ...stat,
+        atime: stat.atim,
+        mtime: stat.mtim,
+        ctime: stat.ctim,
+        birthtime: stat.birthtim,
         isSymlink: !!stat.isSymbolicLink,
         isCharDevice: !!stat.isCharacterDevice,
         isFifo: !!stat.isFIFO,

@@ -9,7 +9,7 @@ import { Headers } from "headers-polyfill";
 import { DOMException, EventTarget } from "./events";
 import { version } from "../../package.json";
 
-import { getFetchHook, getUserAgentOverride, getExtraHTTPHeaders, getFetchInterceptHook, type FetchConnectionInfo, type NetworkCallFrame } from '../utils/network-hooks';
+import { getFetchHook, getUserAgentOverride, getExtraHTTPHeaders, getFetchInterceptHook, getServeHook, captureUserNetworkCallFrames, type FetchConnectionInfo, type NetworkCallFrame } from '../utils/network-hooks';
 import { type HttpClient } from '../deno/07_http';
 
 const curlMod = import.meta.use("curl");
@@ -34,26 +34,20 @@ function curlStr(curl: CModuleCURL.CURL, flag: number): string | undefined {
     return v != null ? String(v) : undefined;
 }
 
-function captureNetworkCallFrames(): NetworkCallFrame[] | undefined {
-    const frames: NetworkCallFrame[] = [];
-    try {
-        const depth = debug.getStackDepth();
-        for (let level = 0; level < Math.min(depth, 32); level++) {
-            try {
-                const info = debug.getFrameInfo(level);
-                if (!info) continue;
-                const fname = info.func?.name || '';
-                frames.push({
-                    functionName: fname,
-                    scriptId: info.file,
-                    url: info.file,
-                    lineNumber: Math.max(0, info.line - 1),
-                    columnNumber: Math.max(0, info.column - 1),
-                });
-            } catch {}
-        }
-    } catch {}
-    return frames.length > 0 ? frames : undefined;
+const responseInitiatorCallFramesSymbol = Symbol.for('cno.response.initiatorCallFrames');
+export function setResponseInitiatorCallFrames(
+    response: globalThis.Response,
+    callFrames: NetworkCallFrame[] | undefined,
+): void {
+    if (!callFrames || callFrames.length === 0) return;
+    Reflect.set(response as object, responseInitiatorCallFramesSymbol, callFrames);
+}
+
+export function getResponseInitiatorCallFrames(
+    response: globalThis.Response | null | undefined,
+): NetworkCallFrame[] | undefined {
+    if (!response) return undefined;
+    return Reflect.get(response as object, responseInitiatorCallFramesSymbol) as NetworkCallFrame[] | undefined;
 }
 
 interface CurlDebugTrace {
@@ -180,6 +174,12 @@ function abortError(signal?: AbortSignal): any {
 
 function timeoutError(): any {
     return new DOMException('The operation timed out', 'TimeoutError');
+}
+
+function compressionAcceptEncoding(headers: Headers): string | undefined {
+    const value = headers.get('accept-encoding');
+    if (!value) return undefined;
+    return value.trim() || undefined;
 }
 
 function isCurlTimeoutError(err: any): boolean {
@@ -493,6 +493,9 @@ export class Response implements globalThis.Response {
             this.headers = new Headers({ 'user-agent': 'cnojs/http' });
         }
         this.body = (body !== undefined && body !== null) ? this.createBodyStream(body) : null;
+        if (getServeHook()) {
+            setResponseInitiatorCallFrames(this, captureUserNetworkCallFrames());
+        }
     }
 
     private createBodyStream(bodyInit: any): ReadableStream<Uint8Array> {
@@ -513,6 +516,7 @@ export class Response implements globalThis.Response {
         Object.defineProperty(r, 'url', { value: this.url });
         Object.defineProperty(r, 'redirected', { value: this.redirected });
         Object.defineProperty(r, 'ok', { value: this.ok });
+        setResponseInitiatorCallFrames(r, getResponseInitiatorCallFrames(this));
         return r;
     }
 
@@ -583,6 +587,20 @@ async function applyClientToCurl(curl: CModuleCURL.CURL, client: HttpClient) {
     if (opts.key) curl.setOpt(curlMod.CURLOPT_SSLKEY, await writeTempPem('key', opts.key));
 }
 
+const CURL_INTERNAL_HEADERS = [
+    'accept-encoding',
+    'connection',
+    'content-length',
+    'date',
+    'host',
+    'pragma',
+    'proxy-connection',
+    'referer'
+]
+function filterHeaders(headers: Headers): void {
+    for (const name of CURL_INTERNAL_HEADERS) headers.delete(name);
+}
+
 async function performFetch(request: Request, url: URL): Promise<Response> {
     throwIfAborted(request.signal);
     const body = await request.getBodyBuffer();
@@ -615,14 +633,19 @@ async function performFetch(request: Request, url: URL): Promise<Response> {
     else if (!finalHeaders.has('User-Agent'))
         finalHeaders.set('User-Agent', `cno/${version}`);
 
+    // filter some headers
+    filterHeaders(finalHeaders);
+
     const objHeaders = Object.fromEntries(finalHeaders.entries());
     curl.setUrl(url.href)
         .setMethod(request.method)
         .setHeaders(objHeaders);
+    curl.setAcceptEncoding(compressionAcceptEncoding(finalHeaders));
 
     if (request.timeout > 0) {
         curl.setTimeout(request.timeout);
         curl.setConnectTimeout(request.timeout);
+        curl.setLowSpeedLimit(1, Math.max(1, Math.ceil(request.timeout / 1000)));
     }
 
     // redirect mode
@@ -650,7 +673,12 @@ async function performFetch(request: Request, url: URL): Promise<Response> {
     // AbortSignal directly cancels the underlying curl request
     let abortHandler: (() => void) | null = null;
     if (request.signal) {
-        abortHandler = () => { try { curl.abort(); } catch {} };
+        abortHandler = () => {
+            const err = abortError(request.signal);
+            headersDone.reject(err);
+            errorBody(err);
+            try { curl.abort(); } catch {}
+        };
         if (request.signal.aborted) {
             curl.abort();
             throw abortError(request.signal);
@@ -869,7 +897,7 @@ export async function fetchAsync(input: any, init?: any, initiatorCallFrames?: N
 }
 
 function fetch(input: any, init?: any): Promise<Response> {
-    const initiatorCallFrames = getFetchHook() ? captureNetworkCallFrames() : undefined;
+    const initiatorCallFrames = getFetchHook() ? captureUserNetworkCallFrames() : undefined;
     return fetchAsync(input, init, initiatorCallFrames);
 }
 
@@ -1003,7 +1031,7 @@ export class XMLHttpRequest extends EventTarget {
         const curlTrace = netHook ? attachCurlDebugTrace(curl) : undefined;
         const interceptHook = getFetchInterceptHook();
         const reqId = (netHook || interceptHook) ? newRequestId() : '';
-        const reqCallFrames = netHook ? captureNetworkCallFrames() : undefined;
+        const reqCallFrames = netHook ? captureUserNetworkCallFrames() : undefined;
         const hdrs: Record<string, string> = {};
         for (const [k, v] of this._headers) hdrs[k] = v;
 
@@ -1018,10 +1046,12 @@ export class XMLHttpRequest extends EventTarget {
             .setHeaders(hdrs)
             .setFollowRedirects(true)
             .setMaxRedirects(20);
+        curl.setAcceptEncoding(typeof hdrs['accept-encoding'] === 'string' ? hdrs['accept-encoding'] : undefined);
 
         if (this.timeout > 0) {
             curl.setTimeout(this.timeout);
             curl.setConnectTimeout(this.timeout);
+            curl.setLowSpeedLimit(1, Math.max(1, Math.ceil(this.timeout / 1000)));
         }
 
         const bodyBytes = (body !== undefined && body !== null) ? serializeBody(body) : null;

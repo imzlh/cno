@@ -10,7 +10,7 @@ import { assert } from "../utils/assert";
 import { type ISocket } from "@cnojs/http/socket"
 import { connectTcp, buildRequest, readHeaders } from "../utils/http"
 import { CloseEvent, ErrorEvent, MessageEvent } from "./events";
-import { getWebSocketHook, type NetworkCallFrame, type WSFrameInfo } from '../utils/network-hooks';
+import { getWebSocketHook, captureUserNetworkCallFrames, type NetworkCallFrame, type NetworkSource, type WSFrameInfo } from '../utils/network-hooks';
 
 const engine = import.meta.use('engine');
 const algo = import.meta.use('algorithm');
@@ -27,24 +27,7 @@ let _wsIdCounter = 0;
 const wsTs = () => Date.now() / 1000;
 
 function captureWebSocketCallFrames(): NetworkCallFrame[] | undefined {
-    const frames: NetworkCallFrame[] = [];
-    try {
-        const depth = debug.getStackDepth();
-        for (let level = 0; level < Math.min(depth, 32); level++) {
-            try {
-                const info = debug.getFrameInfo(level);
-                if (!info) continue;
-                frames.push({
-                    functionName: info.func?.name || '',
-                    scriptId: info.file,
-                    url: info.file,
-                    lineNumber: Math.max(0, info.line - 1),
-                    columnNumber: Math.max(0, info.column - 1),
-                });
-            } catch {}
-        }
-    } catch {}
-    return frames.length > 0 ? frames : undefined;
+    return captureUserNetworkCallFrames(debug);
 }
 
 export enum OpCode {
@@ -63,6 +46,18 @@ export enum WebSocketCloseCode {
     SERVICE_RESTART = 1012, TRY_AGAIN_LATER = 1013, BAD_GATEWAY = 1014,
     TLS_HANDSHAKE_FAIL = 1015
 }
+
+export interface ServerWebSocketMeta {
+    source: NetworkSource;
+    requestId: string;
+    url: string;
+    requestHeaders?: Array<[string, string]>;
+    responseStatus?: number;
+    responseHeaders?: Array<[string, string]>;
+    callFrames?: NetworkCallFrame[];
+}
+
+type ServerWebSocketMetaSource = ServerWebSocketMeta | Promise<ServerWebSocketMeta | undefined> | undefined;
 
 interface WebSocketFrame { fin: boolean; opcode: OpCode; masked: boolean; payload: Uint8Array; }
 interface WebSocketEventMap { open: Event; message: MessageEvent; error: ErrorEvent; close: globalThis.CloseEvent; }
@@ -203,7 +198,7 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
     readonly CLOSING = WebSocketReadyState.CLOSING;
     readonly CLOSED = WebSocketReadyState.CLOSED;
 
-    public readonly url: string;
+    public url: string;
     public readonly protocol: string = '';
     public readonly extensions: string = '';
     public binaryType: 'blob' | 'arraybuffer' = 'arraybuffer';
@@ -223,6 +218,8 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
     private _closeTimer: number | null = null;
     private sendQueue: SendQueue;
     private _netRequestId: string = '';
+    private _serverMeta?: ServerWebSocketMeta;
+    private _serverHandshakeEmitted = false;
 
     public onopen: ((this: globalThis.WebSocket, ev: globalThis.Event) => any) | null = null;
     public onmessage: ((this: globalThis.WebSocket, ev: globalThis.MessageEvent) => any) | null = null;
@@ -234,7 +231,8 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
 
     constructor(url: string, protocols?: string | string[]);
     constructor(connection: Promise<IWSSocket>, isServer: true);
-    constructor(urlOrConnection: string | Promise<IWSSocket>, protocolsOrIsServer?: string | string[] | true) {
+    constructor(connection: Promise<IWSSocket>, isServer: true, serverMeta?: ServerWebSocketMetaSource);
+    constructor(urlOrConnection: string | Promise<IWSSocket>, protocolsOrIsServer?: string | string[] | true, serverMeta?: ServerWebSocketMetaSource) {
         super();
         if (typeof urlOrConnection === 'string') {
             this.url = urlOrConnection; this.isClient = true;
@@ -243,12 +241,29 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
             if (protocols) this.protocol = Array.isArray(protocols) ? protocols[0]! : protocols;
             this.connectClient();
         } else {
-            this.url = ''; this.isClient = false;
+            const syncServerMeta = serverMeta && typeof (serverMeta as Promise<ServerWebSocketMeta | undefined>).then !== 'function'
+                ? serverMeta as ServerWebSocketMeta
+                : undefined;
+            this.url = syncServerMeta?.url ?? ''; this.isClient = false;
+            this._serverMeta = syncServerMeta;
+            this._netRequestId = syncServerMeta?.requestId ?? '';
+            this._initiatorCallFrames = syncServerMeta?.callFrames;
             this.sendQueue = new SendQueue(null, false, () => this.handleClose(WebSocketCloseCode.ABNORMAL, 'Connection closed'));
             this._readyState = WebSocketReadyState.CONNECTING;
+            if (serverMeta && typeof (serverMeta as Promise<ServerWebSocketMeta | undefined>).then === 'function') {
+                (serverMeta as Promise<ServerWebSocketMeta | undefined>).then(meta => {
+                    if (!meta) return;
+                    this._serverMeta = meta;
+                    if (!this.url) this.url = meta.url;
+                    if (!this._netRequestId) this._netRequestId = meta.requestId;
+                    if (!this._initiatorCallFrames) this._initiatorCallFrames = meta.callFrames;
+                    if (this._readyState === WebSocketReadyState.OPEN) this.emitServerHandshakeEvents();
+                }).catch(() => {});
+            }
             urlOrConnection.then(conn => {
                 if (this._readyState === WebSocketReadyState.CLOSED) return;
                 this._readyState = WebSocketReadyState.OPEN; this.connection = conn; this.sendQueue.setConnection(conn);
+                this.emitServerHandshakeEvents();
                 this.dispatchEvent(new Event('open')); this.onopen?.(new Event('open'));
                 queueMicrotask(() => { this.startReceiving();
                     // Server-side sockets don't initiate pings — the client
@@ -270,7 +285,6 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
             if (wsHook) {
                 this._netRequestId = `ws-${++_wsIdCounter}`;
                 this._initiatorCallFrames = captureWebSocketCallFrames();
-                try { wsHook.onCreated?.({ requestId: this._netRequestId, url: this.url, callFrames: this._initiatorCallFrames, timestamp: wsTs() }); } catch {}
             }
 
             this.connection = await connectTcp(url);
@@ -298,6 +312,7 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
             if (wsHook) {
                 try {
                     wsHook.onCreated?.({
+                        source: 'fetch',
                         requestId: this._netRequestId,
                         url: url.href,
                         requestHeaders: Array.from(headers.entries()),
@@ -325,7 +340,7 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
 
         if (this._netRequestId) {
             const wsHook = getWebSocketHook();
-            if (wsHook) try { wsHook.onHandshake?.({ requestId: this._netRequestId, status, headers, timestamp: wsTs() }); } catch {}
+            if (wsHook) try { wsHook.onHandshake?.({ source: 'fetch', requestId: this._netRequestId, status, headers, timestamp: wsTs() }); } catch {}
         }
     }
 
@@ -426,7 +441,8 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
             const wsHook = getWebSocketHook();
             if (wsHook) {
                 const frame: WSFrameInfo = {
-                    requestId: this._netRequestId, opcode, masked: true,
+                    source: this.isClient ? 'fetch' : 'serve',
+                    requestId: this._netRequestId, opcode, masked: this.isClient,
                     payloadData: opcode === OpCode.TEXT ? engine.decodeString(payload) : crypto.base64Encode(payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength) as ArrayBuffer),
                     payloadLength: payload.byteLength, timestamp: wsTs(),
                 };
@@ -469,7 +485,7 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
 
         if (this._netRequestId) {
             const wsHook = getWebSocketHook();
-            if (wsHook) try { wsHook.onClosed?.({ requestId: this._netRequestId, code, reason, timestamp: wsTs() }); } catch {}
+            if (wsHook) try { wsHook.onClosed?.({ source: this.isClient ? 'fetch' : 'serve', requestId: this._netRequestId, code, reason, timestamp: wsTs() }); } catch {}
             this._netRequestId = '';
         }
 
@@ -503,7 +519,8 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
             const wsHook = getWebSocketHook();
             if (wsHook) {
                 const frame: WSFrameInfo = {
-                    requestId: this._netRequestId, opcode, masked: false,
+                    source: this.isClient ? 'fetch' : 'serve',
+                    requestId: this._netRequestId, opcode, masked: !this.isClient,
                     payloadData: opcode === OpCode.TEXT ? engine.decodeString(payload) : crypto.base64Encode(payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength) as ArrayBuffer),
                     payloadLength: payload.byteLength, timestamp: wsTs(),
                 };
@@ -518,6 +535,34 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
     private emitError(error: Error): void {
         const event = new ErrorEvent('error', { error, message: error.message }, true);
         this.dispatchEvent(event); this.onerror?.(event);
+    }
+
+    private emitServerHandshakeEvents(): void {
+        const meta = this._serverMeta;
+        const wsHook = getWebSocketHook();
+        if (!meta || !wsHook || !this._netRequestId || this._serverHandshakeEmitted) return;
+        this._serverHandshakeEmitted = true;
+        try {
+            wsHook.onCreated?.({
+                source: meta.source,
+                requestId: this._netRequestId,
+                url: meta.url,
+                requestHeaders: meta.requestHeaders,
+                callFrames: meta.callFrames,
+                timestamp: wsTs(),
+            });
+        } catch {}
+        if (meta.responseStatus != null && meta.responseHeaders) {
+            try {
+                wsHook.onHandshake?.({
+                    source: meta.source,
+                    requestId: this._netRequestId,
+                    status: meta.responseStatus,
+                    headers: meta.responseHeaders,
+                    timestamp: wsTs(),
+                });
+            } catch {}
+        }
     }
 
     addEventListener<K extends keyof WebSocketEventMap>(type: K, listener: any, options?: boolean | AddEventListenerOptions): void {
@@ -618,8 +663,8 @@ export class WebSocketStream {
     }
 }
 
-export function createWebSocketFromConnection(connection: Promise<IWSSocket>): WebSocket {
-    return new WebSocket(connection, true);
+export function createWebSocketFromConnection(connection: Promise<IWSSocket>, serverMeta?: ServerWebSocketMetaSource): WebSocket {
+    return new WebSocket(connection, true, serverMeta);
 }
 
 Reflect.set(globalThis, 'WebSocket', WebSocket);

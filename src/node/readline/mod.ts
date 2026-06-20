@@ -165,7 +165,11 @@ export class Interface extends EventEmitter {
     private _processLineInput(data: string): void {
         for (let i = 0; i < data.length; i++) {
             const ch = data[i];
-            if (ch === '\n' || ch === '\r') {
+            if (ch === '\r' || ch === '\n') {
+                // Treat \r\n as a single line ending
+                if (ch === '\r' && i + 1 < data.length && data[i + 1] === '\n') {
+                    i++;
+                }
                 const line = this._lineBuf.join('');
                 this._lineBuf = [];
                 this.emit('line', line);
@@ -414,12 +418,5 @@ export function moveCursor(stream: NodeJS.WritableStream, dx: number, dy: number
     callback?.();
 }
 
-// ---------------------------------------------------------------------------
-// Promises API (Node.js 17+)
-// ---------------------------------------------------------------------------
-
-export namespace promises {
-    export function createInterface(options: ReadLineOptions | NodeJS.ReadableStream): Interface {
-        return new Interface(options);
-    }
-}
+import * as promises from './promises';
+export { promises };
