@@ -3,12 +3,12 @@
  */
 
 import {
-    KvKey,
     cursorToRawKey,
     deserializeKey,
     deserializeValue,
     rawKeyToCursor,
     serializeKey,
+    type InternalEntry,
     validateKey,
 } from './types';
 import { KvDatabase, getEndKeyForPrefix } from './db';
@@ -23,7 +23,7 @@ export class KvListIterator<T = unknown> implements AsyncIterableIterator<Deno.K
         consistency: 'strong' | 'eventual';
         cursor?: string;
     };
-    private buffer: Deno.KvEntry<T>[] = [];
+    private buffer: InternalEntry[] = [];
     private nextCursor: string | null = null;
     private done = false;
     private count = 0;
@@ -58,8 +58,15 @@ export class KvListIterator<T = unknown> implements AsyncIterableIterator<Deno.K
         if (this.buffer.length > 0) {
             const entry = this.buffer.shift()!;
             this.count++;
-            this._currentCursor = rawKeyToCursor(serializeKey(entry.key as KvKey));
-            return { done: false, value: entry };
+            this._currentCursor = rawKeyToCursor(entry.key);
+            return {
+                done: false,
+                value: {
+                    key: deserializeKey(entry.key),
+                    value: deserializeValue<T>(entry.value),
+                    versionstamp: entry.versionstamp,
+                }
+            };
         }
 
         return { done: true, value: undefined };
@@ -109,11 +116,7 @@ export class KvListIterator<T = unknown> implements AsyncIterableIterator<Deno.K
             limit: batchLimit,
         });
 
-        this.buffer = result.entries.map(entry => ({
-            key: deserializeKey(entry.key),
-            value: deserializeValue<T>(entry.value),
-            versionstamp: entry.versionstamp,
-        }));
+        this.buffer = result.entries;
 
         this.nextCursor = result.cursor ? rawKeyToCursor(result.cursor) : null;
         this.done = !result.cursor || this.buffer.length === 0;

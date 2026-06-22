@@ -20,6 +20,8 @@ const console = import.meta.use('console');
 
 interface WatchSubscription {
     keys: KvKey[];
+    rawKeys: Uint8Array[];
+    keyIds: string[];
     controller: ReadableStreamDefaultController<KvEntryMaybe<unknown>[]>;
     lastValues: Map<string, { versionstamp: string | null; value: unknown }>;
 }
@@ -218,10 +220,19 @@ export class Kv implements Deno.Kv {
         };
         
         const queueKey: KvKey = [QUEUE_PREFIX, scheduledAt, id];
-        const versionstamp = this.db.set(serializeKey(queueKey), serializeValue(queueEntry), delay + 86400000);
+        const rawQueueKey = serializeKey(queueKey);
+        const versionstamp = this.db.set(rawQueueKey, serializeValue(queueEntry), delay + 86400000);
         
         if (delay === 0) {
-            queueMicrotask(() => this.deliverMessage(queueEntry));
+            queueMicrotask(() => {
+                const deliveryKey = `${queueEntry.id}:${queueEntry.retryCount}`;
+                if (this.pendingDeliveries.has(deliveryKey)) return;
+                const promise = this.deliverMessage(queueEntry, rawQueueKey)
+                    .finally(() => {
+                        this.pendingDeliveries.delete(deliveryKey);
+                    });
+                this.pendingDeliveries.set(deliveryKey, promise);
+            });
         }
         
         return Promise.resolve({ ok: true, versionstamp });
@@ -251,18 +262,22 @@ export class Kv implements Deno.Kv {
         return new ReadableStream({
             start(controller) {
                 const lastValues = new Map<string, { versionstamp: string | null; value: unknown }>();
+                const rawKeys = keys.map(key => serializeKey(key));
+                const keyIds = rawKeys.map(rawKey => rawKeyToCursor(rawKey));
                 
                 subscription = {
                     keys: keys as KvKey[],
+                    rawKeys,
+                    keyIds,
                     controller: controller as ReadableStreamDefaultController<KvEntryMaybe<unknown>[]>,
                     lastValues,
                 };
                 
                 self.watchSubscriptions.add(subscription);
                 
-                const initialValues = keys.map(key => {
-                    const rawKey = serializeKey(key);
-                    const keyId = rawKeyToCursor(rawKey);
+                const initialValues = keys.map((key, index) => {
+                    const rawKey = rawKeys[index]!;
+                    const keyId = keyIds[index]!;
                     const entry = self.db.get(rawKey);
                     
                     let value: KvEntryMaybe<unknown>;
@@ -300,12 +315,15 @@ export class Kv implements Deno.Kv {
         });
     }
 
-    private async deliverMessage(entry: QueueEntry): Promise<void> {
+    private async deliverMessage(entry: QueueEntry, rawQueueKey?: Uint8Array): Promise<void> {
         if (this._closed || this.queueHandlers.length === 0) return;
         
         for (const handler of this.queueHandlers) {
             try {
                 await handler(entry.data);
+                if (rawQueueKey) {
+                    this.db.delete(rawQueueKey);
+                }
                 return;
             } catch (err) {
                 console.error('Queue handler error:', err);
@@ -373,33 +391,45 @@ export class Kv implements Deno.Kv {
     private notifyWatchers(changedKey: KvKey): void {
         const rawChangedKey = serializeKey(changedKey);
         const changedKeyId = rawKeyToCursor(rawChangedKey);
+        const changedEntry = this.db.get(rawChangedKey);
+        const changedVersionstamp = changedEntry?.versionstamp ?? null;
         
         for (const sub of this.watchSubscriptions) {
             try {
-                const keyIndex = sub.keys.findIndex(k => rawKeyToCursor(serializeKey(k)) === changedKeyId);
+                const keyIndex = sub.keyIds.indexOf(changedKeyId);
                 if (keyIndex === -1) continue;
-                
-                const entry = this.db.get(rawChangedKey);
                 const lastValue = sub.lastValues.get(changedKeyId);
-                
-                const newVersionstamp = entry?.versionstamp ?? null;
-                if (lastValue && lastValue.versionstamp === newVersionstamp) {
+
+                if (lastValue && lastValue.versionstamp === changedVersionstamp) {
                     continue;
                 }
                 
-                const values = sub.keys.map(key => {
-                    const rawKey = serializeKey(key);
-                    const keyId = rawKeyToCursor(rawKey);
-                    const e = this.db.get(rawKey);
+                const values = sub.keys.map((key, index) => {
+                    const rawKey = index === keyIndex ? rawChangedKey : sub.rawKeys[index]!;
+                    const keyId = sub.keyIds[index]!;
+                    const e = index === keyIndex ? changedEntry : null;
                     
                     if (e) {
                         const v = deserializeValue(e.value);
                         sub.lastValues.set(keyId, { versionstamp: e.versionstamp, value: v });
                         return { key, value: v, versionstamp: e.versionstamp };
-                    } else {
+                    }
+                    if (index === keyIndex) {
                         sub.lastValues.set(keyId, { versionstamp: null, value: null });
                         return { key, value: null, versionstamp: null };
                     }
+                    const cached = sub.lastValues.get(keyId);
+                    if (cached) {
+                        return { key, value: cached.value, versionstamp: cached.versionstamp };
+                    }
+                    const current = this.db.get(rawKey);
+                    if (current) {
+                        const v = deserializeValue(current.value);
+                        sub.lastValues.set(keyId, { versionstamp: current.versionstamp, value: v });
+                        return { key, value: v, versionstamp: current.versionstamp };
+                    }
+                    sub.lastValues.set(keyId, { versionstamp: null, value: null });
+                    return { key, value: null, versionstamp: null };
                 });
                 
                 sub.controller.enqueue(values);

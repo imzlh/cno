@@ -23,6 +23,7 @@ const debug = import.meta.use('debug');
 
 const websocketSymbol = Symbol('deno.serve.websocket');
 let serveRequestSeq = 0;
+const MAX_HOOK_POST_DATA_BYTES = 256 * 1024;
 
 interface WebSocketResponse extends Response {
     [websocketSymbol]?: (conn: ISocket) => void;
@@ -52,6 +53,14 @@ function headersToRecord(headers: Headers): Record<string, string> {
     const out: Record<string, string> = {};
     headers.forEach((value, key) => { out[key] = value; });
     return out;
+}
+
+function truncateHookPostData(body?: Uint8Array | null): Uint8Array | null | undefined {
+    if (!body) return body;
+    if (body.byteLength > MAX_HOOK_POST_DATA_BYTES) {
+        return new Uint8Array(body.subarray(0, MAX_HOOK_POST_DATA_BYTES));
+    }
+    return body;
 }
 
 /* ------------------------------------------------------------------ */
@@ -352,6 +361,7 @@ function serve(
             const requestId = serveHook ? newServeRequestId() : '';
             const requestStartTime = serveTs();
             const requestEntryCallFrames = serveEntryCallFrames ?? (serveHook ? captureServeCallFrames() : undefined);
+            const requestPostData = req.body instanceof Uint8Array ? truncateHookPostData(req.body) : undefined;
             let requestUrl = '';
             let requestReported = false;
             try {
@@ -362,6 +372,7 @@ function serve(
                     port: addr?.port || options.port || 8000,
                     secure: coreServer.isSecure
                 });
+                req.body = null;
                 requestUrl = webRequest.url;
 
                 // Create connection info
@@ -391,7 +402,7 @@ function serve(
                         url: requestUrl,
                         method: req.method,
                         headers: headersArrayToRecord(req.headers),
-                        postData: req.body ?? null,
+                        postData: requestPostData,
                         callFrames: requestEntryCallFrames,
                         timestamp: requestStartTime,
                     });
@@ -415,7 +426,7 @@ function serve(
                                 url: requestUrl,
                                 method: req.method,
                                 headers: headersArrayToRecord(req.headers),
-                                postData: req.body ?? null,
+                                postData: requestPostData,
                                 callFrames: requestEntryCallFrames,
                                 timestamp: requestStartTime,
                             });

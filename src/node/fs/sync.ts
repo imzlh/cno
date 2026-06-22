@@ -166,21 +166,22 @@ export function rmSync(path: PathLike, options?: { force?: boolean; recursive?: 
 export function readdirSync(path: PathLike, options?: { encoding?: BufferEncoding | 'buffer'; withFileTypes?: boolean; recursive?: boolean } | BufferEncoding): string[] | import('fs').Dirent[] {
     const pathStr = pathToString(path);
     const withFileTypes = typeof options === 'object' ? options?.withFileTypes : false;
-    const entries = wrapSync(() => fs.readdir(pathStr), 'readdirSync', pathStr);
+    const entries = withFileTypes
+        ? wrapSync(() => fs.readdir(pathStr, true), 'readdirSync', pathStr)
+        : wrapSync(() => fs.readdir(pathStr), 'readdirSync', pathStr);
 
     if (withFileTypes) {
-        return entries.map(name => {
-            const stat = fs.lstat(`${pathStr}/${name}`);
-            return toNodeDirent(name, stat);
+        return (entries as CModuleFS.DirEnt[]).map(entry => {
+            return toNodeDirent(entry.name, entry);
         });
     }
 
-    return entries;
+    return entries as string[];
 }
 
 export function opendirSync(path: PathLike, options?: { encoding?: BufferEncoding; bufferSize?: number }): import('fs').Dir {
     const pathStr = pathToString(path);
-    const entries = fs.readdir(pathStr);
+    const entries = fs.readdir(pathStr, true);
     let index = 0;
 
     const dir: import('fs').Dir = {
@@ -188,16 +189,14 @@ export function opendirSync(path: PathLike, options?: { encoding?: BufferEncodin
 
         async read(): Promise<import('fs').Dirent | null> {
             if (index >= entries.length) return null;
-            const name = entries[index++];
-            const stat = fs.lstat(`${pathStr}/${name}`);
-            return toNodeDirent(name, stat);
+            const entry = entries[index++]!;
+            return toNodeDirent(entry.name, entry);
         },
 
         readSync(): import('fs').Dirent | null {
             if (index >= entries.length) return null;
-            const name = entries[index++];
-            const stat = fs.lstat(`${pathStr}/${name}`);
-            return toNodeDirent(name, stat);
+            const entry = entries[index++]!;
+            return toNodeDirent(entry.name, entry);
         },
 
         async close(): Promise<void> {},

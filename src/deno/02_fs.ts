@@ -365,13 +365,12 @@ Object.assign(Deno, wrapFSns({
     },
 
     *readDirSync(path) {
-        for (const el of fs.readdir(toString(path))) {
-            const stat = fs.stat(path + "/" + el);
+        for (const entry of fs.readdir(toString(path), true)) {
             yield {
-                name: el,
-                isDirectory: stat.isDirectory,
-                isFile: stat.isFile,
-                isSymlink: stat.isSymbolicLink,
+                name: entry.name,
+                isDirectory: entry.isDirectory,
+                isFile: entry.isFile,
+                isSymlink: entry.isSymbolicLink,
             } as Deno.DirEntry;
         }
     },

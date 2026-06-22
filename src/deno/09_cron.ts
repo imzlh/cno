@@ -13,6 +13,10 @@ type Matcher = {
     dayOfMonth: Set<number>;
     month: Set<number>;
     dayOfWeek: Set<number>;
+    minuteValues: number[];
+    hourValues: number[];
+    dayOfMonthValues: number[];
+    monthValues: number[];
     dayOfMonthWildcard: boolean;
     dayOfWeekWildcard: boolean;
 };
@@ -141,23 +145,41 @@ function compileMatcher(source: string | Deno.CronSchedule): Matcher {
         const fields = source.trim().split(/\s+/);
         if (fields.length !== 5) fail(`expected 5 cron fields, got ${fields.length}`);
         const [minute, hour, dayOfMonth, month, dayOfWeek] = fields;
+        const minuteSet = parseStringField('minute', minute!);
+        const hourSet = parseStringField('hour', hour!);
+        const dayOfMonthSet = parseStringField('dayOfMonth', dayOfMonth!);
+        const monthSet = parseStringField('month', month!);
+        const dayOfWeekSet = parseStringField('dayOfWeek', dayOfWeek!);
         return {
-            minute: parseStringField('minute', minute!),
-            hour: parseStringField('hour', hour!),
-            dayOfMonth: parseStringField('dayOfMonth', dayOfMonth!),
-            month: parseStringField('month', month!),
-            dayOfWeek: parseStringField('dayOfWeek', dayOfWeek!),
+            minute: minuteSet,
+            hour: hourSet,
+            dayOfMonth: dayOfMonthSet,
+            month: monthSet,
+            dayOfWeek: dayOfWeekSet,
+            minuteValues: Array.from(minuteSet).sort((a, b) => a - b),
+            hourValues: Array.from(hourSet).sort((a, b) => a - b),
+            dayOfMonthValues: Array.from(dayOfMonthSet).sort((a, b) => a - b),
+            monthValues: Array.from(monthSet).sort((a, b) => a - b),
             dayOfMonthWildcard: dayOfMonth === '*',
             dayOfWeekWildcard: dayOfWeek === '*',
         };
     }
 
+    const minuteSet = parseScheduleExpression('minute', source.minute);
+    const hourSet = parseScheduleExpression('hour', source.hour);
+    const dayOfMonthSet = parseScheduleExpression('dayOfMonth', source.dayOfMonth);
+    const monthSet = parseScheduleExpression('month', source.month);
+    const dayOfWeekSet = parseScheduleExpression('dayOfWeek', source.dayOfWeek);
     return {
-        minute: parseScheduleExpression('minute', source.minute),
-        hour: parseScheduleExpression('hour', source.hour),
-        dayOfMonth: parseScheduleExpression('dayOfMonth', source.dayOfMonth),
-        month: parseScheduleExpression('month', source.month),
-        dayOfWeek: parseScheduleExpression('dayOfWeek', source.dayOfWeek),
+        minute: minuteSet,
+        hour: hourSet,
+        dayOfMonth: dayOfMonthSet,
+        month: monthSet,
+        dayOfWeek: dayOfWeekSet,
+        minuteValues: Array.from(minuteSet).sort((a, b) => a - b),
+        hourValues: Array.from(hourSet).sort((a, b) => a - b),
+        dayOfMonthValues: Array.from(dayOfMonthSet).sort((a, b) => a - b),
+        monthValues: Array.from(monthSet).sort((a, b) => a - b),
         dayOfMonthWildcard: source.dayOfMonth === undefined,
         dayOfWeekWildcard: source.dayOfWeek === undefined,
     };
@@ -181,14 +203,73 @@ function compileSchedule(source: string | Deno.CronSchedule): CompiledSchedule {
     };
 }
 
+function nextAllowedValue(values: number[], current: number): number | null {
+    for (const value of values) {
+        if (value >= current) return value;
+    }
+    return null;
+}
+
+function matchesDay(matcher: Matcher, date: Date): boolean {
+    const dayOfMonthMatch = matcher.dayOfMonth.has(date.getUTCDate());
+    const dayOfWeekMatch = matcher.dayOfWeek.has(date.getUTCDay());
+    return matcher.dayOfMonthWildcard || matcher.dayOfWeekWildcard
+        ? dayOfMonthMatch && dayOfWeekMatch
+        : dayOfMonthMatch || dayOfWeekMatch;
+}
+
 function nextRunAt(schedule: CompiledSchedule, now: Date): Date {
+    const matcher = compileMatcher(schedule.source);
     const cursor = new Date(now.getTime());
     cursor.setUTCSeconds(0, 0);
     cursor.setUTCMinutes(cursor.getUTCMinutes() + 1);
-    const maxChecks = 366 * 24 * 60 * 5;
-    for (let i = 0; i < maxChecks; i++) {
+    const deadline = now.getTime() + 366 * 24 * 60 * 60 * 1000 * 5;
+
+    while (cursor.getTime() <= deadline) {
+        const month = cursor.getUTCMonth() + 1;
+        const nextMonth = nextAllowedValue(matcher.monthValues, month);
+        if (nextMonth === null) {
+            cursor.setUTCFullYear(cursor.getUTCFullYear() + 1, matcher.monthValues[0]! - 1, 1);
+            cursor.setUTCHours(0, 0, 0, 0);
+            continue;
+        }
+        if (nextMonth !== month) {
+            cursor.setUTCMonth(nextMonth - 1, 1);
+            cursor.setUTCHours(0, 0, 0, 0);
+            continue;
+        }
+
+        if (!matchesDay(matcher, cursor)) {
+            cursor.setUTCDate(cursor.getUTCDate() + 1);
+            cursor.setUTCHours(0, 0, 0, 0);
+            continue;
+        }
+
+        const hour = cursor.getUTCHours();
+        const nextHour = nextAllowedValue(matcher.hourValues, hour);
+        if (nextHour === null) {
+            cursor.setUTCDate(cursor.getUTCDate() + 1);
+            cursor.setUTCHours(0, 0, 0, 0);
+            continue;
+        }
+        if (nextHour !== hour) {
+            cursor.setUTCHours(nextHour, 0, 0, 0);
+            continue;
+        }
+
+        const minute = cursor.getUTCMinutes();
+        const nextMinute = nextAllowedValue(matcher.minuteValues, minute);
+        if (nextMinute === null) {
+            cursor.setUTCHours(cursor.getUTCHours() + 1, 0, 0, 0);
+            continue;
+        }
+        if (nextMinute !== minute) {
+            cursor.setUTCMinutes(nextMinute, 0, 0);
+            continue;
+        }
+
         if (schedule.matches(cursor)) return new Date(cursor.getTime());
-        cursor.setUTCMinutes(cursor.getUTCMinutes() + 1);
+        cursor.setUTCMinutes(cursor.getUTCMinutes() + 1, 0, 0);
     }
     fail(`unable to find next run for schedule ${JSON.stringify(schedule.source)}`);
 }

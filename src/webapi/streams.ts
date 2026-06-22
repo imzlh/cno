@@ -338,32 +338,51 @@ export class ReadableStream<R = any> implements globalThis.ReadableStream<R> {
 
         const reader = this.getReader();
         const writer = dest.getWriter();
+        void writer.closed.catch(() => {});
+        void writer.ready.catch(() => {});
+
+        if (signal?.aborted) {
+            reader.releaseLock();
+            writer.releaseLock();
+            throw signal.reason;
+        }
 
         let aborted = false;
-        const abortPromise = signal ?
-            new Promise<never>((_, reject) => {
-                signal.addEventListener('abort', () => {
+        const abortState: { removeAbortListener?: () => void } = {};
+        type AbortResult = { aborted: true; reason: any };
+        let abortPromise: Promise<AbortResult>;
+        if (signal) {
+            abortPromise = new Promise<AbortResult>((resolve) => {
+                const onAbort = () => {
                     aborted = true;
-                    reject(signal.reason);
-                });
-            }) : new Promise<never>(() => { });
+                    resolve({ aborted: true, reason: signal.reason });
+                };
+                signal.addEventListener('abort', onAbort, { once: true });
+                abortState.removeAbortListener = () => signal.removeEventListener('abort', onAbort);
+            });
+        } else {
+            abortPromise = new Promise<AbortResult>(() => { });
+        }
 
         try {
             while (!aborted) {
                 const result = await Promise.race([reader.read(), abortPromise]);
+                if ('aborted' in result) throw result.reason;
 
                 if (result.done) {
                     if (!preventClose) await writer.close();
                     break;
                 }
 
-                await writer.write(result.value);
+                const writeResult = await Promise.race([writer.write(result.value).then(() => null), abortPromise]);
+                if (writeResult && 'aborted' in writeResult) throw writeResult.reason;
             }
         } catch (error) {
             if (!preventAbort) await writer.abort(error);
             if (!preventCancel) await reader.cancel(error);
             throw error;
         } finally {
+            abortState.removeAbortListener?.();
             reader.releaseLock();
             writer.releaseLock();
         }
@@ -420,17 +439,62 @@ export class ReadableStream<R = any> implements globalThis.ReadableStream<R> {
         return this.values();
     }
 
-    async* values(): AsyncIterableIterator<R> {
+    values(): AsyncIterableIterator<R> {
         const reader = this.getReader();
-        try {
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) return;
-                yield value;
-            }
-        } finally {
+        let finished = false;
+        let released = false;
+
+        const release = () => {
+            if (released) return;
+            released = true;
             reader.releaseLock();
-        }
+        };
+
+        const iterator: AsyncIterableIterator<R> = {
+            async next(): Promise<IteratorResult<R>> {
+                if (finished) return { value: undefined, done: true };
+                try {
+                    const result = await reader.read();
+                    if (result.done) {
+                        finished = true;
+                        release();
+                        return { value: undefined, done: true };
+                    }
+                    return result;
+                } catch (error) {
+                    finished = true;
+                    release();
+                    throw error;
+                }
+            },
+            async return(value?: any): Promise<IteratorResult<R>> {
+                if (!finished) {
+                    finished = true;
+                    try {
+                        await reader.cancel();
+                    } finally {
+                        release();
+                    }
+                }
+                return { value, done: true };
+            },
+            async throw(error?: any): Promise<IteratorResult<R>> {
+                if (!finished) {
+                    finished = true;
+                    try {
+                        await reader.cancel(error);
+                    } finally {
+                        release();
+                    }
+                }
+                throw error;
+            },
+            [Symbol.asyncIterator]() {
+                return this;
+            }
+        };
+
+        return iterator;
     }
 
     // Internal bridge

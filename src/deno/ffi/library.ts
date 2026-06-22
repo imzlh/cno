@@ -23,6 +23,7 @@ class DynamicLibraryImpl<S extends ForeignLibraryInterface> implements DynamicLi
     private lib: CModuleFFI.UvLib;
     private _symbols: StaticForeignLibraryInterface<S>;
     private closed = false;
+    private cifCache = new Map<string, CModuleFFI.FfiCif>();
 
     get symbols(): StaticForeignLibraryInterface<S> {
         return this._symbols;
@@ -38,6 +39,7 @@ class DynamicLibraryImpl<S extends ForeignLibraryInterface> implements DynamicLi
     close(): void {
         if (this.closed) return;
         this.closed = true;
+        this.cifCache.clear();
     }
 
     private createSymbols(def: S): StaticForeignLibraryInterface<S> {
@@ -102,9 +104,21 @@ class DynamicLibraryImpl<S extends ForeignLibraryInterface> implements DynamicLi
         parameters: readonly NativeType[],
         result: NativeResultType
     ): CModuleFFI.FfiCif {
-        const retType = this.toFfiType(result);
-        const argTypes = parameters.map(p => this.toFfiType(p));
-        return new ffi.FfiCif(retType, argTypes);
+        const cacheKey = `${this.typeCacheKey(result)}(${parameters.map(p => this.typeCacheKey(p)).join(',')})`;
+        let cif = this.cifCache.get(cacheKey);
+        if (!cif) {
+            const retType = this.toFfiType(result);
+            const argTypes = parameters.map(p => this.toFfiType(p));
+            cif = new ffi.FfiCif(retType, argTypes);
+            this.cifCache.set(cacheKey, cif);
+        }
+        return cif;
+    }
+
+    private typeCacheKey(type: NativeType | 'void'): string {
+        return typeof type === 'string'
+            ? type
+            : `struct(${type.struct.map(member => this.typeCacheKey(member)).join(',')})`;
     }
 
     private toFfiType(

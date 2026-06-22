@@ -1,5 +1,6 @@
-const error = import.meta.use('error');
 import { errors } from "../deno/01_errors";
+
+const error = import.meta.use('error');
 
 export function wrapFSErr(e: CModuleError.Error): Error {
     if (!(e instanceof Error) || !e.code) return e;
@@ -66,15 +67,16 @@ export function wrapFSErr(e: CModuleError.Error): Error {
     }
 }
 
-function __rethrow(e: any, stack: string) {
+function __rethrow(e: any, _stack: string) {
     if (typeof e != "object") throw e;
+    const stack = _stack.substring(_stack.indexOf('\n') + 1);
     Object.defineProperty(e, 'stack', { value: stack });
     throw e;
 }
 
 export function __wrap_fs_func(obj: Function) {
-    return function (this: any) {
-        const stack = new Error().stack!.split('\n').slice(1).join('\n');
+    function wrappedFsFunc(this: any) {
+        const stack = new Error().stack!;
         try {
             const ret = obj.apply(this, arguments);
             if (ret instanceof Promise) {
@@ -85,7 +87,8 @@ export function __wrap_fs_func(obj: Function) {
         } catch (e) {
             return __rethrow(wrapFSErr(e as any), stack);
         }
-    };
+    }
+    return wrappedFsFunc;
 }
 
 export function wrapFSns(fsFunc: Partial<typeof Deno>): Partial<typeof Deno> {

@@ -676,10 +676,29 @@ export class ServerImpl extends NetServer implements Server {
                 incoming.headersDistinct[lowerKey]!.push(value);
             }
 
-            if (req.body) {
-                incoming.push(req.body);
+            const requestBody = req.body;
+            if (requestBody instanceof Uint8Array) {
+                incoming.push(requestBody);
                 incoming.push(null);
                 incoming.complete = true;
+            } else if (requestBody instanceof ReadableStream) {
+                (async () => {
+                    const reader = requestBody.getReader();
+                    try {
+                        while (true) {
+                            const { done, value } = await reader.read();
+                            if (done) break;
+                            incoming.push(value);
+                        }
+                        incoming.push(null);
+                        incoming.complete = true;
+                    } catch (err) {
+                        incoming.aborted = true;
+                        incoming.destroy(err as Error);
+                    } finally {
+                        reader.releaseLock();
+                    }
+                })().catch(() => {});
             }
 
             const response = new ServerResponseImpl();
@@ -691,7 +710,7 @@ export class ServerImpl extends NetServer implements Server {
                     url: requestUrl,
                     method: req.method,
                     headers: requestHeaders,
-                    postData: req.body ?? undefined,
+                    postData: req.body instanceof Uint8Array ? req.body : undefined,
                     callFrames: requestCallFrames,
                 });
             } catch {}

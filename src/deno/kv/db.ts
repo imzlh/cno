@@ -39,14 +39,17 @@ const DELETE_SQL = `DELETE FROM kv_entries WHERE key = ?`;
 const COUNT_SQL = `SELECT COUNT(*) as count FROM kv_entries WHERE key >= ? AND key < ?`;
 const CLEANUP_SQL = `DELETE FROM kv_entries WHERE expire_at IS NOT NULL AND expire_at < ?`;
 const DELETE_PREFIX_SQL = `DELETE FROM kv_entries WHERE key >= ? AND key < ?`;
-const LIST_SQL = `SELECT key, value, versionstamp, expire_at FROM kv_entries WHERE key >= ? AND key < ? ORDER BY key ASC LIMIT ?`;
-const LIST_REVERSE_SQL = `SELECT key, value, versionstamp, expire_at FROM kv_entries WHERE key >= ? AND key < ? ORDER BY key DESC LIMIT ?`;
+const LIST_SQL = `SELECT key, value, versionstamp, expire_at FROM kv_entries WHERE key >= ? AND key < ? AND (expire_at IS NULL OR expire_at > ?) ORDER BY key ASC LIMIT ?`;
+const LIST_REVERSE_SQL = `SELECT key, value, versionstamp, expire_at FROM kv_entries WHERE key >= ? AND key < ? AND (expire_at IS NULL OR expire_at > ?) ORDER BY key DESC LIMIT ?`;
+const SQLITE_CACHE_SIZE_KIB = -16384;
 
 export class KvDatabase {
     private db: CModuleSQLite3.Sqlite3Handle | null = null;
     private path: string;
     private isMemory: boolean;
     private cleanupTimer: ReturnType<typeof setInterval> | null = null;
+    private stmtCache = new Map<string, CModuleSQLite3.Sqlite3Stmt>();
+    private lastCleanupAt = 0;
 
     constructor(dbPath?: string) {
         if (dbPath === undefined || dbPath === '') {
@@ -69,7 +72,7 @@ export class KvDatabase {
 
         this.db.exec('PRAGMA journal_mode = WAL');
         this.db.exec('PRAGMA synchronous = NORMAL');
-        this.db.exec('PRAGMA cache_size = -64000');
+        this.db.exec(`PRAGMA cache_size = ${SQLITE_CACHE_SIZE_KIB}`);
         this.db.exec('PRAGMA temp_store = MEMORY');
 
         this.db.exec(CREATE_TABLE_SQL);
@@ -99,6 +102,14 @@ export class KvDatabase {
             clearInterval(this.cleanupTimer);
             this.cleanupTimer = null;
         }
+        for (const stmt of this.stmtCache.values()) {
+            try {
+                stmt.finalize();
+            } catch {
+                // Ignore finalize errors during close.
+            }
+        }
+        this.stmtCache.clear();
         if (this.db) {
             try {
                 this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
@@ -115,13 +126,22 @@ export class KvDatabase {
         return this.db;
     }
 
+    private getStmt(sql: string): CModuleSQLite3.Sqlite3Stmt {
+        let stmt = this.stmtCache.get(sql);
+        if (!stmt) {
+            stmt = this.getDb().prepare(sql);
+            this.stmtCache.set(sql, stmt);
+        }
+        return stmt;
+    }
+
     private cleanup(): void {
         try {
             const now = Date.now();
-            const db = this.getDb();
-            const stmt = db.prepare(CLEANUP_SQL);
+            if (now - this.lastCleanupAt < 60_000) return;
+            this.lastCleanupAt = now;
+            const stmt = this.getStmt(CLEANUP_SQL);
             stmt.run([now]);
-            stmt.finalize();
         } catch {
             // Ignore cleanup errors
         }
@@ -159,15 +179,16 @@ export class KvDatabase {
     }
 
     get(rawKey: RawKey): InternalEntry | null {
-        this.cleanup();
+        const now = Date.now();
+        if (now - this.lastCleanupAt >= 60_000) {
+            this.cleanup();
+        }
         return this._getInternal(rawKey);
     }
 
     private _getInternal(rawKey: RawKey): InternalEntry | null {
-        const db = this.getDb();
-        const stmt = db.prepare(GET_SQL);
+        const stmt = this.getStmt(GET_SQL);
         const rows = stmt.all([rawKey]);
-        stmt.finalize();
 
         if (rows.length === 0) return null;
 
@@ -187,35 +208,27 @@ export class KvDatabase {
         const versionstamp = generateVersionstamp();
         const expireAt = expireIn ? Date.now() + expireIn : null;
 
-        const db = this.getDb();
-        const stmt = db.prepare(SET_SQL);
+        const stmt = this.getStmt(SET_SQL);
         stmt.run([rawKey, value, versionstamp, expireAt]);
-        stmt.finalize();
 
         return versionstamp;
     }
 
     delete(rawKey: RawKey): void {
-        const db = this.getDb();
-        const stmt = db.prepare(DELETE_SQL);
+        const stmt = this.getStmt(DELETE_SQL);
         stmt.run([rawKey]);
-        stmt.finalize();
     }
 
     deletePrefix(prefix: RawKey): number {
         const endKey = getEndKeyForPrefix(prefix);
-        const db = this.getDb();
-        const stmt = db.prepare(DELETE_PREFIX_SQL);
+        const stmt = this.getStmt(DELETE_PREFIX_SQL);
         const result = stmt.run([prefix, endKey]);
-        stmt.finalize();
         return result.changes || 0;
     }
 
     count(startKey: RawKey, endKey: RawKey): number {
-        const db = this.getDb();
-        const stmt = db.prepare(COUNT_SQL);
+        const stmt = this.getStmt(COUNT_SQL);
         const rows = stmt.all([startKey, endKey]);
-        stmt.finalize();
         return rows[0]?.count || 0;
     }
 
@@ -224,14 +237,10 @@ export class KvDatabase {
         endKey: RawKey,
         options: { reverse?: boolean; limit?: number; cursor?: string } = {}
     ): { entries: InternalEntry[]; cursor: RawKey | null } {
-        const db = this.getDb();
         const limit = options.limit ?? 500;
-        const stmt = db.prepare(options.reverse ? LIST_REVERSE_SQL : LIST_SQL);
-        let rows = stmt.all([startKey, endKey, limit + 8]);
-        stmt.finalize();
-
+        const stmt = this.getStmt(options.reverse ? LIST_REVERSE_SQL : LIST_SQL);
         const now = Date.now();
-        rows = rows.filter((row: any) => row.expire_at === null || row.expire_at > now);
+        let rows = stmt.all([startKey, endKey, now, limit + 1]);
 
         if (options.cursor) {
             const cursorKey = cursorToRawKey(options.cursor);
@@ -268,6 +277,8 @@ export class KvDatabase {
         operand?: KvKeyPart;
     }>): { success: boolean; versionstamp?: string } {
         const db = this.getDb();
+        const setStmt = this.getStmt(SET_SQL);
+        const deleteStmt = this.getStmt(DELETE_SQL);
 
         db.exec('BEGIN IMMEDIATE');
 
@@ -288,16 +299,12 @@ export class KvDatabase {
                     case 'set': {
                         const versionstamp = generateVersionstamp();
                         const expireAt = op.expireIn ? Date.now() + op.expireIn : null;
-                        const stmt = db.prepare(SET_SQL);
-                        stmt.run([op.key, op.value!, versionstamp, expireAt]);
-                        stmt.finalize();
+                        setStmt.run([op.key, op.value!, versionstamp, expireAt]);
                         finalVersionstamp = versionstamp;
                         break;
                     }
                     case 'delete': {
-                        const stmt = db.prepare(DELETE_SQL);
-                        stmt.run([op.key]);
-                        stmt.finalize();
+                        deleteStmt.run([op.key]);
                         break;
                     }
                     case 'sum': {
@@ -313,9 +320,7 @@ export class KvDatabase {
                             ? BigInt(currentValue) + BigInt(operand)
                             : currentValue + operand;
                         const versionstamp = generateVersionstamp();
-                        const stmt = db.prepare(SET_SQL);
-                        stmt.run([op.key, serializeValue(newValue), versionstamp, null]);
-                        stmt.finalize();
+                        setStmt.run([op.key, serializeValue(newValue), versionstamp, null]);
                         finalVersionstamp = versionstamp;
                         break;
                     }
@@ -329,9 +334,7 @@ export class KvDatabase {
                             }
                         }
                         const versionstamp = generateVersionstamp();
-                        const stmt = db.prepare(SET_SQL);
-                        stmt.run([op.key, serializeValue(currentValue), versionstamp, null]);
-                        stmt.finalize();
+                        setStmt.run([op.key, serializeValue(currentValue), versionstamp, null]);
                         finalVersionstamp = versionstamp;
                         break;
                     }
@@ -345,9 +348,7 @@ export class KvDatabase {
                             }
                         }
                         const versionstamp = generateVersionstamp();
-                        const stmt = db.prepare(SET_SQL);
-                        stmt.run([op.key, serializeValue(currentValue), versionstamp, null]);
-                        stmt.finalize();
+                        setStmt.run([op.key, serializeValue(currentValue), versionstamp, null]);
                         finalVersionstamp = versionstamp;
                         break;
                     }

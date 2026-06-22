@@ -28,6 +28,7 @@ const HTTP_LINE_RE = /^HTTP\//i;
 const TIMEOUT_ERR_RE = /\b(timed?\s*out|timeout)\b/i;
 const BOUNDARY_RE = /boundary=([^\s;]+)/i;
 const CHARSET_RE = /charset\s*=\s*["']?([^\s;'"]+)/i;
+const MAX_HOOK_POST_DATA_BYTES = 256 * 1024;
 
 // curl.getInfo() returns C module wrapper objects; structured clone (pipe) cannot
 // serialize them — they become [object Object] or fail silently. Coerce every
@@ -258,8 +259,14 @@ function responseBodyToBytes(body?: string | ArrayBuffer): Uint8Array {
     return new Uint8Array(body) as Uint8Array;
 }
 
+function isReadableStreamLike(body: any): body is ReadableStream<Uint8Array> {
+    return !!body && typeof body === 'object' && typeof body.getReader === 'function';
+}
+
 function serializeBody(body: any): Uint8Array | null {
     if (body === null || body === undefined) return null;
+    if (isReadableStreamLike(body)) return null;
+    if (body instanceof Uint8Array) return body as Uint8Array;
     if (ArrayBuffer.isView(body)) return new Uint8Array(body.buffer as ArrayBuffer, body.byteOffset, body.byteLength);
     if (body instanceof ArrayBuffer) return new Uint8Array(body) as Uint8Array;
     if (typeof body === 'string') return engine.encodeString(body) as Uint8Array;
@@ -267,6 +274,66 @@ function serializeBody(body: any): Uint8Array | null {
     if (body instanceof Blob) return null; // async, handled separately
     if (body instanceof FormData) return null; // async, handled separately
     return engine.encodeString(JSON.stringify(body)) as Uint8Array;
+}
+
+function truncateHookPostData(body?: Uint8Array | null): Uint8Array | null | undefined {
+    if (!body) return body;
+    if (body.byteLength > MAX_HOOK_POST_DATA_BYTES) {
+        return new Uint8Array(body.subarray(0, MAX_HOOK_POST_DATA_BYTES));
+    }
+    return body;
+}
+
+function toCurlBody(body: globalThis.Uint8Array<ArrayBufferLike>): Uint8Array | ArrayBuffer {
+    return body.byteOffset === 0 && body.byteLength === body.buffer.byteLength
+        ? body.buffer as ArrayBuffer
+        : body as Uint8Array;
+}
+
+type PreparedRequestBody =
+    | { kind: 'none' }
+    | { kind: 'buffer'; body: Uint8Array }
+    | { kind: 'file'; path: string; size: number };
+
+async function writeStreamToTempFile(stream: ReadableStream<Uint8Array>, signal?: AbortSignal): Promise<{ path: string; size: number }> {
+    const path = `${os.tmpDir}/fetch-body-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.tmp`;
+    const file = await asyncfs.open(path, 'w');
+    const reader = stream.getReader();
+    let size = 0;
+    try {
+        while (true) {
+            throwIfAborted(signal);
+            const { done, value } = await reader.read();
+            if (done) break;
+            let written = 0;
+            size += value.byteLength;
+            while (written < value.byteLength) {
+                const n = await file.write(value.subarray(written));
+                if (n == null) throw new Error('Failed to write temporary request body');
+                written += n;
+            }
+        }
+    } catch (err) {
+        try { await file.close(); } catch {}
+        await asyncfs.unlink(path).catch(() => {});
+        throw err;
+    } finally {
+        reader.releaseLock();
+    }
+    await file.close();
+    return { path, size };
+}
+
+async function prepareRequestBody(request: Request): Promise<PreparedRequestBody> {
+    const buffered = request.getBufferedBody();
+    if (buffered) {
+        request.bodyUsed = true;
+        return { kind: 'buffer', body: buffered };
+    }
+    if (!request.body) return { kind: 'none' };
+    request.bodyUsed = true;
+    const streamed = await writeStreamToTempFile(request.body as ReadableStream<Uint8Array>, request.signal);
+    return { kind: 'file', path: streamed.path, size: streamed.size };
 }
 
 // ---------------------------------------------------------------------------
@@ -351,14 +418,18 @@ export class Request implements globalThis.Request {
         this.keepalive = init?.keepalive ?? base?.keepalive ?? false; this.mode = init?.mode || base?.mode || 'cors';
         this.redirect = init?.redirect || base?.redirect || 'follow'; this.referrer = init?.referrer || base?.referrer || 'about:client';
         this.referrerPolicy = init?.referrerPolicy || base?.referrerPolicy || ''; this.signal = init?.signal ?? base?.signal ?? new AbortController().signal;
+        if (this._bodyBuffer == null) {
+            const directBody = serializeBody(this._bodySource);
+            if (directBody !== null) this._bodyBuffer = directBody;
+        }
         this.body = this._bodySource ? this.createBodyStream() : null;
         if (['GET', 'HEAD'].includes(this.method) && this.body) throw new TypeError(`Request with ${this.method} method cannot have body`);
     }
 
     private createBodyStream(): ReadableStream<Uint8Array> {
         const s = this._bodySource;
-        if (s instanceof ReadableStream) return s as ReadableStream<Uint8Array>;
-        const data = serializeBody(s);
+        if (isReadableStreamLike(s)) return s as ReadableStream<Uint8Array>;
+        const data = this._bodyBuffer ?? serializeBody(s);
         if (data !== null) { const cap = data; return new ReadableStream({ start(c: any) { c.enqueue(cap); c.close(); } }); }
         if (s instanceof Blob) return new ReadableStream({ pull: async (c: any) => { c.enqueue(new Uint8Array(await s.arrayBuffer())); c.close(); } });
         if (s instanceof FormData) return new ReadableStream({ start: async (c: any) => { const buf = await serializeFormData(s); c.enqueue(buf); c.close(); } });
@@ -378,6 +449,10 @@ export class Request implements globalThis.Request {
 
     getInitiatorCallFrames(): NetworkCallFrame[] | undefined {
         return this._initiatorCallFrames;
+    }
+
+    getBufferedBody(): Uint8Array | null {
+        return this._bodyBuffer;
     }
 
     async getBodyBuffer(): Promise<Uint8Array | null> {
@@ -525,13 +600,10 @@ export class Response implements globalThis.Response {
             this.headers = new Headers();
         }
         this.body = (body !== undefined && body !== null) ? this.createBodyStream(body) : null;
-        if (getServeHook()) {
-            setResponseInitiatorCallFrames(this, captureUserNetworkCallFrames());
-        }
     }
 
     private createBodyStream(bodyInit: any): ReadableStream<Uint8Array> {
-        if (bodyInit instanceof ReadableStream) return bodyInit as ReadableStream<Uint8Array>;
+        if (isReadableStreamLike(bodyInit)) return bodyInit as ReadableStream<Uint8Array>;
         const data = serializeBody(bodyInit);
         if (data !== null) { if (!this.headers.has('content-length')) this.headers.set('content-length', String(data.length)); const cap = data; return new ReadableStream({ start(c: any) { c.enqueue(cap); c.close(); } }); }
         if (bodyInit instanceof Blob) return new ReadableStream({ start: async (c: any) => { const r = new Uint8Array(await bodyInit.arrayBuffer()); if (!this.headers.has('content-length')) this.headers.set('content-length', String(r.length)); c.enqueue(r); c.close(); } });
@@ -644,9 +716,13 @@ function filterHeaders(headers: Headers): void {
     for (const name of CURL_INTERNAL_HEADERS) headers.delete(name);
 }
 
+
+const inFlightFetchFrames = new Set<Promise<unknown>>();
+// ----------------------------------------------------------------------------
 async function performFetch(request: Request, url: URL): Promise<Response> {
     throwIfAborted(request.signal);
-    const body = await request.getBodyBuffer();
+    const preparedBody = await prepareRequestBody(request);
+    const body = preparedBody.kind === 'buffer' ? preparedBody.body : null;
     throwIfAborted(request.signal);
 
     const curl = new curlMod.CURL(getCurlPool());
@@ -655,6 +731,7 @@ async function performFetch(request: Request, url: URL): Promise<Response> {
     // instead of reimplementing HTTP on a raw socket.
     const client = (await import('../deno/07_http')).getRequestClient(request);
     let tempPemFiles: string[] = [];
+    let tempBodyFile: string | null = preparedBody.kind === 'file' ? preparedBody.path : null;
     if (client) {
         tempPemFiles = await applyClientToCurl(curl, client);
     }
@@ -718,8 +795,16 @@ async function performFetch(request: Request, url: URL): Promise<Response> {
         curl.setMaxRedirects(20);
     }
 
-    if (body && body.length > 0) {
-        curl.setBody(body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength) as ArrayBuffer);
+    if (preparedBody.kind === 'buffer' && body && body.length > 0) {
+        curl.setBody(toCurlBody(body));
+    } else if (preparedBody.kind === 'file') {
+        curl.setUploadFile(preparedBody.path);
+        if (request.method === 'POST') {
+            curl.setMethod('POST');
+            curl.setOptByName('POSTFIELDSIZE_LARGE', preparedBody.size);
+        } else if (request.method !== 'PUT') {
+            curl.setMethod(request.method);
+        }
     }
 
     // AbortSignal directly cancels the underlying curl request
@@ -747,6 +832,7 @@ async function performFetch(request: Request, url: URL): Promise<Response> {
 
     // Resolve as soon as headers arrive; stream body via ReadableStream.
     const headersDone = Promise.withResolvers<{ status: number; headers: string }>();
+    inFlightFetchFrames.add(headersDone.promise);
     let streamController: ReadableStreamDefaultController<Uint8Array> | null = null;
     let bodyCanceled = false;
     let bodyTerminal: { type: 'close' } | { type: 'error'; error: any } | null = null;
@@ -848,7 +934,7 @@ async function performFetch(request: Request, url: URL): Promise<Response> {
     if (interceptHook?.onRequest) {
         const result = await interceptHook.onRequest({
             requestId, url: url.href, method: request.method,
-            headers: objHeaders, postData: body ?? null, resourceType: 'Fetch',
+            headers: objHeaders, postData: truncateHookPostData(body ?? null), resourceType: 'Fetch',
         });
         if (result) {
             if (result.action === 'fulfill') {
@@ -867,9 +953,7 @@ async function performFetch(request: Request, url: URL): Promise<Response> {
             if (result.url) curl.setUrl(result.url);
             if (result.method) curl.setMethod(result.method);
             if (result.headers) curl.setHeaders(result.headers);
-            if (result.postData) curl.setBody(
-                result.postData.buffer.slice(result.postData.byteOffset, result.postData.byteOffset + result.postData.byteLength) as ArrayBuffer
-            );
+            if (result.postData) curl.setBody(toCurlBody(result.postData));
         }
     }
 
@@ -878,7 +962,7 @@ async function performFetch(request: Request, url: URL): Promise<Response> {
     if (netHook) try {
         netHook.onRequest?.({
             requestId, url: url.href, method: request.method,
-            headers: objHeaders, postData: body ?? null, callFrames: reqCallFrames, resourceType: 'Fetch', timestamp: reqStartTime
+            headers: objHeaders, postData: truncateHookPostData(body ?? null), callFrames: reqCallFrames, resourceType: 'Fetch', timestamp: reqStartTime
         });
     } catch {}
 
@@ -901,8 +985,10 @@ async function performFetch(request: Request, url: URL): Promise<Response> {
             }
         }
     ).finally(() => {
+        inFlightFetchFrames.delete(headersDone.promise);
         removeAbortHandler();
         for (const p of tempPemFiles) asyncfs.unlink(p).catch(() => {});
+        if (tempBodyFile) asyncfs.unlink(tempBodyFile).catch(() => {});
     });
 
     try {
@@ -1126,14 +1212,14 @@ export class XMLHttpRequest extends EventTarget {
 
         const bodyBytes = (body !== undefined && body !== null) ? serializeBody(body) : null;
         if (bodyBytes) {
-            curl.setBody(bodyBytes.buffer.slice(bodyBytes.byteOffset, bodyBytes.byteOffset + bodyBytes.byteLength) as ArrayBuffer);
+            curl.setBody(toCurlBody(bodyBytes));
         }
 
         // CDP Fetch interception
         if (interceptHook?.onRequest) {
             interceptHook.onRequest({
                 requestId: reqId, url: this._url, method: this._method,
-                headers: hdrs, postData: bodyBytes ?? null, resourceType: 'XHR',
+                headers: hdrs, postData: truncateHookPostData(bodyBytes ?? null), resourceType: 'XHR',
             }).then(result => {
                 if (result?.action === 'fulfill') {
                     this._handleInterceptedFulfill(result as any);
@@ -1155,7 +1241,7 @@ export class XMLHttpRequest extends EventTarget {
         const reqStartTime = Date.now() / 1000;
 
         if (netHook) try {
-            netHook.onRequest?.({ requestId: reqId, url: this._url, method: this._method, headers: hdrs, postData: bodyBytes ?? null, callFrames: reqCallFrames, resourceType: 'XHR', timestamp: reqStartTime });
+            netHook.onRequest?.({ requestId: reqId, url: this._url, method: this._method, headers: hdrs, postData: truncateHookPostData(bodyBytes ?? null), callFrames: reqCallFrames, resourceType: 'XHR', timestamp: reqStartTime });
         } catch {}
 
         const handleDone = (response: CModuleCURL.Response): void => {

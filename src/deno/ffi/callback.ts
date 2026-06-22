@@ -36,6 +36,7 @@ export class UnsafeCallback<
     >;
     
     private internal: CallbackInternal;
+    private static cifCache = new Map<string, CModuleFFI.FfiCif>();
 
     constructor(
         definition: Definition,
@@ -103,9 +104,21 @@ export class UnsafeCallback<
         parameters: readonly NativeType[],
         result: NativeResultType
     ): CModuleFFI.FfiCif {
-        const retType = this.toFfiType(result);
-        const argTypes = parameters.map(p => this.toFfiType(p));
-        return new ffi.FfiCif(retType, argTypes);
+        const cacheKey = `${this.typeCacheKey(result)}(${parameters.map(p => this.typeCacheKey(p)).join(',')})`;
+        let cif = UnsafeCallback.cifCache.get(cacheKey);
+        if (!cif) {
+            const retType = this.toFfiType(result);
+            const argTypes = parameters.map(p => this.toFfiType(p));
+            cif = new ffi.FfiCif(retType, argTypes);
+            UnsafeCallback.cifCache.set(cacheKey, cif);
+        }
+        return cif;
+    }
+
+    private typeCacheKey(type: NativeType | 'void'): string {
+        return typeof type === 'string'
+            ? type
+            : `struct(${type.struct.map(member => this.typeCacheKey(member)).join(',')})`;
     }
 
     private toFfiType(

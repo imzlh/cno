@@ -71,7 +71,11 @@ export const toNodeStatAsync = toNodeStat;
 // Dirent conversion
 // ============================================================================
 
-export function toNodeDirent(name: string, stat: CModuleFS.Stats): import('fs').Dirent {
+export function toNodeDirent(
+    name: string,
+    stat: Pick<CModuleFS.Stats, 'isFile' | 'isDirectory' | 'isSymbolicLink'>
+        | Pick<CModuleFS.DirEnt, 'isFile' | 'isDirectory' | 'isSymbolicLink'>
+): import('fs').Dirent {
     return {
         name,
         isFile: () => stat.isFile,
