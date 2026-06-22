@@ -43,6 +43,9 @@ await import('./url');
 // @ts-ignore
 await import('urlpattern-polyfill');
 
+// navigator
+await import('./navigator');
+
 // @ts-ignore
 // const stream = await import('web-streams-polyfill');
 // for (const key in stream) {

@@ -142,7 +142,7 @@ function createBufferedDecipher(
 
 function isGcmAlgorithm(algorithm: string): boolean {
     const a = algorithm.toLowerCase();
-    return a === 'aes-128-gcm' || a === 'aes-256-gcm';
+    return a === 'aes-128-gcm' || a === 'aes-192-gcm' || a === 'aes-256-gcm';
 }
 
 function normalizeHashAlgorithm(algorithm: string): string {
@@ -424,23 +424,75 @@ export function createCipheriv(algorithm: string, key: ArrayBuffer | Uint8Array,
         return createCipherivGCM(a, keyBuf, ivBuf) as unknown as Cipheriv;
     }
 
-    if (a === 'aes-128-cbc') {
-        return createBufferedCipher((data) => crypto.aes128CbcEncrypt(keyBuf, ivBuf, data));
-    }
+    // CBC: use streaming cipher so we can honour setAutoPadding().
+    // The `Raw` variants (no PKCS7 padding) are swapped in when padding is disabled.
+    let cipherObj: CModuleCrypto.Cipher | null = null;
+    let autoPadding = true;
 
-    if (a === 'aes-256-cbc') {
-        const cipher = crypto.createCipherAes256Cbc(keyBuf, ivBuf);
-        return {
-            update(data: ArrayBuffer | Uint8Array | string, inputEncoding?: string, outputEncoding?: string) {
-                return encodeOutput(cipher.update(toBuffer(data, inputEncoding)), outputEncoding);
+    const makeCipher = (withPadding: boolean) => {
+        if (a === 'aes-128-cbc') {
+            // aes-128 only has buffered one-shot in C; re-create via raw variant when needed.
+            if (!withPadding) {
+                const chunks: Uint8Array[] = [];
+                const obj = {
+                    update(data: BinaryInput, inputEncoding?: string, outputEncoding?: string) {
+                        chunks.push(toBuffer(data, inputEncoding));
+                        return encodeOutput(new ArrayBuffer(0), outputEncoding);
+                    },
+                    final(outputEncoding?: string) {
+                        return encodeOutput(crypto.aes128CbcEncryptRaw(keyBuf, ivBuf, concatBuffers(chunks)), outputEncoding);
+                    },
+                    setAutoPadding(_: boolean) { /* already locked */ },
+                };
+                return obj as unknown as Cipheriv;
+            }
+            return createBufferedCipher((data) => crypto.aes128CbcEncrypt(keyBuf, ivBuf, data));
+        }
+        if (a === 'aes-192-cbc') {
+            return withPadding ? crypto.createCipherAes192Cbc(keyBuf, ivBuf) : crypto.createCipherAes192CbcRaw(keyBuf, ivBuf);
+        }
+        if (a === 'aes-256-cbc') {
+            return withPadding ? crypto.createCipherAes256Cbc(keyBuf, ivBuf) : crypto.createCipherAes256CbcRaw(keyBuf, ivBuf);
+        }
+        return null;
+    };
+
+    if (a === 'aes-128-cbc') {
+        // aes-128 path is handled fully above via buffered helpers
+        let noPad = false;
+        const chunks: Uint8Array[] = [];
+        const obj = {
+            update(data: BinaryInput, inputEncoding?: string, outputEncoding?: string) {
+                chunks.push(toBuffer(data, inputEncoding));
+                return encodeOutput(new ArrayBuffer(0), outputEncoding);
             },
             final(outputEncoding?: string) {
-                return encodeOutput(cipher.final(), outputEncoding);
+                const fn = noPad ? crypto.aes128CbcEncryptRaw : crypto.aes128CbcEncrypt;
+                return encodeOutput(fn(keyBuf, ivBuf, concatBuffers(chunks)), outputEncoding);
             },
+            setAutoPadding(v: boolean) { noPad = !v; },
         };
+        return obj as unknown as Cipheriv;
     }
 
-    throw new Error(`Unsupported cipher algorithm: ${algorithm}`);
+    cipherObj = makeCipher(true) as unknown as CModuleCrypto.Cipher;
+    const result = {
+        update(data: BinaryInput, inputEncoding?: string, outputEncoding?: string) {
+            if (!cipherObj) return encodeOutput(new ArrayBuffer(0), outputEncoding);
+            return encodeOutput(cipherObj.update(toBuffer(data, inputEncoding)), outputEncoding);
+        },
+        final(outputEncoding?: string) {
+            if (!cipherObj) return encodeOutput(new ArrayBuffer(0), outputEncoding);
+            return encodeOutput(cipherObj.final(), outputEncoding);
+        },
+        setAutoPadding(v: boolean) {
+            if (v === autoPadding) return;
+            autoPadding = v;
+            cipherObj = makeCipher(v) as unknown as CModuleCrypto.Cipher;
+        },
+    };
+    if (a !== 'aes-192-cbc' && a !== 'aes-256-cbc') throw new Error(`Unsupported cipher algorithm: ${algorithm}`);
+    return result as unknown as Cipheriv;
 }
 
 export function createDecipheriv(algorithm: string, key: ArrayBuffer | Uint8Array, iv: ArrayBuffer | Uint8Array): Decipheriv {
@@ -453,24 +505,45 @@ export function createDecipheriv(algorithm: string, key: ArrayBuffer | Uint8Arra
     }
 
     if (a === 'aes-128-cbc') {
-        return createBufferedDecipher((data) => crypto.aes128CbcDecrypt(keyBuf, ivBuf, data));
-    }
-
-    if (a === 'aes-256-cbc') {
-        const decipher = crypto.createDecipherAes256Cbc(keyBuf, ivBuf);
+        let noPad = false;
+        const chunks: Uint8Array[] = [];
         return {
-            update(data: ArrayBuffer | Uint8Array | string, inputEncoding?: string, outputEncoding?: string) {
-                const result = decipher.update(toBuffer(data, inputEncoding));
-                return encodeOutput(result, outputEncoding);
+            update(data: BinaryInput, inputEncoding?: string, outputEncoding?: string) {
+                chunks.push(toBuffer(data, inputEncoding));
+                return encodeOutput(new ArrayBuffer(0), outputEncoding);
             },
             final(outputEncoding?: string) {
-                const result = decipher.final();
-                return encodeOutput(result, outputEncoding);
+                const fn = noPad ? crypto.aes128CbcDecryptRaw : crypto.aes128CbcDecrypt;
+                return encodeOutput(fn(keyBuf, ivBuf, concatBuffers(chunks)), outputEncoding);
             },
-        };
+            setAutoPadding(v: boolean) { noPad = !v; },
+        } as unknown as Decipheriv;
     }
 
-    throw new Error(`Unsupported cipher algorithm: ${algorithm}`);
+    const makeDecipher = (withPadding: boolean): CModuleCrypto.Cipher => {
+        if (a === 'aes-192-cbc')
+            return withPadding ? crypto.createDecipherAes192Cbc(keyBuf, ivBuf) : crypto.createDecipherAes192CbcRaw(keyBuf, ivBuf);
+        // aes-256-cbc
+        return withPadding ? crypto.createDecipherAes256Cbc(keyBuf, ivBuf) : crypto.createDecipherAes256CbcRaw(keyBuf, ivBuf);
+    };
+
+    if (a !== 'aes-192-cbc' && a !== 'aes-256-cbc') throw new Error(`Unsupported cipher algorithm: ${algorithm}`);
+
+    let autoPadding = true;
+    let decipherObj = makeDecipher(true);
+    return {
+        update(data: BinaryInput, inputEncoding?: string, outputEncoding?: string) {
+            return encodeOutput(decipherObj.update(toBuffer(data, inputEncoding)), outputEncoding);
+        },
+        final(outputEncoding?: string) {
+            return encodeOutput(decipherObj.final(), outputEncoding);
+        },
+        setAutoPadding(v: boolean) {
+            if (v === autoPadding) return;
+            autoPadding = v;
+            decipherObj = makeDecipher(v);
+        },
+    } as unknown as Decipheriv;
 }
 
 export function createCipherAes256Cbc(
@@ -670,8 +743,10 @@ export function cipheriv(algorithm: string, key: ArrayBuffer | Uint8Array, iv: A
     const a = algorithm.toLowerCase();
     switch (a) {
         case 'aes-128-cbc': result = crypto.aes128CbcEncrypt(keyBuf, ivBuf, dataBuf); break;
+        case 'aes-192-cbc': result = crypto.aes192CbcEncrypt(keyBuf, ivBuf, dataBuf); break;
         case 'aes-256-cbc': result = crypto.aes256CbcEncrypt(keyBuf, ivBuf, dataBuf); break;
         case 'aes-128-gcm': result = crypto.aes128GcmEncrypt(keyBuf, ivBuf, dataBuf); break;
+        case 'aes-192-gcm': result = crypto.aes192GcmEncrypt(keyBuf, ivBuf, dataBuf); break;
         case 'aes-256-gcm': result = crypto.aes256GcmEncrypt(keyBuf, ivBuf, dataBuf); break;
         default: throw new Error(`Unsupported cipher algorithm: ${algorithm}`);
     }
@@ -688,8 +763,10 @@ export function decipheriv(algorithm: string, key: ArrayBuffer | Uint8Array, iv:
     const a = algorithm.toLowerCase();
     switch (a) {
         case 'aes-128-cbc': result = crypto.aes128CbcDecrypt(keyBuf, ivBuf, dataBuf); break;
+        case 'aes-192-cbc': result = crypto.aes192CbcDecrypt(keyBuf, ivBuf, dataBuf); break;
         case 'aes-256-cbc': result = crypto.aes256CbcDecrypt(keyBuf, ivBuf, dataBuf); break;
         case 'aes-128-gcm': result = crypto.aes128GcmDecrypt(keyBuf, ivBuf, dataBuf); break;
+        case 'aes-192-gcm': result = crypto.aes192GcmDecrypt(keyBuf, ivBuf, dataBuf); break;
         case 'aes-256-gcm': result = crypto.aes256GcmDecrypt(keyBuf, ivBuf, dataBuf); break;
         default: throw new Error(`Unsupported cipher algorithm: ${algorithm}`);
     }

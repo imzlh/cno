@@ -17,7 +17,7 @@ let proc_cache: any;
 Object.defineProperty(globalThis, 'process', {
     get() {
         if (!proc_cache) {
-            proc_cache = globalThis['require']('process');
+            proc_cache = Reflect.get(globalThis, 'require')('process');
         }
 
         return proc_cache;

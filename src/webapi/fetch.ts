@@ -16,11 +16,18 @@ const curlMod = import.meta.use("curl");
 const asyncfs = import.meta.use("asyncfs");
 const os = import.meta.use("os");
 const engine = import.meta.use("engine");
-const debug = import.meta.use("debug");
 const { Decoder } = import.meta.use("text");
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
-const DEFAULT_FETCH_TIMEOUT = 30000;
+
+// Shared decoder — safe because decode is stateless call → result.
+const sharedDecoder = new Decoder();
+
+// Pre-compiled regexes (avoid recompilation in hot paths).
+const HTTP_LINE_RE = /^HTTP\//i;
+const TIMEOUT_ERR_RE = /\b(timed?\s*out|timeout)\b/i;
+const BOUNDARY_RE = /boundary=([^\s;]+)/i;
+const CHARSET_RE = /charset\s*=\s*["']?([^\s;'"]+)/i;
 
 // curl.getInfo() returns C module wrapper objects; structured clone (pipe) cannot
 // serialize them — they become [object Object] or fail silently. Coerce every
@@ -62,17 +69,19 @@ interface CurlDebugTrace {
 
 function attachCurlDebugTrace(curl: CModuleCURL.CURL): CurlDebugTrace {
     const trace: CurlDebugTrace = {};
-    const decoder = new Decoder();
     curl.onDebug((type, data) => {
         const now = Date.now() / 1000;
         if (trace.debugStart == null) trace.debugStart = now;
         if (type === curlMod.CURLINFO_HEADER_OUT) {
             if (trace.headerOutStart == null) trace.headerOutStart = now;
-            trace.requestHeadersText = decoder.decode(new Uint8Array(data));
+            // Only decode if request header text is actually needed.
+            if (trace.requestHeadersText == null) {
+                trace.requestHeadersText = sharedDecoder.decode(new Uint8Array(data));
+            }
         } else if (type === curlMod.CURLINFO_HEADER_IN) {
             if (trace.headerInStart == null) trace.headerInStart = now;
-            const text = decoder.decode(new Uint8Array(data));
-            trace.responseHeadersText = /^HTTP\//i.test(text) ? text : (trace.responseHeadersText ?? '') + text;
+            const text = sharedDecoder.decode(new Uint8Array(data));
+            trace.responseHeadersText = HTTP_LINE_RE.test(text) ? text : (trace.responseHeadersText ?? '') + text;
         } else if (type === curlMod.CURLINFO_DATA_OUT) {
             if (trace.dataOutStart == null) trace.dataOutStart = now;
         } else if (type === curlMod.CURLINFO_DATA_IN) {
@@ -179,22 +188,19 @@ function timeoutError(): any {
 function compressionAcceptEncoding(headers: Headers): string | undefined {
     const value = headers.get('accept-encoding');
     if (!value) return undefined;
-    return value.trim() || undefined;
+    const trimmed = value.trim();
+    // Only honour explicit "identity" (caller wants no compression).
+    return trimmed === 'identity' ? 'identity' : undefined;
 }
 
 function isCurlTimeoutError(err: any): boolean {
-    return err?.code === 28 || /\b(timed?\s*out|timeout)\b/i.test(String(err?.message ?? err));
+    return err?.code === 28 || TIMEOUT_ERR_RE.test(String(err?.message ?? err));
 }
 
 function throwIfAborted(signal?: AbortSignal): void {
     if (signal?.aborted) throw abortError(signal);
 }
 
-function normalizeTimeout(value: any, fallback: number = DEFAULT_FETCH_TIMEOUT): number {
-    const timeout = value === undefined ? fallback : Number(value);
-    if (!Number.isFinite(timeout) || timeout < 0) throw new TypeError('Invalid timeout value');
-    return timeout;
-}
 
 function mergeChunks(chunks: Uint8Array[]): Uint8Array {
     if (chunks.length === 0) return new Uint8Array(0);
@@ -205,25 +211,32 @@ function mergeChunks(chunks: Uint8Array[]): Uint8Array {
     return merged;
 }
 
-function rawHeadersToHeaders(raw: Array<[string, string]>): Headers {
+function rawHeadersToHeaders(raw: string): Headers {
     const h = new Headers();
-    for (const [k, v] of raw) h.append(k, v);
+    for (const [k, v] of parseHeaders(raw)) h.append(k, v);
     return h;
 }
 
+/**
+ * Parse raw HTTP headers into pairs. Single-pass with pre-compiled regex.
+ */
 function parseHeaders(raw: string): Array<[string, string]> {
-    let current: Array<[string, string]> = [];
+    const out: Array<[string, string]> = [];
     let last: [string, string] | null = null;
-    for (const line of raw.split(/\r?\n/)) {
+    const lines = raw.split(/\r?\n/);
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i]!;
         if (!line) continue;
-        if (/^HTTP\//i.test(line)) { current = []; last = null; continue; }
-        if ((line[0] === " " || line[0] === "\t") && last) { last[1] += " " + line.trim(); continue; }
+        if (HTTP_LINE_RE.test(line)) { out.length = 0; last = null; continue; }
+        const ch = line.charCodeAt(0);
+        // continuation line (starts with space or tab)
+        if ((ch === 0x20 || ch === 0x09) && last) { last[1] += " " + line.trim(); continue; }
         const colon = line.indexOf(":");
         if (colon <= 0) continue;
         const header: [string, string] = [line.slice(0, colon).trim().toLowerCase(), line.slice(colon + 1).trim()];
-        current.push(header); last = header;
+        out.push(header); last = header;
     }
-    return current;
+    return out;
 }
 
 /**
@@ -257,6 +270,35 @@ function serializeBody(body: any): Uint8Array | null {
 }
 
 // ---------------------------------------------------------------------------
+// KMP byte-pattern search — O(n+m) instead of O(n×m)
+// ---------------------------------------------------------------------------
+
+function buildKMPTable(needle: Uint8Array): Int32Array {
+    const m = needle.length;
+    const table = new Int32Array(m);
+    let j = 0;
+    for (let i = 1; i < m; i++) {
+        while (j > 0 && needle[i] !== needle[j]) j = table[j - 1]!;
+        if (needle[i] === needle[j]) j++;
+        table[i] = j;
+    }
+    return table;
+}
+
+function kmpSearch(haystack: Uint8Array, needle: Uint8Array, from: number, table: Int32Array): number {
+    const n = haystack.length;
+    const m = needle.length;
+    if (m === 0) return from;
+    let j = 0;
+    for (let i = from; i < n; i++) {
+        while (j > 0 && haystack[i] !== needle[j]) j = table[j - 1]!;
+        if (haystack[i] === needle[j]) j++;
+        if (j === m) return i - m + 1;
+    }
+    return -1;
+}
+
+// ---------------------------------------------------------------------------
 // Request (Web API)
 // ---------------------------------------------------------------------------
 
@@ -276,7 +318,6 @@ export class Request implements globalThis.Request {
     public readonly referrer: string;
     public readonly referrerPolicy: ReferrerPolicy;
     public readonly signal: AbortSignal;
-    public readonly timeout: number;
     public readonly isHistoryNavigation = false;
     public readonly isReloadNavigation = false;
     public readonly duplex: 'half' = 'half';
@@ -284,7 +325,7 @@ export class Request implements globalThis.Request {
     private _bodyBuffer: Uint8Array | null = null;
     private _initiatorCallFrames?: NetworkCallFrame[];
 
-    constructor(input: any, init?: any) {
+    constructor(input: URL | string | Request, init?: RequestInit) {
         if (input instanceof URL) {
             this.url = input.href;
             this.method = init?.method?.toUpperCase() || 'GET';
@@ -304,12 +345,12 @@ export class Request implements globalThis.Request {
             }
         } else throw new TypeError('Invalid input:' + input);
         if (init?.body !== undefined && init?.body !== null) this._bodySource = init.body;
-        this.cache = init?.cache || 'default'; this.credentials = init?.credentials || 'same-origin';
-        this.destination = '' as RequestDestination; this.integrity = init?.integrity || '';
-        this.keepalive = init?.keepalive || false; this.mode = init?.mode || 'cors';
-        this.redirect = init?.redirect || 'follow'; this.referrer = init?.referrer || 'about:client';
-        this.referrerPolicy = init?.referrerPolicy || ''; this.signal = init?.signal ?? new AbortController().signal;
-        this.timeout = normalizeTimeout(init?.timeout, input instanceof Request ? input.timeout : DEFAULT_FETCH_TIMEOUT);
+        const base = input instanceof Request ? input : undefined;
+        this.cache = init?.cache || base?.cache || 'default'; this.credentials = init?.credentials || base?.credentials || 'same-origin';
+        this.destination = '' as RequestDestination; this.integrity = init?.integrity || base?.integrity || '';
+        this.keepalive = init?.keepalive ?? base?.keepalive ?? false; this.mode = init?.mode || base?.mode || 'cors';
+        this.redirect = init?.redirect || base?.redirect || 'follow'; this.referrer = init?.referrer || base?.referrer || 'about:client';
+        this.referrerPolicy = init?.referrerPolicy || base?.referrerPolicy || ''; this.signal = init?.signal ?? base?.signal ?? new AbortController().signal;
         this.body = this._bodySource ? this.createBodyStream() : null;
         if (['GET', 'HEAD'].includes(this.method) && this.body) throw new TypeError(`Request with ${this.method} method cannot have body`);
     }
@@ -326,7 +367,7 @@ export class Request implements globalThis.Request {
 
     clone(): Request {
         if (this.bodyUsed) throw new TypeError('Already read');
-        const cloned = new Request(this.url, { method: this.method, headers: this.headers, body: this._bodySource, cache: this.cache, credentials: this.credentials, integrity: this.integrity, keepalive: this.keepalive, mode: this.mode, redirect: this.redirect, referrer: this.referrer, referrerPolicy: this.referrerPolicy, signal: this.signal, timeout: this.timeout });
+        const cloned = new Request(this.url, { method: this.method, headers: this.headers, body: this._bodySource, cache: this.cache, credentials: this.credentials, integrity: this.integrity, keepalive: this.keepalive, mode: this.mode, redirect: this.redirect, referrer: this.referrer, referrerPolicy: this.referrerPolicy, signal: this.signal });
         cloned._initiatorCallFrames = this._initiatorCallFrames;
         return cloned;
     }
@@ -360,14 +401,14 @@ export class Request implements globalThis.Request {
         if (!buf) throw new TypeError('Request body is empty');
         const ct = this.headers.get('content-type') ?? '';
         if (ct.includes('multipart/form-data')) {
-            const m = ct.match(/boundary=([^\s;]+)/i);
+            const m = BOUNDARY_RE.exec(ct);
             if (!m) throw new TypeError('Missing multipart boundary');
-            return parseMultipart(buf, m[1]);
+            return parseMultipart(buf, m[1]!);
         }
         if (ct.includes('application/x-www-form-urlencoded')) return parseUrlEncoded(buf);
         throw new TypeError(`Unsupported content type for formData(): ${ct}`);
     }
-    async text(): Promise<string> { return engine.decodeString(new Uint8Array(await this.arrayBuffer())); }
+    async text(): Promise<string> { return sharedDecoder.decode(new Uint8Array(await this.arrayBuffer())); }
     async json<T = any>(): Promise<T> { return JSON.parse(await this.text()); }
 }
 
@@ -408,14 +449,20 @@ function parseUrlEncoded(body: Uint8Array): FormData {
     return fd;
 }
 
+// Pre-built CRLF2 needle for parseMultipart (avoids per-call allocation).
+const CRLF2 = new Uint8Array([0x0d, 0x0a, 0x0d, 0x0a]);
+const CRLF2_TABLE = buildKMPTable(CRLF2);
+
 function parseMultipart(body: Uint8Array, boundary: string): FormData {
     const fd = new FormData();
     const delimiter = engine.encodeString(`\r\n--${boundary}`) as Uint8Array;
+    const firstBnd = engine.encodeString(`--${boundary}`) as Uint8Array;
+    const delimTable = buildKMPTable(delimiter);
+    const firstTable = buildKMPTable(firstBnd);
     let pos = 0;
 
     // Find first boundary (may or may not have leading CRLF).
-    const firstBnd = engine.encodeString(`--${boundary}`) as Uint8Array;
-    pos = indexOf(body, firstBnd, 0);
+    pos = kmpSearch(body, firstBnd, 0, firstTable);
     if (pos < 0) return fd;
     pos += firstBnd.length;
 
@@ -426,7 +473,7 @@ function parseMultipart(body: Uint8Array, boundary: string): FormData {
         if (body[pos] === 0x2d && body[pos + 1] === 0x2d) break;
 
         // Parse part headers until blank line.
-        const hdrEnd = indexOf(body, engine.encodeString('\r\n\r\n') as Uint8Array, pos);
+        const hdrEnd = kmpSearch(body, CRLF2, pos, CRLF2_TABLE);
         if (hdrEnd < 0) break;
         const hdrStr = engine.decodeString(body.subarray(pos, hdrEnd));
         pos = hdrEnd + 4;
@@ -438,7 +485,7 @@ function parseMultipart(body: Uint8Array, boundary: string): FormData {
         const name = nameMatch?.[1] ?? '';
 
         // Find next boundary.
-        const nextBnd = indexOf(body, delimiter, pos);
+        const nextBnd = kmpSearch(body, delimiter, pos, delimTable);
         if (nextBnd < 0) break;
         // Body is everything before the CRLF that precedes the boundary.
         const partBody = body.subarray(pos, nextBnd);
@@ -457,21 +504,6 @@ function parseMultipart(body: Uint8Array, boundary: string): FormData {
     return fd;
 }
 
-function indexOf(haystack: Uint8Array, needle: Uint8Array, from: number): number {
-    outer:
-    for (let i = from; i <= haystack.length - needle.length; i++) {
-        for (let j = 0; j < needle.length; j++) {
-            if (haystack[i + j] !== needle[j]) continue outer;
-        }
-        return i;
-    }
-    return -1;
-}
-
-
-// ---------------------------------------------------------------------------
-// Response (Web API)
-// ---------------------------------------------------------------------------
 
 export class Response implements globalThis.Response {
     public readonly type: ResponseType; public readonly url: string; public readonly redirected: boolean;
@@ -490,7 +522,7 @@ export class Response implements globalThis.Response {
                 : (Reflect.getPrototypeOf(init.headers) === Object.prototype ? Object.entries(init.headers) : init.headers);
             for (const [k, v] of entries as any) this.headers.set(k, v);
         } else {
-            this.headers = new Headers({ 'user-agent': 'cnojs/http' });
+            this.headers = new Headers();
         }
         this.body = (body !== undefined && body !== null) ? this.createBodyStream(body) : null;
         if (getServeHook()) {
@@ -534,9 +566,9 @@ export class Response implements globalThis.Response {
         const bytes = new Uint8Array(buf);
         const ct = this.headers.get('content-type') ?? '';
         if (ct.includes('multipart/form-data')) {
-            const m = ct.match(/boundary=([^\s;]+)/i);
+            const m = BOUNDARY_RE.exec(ct);
             if (!m) throw new TypeError('Missing multipart boundary');
-            return parseMultipart(bytes, m[1]);
+            return parseMultipart(bytes, m[1]!);
         }
         if (ct.includes('application/x-www-form-urlencoded')) return parseUrlEncoded(bytes);
         throw new TypeError(`Unsupported content type for formData(): ${ct}`);
@@ -545,7 +577,7 @@ export class Response implements globalThis.Response {
     async text(): Promise<string> {
         const buf = await this.arrayBuffer();
         const ct = this.headers.get('content-type') ?? '';
-        const m = ct.match(/charset\s*=\s*["']?([^\s;'"]+)/i);
+        const m = CHARSET_RE.exec(ct);
         return new Decoder(m?.[1]).decode(buf);
     }
     static error(): Response { const r = new Response(null, { status: 0, statusText: '' }); Object.defineProperty(r, 'type', { value: 'error' }); return r; }
@@ -569,8 +601,9 @@ async function writeTempPem(name: string, pem: string) {
     return path;
 }
 
-/** Apply Deno.HttpClient proxy + mTLS settings to a curl handle. */
-async function applyClientToCurl(curl: CModuleCURL.CURL, client: HttpClient) {
+/** Apply Deno.HttpClient proxy + mTLS settings to a curl handle. Returns temp PEM paths to delete after use. */
+async function applyClientToCurl(curl: CModuleCURL.CURL, client: HttpClient): Promise<string[]> {
+    const tempFiles: string[] = [];
     const proxyUrl = client.getProxyUrl();
     if (proxyUrl) {
         if (!['http', 'https', 'socks4', 'socks4a', 'socks5', 'socks5h'].includes(proxyUrl.protocol))
@@ -581,10 +614,21 @@ async function applyClientToCurl(curl: CModuleCURL.CURL, client: HttpClient) {
     const opts = client.options;
     if (opts.caCerts?.length) {
         const caPem = opts.caCerts.join('\n');
-        curl.setCABundle(await writeTempPem('ca', caPem));
+        const p = await writeTempPem('ca', caPem);
+        tempFiles.push(p);
+        curl.setCABundle(p);
     }
-    if (opts.cert) curl.setOpt(curlMod.CURLOPT_SSLCERT, await writeTempPem('cert', opts.cert));
-    if (opts.key) curl.setOpt(curlMod.CURLOPT_SSLKEY, await writeTempPem('key', opts.key));
+    if (opts.cert) {
+        const p = await writeTempPem('cert', opts.cert);
+        tempFiles.push(p);
+        curl.setOpt(curlMod.CURLOPT_SSLCERT, p);
+    }
+    if (opts.key) {
+        const p = await writeTempPem('key', opts.key);
+        tempFiles.push(p);
+        curl.setOpt(curlMod.CURLOPT_SSLKEY, p);
+    }
+    return tempFiles;
 }
 
 const CURL_INTERNAL_HEADERS = [
@@ -595,7 +639,6 @@ const CURL_INTERNAL_HEADERS = [
     'host',
     'pragma',
     'proxy-connection',
-    'referer'
 ]
 function filterHeaders(headers: Headers): void {
     for (const name of CURL_INTERNAL_HEADERS) headers.delete(name);
@@ -611,8 +654,9 @@ async function performFetch(request: Request, url: URL): Promise<Response> {
     // If a Deno.HttpClient is attached, apply its proxy/SSL config to curl
     // instead of reimplementing HTTP on a raw socket.
     const client = (await import('../deno/07_http')).getRequestClient(request);
+    let tempPemFiles: string[] = [];
     if (client) {
-        await applyClientToCurl(curl, client);
+        tempPemFiles = await applyClientToCurl(curl, client);
     }
     const netHook = getFetchHook();
     const curlTrace = netHook ? attachCurlDebugTrace(curl) : undefined;
@@ -633,20 +677,38 @@ async function performFetch(request: Request, url: URL): Promise<Response> {
     else if (!finalHeaders.has('User-Agent'))
         finalHeaders.set('User-Agent', `cno/${version}`);
 
-    // filter some headers
+    // Read accept-encoding BEFORE filterHeaders strips it.
+    const acceptEncoding = compressionAcceptEncoding(finalHeaders);
+
+    // referrer → Referer header (only if not already set by caller)
+    if (!finalHeaders.has('Referer') && request.referrer && request.referrer !== 'no-referrer' && request.referrer !== 'about:client') {
+        try {
+            const refUrl = new URL(request.referrer);
+            if (refUrl.protocol === 'http:' || refUrl.protocol === 'https:') {
+                finalHeaders.set('Referer', refUrl.href);
+            }
+        } catch { /* invalid referrer, skip */ }
+    }
+
+    // filter headers managed internally by curl
     filterHeaders(finalHeaders);
 
-    const objHeaders = Object.fromEntries(finalHeaders.entries());
+    // Merge duplicate headers (curl setHeaders only accepts Record<string,string>).
+    // HTTP/1.1 §3.2.2: field values with the same name may be combined with ", ".
+    // Exception: Cookie uses "; " per RFC 6265 §5.4.
+    const objHeaders: Record<string, string> = {};
+    for (const [k, v] of finalHeaders.entries()) {
+        if (k in objHeaders) {
+            objHeaders[k] += (k === 'cookie' ? '; ' : ', ') + v;
+        } else {
+            objHeaders[k] = v;
+        }
+    }
     curl.setUrl(url.href)
         .setMethod(request.method)
         .setHeaders(objHeaders);
-    curl.setAcceptEncoding(compressionAcceptEncoding(finalHeaders));
-
-    if (request.timeout > 0) {
-        curl.setTimeout(request.timeout);
-        curl.setConnectTimeout(request.timeout);
-        curl.setLowSpeedLimit(1, Math.max(1, Math.ceil(request.timeout / 1000)));
-    }
+    curl.setOptByName('AUTOREFERER', 1);  // update Referer to the Location URL on each redirect hop
+    curl.setAcceptEncoding(acceptEncoding);
 
     // redirect mode
     if (request.redirect === 'error' || request.redirect === 'manual') {
@@ -654,16 +716,6 @@ async function performFetch(request: Request, url: URL): Promise<Response> {
     } else {
         curl.setFollowRedirects(true);
         curl.setMaxRedirects(20);
-    }
-
-    // referrer → Referer header
-    if (request.referrer && request.referrer !== 'no-referrer' && request.referrer !== 'about:client') {
-        try {
-            const refUrl = new URL(request.referrer);
-            if (refUrl.protocol === 'http:' || refUrl.protocol === 'https:') {
-                curl.setReferer(refUrl.href);
-            }
-        } catch { /* invalid referrer, skip */ }
     }
 
     if (body && body.length > 0) {
@@ -765,9 +817,10 @@ async function performFetch(request: Request, url: URL): Promise<Response> {
 
         waitingForFinalHeaders = false;
 
+        // Parse headers into object only for the final response.
         if (netHook) {
             const hdrs: Record<string, string> = {};
-            parseHeaders(headers).forEach(([k, v]) => { hdrs[k] = v; });
+            for (const [k, v] of parseHeaders(headers)) hdrs[k] = v;
             try {
                 netHook.onResponse?.({
                     requestId, url: url.href, status, headers: hdrs,
@@ -847,13 +900,16 @@ async function performFetch(request: Request, url: URL): Promise<Response> {
                 try { netHook.onFinished?.({ requestId, success: false, errorText: fetchErr.message, connection: conn, timestamp: ts() }); } catch {}
             }
         }
-    ).finally(removeAbortHandler);
+    ).finally(() => {
+        removeAbortHandler();
+        for (const p of tempPemFiles) asyncfs.unlink(p).catch(() => {});
+    });
 
     try {
         const { status, headers: rawHeaders } = await headersDone.promise;
         throwIfAborted(request.signal);
 
-        const responseHeaders = rawHeadersToHeaders(parseHeaders(rawHeaders));
+        const responseHeaders = rawHeadersToHeaders(rawHeaders);
         const isRedirect = status >= 300 && status < 400;
 
         if (request.redirect === 'error' && isRedirect) {
@@ -891,7 +947,7 @@ export async function fetchAsync(input: any, init?: any, initiatorCallFrames?: N
     const request = new Request(input, init);
     request.setInitiatorCallFrames(initiatorCallFrames);
     throwIfAborted(request.signal);
-    const url = new URL(request.url);
+    const url = new URL(input);
     if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new TypeError(`Unsupported protocol: ${url.protocol}`);
     return performFetch(request, url);
 }
@@ -939,6 +995,7 @@ export class XMLHttpRequest extends EventTarget {
     private _method: string = '';
     private _headers: Array<[string, string]> = [];
     private _responseHeaders: string = '';
+    private _responseHeaderMap: Map<string, string> | null = null;
     private _response: any = null;
     private _responseText: string = '';
     private _aborted: boolean = false;
@@ -979,6 +1036,7 @@ export class XMLHttpRequest extends EventTarget {
         this._response = null;
         this._responseText = '';
         this._responseHeaders = '';
+        this._responseHeaderMap = null;
         this._headers = [];
         this.status = 0;
         this.statusText = '';
@@ -991,13 +1049,15 @@ export class XMLHttpRequest extends EventTarget {
 
     getResponseHeader(name: string): string | null {
         const lower = name.toLowerCase();
-        for (const line of this._responseHeaders.split(/\r?\n/)) {
-            const colon = line.indexOf(':');
-            if (colon > 0 && line.slice(0, colon).trim().toLowerCase() === lower) {
-                return line.slice(colon + 1).trim();
+        if (this._responseHeaderMap == null) {
+            const map = new Map<string, string>();
+            for (const line of this._responseHeaders.split(/\r?\n/)) {
+                const colon = line.indexOf(':');
+                if (colon > 0) map.set(line.slice(0, colon).trim().toLowerCase(), line.slice(colon + 1).trim());
             }
+            this._responseHeaderMap = map;
         }
-        return null;
+        return this._responseHeaderMap.get(lower) ?? null;
     }
 
     getAllResponseHeaders(): string {
@@ -1033,12 +1093,21 @@ export class XMLHttpRequest extends EventTarget {
         const reqId = (netHook || interceptHook) ? newRequestId() : '';
         const reqCallFrames = netHook ? captureUserNetworkCallFrames() : undefined;
         const hdrs: Record<string, string> = {};
-        for (const [k, v] of this._headers) hdrs[k] = v;
+        for (const [k, v] of this._headers) {
+            const lk = k.toLowerCase();
+            if (lk in hdrs) {
+                hdrs[lk] += (lk === 'cookie' ? '; ' : ', ') + v;
+            } else {
+                hdrs[lk] = v;
+            }
+        }
 
-        // Basic auth from open() user/password
+        // Basic auth from open() user/password — UTF-8 encode then base64 (RFC 7617)
         if (this._user !== null) {
-            const auth = engine.encodeString(`${this._user}:${this._password ?? ''}`);
-            hdrs['Authorization'] = `Basic ${btoa(String.fromCharCode(...auth))}`;
+            const credBytes = engine.encodeString(`${this._user}:${this._password ?? ''}`) as Uint8Array;
+            let credStr = '';
+            for (let i = 0; i < credBytes.length; i++) credStr += String.fromCharCode(credBytes[i]!);
+            hdrs['Authorization'] = `Basic ${btoa(credStr)}`;
         }
 
         curl.setUrl(this._url)
@@ -1046,7 +1115,8 @@ export class XMLHttpRequest extends EventTarget {
             .setHeaders(hdrs)
             .setFollowRedirects(true)
             .setMaxRedirects(20);
-        curl.setAcceptEncoding(typeof hdrs['accept-encoding'] === 'string' ? hdrs['accept-encoding'] : undefined);
+        const xhrAE = hdrs['accept-encoding'];
+        curl.setAcceptEncoding(xhrAE === 'identity' ? 'identity' : undefined);
 
         if (this.timeout > 0) {
             curl.setTimeout(this.timeout);
@@ -1087,8 +1157,6 @@ export class XMLHttpRequest extends EventTarget {
         if (netHook) try {
             netHook.onRequest?.({ requestId: reqId, url: this._url, method: this._method, headers: hdrs, postData: bodyBytes ?? null, callFrames: reqCallFrames, resourceType: 'XHR', timestamp: reqStartTime });
         } catch {}
-
-        this._setState(XHR_HEADERS_RECEIVED);
 
         const handleDone = (response: CModuleCURL.Response): void => {
             if (this._aborted) return;
@@ -1141,11 +1209,12 @@ export class XMLHttpRequest extends EventTarget {
         const hdrs: string[] = [];
         for (const [k, v] of result.responseHeaders) hdrs.push(`${k}: ${v}`);
         this._responseHeaders = hdrs.join('\r\n');
+        this._responseHeaderMap = null;
         this.status = result.responseCode;
         this.statusText = '';
         this.responseURL = this._url;
         const bytes = result.body;
-        this._applyBody(bytes);
+        this._applyBody(bytes, result.responseHeaders.find(([k]) => k.toLowerCase() === 'content-type')?.[1]);
         this._setState(XHR_LOADING);
         this._setState(XHR_DONE);
         this._emit('progress');
@@ -1157,10 +1226,13 @@ export class XMLHttpRequest extends EventTarget {
         this.status = response.status;
         this.statusText = '';
         this._responseHeaders = response.headers;
+        this._responseHeaderMap = null;
         try { this.responseURL = this._curl?.getInfo(curlMod.CURLINFO_EFFECTIVE_URL) as string || this._url; } catch { this.responseURL = this._url; }
 
+        this._setState(XHR_HEADERS_RECEIVED);
+
         const bytes = responseBodyToBytes(response.body);
-        this._applyBody(bytes);
+        this._applyBody(bytes, this.getResponseHeader('content-type') ?? undefined);
 
         this._setState(XHR_LOADING);
         this._setState(XHR_DONE);
@@ -1169,15 +1241,17 @@ export class XMLHttpRequest extends EventTarget {
         this._emit('loadend');
     }
 
-    private _applyBody(bytes: Uint8Array): void {
+    private _applyBody(bytes: Uint8Array, contentType?: string): void {
         switch (this.responseType) {
             case '':
-            case 'text':
-                this._responseText = engine.decodeString(bytes);
+            case 'text': {
+                const m = contentType ? CHARSET_RE.exec(contentType) : null;
+                this._responseText = new Decoder(m?.[1]).decode(bytes);
                 this._response = this._responseText;
                 break;
+            }
             case 'json':
-                try { this._response = JSON.parse(engine.decodeString(bytes)); }
+                try { this._response = JSON.parse(new Decoder(undefined).decode(bytes)); }
                 catch { this._response = null; }
                 break;
             case 'arraybuffer':
@@ -1186,9 +1260,11 @@ export class XMLHttpRequest extends EventTarget {
             case 'blob':
                 this._response = new Blob([bytes]);
                 break;
-            default:
-                this._responseText = engine.decodeString(bytes);
+            default: {
+                const m = contentType ? CHARSET_RE.exec(contentType) : null;
+                this._responseText = new Decoder(m?.[1]).decode(bytes);
                 this._response = this._responseText;
+            }
         }
     }
 

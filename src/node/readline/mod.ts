@@ -59,6 +59,7 @@ export class Interface extends EventEmitter {
     private _cursorPos = 0;
     private _history: string[] = [];
     private _historyIndex = -1;
+    private _historyDraft = '';
     private _historySize: number;
     private _removeHistoryDups: boolean;
     private _closed = false;
@@ -276,10 +277,16 @@ export class Interface extends EventEmitter {
     private _moveHistory(dir: number): void {
         if (this._history.length === 0) return;
         if (dir === -1 && this._historyIndex < this._history.length - 1) {
-            if (this._historyIndex === -1) this._history.push(this._line);
+            if (this._historyIndex === -1) this._historyDraft = this._line;
             this._historyIndex++;
         } else if (dir === 1 && this._historyIndex > 0) {
             this._historyIndex--;
+        } else if (dir === 1 && this._historyIndex === 0) {
+            this._historyIndex = -1;
+            this._line = this._historyDraft;
+            this._cursorPos = this._line.length;
+            this._refreshLine();
+            return;
         } else {
             return;
         }
@@ -296,6 +303,7 @@ export class Interface extends EventEmitter {
             this._history.shift();
         }
         this._historyIndex = -1;
+        this._historyDraft = '';
     }
 
     getTerminal(): boolean { return this._terminal; }
@@ -356,6 +364,8 @@ export class Interface extends EventEmitter {
     get cursorPos(): { rows: number; cols: number } {
         return { rows: 0, cols: this._cursorPos };
     }
+
+    get history(): string[] { return this._history; }
 
     get line(): string { return this._line; }
 }

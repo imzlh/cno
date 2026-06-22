@@ -53,24 +53,18 @@ function isInternalNetworkCallFrame(file: string, functionName: string): boolean
     return INTERNAL_NETWORK_FRAME_RE.test(`${file} ${functionName}`);
 }
 
-export function captureUserNetworkCallFrames(
-    maxFrames: number = 32
-): NetworkCallFrame[] | undefined {
+export function captureUserNetworkCallFrames(): NetworkCallFrame[] | undefined {
     const frames: NetworkCallFrame[] = [];
-    let started = false;
     try {
         const depth = debug.getStackDepth();
         for (let level = HOOK_OFFSET; level < Math.min(depth, 64); level++) {
             const info = debug.getFrameInfo(level);
             if (!info) continue;
-            const file = typeof info.file === 'string' ? info.file : '';
+
+            const file = info.file ?? '';
             const functionName = frameFunctionName(info.func);
-            const internal = isInternalNetworkCallFrame(file, functionName);
-            if (!started) {
-                if (internal) continue;
-                started = true;
-            }
-            if (internal) continue;
+            if(isInternalNetworkCallFrame(file, functionName)) continue;
+
             frames.push({
                 functionName,
                 scriptId: file,
@@ -78,7 +72,6 @@ export function captureUserNetworkCallFrames(
                 lineNumber: Math.max(0, (info.line ?? 1) - 1),
                 columnNumber: Math.max(0, (info.column ?? 1) - 1),
             });
-            if (frames.length >= maxFrames) break;
         }
     } catch {}
     return frames.length > 0 ? frames : undefined;

@@ -39,7 +39,7 @@ function newServeRequestId(): string {
 }
 
 function captureServeCallFrames(): NetworkCallFrame[] | undefined {
-    return captureUserNetworkCallFrames(debug);
+    return captureUserNetworkCallFrames();
 }
 
 function headersArrayToRecord(headers: Array<[string, string]>): Record<string, string> {
@@ -560,6 +560,7 @@ function upgradeWebSocket(
  */
 function createWebSocketFromISocket(conn: Promise<ISocket>): globalThis.WebSocket {
     const serverMeta = conn.then(c => Reflect.get(c, '__cnoServerWebSocketMeta') as {
+        source: 'serve';
         requestId: string;
         url: string;
         requestHeaders?: Array<[string, string]>;

@@ -70,57 +70,18 @@ function cssToAnsi(css: string): string {
     return codes.join('');
 }
 
-// Format value for display
-function formatValue(val: unknown, depth = 0): string {
-    if (depth > 2) {
-        if (typeof val === 'object' && val !== null) {
-            if (Array.isArray(val)) return `[Array(${val.length})]`;
-            if (val instanceof Map) return `[Map(${val.size})]`;
-            if (val instanceof Set) return `[Set(${val.size})]`;
-            return `[Object]`;
-        }
-    }
-
+// Format value for display — primitives handled here, everything else delegated to native inspect
+function formatValue(val: unknown): string {
     if (val === null) return 'null';
     if (val === undefined) return 'undefined';
-    if (typeof val === 'string') return val.length > 100 ? val.slice(0, 97) + '...' : val;
+    if (typeof val === 'string') return val;
     if (typeof val === 'number' || typeof val === 'boolean' || typeof val === 'bigint') return String(val);
     if (typeof val === 'symbol') return val.toString();
-    if (typeof val === 'function') return '[Function]';
-    if (val instanceof Date) return val.toISOString();
-    if (val instanceof RegExp) return val.toString();
-    if (val instanceof Error) return `${val.name}: ${val.message}`;
-    if (val instanceof Promise) return '[Promise]';
-
-    if (Array.isArray(val)) {
-        if (val.length === 0) return '[]';
-        const items = val.slice(0, 5).map(v => formatValue(v, depth + 1)).join(', ');
-        return val.length > 5 ? `[${items}, ...]` : `[${items}]`;
+    try {
+        return (internal as any).inspect(val, { depth: 4 });
+    } catch {
+        return String(val);
     }
-
-    if (val instanceof Map) {
-        const entries = Array.from(val.entries()).slice(0, 3)
-            .map(([k, v]) => `${formatValue(k, depth + 1)} => ${formatValue(v, depth + 1)}`).join(', ');
-        return `Map(${val.size}) {${entries}${val.size > 3 ? ', ...' : ''}}`;
-    }
-
-    if (val instanceof Set) {
-        const items = Array.from(val).slice(0, 3).map(v => formatValue(v, depth + 1)).join(', ');
-        return `Set(${val.size}) {${items}${val.size > 3 ? ', ...' : ''}}`;
-    }
-
-    if (typeof val === 'object') {
-        try {
-            const keys = Object.keys(val);
-            if (keys.length === 0) return '{}';
-            const entries = keys.slice(0, 3).map(k => `${k}: ${formatValue((val as Record<string, unknown>)[k], depth + 1)}`).join(', ');
-            return keys.length > 3 ? `{${entries}, ...}` : `{${entries}}`;
-        } catch {
-            return '[Object]';
-        }
-    }
-
-    return String(val);
 }
 
 // Apply format specifiers
@@ -151,14 +112,7 @@ function applyFormat(format: string, args: unknown[]): { text: string; consumed:
                     case 'o':
                     case 'O':
                         try {
-                            const seen = new WeakSet();
-                            result += JSON.stringify(arg, (k, v) => {
-                                if (typeof v === 'object' && v !== null) {
-                                    if (seen.has(v)) return '[Circular]';
-                                    seen.add(v);
-                                }
-                                return v;
-                            }, spec === 'O' ? 2 : undefined);
+                            result += (internal as any).inspect(arg, { depth: spec === 'O' ? 100 : 4 });
                         } catch {
                             result += String(arg);
                         }
@@ -209,6 +163,31 @@ function buildOutput(args: unknown[]): string {
 
 // =================== TABLE IMPLEMENTATION ===================
 
+// Flat single-line formatter for table cells — avoids multiline inspect output
+function formatCell(val: unknown): string {
+    if (val === null) return 'null';
+    if (val === undefined) return 'undefined';
+    if (typeof val === 'string') return val.length > 50 ? val.slice(0, 47) + '...' : val;
+    if (typeof val === 'number' || typeof val === 'boolean' || typeof val === 'bigint') return String(val);
+    if (typeof val === 'symbol') return val.toString();
+    if (typeof val === 'function') return `[Function: ${(val as Function).name || 'anonymous'}]`;
+    if (Array.isArray(val)) return `Array(${val.length})`;
+    if (val instanceof Map) return `Map(${val.size})`;
+    if (val instanceof Set) return `Set(${val.size})`;
+    if (typeof val === 'object') {
+        const name = (val as any)?.constructor?.name;
+        const tag = name && name !== 'Object' ? name + ' ' : '';
+        try {
+            const keys = Object.keys(val as object);
+            if (keys.length === 0) return `${tag}{}`;
+            return `${tag}{${keys.slice(0, 3).join(', ')}${keys.length > 3 ? ', ...' : ''}}`;
+        } catch {
+            return `${tag}{}`;
+        }
+    }
+    return String(val);
+}
+
 interface TableColumn {
     key: string;
     width: number;
@@ -226,12 +205,12 @@ function getTableColumns(data: unknown, columns?: string[]): TableColumn[] {
             if (item && typeof item === 'object' && !Array.isArray(item)) {
                 for (const key of Object.keys(item)) {
                     if (columns && !columns.includes(key)) continue;
-                    const val = formatValue((item as Record<string, unknown>)[key]);
+                    const val = formatCell((item as Record<string, unknown>)[key]);
                     cols.set(key, Math.max(cols.get(key) || key.length, val.length, key.length));
                 }
             } else {
                 // Primitive array
-                const val = formatValue(item);
+                const val = formatCell(item);
                 cols.set('Value', Math.max(cols.get('Value') || 'Value'.length, val.length));
             }
         }
@@ -241,8 +220,8 @@ function getTableColumns(data: unknown, columns?: string[]): TableColumn[] {
         cols.set('Value', 'Value'.length);
         for (const [k, v] of Object.entries(data)) {
             if (columns && !columns.includes(k)) continue;
-            cols.get('Key')!;
-            cols.set('Value', Math.max(cols.get('Value') || 'Value'.length, formatValue(v).length));
+            cols.set('Key', Math.max(cols.get('Key') || 'Key'.length, k.length));
+            cols.set('Value', Math.max(cols.get('Value') || 'Value'.length, formatCell(v).length));
         }
     }
 
@@ -289,9 +268,9 @@ function printTable(data: unknown, columns?: string[]): string[] {
                 const key = cols[i].key;
                 let val: string;
                 if (item && typeof item === 'object' && !Array.isArray(item)) {
-                    val = formatValue((item as Record<string, unknown>)[key]);
+                    val = formatCell((item as Record<string, unknown>)[key]);
                 } else if (cols.length === 2 && cols[1].key === 'Value') {
-                    val = formatValue(item);
+                    val = formatCell(item);
                 } else {
                     val = '';
                 }
@@ -303,9 +282,9 @@ function printTable(data: unknown, columns?: string[]): string[] {
         for (const [k, v] of Object.entries(data)) {
             if (columns && !columns.includes(k)) continue;
             const row = [
-                pad('0', cols[0].width),
+                pad(k, cols[0].width),
                 pad(k, cols.find(c => c.key === 'Key')?.width || 10),
-                pad(formatValue(v), cols.find(c => c.key === 'Value')?.width || 10)
+                pad(formatCell(v), cols.find(c => c.key === 'Value')?.width || 10)
             ];
             lines.push('│' + row.join('│') + '│');
         }
@@ -345,7 +324,7 @@ const webConsole = {
     },
 
     dir(obj: unknown, options?: { depth?: number; colors?: boolean }) {
-        internal.log(groupIndent + formatValue(obj, options?.depth ?? 2));
+        (internal as any).dir(obj);
     },
 
     dirxml(...args: unknown[]) {

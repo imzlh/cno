@@ -26,8 +26,26 @@ type IWSSocket = Omit<ISocket, 'serverHandshake' | 'alpnProtocol' | 'read'>;
 let _wsIdCounter = 0;
 const wsTs = () => Date.now() / 1000;
 
+/**
+ * Encode a Uint8Array slice to base64 for hook reporting.
+ * Caps at HOOK_PAYLOAD_CAP bytes to avoid huge string allocations for large binary frames.
+ */
+function hookBase64(payload: Uint8Array): string {
+    const src = payload.byteLength <= HOOK_PAYLOAD_CAP ? payload : payload.subarray(0, HOOK_PAYLOAD_CAP);
+    // Use a dedicated ArrayBuffer copy so byteOffset is always 0 — base64Encode may not
+    // honour byteOffset on a shared buffer.
+    const buf = src.buffer.slice(src.byteOffset, src.byteOffset + src.byteLength) as ArrayBuffer;
+    return crypto.base64Encode(buf);
+}
+
 function captureWebSocketCallFrames(): NetworkCallFrame[] | undefined {
-    return captureUserNetworkCallFrames(debug);
+    return captureUserNetworkCallFrames();
+}
+
+function toWebSocketUrl(url: string): string {
+    if (url.startsWith('http://')) return `ws://${url.slice('http://'.length)}`;
+    if (url.startsWith('https://')) return `wss://${url.slice('https://'.length)}`;
+    return url;
 }
 
 export enum OpCode {
@@ -64,6 +82,14 @@ interface WebSocketEventMap { open: Event; message: MessageEvent; error: ErrorEv
 
 const HIGH_WATER_MARK = 64 * 1024;
 const MAX_BUFFERED_AMOUNT = 8 * 1024 * 1024;
+// Hook payload reporting: cap base64 encoding to avoid huge strings for large binary frames.
+const HOOK_PAYLOAD_CAP = 64 * 1024;
+// Fragment threshold for large sends.
+// Only payloads exceeding this are split into multiple frames; the sole purpose
+// is to prevent a single enormous frame from blocking PING/CLOSE frames in the
+// send queue for too long.  8 MB - header (14 B) means almost nothing fragments
+// in practice — the C ws_mask implementation handles large payloads efficiently.
+const SEND_FRAGMENT_SIZE = MAX_BUFFERED_AMOUNT - 14;
 
 class SendQueue {
     private queue: Array<{ data: Uint8Array; resolve: () => void; reject: (e: Error) => void }> = [];
@@ -134,8 +160,9 @@ class SendQueue {
         if (masked) {
             const maskKey = new Uint8Array(crypto.randomBytes(4));
             frame.set(maskKey, offset); offset += 4;
+            // ws_mask is a C native — produces the masked payload as a new Uint8Array.
             const maskbuf = algo.ws_mask(payload, maskKey);
-            frame.set(maskbuf, offset); offset += payloadLength;
+            frame.set(maskbuf, offset);
         } else { frame.set(payload, offset); }
         return frame;
     }
@@ -150,9 +177,8 @@ class SendQueue {
      * All fragments are pushed synchronously before drain() runs, so no other
      * concurrent send can interleave frames within this message.
      */
-    enqueueData(opcode: OpCode, payload: Uint8Array): Promise<void> {
-        const FRAGMENT_SIZE = 65536;
-        if (payload.length <= FRAGMENT_SIZE)
+	enqueueData(opcode: OpCode, payload: Uint8Array): Promise<void> {
+		if (payload.length <= SEND_FRAGMENT_SIZE)
             return this.enqueue(this.buildFrame(opcode, payload, true, this.isClient));
 
         if (this._bufferedAmount + payload.length > MAX_BUFFERED_AMOUNT)
@@ -164,7 +190,7 @@ class SendQueue {
         let offset = 0;
         let firstFrame = true;
         while (offset < payload.length) {
-            const end = Math.min(offset + FRAGMENT_SIZE, payload.length);
+            const end = Math.min(offset + SEND_FRAGMENT_SIZE, payload.length);
             const chunk = payload.subarray(offset, end);
             const fin = end === payload.length;
             const frameOpcode = firstFrame ? opcode : OpCode.CONTINUATION;
@@ -206,7 +232,13 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
     private _readyState: WebSocketReadyState = WebSocketReadyState.CONNECTING;
     private connection: IWSSocket | null = null;
     private isClient: boolean;
-    private receiveBuffer: Uint8Array[] = [];
+    // Receive-side buffer: chunks are appended; _rxOffset tracks bytes consumed in chunks[0].
+    // The buffer is merged lazily — only when a complete frame cannot be parsed from
+    // the existing chunks. After merging, the remainder is kept as a single subarray
+    // (zero-copy view) to avoid repeated allocations.
+    private _rxChunks: Uint8Array[] = [];
+    private _rxOffset = 0;   // bytes already consumed from _rxChunks[0]
+    private _rxTotal = 0;    // total unconsumed bytes across all chunks
     private fragments: Uint8Array[] = [];
     private fragmentOpcode: OpCode | null = null;
     private pingInterval: number | null = null;
@@ -244,23 +276,23 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
             const syncServerMeta = serverMeta && typeof (serverMeta as Promise<ServerWebSocketMeta | undefined>).then !== 'function'
                 ? serverMeta as ServerWebSocketMeta
                 : undefined;
-            this.url = syncServerMeta?.url ?? ''; this.isClient = false;
+            const serverMetaReady = serverMeta && typeof (serverMeta as Promise<ServerWebSocketMeta | undefined>).then === 'function'
+                ? (serverMeta as Promise<ServerWebSocketMeta | undefined>).then(meta => {
+                    if (!meta) return;
+                    this._serverMeta = meta;
+                    if (!this.url) this.url = toWebSocketUrl(meta.url);
+                    if (!this._netRequestId) this._netRequestId = meta.requestId;
+                    if (!this._initiatorCallFrames) this._initiatorCallFrames = meta.callFrames;
+                }).catch(() => {})
+                : Promise.resolve();
+            this.url = syncServerMeta?.url ? toWebSocketUrl(syncServerMeta.url) : ''; this.isClient = false;
             this._serverMeta = syncServerMeta;
             this._netRequestId = syncServerMeta?.requestId ?? '';
             this._initiatorCallFrames = syncServerMeta?.callFrames;
             this.sendQueue = new SendQueue(null, false, () => this.handleClose(WebSocketCloseCode.ABNORMAL, 'Connection closed'));
             this._readyState = WebSocketReadyState.CONNECTING;
-            if (serverMeta && typeof (serverMeta as Promise<ServerWebSocketMeta | undefined>).then === 'function') {
-                (serverMeta as Promise<ServerWebSocketMeta | undefined>).then(meta => {
-                    if (!meta) return;
-                    this._serverMeta = meta;
-                    if (!this.url) this.url = meta.url;
-                    if (!this._netRequestId) this._netRequestId = meta.requestId;
-                    if (!this._initiatorCallFrames) this._initiatorCallFrames = meta.callFrames;
-                    if (this._readyState === WebSocketReadyState.OPEN) this.emitServerHandshakeEvents();
-                }).catch(() => {});
-            }
             urlOrConnection.then(conn => {
+                serverMetaReady.then(() => {
                 if (this._readyState === WebSocketReadyState.CLOSED) return;
                 this._readyState = WebSocketReadyState.OPEN; this.connection = conn; this.sendQueue.setConnection(conn);
                 this.emitServerHandshakeEvents();
@@ -269,6 +301,7 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
                     // Server-side sockets don't initiate pings — the client
                     // (e.g. Chrome DevTools) manages its own heartbeat.
                     if (this.isClient) this.startPingTimer();
+                });
                 });
             }).catch(err => {
                 this._readyState = WebSocketReadyState.CLOSED;
@@ -328,7 +361,7 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
     private async receiveHandshake(): Promise<void> {
         assert(this.connection, "Connection is not established");
         const parser = new HttpResponseParser();
-        const { status, headers } = await readHeaders(this.connection, parser);
+        const { status, headers, leftover } = await readHeaders(this.connection, parser);
 
         if (status !== 101) throw new Error(`WebSocket handshake failed: ${status}`);
         const upgrade = headers.find(([n]) => n === 'upgrade')?.[1]?.toLowerCase();
@@ -342,6 +375,10 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
             const wsHook = getWebSocketHook();
             if (wsHook) try { wsHook.onHandshake?.({ source: 'fetch', requestId: this._netRequestId, status, headers, timestamp: wsTs() }); } catch {}
         }
+        if (leftover && leftover.byteLength > 0) {
+            this._rxChunks.push(leftover);
+            this._rxTotal += leftover.byteLength;
+        }
     }
 
     private generateWebSocketKey(): string { return crypto.base64Encode(crypto.randomBytes(16)); }
@@ -353,47 +390,94 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
         conn.onReadable(data => {
             if (data === null) return this.handleClose(WebSocketCloseCode.ABNORMAL, 'Connection closed');
             if (data.length === 0) return;
-            this.receiveBuffer.push(data); this.processFrames();
+            this._rxChunks.push(data);
+            this._rxTotal += data.length;
+            this.processFrames();
         });
+        if (this._rxTotal > 0) queueMicrotask(() => this.processFrames());
     }
 
     private processFrames(): void {
-        while (this.receiveBuffer.length > 0) { const frame = this.parseFrame(); if (!frame) break; this.handleFrame(frame); }
+        while (this._rxTotal > 0) { const frame = this.parseFrame(); if (!frame) break; this.handleFrame(frame); }
+    }
+
+    /**
+     * Merge all pending chunks into one flat Uint8Array and reset the chunk list.
+     * Called only when multiple chunks are present — avoids allocation when there is
+     * already exactly one chunk (the common case for small frames).
+     */
+    private _rxMerge(): Uint8Array {
+        const merged = new Uint8Array(this._rxTotal);
+        let pos = 0;
+        for (let i = 0; i < this._rxChunks.length; i++) {
+            const chunk = this._rxChunks[i]!;
+            const src = i === 0 && this._rxOffset > 0 ? chunk.subarray(this._rxOffset) : chunk;
+            merged.set(src, pos);
+            pos += src.length;
+        }
+        this._rxChunks = [merged];
+        this._rxOffset = 0;
+        return merged;
     }
 
     private parseFrame(): WebSocketFrame | null {
-        const totalLength = this.receiveBuffer.reduce((sum, buf) => sum + buf.length, 0);
-        if (totalLength < 2) return null;
+        if (this._rxTotal < 2) return null;
 
+        // Ensure we have a single flat view for header inspection.
+        // For the common path (one chunk already flat) this is a free subarray.
         let buffer: Uint8Array;
-        if (this.receiveBuffer.length === 1) buffer = this.receiveBuffer[0]!;
-        else { buffer = new Uint8Array(totalLength); let o = 0; for (const buf of this.receiveBuffer) { buffer.set(buf, o); o += buf.length; } }
+        if (this._rxChunks.length === 1) {
+            buffer = this._rxChunks[0]!;
+            if (this._rxOffset > 0) buffer = buffer.subarray(this._rxOffset);
+        } else {
+            buffer = this._rxMerge();
+        }
 
         const byte1 = buffer[0]!, byte2 = buffer[1]!;
-        const fin = (byte1 & 0x80) !== 0;
-        const opcode = byte1 & 0x0F;
+        const fin    = (byte1 & 0x80) !== 0;
+        const opcode =  byte1 & 0x0F;
         const masked = (byte2 & 0x80) !== 0;
         let payloadLength = byte2 & 0x7F;
         let offset = 2;
 
-        if (payloadLength === 126) { if (totalLength < 4) return null; payloadLength = (buffer[2]! << 8) | buffer[3]!; offset = 4; }
-        else if (payloadLength === 127) {
-            if (totalLength < 10) return null;
-            const highBits = buffer[2]! * 0x1000000 + buffer[3]! * 0x10000 + buffer[4]! * 0x100 + buffer[5]!;
-            if (highBits !== 0) { this.close(WebSocketCloseCode.MESSAGE_TOO_BIG, 'Frame payload too large'); return null; }
-            payloadLength = buffer[6]! * 0x1000000 + buffer[7]! * 0x10000 + buffer[8]! * 0x100 + buffer[9]!; offset = 10;
+        if (payloadLength === 126) {
+            if (this._rxTotal < 4) return null;
+            payloadLength = (buffer[2]! << 8) | buffer[3]!;
+            offset = 4;
+        } else if (payloadLength === 127) {
+            if (this._rxTotal < 10) return null;
+            const h0 = buffer[2]!, h1 = buffer[3]!, h2 = buffer[4]!, h3 = buffer[5]!;
+            if ((h0 | h1 | h2 | h3) !== 0) { this.close(WebSocketCloseCode.MESSAGE_TOO_BIG, 'Frame payload too large'); return null; }
+            payloadLength = buffer[6]! * 0x1000000 + buffer[7]! * 0x10000
+                          + buffer[8]! * 0x100     + buffer[9]!;
+            offset = 10;
         }
 
         let maskKey: Uint8Array | null = null;
-        if (masked) { if (totalLength < offset + 4) return null; maskKey = buffer.slice(offset, offset + 4); offset += 4; }
-        if (totalLength < offset + payloadLength) return null;
-
-        let payload = buffer.slice(offset, offset + payloadLength);
-        if (masked && maskKey && payload.length > 0) payload = algo.ws_mask(payload, maskKey);
+        if (masked) {
+            if (this._rxTotal < offset + 4) return null;
+            // subarray — zero-copy view for the 4-byte mask key
+            maskKey = buffer.subarray(offset, offset + 4);
+            offset += 4;
+        }
+        if (this._rxTotal < offset + payloadLength) return null;
 
         const frameLength = offset + payloadLength;
-        if (frameLength === totalLength) this.receiveBuffer = [];
-        else this.receiveBuffer = [buffer.slice(frameLength)];
+
+        // payload: subarray (zero-copy) before masking; ws_mask (C) produces the
+        // unmasked result as a new Uint8Array — unavoidable for correctness.
+        let payload = buffer.subarray(offset, offset + payloadLength);
+        if (masked && maskKey && payload.length > 0) payload = algo.ws_mask(payload, maskKey);
+
+        // Advance cursor: keep the remainder as a subarray — no copy.
+        if (frameLength === this._rxTotal) {
+            this._rxChunks = [];
+            this._rxOffset = 0;
+        } else {
+            this._rxChunks = [buffer.subarray(frameLength)];
+            this._rxOffset = 0;
+        }
+        this._rxTotal -= frameLength;
 
         return { fin, opcode, masked, payload };
     }
@@ -440,10 +524,13 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
         if (this._netRequestId && (opcode === OpCode.TEXT || opcode === OpCode.BINARY)) {
             const wsHook = getWebSocketHook();
             if (wsHook) {
+                const hookPayload = opcode === OpCode.TEXT
+                    ? engine.decodeString(payload)
+                    : hookBase64(payload);
                 const frame: WSFrameInfo = {
                     source: this.isClient ? 'fetch' : 'serve',
                     requestId: this._netRequestId, opcode, masked: this.isClient,
-                    payloadData: opcode === OpCode.TEXT ? engine.decodeString(payload) : crypto.base64Encode(payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength) as ArrayBuffer),
+                    payloadData: hookPayload,
                     payloadLength: payload.byteLength, timestamp: wsTs(),
                 };
                 try { wsHook.onFrameSent?.(frame); } catch {}
@@ -518,10 +605,13 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
         if (this._netRequestId) {
             const wsHook = getWebSocketHook();
             if (wsHook) {
+                const hookPayload = opcode === OpCode.TEXT
+                    ? engine.decodeString(payload)
+                    : hookBase64(payload);
                 const frame: WSFrameInfo = {
                     source: this.isClient ? 'fetch' : 'serve',
                     requestId: this._netRequestId, opcode, masked: !this.isClient,
-                    payloadData: opcode === OpCode.TEXT ? engine.decodeString(payload) : crypto.base64Encode(payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength) as ArrayBuffer),
+                    payloadData: hookPayload,
                     payloadLength: payload.byteLength, timestamp: wsTs(),
                 };
                 try { wsHook.onFrameReceived?.(frame); } catch {}
@@ -546,7 +636,7 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
             wsHook.onCreated?.({
                 source: meta.source,
                 requestId: this._netRequestId,
-                url: meta.url,
+                url: toWebSocketUrl(meta.url),
                 requestHeaders: meta.requestHeaders,
                 callFrames: meta.callFrames,
                 timestamp: wsTs(),

@@ -494,6 +494,9 @@ class SubtleCrypto implements globalThis.SubtleCrypto {
             if (keyAlg.length === 128) {
                 return crypto.aes128CbcEncrypt(keyImpl._handle, iv, dataBuffer);
             }
+            if (keyAlg.length === 192) {
+                return crypto.aes192CbcEncrypt(keyImpl._handle, iv, dataBuffer);
+            }
             if (keyAlg.length === 256) {
                 return crypto.aes256CbcEncrypt(keyImpl._handle, iv, dataBuffer);
             }
@@ -553,6 +556,9 @@ class SubtleCrypto implements globalThis.SubtleCrypto {
 
             if (keyAlg.length === 128) {
                 return crypto.aes128CbcDecrypt(keyImpl._handle, iv, dataBuffer);
+            }
+            if (keyAlg.length === 192) {
+                return crypto.aes192CbcDecrypt(keyImpl._handle, iv, dataBuffer);
             }
             if (keyAlg.length === 256) {
                 return crypto.aes256CbcDecrypt(keyImpl._handle, iv, dataBuffer);

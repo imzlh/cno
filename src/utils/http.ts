@@ -21,6 +21,7 @@ export type IHttpSocket = Pick<ISocket, 'onReadable' | 'stopReading' | 'write' |
 export interface HttpResponseHead {
     status: number;
     headers: Array<[string, string]>;
+    leftover?: Uint8Array;
 }
 
 /**
@@ -80,11 +81,10 @@ export function buildRequest(opts: {
  */
 export function readHeaders(socket: IHttpSocket, parser: HttpResponseParser): Promise<HttpResponseHead> {
     let settled = false;
+    let head: HttpResponseHead | null = null;
     return new Promise<HttpResponseHead>((resolve, reject) => {
         parser.onHeadersComplete = (status, headers) => {
-            settled = true;
-            socket.stopReading();
-            resolve({ status, headers });
+            head = { status, headers };
         };
         parser.onError = (err) => {
             if (!settled) { settled = true; reject(err); }
@@ -95,7 +95,16 @@ export function readHeaders(socket: IHttpSocket, parser: HttpResponseParser): Pr
                 if (!settled) { settled = true; reject(new Error('Connection closed while reading headers')); }
                 return;
             }
-            parser.feed(data);
+            const result = parser.feed(data) as any;
+            if (head && !settled) {
+                settled = true;
+                socket.stopReading();
+                const consumed = Number(result?.nread ?? result?.offset ?? result?.consumed ?? data.byteLength);
+                if (Number.isFinite(consumed) && consumed >= 0 && consumed < data.byteLength) {
+                    head.leftover = data.subarray(consumed);
+                }
+                resolve(head);
+            }
         }, err => {
             if (!settled) { settled = true; reject(err); }
         });

@@ -481,6 +481,7 @@ class URL implements globalThis.URL {
 
         if (!path) return;
 
+        const trailingSlash = path.endsWith('/');
         const segments = path.split('/');
         for (const segment of segments) {
             if (segment === '' || segment === '.') {
@@ -497,6 +498,11 @@ class URL implements globalThis.URL {
             } else {
                 this.#path.push(segment);
             }
+        }
+
+        // Preserve trailing slash: /vip/ → ['vip', ''] → pathname '/vip/'
+        if (trailingSlash) {
+            this.#path.push('');
         }
     }
 
