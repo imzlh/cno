@@ -146,15 +146,26 @@ export function format(format?: string, ...args: any[]): string {
     return result;
 }
 
-export function formatWithOptions(inspectOptions: InspectOptions, format?: any): string {
+export function formatWithOptions(inspectOptions: InspectOptions, format?: any, ...args: any[]): string {
     if (!format) {
         return '';
     }
-    return console.inspect(format, {
+    // Use the first arg as the format object, remaining args for %s/%d/%j/%o substitution
+    const result = console.inspect(format, {
         colors: inspectOptions.colors,
         depth: inspectOptions.depth ?? undefined,
-        showHidden: inspectOptions.showHidden
+        showHidden: inspectOptions.showHidden,
+        maxArrayLength: inspectOptions.maxArrayLength,
+        maxStringLength: inspectOptions.maxStringLength,
+        breakLength: inspectOptions.breakLength,
+        compact: inspectOptions.compact,
+        sorted: inspectOptions.sorted,
     });
+    // Append remaining arguments (format substitution)
+    if (args.length > 0) {
+        return result + ' ' + args.map(a => inspect(a, inspectOptions)).join(' ');
+    }
+    return result;
 }
 
 // ============================================================================
@@ -376,7 +387,7 @@ const defaultInspectOptions: InspectOptions = {
 };
 
 export function inspect(object: unknown, options?: InspectOptions): string {
-    return formatWithOptions(options ?? {}, object);
+    return formatWithOptions(options ?? defaultInspectOptions, object);
 }
 
 inspect.defaultOptions = defaultInspectOptions;
@@ -459,22 +470,34 @@ export interface PromisifyInterface {
 }
 
 export function promisify<T>(fn: Function): (...args: any[]) => Promise<T> {
-    Object.defineProperty(fn, Symbol.for('nodejs.util.promisify.custom'), {
-        value: (...args: any[]) => {
-            return new Promise<T>((resolve, reject) => {
-                fn(...args, (err: Error | null, result: T) => {
-                    if (err) {
-                        reject(err);
-                    } else {
-                        resolve(result);
-                    }
-                });
+    const customSymbol = Symbol.for('nodejs.util.promisify.custom');
+
+    // Check for existing custom promisify implementation
+    if ((fn as any)[customSymbol]) {
+        return (fn as any)[customSymbol];
+    }
+
+    const promisified = (...args: any[]) => {
+        return new Promise<T>((resolve, reject) => {
+            fn(...args, (err: Error | null, result: T) => {
+                if (err) {
+                    reject(err);
+                } else {
+                    resolve(result);
+                }
             });
-        },
+        });
+    };
+
+    // Copy the custom symbol if it exists on the original
+    Object.defineProperty(promisified, customSymbol, {
+        value: promisified,
+        writable: false,
+        enumerable: false,
+        configurable: true,
     });
 
-    // @ts-ignore - symbol index on function
-    return fn[Symbol.for('nodejs.util.promisify.custom')];
+    return promisified;
 }
 
 promisify.custom = Symbol.for('nodejs.util.promisify.custom');

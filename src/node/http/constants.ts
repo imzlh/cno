@@ -3,14 +3,16 @@ export const METHODS = [
     "OPTIONS", "TRACE", "COPY", "LOCK", "MKCOL", "MOVE",
     "PROPFIND", "PROPPATCH", "SEARCH", "UNLOCK", "BIND",
     "REBIND", "UNBIND", "ACL", "REPORT", "MKACTIVITY",
-    "CHECKOUT", "MERGE", "MSEARCH", "NOTIFY", "SUBSCRIBE",
-    "UNSUBSCRIBE", "PATCH", "PURGE", "MKCALENDAR", "LINK", "UNLINK"
+    "CHECKOUT", "MERGE", "M-SEARCH", "NOTIFY", "SUBSCRIBE",
+    "UNSUBSCRIBE", "PATCH", "PURGE", "MKCALENDAR", "LINK", "UNLINK",
+    "SOURCE"
 ] as const;
 
 export const STATUS_CODES: Record<number, string> = {
     100: 'Continue',
     101: 'Switching Protocols',
     102: 'Processing',
+    103: 'Early Hints',
     200: 'OK',
     201: 'Created',
     202: 'Accepted',
@@ -27,6 +29,7 @@ export const STATUS_CODES: Record<number, string> = {
     303: 'See Other',
     304: 'Not Modified',
     305: 'Use Proxy',
+    306: 'Unused',
     307: 'Temporary Redirect',
     308: 'Permanent Redirect',
     400: 'Bad Request',

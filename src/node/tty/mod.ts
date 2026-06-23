@@ -1,5 +1,6 @@
 import type { Stream } from '../../deno/04_stdio';
 import { Readable, Writable } from '../stream';
+import { getTierLimits } from '../../utils/memory-tier';
 
 const os = import.meta.use('os');
 const fs = import.meta.use('fs');
@@ -13,6 +14,8 @@ type Size = { width: number; height: number };
 type TTYRef = { stream: CModuleStreams.TTY; owned: boolean };
 
 const RESIZE_POLL_MS = 250;
+
+const { readBufSize: READ_BUF_SIZE } = getTierLimits();
 
 function validateFd(fd: number): void {
     if (!Number.isInteger(fd) || fd < 0) {
@@ -118,7 +121,7 @@ export class ReadStream extends Readable {
 
     private readFromFd(size: number): void {
         try {
-            const buf = new Uint8Array(size || 64 * 1024);
+            const buf = new Uint8Array(size || READ_BUF_SIZE);
             const n = this.handle.readSync(buf);
             if (!n) {
                 this.push(null);

@@ -41,6 +41,8 @@ class ReadableStreamController<R = any> implements globalThis.ReadableStreamDefa
         reject: (reason: any) => void;
     }> = [];
     #closedCallbacks: Array<{ resolve: () => void; reject: (e: any) => void }> = [];
+    #backpressureBuffer: Array<{ chunk: R; size: number }> = [];
+    #onEnqueue: (() => void) | null = null;
 
     constructor(source: UnderlyingSource<R>, strategy: QueuingStrategy<R>) {
         this.#source = source;
@@ -61,7 +63,7 @@ class ReadableStreamController<R = any> implements globalThis.ReadableStreamDefa
             throw new TypeError('Stream is closed');
         }
 
-        // If there's a pending read, fulfill it directly
+        // If there's a pending read, fulfill it directly — no queuing needed.
         if (this.#pendingReads.length > 0) {
             const read = this.#pendingReads.shift()!;
             read.resolve({ value: chunk, done: false });
@@ -69,7 +71,18 @@ class ReadableStreamController<R = any> implements globalThis.ReadableStreamDefa
             return;
         }
 
-        // Otherwise enqueue
+        // Backpressure: if the queue already exceeds the high water mark,
+        // buffer the chunk separately and notify the producer so it can
+        // stop producing (e.g. pause curl). Chunks must remain lossless;
+        // transport-level backpressure is responsible for stopping growth.
+        if (this.#queueSize >= this.#highWaterMark && this.#highWaterMark > 0) {
+            const size = this.#sizeAlgorithm(chunk);
+            this.#backpressureBuffer.push({ chunk, size });
+            if (this.#onEnqueue) try { this.#onEnqueue(); } catch {}
+            return;
+        }
+
+        // Otherwise enqueue into the main queue.
         const size = this.#sizeAlgorithm(chunk);
         this.#queue.push({ chunk, size });
         this.#queueSize += size;
@@ -80,6 +93,16 @@ class ReadableStreamController<R = any> implements globalThis.ReadableStreamDefa
         if (this.#closeRequested) return;
 
         this.#closeRequested = true;
+
+        // Drain ALL remaining backpressure buffer chunks into the main queue
+        // so they are delivered to the consumer before the stream finishes.
+        // We bypass the HWM limit here — the producer is done, so there is
+        // no risk of unbounded growth; we just need every last chunk reachable.
+        while (this.#backpressureBuffer.length > 0) {
+            const entry = this.#backpressureBuffer.shift()!;
+            this.#queue.push(entry);
+            this.#queueSize += entry.size;
+        }
 
         // If queue is empty, finish immediately — any pending reads get done:true.
         // (This handles the case where close() is called from inside pull()
@@ -96,6 +119,8 @@ class ReadableStreamController<R = any> implements globalThis.ReadableStreamDefa
         this.#storedError = e;
         this.#queue = [];
         this.#queueSize = 0;
+        this.#backpressureBuffer = [];
+        this.#onEnqueue = null;
 
         // Reject all pending reads
         for (const read of this.#pendingReads) {
@@ -116,7 +141,7 @@ class ReadableStreamController<R = any> implements globalThis.ReadableStreamDefa
         this.#started = true;
 
         try {
-            await this.#source.start?.(this);
+            await this.#source?.start?.(this);
             this.#callPullIfNeeded();
         } catch (error) {
             this.error(error);
@@ -145,6 +170,9 @@ class ReadableStreamController<R = any> implements globalThis.ReadableStreamDefa
             const read = this.#pendingReads.shift()!;
             read.resolve({ value: entry.chunk, done: false });
 
+            // Drain backpressure buffer now that queue has room.
+            this.#drainBuffer();
+
             // Check if we should close after dequeueing
             if (this.#closeRequested && this.#queue.length === 0 && this.#pendingReads.length === 0) {
                 this.#finishClose();
@@ -158,6 +186,16 @@ class ReadableStreamController<R = any> implements globalThis.ReadableStreamDefa
         this.#callPullIfNeeded();
     }
 
+    #drainBuffer(): void {
+        // Move chunks from the backpressure buffer into the main queue
+        // until the queue is back at the high water mark.
+        while (this.#backpressureBuffer.length > 0 && this.#queueSize < this.#highWaterMark) {
+            const entry = this.#backpressureBuffer.shift()!;
+            this.#queue.push(entry);
+            this.#queueSize += entry.size;
+        }
+    }
+
     #callPullIfNeeded(): void {
         if (!this.#shouldPull()) return;
 
@@ -169,7 +207,7 @@ class ReadableStreamController<R = any> implements globalThis.ReadableStreamDefa
         this.#pulling = true;
         this.#pullAgain = false;
 
-        Promise.resolve(this.#source.pull?.(this))
+        Promise.resolve(this.#source?.pull?.(this))
             .then(() => {
                 this.#pulling = false;
                 if (this.#pullAgain) {
@@ -196,8 +234,15 @@ class ReadableStreamController<R = any> implements globalThis.ReadableStreamDefa
         this.#state = 'closed';
         this.#queue = [];
         this.#queueSize = 0;
+        this.#backpressureBuffer = [];
+        this.#onEnqueue = null;
+        this.#storedError = undefined;
 
-        await this.#source.cancel?.(reason);
+        // Save source for cancel callback, then release it.
+        const source = this.#source;
+        this.#source = null as unknown as UnderlyingSource<R>;
+
+        await source.cancel?.(reason);
 
         for (const read of this.#pendingReads) {
             read.resolve({ value: undefined, done: true });
@@ -212,6 +257,20 @@ class ReadableStreamController<R = any> implements globalThis.ReadableStreamDefa
 
     #finishClose(): void {
         this.#state = 'closed';
+
+        // Release all queued data so it can be GC'd.
+        // close() already drained #backpressureBuffer into #queue before
+        // calling us, so clearing both is safe — no data is lost.
+        this.#queue = [];
+        this.#queueSize = 0;
+        this.#backpressureBuffer = [];
+        this.#onEnqueue = null;
+        this.#storedError = undefined;
+
+        // Break the closure chain: the source captures the producer's entire
+        // scope (curl handle, headers, hooks, etc.).  Once the stream is done
+        // the source will never be called again, so we can release it.
+        this.#source = null as unknown as UnderlyingSource<R>;
 
         // Resolve any pending reads with done
         for (const read of this.#pendingReads) {
@@ -229,6 +288,9 @@ class ReadableStreamController<R = any> implements globalThis.ReadableStreamDefa
     // Public API bridge for stream operations
     get _state() { return this.#state; }
     get _storedError() { return this.#storedError; }
+    get _backpressured() { return this.#backpressureBuffer.length > 0; }
+
+    set _onEnqueueCallback(fn: (() => void) | null) { this.#onEnqueue = fn; }
 
     _addPendingRead(resolve: any, reject: any) {
         this.#pendingReads.push({ resolve, reject });
@@ -394,15 +456,15 @@ export class ReadableStream<R = any> implements globalThis.ReadableStream<R> {
         }
 
         const reader = this.getReader();
-        const branches: [R[], R[]] = [[], []];
+        const branches: [R[] | null, R[] | null] = [[], []];
         let reading = false;
 
         // @ts-ignore
         const createBranch = (branchIndex: 0 | 1): globalThis.ReadableStream => new ReadableStream<R>({
             async pull(controller) {
                 // If this branch has queued chunks, dequeue
-                if (branches[branchIndex].length > 0) {
-                    controller.enqueue(branches[branchIndex].shift() as any);
+                if (branches[branchIndex] && branches[branchIndex]!.length > 0) {
+                    controller.enqueue(branches[branchIndex]!.shift() as any);
                     return;
                 }
 
@@ -417,18 +479,26 @@ export class ReadableStream<R = any> implements globalThis.ReadableStream<R> {
                         return;
                     }
 
-                    // Enqueue to both branches
-                    branches[0].push(value);
-                    branches[1].push(value);
-
-                    // Dequeue from this branch
-                    controller.enqueue(branches[branchIndex].shift() as any);
+                    // Enqueue to both live branches
+                    const other = 1 - branchIndex as 0 | 1;
+                    if (branches[branchIndex]) {
+                        branches[branchIndex]!.push(value);
+                        controller.enqueue(branches[branchIndex]!.shift() as any);
+                    }
+                    if (branches[other]) {
+                        branches[other]!.push(value);
+                    }
                 } finally {
                     reading = false;
                 }
             },
             cancel(reason) {
-                return reader.cancel(reason);
+                // Clear this branch's buffer so the live branch stops pushing into it.
+                branches[branchIndex] = null;
+                // If both branches are cancelled, cancel the underlying reader.
+                if (!branches[0] && !branches[1]) {
+                    return reader.cancel(reason);
+                }
             }
         });
 
@@ -975,9 +1045,13 @@ export class CompressionStream implements globalThis.CompressionStream {
                     this.controller?.enqueue(new Uint8Array(output));
                 }
                 this.controller?.close();
+                (this.handle as any)?.close?.();
+                (this as any).handle = null;
             },
             abort: (reason) => {
                 this.controller?.error(reason);
+                (this.handle as any)?.close?.();
+                (this as any).handle = null;
             }
         }) as any;
     }
@@ -1021,9 +1095,13 @@ export class DecompressionStream implements globalThis.DecompressionStream {
             },
             close: () => {
                 this.controller?.close();
+                (this.handle as any)?.close?.();
+                (this as any).handle = null;
             },
             abort: (reason) => {
                 this.controller?.error(reason);
+                (this.handle as any)?.close?.();
+                (this as any).handle = null;
             }
         }) as any;
     }

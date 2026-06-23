@@ -11,6 +11,74 @@ const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
 
 // ============================================================================
+// Shared type definitions (used across _promises.ts, callbacks.ts, sync.ts, async.ts)
+// ============================================================================
+
+export type PathLike = string | URL | Buffer;
+export type TimeLike = string | number | Date;
+export type Mode = number | string;
+
+export function modeToNumber(mode?: Mode): number | undefined {
+    if (typeof mode === 'string') {
+        return parseInt(mode, 8);
+    }
+    return mode;
+}
+
+export function timeToNumber(time: TimeLike): number {
+    if (typeof time === 'number') return time;
+    if (typeof time === 'string') return new Date(time).getTime();
+    return time.getTime();
+}
+
+/**
+ * Read a file from a file descriptor in chunks, returning the concatenated result.
+ * Shared by _promises.ts, async.ts, callbacks.ts, sync.ts.
+ */
+export async function readFileFromFdAsync(
+    readFn: (fd: number, buf: Uint8Array) => Promise<number>,
+    fd: number,
+    bufSize: number,
+): Promise<Uint8Array> {
+    const chunks: Uint8Array[] = [];
+    const buf = new Uint8Array(bufSize);
+    for (;;) {
+        const n = await readFn(fd, buf);
+        if (n <= 0) break;
+        chunks.push(buf.slice(0, n));
+        if (n < bufSize) break;
+    }
+    const total = chunks.reduce((s, c) => s + c.length, 0);
+    const out = new Uint8Array(total);
+    let off = 0;
+    for (const c of chunks) { out.set(c, off); off += c.length; }
+    return out;
+}
+
+/**
+ * Synchronous version of readFileFromFd.
+ */
+export function readFileFromFdSync(
+    readFn: (fd: number, buf: Uint8Array) => number,
+    fd: number,
+    bufSize: number,
+): Uint8Array {
+    const chunks: Uint8Array[] = [];
+    const buf = new Uint8Array(bufSize);
+    for (;;) {
+        const n = readFn(fd, buf);
+        if (n <= 0) break;
+        chunks.push(buf.slice(0, n));
+        if (n < bufSize) break;
+    }
+    const total = chunks.reduce((s, c) => s + c.length, 0);
+    const out = new Uint8Array(total);
+    let off = 0;
+    for (const c of chunks) { out.set(c, off); off += c.length; }
+    return out;
+}
+
+// ============================================================================
 // Data conversion
 // ============================================================================
 

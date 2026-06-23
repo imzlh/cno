@@ -6,34 +6,16 @@ const asfs = import.meta.use('asyncfs');
 const engine = import.meta.use('engine');
 const fs = import.meta.use('fs');
 import { FileHandle } from 'fs/promises';
-import { toUint8Array, decodeBuffer, toNodeStatAsync, toNodeDirentAsync, parseFlags, pathToString, splitPathOrFd, removeRecursive, mkdirRecursive } from './utils';
+import { toUint8Array, decodeBuffer, toNodeStatAsync, toNodeDirentAsync, parseFlags, pathToString, splitPathOrFd, removeRecursive, mkdirRecursive, modeToNumber, timeToNumber, readFileFromFdAsync, type PathLike, type TimeLike, type Mode } from './utils';
 import { toErrnoException, wrapPromise } from '../_internal/errno';
+import { getTierLimits } from '../_internal/memory';
 import type { Dirent, StatFsOptions, Stats } from 'fs';
+
+const { readBufSize: READ_BUF_SIZE } = getTierLimits();
 
 // Helper: wrap asyncfs calls, auto-convert errno to ErrnoException
 function w<T>(promise: Promise<T>, syscall: string, path: string): Promise<T> {
     return wrapPromise(promise, syscall, path);
-}
-
-// ============================================================================
-// Type definitions
-// ============================================================================
-
-type PathLike = string | URL | Buffer;
-type TimeLike = string | number | Date;
-type Mode = number | string;
-
-function modeToNumber(mode?: Mode): number | undefined {
-    if (typeof mode === 'string') {
-        return parseInt(mode, 8);
-    }
-    return mode;
-}
-
-function timeToNumber(time: TimeLike): number {
-    if (typeof time === 'number') return time;
-    if (typeof time === 'string') return new Date(time).getTime();
-    return time.getTime();
 }
 
 // ============================================================================
@@ -156,7 +138,7 @@ export async function readFile(path: PathLike | number, options?: { encoding?: B
     const buffer = 'fd' in target
         ? (() => {
             const chunks: Uint8Array[] = [];
-            const buf = new Uint8Array(64 * 1024);
+            const buf = new Uint8Array(READ_BUF_SIZE);
             let bytesRead = 0;
             while ((bytesRead = fs.read(target.fd, buf)) > 0) {
                 chunks.push(buf.slice(0, bytesRead));
@@ -394,7 +376,9 @@ export async function link(existingPath: PathLike, newPath: PathLike): Promise<v
 }
 
 export async function symlink(target: PathLike, path: PathLike, type?: 'file' | 'dir' | 'junction'): Promise<void> {
-    const symlinkType = type === 'dir' ? asfs.SymlinkType.DIR : asfs.SymlinkType.JUNCTION;
+    // Windows: DIR=1, JUNCTION=2, FILE=0 (no flags). SymlinkType enum lacks FILE,
+    // so we use 0 for file symlinks which is the correct Windows API value.
+    const symlinkType = type === 'dir' ? asfs.SymlinkType.DIR : type === 'junction' ? asfs.SymlinkType.JUNCTION : 0 as any;
     const pathStr = pathToString(path);
     await w(asfs.symlink(pathToString(target), pathStr, symlinkType), 'symlink', pathStr);
 }
@@ -484,7 +468,9 @@ export async function lchmod(path: PathLike, mode: Mode): Promise<void> {
 
 export async function mkdtemp(prefix: string, options?: { encoding?: BufferEncoding | null } | BufferEncoding): Promise<string> {
     const encoding = typeof options === 'string' ? options : options?.encoding;
-    const randomStr = Math.random().toString(36).substring(2, 10);
+    // Use crypto-grade randomness (6 bytes = 12 hex chars) instead of Math.random
+    const randomBytes = await import('../crypto').then(m => m.randomBytes(6));
+    const randomStr = Array.from(new Uint8Array(randomBytes)).map(b => b.toString(16).padStart(2, '0')).join('');
     const dirPath = prefix + randomStr;
     await w(asfs.mkdir(dirPath), 'mkdir', dirPath);
     return dirPath;
@@ -670,7 +656,7 @@ export async function* glob(pattern: string | readonly string[], options?: { cwd
             try { stat = await w(asfs.lstat(full), 'lstat', full); } catch { continue; }
             if (excludeRegexes.some(r => r.test(rel))) continue;
             if (regexes.some(r => r.test(rel))) yield rel;
-            if (stat.isDirectory()) yield* walk(full);
+            if (stat.isDirectory) yield* walk(full);
         }
     }
 

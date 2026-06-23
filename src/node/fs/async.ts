@@ -6,14 +6,15 @@ const fs = import.meta.use('fs');
 const asfs = import.meta.use('asyncfs');
 const engine = import.meta.use('engine');
 import { FileHandle } from 'fs/promises';
-import { toUint8Array, decodeBuffer, toNodeStatAsync, toNodeDirentAsync, parseFlags, pathToString, splitPathOrFd, removeRecursive, mkdirRecursive } from './utils';
+import { toUint8Array, decodeBuffer, toNodeStatAsync, toNodeDirentAsync, parseFlags, pathToString, splitPathOrFd, removeRecursive, mkdirRecursive, type PathLike } from './utils';
+import { getTierLimits } from '../../utils/memory-tier';
 import { Stats } from 'fs';
+
+const { readBufSize: READ_BUF_SIZE } = getTierLimits();
 
 // ============================================================================
 // File read/write
 // ============================================================================
-
-type PathLike = string | URL | Buffer;
 
 export async function readFile(path: PathLike | number, options?: { encoding?: BufferEncoding | null; flag?: string | number } | BufferEncoding): Promise<string | Uint8Array> {
     const target = splitPathOrFd(path as PathLike | number);
@@ -21,7 +22,7 @@ export async function readFile(path: PathLike | number, options?: { encoding?: B
     const buffer = 'fd' in target
         ? (() => {
             const chunks: Uint8Array[] = [];
-            const buf = new Uint8Array(64 * 1024);
+            const buf = new Uint8Array(READ_BUF_SIZE);
             let bytesRead = 0;
             while ((bytesRead = fs.read(target.fd, buf)) > 0) {
                 chunks.push(buf.slice(0, bytesRead));
@@ -262,7 +263,7 @@ export async function link(existingPath: PathLike, newPath: PathLike): Promise<v
 }
 
 export async function symlink(target: PathLike, path: PathLike, type?: 'file' | 'dir' | 'junction'): Promise<void> {
-    const symlinkType = type === 'dir' ? asfs.SymlinkType.DIR : asfs.SymlinkType.JUNCTION;
+    const symlinkType = type === 'dir' ? asfs.SymlinkType.DIR : type === 'junction' ? asfs.SymlinkType.JUNCTION : 0 as any;
     await asfs.symlink(pathToString(target), pathToString(path), symlinkType);
 }
 

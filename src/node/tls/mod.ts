@@ -249,9 +249,15 @@ export class TLSSocket extends Duplex {
         this.#sslPipe.feed(data);
 
         if (!this.#handshakeComplete) {
-            // Drive handshake to completion
+            // Drive handshake: flush output, then check if complete.
+            // We limit iterations to avoid an infinite loop when the handshake
+            // needs more network data (multi-round-trip). After flushing, we
+            // break and wait for the next #feedEncrypted call with new data.
+            let iterations = 0;
+            const MAX_HANDSHAKE_ITERATIONS = 16;
             while (!this.#sslPipe.handshake()) {
                 this.#flushOutput();
+                if (++iterations >= MAX_HANDSHAKE_ITERATIONS) break;
             }
             this.#flushOutput();
 
@@ -450,6 +456,8 @@ export class TLSSocket extends Duplex {
     destroy(error?: Error): this {
         if (this.#destroyed) return this;
         this.#destroyed = true;
+        // Sync parent Duplex destroyed state
+        this.destroyed = true;
         this.readyState = 'closed';
 
         if (this.#sslPipe) {
@@ -680,6 +688,14 @@ export function connect(portOrOptions: number | TlsConnectOptions, hostOrOptions
         servername: options.servername ?? host,
     });
 
+    // Attach secureConnect listener BEFORE initiating connection to avoid race
+    // condition where handshake completes before .then() callback runs.
+    if (secureConnectListener) {
+        tlsSocket.on('secureConnect', () => {
+            secureConnectListener();
+        });
+    }
+
     tcp.connect({ ip: host, port: port! }).then(() => {
         const localInfo = tcp.sockname;
         tlsSocket.localAddress = localInfo.ip;
@@ -689,10 +705,6 @@ export function connect(portOrOptions: number | TlsConnectOptions, hostOrOptions
         tlsSocket.remoteAddress = remoteInfo.ip;
         tlsSocket.remotePort = remoteInfo.port;
         tlsSocket.remoteFamily = `IPv${remoteInfo.family}`;
-
-        tlsSocket.on('secureConnect', () => {
-            if (secureConnectListener) secureConnectListener();
-        });
     }).catch((err) => {
         tlsSocket.emit('error', err);
         tlsSocket.destroy();

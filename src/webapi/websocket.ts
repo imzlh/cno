@@ -11,6 +11,7 @@ import { type ISocket } from "@cnojs/http/socket"
 import { connectTcp, buildRequest, readHeaders } from "../utils/http"
 import { CloseEvent, ErrorEvent, MessageEvent } from "./events";
 import { getWebSocketHook, captureUserNetworkCallFrames, type NetworkCallFrame, type NetworkSource, type WSFrameInfo } from '../utils/network-hooks';
+import { getTierLimits } from '../utils/memory-tier';
 
 const engine = import.meta.use('engine');
 const algo = import.meta.use('algorithm');
@@ -31,7 +32,7 @@ const wsTs = () => Date.now() / 1000;
  * Caps at HOOK_PAYLOAD_CAP bytes to avoid huge string allocations for large binary frames.
  */
 function hookBase64(payload: Uint8Array): string {
-    const src = payload.byteLength <= HOOK_PAYLOAD_CAP ? payload : payload.subarray(0, HOOK_PAYLOAD_CAP);
+    const src = payload.byteLength <= hookPayloadCap ? payload : payload.subarray(0, hookPayloadCap);
     // Use a dedicated ArrayBuffer copy so byteOffset is always 0 — base64Encode may not
     // honour byteOffset on a shared buffer.
     const buf = src.buffer.slice(src.byteOffset, src.byteOffset + src.byteLength) as ArrayBuffer;
@@ -80,16 +81,15 @@ type ServerWebSocketMetaSource = ServerWebSocketMeta | Promise<ServerWebSocketMe
 interface WebSocketFrame { fin: boolean; opcode: OpCode; masked: boolean; payload: Uint8Array; }
 interface WebSocketEventMap { open: Event; message: MessageEvent; error: ErrorEvent; close: globalThis.CloseEvent; }
 
-const HIGH_WATER_MARK = 64 * 1024;
 const MAX_BUFFERED_AMOUNT = 8 * 1024 * 1024;
-// Hook payload reporting: cap base64 encoding to avoid huge strings for large binary frames.
-const HOOK_PAYLOAD_CAP = 64 * 1024;
 // Fragment threshold for large sends.
 // Only payloads exceeding this are split into multiple frames; the sole purpose
 // is to prevent a single enormous frame from blocking PING/CLOSE frames in the
 // send queue for too long.  8 MB - header (14 B) means almost nothing fragments
 // in practice — the C ws_mask implementation handles large payloads efficiently.
 const SEND_FRAGMENT_SIZE = MAX_BUFFERED_AMOUNT - 14;
+
+const { streamHighWaterMark: HIGH_WATER_MARK, hookPayloadCap } = getTierLimits();
 
 class SendQueue {
     private queue: Array<{ data: Uint8Array; resolve: () => void; reject: (e: Error) => void }> = [];
@@ -569,6 +569,9 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
         this._readyState = WebSocketReadyState.CLOSED; this.closeCode = code; this.closeReason = reason;
         this.stopPingTimer(); this.sendQueue.close();
         if (this.connection) { try { this.connection.close(); } catch { } this.connection = null; }
+        // Release accumulated fragment data so it can be GC'd.
+        this.fragments = [];
+        this.fragmentOpcode = null;
 
         if (this._netRequestId) {
             const wsHook = getWebSocketHook();
@@ -720,7 +723,7 @@ export class WebSocketStream {
     get url(): string { return this.ws.url; }
 
     opened: Promise<WebSocketStreamConnection> = new Promise((resolve, reject) => { this._openedResolve = resolve; this._openedReject = reject; });
-    get closed(): Promise<{ closeCode: number; reason: string }> { return new Promise(resolve => { this._closedResolve = resolve; }); }
+    closed: Promise<{ closeCode: number; reason: string }> = new Promise(resolve => { this._closedResolve = resolve; });
 
     close(closeInfo?: { closeCode?: number; reason?: string }): void {
         this.ws.close(closeInfo?.closeCode ?? WebSocketCloseCode.NORMAL, closeInfo?.reason ?? '');

@@ -11,6 +11,7 @@ const os = import.meta.use('os');
 
 import { Socket } from '../net';
 import { OutgoingMessageImpl, IncomingMessageImpl, OutgoingHttpHeaders, IncomingHttpHeaders } from './server';
+import { METHODS } from './constants';
 import {
     buildNodeUrl,
     captureNodeNetworkCallFrames,
@@ -23,13 +24,7 @@ import {
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
-export const METHODS = [
-    'ACL', 'BIND', 'CHECKOUT', 'CONNECT', 'COPY', 'DELETE', 'GET', 'HEAD',
-    'LINK', 'LOCK', 'M-SEARCH', 'MERGE', 'MKACTIVITY', 'MKCALENDAR', 'MKCOL',
-    'MOVE', 'NOTIFY', 'OPTIONS', 'PATCH', 'POST', 'PROPFIND', 'PROPPATCH',
-    'PURGE', 'PUT', 'REBIND', 'REPORT', 'SEARCH', 'SOURCE', 'SUBSCRIBE',
-    'TRACE', 'UNBIND', 'UNLINK', 'UNLOCK', 'UNSUBSCRIBE',
-] as const;
+export { METHODS } from './constants';
 
 export interface ClientRequestArgs {
     _defaultAgent?: Agent;

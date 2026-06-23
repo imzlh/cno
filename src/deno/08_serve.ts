@@ -10,26 +10,37 @@ import { getResponseInitiatorCallFrames, setResponseInitiatorCallFrames } from '
 import { wrapFsClassDec as wrap, wrapFSns } from "../utils/wrap";
 import { errors } from './01_errors';
 import { getServeHook, captureUserNetworkCallFrames, type NetworkCallFrame } from '../utils/network-hooks';
+import { getTierLimits } from '../utils/memory-tier';
 import type { ISocket } from "@cnojs/http/socket";
 
 const crypto = import.meta.use('crypto');
 const engine = import.meta.use('engine');
 const http = import.meta.use('http');
-const debug = import.meta.use('debug');
+
+const { hookPayloadCap: PAYLOAD_LEN } = getTierLimits();
 
 /* ------------------------------------------------------------------ */
 /* WebSocket Upgrade Symbol                                           */
 /* ------------------------------------------------------------------ */
 
-const websocketSymbol = Symbol('deno.serve.websocket');
+const kWebSocket = Symbol('deno.serve.websocket');
+const kWSMeta = Symbol('deno.serve.websocket.meta');
 let serveRequestSeq = 0;
-const MAX_HOOK_POST_DATA_BYTES = 256 * 1024;
 
 interface WebSocketResponse extends Response {
-    [websocketSymbol]?: (conn: ISocket) => void;
+    [kWebSocket]?: (conn: ISocket) => void;
 }
 
-class ServeResponseWriteError extends Error {}
+class ServeResponseWriteError extends Error { }
+
+type IWSMeta = {
+    source: 'serve';
+    requestId: string;
+    url: string;
+    requestHeaders?: Array<[string, string]>;
+    responseStatus?: number;
+    responseHeaders?: Array<[string, string]>;
+} | undefined;
 
 function serveTs(): number {
     return Date.now() / 1000;
@@ -57,8 +68,8 @@ function headersToRecord(headers: Headers): Record<string, string> {
 
 function truncateHookPostData(body?: Uint8Array | null): Uint8Array | null | undefined {
     if (!body) return body;
-    if (body.byteLength > MAX_HOOK_POST_DATA_BYTES) {
-        return new Uint8Array(body.subarray(0, MAX_HOOK_POST_DATA_BYTES));
+    if (body.byteLength > PAYLOAD_LEN) {
+        return new Uint8Array(body.subarray(0, PAYLOAD_LEN));
     }
     return body;
 }
@@ -112,7 +123,7 @@ class ResponseAdapter {
         const serveHook = getServeHook();
         if (serveHook) try {
             serveHook.onFinished?.({ requestId: this.requestId, success, errorText, timestamp: serveTs() });
-        } catch {}
+        } catch { }
     }
 
     verify(res: Response): void {
@@ -155,7 +166,7 @@ class ResponseAdapter {
 
     async sendResponse(response: Response): Promise<void> {
         const wsResponse = response as WebSocketResponse;
-        if (wsResponse[websocketSymbol]) {
+        if (wsResponse[kWebSocket]) {
             await this.handleWebSocketUpgrade(wsResponse);
             return;
         }
@@ -166,7 +177,7 @@ class ResponseAdapter {
         const hasBody = response.body !== null && !noBodyStatus && !isHead;
         const hasContentLength = headers2.has('content-length');
         const hasTransferEncoding = headers2.has('transfer-encoding');
-        
+
         if (hasBody && !hasContentLength && !hasTransferEncoding) {
             headers2.set('transfer-encoding', 'chunked');
         }
@@ -188,7 +199,7 @@ class ResponseAdapter {
                 headers: headersToRecord(headers2),
                 timestamp: serveTs()
             });
-        } catch {}
+        } catch { }
         await this.coreRes.writeHead(response.status, statusText, headers);
 
         if (hasBody) {
@@ -199,12 +210,16 @@ class ResponseAdapter {
                     if (done) break;
                     if (serveHook) try {
                         serveHook.onData?.({ requestId: this.requestId, data: value, timestamp: serveTs() });
-                    } catch {}
+                    } catch { }
                     await this.coreRes.write(value);
                 }
             } catch (err) {
                 const message = String((err as Error)?.message ?? err);
                 this.emitFinished(false, message);
+                // Propagate downstream cancellation/write failure back to the
+                // upstream body source (for example fetch -> curl), otherwise
+                // the producer keeps downloading after the client has gone away.
+                try { await reader.cancel(err); } catch {}
                 this.coreRes.close();
                 throw new ServeResponseWriteError(message);
             } finally {
@@ -235,15 +250,15 @@ class ResponseAdapter {
                 timestamp: serveTs()
             });
             this.emitFinished(true);
-        } catch {}
+        } catch { }
         await this.coreRes.writeHead(response.status, statusText, headers);
 
         // Upgrade connection
         const conn = this.coreRes.upgrade();
 
         // Execute WebSocket handler
-        if (response[websocketSymbol]) {
-            Reflect.set(conn, '__cnoServerWebSocketMeta', {
+        if (response[kWebSocket]) {
+            Reflect.set(conn, kWSMeta, {
                 source: 'serve',
                 requestId: this.requestId,
                 url: this.url,
@@ -251,8 +266,8 @@ class ResponseAdapter {
                 responseStatus: response.status,
                 responseHeaders: headers,
                 callFrames: this.requestCallFrames,
-            });
-            response[websocketSymbol]!(conn);
+            } as IWSMeta);
+            response[kWebSocket]!(conn);
         }
     }
 }
@@ -407,7 +422,7 @@ function serve(
                         timestamp: requestStartTime,
                     });
                     requestReported = true;
-                } catch {}
+                } catch { }
 
                 const adapter = new ResponseAdapter(res, req.method, requestId, requestUrl, req.headers, requestEntryCallFrames);
                 await adapter.sendResponse(webResponse);
@@ -452,7 +467,7 @@ function serve(
                 } else if (serveHook && requestId) {
                     try {
                         serveHook.onFinished?.({ requestId, success: false, errorText: String((error as Error)?.message ?? error), timestamp: serveTs() });
-                    } catch {}
+                    } catch { }
                 }
             }
         },
@@ -475,7 +490,7 @@ function serve(
     // Handle abort signal
     if (options.signal) {
         options.signal.addEventListener('abort', () => {
-            httpServer.shutdown().catch(() => {});
+            httpServer.shutdown().catch(() => { });
         }, { once: true });
     }
 
@@ -557,7 +572,7 @@ function upgradeWebSocket(
 
     // Attach WebSocket handler
     const ws = createWebSocketFromISocket(conProm.promise);
-    response[websocketSymbol] = c => conProm.resolve(c);
+    response[kWebSocket] = c => conProm.resolve(c);
 
     return {
         response,
@@ -570,14 +585,7 @@ function upgradeWebSocket(
  * This adapts the raw connection to WebSocket protocol
  */
 function createWebSocketFromISocket(conn: Promise<ISocket>): globalThis.WebSocket {
-    const serverMeta = conn.then(c => Reflect.get(c, '__cnoServerWebSocketMeta') as {
-        source: 'serve';
-        requestId: string;
-        url: string;
-        requestHeaders?: Array<[string, string]>;
-        responseStatus?: number;
-        responseHeaders?: Array<[string, string]>;
-    } | undefined);
+    const serverMeta = conn.then(c => Reflect.get(c, kWSMeta) as IWSMeta);
     return createWebSocketFromConnection(
         conn.then(c => ({
             ...c,

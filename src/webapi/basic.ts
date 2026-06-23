@@ -134,11 +134,6 @@ globalThis.reportError = function(e) {
     globalThis.dispatchEvent(event);
 }
 
-// @ts-ignore
-globalThis.WebTransport = function(){
-    throw new Error('Unsupported');
-}
-
 globalThis.close = function(){
     os.exit(0);
 }

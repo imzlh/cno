@@ -6,6 +6,7 @@
 import { EventEmitter } from '../events';
 import { Readable, Writable } from '../stream';
 import type { Stream as StdioStream } from '../../deno/04_stdio';
+import { getTierLimits } from '../../utils/memory-tier';
 
 const os = import.meta.use('os');
 const engine = import.meta.use('engine');
@@ -14,6 +15,8 @@ const proc = import.meta.use('process');
 const streams = import.meta.use('streams');
 const console = import.meta.use('console');
 const { stdin: denoStdin, stdout: denoStdout, stderr: denoStderr } = streams as any as Record<string, StdioStream>;
+
+const { streamHighWaterMark: PROCESS_READ_STREAM_HWM } = getTierLimits();
 
 // ============================================================================
 // Command line arguments
@@ -133,7 +136,7 @@ class ProcessReadStream extends Readable {
     #isRaw: boolean = false;
 
     constructor(stdio: StdioStream) {
-        super({ highWaterMark: 64 * 1024 });
+        super({ highWaterMark: PROCESS_READ_STREAM_HWM });
         this.#stdio = stdio;
         this._read = this.#doRead.bind(this);
     }
@@ -266,9 +269,16 @@ export function cpuUsage(previousValue?: NodeJS.CpuUsage): NodeJS.CpuUsage {
 
 const signalMap: Map<NodeJS.Signals, Map<() => void, CModuleSignals.SignalHandler>> = new Map();
 
-function addSignalListener(signalName: NodeJS.Signals, listener: () => void): void {
-    if (signalName == 'SIGBREAK' || signalName == 'SIGIOT' || signalName == 'SIGPOLL' || signalName == 'SIGSTKFLT' || signalName == 'SIGUNUSED' || signalName == 'SIGLOST' || signalName == 'SIGINFO')
+// Signals that are not supported on this platform
+const UNSUPPORTED_SIGNALS = new Set(['SIGBREAK', 'SIGIOT', 'SIGPOLL', 'SIGSTKFLT', 'SIGUNUSED', 'SIGLOST', 'SIGINFO']);
+
+function throwIfUnsupportedSignal(signalName: NodeJS.Signals): void {
+    if (UNSUPPORTED_SIGNALS.has(signalName))
         throw new Error('The requested signal is not supported.');
+}
+
+function addSignalListener(signalName: NodeJS.Signals, listener: () => void): void {
+    throwIfUnsupportedSignal(signalName);
     const sigint = sig.signals[signalName];
     if (typeof sigint !== 'number') {
         throw new Error(`Invalid signal: ${signalName}`);
@@ -288,8 +298,7 @@ function addSignalListener(signalName: NodeJS.Signals, listener: () => void): vo
 }
 
 function removeSignalListener(signalName: NodeJS.Signals, listener: () => void): void {
-    if (signalName == 'SIGBREAK' || signalName == 'SIGIOT' || signalName == 'SIGPOLL' || signalName == 'SIGSTKFLT' || signalName == 'SIGUNUSED' || signalName == 'SIGLOST' || signalName == 'SIGINFO')
-        throw new Error('The requested signal is not supported.');
+    throwIfUnsupportedSignal(signalName);
     const sigint = sig.signals[signalName];
     if (typeof sigint !== 'number') {
         throw new Error(`Invalid signal: ${signalName}`);
@@ -359,12 +368,19 @@ class ProcessEventEmitter extends EventEmitter {
 
     override once(event: string | symbol, listener: any): this {
         if (typeof event === 'string' && (event.startsWith('SIG') || event.startsWith('sig'))) {
+            // Register with the native signal system using a wrapper that cleans
+            // itself up AND removes the super.once listener to avoid double-fire.
             const onceListener = () => {
-                listener();
                 removeSignalListener(event as NodeJS.Signals, onceListener);
+                // Remove the super.once wrapper so it doesn't fire again
+                super.off(event, wrappedListener);
+                listener();
             };
+            const wrappedListener = onceListener;
             addSignalListener(event as NodeJS.Signals, onceListener);
-            return super.once(event, listener);
+            // Register with super.once only so EventEmitter tracks the listener,
+            // but we intercept via onceListener above and remove it before it fires.
+            return super.once(event, wrappedListener);
         }
         return super.once(event, listener);
     }
@@ -455,8 +471,9 @@ export function chdir(directory: string): void {
 }
 
 export function exit(code?: number): never {
-    processEE.emit('exit', code ?? 0);
-    os.exit(code ?? 0);
+    const exitCode_ = code ?? exitCode ?? 0;
+    processEE.emit('exit', exitCode_);
+    os.exit(exitCode_);
     throw new Error('unreachable');
 }
 
@@ -464,7 +481,7 @@ export let exitCode: number | undefined = undefined;
 
 export const execPath: string = os.exePath;
 
-export const title: string = 'node';
+export let title: string = 'node';
 
 export const version: string = 'v20.0.0';
 export const versions: NodeJS.ProcessVersions = {

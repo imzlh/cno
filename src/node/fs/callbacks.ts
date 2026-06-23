@@ -2,45 +2,15 @@
  * Node.js fs module - callback-style API
  * All async operations support callback functions
  */
-import { toUint8Array, toNodeStat, toNodeDirentAsync, parseFlags, pathToString, splitPathOrFd, describeFd, removeRecursive, mkdirRecursive } from './utils';
+import { toUint8Array, toNodeStat, toNodeDirentAsync, parseFlags, pathToString, splitPathOrFd, describeFd, removeRecursive, mkdirRecursive, modeToNumber, timeToNumber, type PathLike, type TimeLike, type Mode } from './utils';
 import { toErrnoException } from '../_internal/errno';
+import { getTierLimits } from '../_internal/memory';
 
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
 const asfs = import.meta.use('asyncfs');
 
-// ============================================================================
-// Type definitions
-// ============================================================================
-
-type PathLike = string | URL | Buffer;
-type TimeLike = string | number | Date;
-type Mode = number | string;
 type NoParamCallback = (err: NodeJS.ErrnoException | null) => void;
-
-// ============================================================================
-// Helper functions
-// ============================================================================
-
-function callbackify<T>(promise: Promise<T>, callback: (err: NodeJS.ErrnoException | null, result?: T) => void, syscall?: string, path?: string): void {
-    promise.then(
-        result => callback(null, result),
-        err => callback(toErrnoException(err, syscall, path))
-    );
-}
-
-function modeToNumber(mode?: Mode): number | undefined {
-    if (typeof mode === 'string') {
-        return parseInt(mode, 8);
-    }
-    return mode;
-}
-
-function timeToNumber(time: TimeLike): number {
-    if (typeof time === 'number') return time;
-    if (typeof time === 'string') return new Date(time).getTime();
-    return time.getTime();
-}
 
 // ============================================================================
 // File read/write - callback style
@@ -63,7 +33,7 @@ export function readFile(path: PathLike | number, options?: any, callback?: any)
     if ('fd' in target) {
         try {
             const chunks: Uint8Array[] = [];
-            const buf = new Uint8Array(64 * 1024);
+            const buf = new Uint8Array(getTierLimits().readBufSize);
             let bytesRead = 0;
             while ((bytesRead = fs.read(target.fd, buf)) > 0) {
                 chunks.push(buf.slice(0, bytesRead));
@@ -457,7 +427,7 @@ export function symlink(target: PathLike, path: PathLike, type?: any, callback?:
         type = 'file';
     }
 
-    const symlinkType = type === 'dir' ? asfs.SymlinkType.DIR : asfs.SymlinkType.JUNCTION;
+    const symlinkType = type === 'dir' ? asfs.SymlinkType.DIR : type === 'junction' ? asfs.SymlinkType.JUNCTION : 0 as any;
     asfs.symlink(pathToString(target), pathToString(path), symlinkType).then(
         () => callback(null),
         callback

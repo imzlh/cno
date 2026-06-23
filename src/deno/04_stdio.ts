@@ -190,6 +190,7 @@ export class Stream {
     }
 }
 
+// <INJECT> inject stdio to pipe, for node polyfill only
 export const stdin = new Stream(os.STDIN_FILENO, true);
 export const stdout = new Stream(os.STDOUT_FILENO, false);
 export const stderr = new Stream(os.STDERR_FILENO, false);

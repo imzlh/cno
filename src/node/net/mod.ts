@@ -391,6 +391,9 @@ export class Socket extends Duplex {
             this._stream = null;
         }
 
+        // Sync parent Duplex destroyed state
+        this.destroyed = true;
+
         if (error) {
             this.emit('error', error);
         }

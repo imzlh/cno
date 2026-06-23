@@ -3,29 +3,11 @@
  */
 
 const fs = import.meta.use('fs');
-import { toUint8Array, decodeBuffer, toNodeStat, toNodeDirent, parseFlags, pathToString, splitPathOrFd, describeFd, removeRecursiveSync, mkdirRecursiveSync } from './utils';
+import { toUint8Array, decodeBuffer, toNodeStat, toNodeDirent, parseFlags, pathToString, splitPathOrFd, describeFd, removeRecursiveSync, mkdirRecursiveSync, modeToNumber, timeToNumber, readFileFromFdSync, type PathLike, type TimeLike, type Mode } from './utils';
 import { wrapSync } from '../_internal/errno';
+import { getTierLimits } from '../../utils/memory-tier';
 
-// ============================================================================
-// Type definitions
-// ============================================================================
-
-type PathLike = string | URL | Buffer;
-type TimeLike = string | number | Date;
-type Mode = number | string;
-
-function modeToNumber(mode?: Mode): number | undefined {
-    if (typeof mode === 'string') {
-        return parseInt(mode, 8);
-    }
-    return mode;
-}
-
-function timeToNumber(time: TimeLike): number {
-    if (typeof time === 'number') return time;
-    if (typeof time === 'string') return new Date(time).getTime();
-    return time.getTime();
-}
+const { readBufSize: READ_BUF_SIZE } = getTierLimits();
 
 // ============================================================================
 // File read/write
@@ -37,7 +19,7 @@ export function readFileSync(path: PathLike | number, options?: { encoding?: Buf
     const buffer = 'fd' in target
         ? wrapSync(() => {
             const chunks: Uint8Array[] = [];
-            const buf = new Uint8Array(64 * 1024);
+            const buf = new Uint8Array(READ_BUF_SIZE);
             let bytesRead = 0;
             while ((bytesRead = fs.read(target.fd, buf)) > 0) {
                 chunks.push(buf.slice(0, bytesRead));
@@ -270,7 +252,8 @@ export function readlinkSync(path: PathLike, options?: { encoding?: BufferEncodi
     const pathStr = pathToString(path);
     const result = wrapSync(() => fs.readlink(pathStr), 'readlinkSync', pathStr);
     const encoding = typeof options === 'string' ? options : options?.encoding;
-    return encoding ? result : result;
+    if (encoding === 'buffer') return new TextEncoder().encode(result);
+    return result;
 }
 
 export function realpathSync(path: PathLike, options?: { encoding?: BufferEncoding | 'buffer' } | BufferEncoding): string {

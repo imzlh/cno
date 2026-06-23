@@ -12,6 +12,9 @@ const text = import.meta.use('text');
 import { IPCChannel } from '../ipc_channel';
 import { EventEmitter } from '../events';
 import { Writable, Readable } from '../stream';
+import { getTierLimits } from '../../utils/memory-tier';
+
+const { readBufSize: READ_BUF_SIZE } = getTierLimits();
 
 // ============================================================================
 // Type definitions
@@ -153,7 +156,7 @@ class ChildProcessImpl extends EventEmitter implements ChildProcess {
     private _createReadable(pipe: CModuleStreams.Pipe): Readable {
         const readable = new Readable({
             async read(size) {
-                const chunkSize = size || 65536;
+                const chunkSize = size || READ_BUF_SIZE;
                 const buf = new Uint8Array(chunkSize);
 
                 try {
@@ -360,6 +363,8 @@ export function spawn(command: string, argsOrOptions?: string[] | SpawnOptions, 
                 child.kill(opts.killSignal as string || 'SIGTERM');
             }
         }, opts.timeout);
+        // Clear the timer when the child exits to prevent leaks
+        child.on('close', () => clearTimeout(tid));
     }
 
     return child;
@@ -391,6 +396,17 @@ export function exec(command: string, optionsOrCallback?: ExecOptions | ((error:
         stdio: 'pipe',
     });
 
+    collectOutput(child, cb, `Command failed: ${command}`);
+
+    return child;
+}
+
+// Helper: collect stdout/stderr from a child process and invoke callback
+function collectOutput(
+    child: ChildProcess,
+    cb: ((err: Error | null, stdout: string, stderr: string) => void) | undefined,
+    errorPrefix: string,
+): void {
     let stdout = '';
     let stderr = '';
 
@@ -408,12 +424,10 @@ export function exec(command: string, optionsOrCallback?: ExecOptions | ((error:
 
     child.on('close', (code) => {
         if (cb) {
-            const error = code !== 0 ? new Error(`Command failed: ${command}\n${stderr}`) : null;
+            const error = code !== 0 ? new Error(`${errorPrefix}\n${stderr}`) : null;
             cb(error, stdout, stderr);
         }
     });
-
-    return child;
 }
 
 // ============================================================================
@@ -459,27 +473,7 @@ export function execFile(
         stdio: 'pipe',
     });
 
-    let stdout = '';
-    let stderr = '';
-
-    if (child.stdout) {
-        child.stdout.on('data', (chunk) => {
-            stdout += chunk.toString();
-        });
-    }
-
-    if (child.stderr) {
-        child.stderr.on('data', (chunk) => {
-            stderr += chunk.toString();
-        });
-    }
-
-    child.on('close', (code) => {
-        if (cb) {
-            const error = code !== 0 ? new Error(`Command failed: ${file}\n${stderr}`) : null;
-            cb(error, stdout, stderr);
-        }
-    });
+    collectOutput(child, cb, `Command failed: ${file}`);
 
     return child;
 }
@@ -491,7 +485,7 @@ export function execFile(
 export function fork(modulePath: string, args?: string[], options?: SpawnOptions): ChildProcess {
     const forkArgs = args ?? [];
     // Fork automatically sets up IPC channel
-    return spawn(process.execPath, [modulePath, ...forkArgs], {
+    return spawn(os.exePath, [modulePath, ...forkArgs], {
         ...options,
         // @ts-ignore - fork always uses ipc
         stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
@@ -574,8 +568,11 @@ export function spawnSync(command: string, args?: string[], options?: SpawnOptio
 }
 
 export function execSync(command: string, options?: ExecOptions): Buffer | string {
-    const defaultShell = os.uname().sysname === 'Windows_NT' ? 'cmd.exe' : '/bin/sh';
-    const result = spawnSync(defaultShell, ['-c', command], options);
+    const isWindows = os.uname().sysname === 'Windows_NT';
+    const defaultShell = isWindows ? 'cmd.exe' : '/bin/sh';
+    const shellArg = isWindows ? '/c' : '-c';
+    const { encoding, maxBuffer, ...spawnOpts } = options ?? {} as any;
+    const result = spawnSync(defaultShell, [shellArg, command], spawnOpts as SpawnOptions);
     if (result.error) throw result.error;
     if (result.status !== 0) {
         throw new Error(`Command failed: ${command}`);

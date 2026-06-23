@@ -3,201 +3,14 @@
  * Based on CModuleCrypto implementation
  */
 
-const engine = import.meta.use('engine');
 const crypto = import.meta.use('crypto');
 
-// ============================================================================
-// Type interfaces (simplified, compatible with Node.js crypto API)
-// ============================================================================
+// Re-export types from types.ts
+export type { BinaryInput, Hash, Hmac, Cipheriv, Decipheriv, CipherGCM, DecipherGCM, GcmEncryptResult, GcmDecryptResult, Sign, Verify } from './types';
+import type { BinaryInput, Hash, Hmac, Cipheriv, Decipheriv, CipherGCM, DecipherGCM, GcmEncryptResult, GcmDecryptResult, Sign, Verify } from './types';
 
-type BinaryInput = ArrayBuffer | Uint8Array | string;
-
-export interface Hash {
-    update(input: BinaryInput, encoding?: string): Hash;
-    digest(encoding?: string): ArrayBuffer | string;
-}
-
-export interface Hmac {
-    update(input: BinaryInput, encoding?: string): Hmac;
-    digest(encoding?: string): ArrayBuffer | string;
-}
-
-export interface Cipheriv {
-    update(data: BinaryInput, inputEncoding?: string, outputEncoding?: string): ArrayBuffer | string;
-    final(outputEncoding?: string): ArrayBuffer | string;
-}
-
-export interface Decipheriv {
-    update(data: BinaryInput, inputEncoding?: string, outputEncoding?: string): ArrayBuffer | string;
-    final(outputEncoding?: string): ArrayBuffer | string;
-}
-
-export interface CipherGCM {
-    setAAD(aad: ArrayBuffer | Uint8Array): CipherGCM;
-    update(data: BinaryInput, inputEncoding?: string, outputEncoding?: string): ArrayBuffer | string;
-    final(outputEncoding?: string): ArrayBuffer | string;
-    getAuthTag(): ArrayBuffer;
-}
-
-export interface DecipherGCM {
-    setAAD(aad: ArrayBuffer | Uint8Array): DecipherGCM;
-    setAuthTag(tag: ArrayBuffer | Uint8Array): DecipherGCM;
-    update(data: BinaryInput, inputEncoding?: string, outputEncoding?: string): ArrayBuffer | string;
-    final(outputEncoding?: string): ArrayBuffer | string;
-}
-
-export interface GcmEncryptResult {
-    ciphertext: ArrayBuffer;
-    tag: ArrayBuffer;
-}
-
-export interface GcmDecryptResult {
-    plaintext: ArrayBuffer;
-    verified: boolean;
-}
-
-export interface Sign {
-    update(input: BinaryInput, encoding?: string): Sign;
-    sign(privateKey: ArrayBuffer | Uint8Array, outputEncoding?: string): ArrayBuffer | string;
-}
-
-export interface Verify {
-    update(input: BinaryInput, encoding?: string): Verify;
-    verify(publicKey: ArrayBuffer | Uint8Array, signature: ArrayBuffer | Uint8Array, signatureEncoding?: string): boolean;
-}
-
-// ============================================================================
-// Helper functions
-// ============================================================================
-
-function toBuffer(data: ArrayBuffer | Uint8Array | string, encoding: string = 'utf8'): Uint8Array {
-    if (typeof data === 'string') {
-        if (encoding === 'hex') return new Uint8Array(crypto.hexDecode(data));
-        if (encoding === 'base64') return new Uint8Array(crypto.base64Decode(data));
-        if (encoding === 'base64url') return new Uint8Array(crypto.base64Decode(data.replace(/-/g, '+').replace(/_/g, '/') + '=='.slice(0, (4 - data.length % 4) % 4)));
-        if (encoding === 'latin1' || encoding === 'ascii' || encoding === 'binary') {
-            const buf = new Uint8Array(data.length);
-            for (let i = 0; i < data.length; i++) buf[i] = data.charCodeAt(i);
-            return buf;
-        }
-        return engine.encodeString(data);
-    }
-    if (data instanceof ArrayBuffer) {
-        return new Uint8Array(data);
-    }
-    return data;
-}
-
-function encodeOutput(data: ArrayBuffer, encoding?: string): ArrayBuffer | string {
-    if (!encoding) return data;
-    if (encoding === 'hex') return crypto.hexEncode(data);
-    if (encoding === 'base64') return crypto.base64Encode(data);
-    if (encoding === 'base64url') {
-        const b64 = crypto.base64Encode(data) as string;
-        return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-    }
-    return data;
-}
-
-function concatBuffers(chunks: Uint8Array[]): Uint8Array {
-    const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-    const out = new Uint8Array(total);
-    let offset = 0;
-    for (const chunk of chunks) {
-        out.set(chunk, offset);
-        offset += chunk.length;
-    }
-    return out;
-}
-
-function createBufferedCipher(
-    transform: (data: Uint8Array) => ArrayBuffer,
-): Cipheriv {
-    const chunks: Uint8Array[] = [];
-    return {
-        update(data: BinaryInput, inputEncoding?: string, outputEncoding?: string) {
-            chunks.push(toBuffer(data, inputEncoding));
-            return encodeOutput(new ArrayBuffer(0), outputEncoding);
-        },
-        final(outputEncoding?: string) {
-            return encodeOutput(transform(concatBuffers(chunks)), outputEncoding);
-        },
-    };
-}
-
-function createBufferedDecipher(
-    transform: (data: Uint8Array) => ArrayBuffer,
-): Decipheriv {
-    const chunks: Uint8Array[] = [];
-    return {
-        update(data: BinaryInput, inputEncoding?: string, outputEncoding?: string) {
-            chunks.push(toBuffer(data, inputEncoding));
-            return encodeOutput(new ArrayBuffer(0), outputEncoding);
-        },
-        final(outputEncoding?: string) {
-            return encodeOutput(transform(concatBuffers(chunks)), outputEncoding);
-        },
-    };
-}
-
-function isGcmAlgorithm(algorithm: string): boolean {
-    const a = algorithm.toLowerCase();
-    return a === 'aes-128-gcm' || a === 'aes-192-gcm' || a === 'aes-256-gcm';
-}
-
-function normalizeHashAlgorithm(algorithm: string): string {
-    return algorithm.toLowerCase().replace(/-/g, '');
-}
-
-function oneShotHmac(algorithm: string, key: Uint8Array, data: Uint8Array): ArrayBuffer {
-    switch (normalizeHashAlgorithm(algorithm)) {
-        case 'md5':
-            return crypto.hmacMd5(key, data);
-        case 'sha1':
-            return crypto.hmacSha1(key, data);
-        case 'sha256':
-            return crypto.hmacSha256(key, data);
-        case 'sha512':
-            return crypto.hmacSha512(key, data);
-        default:
-            throw new Error(`Unsupported HMAC algorithm: ${algorithm}`);
-    }
-}
-
-function createOneShotHmac(algorithm: string, key: Uint8Array): Hmac {
-    const chunks: Uint8Array[] = [];
-    return {
-        update(input: BinaryInput, encoding?: string) {
-            chunks.push(toBuffer(input, encoding));
-            return this;
-        },
-        digest(encoding?: string) {
-            const result = oneShotHmac(algorithm, key, concatBuffers(chunks));
-            return encodeOutput(result, encoding);
-        },
-    };
-}
-
-function readAsymmetricCipherArgs(
-    keyOrOptions: ArrayBuffer | Uint8Array | { key: ArrayBuffer | Uint8Array; oaepHash?: string; oaepLabel?: ArrayBuffer | Uint8Array },
-    data: ArrayBuffer | Uint8Array,
-) {
-    if (keyOrOptions instanceof ArrayBuffer || keyOrOptions instanceof Uint8Array) {
-        return {
-            key: toBuffer(keyOrOptions),
-            data: toBuffer(data),
-            oaepHash: 'sha256',
-            oaepLabel: undefined as Uint8Array | undefined,
-        };
-    }
-
-    return {
-        key: toBuffer(keyOrOptions.key),
-        data: toBuffer(data),
-        oaepHash: keyOrOptions.oaepHash?.toLowerCase() || 'sha256',
-        oaepLabel: keyOrOptions.oaepLabel ? toBuffer(keyOrOptions.oaepLabel) : undefined,
-    };
-}
+// Import helpers from helpers.ts
+import { toBuffer, encodeOutput, concatBuffers, createBufferedCipher, createBufferedDecipher, isGcmAlgorithm, normalizeHashAlgorithm, oneShotHmac, createOneShotHmac, readAsymmetricCipherArgs } from './helpers';
 
 // ============================================================================
 // createHash
@@ -424,38 +237,8 @@ export function createCipheriv(algorithm: string, key: ArrayBuffer | Uint8Array,
         return createCipherivGCM(a, keyBuf, ivBuf) as unknown as Cipheriv;
     }
 
-    // CBC: use streaming cipher so we can honour setAutoPadding().
-    // The `Raw` variants (no PKCS7 padding) are swapped in when padding is disabled.
-    let cipherObj: CModuleCrypto.Cipher | null = null;
-    let autoPadding = true;
-
-    const makeCipher = (withPadding: boolean) => {
-        if (a === 'aes-128-cbc') {
-            // aes-128 only has buffered one-shot in C; re-create via raw variant when needed.
-            if (!withPadding) {
-                const chunks: Uint8Array[] = [];
-                const obj = {
-                    update(data: BinaryInput, inputEncoding?: string, outputEncoding?: string) {
-                        chunks.push(toBuffer(data, inputEncoding));
-                        return encodeOutput(new ArrayBuffer(0), outputEncoding);
-                    },
-                    final(outputEncoding?: string) {
-                        return encodeOutput(crypto.aes128CbcEncryptRaw(keyBuf, ivBuf, concatBuffers(chunks)), outputEncoding);
-                    },
-                    setAutoPadding(_: boolean) { /* already locked */ },
-                };
-                return obj as unknown as Cipheriv;
-            }
-            return createBufferedCipher((data) => crypto.aes128CbcEncrypt(keyBuf, ivBuf, data));
-        }
-        if (a === 'aes-192-cbc') {
-            return withPadding ? crypto.createCipherAes192Cbc(keyBuf, ivBuf) : crypto.createCipherAes192CbcRaw(keyBuf, ivBuf);
-        }
-        if (a === 'aes-256-cbc') {
-            return withPadding ? crypto.createCipherAes256Cbc(keyBuf, ivBuf) : crypto.createCipherAes256CbcRaw(keyBuf, ivBuf);
-        }
-        return null;
-    };
+    // CBC: use one-shot functions so setAutoPadding() is a simple flag toggle
+    // and never needs to recreate the cipher mid-stream (which would discard data).
 
     if (a === 'aes-128-cbc') {
         // aes-128 path is handled fully above via buffered helpers
@@ -475,21 +258,22 @@ export function createCipheriv(algorithm: string, key: ArrayBuffer | Uint8Array,
         return obj as unknown as Cipheriv;
     }
 
-    cipherObj = makeCipher(true) as unknown as CModuleCrypto.Cipher;
+    // CBC: buffer all chunks and encrypt at final() so setAutoPadding() never
+    // needs to recreate the cipher mid-stream (which would discard buffered data).
+    let autoPadding = true;
+    const chunks: Uint8Array[] = [];
     const result = {
         update(data: BinaryInput, inputEncoding?: string, outputEncoding?: string) {
-            if (!cipherObj) return encodeOutput(new ArrayBuffer(0), outputEncoding);
-            return encodeOutput(cipherObj.update(toBuffer(data, inputEncoding)), outputEncoding);
+            chunks.push(toBuffer(data, inputEncoding));
+            return encodeOutput(new ArrayBuffer(0), outputEncoding);
         },
         final(outputEncoding?: string) {
-            if (!cipherObj) return encodeOutput(new ArrayBuffer(0), outputEncoding);
-            return encodeOutput(cipherObj.final(), outputEncoding);
+            const cipher = autoPadding
+                ? (a === 'aes-192-cbc' ? crypto.aes192CbcEncrypt : crypto.aes256CbcEncrypt)
+                : (a === 'aes-192-cbc' ? crypto.aes192CbcEncryptRaw : crypto.aes256CbcEncryptRaw);
+            return encodeOutput(cipher(keyBuf, ivBuf, concatBuffers(chunks)), outputEncoding);
         },
-        setAutoPadding(v: boolean) {
-            if (v === autoPadding) return;
-            autoPadding = v;
-            cipherObj = makeCipher(v) as unknown as CModuleCrypto.Cipher;
-        },
+        setAutoPadding(v: boolean) { autoPadding = v; },
     };
     if (a !== 'aes-192-cbc' && a !== 'aes-256-cbc') throw new Error(`Unsupported cipher algorithm: ${algorithm}`);
     return result as unknown as Cipheriv;
@@ -520,29 +304,24 @@ export function createDecipheriv(algorithm: string, key: ArrayBuffer | Uint8Arra
         } as unknown as Decipheriv;
     }
 
-    const makeDecipher = (withPadding: boolean): CModuleCrypto.Cipher => {
-        if (a === 'aes-192-cbc')
-            return withPadding ? crypto.createDecipherAes192Cbc(keyBuf, ivBuf) : crypto.createDecipherAes192CbcRaw(keyBuf, ivBuf);
-        // aes-256-cbc
-        return withPadding ? crypto.createDecipherAes256Cbc(keyBuf, ivBuf) : crypto.createDecipherAes256CbcRaw(keyBuf, ivBuf);
-    };
-
     if (a !== 'aes-192-cbc' && a !== 'aes-256-cbc') throw new Error(`Unsupported cipher algorithm: ${algorithm}`);
 
+    // CBC: buffer all chunks and decrypt at final() so setAutoPadding() never
+    // needs to recreate the decipher mid-stream (which would discard buffered data).
     let autoPadding = true;
-    let decipherObj = makeDecipher(true);
+    const chunks: Uint8Array[] = [];
     return {
         update(data: BinaryInput, inputEncoding?: string, outputEncoding?: string) {
-            return encodeOutput(decipherObj.update(toBuffer(data, inputEncoding)), outputEncoding);
+            chunks.push(toBuffer(data, inputEncoding));
+            return encodeOutput(new ArrayBuffer(0), outputEncoding);
         },
         final(outputEncoding?: string) {
-            return encodeOutput(decipherObj.final(), outputEncoding);
+            const decipher = autoPadding
+                ? (a === 'aes-192-cbc' ? crypto.aes192CbcDecrypt : crypto.aes256CbcDecrypt)
+                : (a === 'aes-192-cbc' ? crypto.aes192CbcDecryptRaw : crypto.aes256CbcDecryptRaw);
+            return encodeOutput(decipher(keyBuf, ivBuf, concatBuffers(chunks)), outputEncoding);
         },
-        setAutoPadding(v: boolean) {
-            if (v === autoPadding) return;
-            autoPadding = v;
-            decipherObj = makeDecipher(v);
-        },
+        setAutoPadding(v: boolean) { autoPadding = v; },
     } as unknown as Decipheriv;
 }
 
@@ -792,164 +571,8 @@ export function randomBytes(size: number, callback?: (err: Error | null, buf: Ui
     }
     return new Uint8Array(crypto.randomBytes(size));
 }
-
-// ============================================================================
-// randomInt / randomFill
-// ============================================================================
-
-export function randomInt(max: number): number;
-export function randomInt(min: number, max: number): number;
-export function randomInt(min: number, max?: number, callback?: (err: Error | null, n: number) => void): number | void {
-    if (max === undefined) {
-        max = min;
-        min = 0;
-    }
-
-    const range = max - min;
-    const bytes = new Uint8Array(crypto.randomBytes(4));
-    const value = (bytes[0] << 24) | (bytes[1] << 16) | (bytes[2] << 8) | bytes[3];
-    const result = min + (Math.abs(value) % range);
-
-    if (callback) {
-        callback(null, result);
-        return;
-    }
-    return result;
-}
-
-export function randomFill<T extends ArrayBufferView>(buffer: T, callback: (err: Error | null, buf: T) => void): void;
-export function randomFill<T extends ArrayBufferView>(buffer: T, offset: number, callback: (err: Error | null, buf: T) => void): void;
-export function randomFill<T extends ArrayBufferView>(buffer: T, offset: number, size: number, callback: (err: Error | null, buf: T) => void): void;
-export function randomFill<T extends ArrayBufferView>(buffer: T, offset?: number | ((err: Error | null, buf: T) => void), size?: number | ((err: Error | null, buf: T) => void), callback?: (err: Error | null, buf: T) => void): void {
-    if (typeof offset === 'function') {
-        callback = offset;
-        offset = 0;
-        size = buffer.byteLength;
-    } else if (typeof size === 'function') {
-        callback = size;
-        size = buffer.byteLength - (offset as number);
-    }
-
-    const off = offset as number;
-    const sz = size as number;
-    const cb = callback!;
-
-    try {
-        const randomData = new Uint8Array(crypto.randomBytes(sz));
-        const view = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
-        for (let i = 0; i < sz; i++) {
-            view[off + i] = randomData[i];
-        }
-        cb(null, buffer);
-    } catch (err) {
-        cb(err as Error, buffer);
-    }
-}
-
-// ============================================================================
-// pbkdf2
-// ============================================================================
-
-export function pbkdf2(password: ArrayBuffer | Uint8Array | string, salt: ArrayBuffer | Uint8Array | string, iterations: number, keylen: number, digest: string, callback: (err: Error | null, derivedKey: Uint8Array) => void): void {
-    try {
-        const passwordBuf = toBuffer(password);
-        const saltBuf = toBuffer(salt);
-        let result: ArrayBuffer;
-
-        switch (digest.toLowerCase()) {
-            case 'sha256':
-                result = crypto.pbkdf2Sha256(passwordBuf, saltBuf, iterations, keylen);
-                break;
-            case 'sha512':
-                result = crypto.pbkdf2Sha512(passwordBuf, saltBuf, iterations, keylen);
-                break;
-            default:
-                throw new Error(`Unsupported digest: ${digest}`);
-        }
-
-        callback(null, new Uint8Array(result));
-    } catch (err) {
-        callback(err as Error, new Uint8Array(0));
-    }
-}
-
-export function pbkdf2Sync(password: ArrayBuffer | Uint8Array | string, salt: ArrayBuffer | Uint8Array | string, iterations: number, keylen: number, digest: string): Uint8Array {
-    const passwordBuf = toBuffer(password);
-    const saltBuf = toBuffer(salt);
-    let result: ArrayBuffer;
-
-    switch (digest.toLowerCase()) {
-        case 'sha256':
-            result = crypto.pbkdf2Sha256(passwordBuf, saltBuf, iterations, keylen);
-            break;
-        case 'sha512':
-            result = crypto.pbkdf2Sha512(passwordBuf, saltBuf, iterations, keylen);
-            break;
-        default:
-            throw new Error(`Unsupported digest: ${digest}`);
-    }
-
-    return new Uint8Array(result);
-}
-
-export function pbkdf2Sha256(
-    password: ArrayBuffer | Uint8Array | string,
-    salt: ArrayBuffer | Uint8Array | string,
-    iterations: number,
-    keylen: number,
-): ArrayBuffer {
-    return crypto.pbkdf2Sha256(toBuffer(password), toBuffer(salt), iterations, keylen);
-}
-
-export function pbkdf2Sha512(
-    password: ArrayBuffer | Uint8Array | string,
-    salt: ArrayBuffer | Uint8Array | string,
-    iterations: number,
-    keylen: number,
-): ArrayBuffer {
-    return crypto.pbkdf2Sha512(toBuffer(password), toBuffer(salt), iterations, keylen);
-}
-
-// ============================================================================
-// hkdf
-// ============================================================================
-
-export function hkdf(digest: string, ikm: ArrayBuffer | Uint8Array, salt: ArrayBuffer | Uint8Array, info: ArrayBuffer | Uint8Array, keylen: number): ArrayBuffer {
-    const ikmBuf = toBuffer(ikm);
-    const saltBuf = salt ? toBuffer(salt) : undefined;
-    const infoBuf = info ? toBuffer(info) : undefined;
-
-    switch (digest.toLowerCase()) {
-        case 'sha256':
-            return crypto.hkdfSha256(ikmBuf, keylen, saltBuf, infoBuf);
-        case 'sha512':
-            return crypto.hkdfSha512(ikmBuf, keylen, saltBuf, infoBuf);
-        default:
-            throw new Error(`Unsupported digest: ${digest}`);
-    }
-}
-
-export function hkdfSync(digest: string, ikm: ArrayBuffer | Uint8Array, salt: ArrayBuffer | Uint8Array, info: ArrayBuffer | Uint8Array, keylen: number): ArrayBuffer {
-    return hkdf(digest, ikm, salt, info, keylen);
-}
-
-export function hkdfSha256(
-    ikm: ArrayBuffer | Uint8Array | string,
-    keylen: number,
-    salt?: ArrayBuffer | Uint8Array | string,
-    info?: ArrayBuffer | Uint8Array | string,
-): ArrayBuffer {
-    return crypto.hkdfSha256(toBuffer(ikm), keylen, salt ? toBuffer(salt) : undefined, info ? toBuffer(info) : undefined);
-}
-
-export function hkdfSha512(
-    ikm: ArrayBuffer | Uint8Array | string,
-    keylen: number,
-    salt?: ArrayBuffer | Uint8Array | string,
-    info?: ArrayBuffer | Uint8Array | string,
-): ArrayBuffer {
-    return crypto.hkdfSha512(toBuffer(ikm), keylen, salt ? toBuffer(salt) : undefined, info ? toBuffer(info) : undefined);
-}
+// Re-export random/kdf/hkdf from random.ts
+export { randomInt, randomFill, pbkdf2, pbkdf2Sync, pbkdf2Sha256, pbkdf2Sha512, hkdf, hkdfSync, hkdfSha256, hkdfSha512 } from './random';
 
 // ============================================================================
 // RSA

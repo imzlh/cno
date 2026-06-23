@@ -40,33 +40,64 @@ export interface PipeOptions {
 
 export class Stream extends EventEmitter {
     destroyed: boolean = false;
+    // Track piped destinations for unpipe() support
+    private _pipedDestinations: Writable[] = [];
 
     pipe<T extends Writable>(destination: T, options?: PipeOptions): T {
         const src = this as any;
         let drained = true;
-        this.on('data', (chunk) => {
+
+        // Track this destination for unpipe()
+        this._pipedDestinations.push(destination);
+
+        const onData = (chunk: any) => {
             if (!destination.write(chunk)) {
                 drained = false;
                 src.pause?.();
             }
-        });
+        };
 
-        destination.on('drain', () => {
+        const onDrain = () => {
             if (!drained) {
                 drained = true;
                 src.resume?.();
             }
-        });
+        };
 
-        if (options?.end !== false) {
-            this.on('end', () => {
+        const onEnd = () => {
+            if (options?.end !== false) {
                 destination.end();
-            });
-        }
+            }
+        };
 
-        this.on('error', (err) => {
+        const onError = (err: Error) => {
             destination.emit('error', err);
-        });
+        };
+
+        const onClose = () => {
+            if (!destination.destroyed) destination.destroy();
+        };
+
+        const onDestClose = () => {
+            if (!src.destroyed) src.pause?.();
+        };
+
+        this.on('data', onData);
+        destination.on('drain', onDrain);
+        this.on('end', onEnd);
+        this.on('error', onError);
+        this.on('close', onClose);
+        destination.on('close', onDestClose);
+
+        // Cleanup function for unpipe
+        (destination as any).__pipeCleanup = () => {
+            this.removeListener('data', onData);
+            destination.removeListener('drain', onDrain);
+            this.removeListener('end', onEnd);
+            this.removeListener('error', onError);
+            this.removeListener('close', onClose);
+            destination.removeListener('close', onDestClose);
+        };
 
         return destination;
     }
@@ -248,15 +279,18 @@ export class Readable extends Stream {
     }
 
     unpipe(destination?: Writable): this {
-        // Best-effort: remove from internal pipe list if present
-        const state = this._readableState as any;
-        if (state.pipes) {
-            if (destination) {
-                const idx = state.pipes.indexOf(destination);
-                if (idx !== -1) state.pipes.splice(idx, 1);
-            } else {
-                state.pipes = [];
+        const destinations = destination ? [destination] : [...this._pipedDestinations];
+        for (const dest of destinations) {
+            // Call the cleanup function set by pipe()
+            const cleanup = (dest as any).__pipeCleanup;
+            if (typeof cleanup === 'function') {
+                cleanup();
+                delete (dest as any).__pipeCleanup;
             }
+            const idx = this._pipedDestinations.indexOf(dest);
+            if (idx !== -1) this._pipedDestinations.splice(idx, 1);
+        }
+        return this;
         }
         return this;
     }
@@ -309,9 +343,9 @@ export class Readable extends Stream {
 
         if (state.flowing) {
             this.emit('data', chunk);
-            // Keep reading if still flowing
             queueMicrotask(() => this._readAndResolve());
-            return false;
+            // Return true if buffer is below high water mark (producer can keep sending)
+            return state.buffer.length < state.highWaterMark;
         }
 
         state.buffer.push(chunk);

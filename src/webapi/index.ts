@@ -24,38 +24,22 @@ Object.defineProperties(globalThis, {
     }
 });
 
-// console with format support
-await import('./console');
+await Promise.all([
+    import('./console'),
+    import('./basic'),
+    import('./events'),
+]);
 
-// basic
-await import('./basic');
-
-// events
-await import('./events');
-
-// web streams polyfill
-await import('./streams');
-
-// URL polyfill
-await import('./url');
-
-// URLPattern polyfill
-// @ts-ignore
-await import('urlpattern-polyfill');
+await Promise.all([
+    import('./streams'),
+    import('./url'),
+    import('./formdata'),
+    // @ts-ignore
+    import('urlpattern-polyfill'),
+]);
 
 // navigator
 await import('./navigator');
-
-// @ts-ignore
-// const stream = await import('web-streams-polyfill');
-// for (const key in stream) {
-//     if (key === 'default') continue;
-//     // @ts-ignore
-//     Reflect.set(globalThis, key, stream[key]);
-// }
-
-// formdata, blob, etc
-await import('./formdata');
 
 // abort-signal polyfill
 await import('./abort');
@@ -69,7 +53,7 @@ Reflect.set(globalThis, 'addEventListener', globalEvent.addEventListener.bind(gl
 Reflect.set(globalThis,'removeEventListener', globalEvent.removeEventListener.bind(globalEvent));
 Reflect.set(globalThis, 'dispatchEvent', globalEvent.dispatchEvent.bind(globalEvent));
 
-// brigde cjs event
+// bridge cjs event
 onEvent((eventName, eventData) => {
     let event;
     switch (eventName) {
@@ -99,9 +83,6 @@ onEvent((eventName, eventData) => {
     if (event.defaultPrevented) return true;
     return false;
 });
-
-// formdata, blob, etc
-await import('./formdata');
 
 // worker
 await import('./worker');
