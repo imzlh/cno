@@ -131,7 +131,7 @@ export async function performFetch(request: Request, url: URL): Promise<Response
     curl.setUrl(url.href)
         .setMethod(request.method)
         .setHeaders(objHeaders);
-    curl.setOptByName('AUTOREFERER', 1);  // update Referer to the Location URL on each redirect hop
+    curl.setOpt(curlMod.CURLOPT_AUTOREFERER, 1);  // update Referer to the Location URL on each redirect hop
     curl.setAcceptEncoding(acceptEncoding);
 
     // redirect mode
@@ -148,7 +148,7 @@ export async function performFetch(request: Request, url: URL): Promise<Response
         curl.setUploadFile(preparedBody.path);
         if (request.method === 'POST') {
             curl.setMethod('POST');
-            curl.setOptByName('POSTFIELDSIZE_LARGE', preparedBody.size);
+            curl.setOpt(curlMod.CURLOPT_POSTFIELDSIZE_LARGE, preparedBody.size);
         } else if (request.method !== 'PUT') {
             curl.setMethod(request.method);
         }
