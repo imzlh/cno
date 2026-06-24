@@ -279,7 +279,7 @@ function throwIfUnsupportedSignal(signalName: NodeJS.Signals): void {
 
 function addSignalListener(signalName: NodeJS.Signals, listener: () => void): void {
     throwIfUnsupportedSignal(signalName);
-    const sigint = sig.signals[signalName];
+    const sigint = (sig.signals as any)[signalName];
     if (typeof sigint !== 'number') {
         throw new Error(`Invalid signal: ${signalName}`);
     }
@@ -299,7 +299,7 @@ function addSignalListener(signalName: NodeJS.Signals, listener: () => void): vo
 
 function removeSignalListener(signalName: NodeJS.Signals, listener: () => void): void {
     throwIfUnsupportedSignal(signalName);
-    const sigint = sig.signals[signalName];
+    const sigint = (sig.signals as any)[signalName];
     if (typeof sigint !== 'number') {
         throw new Error(`Invalid signal: ${signalName}`);
     }

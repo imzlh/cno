@@ -41,7 +41,7 @@ export interface PipeOptions {
 export class Stream extends EventEmitter {
     destroyed: boolean = false;
     // Track piped destinations for unpipe() support
-    private _pipedDestinations: Writable[] = [];
+    protected _pipedDestinations: Writable[] = [];
 
     pipe<T extends Writable>(destination: T, options?: PipeOptions): T {
         const src = this as any;
@@ -289,8 +289,6 @@ export class Readable extends Stream {
             }
             const idx = this._pipedDestinations.indexOf(dest);
             if (idx !== -1) this._pipedDestinations.splice(idx, 1);
-        }
-        return this;
         }
         return this;
     }

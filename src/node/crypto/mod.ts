@@ -318,7 +318,7 @@ export function createDecipheriv(algorithm: string, key: ArrayBuffer | Uint8Arra
         final(outputEncoding?: string) {
             const decipher = autoPadding
                 ? (a === 'aes-192-cbc' ? crypto.aes192CbcDecrypt : crypto.aes256CbcDecrypt)
-                : (a === 'aes-192-cbc' ? crypto.aes192CbcDecryptRaw : crypto.aes256CbcDecryptRaw);
+                : (a === 'aes-192-cbc' ? crypto.aes192CbcDecryptRaw : (crypto as any).aes256CbcDecryptRaw);
             return encodeOutput(decipher(keyBuf, ivBuf, concatBuffers(chunks)), outputEncoding);
         },
         setAutoPadding(v: boolean) { autoPadding = v; },

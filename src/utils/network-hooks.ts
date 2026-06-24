@@ -18,6 +18,13 @@ export function getUserAgentOverride(): string | null { return _userAgentOverrid
 export function setExtraHTTPHeaders(headers: Record<string, string>): void { _extraHTTPHeaders = headers; }
 export function getExtraHTTPHeaders(): Record<string, string> { return _extraHTTPHeaders; }
 
+// ---- CurlInit hook (applied to every CURL handle before perform) -----------
+
+export type CurlInitHook = (curl: CModuleCURL.CURL) => void;
+let _curlInitHook: CurlInitHook | null = null;
+export function setCurlInitHook(hook: CurlInitHook | null): void { _curlInitHook = hook; }
+export function getCurlInitHook(): CurlInitHook | null { return _curlInitHook; }
+
 // ---- Fetch hooks -----------------------------------------------------------
 
 export interface NetworkCallFrame {

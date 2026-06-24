@@ -1,6 +1,6 @@
 import { Headers } from "headers-polyfill";
 import { version } from "../../../package.json";
-import { getFetchHook, getUserAgentOverride, getExtraHTTPHeaders, getFetchInterceptHook, captureUserNetworkCallFrames, type NetworkCallFrame } from "../../utils/network-hooks";
+import { getFetchHook, getUserAgentOverride, getExtraHTTPHeaders, getFetchInterceptHook, captureUserNetworkCallFrames, getCurlInitHook, type NetworkCallFrame } from "../../utils/network-hooks";
 import { type HttpClient } from "../../deno/07_http";
 import { Request } from "./request";
 import { Response } from "./response";
@@ -73,6 +73,7 @@ export async function performFetch(request: Request, url: URL): Promise<Response
     throwIfAborted(request.signal);
 
     const curl = new curlMod.CURL(getCurlPool());
+    getCurlInitHook()?.(curl);
 
     // If a Deno.HttpClient is attached, apply its proxy/SSL config to curl
     // instead of reimplementing HTTP on a raw socket.

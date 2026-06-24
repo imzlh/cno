@@ -1,5 +1,5 @@
 import { DOMException, EventTarget } from "../events";
-import { getFetchHook, getFetchInterceptHook, captureUserNetworkCallFrames, type NetworkCallFrame } from "../../utils/network-hooks";
+import { getFetchHook, getFetchInterceptHook, captureUserNetworkCallFrames, getCurlInitHook, type NetworkCallFrame } from "../../utils/network-hooks";
 import { attachCurlDebugTrace, buildConnectionInfo, CHARSET_RE, type CurlDebugTrace, curlMod, Decoder, engine, getCurlPool, parseHeaders, responseBodyToBytes, serializeBody, toCurlBody, truncateHookPostData } from "./helpers";
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
@@ -134,6 +134,7 @@ export class XMLHttpRequest extends EventTarget {
         this._emit('loadstart');
 
         const curl = new curlMod.CURL(getCurlPool());
+        getCurlInitHook()?.(curl);
         this._curl = curl;
         const netHook = getFetchHook();
         const curlTrace = netHook ? attachCurlDebugTrace(curl) : undefined;

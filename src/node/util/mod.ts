@@ -151,7 +151,7 @@ export function formatWithOptions(inspectOptions: InspectOptions, format?: any, 
         return '';
     }
     // Use the first arg as the format object, remaining args for %s/%d/%j/%o substitution
-    const result = console.inspect(format, {
+    const inspectOpts: any = {
         colors: inspectOptions.colors,
         depth: inspectOptions.depth ?? undefined,
         showHidden: inspectOptions.showHidden,
@@ -160,7 +160,8 @@ export function formatWithOptions(inspectOptions: InspectOptions, format?: any, 
         breakLength: inspectOptions.breakLength,
         compact: inspectOptions.compact,
         sorted: inspectOptions.sorted,
-    });
+    };
+    const result = console.inspect(format, inspectOpts);
     // Append remaining arguments (format substitution)
     if (args.length > 0) {
         return result + ' ' + args.map(a => inspect(a, inspectOptions)).join(' ');
