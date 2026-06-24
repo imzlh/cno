@@ -1,6 +1,6 @@
 import { errors } from "./01_errors";
 import packageJson from '../../package.json';
-import { os_args } from "../utils/args";
+import { getDenoArgs } from "../utils/args";
 
 const os = import.meta.use('os');
 const engine = import.meta.use('engine');
@@ -377,7 +377,7 @@ Object.defineProperty(globalThis, "Deno", {
 
         pid: os.pid,
         ppid: os.ppid,
-        args: os_args!.slice(1),    // remove self
+        // args: set via getter below after object creation
         env: {
             get: safeGetEnv,
             set: os.setenv,
@@ -535,7 +535,8 @@ Object.defineProperty(globalThis, "Deno", {
     writable: false,
     enumerable: true,
     configurable: true,
-})
+});
+Object.defineProperty(Deno, "args", { get: getDenoArgs, enumerable: true, configurable: true });
 
 // then import polyfills
 await import('./02_fs');
