@@ -12,7 +12,7 @@ const text = import.meta.use('text');
 import { IPCChannel } from '../ipc_channel';
 import { EventEmitter } from '../events';
 import { Writable, Readable } from '../stream';
-import { getTierLimits } from '../../utils/memory-tier';
+import { getTierLimits } from '../_internal/memory';
 
 const { readBufSize: READ_BUF_SIZE } = getTierLimits();
 

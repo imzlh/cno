@@ -6,7 +6,7 @@
 import { EventEmitter } from '../events';
 import { Readable, Writable } from '../stream';
 import type { Stream as StdioStream } from '../../deno/04_stdio';
-import { getTierLimits } from '../../utils/memory-tier';
+import { getTierLimits } from '../_internal/memory';
 
 const os = import.meta.use('os');
 const engine = import.meta.use('engine');

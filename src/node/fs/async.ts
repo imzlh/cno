@@ -7,7 +7,7 @@ const asfs = import.meta.use('asyncfs');
 const engine = import.meta.use('engine');
 import { FileHandle } from 'fs/promises';
 import { toUint8Array, decodeBuffer, toNodeStatAsync, toNodeDirentAsync, parseFlags, pathToString, splitPathOrFd, removeRecursive, mkdirRecursive, type PathLike } from './utils';
-import { getTierLimits } from '../../utils/memory-tier';
+import { getTierLimits } from '../_internal/memory';
 import { Stats } from 'fs';
 
 const { readBufSize: READ_BUF_SIZE } = getTierLimits();

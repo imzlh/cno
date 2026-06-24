@@ -5,7 +5,7 @@
 const fs = import.meta.use('fs');
 import { toUint8Array, decodeBuffer, toNodeStat, toNodeDirent, parseFlags, pathToString, splitPathOrFd, describeFd, removeRecursiveSync, mkdirRecursiveSync, modeToNumber, timeToNumber, readFileFromFdSync, type PathLike, type TimeLike, type Mode } from './utils';
 import { wrapSync } from '../_internal/errno';
-import { getTierLimits } from '../../utils/memory-tier';
+import { getTierLimits } from '../_internal/memory';
 
 const { readBufSize: READ_BUF_SIZE } = getTierLimits();
 

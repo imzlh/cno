@@ -1,6 +1,6 @@
 import type { Stream } from '../../deno/04_stdio';
 import { Readable, Writable } from '../stream';
-import { getTierLimits } from '../../utils/memory-tier';
+import { getTierLimits } from '../_internal/memory';
 
 const os = import.meta.use('os');
 const fs = import.meta.use('fs');
