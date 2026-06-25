@@ -145,7 +145,7 @@ class Blob implements globalThis.Blob {
         const buffer = this.#toBuffer();
         const sliced = new Uint8Array(buffer.buffer, buffer.byteOffset + relativeStart, span);
 
-        return new Blob([new Uint8Array(sliced)], { type: contentType ?? '' });
+        return new Blob([sliced], { type: contentType ?? '' });
     }
 
     async arrayBuffer(): Promise<ArrayBuffer> {
@@ -312,6 +312,9 @@ class File extends Blob implements globalThis.File {
                     } catch (error) {
                         controller.error(error);
                     }
+                },
+                cancel() {
+                    if (fileHandle) { fileHandle.close(); fileHandle = undefined; }
                 },
             });
         };

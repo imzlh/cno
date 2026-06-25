@@ -95,6 +95,8 @@ function createBenchContext(name: string, origin: string): Deno.BenchContext {
         end() {
             if (timerActive) {
                 timerActive = false;
+                const elapsed = performance.now() - startTime;
+                console.log(`bench ${name}: ${elapsed.toFixed(3)}ms`);
             }
         }
     };
@@ -116,159 +118,36 @@ function isBenchDefinition(obj: unknown): obj is Deno.BenchDefinition {
     return typeof obj === 'object' && obj !== null && 'fn' in obj && 'name' in obj;
 }
 
+function parseTestArgs(args: unknown[], extra?: Partial<Deno.TestDefinition>): Deno.TestDefinition {
+    if (args.length === 1) {
+        const arg = args[0];
+        if (typeof arg === 'object' && arg !== null && 'fn' in arg && 'name' in arg) return { ...arg, ...extra } as Deno.TestDefinition;
+        if (typeof arg === 'function') return { name: arg.name || 'anonymous', fn: arg as any, ...extra };
+        throw new TypeError('Invalid test definition');
+    } else if (args.length === 2) {
+        const [a, b] = args;
+        if (typeof a === 'string') return { name: a, fn: b as any, ...extra };
+        if (typeof a === 'object' && typeof b === 'function') {
+            const { name: _n, fn: _f, ...opts } = a as any;
+            return { name: (b as any).name || 'anonymous', fn: b as any, ...opts, ...extra };
+        }
+        throw new TypeError('Invalid test definition');
+    } else if (args.length === 3) {
+        const { name: _n, fn: _f, ...opts } = args[1] as any;
+        return { name: args[0] as string, fn: args[2] as any, ...opts, ...extra };
+    }
+    throw new TypeError('Invalid test definition');
+}
+
 function createTestFunction(): Deno.DenoTest {
-    const testFn = (...args: unknown[]) => {
-        let def: Deno.TestDefinition;
-
-        if (args.length === 1) {
-            const arg = args[0];
-            if (isTestDefinition(arg)) {
-                def = arg;
-            } else if (typeof arg === 'function') {
-                def = { name: arg.name || 'anonymous', fn: arg as (t: Deno.TestContext) => void | Promise<void> };
-            } else {
-                throw new TypeError('Invalid test definition');
-            }
-        } else if (args.length === 2) {
-            const [nameOrOptions, fnOrOptions] = args;
-            if (typeof nameOrOptions === 'string') {
-                def = {
-                    name: nameOrOptions,
-                    fn: fnOrOptions as (t: Deno.TestContext) => void | Promise<void>
-                };
-            } else if (typeof nameOrOptions === 'object' && typeof fnOrOptions === 'function') {
-                const opts = nameOrOptions as Omit<Deno.TestDefinition, 'fn' | 'name'>;
-                const fn2 = fnOrOptions as (t: Deno.TestContext) => void | Promise<void>;
-                def = {
-                    name: fnOrOptions.name || 'anonymous',
-                    fn: fn2,
-                    ...opts
-                };
-            } else {
-                throw new TypeError('Invalid test definition');
-            }
-        } else if (args.length === 3) {
-            const [name, options, fn] = args;
-            def = {
-                name: name as string,
-                fn: fn as (t: Deno.TestContext) => void | Promise<void>,
-                ...(options as Omit<Deno.TestDefinition, 'fn' | 'name'>)
-            };
-        } else {
-            throw new TypeError('Invalid test definition');
-        }
-
-        registerTest(def);
-    };
-
+    const testFn = (...args: unknown[]) => registerTest(parseTestArgs(args));
     const testObj = Object.assign(testFn, {
-        ignore: (...args: unknown[]) => {
-            let def: Deno.TestDefinition;
-
-            if (args.length === 1) {
-                const arg = args[0];
-                if (typeof arg === 'object' && arg !== null) {
-                    def = { ...arg, ignore: true } as Deno.TestDefinition;
-                } else if (typeof arg === 'function') {
-                    def = { name: arg.name || 'anonymous', fn: arg as (t: Deno.TestContext) => void | Promise<void>, ignore: true };
-                } else {
-                    throw new TypeError('Invalid test definition');
-                }
-            } else if (args.length === 2) {
-                const [nameOrOptions, fnOrOptions] = args;
-                if (typeof nameOrOptions === 'string') {
-                    def = {
-                        name: nameOrOptions,
-                        fn: fnOrOptions as (t: Deno.TestContext) => void | Promise<void>,
-                        ignore: true
-                    };
-                } else if (typeof nameOrOptions === 'object' && typeof fnOrOptions === 'function') {
-                    const opts = nameOrOptions as Omit<Deno.TestDefinition, 'fn' | 'name' | 'ignore'>;
-                    const fn2 = fnOrOptions as (t: Deno.TestContext) => void | Promise<void>;
-                    def = {
-                        name: fnOrOptions.name || 'anonymous',
-                        fn: fn2,
-                        ignore: true,
-                        ...opts
-                    };
-                } else {
-                    throw new TypeError('Invalid test definition');
-                }
-            } else if (args.length === 3) {
-                const [name, options, fn] = args;
-                def = {
-                    name: name as string,
-                    fn: fn as (t: Deno.TestContext) => void | Promise<void>,
-                    ignore: true,
-                    ...(options as Omit<Deno.TestDefinition, 'fn' | 'name' | 'ignore'>)
-                };
-            } else {
-                throw new TypeError('Invalid test definition');
-            }
-            registerTest(def);
-        },
-
-        only: (...args: unknown[]) => {
-            let def: Deno.TestDefinition;
-
-            if (args.length === 1) {
-                const arg = args[0];
-                if (typeof arg === 'object' && arg !== null) {
-                    def = { ...arg, only: true } as Deno.TestDefinition;
-                } else if (typeof arg === 'function') {
-                    def = { name: arg.name || 'anonymous', fn: arg as (t: Deno.TestContext) => void | Promise<void>, only: true };
-                } else {
-                    throw new TypeError('Invalid test definition');
-                }
-            } else if (args.length === 2) {
-                const [nameOrOptions, fnOrOptions] = args;
-                if (typeof nameOrOptions === 'string') {
-                    def = {
-                        name: nameOrOptions,
-                        fn: fnOrOptions as (t: Deno.TestContext) => void | Promise<void>,
-                        only: true
-                    };
-                } else if (typeof nameOrOptions === 'object' && typeof fnOrOptions === 'function') {
-                    const opts = nameOrOptions as Omit<Deno.TestDefinition, 'fn' | 'name' | 'only'>;
-                    const fn2 = fnOrOptions as (t: Deno.TestContext) => void | Promise<void>;
-                    def = {
-                        name: fnOrOptions.name || 'anonymous',
-                        fn: fn2,
-                        only: true,
-                        ...opts
-                    };
-                } else {
-                    throw new TypeError('Invalid test definition');
-                }
-            } else if (args.length === 3) {
-                const [name, options, fn] = args;
-                def = {
-                    name: name as string,
-                    fn: fn as (t: Deno.TestContext) => void | Promise<void>,
-                    only: true,
-                    ...(options as Omit<Deno.TestDefinition, 'fn' | 'name' | 'only'>)
-                };
-            } else {
-                throw new TypeError('Invalid test definition');
-            }
-            registerTest(def);
-        },
-
-        beforeAll: (fn: () => void | Promise<void>) => {
-            beforeAllHooks.push(fn);
-        },
-
-        beforeEach: (fn: () => void | Promise<void>) => {
-            beforeEachHooks.push(fn);
-        },
-
-        afterEach: (fn: () => void | Promise<void>) => {
-            afterEachHooks.push(fn);
-        },
-
-        afterAll: (fn: () => void | Promise<void>) => {
-            afterAllHooks.push(fn);
-        }
+        ignore: (...args: unknown[]) => registerTest(parseTestArgs(args, { ignore: true })),
+        only:    (...args: unknown[]) => registerTest(parseTestArgs(args, { only: true })),
+        beforeAll:   (fn: () => void | Promise<void>) => { beforeAllHooks.push(fn); },
+        beforeEach:  (fn: () => void | Promise<void>) => { beforeEachHooks.push(fn); },
+        afterEach:   (fn: () => void | Promise<void>) => { afterEachHooks.push(fn); },
+        afterAll:    (fn: () => void | Promise<void>) => { afterAllHooks.push(fn); },
     });
 
     return testObj as Deno.DenoTest;
@@ -391,13 +270,13 @@ Object.defineProperty(globalThis, "Deno", {
                 return env;
             },
         },
-        exit: code => os.exit(code == 0 ? Deno.exitCode : code ?? 0),
+        exit: code => os.exit(code ?? Deno.exitCode),
         exitCode: 0,
         build: {
             arch: uname.machine,
             os: toDenoSystemName(uname.sysname),
             standalone: false,
-            target: `${uname.machine}-unknown-${os.uname().sysname}`,
+            target: `${uname.machine}-unknown-${uname.sysname}`,
             vendor: "cno"
         },
         version: {
@@ -413,7 +292,7 @@ Object.defineProperty(globalThis, "Deno", {
             return globalThis.__mainScript;
         },
         execPath: () => os.exePath,
-        noColor: safeGetEnv("NO_COLOR") === "1",
+        noColor: safeGetEnv("NO_COLOR") != null,
         memoryUsage: () => {
             const memory = os.memoryUsage();
             return {

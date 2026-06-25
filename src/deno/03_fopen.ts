@@ -19,10 +19,7 @@ export function optionsToMode(options: Deno.OpenOptions): CModuleFS.OpenFlags {
     // Handle exclusive creation first (has highest priority)
     if (createNew) {
         if (write || append) {
-            // createNew with write = 'wx' mode (exclusive write)
-            // createNew with append = 'ax' mode (exclusive append)
-            // For simplicity, we return base mode without 'x' suffix
-            return append ? 'a' : 'w';
+            return append ? 'a+' : 'wx';
         }
         throw new Error('createNew requires write or append mode');
     }

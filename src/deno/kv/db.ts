@@ -4,6 +4,7 @@
 
 const sqlite3 = import.meta.use('sqlite3');
 const fs = import.meta.use('fs');
+import { getMemoryTier } from '../../utils/memory-tier';
 
 import {
     KvKeyPart,
@@ -41,7 +42,7 @@ const CLEANUP_SQL = `DELETE FROM kv_entries WHERE expire_at IS NOT NULL AND expi
 const DELETE_PREFIX_SQL = `DELETE FROM kv_entries WHERE key >= ? AND key < ?`;
 const LIST_SQL = `SELECT key, value, versionstamp, expire_at FROM kv_entries WHERE key >= ? AND key < ? AND (expire_at IS NULL OR expire_at > ?) ORDER BY key ASC LIMIT ?`;
 const LIST_REVERSE_SQL = `SELECT key, value, versionstamp, expire_at FROM kv_entries WHERE key >= ? AND key < ? AND (expire_at IS NULL OR expire_at > ?) ORDER BY key DESC LIMIT ?`;
-const SQLITE_CACHE_SIZE_KIB = -16384;
+const SQLITE_CACHE_SIZE_KIB = getMemoryTier() === 'low' ? -512 : getMemoryTier() === 'normal' ? -4096 : -16384;
 
 export class KvDatabase {
     private db: CModuleSQLite3.Sqlite3Handle | null = null;

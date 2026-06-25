@@ -212,7 +212,10 @@ export class EventEmitter<T extends EventMap<T> = any> {
                 if (eventName === 'error') {
                     throw err;
                 }
-                this.emit('error', err);
+                if ((this as any)._emittingError) throw err;
+                (this as any)._emittingError = true;
+                try { this.emit('error', err); }
+                finally { (this as any)._emittingError = false; }
             }
         }
 

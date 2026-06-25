@@ -162,7 +162,9 @@ export async function resolveSoa(hostname: string): Promise<SoaRecord> {
 }
 
 export async function reverse(ip: string): Promise<string[]> {
-    const ptrName = ip.split('.').reverse().join('.') + '.in-addr.arpa';
+    const ptrName = ip.includes(':')
+        ? ip.replace(/:/g, '').split('').reverse().join('.') + '.ip6.arpa'
+        : ip.split('.').reverse().join('.') + '.in-addr.arpa';
     return await resolve(ptrName, 'PTR') as string[];
 }
 

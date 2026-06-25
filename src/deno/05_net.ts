@@ -408,7 +408,7 @@ class TlsConn implements Deno.TlsConn {
             if (n === chunk.byteLength) {
                 this.$readQueue.shift();
             } else {
-                this.$readQueue[0] = chunk.subarray(n);
+                this.$readQueue[0] = new Uint8Array(chunk.buffer.slice(chunk.byteOffset + n, chunk.byteOffset + chunk.byteLength));
             }
         }
 

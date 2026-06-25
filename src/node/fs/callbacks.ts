@@ -430,7 +430,7 @@ export function symlink(target: PathLike, path: PathLike, type?: any, callback?:
     const symlinkType = type === 'dir' ? asfs.SymlinkType.DIR : type === 'junction' ? asfs.SymlinkType.JUNCTION : 0 as any;
     asfs.symlink(pathToString(target), pathToString(path), symlinkType).then(
         () => callback(null),
-        callback
+        (err) => callback(toErrnoException(err, 'symlink', pathToString(path)))
     );
 }
 

@@ -36,6 +36,10 @@ function deserializeTransferables(meta: { ports?: string[] }): MessagePort[] {
                 port = new MessagePort();
                 transferredPorts.set(port, id);
                 portRegistry.set(id, port);
+            } else {
+                // Clean up registry entry after retrieval
+                portRegistry.delete(id);
+                transferredPorts.delete(port);
             }
             (port as any)[closedSymbol] = false;
             ports.push(port);

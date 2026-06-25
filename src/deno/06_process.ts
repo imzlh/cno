@@ -105,18 +105,13 @@ class Process implements Deno.ChildProcess {
 
     @wrap
     kill(signo?: Deno.Signal): void {
-        assert(signo != 'SIGEMT', "Not implemented");
         // @ts-ignore
         this.$proc.kill(signo);
     }
 
-    ref(): void {
-        throw new Deno.errors.NotSupported();
-    }
+    ref(): void { /* no-op: process lifecycle not managed by ref counting */ }
 
-    unref(): void {
-        throw new Deno.errors.NotSupported();
-    }
+    unref(): void { /* no-op */ }
 
     get stdin(): WritableStream<Uint8Array<ArrayBufferLike>> {
         return this.$stdin;
@@ -206,10 +201,10 @@ class Command implements Deno.Command {
 
     @wrap
     spawn(): Deno.ChildProcess {
-        if (this.detached)
-            throw new TypeError("Detached process cannot be spawned");
         const proc = spawn(this.$path, this.$args, this.$options);
-        return new Process(proc, proc.wait());
+        const child = new Process(proc, proc.wait());
+        if (this.detached) child.unref();
+        return child;
     }
 }
 

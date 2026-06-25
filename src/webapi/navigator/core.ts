@@ -39,13 +39,13 @@ function getUserAgent(): string {
 
     switch (platform) {
         case 'Linux':
-            return `Mozilla/5.0 (X11; Linux ${arch}) AppleWebKit/537.36 (KHTML, like Gecko) denort/${version} Safari/537.36`;
+            return `Mozilla/5.0 (X11; Linux ${arch}) AppleWebKit/537.36 (KHTML, like Gecko) deno/2.8 cno/${version} Safari/537.36`;
         case 'Darwin':
-            return `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) denort/${version} Safari/537.36`;
+            return `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) deno/2.8 cno/${version} Safari/537.36`;
         case 'Windows_NT':
-            return `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) denort/${version} Safari/537.36`;
+            return `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) deno/2.8 cno/${version} Safari/537.36`;
         default:
-            return `Mozilla/5.0 (${platform}; ${arch}) AppleWebKit/537.36 (KHTML, like Gecko) denort/${version} Safari/537.36`;
+            return `Mozilla/5.0 (${platform}; ${arch}) AppleWebKit/537.36 (KHTML, like Gecko) deno/2.8 cno/${version} Safari/537.36`;
     }
 }
 
@@ -92,7 +92,7 @@ export class NavigatorCoreImpl{
     }
 
     get vendor(): string {
-        return 'denort';
+        return 'cno';
     }
 
     get appName(): string {

@@ -114,117 +114,32 @@ export function unzipSync(buffer: ArrayBuffer | Uint8Array, options?: ZlibOption
 // Async compress/decompress (callback style)
 // ============================================================================
 
-export function deflate(buffer: ArrayBuffer | Uint8Array, callback: CompressCallback): void;
-export function deflate(buffer: ArrayBuffer | Uint8Array, options: ZlibOptions, callback: CompressCallback): void;
-export function deflate(buffer: ArrayBuffer | Uint8Array, optionsOrCallback: ZlibOptions | CompressCallback, callback?: CompressCallback): void {
-    const opts = typeof optionsOrCallback === 'function' ? {} : optionsOrCallback;
-    const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
-    
-    queueMicrotask(() => {
-        try {
-            const result = deflateSync(buffer, opts);
-            cb?.(null, result);
-        } catch (err) {
-            cb?.(err as Error);
-        }
-    });
+type SyncFn = (buf: ArrayBuffer | Uint8Array, opts?: ZlibOptions) => Uint8Array;
+
+function wrapCallback(syncFn: SyncFn) {
+    return function(buffer: ArrayBuffer | Uint8Array, optionsOrCallback: ZlibOptions | CompressCallback, callback?: CompressCallback) {
+        const opts = typeof optionsOrCallback === 'function' ? {} : optionsOrCallback;
+        const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
+        queueMicrotask(() => {
+            try { cb?.(null, syncFn(buffer, opts)); }
+            catch (err) { cb?.(err as Error); }
+        });
+    };
 }
 
-export function deflateRaw(buffer: ArrayBuffer | Uint8Array, callback: CompressCallback): void;
-export function deflateRaw(buffer: ArrayBuffer | Uint8Array, options: ZlibOptions, callback: CompressCallback): void;
-export function deflateRaw(buffer: ArrayBuffer | Uint8Array, optionsOrCallback: ZlibOptions | CompressCallback, callback?: CompressCallback): void {
-    const opts = typeof optionsOrCallback === 'function' ? {} : optionsOrCallback;
-    const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
-    
-    queueMicrotask(() => {
-        try {
-            const result = deflateRawSync(buffer, opts);
-            cb?.(null, result);
-        } catch (err) {
-            cb?.(err as Error);
-        }
-    });
-}
+export const deflate = wrapCallback(deflateSync);
+export const deflateRaw = wrapCallback(deflateRawSync);
+export const gzip = wrapCallback(gzipSync);
+export const inflate = wrapCallback(inflateSync);
+export const inflateRaw = wrapCallback(inflateRawSync);
+export const gunzip = wrapCallback(gunzipSync);
+export const unzip = wrapCallback(unzipSync);
 
-export function gzip(buffer: ArrayBuffer | Uint8Array, callback: CompressCallback): void;
-export function gzip(buffer: ArrayBuffer | Uint8Array, options: ZlibOptions, callback: CompressCallback): void;
-export function gzip(buffer: ArrayBuffer | Uint8Array, optionsOrCallback: ZlibOptions | CompressCallback, callback?: CompressCallback): void {
-    const opts = typeof optionsOrCallback === 'function' ? {} : optionsOrCallback;
-    const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
-    
-    queueMicrotask(() => {
-        try {
-            const result = gzipSync(buffer, opts);
-            cb?.(null, result);
-        } catch (err) {
-            cb?.(err as Error);
-        }
-    });
-}
 
-export function inflate(buffer: ArrayBuffer | Uint8Array, callback: CompressCallback): void;
-export function inflate(buffer: ArrayBuffer | Uint8Array, options: ZlibOptions, callback: CompressCallback): void;
-export function inflate(buffer: ArrayBuffer | Uint8Array, optionsOrCallback: ZlibOptions | CompressCallback, callback?: CompressCallback): void {
-    const opts = typeof optionsOrCallback === 'function' ? {} : optionsOrCallback;
-    const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
-    
-    queueMicrotask(() => {
-        try {
-            const result = inflateSync(buffer, opts);
-            cb?.(null, result);
-        } catch (err) {
-            cb?.(err as Error);
-        }
-    });
-}
 
-export function inflateRaw(buffer: ArrayBuffer | Uint8Array, callback: CompressCallback): void;
-export function inflateRaw(buffer: ArrayBuffer | Uint8Array, options: ZlibOptions, callback: CompressCallback): void;
-export function inflateRaw(buffer: ArrayBuffer | Uint8Array, optionsOrCallback: ZlibOptions | CompressCallback, callback?: CompressCallback): void {
-    const opts = typeof optionsOrCallback === 'function' ? {} : optionsOrCallback;
-    const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
-    
-    queueMicrotask(() => {
-        try {
-            const result = inflateRawSync(buffer, opts);
-            cb?.(null, result);
-        } catch (err) {
-            cb?.(err as Error);
-        }
-    });
-}
 
-export function gunzip(buffer: ArrayBuffer | Uint8Array, callback: CompressCallback): void;
-export function gunzip(buffer: ArrayBuffer | Uint8Array, options: ZlibOptions, callback: CompressCallback): void;
-export function gunzip(buffer: ArrayBuffer | Uint8Array, optionsOrCallback: ZlibOptions | CompressCallback, callback?: CompressCallback): void {
-    const opts = typeof optionsOrCallback === 'function' ? {} : optionsOrCallback;
-    const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
-    
-    queueMicrotask(() => {
-        try {
-            const result = gunzipSync(buffer, opts);
-            cb?.(null, result);
-        } catch (err) {
-            cb?.(err as Error);
-        }
-    });
-}
 
-export function unzip(buffer: ArrayBuffer | Uint8Array, callback: CompressCallback): void;
-export function unzip(buffer: ArrayBuffer | Uint8Array, options: ZlibOptions, callback: CompressCallback): void;
-export function unzip(buffer: ArrayBuffer | Uint8Array, optionsOrCallback: ZlibOptions | CompressCallback, callback?: CompressCallback): void {
-    const opts = typeof optionsOrCallback === 'function' ? {} : optionsOrCallback;
-    const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
-    
-    queueMicrotask(() => {
-        try {
-            const result = unzipSync(buffer, opts);
-            cb?.(null, result);
-        } catch (err) {
-            cb?.(err as Error);
-        }
-    });
-}
+
 
 // ============================================================================
 // Stream compress/decompress
@@ -232,216 +147,82 @@ export function unzip(buffer: ArrayBuffer | Uint8Array, optionsOrCallback: ZlibO
 
 import { Transform, TransformOptions } from '../stream';
 
-export class Deflate extends Transform {
-    private _handle: CModuleZLib.Deflate;
-    
-    constructor(options?: ZlibOptions & TransformOptions) {
-        super(options);
-        this._handle = zlib.createDeflate(
-            options?.level ?? zlib.DEFAULT_COMPRESSION,
-            options?.strategy ?? zlib.DEFAULT_STRATEGY,
-            options?.memLevel ?? 8
-        );
-    }
-    
-    protected _transform(chunk: any, encoding: BufferEncoding, callback: (error?: Error | null, data?: any) => void): void {
-        try {
-            const input = toUint8Array(chunk);
-            const output = this._handle.deflate(input);
-            callback(null, new Uint8Array(output));
-        } catch (err) {
-            callback(err as Error);
-        }
-    }
-    
-    protected _flush(callback: (error?: Error | null, data?: any) => void): void {
-        try {
-            const output = this._handle.finish();
-            callback(null, new Uint8Array(output));
-        } catch (err) {
-            callback(err as Error);
-        }
-    }
+function _doTransform(handle: any, chunk: any, compress: boolean, cb: any) {
+    try {
+        const fn = compress ? 'deflate' : 'inflate';
+        cb(null, new Uint8Array(handle[fn](toUint8Array(chunk))));
+    } catch (err) { cb(err); }
 }
 
+function _doFlush(handle: any, cb: any) {
+    try { cb(null, new Uint8Array(handle.finish())); }
+    catch (err) { cb(err); }
+}
+
+export class Deflate extends Transform {
+    _handle: any;
+    constructor(o?: ZlibOptions & TransformOptions) { super(o); this._handle = zlib.createDeflate(..._opts(o)); }
+    _transform(chunk: any, _e: BufferEncoding, cb: any) { _doTransform(this._handle, chunk, true, cb); }
+    _flush(cb: any) { _doFlush(this._handle, cb); }
+}
+
+const _opts = (o?: ZlibOptions) => [
+    o?.level ?? zlib.DEFAULT_COMPRESSION,
+    o?.strategy ?? zlib.DEFAULT_STRATEGY,
+    o?.memLevel ?? 8
+] as const;
+
 export class Inflate extends Transform {
-    private _handle: CModuleZLib.Inflate;
-    
-    constructor(options?: ZlibOptions & TransformOptions) {
-        super(options);
-        this._handle = zlib.createInflate();
-    }
-    
-    protected _transform(chunk: any, encoding: BufferEncoding, callback: (error?: Error | null, data?: any) => void): void {
-        try {
-            const input = toUint8Array(chunk);
-            const output = this._handle.inflate(input);
-            callback(null, new Uint8Array(output));
-        } catch (err) {
-            callback(err as Error);
-        }
-    }
+    _handle: any;
+    constructor(o?: ZlibOptions & TransformOptions) { super(o); this._handle = zlib.createInflate(); }
+    _transform(chunk: any, _e: BufferEncoding, cb: any) { _doTransform(this._handle, chunk, false, cb); }
 }
 
 export class Gzip extends Transform {
-    private _handle: CModuleZLib.Deflate;
-    
-    constructor(options?: ZlibOptions & TransformOptions) {
-        super(options);
-        this._handle = zlib.createGzip(
-            options?.level ?? zlib.DEFAULT_COMPRESSION,
-            options?.strategy ?? zlib.DEFAULT_STRATEGY,
-            options?.memLevel ?? 8
-        );
-    }
-    
-    protected _transform(chunk: any, encoding: BufferEncoding, callback: (error?: Error | null, data?: any) => void): void {
-        try {
-            const input = toUint8Array(chunk);
-            const output = this._handle.deflate(input);
-            callback(null, new Uint8Array(output));
-        } catch (err) {
-            callback(err as Error);
-        }
-    }
-    
-    protected _flush(callback: (error?: Error | null, data?: any) => void): void {
-        try {
-            const output = this._handle.finish();
-            callback(null, new Uint8Array(output));
-        } catch (err) {
-            callback(err as Error);
-        }
-    }
+    _handle: any;
+    constructor(o?: ZlibOptions & TransformOptions) { super(o); this._handle = zlib.createGzip(..._opts(o)); }
+    _transform(chunk: any, _e: BufferEncoding, cb: any) { _doTransform(this._handle, chunk, true, cb); }
+    _flush(cb: any) { _doFlush(this._handle, cb); }
 }
 
 export class Gunzip extends Transform {
-    private _handle: CModuleZLib.Inflate;
-    
-    constructor(options?: ZlibOptions & TransformOptions) {
-        super(options);
-        this._handle = zlib.createGunzip();
-    }
-    
-    protected _transform(chunk: any, encoding: BufferEncoding, callback: (error?: Error | null, data?: any) => void): void {
-        try {
-            const input = toUint8Array(chunk);
-            const output = this._handle.inflate(input);
-            callback(null, new Uint8Array(output));
-        } catch (err) {
-            callback(err as Error);
-        }
-    }
+    _handle: any;
+    constructor(o?: ZlibOptions & TransformOptions) { super(o); this._handle = zlib.createGunzip(); }
+    _transform(chunk: any, _e: BufferEncoding, cb: any) { _doTransform(this._handle, chunk, false, cb); }
 }
 
 export class DeflateRaw extends Transform {
-    private _handle: CModuleZLib.Deflate;
-    
-    constructor(options?: ZlibOptions & TransformOptions) {
-        super(options);
-        this._handle = zlib.createDeflateRaw(
-            options?.level ?? zlib.DEFAULT_COMPRESSION,
-            options?.strategy ?? zlib.DEFAULT_STRATEGY,
-            options?.memLevel ?? 8
-        );
-    }
-    
-    protected _transform(chunk: any, encoding: BufferEncoding, callback: (error?: Error | null, data?: any) => void): void {
-        try {
-            const input = toUint8Array(chunk);
-            const output = this._handle.deflate(input);
-            callback(null, new Uint8Array(output));
-        } catch (err) {
-            callback(err as Error);
-        }
-    }
-    
-    protected _flush(callback: (error?: Error | null, data?: any) => void): void {
-        try {
-            const output = this._handle.finish();
-            callback(null, new Uint8Array(output));
-        } catch (err) {
-            callback(err as Error);
-        }
-    }
+    _handle: any;
+    constructor(o?: ZlibOptions & TransformOptions) { super(o); this._handle = zlib.createDeflateRaw(..._opts(o)); }
+    _transform(chunk: any, _e: BufferEncoding, cb: any) { _doTransform(this._handle, chunk, true, cb); }
+    _flush(cb: any) { _doFlush(this._handle, cb); }
 }
 
 export class InflateRaw extends Transform {
-    private _handle: CModuleZLib.Inflate;
-    
-    constructor(options?: ZlibOptions & TransformOptions) {
-        super(options);
-        this._handle = zlib.createInflateRaw();
-    }
-    
-    protected _transform(chunk: any, encoding: BufferEncoding, callback: (error?: Error | null, data?: any) => void): void {
-        try {
-            const input = toUint8Array(chunk);
-            const output = this._handle.inflate(input);
-            callback(null, new Uint8Array(output));
-        } catch (err) {
-            callback(err as Error);
-        }
-    }
+    _handle: any;
+    constructor(o?: ZlibOptions & TransformOptions) { super(o); this._handle = zlib.createInflateRaw(); }
+    _transform(chunk: any, _e: BufferEncoding, cb: any) { _doTransform(this._handle, chunk, false, cb); }
 }
 
 export class Unzip extends Transform {
-    private _handle: CModuleZLib.Inflate;
-    
-    constructor(options?: ZlibOptions & TransformOptions) {
-        super(options);
-        this._handle = zlib.createInflate();
-    }
-    
-    protected _transform(chunk: any, encoding: BufferEncoding, callback: (error?: Error | null, data?: any) => void): void {
-        try {
-            const input = toUint8Array(chunk);
-            const output = this._handle.inflate(input);
-            callback(null, new Uint8Array(output));
-        } catch (err) {
-            callback(err as Error);
-        }
-    }
+    _handle: any;
+    constructor(o?: ZlibOptions & TransformOptions) { super(o); this._handle = zlib.createInflate(); }
+    _transform(chunk: any, _e: BufferEncoding, cb: any) { _doTransform(this._handle, chunk, false, cb); }
 }
 
 // ============================================================================
 // Factory functions
 // ============================================================================
 
-export function createDeflate(options?: ZlibOptions): Deflate {
-    // @ts-ignore - options type compatibility
-    return new Deflate(options);
-}
+function _create(Cls: any) { return (options?: ZlibOptions) => new Cls(options); }
 
-export function createInflate(options?: ZlibOptions): Inflate {
-    // @ts-ignore - options type compatibility
-    return new Inflate(options);
-}
-
-export function createGzip(options?: ZlibOptions): Gzip {
-    // @ts-ignore - options type compatibility
-    return new Gzip(options);
-}
-
-export function createGunzip(options?: ZlibOptions): Gunzip {
-    // @ts-ignore - options type compatibility
-    return new Gunzip(options);
-}
-
-export function createDeflateRaw(options?: ZlibOptions): DeflateRaw {
-    // @ts-ignore - options type compatibility
-    return new DeflateRaw(options);
-}
-
-export function createInflateRaw(options?: ZlibOptions): InflateRaw {
-    // @ts-ignore - options type compatibility
-    return new InflateRaw(options);
-}
-
-export function createUnzip(options?: ZlibOptions): Unzip {
-    // @ts-ignore - options type compatibility
-    return new Unzip(options);
-}
+export const createDeflate = _create(Deflate);
+export const createInflate = _create(Inflate);
+export const createGzip = _create(Gzip);
+export const createGunzip = _create(Gunzip);
+export const createDeflateRaw = _create(DeflateRaw);
+export const createInflateRaw = _create(InflateRaw);
+export const createUnzip = _create(Unzip);
 
 // ============================================================================
 // Checksum

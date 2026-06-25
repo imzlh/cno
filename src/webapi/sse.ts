@@ -110,6 +110,10 @@ export class EventSource extends EventTarget {
     private processChunk(chunk: Uint8Array): void {
         const text = engine.decodeString(chunk);
         this.lineBuffer += text;
+        // Guard against unbounded line buffer from malicious server
+        if (this.lineBuffer.length > 1024 * 1024) {
+            this.lineBuffer = this.lineBuffer.slice(-4096);
+        }
         let newlineIndex: number;
         while ((newlineIndex = this.lineBuffer.indexOf('\n')) !== -1) {
             const line = this.lineBuffer.slice(0, newlineIndex);

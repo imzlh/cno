@@ -666,16 +666,16 @@ export function setgroups(): void {
 }
 
 export function umask(mask?: number | string): number {
-    if (mask === undefined) return 0o022;
-    const prev = 0o022;
-    try {
-        (os as any).umask?.(typeof mask === 'string' ? parseInt(mask, 8) : mask);
-    } catch { }
+    const readMask = () => { try { return (os as any).umask?.() ?? 0o022; } catch { return 0o022; } };
+    const prev = readMask();
+    if (mask !== undefined) {
+        try { (os as any).umask?.(typeof mask === 'string' ? parseInt(mask, 8) : mask); } catch {}
+    }
     return prev;
 }
 
 export function nextTick(callback: Function, ...args: any[]): void {
-    setTimeout(() => callback(...args), 0);
+    queueMicrotask(() => callback(...args));
 }
 
 export let connected: boolean = false;
@@ -745,11 +745,13 @@ export function threadCpuUsage(previousValue?: NodeJS.CpuUsage): NodeJS.CpuUsage
 }
 
 export function constrainedMemory(): number {
-    return 0;
+    const mem = os.memoryUsage();
+    return mem["os.total"] || 0;
 }
 
 export function availableMemory(): number {
-    return 0;
+    const mem = os.memoryUsage();
+    return mem["os.free"] || 0;
 }
 
 export function setUncaughtExceptionCaptureCallback(cb: ((err: Error) => void) | null): void { }

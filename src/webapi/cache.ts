@@ -2,10 +2,14 @@
 // Matches the subset of the Cache API tested by Deno's cache_api_test.ts.
 
 import { Response } from "./fetch";
+import { getMemoryTier } from "../utils/memory-tier";
 
 declare const globalThis: any;
 
 const ILLEGAL = Symbol('cache.illegal');
+
+// Max cache entries per Cache instance, tier-aware
+const MAX_ENTRIES = getMemoryTier() === 'low' ? 64 : getMemoryTier() === 'normal' ? 256 : 1024;
 
 function toRequestKey(input: string | URL | Request): Request {
     if (typeof input === 'string') return new globalThis.Request(input);
@@ -78,6 +82,10 @@ class CacheImpl implements Cache {
         if (idx >= 0) {
             this.#entries[idx] = entry;
         } else {
+            // Evict LRU (oldest) entries when over capacity
+            while (this.#entries.length >= MAX_ENTRIES) {
+                this.#entries.shift();
+            }
             this.#entries.push(entry);
         }
     }

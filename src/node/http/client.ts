@@ -10,7 +10,7 @@ const http = import.meta.use('http');
 const os = import.meta.use('os');
 
 import { Socket } from '../net';
-import { OutgoingMessageImpl, IncomingMessageImpl, OutgoingHttpHeaders, IncomingHttpHeaders } from './server';
+import { OutgoingMessageImpl, IncomingMessageImpl, OutgoingHttpHeaders } from './server';
 import { METHODS } from './constants';
 import {
     buildNodeUrl,
@@ -20,6 +20,7 @@ import {
     nextNodeRequestId,
     nodeTs,
     normalizeHeaderRecord,
+    setupResponseParser,
 } from '../_internal/network-debug';
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
@@ -242,96 +243,15 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
     private _readResponse(): void {
         if (!this._tcp) return;
 
-        const fetchHook = getNodeFetchHook();
-        let finished = false;
-        const finish = (success: boolean, errorText?: string) => {
-            if (finished) return;
-            finished = true;
-            try {
-                fetchHook?.onFinished?.({
-                    requestId: this._requestId,
-                    timestamp: nodeTs(),
-                    success,
-                    errorText,
-                });
-            } catch {}
-        };
-        const parser = new http.Parser(http.RESPONSE);
         const res = new IncomingMessageImpl(this.socket!);
         this._response = res;
-        let currentHeaderField = '';
-        const pendingChunks: Uint8Array[] = [];
-
-        const decode = (buf: any, off: number, len: number) =>
-            engine.decodeString(new Uint8Array(buf as ArrayBuffer).slice(off, off + len));
-
-        parser.onStatus = (buf, off, len) => {
-            res.statusMessage = decode(buf, off, len);
-        };
-
-        parser.onHeaderField = (buf, off, len) => {
-            currentHeaderField = decode(buf, off, len).toLowerCase();
-        };
-
-        parser.onHeaderValue = (buf, off, len) => {
-            const value = decode(buf, off, len);
-            const existing = res.headers[currentHeaderField as keyof IncomingHttpHeaders];
-            if (existing) {
-                if (Array.isArray(existing)) existing.push(value);
-                else res.headers[currentHeaderField as keyof IncomingHttpHeaders] = [existing, value] as any;
-            } else {
-                res.headers[currentHeaderField as keyof IncomingHttpHeaders] = value as any;
-            }
-            res.rawHeaders.push(currentHeaderField, value);
-            if (!res.headersDistinct[currentHeaderField]) {
-                res.headersDistinct[currentHeaderField] = [];
-            }
-            res.headersDistinct[currentHeaderField]!.push(value);
-        };
-
-        parser.onHeadersComplete = () => {
-            res.statusCode = parser.state.status;
-            res.httpVersion = `${parser.state.httpMajor}.${parser.state.httpMinor}`;
-            res.httpVersionMajor = parser.state.httpMajor;
-            res.httpVersionMinor = parser.state.httpMinor;
-
-            this.emit('response', res);
-            if (this._callback) this._callback(res);
-            try {
-                fetchHook?.onResponse?.({
-                    requestId: this._requestId,
-                    timestamp: nodeTs(),
-                    url: buildNodeUrl(this.protocol, this.host, this.path),
-                    status: res.statusCode ?? 0,
-                    headers: normalizeHeaderRecord(res.headers as Record<string, string | string[] | undefined>),
-                    requestHeaders: normalizeHeaderRecord(this.getHeaders()),
-                    resourceType: 'Fetch',
-                });
-            } catch {}
-
-            // Flush any chunks that arrived during header parsing
-            for (const chunk of pendingChunks) {
-                res.push(chunk);
-            }
-            pendingChunks.length = 0;
-        };
-
-        parser.onBody = (buf, off, len) => {
-            const data = new Uint8Array(buf as ArrayBuffer).slice(off, off + len);
-            try { fetchHook?.onData?.({ requestId: this._requestId, timestamp: nodeTs(), data }); } catch {}
-            if (res.statusCode === 0) {
-                pendingChunks.push(data); // headers not complete yet, buffer
-            } else {
-                res.push(data);
-            }
-        };
-
-        parser.onMessageComplete = () => {
-            res.push(null);
-            res.complete = true;
-            finish(true);
-            this._cleanup();
-        };
+        const { parser, finish } = setupResponseParser({
+            requestId: this._requestId,
+            protocol: this.protocol, host: this.host, path: this.path,
+            res, getHeaders: () => this.getHeaders(),
+            onResponse: (_res) => { this.emit('response', _res); if (this._callback) this._callback(_res); },
+            onComplete: () => this._cleanup(),
+        });
 
         const tcp = this._tcp;
         const buffer = new Uint8Array(65536);

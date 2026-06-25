@@ -395,7 +395,7 @@ export class Socket extends Duplex {
         this.destroyed = true;
 
         if (error) {
-            this.emit('error', error);
+            try { this.emit('error', error); } catch {}
         }
         this.emit('close', !!error);
 

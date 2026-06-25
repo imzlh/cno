@@ -68,8 +68,6 @@ class BroadcastChannelImpl extends EventTarget implements BroadcastChannel {
         }
         if (handler) {
             this.addEventListener('messageerror', handler);
-        } else {
-            this.addEventListener('messageerror', handler);
         }
         this.#onmessageerror = handler;
     }

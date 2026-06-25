@@ -133,21 +133,20 @@ function normalizeAlgorithm(algorithm: AlgorithmIdentifier): Algorithm {
     return { ...algorithm, name: algorithm.name.toUpperCase() };
 }
 
+const HASH_FUNCTIONS: Record<string, (data: ArrayBuffer) => ArrayBuffer> = {
+    'SHA-1': crypto.sha1,
+    'SHA-256': crypto.sha256,
+    'SHA-384': crypto.sha384,
+    'SHA-512': crypto.sha512,
+    'SHA3-224': crypto.sha3_224,
+    'SHA3-256': crypto.sha3_256,
+    'SHA3-384': crypto.sha3_384,
+    'SHA3-512': crypto.sha3_512,
+};
+
 function getHashFunction(algorithm: HashAlgorithmIdentifier): (data: ArrayBuffer) => ArrayBuffer {
     const normalized = typeof algorithm === 'string' ? algorithm.toUpperCase() : normalizeAlgorithm(algorithm).name;
-
-    const hashFunctions: Record<string, (data: ArrayBuffer) => ArrayBuffer> = {
-        'SHA-1': crypto.sha1,
-        'SHA-256': crypto.sha256,
-        'SHA-384': crypto.sha384,
-        'SHA-512': crypto.sha512,
-        'SHA3-224': crypto.sha3_224,
-        'SHA3-256': crypto.sha3_256,
-        'SHA3-384': crypto.sha3_384,
-        'SHA3-512': crypto.sha3_512,
-    };
-
-    const fn = hashFunctions[normalized];
+    const fn = HASH_FUNCTIONS[normalized];
     if (!fn) throw new Error(`Unsupported hash algorithm: ${normalized}`);
     return fn;
 }

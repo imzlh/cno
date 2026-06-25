@@ -132,19 +132,13 @@ class ResponseAdapter {
         const contentLength = getHeader('content-length');
         const transferEncoding = getHeader('transfer-encoding');
 
-        // 1. status code that should not have a body
         const noBodyStatusCodes = [204, 205, 304];
         if (noBodyStatusCodes.includes(res.status)) {
-            assert(
-                !res.body,
-                `Status ${res.status} must not have a response body, but got: ${JSON.stringify(res.body)}`
-            );
-            assert(!contentLength || contentLength === '0',
-                `Status ${res.status} must not have Content-Length or it must be 0`);
+            assert(!res.body, `Status ${res.status} must not have a response body`);
+            assert(!contentLength || contentLength === '0', `Status ${res.status} must not have Content-Length or it must be 0`);
             return;
         }
 
-        // 2. Content-Length
         if (contentLength) {
             const length = parseInt(contentLength, 10);
             assert(!isNaN(length), `Invalid Content-Length: ${contentLength}`);
@@ -152,13 +146,10 @@ class ResponseAdapter {
             if (length > 0) assert(res.body, "Body must exist if Content-Length > 0");
         }
 
-        // no Transfer-Encoding and Content-Length(mutex)
         if (transferEncoding && transferEncoding.toLowerCase() === 'chunked') {
-            assert(!contentLength,
-                'Transfer-Encoding: chunked and Content-Length cannot coexist');
+            assert(!contentLength, 'Transfer-Encoding: chunked and Content-Length cannot coexist');
         }
 
-        // ensure client can handle content encoding
         if (res.body && (res.body instanceof ReadableStream) && !transferEncoding && !contentLength) {
             assert(contentType, 'Streamed body exists but no Content-Type, Content-Length or Transfer-Encoding specified');
         }
@@ -420,6 +411,7 @@ function serve(
                 } catch { }
 
                 const adapter = new ResponseAdapter(res, req.method, requestId, requestUrl, req.headers, requestEntryCallFrames);
+                adapter.verify(webResponse);
                 await adapter.sendResponse(webResponse);
 
             } catch (error) {

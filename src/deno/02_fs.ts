@@ -37,163 +37,69 @@ export function toDenoStat(stat: CModuleAsyncFS.StatResult) {
 }
 
 /**
- * Recursively create directory tree (cross-platform)
+ * Yield directory paths that need to be created (cross-platform)
  */
-async function mkdirRecursive(fullPath: string, mode?: number): Promise<void> {
-    // Normalize path: convert backslashes to forward slashes
+function* iterMkdirPaths(fullPath: string): Generator<string> {
     const normalizedPath = fullPath.replace(/\\/g, '/');
-
-    // Split path into components
-    const parts = normalizedPath.split('/').filter(part => part !== '' && part !== '.');
-
-    // Build path progressively
+    const parts = normalizedPath.split('/').filter(p => p !== '' && p !== '.');
     let currentPath = '';
-
     for (const part of parts) {
-        // Handle root paths
         if (currentPath === '') {
-            // Unix absolute path
-            if (normalizedPath.startsWith('/')) {
-                currentPath = '/';
-            }
-            // Windows absolute path with drive letter
-            else if (/^[A-Za-z]:/.test(normalizedPath)) {
-                currentPath = part + '/';
-                continue;
-            }
-            // UNC path (\\server\share)
+            if (normalizedPath.startsWith('/')) { currentPath = '/'; }
+            else if (/^[A-Za-z]:/.test(normalizedPath)) { currentPath = part + '/'; continue; }
             else if (normalizedPath.startsWith('//')) {
                 currentPath = '//';
-                // For UNC paths, first two parts are server and share
-                if (parts.length >= 2) {
-                    currentPath += parts.slice(0, 2).join('/');
-                    // Skip the server and share parts in the loop
-                    parts.splice(0, 2);
-                }
+                if (parts.length >= 2) { currentPath += parts.slice(0, 2).join('/'); parts.splice(0, 2); }
                 continue;
             }
-            // Relative path
-            else {
-                currentPath = part;
-            }
-        } else {
-            currentPath = currentPath + '/' + part;
-        }
+            else { currentPath = part; }
+        } else { currentPath = currentPath + '/' + part; }
+        yield currentPath;
+    }
+}
 
-        try {
-            if (!(await asfs.stat(currentPath)).isDirectory)
-                throw -1;
-            // already exists and is a directory, skip
-        } catch (error) {
-            if (error === -1) {
-                throw new Error(`Cannot create directory '${currentPath}': File exists`);
-            } else {
-                await asfs.mkdir(currentPath, mode);
-            }
-        }
+async function mkdirRecursive(fullPath: string, mode?: number): Promise<void> {
+    for (const p of iterMkdirPaths(fullPath)) {
+        try { if (!(await asfs.stat(p)).isDirectory) throw -1; }
+        catch (e) { if (e === -1) throw new Error(`Cannot create directory '${p}': File exists`); await asfs.mkdir(p, mode); }
     }
 }
 
 function mkdirRecursiveSync(fullPath: string, mode?: number): void {
-    // Normalize path: convert backslashes to forward slashes
-    const normalizedPath = fullPath.replace(/\\/g, '/');
-
-    // Split path into components
-    const parts = normalizedPath.split('/').filter(part => part !== '' && part !== '.');
-
-    // Build path progressively
-    let currentPath = '';
-
-    for (const part of parts) {
-        // Handle root paths
-        if (currentPath === '') {
-            // Unix absolute path
-            if (normalizedPath.startsWith('/')) {
-                currentPath = '/';
-            }
-            // Windows absolute path with drive letter
-            else if (/^[A-Za-z]:/.test(normalizedPath)) {
-                currentPath = part + '/';
-                continue;
-            }
-            // UNC path (\\server\share)
-            else if (normalizedPath.startsWith('//')) {
-                currentPath = '//';
-                // For UNC paths, first two parts are server and share
-                if (parts.length >= 2) {
-                    currentPath += parts.slice(0, 2).join('/');
-                    // Skip the server and share parts in the loop
-                    parts.splice(0, 2);
-                }
-                continue;
-            }
-            // Relative path
-            else {
-                currentPath = part;
-            }
-        } else {
-            currentPath = currentPath + '/' + part;
-        }
-
-        try {
-            if (!fs.stat(currentPath).isDirectory)
-                throw -1;
-            // already exists and is a directory, skip
-        } catch (error) {
-            if (error === -1) {
-                throw new Error(`Cannot create directory '${currentPath}': File exists`);
-            } else {
-                fs.mkdir(currentPath, mode);
-            }
-        }
+    for (const p of iterMkdirPaths(fullPath)) {
+        try { if (!fs.stat(p).isDirectory) throw -1; }
+        catch (e) { if (e === -1) throw new Error(`Cannot create directory '${p}': File exists`); fs.mkdir(p, mode); }
     }
 }
 
 function removeRecursiveSync(targetPath: string): void {
-    try {
-        const stats = fs.stat(targetPath);
-
-        if (stats.isDirectory) {
-            const items = fs.readdir(targetPath);
-            for (const item of items) {
-                removeRecursiveSync(join(targetPath, item));
-            }
-            fs.rmdir(targetPath);
-        } else {
-            fs.unlink(targetPath);
+    const stats = fs.stat(targetPath);
+    if (stats.isDirectory) {
+        for (const item of fs.readdir(targetPath)) {
+            removeRecursiveSync(join(targetPath, item));
         }
-    } catch (error) {
-        throw error;
+        fs.rmdir(targetPath);
+    } else {
+        fs.unlink(targetPath);
     }
 }
 
 async function removeRecursive(targetPath: string): Promise<void> {
-    try {
-        const stats = await asfs.stat(targetPath);
-
-        if (stats.isDirectory) {
-            // Open directory for reading contents
-            const dirHandle = await asfs.readDir(targetPath);
-
-            try {
-                // Read and delete all directory contents
-                for await (const entry of dirHandle) {
-                    const itemPath = join(targetPath, entry.name);
-                    await removeRecursive(itemPath);
-                }
-            } finally {
-                await dirHandle.close();
+    const stats = await asfs.stat(targetPath);
+    if (stats.isDirectory) {
+        const dirHandle = await asfs.readDir(targetPath);
+        try {
+            for await (const entry of dirHandle) {
+                await removeRecursive(join(targetPath, entry.name));
             }
-
-            // Delete empty directory
-            await asfs.rmdir(targetPath);
-        } else {
+        } finally {
+            await dirHandle.close();
+        }
+        await asfs.rmdir(targetPath);
+    } else {
             // Delete file
             await asfs.unlink(targetPath);
         }
-    } catch (error) {
-        throw error;
-    }
 }
 
 async function denoWriteAnyFile(path: string | URL, data: string | Uint8Array | ReadableStream<string | Uint8Array>, options?: Deno.WriteFileOptions) {
@@ -535,14 +441,14 @@ Object.assign(Deno, wrapFSns({
     async makeTempDir(opt) {
         const rand = Math.floor(Math.random() * 1e9).toString(36);
         const tmp = join(opt?.dir ?? os.tmpDir, opt?.prefix ?? 'deno', opt?.suffix ?? rand);
-        await mkdirRecursive(tmp, 755);
+        await mkdirRecursive(tmp, 0o755);
         return tmp;
     },
 
     makeTempDirSync(opt) {
         const rand = Math.floor(Math.random() * 1e9).toString(36);
         const tmp = join(opt?.dir ?? os.tmpDir, opt?.prefix ?? 'deno', opt?.suffix ?? rand);
-        mkdirRecursiveSync(tmp, 755);
+        mkdirRecursiveSync(tmp, 0o755);
         return tmp;
     },
 

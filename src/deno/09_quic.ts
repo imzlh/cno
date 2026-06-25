@@ -240,6 +240,9 @@ class QuicListenerImpl implements Deno.QuicListener {
 
     stop(): void {
         this.#stopped = true;
+        const err = new Error("QUIC listener stopped");
+        for (const w of this.#waiters) w(Promise.reject(err) as any);
+        this.#waiters.length = 0;
     }
 
     async *[Symbol.asyncIterator](): AsyncIterableIterator<Deno.QuicIncoming> {
@@ -274,7 +277,10 @@ class QuicEndpointImpl implements Deno.QuicEndpoint {
     }
 
     close(): void {
-        this.socket = undefined;
+        if (this.socket) {
+            try { this.socket.close(); } catch {}
+            this.socket = undefined;
+        }
     }
 }
 

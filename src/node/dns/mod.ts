@@ -322,8 +322,9 @@ export function resolveNaptr(hostname: string, callback: (err: NodeJS.ErrnoExcep
 // ============================================================================
 
 export function reverse(ip: string, callback: (err: NodeJS.ErrnoException | null, hostnames: string[]) => void): void {
-    // Reverse DNS lookup
-    const ptrName = ip.split('.').reverse().join('.') + '.in-addr.arpa';
+    const ptrName = ip.includes(':')
+        ? ip.replace(/:/g, '').split('').reverse().join('.') + '.ip6.arpa'
+        : ip.split('.').reverse().join('.') + '.in-addr.arpa';
     resolve(ptrName, 'PTR', callback);
 }
 

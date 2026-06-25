@@ -78,6 +78,8 @@ export class Kv implements Deno.Kv {
         this.watchSubscriptions.clear();
         
         this.queueHandlers = [];
+        for (const resolve of this.listenQueueResolvers) resolve();
+        this.listenQueueResolvers.length = 0;
         this.pendingDeliveries.clear();
         
         this.db.close();
@@ -240,10 +242,12 @@ export class Kv implements Deno.Kv {
 
     listenQueue(handler: (value: unknown) => Promise<void> | void): Promise<void> {
         this.checkClosed();
-        
+
         this.queueHandlers.push(handler);
-        
-        return new Promise(() => {});
+
+        return new Promise<void>((resolve) => {
+            this.listenQueueResolvers.push(resolve);
+        });
     }
 
     watch<T extends readonly unknown[]>(

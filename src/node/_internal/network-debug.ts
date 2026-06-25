@@ -106,3 +106,78 @@ export function buildNodeServerUrl(
     const path = url && url.length > 0 ? url : '/';
     return buildNodeUrl(protocol, host, path);
 }
+
+// ── Shared HTTP response parser setup ─────────────────────────────────────────
+
+const engine = import.meta.use('engine');
+const httpNative = import.meta.use('http');
+
+export interface ResponseParserContext {
+    requestId: string;
+    protocol: string;
+    host: string;
+    path: string;
+    res: any;  // IncomingMessageImpl or compatible (must have push())
+    getHeaders: () => Record<string, any>;
+    onResponse: (res: any) => void;
+    onComplete: () => void;
+}
+
+export function setupResponseParser(ctx: ResponseParserContext) {
+    const fetchHook = getNodeFetchHook();
+    let finished = false;
+    const finish = (success: boolean, errorText?: string) => {
+        if (finished) return; finished = true;
+        try { fetchHook?.onFinished?.({ requestId: ctx.requestId, timestamp: nodeTs(), success, errorText }); } catch {}
+    };
+    const parser = new httpNative.Parser(httpNative.RESPONSE);
+    const res = ctx.res;
+    let currentHeaderField = '';
+    const pendingChunks: Uint8Array[] = [];
+
+    const decode = (buf: any, off: number, len: number) =>
+        engine.decodeString(new Uint8Array(buf as ArrayBuffer).slice(off, off + len));
+
+    parser.onStatus = (buf: any, off: number, len: number) => { res.statusMessage = decode(buf, off, len); };
+    parser.onHeaderField = (buf: any, off: number, len: number) => { currentHeaderField = decode(buf, off, len).toLowerCase(); };
+    parser.onHeaderValue = (buf: any, off: number, len: number) => {
+        const value = decode(buf, off, len);
+        const existing = res.headers[currentHeaderField];
+        if (existing) {
+            if (Array.isArray(existing)) existing.push(value);
+            else res.headers[currentHeaderField] = [existing, value];
+        } else { res.headers[currentHeaderField] = value; }
+        res.rawHeaders.push(currentHeaderField, value);
+        (res.headersDistinct[currentHeaderField] ??= []).push(value);
+    };
+    parser.onHeadersComplete = () => {
+        res.statusCode = parser.state.status;
+        res.httpVersion = `${parser.state.httpMajor}.${parser.state.httpMinor}`;
+        res.httpVersionMajor = parser.state.httpMajor;
+        res.httpVersionMinor = parser.state.httpMinor;
+        ctx.onResponse(res);
+        try { fetchHook?.onResponse?.({
+            requestId: ctx.requestId, timestamp: nodeTs(),
+            url: buildNodeUrl(ctx.protocol, ctx.host, ctx.path),
+            status: res.statusCode ?? 0,
+            headers: normalizeHeaderRecord(res.headers),
+            requestHeaders: normalizeHeaderRecord(ctx.getHeaders()),
+            resourceType: 'Fetch',
+        }); } catch {}
+        for (const chunk of pendingChunks) res.push(chunk);
+        pendingChunks.length = 0;
+    };
+    parser.onBody = (buf: any, off: number, len: number) => {
+        const data = new Uint8Array(buf as ArrayBuffer).slice(off, off + len);
+        try { fetchHook?.onData?.({ requestId: ctx.requestId, timestamp: nodeTs(), data }); } catch {}
+        if (res.statusCode === 0) pendingChunks.push(data);
+        else res.push(data);
+    };
+    parser.onMessageComplete = () => {
+        res.push(null); res.complete = true;
+        finish(true);
+        ctx.onComplete();
+    };
+
+    return { parser, res, finish, pendingChunks };
+}

@@ -98,7 +98,8 @@ export class Stream {
     readSync(buf: Uint8Array): number | null {
         if (this.type == 'file') {
             tryLock(this.fd);
-            return (this.stream as FSFile).readSync(buf);
+            try { return (this.stream as FSFile).readSync(buf); }
+            finally { unlock(this.fd); }
         } else {
             return sfs.read(this.fd, buf);
         }
@@ -108,7 +109,8 @@ export class Stream {
     writeSync(data: Uint8Array): number {
         if (this.type == 'file') {
             tryLock(this.fd);
-            return (this.stream as FSFile).writeSync(data);
+            try { return (this.stream as FSFile).writeSync(data); }
+            finally { unlock(this.fd); }
         } else {
             return sfs.write(this.fd, data);
         }

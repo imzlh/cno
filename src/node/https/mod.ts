@@ -33,6 +33,7 @@ import {
     nextNodeRequestId,
     nodeTs,
     normalizeHeaderRecord,
+    setupResponseParser,
     toUint8Array,
 } from '../_internal/network-debug';
 
@@ -537,79 +538,15 @@ class HttpsClientRequest extends OutgoingMessageImpl {
     private _readResponse(): void {
         if (!this._tlsSocket) return;
 
-        const fetchHook = getNodeFetchHook();
-        let finished = false;
-        const finish = (success: boolean, errorText?: string) => {
-            if (finished) return;
-            finished = true;
-            try {
-                fetchHook?.onFinished?.({
-                    requestId: this._requestId,
-                    timestamp: nodeTs(),
-                    success,
-                    errorText,
-                });
-            } catch {}
-        };
-        const parser = new httpParser.Parser(httpParser.RESPONSE);
         const res = new IncomingMessageImpl(null);
         (res as any).socket = this._tlsSocket;
-        let currentHeaderField = '';
-
-        const decode = (buf: any, off: number, len: number) =>
-            engine.decodeString(new Uint8Array(buf as ArrayBuffer).slice(off, off + len));
-
-        parser.onStatus = (buf: any, off: number, len: number) => {
-            res.statusMessage = decode(buf, off, len);
-        };
-        parser.onHeaderField = (buf: any, off: number, len: number) => {
-            currentHeaderField = decode(buf, off, len).toLowerCase();
-        };
-        parser.onHeaderValue = (buf: any, off: number, len: number) => {
-            const value = decode(buf, off, len);
-            const existing = res.headers[currentHeaderField as keyof IncomingHttpHeaders];
-            if (existing) {
-                if (Array.isArray(existing)) existing.push(value);
-                else res.headers[currentHeaderField as keyof IncomingHttpHeaders] = [existing, value] as any;
-            } else {
-                res.headers[currentHeaderField as keyof IncomingHttpHeaders] = value as any;
-            }
-            res.rawHeaders.push(currentHeaderField, value);
-            if (!res.headersDistinct[currentHeaderField]) {
-                res.headersDistinct[currentHeaderField] = [];
-            }
-            res.headersDistinct[currentHeaderField]!.push(value);
-        };
-        parser.onHeadersComplete = () => {
-            res.statusCode = parser.state.status;
-            res.httpVersion = `${parser.state.httpMajor}.${parser.state.httpMinor}`;
-            res.httpVersionMajor = parser.state.httpMajor;
-            res.httpVersionMinor = parser.state.httpMinor;
-
-            this.emit('response', res);
-            if (this._callback) this._callback(res);
-            try {
-                fetchHook?.onResponse?.({
-                    requestId: this._requestId,
-                    timestamp: nodeTs(),
-                    url: buildNodeUrl(this.protocol, this.host, this.path),
-                    status: res.statusCode ?? 0,
-                    headers: normalizeHeaderRecord(res.headers as Record<string, string | string[] | undefined>),
-                    requestHeaders: normalizeHeaderRecord(this.getHeaders()),
-                    resourceType: 'Fetch',
-                });
-            } catch {}
-        };
-        parser.onBody = (buf: any, off: number, len: number) => {
-            const data = new Uint8Array(buf as ArrayBuffer).slice(off, off + len);
-            try { fetchHook?.onData?.({ requestId: this._requestId, timestamp: nodeTs(), data }); } catch {}
-            res.push(data);
-        };
-        parser.onMessageComplete = () => {
-            res.push(null);
-            res.complete = true;
-            finish(true);
-        };
+        const { parser, finish } = setupResponseParser({
+            requestId: this._requestId,
+            protocol: this.protocol, host: this.host, path: this.path,
+            res, getHeaders: () => this.getHeaders(),
+            onResponse: (_res) => { this.emit('response', _res); if (this._callback) this._callback(_res); },
+            onComplete: () => {},
+        });
 
         this._tlsSocket.on('data', (chunk: Uint8Array) => {
             const ab = chunk.buffer instanceof SharedArrayBuffer

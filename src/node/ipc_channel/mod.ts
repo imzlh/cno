@@ -24,12 +24,15 @@
  */
 
 import { EventEmitter } from '../events';
+import { getMemoryTier } from '../../utils/memory-tier';
 
 const engine = import.meta.use('engine');
 
 const NEWLINE = 0x0a;
-// Guard against unbounded buffering from a peer that never sends a delimiter.
-const MAX_BUFFER_BYTES = 256 * 1024 * 1024;
+// Guard against unbounded buffering — tier-aware cap
+const MAX_BUFFER_BYTES = getMemoryTier() === 'low' ? 4 * 1024 * 1024
+                       : getMemoryTier() === 'normal' ? 64 * 1024 * 1024
+                       : 256 * 1024 * 1024;
 
 function isInternalMessage(message: any): boolean {
     return (

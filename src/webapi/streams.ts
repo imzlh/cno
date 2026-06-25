@@ -4,6 +4,7 @@
  */
 
 import { assert } from "../utils/assert";
+import { getMemoryTier } from "../utils/memory-tier";
 
 const zlib = import.meta.use('zlib');
 
@@ -42,12 +43,16 @@ class ReadableStreamController<R = any> implements globalThis.ReadableStreamDefa
     }> = [];
     #closedCallbacks: Array<{ resolve: () => void; reject: (e: any) => void }> = [];
     #backpressureBuffer: Array<{ chunk: R; size: number }> = [];
+    #backpressureBufferSize = 0;
+    #maxBackpressureSize: number;
     #onEnqueue: (() => void) | null = null;
 
     constructor(source: UnderlyingSource<R>, strategy: QueuingStrategy<R>) {
         this.#source = source;
         this.#sizeAlgorithm = extractSizeAlgorithm(strategy);
         this.#highWaterMark = extractHighWaterMark(strategy, 1);
+        const tier = getMemoryTier();
+        this.#maxBackpressureSize = tier === 'low' ? 1 * 1024 * 1024 : tier === 'normal' ? 8 * 1024 * 1024 : 32 * 1024 * 1024;
     }
 
     get desiredSize(): number | null {
@@ -77,7 +82,11 @@ class ReadableStreamController<R = any> implements globalThis.ReadableStreamDefa
         // transport-level backpressure is responsible for stopping growth.
         if (this.#queueSize >= this.#highWaterMark && this.#highWaterMark > 0) {
             const size = this.#sizeAlgorithm(chunk);
+            if (this.#backpressureBufferSize + size > this.#maxBackpressureSize) {
+                throw new TypeError('Backpressure buffer exceeded memory limit');
+            }
             this.#backpressureBuffer.push({ chunk, size });
+            this.#backpressureBufferSize += size;
             if (this.#onEnqueue) try { this.#onEnqueue(); } catch {}
             return;
         }
@@ -120,6 +129,7 @@ class ReadableStreamController<R = any> implements globalThis.ReadableStreamDefa
         this.#queue = [];
         this.#queueSize = 0;
         this.#backpressureBuffer = [];
+        this.#backpressureBufferSize = 0;
         this.#onEnqueue = null;
 
         // Reject all pending reads
@@ -187,10 +197,9 @@ class ReadableStreamController<R = any> implements globalThis.ReadableStreamDefa
     }
 
     #drainBuffer(): void {
-        // Move chunks from the backpressure buffer into the main queue
-        // until the queue is back at the high water mark.
         while (this.#backpressureBuffer.length > 0 && this.#queueSize < this.#highWaterMark) {
             const entry = this.#backpressureBuffer.shift()!;
+            this.#backpressureBufferSize -= entry.size;
             this.#queue.push(entry);
             this.#queueSize += entry.size;
         }
@@ -235,6 +244,7 @@ class ReadableStreamController<R = any> implements globalThis.ReadableStreamDefa
         this.#queue = [];
         this.#queueSize = 0;
         this.#backpressureBuffer = [];
+        this.#backpressureBufferSize = 0;
         this.#onEnqueue = null;
         this.#storedError = undefined;
 
@@ -264,6 +274,7 @@ class ReadableStreamController<R = any> implements globalThis.ReadableStreamDefa
         this.#queue = [];
         this.#queueSize = 0;
         this.#backpressureBuffer = [];
+        this.#backpressureBufferSize = 0;
         this.#onEnqueue = null;
         this.#storedError = undefined;
 
