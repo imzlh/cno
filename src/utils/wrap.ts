@@ -3,6 +3,7 @@ import { errors } from "../deno/01_errors";
 const error = import.meta.use('error');
 
 export function wrapFSErr(e: CModuleError.Error): Error {
+    if (e instanceof Error && e.constructor?.name === 'DOMException') return e;
     if (!(e instanceof Error) || !e.code) return e;
 
     switch (e.code) {

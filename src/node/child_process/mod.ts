@@ -147,8 +147,8 @@ class ChildProcessImpl extends EventEmitter implements ChildProcess {
                 const data = chunk instanceof Uint8Array ? chunk : engine.encodeString(chunk);
                 pipe.write(data).then(() => callback()).catch(callback);
             },
-            final(callback: (error?: Error | null) => void) {
-                try { pipe.shutdown(); } finally { callback(); }
+            async final(callback: (error?: Error | null) => void) {
+                try { await pipe.shutdown(); } finally { callback(); }
             },
         });
     }

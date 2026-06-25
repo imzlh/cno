@@ -547,6 +547,7 @@ await import('./06_process');
 await import('./07_http');
 await import('./08_serve');
 await import('./09_cron');
+await import('./09_quic');
 
 // unstable APIs
 await import('./kv');

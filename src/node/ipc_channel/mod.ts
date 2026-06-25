@@ -179,7 +179,6 @@ export class IPCChannel extends EventEmitter {
     close(): void {
         if (this._pipe) {
             try {
-                this._pipe.shutdown();
                 this._pipe.close();
             } catch { /* ignore */ }
             this._pipe = null;

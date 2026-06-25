@@ -266,18 +266,18 @@ export class TLSSocket extends Duplex {
                 this.#connecting = false;
                 this.readyState = 'open';
 
-                const verify = this.#sslPipe.verifyResult();
+                const verify = this.#sslPipe.verifyResult;
                 this.authorized = verify.ok;
                 if (!verify.ok) {
                     this.authorizationError = new Error(verify.error ?? `Certificate verification failed: ${verify.code}`);
                 }
 
-                const cipher = this.#sslPipe.cipher();
+                const cipher = this.#sslPipe.cipher;
                 if (cipher) {
                     this.protocol = cipher.name;
                     this.tlsVersion = cipher.version;
                 }
-                this.alpnProtocol = this.#sslPipe.alpnProtocol();
+                this.alpnProtocol = this.#sslPipe.alpnProtocol;
 
                 this.emit('secureConnect');
 

@@ -182,11 +182,6 @@ class ResponseAdapter {
             headers2.set('transfer-encoding', 'chunked');
         }
 
-        // Always set Connection header for HTTP/1.1 keep-alive
-        if (!headers2.has('connection')) {
-            headers2.set('connection', 'keep-alive');
-        }
-
         const headers = Array.from(headers2.entries());
         const statusText = response.statusText ?? http.strstatus(response.status);
         const serveHook = getServeHook();
@@ -489,9 +484,7 @@ function serve(
 
     // Handle abort signal
     if (options.signal) {
-        options.signal.addEventListener('abort', () => {
-            httpServer.shutdown().catch(() => { });
-        }, { once: true });
+        options.signal.addEventListener('abort', () => httpServer.shutdown(), { once: true });
     }
 
     // Call onListen callback if provided

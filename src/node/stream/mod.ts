@@ -898,6 +898,3 @@ export function addAbortSignal(signal: AbortSignal, stream: Stream): Stream {
     }
     return stream;
 }
-
-import * as promises from './promises';
-export { promises };
