@@ -29,7 +29,6 @@ function wrapMessagePipe(pipe: CModuleWorker.MessagePipe): MessagePort {
 }
 
 export class MessagePort extends EventEmitter {
-    private readonly events = new EventEmitter();
     onmessage: ((this: MessagePort, ev: { type: string; data: any; ports?: MessagePort[] }) => any) | null = null;
     onmessageerror: ((this: MessagePort, ev: { type: string; data: any }) => any) | null = null;
     [otherPortSymbol]: MessagePort | null = null;
@@ -84,26 +83,26 @@ export class MessagePort extends EventEmitter {
 
     // @ts-ignore
     on(event: string, listener: (...args: any[]) => void): this {
-        this.events.on(event, listener as any);
+        super.on(event, listener as any);
         if (event === 'message' && !this[startedSymbol]) this.start();
         return this;
     }
 
     // @ts-ignore
     off(event: string, listener: (...args: any[]) => void): this {
-        this.events.off(event, listener as any);
+        super.off(event, listener as any);
         return this;
     }
 
     // @ts-ignore
     once(event: string, listener: (...args: any[]) => void): this {
-        this.events.once(event, listener as any);
+        super.once(event, listener as any);
         return this;
     }
 
     // @ts-ignore
     emit(event: string, ...args: any[]): boolean {
-        return this.events.emit(event, ...args);
+        return super.emit(event, ...args);
     }
 }
 

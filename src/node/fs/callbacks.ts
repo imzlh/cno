@@ -2,7 +2,7 @@
  * Node.js fs module - callback-style API
  * All async operations support callback functions
  */
-import { toUint8Array, toNodeStat, toNodeDirentAsync, parseFlags, pathToString, splitPathOrFd, describeFd, removeRecursive, mkdirRecursive, modeToNumber, timeToNumber, type PathLike, type TimeLike, type Mode } from './utils';
+import { toUint8Array, toNodeStat, toNodeDirentAsync, parseFlags, pathToString, splitPathOrFd, describeFd, removeRecursive, mkdirRecursive, modeToNumber, timeToNumber, readFileFromFdSync, type PathLike, type TimeLike, type Mode } from './utils';
 import { toErrnoException } from '../_internal/errno';
 import { getTierLimits } from '../_internal/memory';
 
@@ -32,19 +32,7 @@ export function readFile(path: PathLike | number, options?: any, callback?: any)
     const encoding = typeof options === 'string' ? options : options?.encoding;
     if ('fd' in target) {
         try {
-            const chunks: Uint8Array[] = [];
-            const buf = new Uint8Array(getTierLimits().readBufSize);
-            let bytesRead = 0;
-            while ((bytesRead = fs.read(target.fd, buf)) > 0) {
-                chunks.push(buf.slice(0, bytesRead));
-            }
-            const total = chunks.reduce((n, chunk) => n + chunk.length, 0);
-            const out = new Uint8Array(total);
-            let offset = 0;
-            for (const chunk of chunks) {
-                out.set(chunk, offset);
-                offset += chunk.length;
-            }
+            const out = readFileFromFdSync(fs.read, target.fd, getTierLimits().readBufSize);
             const result = encoding ? engine.decodeString(out as Uint8Array<ArrayBuffer>) : Buffer.from(out);
             callback(null, result);
         } catch (err) {
@@ -87,7 +75,9 @@ export function writeFile(path: PathLike | number, data: any, options?: any, cal
     const buffer = toUint8Array(data);
     if ('fd' in target) {
         try {
-            fs.ftruncate(target.fd, 0);
+            if (flag !== 'a' && flag !== 'ax') {
+                fs.ftruncate(target.fd, 0);
+            }
             fs.write(target.fd, buffer);
             callback(null);
         } catch (err) {
@@ -332,6 +322,8 @@ export function readdir(path: PathLike, options?: any, callback?: any): void {
                     }
                 }
                 callback(null, entries);
+            } catch (err) {
+                callback(toErrnoException(err, 'readdir', pathStr));
             } finally {
                 await dirHandle.close();
             }
@@ -451,7 +443,7 @@ export function readlink(path: PathLike, options?: any, callback?: any): void {
 
     asfs.readLink(pathToString(path)).then(
         result => callback(null, result),
-        callback
+        err => callback(toErrnoException(err, 'readlink', pathToString(path)))
     );
 }
 
@@ -472,7 +464,7 @@ export function realpath(path: PathLike, options?: any, callback?: any): void {
 
     asfs.realPath(pathToString(path)).then(
         result => callback(null, result),
-        callback
+        err => callback(toErrnoException(err, 'realpath', pathToString(path)))
     );
 }
 

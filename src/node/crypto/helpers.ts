@@ -10,7 +10,10 @@ export function toBuffer(data: ArrayBuffer | Uint8Array | string, encoding: stri
     if (typeof data === 'string') {
         if (encoding === 'hex') return new Uint8Array(crypto.hexDecode(data));
         if (encoding === 'base64') return new Uint8Array(crypto.base64Decode(data));
-        if (encoding === 'base64url') return new Uint8Array(crypto.base64Decode(data.replace(/-/g, '+').replace(/_/g, '/') + '=='.slice(0, (4 - data.length % 4) % 4)));
+        if (encoding === 'base64url') {
+            const stripped = data.replace(/=+$/, '');
+            return new Uint8Array(crypto.base64Decode(stripped.replace(/-/g, '+').replace(/_/g, '/') + '=='.slice(0, (4 - stripped.length % 4) % 4)));
+        }
         if (encoding === 'latin1' || encoding === 'ascii' || encoding === 'binary') {
             const buf = new Uint8Array(data.length);
             for (let i = 0; i < data.length; i++) buf[i] = data.charCodeAt(i);
@@ -48,30 +51,58 @@ export function concatBuffers(chunks: Uint8Array[]): Uint8Array {
 
 export function createBufferedCipher(
     transform: (data: Uint8Array) => ArrayBuffer,
+    blockSize = 16,
 ): Cipheriv {
     const chunks: Uint8Array[] = [];
+    let outChunks: Uint8Array[] = [];
     return {
         update(data: BinaryInput, inputEncoding?: string, outputEncoding?: string) {
             chunks.push(toBuffer(data, inputEncoding));
-            return encodeOutput(new ArrayBuffer(0), outputEncoding);
+            const buf = concatBuffers(chunks);
+            const fullBlocks = Math.floor(buf.length / blockSize) * blockSize;
+            if (fullBlocks >= blockSize) {
+                const out = new Uint8Array(transform(buf.slice(0, fullBlocks)));
+                outChunks.push(out);
+                chunks.length = 0;
+                if (buf.length > fullBlocks) chunks.push(buf.slice(fullBlocks));
+            }
+            const result = concatBuffers(outChunks);
+            outChunks = [];
+            return encodeOutput(result.buffer, outputEncoding);
         },
         final(outputEncoding?: string) {
-            return encodeOutput(transform(concatBuffers(chunks)), outputEncoding);
+            const buf = concatBuffers(chunks);
+            chunks.length = 0;
+            return encodeOutput(transform(buf), outputEncoding);
         },
     };
 }
 
 export function createBufferedDecipher(
     transform: (data: Uint8Array) => ArrayBuffer,
+    blockSize = 16,
 ): Decipheriv {
     const chunks: Uint8Array[] = [];
+    let outChunks: Uint8Array[] = [];
     return {
         update(data: BinaryInput, inputEncoding?: string, outputEncoding?: string) {
             chunks.push(toBuffer(data, inputEncoding));
-            return encodeOutput(new ArrayBuffer(0), outputEncoding);
+            const buf = concatBuffers(chunks);
+            const fullBlocks = Math.floor(buf.length / blockSize) * blockSize;
+            if (fullBlocks >= blockSize) {
+                const out = new Uint8Array(transform(buf.slice(0, fullBlocks)));
+                outChunks.push(out);
+                chunks.length = 0;
+                if (buf.length > fullBlocks) chunks.push(buf.slice(fullBlocks));
+            }
+            const result = concatBuffers(outChunks);
+            outChunks = [];
+            return encodeOutput(result.buffer, outputEncoding);
         },
         final(outputEncoding?: string) {
-            return encodeOutput(transform(concatBuffers(chunks)), outputEncoding);
+            const buf = concatBuffers(chunks);
+            chunks.length = 0;
+            return encodeOutput(transform(buf), outputEncoding);
         },
     };
 }
@@ -86,12 +117,11 @@ export function normalizeHashAlgorithm(algorithm: string): string {
 }
 
 export function oneShotHmac(algorithm: string, key: Uint8Array, data: Uint8Array): ArrayBuffer {
-    const crypto_ = import.meta.use('crypto');
     switch (normalizeHashAlgorithm(algorithm)) {
-        case 'md5': return crypto_.hmacMd5(key, data);
-        case 'sha1': return crypto_.hmacSha1(key, data);
-        case 'sha256': return crypto_.hmacSha256(key, data);
-        case 'sha512': return crypto_.hmacSha512(key, data);
+        case 'md5': return crypto.hmacMd5(key, data);
+        case 'sha1': return crypto.hmacSha1(key, data);
+        case 'sha256': return crypto.hmacSha256(key, data);
+        case 'sha512': return crypto.hmacSha512(key, data);
         default: throw new Error(`Unsupported HMAC algorithm: ${algorithm}`);
     }
 }

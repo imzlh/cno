@@ -215,7 +215,11 @@ Object.assign(Deno, wrapFSns({
     },
 
     umask(mask?: number): number {
-        return 0;   // not implemented
+        const os = import.meta.use('os');
+        try {
+            if (mask !== undefined) return (os as any).umask?.(mask) ?? 0o022;
+            return (os as any).umask?.() ?? 0o022;
+        } catch { return 0o022; }
     },
 
     // unstable, but useful

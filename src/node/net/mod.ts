@@ -157,9 +157,10 @@ export class Socket extends Duplex {
             this.connecting = true;
             this._connecting = true;
             this.readyState = 'opening';
+            connectListener = typeof hostOrCb === 'function' ? hostOrCb : undefined;
 
             const pipe = new streams.Pipe();
-            pipe.connect(host as string).then(() => {
+            pipe.connect(portOrPath as string).then(() => {
                 this._stream = pipe;
                 this.connecting = false;
                 this._connecting = false;

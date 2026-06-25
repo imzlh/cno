@@ -197,13 +197,16 @@ class TlsConn implements Deno.TlsConn {
                 try {
                     await this.$handshake;
                     let written = 0;
+                    let retries = 0;
                     while (written < chunk.length) {
                         const n = $pipe.write(chunk.subarray(written));
                         if (n === null) {
+                            if (++retries > 100) throw new Error('TLS write stall');
                             await this.output();
                             await this.waitForTlsProgress();
                             continue;
                         }
+                        retries = 0;
                         written += n;
                         await this.output();
                     }
@@ -408,7 +411,7 @@ class TlsConn implements Deno.TlsConn {
             if (n === chunk.byteLength) {
                 this.$readQueue.shift();
             } else {
-                this.$readQueue[0] = new Uint8Array(chunk.buffer.slice(chunk.byteOffset + n, chunk.byteOffset + chunk.byteLength));
+                this.$readQueue[0] = chunk.slice(n);
             }
         }
 
@@ -860,7 +863,7 @@ Object.assign(Deno, wrapFSns({
         if (tlsOptions.keyFormat && tlsOptions.keyFormat !== 'pem')
             throw new TypeError(`Unsupported key format: ${tlsOptions.keyFormat}`);
         const hostname = options.hostname ?? '127.0.0.1';
-        const pipe = await connectTcp(hostname, options.port);
+        const pipe = await connectTcp(hostname, options.port, (options as any).signal);
 
         // create SSL context
         const ctx = new ssl.Context({

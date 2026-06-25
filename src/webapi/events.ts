@@ -1,7 +1,7 @@
 export class Event {
     readonly type: string;
     readonly bubbles: boolean = false;
-    readonly cancelable: boolean = true;    // by default, cjs events are cancelable
+    readonly cancelable: boolean = false;
     readonly composed: boolean = false;
     readonly eventPhase: 0 = 0;             // NONE only
     readonly isTrusted: boolean = false;
@@ -20,7 +20,11 @@ export class Event {
 
     constructor(type: string, options?: EventInit, trust = false) {
         this.type = type;
-        Object.assign(this, options);
+        if (options) {
+            (this as any).bubbles = !!options.bubbles;
+            (this as any).cancelable = !!options.cancelable;
+            (this as any).composed = !!options.composed;
+        }
         this.isTrusted = trust;
     }
 
@@ -65,30 +69,40 @@ export class Event {
     }
 }
 
+interface ListenerEntry { listener: EventListener; once: boolean; signal?: AbortSignal; }
+
 export class EventTarget {
-    #listeners = new Map<string, Set<EventListener>>();
+    #listeners = new Map<string, ListenerEntry[]>();
 
     addEventListener(
         type: string,
         listener: EventListener | null,
-        _options?: AddEventListenerOptions | boolean
+        options?: AddEventListenerOptions | boolean
     ): void {
         if (!listener) return;
+        const opts = typeof options === 'boolean' ? { capture: options } : options ?? {};
         let bucket = this.#listeners.get(type);
-        if (!bucket) {
-            bucket = new Set();
-            this.#listeners.set(type, bucket);
+        if (!bucket) { bucket = []; this.#listeners.set(type, bucket); }
+        const entry: ListenerEntry = { listener, once: !!opts.once, signal: opts.signal };
+        bucket.push(entry);
+        if (opts.signal) {
+            opts.signal.addEventListener('abort', () => {
+                const idx = bucket.indexOf(entry);
+                if (idx !== -1) bucket.splice(idx, 1);
+            }, { once: true });
         }
-        bucket.add(listener);
     }
 
     removeEventListener(
         type: string,
         listener: EventListener | null,
-        _options?: AddEventListenerOptions | boolean
+        options?: AddEventListenerOptions | boolean
     ): void {
         if (!listener) return;
-        this.#listeners.get(type)?.delete(listener);
+        const bucket = this.#listeners.get(type);
+        if (!bucket) return;
+        const idx = bucket.findIndex(e => e.listener === listener);
+        if (idx !== -1) bucket.splice(idx, 1);
     }
 
     dispatchEvent(event: globalThis.Event): boolean {
@@ -101,11 +115,16 @@ export class EventTarget {
 
         const bucket = this.#listeners.get(event.type);
         if (bucket) {
-            // copy to allow removal during iteration
-            for (const fn of [...bucket]) {
+            const snapshot = [...bucket];
+            for (const entry of snapshot) {
                 if (event.propagationStopped) break;
-                // @ts-ignore
-                fn.call(this, event);
+                if (entry.once) {
+                    const idx = bucket.indexOf(entry);
+                    if (idx !== -1) bucket.splice(idx, 1);
+                }
+                const fn = entry.listener;
+                if (typeof fn === 'function') fn.call(this, event);
+                else (fn as any).handleEvent?.(event);
             }
         }
 
@@ -209,6 +228,7 @@ export class DOMException extends Error {
 
         this.name = name;
         this.code = DOMException.getErrorCode(name);
+        Object.setPrototypeOf(this, DOMException.prototype);
     }
 
     // Static error code constants (as defined in DOM Standard)
@@ -276,33 +296,17 @@ export class DOMException extends Error {
         return new DOMException(message, name);
     }
 
-    static indexSize(message?: string): DOMException {
-        return new DOMException(message, 'IndexSizeError');
+    static of(name: string, message?: string): DOMException {
+        return new DOMException(message, name);
     }
 
-    static hierarchyRequest(message?: string): DOMException {
-        return new DOMException(message, 'HierarchyRequestError');
-    }
-
-    static notFound(message?: string): DOMException {
-        return new DOMException(message, 'NotFoundError');
-    }
-
-    static security(message?: string): DOMException {
-        return new DOMException(message, 'SecurityError');
-    }
-
-    static syntax(message?: string): DOMException {
-        return new DOMException(message, 'SyntaxError');
-    }
-
-    static typeMismatch(message?: string): DOMException {
-        return new DOMException(message, 'TypeMismatchError');
-    }
-
-    static invalidState(message?: string): DOMException {
-        return new DOMException(message, 'InvalidStateError');
-    }
+    static indexSize(message?: string) { return DOMException.of('IndexSizeError', message); }
+    static hierarchyRequest(message?: string) { return DOMException.of('HierarchyRequestError', message); }
+    static notFound(message?: string) { return DOMException.of('NotFoundError', message); }
+    static security(message?: string) { return DOMException.of('SecurityError', message); }
+    static syntax(message?: string) { return DOMException.of('SyntaxError', message); }
+    static typeMismatch(message?: string) { return DOMException.of('TypeMismatchError', message); }
+    static invalidState(message?: string) { return DOMException.of('InvalidStateError', message); }
 }
 
 export class ProgressEvent<T extends EventTarget = EventTarget> extends Event implements globalThis.ProgressEvent<T> {
@@ -320,15 +324,10 @@ export class ProgressEvent<T extends EventTarget = EventTarget> extends Event im
     }
 }
 
-Reflect.set(globalThis, 'Event', Event);
-Reflect.set(globalThis, 'EventTarget', EventTarget);
-Reflect.set(globalThis, 'CustomEvent', CustomEvent);
-Reflect.set(globalThis, 'ErrorEvent', ErrorEvent);
-Reflect.set(globalThis, 'PromiseRejectionEvent', PromiseRejectionEvent);
-Reflect.set(globalThis, 'CloseEvent', CloseEvent);
-Reflect.set(globalThis, 'MessageEvent', MessageEvent);
-Reflect.set(globalThis, 'DOMException', DOMException);
-Reflect.set(globalThis, 'ProgressEvent', ProgressEvent);
+for (const [name, cls] of Object.entries({
+    Event, EventTarget, CustomEvent, ErrorEvent, PromiseRejectionEvent,
+    CloseEvent, MessageEvent, DOMException, ProgressEvent,
+})) Reflect.set(globalThis, name, cls);
 
 export const parseStackFrame = (
     line: string

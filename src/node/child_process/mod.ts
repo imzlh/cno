@@ -294,7 +294,7 @@ export function spawn(command: string, argsOrOptions?: string[] | SpawnOptions, 
         const defaultShell = isWindows ? 'cmd.exe' : '/bin/sh';
         const shell = typeof opts.shell === 'string' ? opts.shell : defaultShell;
         const shellArg = isWindows ? '/c' : '-c';
-        args = [shellArg, args.length > 0 ? `${command} ${args.join(' ')}` : command];
+        args = [shellArg, args.length > 0 ? `${command} ${args.join(' ')}` : `"${command}"`];
         command = shell;
     }
 
@@ -572,7 +572,7 @@ export function execSync(command: string, options?: ExecOptions): Buffer | strin
     const defaultShell = isWindows ? 'cmd.exe' : '/bin/sh';
     const shellArg = isWindows ? '/c' : '-c';
     const { encoding, maxBuffer, ...spawnOpts } = options ?? {} as any;
-    const result = spawnSync(defaultShell, [shellArg, command], spawnOpts as SpawnOptions);
+    const result = spawnSync(defaultShell, [shellArg, command], { ...spawnOpts, encoding } as SpawnOptions);
     if (result.error) throw result.error;
     if (result.status !== 0) {
         throw new Error(`Command failed: ${command}`);

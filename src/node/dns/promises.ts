@@ -161,9 +161,21 @@ export async function resolveSoa(hostname: string): Promise<SoaRecord> {
     return await resolve(hostname, 'SOA') as SoaRecord;
 }
 
+function expandIPv6(ip: string): string {
+    if (ip.includes('::')) {
+        const [left, right] = ip.split('::');
+        const leftParts = left ? left.split(':') : [];
+        const rightParts = right ? right.split(':') : [];
+        const missing = 8 - leftParts.length - rightParts.length;
+        return [...leftParts, ...Array(missing).fill('0'), ...rightParts]
+            .map(p => p.padStart(4, '0')).join('');
+    }
+    return ip.split(':').map(p => p.padStart(4, '0')).join('');
+}
+
 export async function reverse(ip: string): Promise<string[]> {
     const ptrName = ip.includes(':')
-        ? ip.replace(/:/g, '').split('').reverse().join('.') + '.ip6.arpa'
+        ? expandIPv6(ip).split('').reverse().join('.') + '.ip6.arpa'
         : ip.split('.').reverse().join('.') + '.in-addr.arpa';
     return await resolve(ptrName, 'PTR') as string[];
 }

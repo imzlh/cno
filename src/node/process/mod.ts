@@ -212,7 +212,7 @@ export function memoryUsage(): NodeJS.MemoryUsage {
     const memory = os.memoryUsage();
     return {
         rss: memory['os.rss'],
-        heapTotal: memory['os.total'] - memory['os.free'],
+        heapTotal: memory['used'],
         heapUsed: memory['used'],
         external: memory['vm.used'],
         arrayBuffers: memory['buffer.used'],

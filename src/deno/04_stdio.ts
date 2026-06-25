@@ -70,28 +70,26 @@ export class Stream {
     @wrap
     async write(data: Uint8Array) {
         lock(this.fd);
-        let w = await this.stream.write(data);
-        unlock(this.fd);
-        return w;
+        try { return await this.stream.write(data); }
+        finally { unlock(this.fd); }
     }
 
     @wrap
     async read(buf: Uint8Array<ArrayBuffer>): Promise<number | null> {
         lock(this.fd);
-        let r;
-        if (this.type == 'file') {
-            r = await (this.stream as FSFile).read(buf);
-        } else {
-            const stream = (this.stream as CModuleStreams.Stream);
-            try {
-                const n = await stream.read(buf);
-                r = n === 0 ? null : n;
-            } catch (e) {
-                r = null;
+        try {
+            if (this.type == 'file') {
+                return await (this.stream as FSFile).read(buf);
+            } else {
+                const stream = (this.stream as CModuleStreams.Stream);
+                try {
+                    const n = await stream.read(buf);
+                    return n === 0 ? null : n;
+                } catch {
+                    return null;
+                }
             }
-        }
-        unlock(this.fd);
-        return r;
+        } finally { unlock(this.fd); }
     }
 
     @wrap

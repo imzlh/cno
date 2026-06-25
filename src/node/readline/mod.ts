@@ -71,7 +71,7 @@ export class Interface extends EventEmitter {
     private _readBuf = new Uint8Array(4096);
     private _lineBuf: string[] = [];
     private _reading = false;
-    private _decoder = new text.Decoder();
+    private _decoder = new text.Decoder(undefined, { stream: true });
 
     constructor(options: ReadLineOptions | NodeJS.ReadableStream) {
         super();
@@ -91,7 +91,7 @@ export class Interface extends EventEmitter {
         if (opts.prompt) this._displayPrompt();
         if (!this._paused) this._startRead();
 
-        if (stdin.isTTY)  try {
+        if (this._terminal && stdin.isTTY)  try {
             const stream = stdin.__stream as CModuleStreams.TTY;
             this._prevMode = stream.mode;
             stream.mode = streams.TTY_MODE_RAW_VT;

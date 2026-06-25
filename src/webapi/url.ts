@@ -296,9 +296,9 @@ class URL implements globalThis.URL {
         }
     }
 
-    static canParse(url: string): boolean {
+    static canParse(url: string, base?: string): boolean {
         try {
-            new URL(url);
+            new URL(url, base);
             return true;
         } catch {
             return false;
@@ -513,6 +513,9 @@ class URL implements globalThis.URL {
     }
 
     set href(value: string) {
+        this.#scheme = ''; this.#host = ''; this.#port = '';
+        this.#username = ''; this.#password = '';
+        this.#path = []; this.#query = ''; this.#fragment = '';
         this.#parse(value);
     }
 
@@ -579,21 +582,33 @@ class URL implements globalThis.URL {
         if (this.#scheme === 'file') return;
 
         const str = String(value);
-        const colonIndex = str.lastIndexOf(':');
+        let hostPart: string;
+        let portStr = '';
 
-        if (colonIndex === -1) {
-            this.#host = str.toLowerCase();
-            this.#port = '';
+        if (str.startsWith('[')) {
+            const endBracket = str.indexOf(']');
+            if (endBracket === -1) { this.#host = str.toLowerCase(); this.#port = ''; return; }
+            hostPart = str.slice(0, endBracket + 1).toLowerCase();
+            if (str[endBracket + 1] === ':') portStr = str.slice(endBracket + 2);
         } else {
-            this.#host = str.slice(0, colonIndex).toLowerCase();
-            const portStr = str.slice(colonIndex + 1);
-            if (/^\d+$/.test(portStr)) {
-                const port = parseInt(portStr, 10);
-                if (port <= 65535) {
-                    const defaultPort = SPECIAL_SCHEMES[this.#scheme];
-                    this.#port = defaultPort === port ? '' : String(port);
-                }
+            const colonIndex = str.lastIndexOf(':');
+            if (colonIndex === -1) {
+                hostPart = str.toLowerCase();
+            } else {
+                hostPart = str.slice(0, colonIndex).toLowerCase();
+                portStr = str.slice(colonIndex + 1);
             }
+        }
+
+        this.#host = hostPart;
+        if (portStr && /^\d+$/.test(portStr)) {
+            const port = parseInt(portStr, 10);
+            if (port <= 65535) {
+                const defaultPort = SPECIAL_SCHEMES[this.#scheme];
+                this.#port = defaultPort === port ? '' : String(port);
+            }
+        } else {
+            this.#port = '';
         }
     }
 

@@ -5,127 +5,16 @@
 const asfs = import.meta.use('asyncfs');
 const engine = import.meta.use('engine');
 const fs = import.meta.use('fs');
-import { FileHandle } from 'fs/promises';
-import { toUint8Array, decodeBuffer, toNodeStatAsync, toNodeDirentAsync, parseFlags, pathToString, splitPathOrFd, removeRecursive, mkdirRecursive, modeToNumber, timeToNumber, readFileFromFdAsync, type PathLike, type TimeLike, type Mode } from './utils';
+import { toUint8Array, decodeBuffer, toNodeStatAsync, toNodeDirentAsync, parseFlags, pathToString, splitPathOrFd, removeRecursive, mkdirRecursive, modeToNumber, timeToNumber, readFileFromFdSync, createFileHandle, type PathLike, type TimeLike, type Mode } from './utils';
 import { toErrnoException, wrapPromise } from '../_internal/errno';
 import { getTierLimits } from '../_internal/memory';
-import type { Dirent, StatFsOptions, Stats } from 'fs';
+import type { Dirent } from 'fs';
 
 const { readBufSize: READ_BUF_SIZE } = getTierLimits();
 
 // Helper: wrap asyncfs calls, auto-convert errno to ErrnoException
 function w<T>(promise: Promise<T>, syscall: string, path: string): Promise<T> {
     return wrapPromise(promise, syscall, path);
-}
-
-// ============================================================================
-// FileHandle implementation
-// ============================================================================
-
-class FileHandleImpl implements FileHandle {
-    constructor(
-        public fd: number,
-        private handle: CModuleAsyncFS.FileHandle
-    ) {}
-
-    async read(buffer: Uint8Array, offset?: number, length?: number, position?: number | null): Promise<{ bytesRead: number; buffer: Uint8Array }>;
-    async read(options?: { buffer?: Uint8Array; offset?: number; length?: number; position?: number | null }): Promise<{ bytesRead: number; buffer: Uint8Array }>;
-    async read(...args: any[]): Promise<{ bytesRead: number; buffer: Uint8Array }> {
-        if (args.length === 1 && typeof args[0] === 'object') {
-            const { buffer = new Uint8Array(16384), offset = 0, length = buffer.length, position = null } = args[0];
-            const bytesRead = await this.handle.read(buffer.subarray(offset, offset + length), position);
-            return { bytesRead, buffer };
-        }
-
-        const [buffer, offset = 0, length = buffer.length, position = null] = args;
-        const bytesRead = await this.handle.read(buffer.subarray(offset, offset + length), position);
-        return { bytesRead, buffer };
-    }
-
-    async write(buffer: Uint8Array | string, offset?: any, length?: any, position?: number | null): Promise<{ bytesWritten: number; buffer: any }> {
-        const data = typeof buffer === 'string' ? toUint8Array(buffer) : buffer;
-        const actualOffset = typeof offset === 'number' ? offset : 0;
-        const actualLength = typeof length === 'number' ? length : data.length - actualOffset;
-        const bytesWritten = await this.handle.write(
-            data.subarray(actualOffset, actualOffset + actualLength) as Uint8Array<ArrayBuffer>, 
-            position ?? null
-        );
-        return { bytesWritten, buffer: data };
-    }
-
-    async close(): Promise<void> {
-        await this.handle.close();
-    }
-
-    // @ts-ignore
-    async stat(ops: StatFsOptions = {}): Promise<Stats> {
-        if (ops.bigint) throw new Error('bigint option is not supported');
-        const st = await this.handle.stat();
-        return toNodeStatAsync(st);
-    }
-
-    async sync(): Promise<void> {
-        await this.handle.sync();
-    }
-
-    async datasync(): Promise<void> {
-        await this.handle.datasync();
-    }
-
-    async truncate(len?: number): Promise<void> {
-        await this.handle.truncate(len ?? 0);
-    }
-
-    async chmod(mode: Mode): Promise<void> {
-        await this.handle.chmod(modeToNumber(mode)!);
-    }
-
-    async chown(uid: number, gid: number): Promise<void> {
-        await this.handle.chown(uid, gid);
-    }
-
-    async utimes(atime: TimeLike, mtime: TimeLike): Promise<void> {
-        await this.handle.utime(timeToNumber(atime) / 1000, timeToNumber(mtime) / 1000);
-    }
-
-    async appendFile(data: string | Uint8Array | ArrayBuffer, options?: { encoding?: BufferEncoding | null; mode?: Mode; flag?: string | number } | BufferEncoding): Promise<void> {
-        const buffer = toUint8Array(data);
-        await this.handle.write(buffer);
-    }
-
-    // @ts-ignore
-    async readFile(options?: { encoding?: BufferEncoding | null; flag?: string | number } | BufferEncoding): Promise<string | Uint8Array> {
-        const stat = await this.handle.stat();
-        const buffer = new Uint8Array(stat.size);
-        let offset = 0;
-
-        while (offset < stat.size) {
-            const bytesRead = await this.handle.read(buffer.subarray(offset), null);
-            if (bytesRead === 0) break;
-            offset += bytesRead;
-        }
-
-        const encoding = typeof options === 'string' ? options : options?.encoding;
-        return decodeBuffer(buffer, encoding);
-    }
-
-    async writeFile(data: string | Uint8Array | ArrayBuffer, options?: { encoding?: BufferEncoding | null; mode?: Mode; flag?: string | number } | BufferEncoding): Promise<void> {
-        const buffer = toUint8Array(data);
-        await this.handle.write(buffer);
-    }
-
-    // @ts-ignore
-    readableWebStream(options?: { type?: 'bytes' }): never {
-        throw new Error('readableWebStream is not implemented');
-    }
-
-    writableWebStream(options?: { type?: 'bytes' }): WritableStream<Uint8Array> {
-        throw new Error('writableWebStream is not implemented');
-    }
-
-    [Symbol.asyncDispose](): Promise<void> {
-        return this.close();
-    }
 }
 
 // ============================================================================
@@ -136,22 +25,7 @@ export async function readFile(path: PathLike | number, options?: { encoding?: B
     const target = splitPathOrFd(path as PathLike | number);
     const encoding = typeof options === 'string' ? options : options?.encoding;
     const buffer = 'fd' in target
-        ? (() => {
-            const chunks: Uint8Array[] = [];
-            const buf = new Uint8Array(READ_BUF_SIZE);
-            let bytesRead = 0;
-            while ((bytesRead = fs.read(target.fd, buf)) > 0) {
-                chunks.push(buf.slice(0, bytesRead));
-            }
-            const total = chunks.reduce((n, chunk) => n + chunk.length, 0);
-            const out = new Uint8Array(total);
-            let offset = 0;
-            for (const chunk of chunks) {
-                out.set(chunk, offset);
-                offset += chunk.length;
-            }
-            return out;
-        })()
+        ? readFileFromFdSync(fs.read, target.fd, READ_BUF_SIZE)
         : await w(asfs.readFile(target.path), 'readFile', target.path);
     return decodeBuffer(buffer, encoding);
 }
@@ -449,12 +323,12 @@ export async function statfs(path: PathLike, options?: { bigint?: boolean }): Pr
 // Open file
 // ============================================================================
 
-export async function open(path: PathLike, flags?: string | number, mode?: Mode): Promise<FileHandleImpl> {
+export async function open(path: PathLike, flags?: string | number, mode?: Mode) {
     const flag = parseFlags(flags);
     const modeNum = modeToNumber(mode);
     const pathStr = pathToString(path);
     const handle = await w(asfs.open(pathStr, flag, modeNum), 'open', pathStr);
-    return new FileHandleImpl(handle.fileno(), handle);
+    return createFileHandle(handle.fileno(), handle);
 }
 
 // ============================================================================

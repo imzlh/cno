@@ -27,7 +27,7 @@ export function randomInt(min: number, max?: number, callback?: (err: Error | nu
     const result = min + (value % range);
 
     if (callback) {
-        callback(null, result);
+        queueMicrotask(() => callback(null, result));
         return;
     }
     return result;

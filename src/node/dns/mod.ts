@@ -208,6 +208,9 @@ export function resolve(hostname: string, rrtype?: any, callback?: any): void {
                 callback(null, answers.map((a: any) => a.ptr));
             } else if (rrtype === 'SOA') {
                 const a = answers[0] as CModuleDNS.SoaAnswer;
+                if (!a) {
+                    callback(toErrnoException(new Error('ENODATA'), 'query', hostname), null as any);
+                } else {
                 callback(null, {
                     nsname: a.name,
                     hostmaster: a.admin,
@@ -217,6 +220,7 @@ export function resolve(hostname: string, rrtype?: any, callback?: any): void {
                     expire: a.expire,
                     minttl: a.minimum,
                 });
+                }
             } else if (rrtype === 'SRV') {
                 callback(null, answers.map((a: any) => ({
                     priority: a.priority,
@@ -254,7 +258,7 @@ export function resolve4(hostname: string, options?: any, callback?: any): void 
                 callback(null, answers.map((a: any) => a.address));
             }
         },
-        err => callback(toErrnoException(err, 'resolve4'))
+        err => callback(toErrnoException(err, 'resolve4', hostname))
     );
 }
 
@@ -274,7 +278,7 @@ export function resolve6(hostname: string, options?: any, callback?: any): void 
                 callback(null, answers.map((a: any) => a.address));
             }
         },
-        err => callback(toErrnoException(err, 'resolve6'))
+        err => callback(toErrnoException(err, 'resolve6', hostname))
     );
 }
 
@@ -297,7 +301,7 @@ export function resolveNs(hostname: string, callback: (err: NodeJS.ErrnoExceptio
 export function resolveTxt(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[][]) => void): void {
     dns.query(hostname, dns.TXT).then(
         answers => callback(null, answers.map((a: any) => [a.txt])),
-        err => callback(toErrnoException(err, 'resolveTxt'), [])
+        err => callback(toErrnoException(err, 'resolveTxt', hostname), null as any)
     );
 }
 
@@ -321,9 +325,21 @@ export function resolveNaptr(hostname: string, callback: (err: NodeJS.ErrnoExcep
 // reverse
 // ============================================================================
 
+function expandIPv6(ip: string): string {
+    if (ip.includes('::')) {
+        const [left, right] = ip.split('::');
+        const leftParts = left ? left.split(':') : [];
+        const rightParts = right ? right.split(':') : [];
+        const missing = 8 - leftParts.length - rightParts.length;
+        return [...leftParts, ...Array(missing).fill('0'), ...rightParts]
+            .map(p => p.padStart(4, '0')).join('');
+    }
+    return ip.split(':').map(p => p.padStart(4, '0')).join('');
+}
+
 export function reverse(ip: string, callback: (err: NodeJS.ErrnoException | null, hostnames: string[]) => void): void {
     const ptrName = ip.includes(':')
-        ? ip.replace(/:/g, '').split('').reverse().join('.') + '.ip6.arpa'
+        ? expandIPv6(ip).split('').reverse().join('.') + '.ip6.arpa'
         : ip.split('.').reverse().join('.') + '.in-addr.arpa';
     resolve(ptrName, 'PTR', callback);
 }

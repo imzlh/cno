@@ -110,11 +110,7 @@ function registerBench(def: Deno.BenchDefinition): void {
     benchRegistry.push(def);
 }
 
-function isTestDefinition(obj: unknown): obj is Deno.TestDefinition {
-    return typeof obj === 'object' && obj !== null && 'fn' in obj && 'name' in obj;
-}
-
-function isBenchDefinition(obj: unknown): obj is Deno.BenchDefinition {
+function isDefinition(obj: unknown): obj is Deno.TestDefinition {
     return typeof obj === 'object' && obj !== null && 'fn' in obj && 'name' in obj;
 }
 
@@ -137,6 +133,27 @@ function parseTestArgs(args: unknown[], extra?: Partial<Deno.TestDefinition>): D
         return { name: args[0] as string, fn: args[2] as any, ...opts, ...extra };
     }
     throw new TypeError('Invalid test definition');
+}
+
+function parseBenchArgs(args: unknown[]): Deno.BenchDefinition {
+    if (args.length === 1) {
+        const arg = args[0];
+        if (isDefinition(arg)) return { name: (arg as any).name, fn: (arg as any).fn, ...(arg as any) };
+        if (typeof arg === 'function') return { name: arg.name || 'anonymous', fn: arg as any };
+        throw new TypeError('Invalid bench definition');
+    } else if (args.length === 2) {
+        const [a, b] = args;
+        if (typeof a === 'string') return { name: a, fn: b as any };
+        if (typeof a === 'object' && typeof b === 'function') {
+            const { name: _n, fn: _f, ...opts } = a as any;
+            return { name: (b as any).name || 'anonymous', fn: b as any, ...opts };
+        }
+        throw new TypeError('Invalid bench definition');
+    } else if (args.length === 3) {
+        const { name: _n, fn: _f, ...opts } = args[1] as any;
+        return { name: args[0] as string, fn: args[2] as any, ...opts };
+    }
+    throw new TypeError('Invalid bench definition');
 }
 
 function createTestFunction(): Deno.DenoTest {
@@ -162,47 +179,7 @@ function createBenchFunction(): {
     (options: Omit<Deno.BenchDefinition, "fn" | "name">, fn: (b: Deno.BenchContext) => void | Promise<void>): void;
 } {
     const benchFn = (...args: unknown[]) => {
-        let def: Deno.BenchDefinition;
-
-        if (args.length === 1) {
-            const arg = args[0];
-            if (isBenchDefinition(arg)) {
-                def = arg;
-            } else if (typeof arg === 'function') {
-                def = { name: arg.name || 'anonymous', fn: arg as (b: Deno.BenchContext) => void | Promise<void> };
-            } else {
-                throw new TypeError('Invalid bench definition');
-            }
-        } else if (args.length === 2) {
-            const [nameOrOptions, fnOrOptions] = args;
-            if (typeof nameOrOptions === 'string') {
-                def = {
-                    name: nameOrOptions,
-                    fn: fnOrOptions as (b: Deno.BenchContext) => void | Promise<void>
-                };
-            } else if (typeof nameOrOptions === 'object' && typeof fnOrOptions === 'function') {
-                const opts = nameOrOptions as Omit<Deno.BenchDefinition, 'fn' | 'name'>;
-                const fn2 = fnOrOptions as (b: Deno.BenchContext) => void | Promise<void>;
-                def = {
-                    name: fnOrOptions.name || 'anonymous',
-                    fn: fn2,
-                    ...opts
-                };
-            } else {
-                throw new TypeError('Invalid bench definition');
-            }
-        } else if (args.length === 3) {
-            const [name, options, fn] = args;
-            def = {
-                name: name as string,
-                fn: fn as (b: Deno.BenchContext) => void | Promise<void>,
-                ...(options as Omit<Deno.BenchDefinition, 'fn' | 'name'>)
-            };
-        } else {
-            throw new TypeError('Invalid bench definition');
-        }
-
-        registerBench(def);
+        registerBench(parseBenchArgs(args));
     };
 
     return benchFn as {

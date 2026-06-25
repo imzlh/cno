@@ -62,7 +62,7 @@ class PtyProcess implements CNO.PtyPipe {
         if (opts.argv && opts.argv.length > 0) {
             this.#proc = process.spawn(opts.argv, spawnOpts);
         } else {
-            this.#proc = process.spawn([opts.name ?? osShell, ...(opts.argv ?? [])], spawnOpts);
+            this.#proc = process.spawn([opts.name ?? osShell], spawnOpts);
         }
         this.#readable = pipeToReadable(this.#proc.readable!);
         this.#writable = pipeToWritable(this.#proc.writable!);

@@ -39,7 +39,7 @@ export function optionsToMode(options: Deno.OpenOptions): CModuleFS.OpenFlags {
             return 'r+';
         } else {
             // Write-only mode
-            return truncate ? 'w' : 'r+'; // Fallback to r+ if no truncate
+            return truncate ? 'w' : 'a';
         }
     }
 

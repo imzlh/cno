@@ -17,22 +17,7 @@ export function readFileSync(path: PathLike | number, options?: { encoding?: Buf
     const target = splitPathOrFd(path as PathLike | number);
     const encoding = typeof options === 'string' ? options : options?.encoding;
     const buffer = 'fd' in target
-        ? wrapSync(() => {
-            const chunks: Uint8Array[] = [];
-            const buf = new Uint8Array(READ_BUF_SIZE);
-            let bytesRead = 0;
-            while ((bytesRead = fs.read(target.fd, buf)) > 0) {
-                chunks.push(buf.slice(0, bytesRead));
-            }
-            const total = chunks.reduce((n, chunk) => n + chunk.length, 0);
-            const out = new Uint8Array(total);
-            let offset = 0;
-            for (const chunk of chunks) {
-                out.set(chunk, offset);
-                offset += chunk.length;
-            }
-            return out;
-        }, 'readFileSync', describeFd(target.fd))
+        ? wrapSync(() => readFileFromFdSync(fs.read, target.fd, READ_BUF_SIZE), 'readFileSync', describeFd(target.fd))
         : wrapSync(() => new Uint8Array(fs.readFile(target.path)), 'readFileSync', target.path);
     return decodeBuffer(buffer, encoding);
 }
@@ -48,7 +33,7 @@ export function writeFileSync(path: PathLike | number, data: string | Uint8Array
         }, 'writeFileSync', describeFd(target.fd));
         return;
     }
-    wrapSync(() => fs.writeFile(target.path, buffer.buffer as ArrayBuffer, mode), 'writeFileSync', target.path);
+    wrapSync(() => fs.writeFile(target.path, buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength), mode), 'writeFileSync', target.path);
 }
 
 export function appendFileSync(path: PathLike | number, data: string | Uint8Array | ArrayBuffer, options?: { encoding?: BufferEncoding | null; mode?: Mode; flag?: string | number } | BufferEncoding | number): void {

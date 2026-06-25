@@ -135,7 +135,10 @@ export function totalmem(): number {
  * Returns an array of CPU information
  */
 export function cpus(): CpuInfo[] {
-    return os.cpuInfo();
+    return os.cpuInfo().map((cpu: any) => ({
+        ...cpu,
+        times: cpu.times ?? { user: 0, nice: 0, sys: 0, idle: 0, irq: 0 },
+    }));
 }
 
 /**
@@ -172,7 +175,7 @@ export function networkInterfaces(): NodeJS.Dict<NetworkInterfaceInfo[]> {
         }
 
         const isIPv6 = iface.address.includes(':');
-        const cidr = `${iface.address}/${isIPv6 ? 128 : 32}`;
+        const cidr = (iface as any).cidr ?? `${iface.address}/${isIPv6 ? 128 : 32}`;
 
         if (isIPv6) {
             result[iface.name]!.push({
@@ -280,9 +283,9 @@ export function platform(): NodeJS.Platform {
             return 'darwin';
         case 'Windows_NT':
             return 'win32';
-        case 'Freebsd':
+        case 'FreeBSD':
             return 'freebsd';
-        case 'Openbsd':
+        case 'OpenBSD':
             return 'openbsd';
         case 'Sunos':
             return 'sunos';

@@ -5,8 +5,10 @@ import { createStorageManager } from './storage';
 import { createNetworkInformation } from './connection';
 import { createDirectSockets } from './sockets';
 import { DOMException, EventTarget } from '../events';
+import { LockManager } from '../lock';
 
 const os = import.meta.use('os');
+const _lockManager = new LockManager();
 
 class BatteryManagerImpl extends EventTarget implements BatteryManager {
     readonly charging: boolean = true;
@@ -122,8 +124,8 @@ class NavigatorImpl implements Navigator {
         return this._opensocket;
     }
 
-    get locks(): never {
-        throw new DOMException('Not implemented', 'DOMException');
+    get locks(): LockManager {
+        return _lockManager;
     }
 
     async getBattery(): Promise<BatteryManager> {

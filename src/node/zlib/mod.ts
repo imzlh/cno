@@ -176,6 +176,7 @@ export class Inflate extends Transform {
     _handle: any;
     constructor(o?: ZlibOptions & TransformOptions) { super(o); this._handle = zlib.createInflate(); }
     _transform(chunk: any, _e: BufferEncoding, cb: any) { _doTransform(this._handle, chunk, false, cb); }
+    _flush(cb: any) { _doFlush(this._handle, cb); }
 }
 
 export class Gzip extends Transform {
@@ -189,6 +190,7 @@ export class Gunzip extends Transform {
     _handle: any;
     constructor(o?: ZlibOptions & TransformOptions) { super(o); this._handle = zlib.createGunzip(); }
     _transform(chunk: any, _e: BufferEncoding, cb: any) { _doTransform(this._handle, chunk, false, cb); }
+    _flush(cb: any) { _doFlush(this._handle, cb); }
 }
 
 export class DeflateRaw extends Transform {
@@ -202,12 +204,14 @@ export class InflateRaw extends Transform {
     _handle: any;
     constructor(o?: ZlibOptions & TransformOptions) { super(o); this._handle = zlib.createInflateRaw(); }
     _transform(chunk: any, _e: BufferEncoding, cb: any) { _doTransform(this._handle, chunk, false, cb); }
+    _flush(cb: any) { _doFlush(this._handle, cb); }
 }
 
 export class Unzip extends Transform {
     _handle: any;
-    constructor(o?: ZlibOptions & TransformOptions) { super(o); this._handle = zlib.createInflate(); }
+    constructor(o?: ZlibOptions & TransformOptions) { super(o); this._handle = zlib.createUnzip(); }
     _transform(chunk: any, _e: BufferEncoding, cb: any) { _doTransform(this._handle, chunk, false, cb); }
+    _flush(cb: any) { _doFlush(this._handle, cb); }
 }
 
 // ============================================================================

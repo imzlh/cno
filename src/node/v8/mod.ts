@@ -51,20 +51,12 @@ export function enableTimeTravel(): void {}
 export function disableTimeTravel(): void {}
 
 export function deserialize(buf: Buffer | Uint8Array): any {
-    try {
-        return engine.deserialize(new Uint8Array(buf));
-    } catch {
-        return null;
-    }
+    return engine.deserialize(new Uint8Array(buf));
 }
 
 export function serialize(value: any): Buffer {
-    try {
-        const bytes = engine.serialize(value);
-        return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-    } catch {
-        return Buffer.alloc(0);
-    }
+    const bytes = engine.serialize(value);
+    return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
 }
 
 export class Serializer {
@@ -102,19 +94,11 @@ export class Deserializer {
     }
     readHeader(): boolean { return true; }
     readValue(): any {
+        if (this._offset >= this._buffer.byteLength) return undefined;
         try {
             const remaining = this._buffer.slice(this._offset);
             const result = engine.deserialize(remaining);
-            // Advance offset past the consumed data. The engine deserializer
-            // processes one value; we approximate offset by re-serializing the
-            // consumed portion to know its byte length.
-            try {
-                const consumed = engine.serialize(result);
-                this._offset += new Uint8Array(consumed).byteLength;
-            } catch {
-                // If re-serialization fails, mark all data consumed
-                this._offset = this._buffer.byteLength;
-            }
+            this._offset = this._buffer.byteLength;
             return result;
         } catch {
             return undefined;

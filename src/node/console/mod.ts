@@ -79,7 +79,7 @@ function formatValue(val: unknown, depth = 0): string {
     }
     if (val === null) return 'null';
     if (val === undefined) return 'undefined';
-    if (typeof val === 'string') return val.length > 100 ? val.slice(0, 97) + '...' : val;
+    if (typeof val === 'string') return val.length > 200 ? val.slice(0, 197) + '...' : val;
     if (typeof val === 'number' || typeof val === 'boolean' || typeof val === 'bigint') return String(val);
     if (typeof val === 'symbol') return val.toString();
     if (typeof val === 'function') return `[Function: ${val.name || 'anonymous'}]`;
@@ -127,6 +127,11 @@ function applyFormat(format: string, args: unknown[]): { text: string; consumed:
     while (i < format.length) {
         if (format[i] === '%' && i + 1 < format.length) {
             const spec = format[i + 1];
+            if (spec === '%') {
+                result += '%';
+                i += 2;
+                continue;
+            }
             if (argIdx < args.length) {
                 const arg = args[argIdx++];
                 switch (spec) {
@@ -153,6 +158,19 @@ function applyFormat(format: string, args: unknown[]): { text: string; consumed:
                         }
                         i += 2;
                         continue;
+                    case 'x':
+                    case 'X':
+                        {
+                            const num = Number(arg);
+                            if (isNaN(num)) { result += 'NaN'; }
+                            else { result += (spec === 'X' ? Math.abs(Math.floor(num)) >>> 0 : Math.floor(num) >>> 0).toString(16); }
+                        }
+                        i += 2;
+                        continue;
+                    case 'j':
+                        try { result += JSON.stringify(arg); } catch { result += String(arg); }
+                        i += 2;
+                        continue;
                     case 'o':
                     case 'O':
                         try {
@@ -171,10 +189,6 @@ function applyFormat(format: string, args: unknown[]): { text: string; consumed:
                         continue;
                     case 'c':
                         result += cssToAnsi(String(arg));
-                        i += 2;
-                        continue;
-                    case '%':
-                        result += '%';
                         i += 2;
                         continue;
                 }

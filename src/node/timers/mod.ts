@@ -22,9 +22,17 @@ export interface TimerOptions {
 class Timeout implements NodeJS.Timeout {
     #id: any;
     #refed = true;
+    #isInterval: boolean;
+    #fn?: Function;
+    #ms?: number;
+    #args?: any[];
 
-    constructor(id: any) {
+    constructor(id: any, isInterval = false, fn?: Function, ms?: number, args?: any[]) {
         this.#id = id;
+        this.#isInterval = isInterval;
+        this.#fn = fn;
+        this.#ms = ms;
+        this.#args = args;
     }
 
     hasRef(): boolean {
@@ -42,11 +50,18 @@ class Timeout implements NodeJS.Timeout {
     }
 
     refresh(): this {
+        if (this.#fn) {
+            const clearFn = this.#isInterval ? timer.clearInterval : timer.clearTimeout;
+            clearFn(this.#id);
+            const setFn = this.#isInterval ? timer.setInterval : timer.setTimeout;
+            this.#id = setFn(this.#fn, this.#ms, ...(this.#args ?? []));
+        }
         return this;
     }
 
     close(): this {
-        timer.clearTimeout(this.#id);
+        const clearFn = this.#isInterval ? timer.clearInterval : timer.clearTimeout;
+        clearFn(this.#id);
         return this;
     }
 
@@ -55,7 +70,8 @@ class Timeout implements NodeJS.Timeout {
     }
 
     [Symbol.dispose](): void {
-        timer.clearTimeout(this.#id);
+        const clearFn = this.#isInterval ? timer.clearInterval : timer.clearTimeout;
+        clearFn(this.#id);
     }
 
     get _onTimeout(): any {
@@ -93,6 +109,11 @@ class Immediate implements NodeJS.Immediate {
         this.#canceled = true;
     }
 
+    close(): this {
+        this.#canceled = true;
+        return this;
+    }
+
     get _onImmediate(): any {
         return this.handle;
     }
@@ -103,13 +124,15 @@ class Immediate implements NodeJS.Immediate {
 // ============================================================================
 
 export function setTimeout<T>(callback: (...args: T[]) => void, ms?: number, ...args: T[]): NodeJS.Timeout {
-    const id = timer.setTimeout(callback, ms ?? 0, ...args);
-    return new Timeout(id);
+    const delay = ms ?? 1;
+    const id = timer.setTimeout(callback, delay, ...args);
+    return new Timeout(id, false, callback, delay, args);
 }
 
 export function setInterval<T>(callback: (...args: T[]) => void, ms?: number, ...args: T[]): NodeJS.Timeout {
-    const id = timer.setInterval(callback, ms ?? 0, ...args);
-    return new Timeout(id);
+    const delay = ms ?? 1;
+    const id = timer.setInterval(callback, delay, ...args);
+    return new Timeout(id, true, callback, delay, args);
 }
 
 export function setImmediate<T>(callback: (...args: T[]) => void, ...args: T[]): NodeJS.Immediate {

@@ -135,7 +135,7 @@ export class Socket extends EventEmitter {
 
             const flags = this._ipv6Only ? udp.UDP_IPV6ONLY : 0;
 
-            this._handle!.bind({ ip: address, port });
+            this._handle!.bind({ ip: address, port, flags });
             this._bound = true;
 
             const sockname = this._handle!.getsockname();
@@ -221,8 +221,11 @@ export class Socket extends EventEmitter {
             cb?.(null, bytes);
             this.emit('send', bytes);
         } catch (err) {
-            cb?.(err as Error);
-            this.emit('error', err);
+            if (cb) {
+                cb(err as Error);
+            } else if (this.listenerCount('error') > 0) {
+                this.emit('error', err);
+            }
         }
     }
 

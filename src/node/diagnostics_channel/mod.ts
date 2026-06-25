@@ -31,19 +31,20 @@ export class Channel {
     }
 }
 
-const _channels = new Map<string, Channel>();
+const _channels = new Map<string, WeakRef<Channel>>();
 
 export function channel(name: string): Channel {
-    let ch = _channels.get(name);
+    let ref = _channels.get(name);
+    let ch = ref?.deref();
     if (!ch) {
         ch = new Channel(name);
-        _channels.set(name, ch);
+        _channels.set(name, new WeakRef(ch));
     }
     return ch;
 }
 
 export function hasSubscribers(name: string): boolean {
-    return _channels.get(name)?.hasSubscribers() ?? false;
+    return _channels.get(name)?.deref()?.hasSubscribers() ?? false;
 }
 
 export function subscribe(name: string, onMessage: (message: unknown, channelName: string) => void): void {
@@ -51,7 +52,7 @@ export function subscribe(name: string, onMessage: (message: unknown, channelNam
 }
 
 export function unsubscribe(name: string, onMessage: Function): void {
-    _channels.get(name)?.unsubscribe(onMessage);
+    _channels.get(name)?.deref()?.unsubscribe(onMessage);
 }
 
 export function tracingChannel(name: string): { start: Channel; end: Channel; asyncStart: Channel; asyncEnd: Channel; error: Channel } {

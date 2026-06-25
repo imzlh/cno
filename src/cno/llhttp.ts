@@ -287,25 +287,6 @@ function createResponseStreamParser(onMessage: (msg: CNO.HttpResponseMessage) =>
 // One-shot parse
 // ============================================================================
 
-function collectBody(stream: ReadableStream<Uint8Array> | null): Uint8Array | null {
-    if (!stream) return null;
-    const reader = stream.getReader();
-    const chunks: Uint8Array[] = [];
-    // Synchronous drain — one-shot parse only works if body is already buffered
-    // For true streaming, use StreamingParser
-    let done = false;
-    const drain = async () => {
-        while (!done) {
-            const r = await reader.read();
-            if (r.done) { done = true; break; }
-            chunks.push(r.value);
-        }
-    };
-    // We can't await here in sync context, so return the stream itself
-    // For parseRequest/parseResponse, the body is always fully available
-    return null; // body will be the stream
-}
-
 function parseRequest(data: Uint8Array | ArrayBuffer): CNO.HttpRequestMessage {
     const buf = data instanceof ArrayBuffer ? new Uint8Array(data) : data;
     let method: CNO.HttpMethod = 'GET';
@@ -391,8 +372,6 @@ function formatRequestHead(method: CNO.HttpMethod, url: string, headers: Headers
     const ver = options?.httpVersion ?? '1.1';
     const line = `${method} ${url} HTTP/${ver}\r\n`;
     const parts: Uint8Array[] = [encode(line)];
-
-    let needContentLength = !options?.noContentLength && !headers.has('content-length') && !headers.has('transfer-encoding');
 
     for (const [key, value] of headers) {
         parts.push(encode(`${key}: ${value}\r\n`));

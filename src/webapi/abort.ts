@@ -55,9 +55,10 @@ class AbortSignal extends EventTarget implements globalThis.AbortSignal {
             throw new TypeError('Invalid timeout value');
         }
 
-        setTimeout(() => {
+        const id = setTimeout(() => {
             signal._abort(new DOMException('Signal timed out', 'TimeoutError'));
         }, ms);
+        signal.addEventListener('abort', () => clearTimeout(id), { once: true });
 
         return signal;
     }
@@ -80,16 +81,23 @@ class AbortSignal extends EventTarget implements globalThis.AbortSignal {
         // Listen to all signals
         const handlers = new Map<globalThis.AbortSignal, () => void>();
 
+        const cleanup = () => {
+            for (const [s, h] of handlers) {
+                s.removeEventListener('abort', h);
+            }
+            handlers.clear();
+        };
+
         for (const signal of signals) {
             const handler = () => {
                 resultSignal._abort(signal.reason);
-                for (const [s, h] of handlers) {
-                    s.removeEventListener('abort', h);
-                }
+                cleanup();
             };
             handlers.set(signal, handler);
             signal.addEventListener('abort', handler);
         }
+
+        resultSignal.addEventListener('abort', cleanup, { once: true });
 
         return resultSignal;
     }

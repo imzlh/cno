@@ -3,6 +3,7 @@
  */
 
 import { Stats } from 'fs';
+import type { StatFsOptions } from 'fs';
 // @ts-ignore - dynamic import
 import { dirname } from '../path';
 import { fileURLToPath } from '../url';
@@ -93,10 +94,16 @@ export function toUint8Array(data: string | Uint8Array | ArrayBuffer): Uint8Arra
 }
 
 export function decodeBuffer(buffer: Uint8Array<ArrayBuffer>, encoding?: BufferEncoding | null): string | Uint8Array<ArrayBuffer> {
-    if (encoding) {
-        return engine.decodeString(buffer);
-    }
-    return buffer;
+    if (!encoding || encoding === 'buffer') return buffer;
+    return engine.decodeString(buffer);
+}
+
+export function concatChunks(chunks: Uint8Array[]): Uint8Array {
+    const total = chunks.reduce((n, c) => n + c.length, 0);
+    const out = new Uint8Array(total);
+    let off = 0;
+    for (const c of chunks) { out.set(c, off); off += c.length; }
+    return out;
 }
 
 // ============================================================================
@@ -285,4 +292,49 @@ export async function mkdirRecursive(pathStr: string, mode?: number): Promise<vo
             await asfs.mkdir(current, mode);
         }
     }
+}
+
+export function createFileHandle(fd: number, handle: CModuleAsyncFS.FileHandle) {
+    return {
+        fd,
+        async read(buffer: Uint8Array, offset?: number, length?: number, position?: number | null) {
+            const o = offset ?? 0, l = length ?? buffer.length;
+            const bytesRead = await handle.read(buffer.subarray(o, o + l), position ?? null);
+            return { bytesRead, buffer };
+        },
+        async write(buffer: Uint8Array | string, offset?: number, length?: number, position?: number | null) {
+            const data = typeof buffer === 'string' ? toUint8Array(buffer) : buffer;
+            const o = offset ?? 0, l = length ?? data.length;
+            const bytesWritten = await handle.write(data.subarray(o, o + l) as Uint8Array<ArrayBuffer>, position ?? null);
+            return { bytesWritten, buffer: data };
+        },
+        async close() { await handle.close(); },
+        async stat(ops?: StatFsOptions) {
+            if (ops?.bigint) throw new Error('bigint option is not supported');
+            return toNodeStatAsync(await handle.stat());
+        },
+        async sync() { await handle.sync(); },
+        async datasync() { await handle.datasync(); },
+        async truncate(len?: number) { await handle.truncate(len ?? 0); },
+        async chmod(mode: Mode) { await handle.chmod(modeToNumber(mode)!); },
+        async chown(uid: number, gid: number) { await handle.chown(uid, gid); },
+        async utimes(atime: TimeLike, mtime: TimeLike) {
+            await handle.utime(timeToNumber(atime) / 1000, timeToNumber(mtime) / 1000);
+        },
+        async appendFile(data: string | Uint8Array | ArrayBuffer) {
+            await handle.write(toUint8Array(data));
+        },
+        async readFile(options?: { encoding?: BufferEncoding | null } | BufferEncoding) {
+            const st = await handle.stat();
+            const buf = new Uint8Array(st.size);
+            let off = 0;
+            while (off < st.size) { const n = await handle.read(buf.subarray(off), null); if (n === 0) break; off += n; }
+            return decodeBuffer(buf, typeof options === 'string' ? options : options?.encoding);
+        },
+        async writeFile(data: string | Uint8Array | ArrayBuffer) {
+            await handle.truncate(0);
+            await handle.write(toUint8Array(data));
+        },
+        [Symbol.asyncDispose]() { return handle.close(); },
+    };
 }

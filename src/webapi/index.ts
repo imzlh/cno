@@ -118,6 +118,10 @@ await import('./broadcast-channel');
 // CacheStorage / Cache API
 await import('./cache');
 
+// Scheduling API (scheduler.postTask)
+const { scheduler } = await import('./scheduler');
+Reflect.set(globalThis, 'scheduler', scheduler);
+
 // Intl (partial support)
 await import('./intl');
 

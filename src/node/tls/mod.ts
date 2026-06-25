@@ -12,6 +12,7 @@ const streams = import.meta.use('streams');
 const os = import.meta.use('os');
 const ssl = import.meta.use('ssl');
 const engine = import.meta.use('engine');
+const dns = import.meta.use('dns');
 
 // ============================================================================
 // Types
@@ -97,16 +98,16 @@ export class SecureContext {
         const opts: CModuleSSL.ContextOptions = {};
 
         if (options?.key) {
-            opts.key = typeof options.key === 'string' ? options.key :
-                Array.isArray(options.key) ? (typeof options.key[0] === 'string' ? options.key[0] : options.key[0].pem as string) : undefined;
+            const k = Array.isArray(options.key) ? options.key[0] : options.key;
+            opts.key = typeof k === 'string' ? k : (k as any)?.pem ?? (k as any)?.key;
         }
         if (options?.cert) {
-            opts.cert = typeof options.cert === 'string' ? options.cert :
-                Array.isArray(options.cert) ? options.cert[0] : undefined;
+            const c = Array.isArray(options.cert) ? options.cert[0] : options.cert;
+            opts.cert = typeof c === 'string' ? c : (c as any)?.pem ?? (c as any)?.cert;
         }
         if (options?.ca) {
-            opts.ca = typeof options.ca === 'string' ? options.ca :
-                Array.isArray(options.ca) ? options.ca[0] : undefined;
+            const ca = Array.isArray(options.ca) ? options.ca : [options.ca];
+            opts.ca = ca.map(c => typeof c === 'string' ? c : (c as any)?.pem ?? (c as any)?.cert).join('\n');
         }
         if (options?.ciphers) opts.ciphers = options.ciphers;
         if (options?.minVersion) opts.minVersion = options.minVersion;
@@ -659,6 +660,8 @@ export function connect(portOrOptions: number | TlsConnectOptions, hostOrOptions
         ciphers: options.ciphers,
         minVersion: options.minVersion,
         maxVersion: options.maxVersion,
+        dhparam: options.dhparam,
+        ecdhCurve: options.ecdhCurve,
     });
 
     // If an existing socket was provided, upgrade it
@@ -696,19 +699,26 @@ export function connect(portOrOptions: number | TlsConnectOptions, hostOrOptions
         });
     }
 
-    tcp.connect({ ip: host, port: port! }).then(() => {
-        const localInfo = tcp.sockname;
-        tlsSocket.localAddress = localInfo.ip;
-        tlsSocket.localPort = localInfo.port;
-
-        const remoteInfo = tcp.peername;
-        tlsSocket.remoteAddress = remoteInfo.ip;
-        tlsSocket.remotePort = remoteInfo.port;
-        tlsSocket.remoteFamily = `IPv${remoteInfo.family}`;
-    }).catch((err) => {
-        tlsSocket.emit('error', err);
-        tlsSocket.destroy();
-    });
+    const connectAndHandshake = async () => {
+        try {
+            const isIPv6 = host.includes(':');
+            const addrs = await dns.resolve(host, { family: isIPv6 ? os.AF_INET6 : os.AF_INET });
+            const addr = addrs?.find((a: any) => a.family === (isIPv6 ? os.AF_INET6 : os.AF_INET)) || addrs?.[0];
+            if (!addr) throw new Error(`DNS resolution failed for ${host}`);
+            await tcp.connect({ ip: addr.ip, port: port! });
+            const localInfo = tcp.sockname;
+            tlsSocket.localAddress = localInfo.ip;
+            tlsSocket.localPort = localInfo.port;
+            const remoteInfo = tcp.peername;
+            tlsSocket.remoteAddress = remoteInfo.ip;
+            tlsSocket.remotePort = remoteInfo.port;
+            tlsSocket.remoteFamily = `IPv${remoteInfo.family}`;
+        } catch (err) {
+            tlsSocket.emit('error', err);
+            tlsSocket.destroy();
+        }
+    };
+    connectAndHandshake();
 
     return tlsSocket;
 }

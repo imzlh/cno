@@ -92,6 +92,7 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
     private _response: IncomingMessageImpl | null = null;
     private _requestId: string = '';
     private _requestCallFrames = captureNodeNetworkCallFrames();
+    private _abortHandler: (() => void) | null = null;
 
     constructor(url: string | URL | ClientRequestArgs, cb?: (res: IncomingMessageImpl) => void) {
         super();
@@ -140,7 +141,8 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
         }
 
         if (this._options.signal) {
-            this._options.signal.addEventListener('abort', () => this.abort());
+            this._abortHandler = () => this.abort();
+            this._options.signal.addEventListener('abort', this._abortHandler, { once: true });
         }
     }
 
@@ -344,6 +346,10 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
             timers.clearTimeout(this._timeoutId);
             this._timeoutId = null;
         }
+        if (this._abortHandler && this._options.signal) {
+            this._options.signal.removeEventListener('abort', this._abortHandler);
+            this._abortHandler = null;
+        }
         if (this._tcp) {
             try { this._tcp.close(); } catch {}
             this._tcp = null;
@@ -464,10 +470,20 @@ export class Agent {
             if (index !== -1) sockets.splice(index, 1);
             if (sockets.length === 0) this.sockets.delete(name);
         }
+        // Drain queued requests for this name
+        const queued = this.requests.get(name);
+        if (queued?.length) {
+            const next = queued.shift()!;
+            if (queued.length === 0) this.requests.delete(name);
+            this.addRequest(next as any, options);
+        }
     }
 
     destroy(): void {
         for (const sockets of this.sockets.values()) {
+            for (const socket of sockets) socket.destroy();
+        }
+        for (const sockets of this.freeSockets.values()) {
             for (const socket of sockets) socket.destroy();
         }
         this.sockets.clear();

@@ -71,7 +71,8 @@ export class Stream extends EventEmitter {
         };
 
         const onError = (err: Error) => {
-            destination.emit('error', err);
+            cleanup();
+            if (!destination.destroyed) destination.destroy(err);
         };
 
         const onClose = () => {
@@ -361,6 +362,8 @@ export class Readable extends Stream {
         if (state.destroyed) return this;
         state.destroyed = true;
         this.destroyed = true;
+        state.buffer.length = 0;
+        this.readableLength = 0;
         if (error) {
             this.emit('error', error);
         }
@@ -763,13 +766,24 @@ export class Duplex extends Writable {
     }
 
     unpipe(destination?: Writable): this {
+        const destinations = destination ? [destination] : [...this._pipedDestinations];
+        for (const dest of destinations) {
+            const cleanup = (dest as any).__pipeCleanup;
+            if (typeof cleanup === 'function') {
+                cleanup();
+                delete (dest as any).__pipeCleanup;
+            }
+            const idx = this._pipedDestinations.indexOf(dest);
+            if (idx !== -1) this._pipedDestinations.splice(idx, 1);
+        }
         return this;
     }
 
     unshift(chunk: any, encoding?: BufferEncoding): boolean {
-        const state = this._readableState;
-        state.buffer.unshift(chunk);
-        return true;
+        if (typeof chunk === 'string') {
+            chunk = Buffer.from(chunk, encoding || this._readableState.defaultEncoding);
+        }
+        return this.push(chunk);
     }
 
     push(chunk: any, encoding?: BufferEncoding): boolean {
@@ -793,20 +807,44 @@ export class Duplex extends Writable {
         if (state.flowing) {
             this.emit('data', chunk);
             queueMicrotask(() => this._duplexReadAndResolve());
-            return false;
+        } else {
+            state.buffer.push(chunk);
         }
-
-        state.buffer.push(chunk);
         this.readableLength = state.buffer.length;
-
         return state.buffer.length < state.highWaterMark;
     }
 
     protected _read(size: number): void {
-        // Default: no-op, subclass should override
+        throw new Error('_read() is not implemented');
     }
 
     static fromSource(source: any): Duplex {
+        if (source && typeof source[Symbol.asyncIterator] === 'function') {
+            const duplex = new Duplex({
+                read() {},
+                write(chunk, encoding, cb) { cb(); },
+            });
+            (async () => {
+                try {
+                    for await (const chunk of source) {
+                        if (!duplex.push(chunk)) break;
+                    }
+                    duplex.push(null);
+                } catch (err) { duplex.destroy(err as Error); }
+            })();
+            return duplex;
+        }
+        if (source && typeof source[Symbol.iterator] === 'function') {
+            const duplex = new Duplex({
+                read() {},
+                write(chunk, encoding, cb) { cb(); },
+            });
+            for (const chunk of source) {
+                if (!duplex.push(chunk)) break;
+            }
+            duplex.push(null);
+            return duplex;
+        }
         return new Duplex();
     }
 
@@ -815,6 +853,9 @@ export class Duplex extends Writable {
         this.destroyed = true;
         this.readable = false;
         this.writable = false;
+        const state = this._readableState;
+        state.buffer.length = 0;
+        this.readableLength = 0;
         if (error) {
             this.emit('error', error);
         }

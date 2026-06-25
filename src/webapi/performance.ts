@@ -659,6 +659,18 @@ class Performance extends EventTarget implements globalThis.Performance {
                 this.dispatchEvent(new Event('resourcetimingbufferfull'));
             }
         }
+        // Cap marks/measures to prevent unbounded growth
+        if (entry.entryType === 'mark' || entry.entryType === 'measure') {
+            const typed = this.#entries.filter(e => e.entryType === entry.entryType);
+            if (typed.length > 1000) {
+                const toRemove = typed.length - 1000;
+                let removed = 0;
+                this.#entries = this.#entries.filter(e => {
+                    if (removed < toRemove && e.entryType === entry.entryType) { removed++; return false; }
+                    return true;
+                });
+            }
+        }
 
         for (const observer of this.#observers) {
             // @ts-ignore string to EntryType

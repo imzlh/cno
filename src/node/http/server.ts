@@ -425,15 +425,12 @@ export class ServerImpl extends NetServer implements Server {
             socket.destroy();
         }
         this._httpConnections.clear();
+        this._httpServer?.close();
     }
 
     closeIdleConnections(): void {
-        for (const socket of this._httpConnections) {
-            if ((socket as any)._httpMessage?.finished || !(socket as any)._httpMessage) {
-                socket.destroy();
-                this._httpConnections.delete(socket);
-            }
-        }
+        // Native server manages connections internally; close idle via native API
+        this._httpServer?.close();
     }
 
     listen(arg1?: number | ListenOptions | string, arg2?: string | number | (() => void), arg3?: number | (() => void), arg4?: () => void): this {
@@ -482,9 +479,9 @@ export class ServerImpl extends NetServer implements Server {
             incoming.httpVersionMinor = minor;
 
             for (const [key, value] of req.headers) {
-                incoming.headers[key.toLowerCase() as keyof IncomingHttpHeaders] = value;
-                incoming.rawHeaders.push(key, value);
                 const lowerKey = key.toLowerCase();
+                incoming.headers[lowerKey as keyof IncomingHttpHeaders] = value;
+                incoming.rawHeaders.push(key, value);
                 if (!incoming.headersDistinct[lowerKey]) {
                     incoming.headersDistinct[lowerKey] = [];
                 }

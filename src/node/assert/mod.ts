@@ -173,7 +173,7 @@ function _deepEqual(actual: unknown, expected: unknown, strict: boolean, skipPro
 
     // Circular reference protection
     const _seen = seen ?? new WeakSet();
-    if (_seen.has(actual as object) || _seen.has(expected as object)) return true;
+    if (_seen.has(actual as object) && _seen.has(expected as object)) return true;
     _seen.add(actual as object);
     _seen.add(expected as object);
 
@@ -655,29 +655,43 @@ export function assert(cond: any, message = 'Assertion failed'): asserts cond {
     }
 }
 
-export class CallTracker {
-    #calls: Array<{ args: unknown[]; thisArg: unknown }> = [];
-    #tracked = new Set<Function>();
+interface CallExpectation {
+    callback: Function;
+    atLeast: number;
+    calls: number;
+}
 
-    calls(thisArg?: unknown) {
-        const tracker = this;
-        const fn = function (this: unknown, ...args: unknown[]) {
-            tracker.#calls.push({ args, thisArg: thisArg ?? this });
-        };
-        tracker.#tracked.add(fn);
-        return fn;
+export class CallTracker {
+    #expectations: CallExpectation[] = [];
+
+    calls(fn?: Function, num: number = 1) {
+        const exp: CallExpectation = { callback: fn ?? (() => {}), atLeast: num, calls: 0 };
+        this.#expectations.push(exp);
+        const wrapper = Object.assign(function (this: unknown, ...args: unknown[]) {
+            exp.calls++;
+            return exp.callback.apply(this, args);
+        }, { callback: exp.callback, atLeast: exp.atLeast });
+        return wrapper;
     }
 
     reset() {
-        this.#calls = [];
+        for (const exp of this.#expectations) exp.calls = 0;
     }
 
     get callCount() {
-        return this.#calls.length;
+        return this.#expectations.reduce((sum, exp) => sum + exp.calls, 0);
     }
 
-    verify(): boolean {
-        return true;
+    verify(): void {
+        const errors: string[] = [];
+        for (const exp of this.#expectations) {
+            if (exp.calls < exp.atLeast) {
+                errors.push(`Expected at least ${exp.atLeast} calls but got ${exp.calls}`);
+            }
+        }
+        if (errors.length) {
+            throw new AssertionError({ message: errors.join('\n'), operator: 'CallTracker.verify' });
+        }
     }
 }
 

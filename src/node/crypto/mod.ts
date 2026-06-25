@@ -12,6 +12,15 @@ import type { BinaryInput, Hash, Hmac, Cipheriv, Decipheriv, CipherGCM, Decipher
 // Import helpers from helpers.ts
 import { toBuffer, encodeOutput, concatBuffers, createBufferedCipher, createBufferedDecipher, isGcmAlgorithm, normalizeHashAlgorithm, oneShotHmac, createOneShotHmac, readAsymmetricCipherArgs } from './helpers';
 
+function resolveCurve(curve: string): 'p256' | 'p384' | 'p521' {
+    switch (curve.toLowerCase()) {
+        case 'p256': case 'prime256v1': case 'secp256r1': return 'p256';
+        case 'p384': case 'secp384r1': return 'p384';
+        case 'p521': case 'secp521r1': return 'p521';
+        default: throw new Error(`Unsupported curve: ${curve}`);
+    }
+}
+
 // ============================================================================
 // createHash
 // ============================================================================
@@ -260,6 +269,7 @@ export function createCipheriv(algorithm: string, key: ArrayBuffer | Uint8Array,
 
     // CBC: buffer all chunks and encrypt at final() so setAutoPadding() never
     // needs to recreate the cipher mid-stream (which would discard buffered data).
+    if (a !== 'aes-192-cbc' && a !== 'aes-256-cbc') throw new Error(`Unsupported cipher algorithm: ${algorithm}`);
     let autoPadding = true;
     const chunks: Uint8Array[] = [];
     const result = {
@@ -275,7 +285,6 @@ export function createCipheriv(algorithm: string, key: ArrayBuffer | Uint8Array,
         },
         setAutoPadding(v: boolean) { autoPadding = v; },
     };
-    if (a !== 'aes-192-cbc' && a !== 'aes-256-cbc') throw new Error(`Unsupported cipher algorithm: ${algorithm}`);
     return result as unknown as Cipheriv;
 }
 
@@ -590,25 +599,13 @@ export function generateKeyPairSync(type: string, options: any): { publicKey: Ar
     }
 
     if (type === 'ec') {
-        const curve = options.namedCurve?.toLowerCase();
+        const curve = resolveCurve(options.namedCurve || '');
         let keyPair: CModuleCrypto.EcKeyPair;
 
         switch (curve) {
-            case 'p256':
-            case 'prime256v1':
-            case 'secp256r1':
-                keyPair = crypto.generateEcKeyP256();
-                break;
-            case 'p384':
-            case 'secp384r1':
-                keyPair = crypto.generateEcKeyP384();
-                break;
-            case 'p521':
-            case 'secp521r1':
-                keyPair = crypto.generateEcKeyP521();
-                break;
-            default:
-                throw new Error(`Unsupported curve: ${curve}`);
+            case 'p256': keyPair = crypto.generateEcKeyP256(); break;
+            case 'p384': keyPair = crypto.generateEcKeyP384(); break;
+            case 'p521': keyPair = crypto.generateEcKeyP521(); break;
         }
 
         return {
@@ -645,12 +642,8 @@ export function createSign(algorithm: string): Sign {
         },
         sign(privateKey: ArrayBuffer | Uint8Array, outputEncoding?: string) {
             const keyBuf = toBuffer(privateKey);
-            const allData = new Uint8Array(data.reduce((acc, d) => acc + d.length, 0));
-            let offset = 0;
-            for (const d of data) {
-                allData.set(d, offset);
-                offset += d.length;
-            }
+            const allData = concatBuffers(data);
+            data = [];
 
             let result: ArrayBuffer;
             switch (algorithm.toLowerCase()) {
@@ -682,12 +675,8 @@ export function createVerify(algorithm: string): Verify {
         verify(publicKey: ArrayBuffer | Uint8Array, signature: ArrayBuffer | Uint8Array, signatureEncoding?: string) {
             const keyBuf = toBuffer(publicKey);
             const sigBuf = toBuffer(signature);
-            const allData = new Uint8Array(data.reduce((acc, d) => acc + d.length, 0));
-            let offset = 0;
-            for (const d of data) {
-                allData.set(d, offset);
-                offset += d.length;
-            }
+            const allData = concatBuffers(data);
+            data = [];
 
             switch (algorithm.toLowerCase()) {
                 case 'rsa-sha256':
@@ -708,8 +697,10 @@ export function sign(algorithm: string, data: ArrayBuffer | Uint8Array, key: Arr
     const keyBuf = toBuffer(key);
 
     switch (algorithm.toLowerCase()) {
+        case 'rsa-sha256':
         case 'sha256':
             return crypto.signSha256(keyBuf, dataBuf);
+        case 'rsa-sha512':
         case 'sha512':
             return crypto.signSha512(keyBuf, dataBuf);
         default:
@@ -735,8 +726,10 @@ export function verify(algorithm: string, data: ArrayBuffer | Uint8Array, key: A
     const sigBuf = toBuffer(signature);
 
     switch (algorithm.toLowerCase()) {
+        case 'rsa-sha256':
         case 'sha256':
             return crypto.verifySha256(keyBuf, dataBuf, sigBuf);
+        case 'rsa-sha512':
         case 'sha512':
             return crypto.verifySha512(keyBuf, dataBuf, sigBuf);
         default:
@@ -768,19 +761,11 @@ export function ecdsaSign(curve: string, privateKey: ArrayBuffer | Uint8Array, d
     const keyBuf = toBuffer(privateKey);
     const dataBuf = toBuffer(data);
 
-    switch (curve.toLowerCase()) {
-        case 'p256':
-        case 'prime256v1':
-        case 'secp256r1':
-            return crypto.ecdsaSignP256(keyBuf, dataBuf);
-        case 'p384':
-        case 'secp384r1':
-            return crypto.ecdsaSignP384(keyBuf, dataBuf);
-        case 'p521':
-        case 'secp521r1':
-            return crypto.ecdsaSignP521(keyBuf, dataBuf);
-        default:
-            throw new Error(`Unsupported curve: ${curve}`);
+    const c = resolveCurve(curve);
+    switch (c) {
+        case 'p256': return crypto.ecdsaSignP256(keyBuf, dataBuf);
+        case 'p384': return crypto.ecdsaSignP384(keyBuf, dataBuf);
+        case 'p521': return crypto.ecdsaSignP521(keyBuf, dataBuf);
     }
 }
 
@@ -789,19 +774,11 @@ export function ecdsaVerify(curve: string, publicKey: ArrayBuffer | Uint8Array, 
     const dataBuf = toBuffer(data);
     const sigBuf = toBuffer(signature);
 
-    switch (curve.toLowerCase()) {
-        case 'p256':
-        case 'prime256v1':
-        case 'secp256r1':
-            return crypto.ecdsaVerifyP256(keyBuf, dataBuf, sigBuf);
-        case 'p384':
-        case 'secp384r1':
-            return crypto.ecdsaVerifyP384(keyBuf, dataBuf, sigBuf);
-        case 'p521':
-        case 'secp521r1':
-            return crypto.ecdsaVerifyP521(keyBuf, dataBuf, sigBuf);
-        default:
-            throw new Error(`Unsupported curve: ${curve}`);
+    const c = resolveCurve(curve);
+    switch (c) {
+        case 'p256': return crypto.ecdsaVerifyP256(keyBuf, dataBuf, sigBuf);
+        case 'p384': return crypto.ecdsaVerifyP384(keyBuf, dataBuf, sigBuf);
+        case 'p521': return crypto.ecdsaVerifyP521(keyBuf, dataBuf, sigBuf);
     }
 }
 
@@ -813,19 +790,11 @@ export function ecdhComputeSecret(curve: string, privateKey: ArrayBuffer | Uint8
     const privBuf = toBuffer(privateKey);
     const pubBuf = toBuffer(publicKey);
 
-    switch (curve.toLowerCase()) {
-        case 'p256':
-        case 'prime256v1':
-        case 'secp256r1':
-            return crypto.ecdhDeriveP256(privBuf, pubBuf);
-        case 'p384':
-        case 'secp384r1':
-            return crypto.ecdhDeriveP384(privBuf, pubBuf);
-        case 'p521':
-        case 'secp521r1':
-            return crypto.ecdhDeriveP521(privBuf, pubBuf);
-        default:
-            throw new Error(`Unsupported curve: ${curve}`);
+    const c = resolveCurve(curve);
+    switch (c) {
+        case 'p256': return crypto.ecdhDeriveP256(privBuf, pubBuf);
+        case 'p384': return crypto.ecdhDeriveP384(privBuf, pubBuf);
+        case 'p521': return crypto.ecdhDeriveP521(privBuf, pubBuf);
     }
 }
 

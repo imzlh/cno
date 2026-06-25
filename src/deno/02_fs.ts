@@ -21,7 +21,16 @@ export const toString = (e: URL | string): string => {
 
 export function toDenoStat(stat: CModuleAsyncFS.StatResult) {
     return {
-        ...stat,
+        dev: stat.dev,
+        ino: stat.ino,
+        mode: stat.mode,
+        nlink: stat.nlink,
+        uid: stat.uid,
+        gid: stat.gid,
+        rdev: stat.rdev,
+        size: stat.size,
+        blksize: stat.blksize,
+        blocks: stat.blocks,
         atime: stat.atim,
         mtime: stat.mtim,
         ctime: stat.ctim,
@@ -43,15 +52,16 @@ function* iterMkdirPaths(fullPath: string): Generator<string> {
     const normalizedPath = fullPath.replace(/\\/g, '/');
     const parts = normalizedPath.split('/').filter(p => p !== '' && p !== '.');
     let currentPath = '';
-    for (const part of parts) {
+    let i = 0;
+    if (normalizedPath.startsWith('//') && parts.length >= 2) {
+        currentPath = '//' + parts[0] + '/' + parts[1];
+        i = 2;
+    }
+    for (; i < parts.length; i++) {
+        const part = parts[i];
         if (currentPath === '') {
             if (normalizedPath.startsWith('/')) { currentPath = '/'; }
             else if (/^[A-Za-z]:/.test(normalizedPath)) { currentPath = part + '/'; continue; }
-            else if (normalizedPath.startsWith('//')) {
-                currentPath = '//';
-                if (parts.length >= 2) { currentPath += parts.slice(0, 2).join('/'); parts.splice(0, 2); }
-                continue;
-            }
             else { currentPath = part; }
         } else { currentPath = currentPath + '/' + part; }
         yield currentPath;
@@ -73,7 +83,7 @@ function mkdirRecursiveSync(fullPath: string, mode?: number): void {
 }
 
 function removeRecursiveSync(targetPath: string): void {
-    const stats = fs.stat(targetPath);
+    const stats = fs.lstat(targetPath);
     if (stats.isDirectory) {
         for (const item of fs.readdir(targetPath)) {
             removeRecursiveSync(join(targetPath, item));
@@ -85,7 +95,7 @@ function removeRecursiveSync(targetPath: string): void {
 }
 
 async function removeRecursive(targetPath: string): Promise<void> {
-    const stats = await asfs.stat(targetPath);
+    const stats = await asfs.lstat(targetPath);
     if (stats.isDirectory) {
         const dirHandle = await asfs.readDir(targetPath);
         try {
@@ -112,33 +122,31 @@ async function denoWriteAnyFile(path: string | URL, data: string | Uint8Array | 
         flag = "wx";
     }
     const fhandle = await asfs.open(toString(path), flag, options?.mode);
+    try {
+        if (typeof data === "string")
+            data = engine.encodeString(data);
 
-    if (typeof data === "string")
-        data = engine.encodeString(data);
-
-    if (data instanceof Uint8Array) {
-        let written = 0;
-        while (written < data.length) {
-            const n = await fhandle.write(data.subarray(written) as Uint8Array<ArrayBuffer>);
-            if (n === null) {
-                throw new errors.UnexpectedEof("write");
+        if (data instanceof Uint8Array) {
+            let written = 0;
+            while (written < data.length) {
+                const n = await fhandle.write(data.subarray(written) as Uint8Array<ArrayBuffer>);
+                if (n === null) throw new errors.UnexpectedEof("write");
+                written += n;
             }
-            written += n;
-        }
-    } else {
-        const reader = data.getReader();
-        while (true) {
-            const { value, done } = await reader.read();
-            if (done) break;
-            const n = await fhandle.write(
-                (typeof value === "string" ? engine.encodeString(value) : value) as Uint8Array<ArrayBuffer>
-            );
-            if (n === null) {
-                throw new errors.UnexpectedEof("write");
+        } else {
+            const reader = data.getReader();
+            while (true) {
+                const { value, done } = await reader.read();
+                if (done) break;
+                const n = await fhandle.write(
+                    (typeof value === "string" ? engine.encodeString(value) : value) as Uint8Array<ArrayBuffer>
+                );
+                if (n === null) throw new errors.UnexpectedEof("write");
             }
         }
+    } finally {
+        await fhandle.close();
     }
-    await fhandle.close();
 }
 
 function watchToIterator(path: string): AsyncIterableIterator<Deno.FsEvent> & { close(): void } {
@@ -403,7 +411,7 @@ Object.assign(Deno, wrapFSns({
 
     async truncate(name, len) {
         const file = await asfs.open(toString(name), "r+");
-        file.truncate(len);
+        file.truncate(len ?? 0);
         await file.close();
     },
 

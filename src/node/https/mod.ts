@@ -81,7 +81,7 @@ async function getSystemCa(): Promise<string | null> {
         try {
             const certs = windows!.exportCerts();
             if (certs?.length) {
-                fs.writeFile(tmp, engine.encodeString(certs.join('\n')), 0o666);
+                await asfs.writeFile(tmp, engine.encodeString(certs.join('\n')));
                 _sysCaCache = tmp; return tmp;
             }
         } catch {}
@@ -104,6 +104,8 @@ export class Server extends EventEmitter {
     #tlsServer: TlsServer;
     #requestListener: ((req: IncomingMessageImpl, res: ServerResponseImpl) => void) | null = null;
     #requestSerial = 0;
+    #timeout = 0;
+    #timeoutCallback: ((socket: TLSSocket) => void) | null = null;
 
     constructor(options?: HttpsServerOptions, requestListener?: (req: IncomingMessageImpl, res: ServerResponseImpl) => void);
     constructor(requestListener?: (req: IncomingMessageImpl, res: ServerResponseImpl) => void);
@@ -125,6 +127,7 @@ export class Server extends EventEmitter {
 
             const incoming = new IncomingMessageImpl(null);
             incoming.socket = tlsSocket as any;
+            incoming.setTimeout(this.#timeout, this.#timeoutCallback ? () => this.#timeoutCallback!(tlsSocket) : undefined);
 
             const response = new ServerResponseImpl();
             response.req = incoming;
@@ -281,7 +284,9 @@ export class Server extends EventEmitter {
     ref(): this { this.#tlsServer.ref(); return this; }
     unref(): this { this.#tlsServer.unref(); return this; }
 
-    setTimeout(msecs: number, callback?: () => void): this {
+    setTimeout(msecs: number, callback?: (socket: TLSSocket) => void): this {
+        this.#timeout = msecs;
+        this.#timeoutCallback = callback ?? null;
         return this;
     }
 }
@@ -411,7 +416,7 @@ class HttpsClientRequest extends OutgoingMessageImpl {
         }
 
         if (this._options.signal) {
-            this._options.signal.addEventListener('abort', () => this.abort());
+            this._options.signal.addEventListener('abort', () => this.abort(), { once: true });
         }
     }
 
@@ -426,9 +431,9 @@ class HttpsClientRequest extends OutgoingMessageImpl {
 
         try {
             const isIPv6 = this.host.includes(':');
-            const addrs = await dns.resolve(this.host, { family: isIPv6 ? 10 : 0 });
+            const addrs = await dns.resolve(this.host, { family: isIPv6 ? os.AF_INET6 : os.AF_INET });
             if (!addrs?.length) throw new Error(`DNS resolution failed for ${this.host}`);
-            const addr = addrs.find((a: any) => a.family === (isIPv6 ? 10 : 4)) || addrs[0];
+            const addr = addrs.find((a: any) => a.family === (isIPv6 ? os.AF_INET6 : os.AF_INET)) || addrs[0];
 
             const family = addr.family === 6 ? os.AF_INET6 : os.AF_INET;
             this._tcp = new streams.TCP(family);
@@ -464,15 +469,16 @@ class HttpsClientRequest extends OutgoingMessageImpl {
             this.emit('socket', this._tlsSocket);
 
             await new Promise<void>((resolve, reject) => {
+                const timeout = timers.setTimeout(() => reject(new Error('TLS handshake timeout')), 10000);
                 this._tlsSocket!.on('secureConnect', () => {
+                    timers.clearTimeout(timeout);
                     if (rejectUnauthorized && !this._tlsSocket!.authorized) {
                         reject(this._tlsSocket!.authorizationError ?? new Error('Certificate verification failed'));
                     } else {
                         resolve();
                     }
                 });
-                this._tlsSocket!.on('error', reject);
-                timers.setTimeout(() => reject(new Error('TLS handshake timeout')), 10000);
+                this._tlsSocket!.on('error', (err) => { timers.clearTimeout(timeout); reject(err); });
             });
 
             if (!this.hasHeader('host')) {
@@ -545,7 +551,7 @@ class HttpsClientRequest extends OutgoingMessageImpl {
             protocol: this.protocol, host: this.host, path: this.path,
             res, getHeaders: () => this.getHeaders(),
             onResponse: (_res) => { this.emit('response', _res); if (this._callback) this._callback(_res); },
-            onComplete: () => {},
+            onComplete: () => { this._cleanup(); },
         });
 
         this._tlsSocket.on('data', (chunk: Uint8Array) => {
@@ -587,6 +593,7 @@ class HttpsClientRequest extends OutgoingMessageImpl {
         let callback: (() => void) | undefined;
         if (typeof chunk === 'function') { callback = chunk; chunk = undefined; }
         else if (typeof encodingOrCb === 'function') { callback = encodingOrCb; }
+        else if (typeof cb === 'function') { callback = cb; }
 
         if (chunk !== undefined) {
             const data = typeof chunk === 'string' ? engine.encodeString(chunk) : chunk as Uint8Array;
