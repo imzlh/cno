@@ -63,7 +63,7 @@ export function readFileFromFdSync(
     readFn: (fd: number, buf: Uint8Array) => number,
     fd: number,
     bufSize: number,
-): Uint8Array {
+): Uint8Array<ArrayBuffer> {
     const chunks: Uint8Array[] = [];
     const buf = new Uint8Array(bufSize);
     for (;;) {
@@ -94,7 +94,7 @@ export function toUint8Array(data: string | Uint8Array | ArrayBuffer): Uint8Arra
 }
 
 export function decodeBuffer(buffer: Uint8Array<ArrayBuffer>, encoding?: BufferEncoding | null): string | Uint8Array<ArrayBuffer> {
-    if (!encoding || encoding === 'buffer') return buffer;
+    if (!encoding || encoding as string === 'buffer') return buffer;
     return engine.decodeString(buffer);
 }
 
@@ -297,7 +297,7 @@ export async function mkdirRecursive(pathStr: string, mode?: number): Promise<vo
 export function createFileHandle(fd: number, handle: CModuleAsyncFS.FileHandle) {
     return {
         fd,
-        async read(buffer: Uint8Array, offset?: number, length?: number, position?: number | null) {
+        async read(buffer: Uint8Array<ArrayBuffer>, offset?: number, length?: number, position?: number | null) {
             const o = offset ?? 0, l = length ?? buffer.length;
             const bytesRead = await handle.read(buffer.subarray(o, o + l), position ?? null);
             return { bytesRead, buffer };

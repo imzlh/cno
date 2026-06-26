@@ -1,31 +1,54 @@
-/**
- * Node.js inspector module (stub)
- * V8 inspector integration
- */
+import { Session } from './session'
+import { console } from './console'
+import { getInspectorBridge } from './state'
 
-export function open(_port?: number, _host?: string, _wait?: boolean): void {}
-export function close(): void {}
-export function url(): string | undefined { return undefined; }
-export function waitForDebugger(): void {}
+const disposeSymbol: symbol = (Symbol as typeof Symbol & { dispose?: symbol }).dispose ?? Symbol.for('Symbol.dispose')
 
-export const console = {
-    log(..._args: any[]): void {},
-    warn(..._args: any[]): void {},
-    error(..._args: any[]): void {},
-    info(..._args: any[]): void {},
-    dir(_object: any, _options?: any): void {},
-    table(_data: any, _properties?: string[]): void {},
-    trace(..._args: any[]): void {},
-    assert(_condition?: boolean, ..._data: any[]): void {},
-    clear(): void {},
-    count(_label?: string): void {},
-    countReset(_label?: string): void {},
-    group(..._data: any[]): void {},
-    groupCollapsed(..._data: any[]): void {},
-    groupEnd(): void {},
-    time(_label?: string): void {},
-    timeEnd(_label?: string): void {},
-    timeStamp(_label?: string): void {},
-    profile(_label?: string): void {},
-    profileEnd(_label?: string): void {},
-};
+export { Session, console }
+
+export function open(port = 9229, host = '127.0.0.1', wait = false): { dispose(): void } {
+	const bridge = requireBridge()
+	void bridge.open({ port, host, wait })
+	return {
+		dispose(): void {
+			close()
+		},
+		[disposeSymbol](): void {
+			close()
+		},
+	}
+}
+
+export function close(): void {
+	const bridge = getInspectorBridge()
+	if (!bridge) return
+	void bridge.close()
+}
+
+export function url(): string | undefined {
+	return getInspectorBridge()?.url()
+}
+
+export function waitForDebugger(): void {
+	const bridge = requireBridge()
+	if (!bridge.isActive()) {
+		void bridge.open({ wait: true })
+		return
+	}
+	void bridge.waitForDebugger()
+}
+
+function requireBridge() {
+	const bridge = getInspectorBridge()
+	if (!bridge) throw new Error('Inspector bridge is not available in this runtime')
+	return bridge
+}
+
+export default {
+	open,
+	close,
+	url,
+	waitForDebugger,
+	console,
+	Session,
+}

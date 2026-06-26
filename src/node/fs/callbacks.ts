@@ -75,7 +75,7 @@ export function writeFile(path: PathLike | number, data: any, options?: any, cal
     const buffer = toUint8Array(data);
     if ('fd' in target) {
         try {
-            if (flag !== 'a' && flag !== 'ax') {
+            if (flag !== 'a') {
                 fs.ftruncate(target.fd, 0);
             }
             fs.write(target.fd, buffer);

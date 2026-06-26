@@ -38,7 +38,7 @@ export function encodeOutput(data: ArrayBuffer, encoding?: string): ArrayBuffer 
     return data;
 }
 
-export function concatBuffers(chunks: Uint8Array[]): Uint8Array {
+export function concatBuffers(chunks: Uint8Array[]): Uint8Array<ArrayBuffer> {
     const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
     const out = new Uint8Array(total);
     let offset = 0;

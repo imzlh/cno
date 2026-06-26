@@ -209,7 +209,7 @@ export class InflateRaw extends Transform {
 
 export class Unzip extends Transform {
     _handle: any;
-    constructor(o?: ZlibOptions & TransformOptions) { super(o); this._handle = zlib.createUnzip(); }
+    constructor(o?: ZlibOptions & TransformOptions) { super(o); this._handle = zlib.createGunzip(); }
     _transform(chunk: any, _e: BufferEncoding, cb: any) { _doTransform(this._handle, chunk, false, cb); }
     _flush(cb: any) { _doFlush(this._handle, cb); }
 }

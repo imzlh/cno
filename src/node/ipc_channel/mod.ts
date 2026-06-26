@@ -24,7 +24,7 @@
  */
 
 import { EventEmitter } from '../events';
-import { getMemoryTier } from '../../utils/memory-tier';
+import { getMemoryTier } from '../_internal/memory';
 
 const engine = import.meta.use('engine');
 

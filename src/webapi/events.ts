@@ -1,4 +1,4 @@
-export class Event {
+export class Event implements globalThis.Event {
     readonly type: string;
     readonly bubbles: boolean = false;
     readonly cancelable: boolean = false;
@@ -69,14 +69,14 @@ export class Event {
     }
 }
 
-interface ListenerEntry { listener: EventListener; once: boolean; signal?: AbortSignal; }
+interface ListenerEntry { listener: EventListenerOrEventListenerObject; once: boolean; signal?: AbortSignal; }
 
-export class EventTarget {
+export class EventTarget implements globalThis.EventTarget {
     #listeners = new Map<string, ListenerEntry[]>();
 
     addEventListener(
         type: string,
-        listener: EventListener | null,
+        listener: EventListenerOrEventListenerObject | null,
         options?: AddEventListenerOptions | boolean
     ): void {
         if (!listener) return;
@@ -123,8 +123,9 @@ export class EventTarget {
                     if (idx !== -1) bucket.splice(idx, 1);
                 }
                 const fn = entry.listener;
+                // @ts-expect-error - polyfill Event vs global Event structural mismatch
                 if (typeof fn === 'function') fn.call(this, event);
-                else (fn as any).handleEvent?.(event);
+                else fn.handleEvent?.(event);
             }
         }
 

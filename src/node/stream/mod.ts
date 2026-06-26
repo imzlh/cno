@@ -70,6 +70,15 @@ export class Stream extends EventEmitter {
             }
         };
 
+        const cleanup = () => {
+            this.removeListener('data', onData);
+            destination.removeListener('drain', onDrain);
+            this.removeListener('end', onEnd);
+            this.removeListener('error', onError);
+            this.removeListener('close', onClose);
+            destination.removeListener('close', onDestClose);
+        };
+
         const onError = (err: Error) => {
             cleanup();
             if (!destination.destroyed) destination.destroy(err);
@@ -90,15 +99,7 @@ export class Stream extends EventEmitter {
         this.on('close', onClose);
         destination.on('close', onDestClose);
 
-        // Cleanup function for unpipe
-        (destination as any).__pipeCleanup = () => {
-            this.removeListener('data', onData);
-            destination.removeListener('drain', onDrain);
-            this.removeListener('end', onEnd);
-            this.removeListener('error', onError);
-            this.removeListener('close', onClose);
-            destination.removeListener('close', onDestClose);
-        };
+        (destination as any).__pipeCleanup = cleanup;
 
         return destination;
     }

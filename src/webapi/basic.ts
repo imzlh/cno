@@ -10,27 +10,6 @@ const timer = import.meta.use('timers');
 const streams = import.meta.use('streams');
 const console = import.meta.use('console');
 
-globalThis.atob = function(str: string): string {
-    // Strip whitespace (HTML spec §2.5), normalise URL-safe base64 chars.
-    const norm = str.replace(/[\t\n\f\r ]/g, '').replace(/-/g, '+').replace(/_/g, '/');
-    const dec = new Uint8Array(crypto.base64Decode(norm) as ArrayBuffer);
-    // latin-1: each byte → the character with the same code point (matches browser behaviour).
-    let out = '';
-    for (let i = 0; i < dec.length; i++) out += String.fromCharCode(dec[i]!);
-    return out;
-}
-
-globalThis.btoa = function(str: string): string {
-    // btoa is latin-1: reject code points > 255, then take the low byte of each char.
-    const bytes = new Uint8Array(str.length);
-    for (let i = 0; i < str.length; i++) {
-        const c = str.charCodeAt(i);
-        if (c > 255) throw new DOMException('The string contains characters outside of the Latin1 range.', 'InvalidCharacterError');
-        bytes[i] = c;
-    }
-    return crypto.base64Encode(bytes) as string;
-}
-
 globalThis.alert = function(msg) {
     console.log(msg);
 }

@@ -53,8 +53,13 @@ class Timeout implements NodeJS.Timeout {
         if (this.#fn) {
             const clearFn = this.#isInterval ? timer.clearInterval : timer.clearTimeout;
             clearFn(this.#id);
-            const setFn = this.#isInterval ? timer.setInterval : timer.setTimeout;
-            this.#id = setFn(this.#fn, this.#ms, ...(this.#args ?? []));
+            if (this.#isInterval) {
+                // @ts-expect-error - Function vs () => any overload mismatch in CModuleTimers
+                this.#id = timer.setInterval(this.#fn, this.#ms, ...(this.#args ?? []));
+            } else {
+                // @ts-expect-error - Function vs () => any overload mismatch in CModuleTimers
+                this.#id = timer.setTimeout(this.#fn, this.#ms, ...(this.#args ?? []));
+            }
         }
         return this;
     }

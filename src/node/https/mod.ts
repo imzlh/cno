@@ -81,7 +81,7 @@ async function getSystemCa(): Promise<string | null> {
         try {
             const certs = windows!.exportCerts();
             if (certs?.length) {
-                await asfs.writeFile(tmp, engine.encodeString(certs.join('\n')));
+                await fs.writeFile(tmp, engine.encodeString(certs.join('\n')));
                 _sysCaCache = tmp; return tmp;
             }
         } catch {}
