@@ -26,7 +26,6 @@ import {
     buildNodeServerUrl,
     buildNodeUrl,
     captureNodeNetworkCallFrames,
-    concatChunks,
     getNodeFetchHook,
     getNodeServeHook,
     headerEntriesToRecord,
@@ -36,6 +35,7 @@ import {
     setupResponseParser,
     toUint8Array,
 } from '../_internal/network-debug';
+import { concatChunks } from '../_internal/buffer';
 
 const streams = import.meta.use('streams');
 const dns = import.meta.use('dns');

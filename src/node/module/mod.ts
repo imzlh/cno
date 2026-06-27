@@ -7,11 +7,29 @@ import { fileURLToPath } from '../url';
 import path from '../path';
 const { dirname, join } = path;
 
-const CTS_INTERNAL = (globalThis as any)[Symbol.for('cts.internal')] as {
+type CtsInternal = {
     mkRequire: (parentPath: string, parentMod: any) => NodeJS.Require;
     builtinModules: string[];
     cache: Map<string, any>;
-} | undefined;
+} & {
+    specToLocalPath?: (specPath: string) => string | null;
+};
+
+function getCtsInternal(): CtsInternal | undefined {
+    return (globalThis as any)[Symbol.for('cts.internal')] as CtsInternal | undefined;
+}
+
+function getBuiltinModules(): string[] {
+    return getCtsInternal()?.builtinModules ?? [];
+}
+
+type RequireExtensionMap = Record<string, ((module: any, filename: string) => any) | undefined>;
+
+function getExtensions(): RequireExtensionMap {
+    const ctsInternal = getCtsInternal();
+    if (!ctsInternal) return Object.create(null);
+    return ctsInternal.mkRequire(fileURLToPath(import.meta.url), undefined).extensions ?? Object.create(null);
+}
 
 export interface SourceMap {
     payload: any;
@@ -23,12 +41,21 @@ const _pathsCache = new Map<string, string[]>();
 
 export function createRequire(filename: string | URL): NodeJS.Require {
     const parentPath = filename instanceof URL ? fileURLToPath(filename) : filename;
-    if (CTS_INTERNAL) return CTS_INTERNAL.mkRequire(parentPath, undefined);
+    const ctsInternal = getCtsInternal();
+    if (ctsInternal) return ctsInternal.mkRequire(parentPath, undefined);
     return require;
 }
 
 export function createRequireFromURL(url: string | URL): NodeJS.Require {
-    return createRequire(url instanceof URL ? url : new URL(url));
+    if (url instanceof URL) {
+        return createRequire(fileURLToPath(url));
+    }
+    // Already a filesystem path (no scheme)
+    if (!url.includes('://')) {
+        return createRequire(url);
+    }
+    // Has a scheme — convert via fileURLToPath which handles file:/npm:/jsr: etc.
+    return createRequire(fileURLToPath(url));
 }
 
 export function runMain(): void {
@@ -44,7 +71,7 @@ export function _nodeModulePaths(from: string): string[] {
     if (hit) return hit;
     const out: string[] = [];
     let d = from;
-    while (d !== '/' && d !== '') {
+    while (d !== '/' && d !== '' && !/^[a-zA-Z]:\\?$/.test(d)) {
         out.push(join(d, 'node_modules'));
         const up = dirname(d);
         if (up === d) break;
@@ -55,9 +82,10 @@ export function _nodeModulePaths(from: string): string[] {
 }
 
 export function _resolveFilename(request: string, parent?: { filename?: string }, isMain?: boolean, options?: { paths?: string[] }): string {
-    if (CTS_INTERNAL) {
+    const ctsInternal = getCtsInternal();
+    if (ctsInternal) {
         const parentPath = parent?.filename ?? '';
-        const requireFn = CTS_INTERNAL.mkRequire(parentPath, undefined);
+        const requireFn = ctsInternal.mkRequire(parentPath, undefined);
         return (requireFn.resolve as any)(request, options);
     }
     return request;
@@ -67,25 +95,41 @@ export function _pathFilename(filename: string): string {
     return filename;
 }
 
-export const builtinModules: string[] = CTS_INTERNAL?.builtinModules ?? [];
-
-export const _cache: Record<string, any> = new Proxy({} as Record<string, any>, {
-    has: (_t, key) => CTS_INTERNAL?.cache.has(key as string) ?? false,
-    get: (_t, key) => CTS_INTERNAL?.cache.get(key as string),
-    set: (_t, key, value) => { CTS_INTERNAL?.cache.set(key as string, value); return true; },
-    deleteProperty: (_t, key) => { CTS_INTERNAL?.cache.delete(key as string); return true; },
-    ownKeys: () => CTS_INTERNAL ? [...CTS_INTERNAL.cache.keys()] : [],
+export const builtinModules: string[] = new Proxy([] as string[], {
+    get: (_t, key) => Reflect.get(getBuiltinModules(), key),
+    has: (_t, key) => key in getBuiltinModules(),
+    ownKeys: () => Reflect.ownKeys(getBuiltinModules()),
     getOwnPropertyDescriptor: (_t, key) => {
-        if (!CTS_INTERNAL?.cache.has(key as string)) return undefined;
-        return { value: CTS_INTERNAL.cache.get(key as string), writable: true, enumerable: true, configurable: true };
+        const desc = Object.getOwnPropertyDescriptor(getBuiltinModules(), key);
+        return desc ? { ...desc, configurable: true } : undefined;
     },
 });
 
-export const _extensions: Record<string, (module: any, filename: string) => void> = {
-    '.js'() {},
-    '.json'() {},
-    '.node'() {},
-};
+export const _cache: Record<string, any> = new Proxy({} as Record<string, any>, {
+    has: (_t, key) => getCtsInternal()?.cache.has(key as string) ?? false,
+    get: (_t, key) => getCtsInternal()?.cache.get(key as string),
+    set: (_t, key, value) => { getCtsInternal()?.cache.set(key as string, value); return true; },
+    deleteProperty: (_t, key) => { getCtsInternal()?.cache.delete(key as string); return true; },
+    ownKeys: () => {
+        const ctsInternal = getCtsInternal();
+        return ctsInternal ? [...ctsInternal.cache.keys()] : [];
+    },
+    getOwnPropertyDescriptor: (_t, key) => {
+        const ctsInternal = getCtsInternal();
+        if (!ctsInternal?.cache.has(key as string)) return undefined;
+        return { value: ctsInternal.cache.get(key as string), writable: true, enumerable: true, configurable: true };
+    },
+});
+
+export const _extensions: RequireExtensionMap = new Proxy(Object.create(null), {
+    get: (_t, key) => Reflect.get(getExtensions(), key),
+    has: (_t, key) => key in getExtensions(),
+    ownKeys: () => Reflect.ownKeys(getExtensions()),
+    getOwnPropertyDescriptor: (_t, key) => {
+        const desc = Object.getOwnPropertyDescriptor(getExtensions(), key);
+        return desc ? { ...desc, configurable: true } : undefined;
+    },
+});
 
 export function findSourceMap(_path: string, _error?: Error): SourceMap | undefined {
     return undefined;
@@ -95,7 +139,7 @@ export const globalPaths: string[] = [];
 
 export function isBuiltin(moduleName: string): boolean {
     const bare = moduleName.startsWith('node:') ? moduleName.slice(5) : moduleName;
-    return builtinModules.includes(bare);
+    return getBuiltinModules().includes(bare);
 }
 
 export function syncBuiltinESMExports(): void {}
@@ -141,8 +185,6 @@ export class Module {
 
     static _resolveFilename = _resolveFilename;
 
-    static builtinModules = builtinModules;
-
     static isBuiltin = isBuiltin;
 
     static createRequire = createRequire;
@@ -154,7 +196,19 @@ export class Module {
 
 // Live cache proxy
 Object.defineProperty(Module, '_cache', {
-    get: () => CTS_INTERNAL?.cache ?? {},
+    get: () => getCtsInternal()?.cache ?? {},
+    enumerable: true,
+    configurable: true,
+});
+
+Object.defineProperty(Module, '_extensions', {
+    get: () => _extensions,
+    enumerable: true,
+    configurable: true,
+});
+
+Object.defineProperty(Module, 'builtinModules', {
+    get: () => getBuiltinModules(),
     enumerable: true,
     configurable: true,
 });

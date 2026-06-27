@@ -5,6 +5,8 @@
 const engine = import.meta.use('engine');
 const crypto = import.meta.use('crypto');
 import type { BinaryInput, Cipheriv, Decipheriv, Hmac } from './types';
+import { concatChunks as concatBuffers } from '../_internal/buffer';
+export { concatBuffers };
 
 export function toBuffer(data: ArrayBuffer | Uint8Array | string, encoding: string = 'utf8'): Uint8Array {
     if (typeof data === 'string') {
@@ -38,17 +40,6 @@ export function encodeOutput(data: ArrayBuffer, encoding?: string): ArrayBuffer 
     return data;
 }
 
-export function concatBuffers(chunks: Uint8Array[]): Uint8Array<ArrayBuffer> {
-    const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-    const out = new Uint8Array(total);
-    let offset = 0;
-    for (const chunk of chunks) {
-        out.set(chunk, offset);
-        offset += chunk.length;
-    }
-    return out;
-}
-
 export function createBufferedCipher(
     transform: (data: Uint8Array) => ArrayBuffer,
     blockSize = 16,
@@ -78,34 +69,10 @@ export function createBufferedCipher(
     };
 }
 
-export function createBufferedDecipher(
+export const createBufferedDecipher = createBufferedCipher as (
     transform: (data: Uint8Array) => ArrayBuffer,
-    blockSize = 16,
-): Decipheriv {
-    const chunks: Uint8Array[] = [];
-    let outChunks: Uint8Array[] = [];
-    return {
-        update(data: BinaryInput, inputEncoding?: string, outputEncoding?: string) {
-            chunks.push(toBuffer(data, inputEncoding));
-            const buf = concatBuffers(chunks);
-            const fullBlocks = Math.floor(buf.length / blockSize) * blockSize;
-            if (fullBlocks >= blockSize) {
-                const out = new Uint8Array(transform(buf.slice(0, fullBlocks)));
-                outChunks.push(out);
-                chunks.length = 0;
-                if (buf.length > fullBlocks) chunks.push(buf.slice(fullBlocks));
-            }
-            const result = concatBuffers(outChunks);
-            outChunks = [];
-            return encodeOutput(result.buffer, outputEncoding);
-        },
-        final(outputEncoding?: string) {
-            const buf = concatBuffers(chunks);
-            chunks.length = 0;
-            return encodeOutput(transform(buf), outputEncoding);
-        },
-    };
-}
+    blockSize?: number,
+) => Decipheriv;
 
 export function isGcmAlgorithm(algorithm: string): boolean {
     const a = algorithm.toLowerCase();

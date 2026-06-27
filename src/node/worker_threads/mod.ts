@@ -172,27 +172,27 @@ export class MessagePort extends EventEmitter {
         schedulePortDispatch(this);
     }
 
-    // @ts-ignore
+    // @ts-expect-error - override narrows generic E to string
     on(event: string, listener: (...args: any[]) => void): this {
         super.on(event, listener as any);
         if (event === 'message' && !this[startedSymbol]) this.start();
         return this;
     }
 
-    // @ts-ignore
+    // @ts-expect-error - override narrows generic E to string
     once(event: string, listener: (...args: any[]) => void): this {
         super.once(event, listener as any);
         if (event === 'message' && !this[startedSymbol]) this.start();
         return this;
     }
 
-    // @ts-ignore
+    // @ts-expect-error - override narrows generic E to string
     off(event: string, listener: (...args: any[]) => void): this {
         super.off(event, listener as any);
         return this;
     }
 
-    // @ts-ignore
+    // @ts-expect-error - override narrows generic E to string
     emit(event: string, ...args: any[]): boolean {
         return super.emit(event, ...args);
     }

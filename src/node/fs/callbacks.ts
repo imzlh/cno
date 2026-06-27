@@ -2,7 +2,7 @@
  * Node.js fs module - callback-style API
  * All async operations support callback functions
  */
-import { toUint8Array, toNodeStat, toNodeDirentAsync, parseFlags, pathToString, splitPathOrFd, describeFd, removeRecursive, mkdirRecursive, modeToNumber, timeToNumber, readFileFromFdSync, type PathLike, type TimeLike, type Mode } from './utils';
+import { toUint8Array, toNodeStat, toNodeDirentAsync, parseFlags, pathToString, splitPathOrFd, describeFd, removeRecursive, mkdirRecursive, modeToNumber, timeToNumber, readFileFromFdSync, randomHex, createAsyncDir, type PathLike, type TimeLike, type Mode } from './utils';
 import { toErrnoException } from '../_internal/errno';
 import { getTierLimits } from '../_internal/memory';
 
@@ -468,6 +468,21 @@ export function realpath(path: PathLike, options?: any, callback?: any): void {
     );
 }
 
+export function mkdtemp(prefix: string, callback: (err: NodeJS.ErrnoException | null, folder: string) => void): void;
+export function mkdtemp(prefix: string, options: { encoding?: BufferEncoding | null } | BufferEncoding, callback: (err: NodeJS.ErrnoException | null, folder: string) => void): void;
+export function mkdtemp(prefix: string, options?: any, callback?: any): void {
+    if (typeof options === 'function') {
+        callback = options;
+        options = {};
+    }
+
+    const dirPath = prefix + randomHex();
+    asfs.mkdir(dirPath).then(
+        () => callback(null, dirPath),
+        err => callback(toErrnoException(err, 'mkdtemp', dirPath), ''),
+    );
+}
+
 // ============================================================================
 // Permission operations - callback style
 // ============================================================================
@@ -501,8 +516,8 @@ export function lchmod(path: PathLike, mode: Mode, callback: NoParamCallback): v
 }
 
 export function chown(path: PathLike, uid: number, gid: number, callback: NoParamCallback): void {
-    const __pathStr = pathToString(path);
-    asfs.chown(__pathStr, uid, gid).then(() => callback(null), err => callback(toErrnoException(err, 'chown', __pathStr)));
+    const pathStr = pathToString(path);
+    asfs.chown(pathStr, uid, gid).then(() => callback(null), err => callback(toErrnoException(err, 'chown', pathStr)));
 }
 
 export function fchown(fd: number, uid: number, gid: number, callback: NoParamCallback): void {
@@ -715,52 +730,7 @@ export function opendir(path: PathLike, options?: any, callback?: any): void {
 
     const pathStr = pathToString(path);
     asfs.readDir(pathStr).then(
-        dirHandle => {
-            let closed = false;
-
-            const dir: import('fs').Dir = {
-                path: pathStr,
-
-                async read(): Promise<import('fs').Dirent | null> {
-                    if (closed) return null;
-                    const result = await dirHandle.next();
-                    if (result.done) return null;
-                    return toNodeDirentAsync(result.value);
-                },
-
-                readSync(): import('fs').Dirent | null {
-                    throw new Error('readSync is not supported in async opendir');
-                },
-
-                async close(): Promise<void> {
-                    if (closed) return;
-                    closed = true;
-                    await dirHandle.close();
-                },
-
-                closeSync(): void {
-                    throw new Error('closeSync is not supported in async opendir');
-                },
-
-                [Symbol.asyncIterator](): AsyncIterableIterator<import('fs').Dirent> {
-                    return {
-                        async next() {
-                            const entry = await dir.read();
-                            if (entry === null) {
-                                return { done: true, value: undefined };
-                            }
-                            return { done: false, value: entry };
-                        },
-                        async return() {
-                            await dir.close();
-                            return { done: true, value: undefined };
-                        },
-                    } as AsyncIterableIterator<import('fs').Dirent>;
-                },
-            } as import('fs').Dir;
-
-            callback(null, dir);
-        },
+        dirHandle => callback(null, createAsyncDir(pathStr, dirHandle)),
         err => callback(toErrnoException(err, 'opendir', pathStr))
     );
 }

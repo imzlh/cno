@@ -9,7 +9,6 @@ const sock = import.meta.use('socket');
 const engine = import.meta.use('engine');
 
 import { EventEmitter } from '../events';
-// @ts-ignore - buffer is dynamic import
 import { Buffer } from '../buffer';
 
 // Platform-specific IP multicast socket options

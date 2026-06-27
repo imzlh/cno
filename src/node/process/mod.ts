@@ -412,7 +412,8 @@ export const stdout: NodeJS.WriteStream = stdoutStream as any;
 export const stderr: NodeJS.WriteStream = stderrStream as any;
 export const stdin: NodeJS.ReadStream = stdinStream as any;
 
-export const argv: string[] = [os.exePath, ...os_args.slice(1)];
+const start_idx = (os_args[1] == 'run' || os_args[1] == 'repl') ? 2 : 1;
+export const argv: string[] = [os.exePath, ...os_args.slice(start_idx)];
 export const argv0: string = os_args[0] ?? os.exePath;
 export const execArgv: string[] = [];
 
@@ -483,12 +484,12 @@ export const execPath: string = os.exePath;
 
 export let title: string = 'node';
 
-export const version: string = 'v20.0.0';
+export const version: string = 'v24.1.0';
 export const versions: NodeJS.ProcessVersions = {
-    node: '20.0.0',
+    node: '24.1.0',
     v8: engine.versions.quickjs,
     modules: '120',
-    http_parser: '2.0',
+    http_parser: engine.versions.llhttp ?? '9.0.0',
     uv: engine.versions.uv,
     zlib: engine.versions.zlib,
     ares: '1.0',
@@ -645,25 +646,19 @@ export function getegid(): number {
     return os.userInfo.groupId;
 }
 
-export function setuid(): void {
-    throw new Error('setuid is not supported');
+function unsupported(name: string): never {
+    throw new Error(`${name} is not supported`);
 }
 
-export function setgid(): void {
-    throw new Error('setgid is not supported');
-}
+export function setuid(): void { unsupported('setuid'); }
 
-export function seteuid(): void {
-    throw new Error('seteuid is not supported');
-}
+export function setgid(): void { unsupported('setgid'); }
 
-export function setegid(): void {
-    throw new Error('setegid is not supported');
-}
+export function seteuid(): void { unsupported('seteuid'); }
 
-export function setgroups(): void {
-    throw new Error('setgroups is not supported');
-}
+export function setegid(): void { unsupported('setegid'); }
+
+export function setgroups(): void { unsupported('setgroups'); }
 
 export function umask(mask?: number | string): number {
     const readMask = () => { try { return (os as any).umask?.() ?? 0o022; } catch { return 0o022; } };
@@ -697,7 +692,7 @@ export const mainModule: NodeJS.Module | undefined = undefined;
 export const debugPort: number = 5858;
 
 export function dlopen(module: object, filename: string, flags?: number): void {
-    throw new Error('process.dlopen is not supported');
+    unsupported('process.dlopen');
 }
 
 export const finalization = {
@@ -733,7 +728,7 @@ export function ref(maybeRefable: any): void { }
 export function unref(maybeRefable: any): void { }
 
 export function loadEnvFile(path?: any): void {
-    throw new Error('process.loadEnvFile is not supported');
+    unsupported('process.loadEnvFile');
 }
 
 export const sourceMapsEnabled: boolean = false;

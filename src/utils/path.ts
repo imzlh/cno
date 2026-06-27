@@ -2,6 +2,11 @@ import { isPosixCompatible } from "./platform";
 
 export const systemPathSplit = isPosixCompatible ? '/' : '\\';
 
+/** Convert a path to POSIX separators. */
+export function toPosixPath(p: string): string {
+    return p.includes('\\') ? p.replace(/\\/g, '/') : p;
+}
+
 export function join(...parts: string[]): string {
     let path = '';
     for (const p of parts) {
@@ -16,7 +21,13 @@ export function dirname(path: string): string {
     const i = path.lastIndexOf('\\');
     const j = path.lastIndexOf('/');
     const k = Math.max(i, j);
-    return k > 0 ? path.slice(0, k) : '.';
+    if (k < 0) return '.';
+    if (k === 0) return path[0] === '/' ? '/' : '.';
+    const dir = path.slice(0, k);
+    // On Windows, "C:" (without trailing slash) means "current dir on C:",
+    // not the root.  Ensure we always return "C:\" for drive-root children.
+    if (!isPosixCompatible && /^[a-zA-Z]:$/.test(dir)) return dir + systemPathSplit;
+    return dir;
 }
 
 

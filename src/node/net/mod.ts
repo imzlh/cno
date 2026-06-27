@@ -74,6 +74,12 @@ export interface ListenOptions {
     signal?: AbortSignal;
 }
 
+function normalizeTcpHost(host: string): string {
+    if (!host || host === '*') return '0.0.0.0';
+    if (host === 'localhost') return '127.0.0.1';
+    return host;
+}
+
 // ============================================================================
 // Socket
 // ============================================================================
@@ -180,6 +186,7 @@ export class Socket extends Duplex {
         this._connecting = true;
         this.readyState = 'opening';
 
+        host = normalizeTcpHost(host);
         const family = host.includes(':') ? os.AF_INET6 : os.AF_INET;
         this._tcp = new streams.TCP(family);
 
@@ -411,7 +418,7 @@ export class Socket extends Duplex {
 export class Server extends EventEmitter {
     private _tcp: CModuleStreams.TCP | null = null;
     private _pipe: CModuleStreams.Pipe | null = null;
-    private _listening: boolean = false;
+    protected _listening: boolean = false;
     private _connections: Set<Socket> = new Set();
     private _maxConnections: number = 0;
     private _allowHalfOpen: boolean = false;
@@ -491,6 +498,7 @@ export class Server extends EventEmitter {
             listeningListener = args[0];
         }
 
+        host = normalizeTcpHost(host);
         const family = host.includes(':') ? os.AF_INET6 : os.AF_INET;
         this._tcp = new streams.TCP(family);
 
@@ -505,10 +513,11 @@ export class Server extends EventEmitter {
             };
 
             this._listening = true;
+            this._acceptLoop().catch((err) => {
+                if (this._listening) this.emit('error', err);
+            });
             this.emit('listening');
             if (listeningListener) listeningListener();
-
-            this._acceptLoop();
         } catch (err) {
             this.emit('error', err);
             return this;
@@ -518,7 +527,9 @@ export class Server extends EventEmitter {
     }
 
     private _acceptLoop(): Promise<void> {
-        return new Promise((rs, rj) => this._tcp!.onconnection = (error, clientTcp) => {
+        const tcp = this._tcp;
+        if (!tcp) return Promise.resolve();
+        return new Promise((rs, rj) => tcp.onconnection = (error, clientTcp) => {
             if (error || !clientTcp) return rj(error);
             if (!this._listening) return rs();
             

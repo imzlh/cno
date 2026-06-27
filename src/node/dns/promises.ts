@@ -5,6 +5,7 @@
 const dns = import.meta.use('dns');
 const os = import.meta.use('os');
 import { toErrnoException } from '../_internal/errno';
+import { typeMap, shapeAnswers, reverseName } from './_internal';
 import type { AnyRecord, LookupOptions, MxRecord, NaptrRecord, SoaRecord, SrvRecord } from './mod';
 
 type LookupAddress = { address: string; family: number };
@@ -34,74 +35,13 @@ export async function lookup(hostname: string, options?: LookupOptions): Promise
 }
 
 export async function resolve(hostname: string, rrtype: string = 'A'): Promise<string[] | AnyRecord[] | MxRecord[] | NaptrRecord[] | SoaRecord | SrvRecord[] | string[][]> {
-    const typeMap: Record<string, number> = {
-        A: dns.A,
-        AAAA: dns.AAAA,
-        CNAME: dns.CNAME,
-        MX: dns.MX,
-        NAPTR: dns.NAPTR,
-        NS: dns.NS,
-        PTR: dns.PTR,
-        SOA: dns.SOA,
-        SRV: dns.SRV,
-        TXT: dns.TXT,
-        ANY: dns.A,
-    };
-
     try {
         const answers = await dns.query(hostname, typeMap[rrtype] ?? dns.A);
-        if (rrtype === 'A' || rrtype === 'AAAA') {
-            return answers.map((a: any) => a.address);
+        const result = shapeAnswers(rrtype, answers);
+        if (rrtype === 'SOA' && !result) {
+            throw new Error(`ENODATA ${hostname}`);
         }
-        if (rrtype === 'CNAME') {
-            return answers.map((a: any) => a.cname);
-        }
-        if (rrtype === 'MX') {
-            return answers.map((a: any) => ({ priority: a.priority, exchange: a.exchange }));
-        }
-        if (rrtype === 'NAPTR') {
-            return answers.map((a: any) => ({
-                flags: a.flags,
-                service: a.service,
-                regexp: a.regexp,
-                replacement: a.replacement,
-                order: a.order,
-                preference: a.preference,
-            }));
-        }
-        if (rrtype === 'NS') {
-            return answers.map((a: any) => a.ns);
-        }
-        if (rrtype === 'PTR') {
-            return answers.map((a: any) => a.ptr);
-        }
-        if (rrtype === 'SOA') {
-            const a = answers[0] as CModuleDNS.SoaAnswer | undefined;
-            if (!a) {
-                throw new Error(`ENODATA ${hostname}`);
-            }
-            return {
-                nsname: a.name,
-                hostmaster: a.admin,
-                serial: a.serial,
-                refresh: a.refresh,
-                retry: a.retry,
-                expire: a.expire,
-                minttl: a.minimum,
-            };
-        }
-        if (rrtype === 'SRV') {
-            return answers.map((a: any) => ({
-                priority: a.priority,
-                weight: a.weight,
-                port: a.port,
-                name: a.target,
-            }));
-        }
-        if (rrtype === 'TXT') {
-            return answers.map((a: any) => [a.txt]);
-        }
-        return answers as AnyRecord[];
+        return result;
     } catch (err) {
         throw toErrnoException(err, 'resolve', hostname);
     }
@@ -161,23 +101,8 @@ export async function resolveSoa(hostname: string): Promise<SoaRecord> {
     return await resolve(hostname, 'SOA') as SoaRecord;
 }
 
-function expandIPv6(ip: string): string {
-    if (ip.includes('::')) {
-        const [left, right] = ip.split('::');
-        const leftParts = left ? left.split(':') : [];
-        const rightParts = right ? right.split(':') : [];
-        const missing = 8 - leftParts.length - rightParts.length;
-        return [...leftParts, ...Array(missing).fill('0'), ...rightParts]
-            .map(p => p.padStart(4, '0')).join('');
-    }
-    return ip.split(':').map(p => p.padStart(4, '0')).join('');
-}
-
 export async function reverse(ip: string): Promise<string[]> {
-    const ptrName = ip.includes(':')
-        ? expandIPv6(ip).split('').reverse().join('.') + '.ip6.arpa'
-        : ip.split('.').reverse().join('.') + '.in-addr.arpa';
-    return await resolve(ptrName, 'PTR') as string[];
+    return await resolve(reverseName(ip), 'PTR') as string[];
 }
 
 export * as default from './promises';

@@ -19,6 +19,16 @@ function toDenoSystemName(name: string): string {
     return 'linux';
 }
 
+/** Map uname.machine + toDenoSystemName to a standard Rust-style target triple. */
+function toDenoTarget(arch: string, os: string): string {
+    const a = arch === 'x86_64' || arch === 'x64' ? 'x86_64'
+            : arch === 'aarch64' || arch === 'arm64' ? 'aarch64'
+            : arch;
+    if (os === 'windows') return `${a}-pc-windows-msvc`;
+    if (os === 'darwin')   return `${a}-apple-darwin`;
+    return `${a}-unknown-linux-gnu`;
+}
+
 const signalMap: Record<string, Map<() => void, CModuleSignals.SignalHandler>> = {};
 
 function safeGetEnv(env: string) {
@@ -253,7 +263,7 @@ Object.defineProperty(globalThis, "Deno", {
             arch: uname.machine,
             os: toDenoSystemName(uname.sysname),
             standalone: false,
-            target: `${uname.machine}-unknown-${uname.sysname}`,
+            target: toDenoTarget(uname.machine, toDenoSystemName(uname.sysname)),
             vendor: "cno"
         },
         version: {

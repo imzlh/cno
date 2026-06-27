@@ -79,19 +79,6 @@ export function toUint8Array(chunk: unknown, encodeString: (value: string) => Ui
     return encodeString(String(chunk ?? ''));
 }
 
-export function concatChunks(chunks: Uint8Array[]): Uint8Array | undefined {
-    if (chunks.length === 0) return undefined;
-    let total = 0;
-    for (const chunk of chunks) total += chunk.byteLength;
-    const out = new Uint8Array(total);
-    let offset = 0;
-    for (const chunk of chunks) {
-        out.set(chunk, offset);
-        offset += chunk.byteLength;
-    }
-    return out;
-}
-
 export function buildNodeUrl(protocol: string, host: string, path: string): string {
     return `${protocol}//${host}${path || '/'}`;
 }

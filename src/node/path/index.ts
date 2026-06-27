@@ -11,9 +11,11 @@ import * as posixNs from "jsr:@std/path/posix"
 // @ts-ignore - windows sub-module (exports map: ./windows → windows/mod.ts)
 import * as win32Ns from "jsr:@std/path/windows"
 
-// Node.js lowercase aliases
-export const sep = stdPath.SEPARATOR
-export const delimiter = stdPath.DELIMITER
+// Node.js lowercase aliases. Keep these explicit; third-party code often
+// concatenates with path.sep, so an upstream constant rename becomes visible
+// as paths like "D:undefinedproject".
+export const sep = process.platform === 'win32' ? '\\' : '/'
+export const delimiter = process.platform === 'win32' ? ';' : ':'
 
 // Platform-specific namespace objects (Node.js path.posix / path.win32)
 export const posix = posixNs

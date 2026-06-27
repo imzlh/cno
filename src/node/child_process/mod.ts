@@ -155,24 +155,30 @@ class ChildProcessImpl extends EventEmitter implements ChildProcess {
 
     private _createReadable(pipe: CModuleStreams.Pipe): Readable {
         const readable = new Readable({
-            async read(size) {
-                const chunkSize = size || READ_BUF_SIZE;
-                const buf = new Uint8Array(chunkSize);
-
-                try {
-                    const n = await pipe.read(buf);
-                    if (n === 0) {
-                        readable.push(null);
-                        return;
-                    }
-                    readable.push(buf.subarray(0, n));
-                } catch (err) {
-                    readable.emit('error', err);
-                    readable.push(null);
-                }
+            read() {
+                // Resume reading when the consumer has drained below the high water mark
+                try { pipe.startRead(); } catch {}
             }
         });
 
+        // Use callback-based read: pipe.onread pushes data into the Readable buffer
+        pipe.onread = (data: Uint8Array | null | undefined, err?: any) => {
+            if (err) { readable.destroy(err as Error); return; }
+            if (data === null || data === undefined) {
+                readable.push(null);
+                try { pipe.stopRead(); } catch {}
+                return;
+            }
+            const ok = readable.push(data);
+            if (!ok) {
+                // Back-pressure: stop reading until Readable drains
+                try { pipe.stopRead(); } catch {}
+            }
+        };
+
+        // Enter flowing mode so push() emits 'data' immediately.
+        // Must be after onread is set — resume() calls _read() → startRead().
+        readable.resume();
         return readable;
     }
 
@@ -341,8 +347,7 @@ export function spawn(command: string, argsOrOptions?: string[] | SpawnOptions, 
         spawnOpts.env = { ...baseEnv, NODE_CHANNEL_FD: '3' };
     }
 
-    // @ts-ignore
-    const process = proc.spawn(command, args, spawnOpts);
+    const process = proc.spawn([command, ...args], spawnOpts);
     child._init(process, command, args, opts);
 
     // Set up IPC channel if created

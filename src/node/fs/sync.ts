@@ -3,9 +3,11 @@
  */
 
 const fs = import.meta.use('fs');
-import { toUint8Array, decodeBuffer, toNodeStat, toNodeDirent, parseFlags, pathToString, splitPathOrFd, describeFd, removeRecursiveSync, mkdirRecursiveSync, modeToNumber, timeToNumber, readFileFromFdSync, type PathLike, type TimeLike, type Mode } from './utils';
+import { toUint8Array, decodeBuffer, toNodeStat, toNodeDirent, parseFlags, pathToString, splitPathOrFd, describeFd, removeRecursiveSync, mkdirRecursiveSync, modeToNumber, timeToNumber, readFileFromFdSync, randomHex, type PathLike, type TimeLike, type Mode } from './utils';
 import { wrapSync } from '../_internal/errno';
 import { getTierLimits } from '../_internal/memory';
+import path from '../path';
+const { join } = path;
 
 const { readBufSize: READ_BUF_SIZE } = getTierLimits();
 
@@ -381,7 +383,7 @@ export function cpSync(src: PathLike, dest: PathLike, options?: CopyOptionsSync)
 
         const entries = fs.readdir(srcStr);
         for (const entry of entries) {
-            cpSync(`${srcStr}/${entry}`, `${destStr}/${entry}`, options);
+            cpSync(join(srcStr, entry), join(destStr, entry), options);
         }
     } else {
         if (fs.exists(destStr) && !options?.force) {
@@ -393,4 +395,10 @@ export function cpSync(src: PathLike, dest: PathLike, options?: CopyOptionsSync)
 
         wrapSync(() => fs.copy(srcStr, destStr), 'cpSync', srcStr);
     }
+}
+
+export function mkdtempSync(prefix: string, options?: { encoding?: BufferEncoding | null } | BufferEncoding): string {
+    const dirPath = prefix + randomHex();
+    wrapSync(() => fs.mkdir(dirPath), 'mkdtempSync', dirPath);
+    return dirPath;
 }

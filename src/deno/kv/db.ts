@@ -5,6 +5,7 @@
 const sqlite3 = import.meta.use('sqlite3');
 const fs = import.meta.use('fs');
 import { getMemoryTier } from '../../utils/memory-tier';
+import { toPosixPath } from '../../utils/path';
 
 import {
     KvKeyPart,
@@ -64,7 +65,8 @@ export class KvDatabase {
 
     async open(): Promise<void> {
         if (!this.isMemory) {
-            const dir = this.path.substring(0, this.path.lastIndexOf('/')) || '.';
+            const posixPath = toPosixPath(this.path);
+            const dir = posixPath.substring(0, posixPath.lastIndexOf('/')) || '.';
             this.mkdirRecursive(dir);
         }
 
@@ -86,8 +88,9 @@ export class KvDatabase {
     private mkdirRecursive(path: string): void {
         if (!path || path === '.') return;
 
-        const parts = path.split('/').filter(p => p);
-        let current = path.startsWith('/') ? '/' : '';
+        const normalized = toPosixPath(path);
+        const parts = normalized.split('/').filter(p => p);
+        let current = normalized.startsWith('/') ? '/' : '';
 
         for (const part of parts) {
             current += part;

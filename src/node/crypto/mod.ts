@@ -580,6 +580,14 @@ export function randomBytes(size: number, callback?: (err: Error | null, buf: Ui
     }
     return new Uint8Array(crypto.randomBytes(size));
 }
+
+// Web Crypto API compat (Node.js 17+)
+export function getRandomValues<T extends ArrayBufferView>(array: T): T {
+    const bytes = crypto.randomBytes(array.byteLength);
+    // @ts-ignore - arraybufferview
+    new Uint8Array(array.buffer, array.byteOffset, array.byteLength).set(bytes);
+    return array;
+}
 // Re-export random/kdf/hkdf from random.ts
 export { randomInt, randomFill, pbkdf2, pbkdf2Sync, pbkdf2Sha256, pbkdf2Sha512, hkdf, hkdfSync, hkdfSha256, hkdfSha512 } from './random';
 

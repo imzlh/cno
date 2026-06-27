@@ -4,16 +4,16 @@
 
 export { STATUS_CODES, METHODS } from './server';
 export { 
-    IncomingMessageImpl,
-    OutgoingMessageImpl,
-    ServerResponseImpl,
-    ServerImpl,
+    IncomingMessageImpl as IncomingMessage,
+    OutgoingMessageImpl as OutgoingMessage,
+    ServerResponseImpl as ServerResponse,
+    ServerImpl as Server,
     createServer,
     validateHeaderName,
     validateHeaderValue,
 } from './server';
 export { 
-    ClientRequestImpl,
+    ClientRequestImpl as ClientRequest,
     Agent,
     globalAgent,
     request,

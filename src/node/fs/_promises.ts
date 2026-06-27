@@ -5,10 +5,12 @@
 const asfs = import.meta.use('asyncfs');
 const engine = import.meta.use('engine');
 const fs = import.meta.use('fs');
-import { toUint8Array, decodeBuffer, toNodeStatAsync, toNodeDirentAsync, parseFlags, pathToString, splitPathOrFd, removeRecursive, mkdirRecursive, modeToNumber, timeToNumber, readFileFromFdSync, createFileHandle, type PathLike, type TimeLike, type Mode } from './utils';
+import { toUint8Array, decodeBuffer, toNodeStat, toNodeDirentAsync, parseFlags, pathToString, splitPathOrFd, removeRecursive, mkdirRecursive, modeToNumber, timeToNumber, readFileFromFdSync, createFileHandle, randomHex, createAsyncDir, type PathLike, type TimeLike, type Mode } from './utils';
 import { toErrnoException, wrapPromise } from '../_internal/errno';
 import { getTierLimits } from '../_internal/memory';
 import type { Dirent } from 'fs';
+import path from '../path';
+const { join, SEPARATOR } = path;
 
 const { readBufSize: READ_BUF_SIZE } = getTierLimits();
 
@@ -78,13 +80,13 @@ export async function access(path: PathLike, mode?: number): Promise<void> {
 export async function stat(path: PathLike, options?: { bigint?: boolean }): Promise<import('fs').Stats> {
     const pathStr = pathToString(path);
     const st = await w(asfs.stat(pathStr), 'stat', pathStr);
-    return toNodeStatAsync(st);
+    return toNodeStat(st);
 }
 
 export async function lstat(path: PathLike, options?: { bigint?: boolean }): Promise<import('fs').Stats> {
     const pathStr = pathToString(path);
     const st = await w(asfs.lstat(pathStr), 'lstat', pathStr);
-    return toNodeStatAsync(st);
+    return toNodeStat(st);
 }
 
 // ============================================================================
@@ -165,50 +167,7 @@ export async function readdir(path: PathLike, options?: { encoding?: BufferEncod
 export async function opendir(path: PathLike, options?: { encoding?: BufferEncoding; bufferSize?: number }): Promise<import('fs').Dir> {
     const pathStr = pathToString(path);
     const dirHandle = await w(asfs.readDir(pathStr), 'readdir', pathStr);
-    let closed = false;
-
-    const dir: import('fs').Dir = {
-        path: pathStr,
-
-        async read(): Promise<import('fs').Dirent | null> {
-            if (closed) return null;
-            const result = await dirHandle.next();
-            if (result.done) return null;
-            return toNodeDirentAsync(result.value);
-        },
-
-        readSync(): import('fs').Dirent | null {
-            throw new Error('readSync is not supported in async opendir');
-        },
-
-        async close(): Promise<void> {
-            if (closed) return;
-            closed = true;
-            await dirHandle.close();
-        },
-
-        closeSync(): void {
-            throw new Error('closeSync is not supported in async opendir');
-        },
-
-        [Symbol.asyncIterator](): AsyncIterableIterator<import('fs').Dirent> {
-            return {
-                async next() {
-                    const entry = await dir.read();
-                    if (entry === null) {
-                        return { done: true, value: undefined };
-                    }
-                    return { done: false, value: entry };
-                },
-                async return() {
-                    await dir.close();
-                    return { done: true, value: undefined };
-                },
-            } as AsyncIterableIterator<import('fs').Dirent>;
-        },
-    } as import('fs').Dir;
-
-    return dir;
+    return createAsyncDir(pathStr, dirHandle);
 }
 
 // ============================================================================
@@ -216,8 +175,8 @@ export async function opendir(path: PathLike, options?: { encoding?: BufferEncod
 // ============================================================================
 
 export async function unlink(path: PathLike): Promise<void> {
-    const __p = pathToString(path);
-    try { await asfs.unlink(__p); } catch (e) { throw toErrnoException(e, 'unlink', __p); }
+    const pathStr = pathToString(path);
+    await w(asfs.unlink(pathStr), 'unlink', pathStr);
 }
 
 export async function rename(oldPath: PathLike, newPath: PathLike): Promise<void> {
@@ -341,11 +300,7 @@ export async function lchmod(path: PathLike, mode: Mode): Promise<void> {
 }
 
 export async function mkdtemp(prefix: string, options?: { encoding?: BufferEncoding | null } | BufferEncoding): Promise<string> {
-    const encoding = typeof options === 'string' ? options : options?.encoding;
-    // Use crypto-grade randomness (6 bytes = 12 hex chars) instead of Math.random
-    const randomBytes = await import('../crypto').then(m => m.randomBytes(6));
-    const randomStr = Array.from(new Uint8Array(randomBytes)).map(b => b.toString(16).padStart(2, '0')).join('');
-    const dirPath = prefix + randomStr;
+    const dirPath = prefix + randomHex();
     await w(asfs.mkdir(dirPath), 'mkdir', dirPath);
     return dirPath;
 }
@@ -385,7 +340,7 @@ export function watch(path: PathLike, options?: { persistent?: boolean; recursiv
         if (closed) return;
         closed = true;
         if (watcher) {
-            await watcher.close();
+            watcher.close();
             watcher = null;
         }
         if (resolveNext) {
@@ -394,9 +349,13 @@ export function watch(path: PathLike, options?: { persistent?: boolean; recursiv
         }
     };
 
-    fswatch.watch(pathStr, (filename: string, event: string) => {
-        pushEvent({ eventType: event, filename });
-    }).then(w => { watcher = w; }).catch(() => { close(); });
+    try {
+        watcher = fswatch.watch(pathStr, (filename: string, event: string) => {
+            pushEvent({ eventType: event, filename });
+        });
+    } catch {
+        void close();
+    }
 
     if (signal) {
         signal.addEventListener('abort', () => { close(); }, { once: true });
@@ -435,8 +394,8 @@ export async function cp(source: PathLike, destination: PathLike, opts?: { force
             const dir = await w(asfs.readDir(srcStr), 'cp', srcStr);
             try {
                 for await (const entry of dir) {
-                    const srcPath = srcStr + '/' + entry.name;
-                    const destPath = destStr + '/' + entry.name;
+                    const srcPath = join(srcStr, entry.name);
+                    const destPath = join(destStr, entry.name);
 
                     if (opts?.filter) {
                         const shouldCopy = await opts.filter(srcPath, destPath);
@@ -463,25 +422,27 @@ export async function cp(source: PathLike, destination: PathLike, opts?: { force
 }
 
 function globToRegex(pattern: string): RegExp {
+    const sep = '[/\\\\]';
+    const notSep = '[^/\\\\]';
     let regex = '';
     let i = 0;
     while (i < pattern.length) {
         const c = pattern[i];
         if (c === '*') {
             if (pattern[i + 1] === '*') {
-                if (pattern[i + 2] === '/') {
-                    regex += '(?:.*/)?';
+                if (pattern[i + 2] === '/' || pattern[i + 2] === '\\') {
+                    regex += `(?:.*${sep})?`;
                     i += 3;
                 } else {
                     regex += '.*';
                     i += 2;
                 }
             } else {
-                regex += '[^/]*';
+                regex += notSep + '*';
                 i++;
             }
         } else if (c === '?') {
-            regex += '[^/]';
+            regex += notSep;
             i++;
         } else if (c === '[') {
             const j = pattern.indexOf(']', i);
@@ -524,8 +485,10 @@ export async function* glob(pattern: string | readonly string[], options?: { cwd
         }
         catch { return; }
         for (const name of entries) {
-            const full = dir + '/' + name;
-            const rel = full.slice(cwd.length + 1);
+            const full = join(dir, name);
+            let rel = full.slice(cwd.length + 1);
+            // Normalize separator for consistent regex matching
+            if (SEPARATOR === '\\') rel = rel.replace(/\\/g, '/');
             let stat: any;
             try { stat = await w(asfs.lstat(full), 'lstat', full); } catch { continue; }
             if (excludeRegexes.some(r => r.test(rel))) continue;

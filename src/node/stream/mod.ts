@@ -182,6 +182,27 @@ export class Readable extends Stream {
         }
     }
 
+    // Node.js compat: adding a 'data' listener auto-resumes the stream
+    override on(event: string | symbol, fn: (...args: any[]) => void): this {
+        super.on(event, fn);
+        if (event === 'data') this.resume();
+        return this;
+    }
+
+    override once(event: string | symbol, fn: (...args: any[]) => void): this {
+        super.once(event, fn);
+        if (event === 'data') this.resume();
+        return this;
+    }
+
+    private _emitReadableEndIfNeeded(): void {
+        const state = this._readableState;
+        if (!state.ended || state.endEmitted || state.buffer.length > 0) return;
+        state.endEmitted = true;
+        this.readableEnded = true;
+        this.emit('end');
+    }
+
     static from(iterable: Iterable<any> | AsyncIterable<any>, options?: ReadableOptions): Readable {
         const readable = new Readable(options);
         const iterator = (iterable as any)[Symbol.asyncIterator]?.() ?? (iterable as any)[Symbol.iterator]?.();
@@ -207,6 +228,7 @@ export class Readable extends Stream {
 
         if (state.buffer.length === 0) {
             if (state.ended) {
+                this._emitReadableEndIfNeeded();
                 return null;
             }
             state.needReadable = true;
@@ -216,11 +238,7 @@ export class Readable extends Stream {
         const chunk = state.buffer.shift();
         this.readableLength = state.buffer.length;
 
-        if (state.ended && state.buffer.length === 0 && !state.endEmitted) {
-            state.endEmitted = true;
-            this.readableEnded = true;
-            this.emit('end');
-        }
+        this._emitReadableEndIfNeeded();
 
         return chunk;
     }
@@ -251,7 +269,7 @@ export class Readable extends Stream {
 
     private _readAndResolve(): void {
         const state = this._readableState;
-        if (!state.flowing || state.ended) return;
+        if (!state.flowing) return;
 
         // Drain buffered data first
         while (state.flowing && state.buffer.length > 0) {
@@ -260,10 +278,8 @@ export class Readable extends Stream {
             this.emit('data', chunk);
         }
 
-        if (state.ended && !state.endEmitted) {
-            state.endEmitted = true;
-            this.readableEnded = true;
-            this.emit('end');
+        if (state.ended) {
+            this._emitReadableEndIfNeeded();
             return;
         }
 
@@ -329,15 +345,7 @@ export class Readable extends Stream {
 
         if (chunk === null) {
             state.ended = true;
-            if (state.flowing && !state.endEmitted) {
-                state.endEmitted = true;
-                this.readableEnded = true;
-                this.emit('end');
-            } else if (state.buffer.length === 0 && !state.endEmitted) {
-                state.endEmitted = true;
-                this.readableEnded = true;
-                this.emit('end');
-            }
+            if (state.flowing) this._emitReadableEndIfNeeded();
             return false;
         }
 
@@ -692,6 +700,7 @@ export class Duplex extends Writable {
 
         if (state.buffer.length === 0) {
             if (state.ended) {
+                this._emitReadableEndIfNeeded();
                 return null;
             }
             state.needReadable = true;
@@ -701,11 +710,7 @@ export class Duplex extends Writable {
         const chunk = state.buffer.shift();
         this.readableLength = state.buffer.length;
 
-        if (state.ended && state.buffer.length === 0 && !state.endEmitted) {
-            state.endEmitted = true;
-            this.readableEnded = true;
-            this.emit('end');
-        }
+        this._emitReadableEndIfNeeded();
 
         return chunk;
     }
@@ -736,9 +741,30 @@ export class Duplex extends Writable {
         return this;
     }
 
+    // Node.js compat: adding a 'data' listener auto-resumes the readable side
+    override on(event: string | symbol, fn: (...args: any[]) => void): this {
+        super.on(event, fn);
+        if (event === 'data') this.resume();
+        return this;
+    }
+
+    override once(event: string | symbol, fn: (...args: any[]) => void): this {
+        super.once(event, fn);
+        if (event === 'data') this.resume();
+        return this;
+    }
+
+    private _emitReadableEndIfNeeded(): void {
+        const state = this._readableState;
+        if (!state.ended || state.endEmitted || state.buffer.length > 0) return;
+        state.endEmitted = true;
+        this.readableEnded = true;
+        this.emit('end');
+    }
+
     private _duplexReadAndResolve(): void {
         const state = this._readableState;
-        if (!state.flowing || state.ended) return;
+        if (!state.flowing) return;
 
         while (state.flowing && state.buffer.length > 0) {
             const chunk = state.buffer.shift();
@@ -746,10 +772,8 @@ export class Duplex extends Writable {
             this.emit('data', chunk);
         }
 
-        if (state.ended && !state.endEmitted) {
-            state.endEmitted = true;
-            this.readableEnded = true;
-            this.emit('end');
+        if (state.ended) {
+            this._emitReadableEndIfNeeded();
             return;
         }
 
@@ -793,15 +817,7 @@ export class Duplex extends Writable {
 
         if (chunk === null) {
             state.ended = true;
-            if (state.flowing && !state.endEmitted) {
-                state.endEmitted = true;
-                this.readableEnded = true;
-                this.emit('end');
-            } else if (state.buffer.length === 0 && !state.endEmitted) {
-                state.endEmitted = true;
-                this.readableEnded = true;
-                this.emit('end');
-            }
+            if (state.flowing) this._emitReadableEndIfNeeded();
             return false;
         }
 

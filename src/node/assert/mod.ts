@@ -3,6 +3,58 @@
  */
 
 const console = import.meta.use('console');
+import { deepEqual as _deepEqual } from '../_internal/deep-equal';
+
+// Internal helpers to reduce boilerplate
+function msg(m?: string | Error): string | undefined {
+    return typeof m === 'string' ? m : m?.message;
+}
+
+function checkArgs(min: number, actual: number): void {
+    if (actual < min) {
+        throw new AssertionError({ message: 'actual and expected arguments required', generatedMessage: true });
+    }
+}
+
+function inspectForAssertion(value: unknown, seen = new WeakSet<object>()): string {
+    if (value === null) return 'null';
+    if (value === undefined) return 'undefined';
+    if (typeof value === 'string') return `'${value}'`;
+    if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') return String(value);
+    if (typeof value === 'symbol') return value.toString();
+    if (typeof value === 'function') return `[Function${value.name ? `: ${value.name}` : ''}]`;
+    if (typeof value !== 'object') return String(value);
+
+    if (seen.has(value)) return '[Circular]';
+    seen.add(value);
+
+    if (Array.isArray(value)) {
+        return `[ ${value.map(item => inspectForAssertion(item, seen)).join(', ')} ]`;
+    }
+    if (value instanceof Date) return value.toISOString();
+    if (value instanceof RegExp) return value.toString();
+    if (value instanceof Error) return `${value.name}: ${value.message}`;
+    if (value instanceof Map) {
+        const entries = Array.from(value, ([key, item]) => `${inspectForAssertion(key, seen)} => ${inspectForAssertion(item, seen)}`);
+        return `Map(${value.size}) { ${entries.join(', ')} }`;
+    }
+    if (value instanceof Set) {
+        const entries = Array.from(value, item => inspectForAssertion(item, seen));
+        return `Set(${value.size}) { ${entries.join(', ')} }`;
+    }
+
+    try {
+        const keys = Reflect.ownKeys(value);
+        const entries = keys.map(key => {
+            const label = typeof key === 'symbol' ? `[${key.toString()}]` : String(key);
+            return `${label}: ${inspectForAssertion((value as any)[key], seen)}`;
+        });
+        const prefix = Object.getPrototypeOf(value) === null ? '[Object: null prototype] ' : '';
+        return `${prefix}{ ${entries.join(', ')} }`;
+    } catch {
+        return console.inspect(value);
+    }
+}
 
 export type AssertPredicate = RegExp | (new () => object) | ((thrown: unknown) => boolean) | object | Error;
 
@@ -28,7 +80,7 @@ export class AssertionError extends Error {
         // provided — matches Node.js behaviour (e.g. "1 equal 2", "'deno' match /node/").
         let message = options.message;
         if (message == null && (options.actual !== undefined || options.expected !== undefined)) {
-            message = `${console.inspect(options.actual)} ${options.operator || ''} ${console.inspect(options.expected)}`.trim();
+            message = `${inspectForAssertion(options.actual)} ${options.operator || ''} ${inspectForAssertion(options.expected)}`.trim();
         }
         super(message || 'Assertion failed');
         this.name = 'AssertionError';
@@ -53,7 +105,7 @@ function innerOk(fn: Function, argLen: number, value: unknown, message?: string 
         throw new AssertionError({
             actual: value,
             expected: true,
-            message: typeof message === 'string' ? message : message?.message,
+            message: msg(message),
             operator: '==',
             generatedMessage: !message
         });
@@ -67,28 +119,23 @@ export function ok(value: unknown, message?: string | Error): asserts value {
 export function fail(message?: string | Error): never;
 export function fail(actual: unknown, expected: unknown, message?: string | Error, operator?: string): never;
 export function fail(actual?: unknown, expected?: unknown, message?: string | Error, operator?: string): never {
-    const msg = arguments.length === 1 ? actual : message;
+    const m = arguments.length === 1 ? actual : message;
     throw new AssertionError({
-        message: typeof msg === 'string' ? msg : (msg as Error)?.message,
+        message: msg(m as string | Error),
         actual: arguments.length > 1 ? actual : undefined,
         expected: arguments.length > 1 ? expected : undefined,
         operator: operator || 'fail',
-        generatedMessage: !msg
+        generatedMessage: !m
     });
 }
 
 export function equal(actual: unknown, expected: unknown, message?: string | Error): void {
-    if (arguments.length < 2) {
-        throw new AssertionError({
-            message: 'actual and expected arguments required',
-            generatedMessage: true
-        });
-    }
+    checkArgs(2, arguments.length);
     if (actual != expected) {
         throw new AssertionError({
             actual,
             expected,
-            message: typeof message === 'string' ? message : message?.message,
+            message: msg(message),
             operator: '==',
             generatedMessage: !message
         });
@@ -96,17 +143,12 @@ export function equal(actual: unknown, expected: unknown, message?: string | Err
 }
 
 export function notEqual(actual: unknown, expected: unknown, message?: string | Error): void {
-    if (arguments.length < 2) {
-        throw new AssertionError({
-            message: 'actual and expected arguments required',
-            generatedMessage: true
-        });
-    }
+    checkArgs(2, arguments.length);
     if (actual == expected) {
         throw new AssertionError({
             actual,
             expected,
-            message: typeof message === 'string' ? message : message?.message,
+            message: msg(message),
             operator: '!=',
             generatedMessage: !message
         });
@@ -114,17 +156,12 @@ export function notEqual(actual: unknown, expected: unknown, message?: string | 
 }
 
 export function strictEqual<T>(actual: unknown, expected: T, message?: string | Error): asserts actual is T {
-    if (arguments.length < 2) {
-        throw new AssertionError({
-            message: 'actual and expected arguments required',
-            generatedMessage: true
-        });
-    }
+    checkArgs(2, arguments.length);
     if (!Object.is(actual, expected)) {
         throw new AssertionError({
             actual,
             expected,
-            message: typeof message === 'string' ? message : message?.message,
+            message: msg(message),
             operator: 'strictEqual',
             generatedMessage: !message
         });
@@ -132,127 +169,25 @@ export function strictEqual<T>(actual: unknown, expected: T, message?: string | 
 }
 
 export function notStrictEqual(actual: unknown, expected: unknown, message?: string | Error): void {
-    if (arguments.length < 2) {
-        throw new AssertionError({
-            message: 'actual and expected arguments required',
-            generatedMessage: true
-        });
-    }
+    checkArgs(2, arguments.length);
     if (Object.is(actual, expected)) {
         throw new AssertionError({
             actual,
             expected,
-            message: typeof message === 'string' ? message : message?.message,
+            message: msg(message),
             operator: 'notStrictEqual',
             generatedMessage: !message
         });
     }
 }
 
-function _deepEqual(actual: unknown, expected: unknown, strict: boolean, skipPrototype: boolean = false, seen?: WeakSet<object>): boolean {
-    if (Object.is(actual, expected)) return true;
-    if (!strict && actual == expected) return true;
-    if (actual === null || expected === null) return false;
-    if (typeof actual !== 'object' && typeof expected !== 'object') {
-        return strict ? Object.is(actual, expected) : actual == expected;
-    }
-    if (typeof actual !== 'object' || typeof expected !== 'object') return false;
-
-    // Boxed primitives (Number/Boolean/String) — compare their primitive values
-    // via `valueOf()`. Without this, `new Number(1)` and `new Number(2)` would
-    // appear equal because Object.keys() returns [] for both.
-    if (actual instanceof Number && expected instanceof Number) {
-        return Object.is(actual.valueOf(), expected.valueOf());
-    }
-    if (actual instanceof Boolean && expected instanceof Boolean) {
-        return Object.is(actual.valueOf(), expected.valueOf());
-    }
-    if (actual instanceof String && expected instanceof String) {
-        return Object.is(actual.valueOf(), expected.valueOf());
-    }
-
-    // Circular reference protection
-    const _seen = seen ?? new WeakSet();
-    if (_seen.has(actual as object) && _seen.has(expected as object)) return true;
-    _seen.add(actual as object);
-    _seen.add(expected as object);
-
-    if (!skipPrototype && Object.getPrototypeOf(actual) !== Object.getPrototypeOf(expected)) {
-        return false;
-    }
-
-    if (actual instanceof Date && expected instanceof Date) {
-        return actual.getTime() === expected.getTime();
-    }
-    if (actual instanceof RegExp && expected instanceof RegExp) {
-        return actual.source === expected.source && actual.flags === expected.flags;
-    }
-    if (ArrayBuffer.isView(actual) && ArrayBuffer.isView(expected)) {
-        if (actual.byteLength !== expected.byteLength) return false;
-        const actualView = new Uint8Array(actual.buffer as ArrayBuffer, actual.byteOffset, actual.byteLength);
-        const expectedView = new Uint8Array(expected.buffer as ArrayBuffer, expected.byteOffset, expected.byteLength);
-        for (let i = 0; i < actualView.length; i++) {
-            if (actualView[i] !== expectedView[i]) return false;
-        }
-        return true;
-    }
-    if (actual instanceof Map && expected instanceof Map) {
-        if (actual.size !== expected.size) return false;
-        for (const [key, value] of actual) {
-            if (!expected.has(key) || !_deepEqual(value, expected.get(key), strict, skipPrototype, _seen)) return false;
-        }
-        return true;
-    }
-    if (actual instanceof Set && expected instanceof Set) {
-        if (actual.size !== expected.size) return false;
-        for (const value of actual) {
-            // .has() uses reference equality, so use _deepEqual for objects
-            let found = false;
-            for (const expVal of expected) {
-                if (_deepEqual(value, expVal, strict, skipPrototype, _seen)) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) return false;
-        }
-        return true;
-    }
-    if (Array.isArray(actual) !== Array.isArray(expected)) return false;
-
-    const actualKeys = Object.keys(actual as object);
-    const expectedKeys = Object.keys(expected as object);
-    if (actualKeys.length !== expectedKeys.length) return false;
-
-    for (const key of actualKeys) {
-        if (!Object.prototype.hasOwnProperty.call(expected, key)) return false;
-        if (!_deepEqual((actual as any)[key], (expected as any)[key], strict, skipPrototype, _seen)) return false;
-    }
-
-    if (strict) {
-        const actualSymbols = Object.getOwnPropertySymbols(actual as object);
-        const expectedSymbols = Object.getOwnPropertySymbols(expected as object);
-        if (actualSymbols.length !== expectedSymbols.length) return false;
-        for (const sym of actualSymbols) {
-            if (!Object.prototype.hasOwnProperty.call(expected, sym)) return false;
-            if (!_deepEqual((actual as any)[sym], (expected as any)[sym], strict, skipPrototype, _seen)) return false;
-        }
-    }
-    return true;
-}
-
 export function deepEqual(actual: unknown, expected: unknown, message?: string | Error): void {
-    if (arguments.length < 2) {
-        throw new AssertionError({
-            message: 'actual and expected arguments required',
-            generatedMessage: true
-        });
-    }
+    checkArgs(2, arguments.length);
     if (!_deepEqual(actual, expected, false)) {
         throw new AssertionError({
             actual,
             expected,
-            message: typeof message === 'string' ? message : message?.message,
+            message: msg(message),
             operator: 'deepEqual',
             generatedMessage: !message
         });
@@ -260,17 +195,12 @@ export function deepEqual(actual: unknown, expected: unknown, message?: string |
 }
 
 export function notDeepEqual(actual: unknown, expected: unknown, message?: string | Error): void {
-    if (arguments.length < 2) {
-        throw new AssertionError({
-            message: 'actual and expected arguments required',
-            generatedMessage: true
-        });
-    }
+    checkArgs(2, arguments.length);
     if (_deepEqual(actual, expected, false)) {
         throw new AssertionError({
             actual,
             expected,
-            message: typeof message === 'string' ? message : message?.message,
+            message: msg(message),
             operator: 'notDeepEqual',
             generatedMessage: !message
         });
@@ -278,17 +208,12 @@ export function notDeepEqual(actual: unknown, expected: unknown, message?: strin
 }
 
 export function deepStrictEqual<T>(actual: unknown, expected: T, message?: string | Error): asserts actual is T {
-    if (arguments.length < 2) {
-        throw new AssertionError({
-            message: 'actual and expected arguments required',
-            generatedMessage: true
-        });
-    }
+    checkArgs(2, arguments.length);
     if (!_deepEqual(actual, expected, true)) {
         throw new AssertionError({
             actual,
             expected,
-            message: typeof message === 'string' ? message : message?.message,
+            message: msg(message),
             operator: 'deepStrictEqual',
             generatedMessage: !message
         });
@@ -296,17 +221,12 @@ export function deepStrictEqual<T>(actual: unknown, expected: T, message?: strin
 }
 
 export function notDeepStrictEqual(actual: unknown, expected: unknown, message?: string | Error): void {
-    if (arguments.length < 2) {
-        throw new AssertionError({
-            message: 'actual and expected arguments required',
-            generatedMessage: true
-        });
-    }
+    checkArgs(2, arguments.length);
     if (_deepEqual(actual, expected, true)) {
         throw new AssertionError({
             actual,
             expected,
-            message: typeof message === 'string' ? message : message?.message,
+            message: msg(message),
             operator: 'notDeepStrictEqual',
             generatedMessage: !message
         });
@@ -320,7 +240,7 @@ function _checkError(err: unknown, error: AssertPredicate, message?: string | Er
                 throw new AssertionError({
                     actual: err,
                     expected: error,
-                    message: typeof message === 'string' ? message : message?.message,
+                    message: msg(message),
                     operator: 'throws',
                     generatedMessage: !message
                 });
@@ -330,7 +250,7 @@ function _checkError(err: unknown, error: AssertPredicate, message?: string | Er
                 throw new AssertionError({
                     actual: err,
                     expected: error,
-                    message: typeof message === 'string' ? message : message?.message,
+                    message: msg(message),
                     operator: 'throws',
                     generatedMessage: !message
                 });
@@ -341,7 +261,7 @@ function _checkError(err: unknown, error: AssertPredicate, message?: string | Er
             throw new AssertionError({
                 actual: err,
                 expected: error,
-                message: typeof message === 'string' ? message : message?.message,
+                message: msg(message),
                 operator: 'throws',
                 generatedMessage: !message
             });
@@ -351,7 +271,7 @@ function _checkError(err: unknown, error: AssertPredicate, message?: string | Er
             throw new AssertionError({
                 actual: err,
                 expected: error,
-                message: typeof message === 'string' ? message : message?.message,
+                message: msg(message),
                 operator: 'throws',
                 generatedMessage: !message
             });
@@ -366,7 +286,7 @@ function _checkError(err: unknown, error: AssertPredicate, message?: string | Er
                     throw new AssertionError({
                         actual: err,
                         expected: error,
-                        message: typeof message === 'string' ? message : message?.message,
+                        message: msg(message),
                         operator: 'throws',
                         generatedMessage: !message
                     });
@@ -375,7 +295,7 @@ function _checkError(err: unknown, error: AssertPredicate, message?: string | Er
                 throw new AssertionError({
                     actual: err,
                     expected: error,
-                    message: typeof message === 'string' ? message : message?.message,
+                    message: msg(message),
                     operator: 'throws',
                     generatedMessage: !message
                 });
@@ -405,11 +325,11 @@ export function throws(block: () => unknown, error?: AssertPredicate | string | 
     }
 
     if (!threw) {
-        const msg = typeof error === 'string' || error instanceof Error ? error : message;
+        const m = typeof error === 'string' || error instanceof Error ? error : message;
         throw new AssertionError({
-            message: typeof msg === 'string' ? msg : msg?.message || 'Missing expected exception',
+            message: msg(m as string | Error) || 'Missing expected exception',
             operator: 'throws',
-            generatedMessage: !msg
+            generatedMessage: !m
         });
     }
 
@@ -428,9 +348,7 @@ export function doesNotThrow(block: () => unknown, error?: AssertPredicate | str
         });
     }
 
-    let msg: string | Error | undefined;
-    if (typeof error === 'string' || error instanceof Error) msg = error;
-    else msg = message;
+    const m = (typeof error === 'string' || error instanceof Error) ? error : message;
 
     try {
         block();
@@ -438,9 +356,9 @@ export function doesNotThrow(block: () => unknown, error?: AssertPredicate | str
         throw new AssertionError({
             actual: err,
             expected: undefined,
-            message: typeof msg === 'string' ? msg : msg?.message || 'Got unwanted exception',
+            message: msg(m as string | Error) || 'Got unwanted exception',
             operator: 'doesNotThrow',
-            generatedMessage: !msg
+            generatedMessage: !m
         });
     }
 }
@@ -485,11 +403,11 @@ export async function rejects(block: (() => Promise<unknown>) | Promise<unknown>
     }
 
     if (!threw) {
-        const msg = typeof error === 'string' || error instanceof Error ? error : message;
+        const m = typeof error === 'string' || error instanceof Error ? error : message;
         throw new AssertionError({
-            message: typeof msg === 'string' ? msg : msg?.message || 'Missing expected rejection',
+            message: msg(m as string | Error) || 'Missing expected rejection',
             operator: 'rejects',
-            generatedMessage: !msg
+            generatedMessage: !m
         });
     }
 
@@ -502,10 +420,7 @@ export function doesNotReject(block: (() => Promise<unknown>) | Promise<unknown>
 export function doesNotReject(block: (() => Promise<unknown>) | Promise<unknown>, error: AssertPredicate, message?: string | Error): Promise<void>;
 export async function doesNotReject(block: (() => Promise<unknown>) | Promise<unknown>, error?: AssertPredicate | string | Error, message?: string | Error): Promise<void> {
     let promise: Promise<unknown>;
-    let msg: string | Error | undefined;
-
-    if (typeof error === 'string' || error instanceof Error) msg = error;
-    else msg = message;
+    const m = (typeof error === 'string' || error instanceof Error) ? error : message;
 
     if (typeof block === 'function') {
         try {
@@ -526,9 +441,9 @@ export async function doesNotReject(block: (() => Promise<unknown>) | Promise<un
         throw new AssertionError({
             actual: err,
             expected: undefined,
-            message: typeof msg === 'string' ? msg : msg?.message || 'Got unwanted rejection',
+            message: msg(m as string | Error) || 'Got unwanted rejection',
             operator: 'doesNotReject',
-            generatedMessage: !msg
+            generatedMessage: !m
         });
     }
 }
@@ -562,7 +477,7 @@ export function match(string: string, regexp: RegExp, message?: string | Error):
         throw new AssertionError({
             actual: string,
             expected: regexp,
-            message: typeof message === 'string' ? message : message?.message,
+            message: msg(message),
             operator: 'match',
             generatedMessage: !message
         });
@@ -598,7 +513,7 @@ export function doesNotMatch(string: string, regexp: RegExp, message?: string | 
         throw new AssertionError({
             actual: string,
             expected: regexp,
-            message: typeof message === 'string' ? message : message?.message,
+            message: msg(message),
             operator: 'doesNotMatch',
             generatedMessage: !message
         });
@@ -606,12 +521,7 @@ export function doesNotMatch(string: string, regexp: RegExp, message?: string | 
 }
 
 export function partialDeepStrictEqual(actual: unknown, expected: unknown, message?: string | Error): void {
-    if (arguments.length < 2) {
-        throw new AssertionError({
-            message: 'actual and expected arguments required',
-            generatedMessage: true
-        });
-    }
+    checkArgs(2, arguments.length);
 
     const compare = (a: unknown, e: unknown): boolean => {
         if (e === null || e === undefined) return Object.is(a, e);
@@ -636,7 +546,7 @@ export function partialDeepStrictEqual(actual: unknown, expected: unknown, messa
         throw new AssertionError({
             actual,
             expected,
-            message: typeof message === 'string' ? message : message?.message,
+            message: msg(message),
             operator: 'partialDeepStrictEqual',
             generatedMessage: !message
         });

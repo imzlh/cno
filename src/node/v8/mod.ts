@@ -5,6 +5,7 @@
 
 const engine = import.meta.use('engine');
 const os = import.meta.use('os');
+import { concatChunks } from '../_internal/buffer';
 
 const WIRE_VERSION = 1;
 const HEADER_BYTES = Uint8Array.from([0x43, 0x54, 0x53, 0x56, 0x38, WIRE_VERSION]);
@@ -29,23 +30,11 @@ function fnv1a32(input: string): number {
 }
 
 function asUint8Array(value: Buffer | Uint8Array | ArrayBufferView): Uint8Array {
-    if (value instanceof Uint8Array) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
     return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
 }
 
 function toBuffer(value: Uint8Array): Buffer {
     return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
-}
-
-function concatChunks(chunks: Uint8Array[]): Uint8Array {
-    const total = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
-    const out = new Uint8Array(total);
-    let offset = 0;
-    for (const chunk of chunks) {
-        out.set(chunk, offset);
-        offset += chunk.byteLength;
-    }
-    return out;
 }
 
 function writeUint32LE(value: number): Uint8Array {

@@ -9,19 +9,18 @@ const timers = import.meta.use('timers');
 const http = import.meta.use('http');
 const os = import.meta.use('os');
 
-import { Socket } from '../net';
-import { OutgoingMessageImpl, IncomingMessageImpl, OutgoingHttpHeaders } from './server';
-import { METHODS } from './constants';
+import { concatChunks } from '../_internal/buffer';
 import {
     buildNodeUrl,
     captureNodeNetworkCallFrames,
-    concatChunks,
     getNodeFetchHook,
     nextNodeRequestId,
     nodeTs,
     normalizeHeaderRecord,
     setupResponseParser,
 } from '../_internal/network-debug';
+import { Socket } from '../net';
+import { IncomingMessageImpl, OutgoingHttpHeaders, OutgoingMessageImpl } from './server';
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 

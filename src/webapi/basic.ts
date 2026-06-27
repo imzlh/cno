@@ -58,14 +58,53 @@ globalThis.confirm = function(msg) {
 globalThis.TextEncoder = text.Encoder;
 globalThis.TextDecoder = text.Decoder;
 
+
+class TimeoutOrInterval extends Number implements NodeJS.Timeout {
+    constructor(private fd: number, readonly _onTimeout: () => void) {
+        super(fd);
+    }
+
+    close() {
+        timer.clearTimeout(this.fd);
+        return this;
+    }
+
+    ref() {
+        // noop
+        return this;
+    }
+
+    unref() {
+        // noop
+        return this;
+    }
+
+    hasRef() {
+        return false;
+    }
+
+    refresh() {
+        // noop
+        return this;
+    }
+
+    [Symbol.toPrimitive]() {
+        return this.fd;
+    }
+
+    [Symbol.dispose]() {
+        this.close();
+    }
+}
+
 // @ts-ignore - __promisify__ is defined next
 globalThis.setTimeout = function(cb: string | ((...args: any[]) => void), delay?: number | undefined, ...args: any[]) {
     if (typeof cb == 'string') {
         throw new Error('string argument is not allowed for setTimeout for security reasons.');
     }
-    return timer.setTimeout(() => {
+    return new TimeoutOrInterval(timer.setTimeout(() => {
         cb(...args);
-    }, delay ?? 0);
+    }, delay ?? 0), cb);
 }
 Reflect.set(Reflect.get(globalThis, 'setTimeout'), '__promisify__', <T = void>(delay?: number | undefined, value?: T | undefined, options?: TimerOptions | undefined): Promise<T> => new Promise(rs => {
     const fd = timer.setTimeout(() => {
@@ -75,6 +114,7 @@ Reflect.set(Reflect.get(globalThis, 'setTimeout'), '__promisify__', <T = void>(d
         options.signal.addEventListener('abort', () => timer.clearTimeout(fd));
     }
 }));
+
 // @ts-ignore - webapi
 globalThis.clearTimeout = globalThis.clearInterval = function(id: number) {
     if (!id) return;
@@ -85,9 +125,9 @@ globalThis.setInterval = function<any>(cb, timeout, ...args) {
     if (typeof cb == 'string') {
         throw new Error('string argument is not allowed for setTimeout for security reasons.');
     }
-    return timer.setInterval(() => {
+    return new TimeoutOrInterval(timer.setInterval(() => {
         cb(...args);
-    }, timeout ?? 0);
+    }, timeout ?? 0), cb);
 };
 
 globalThis.structuredClone = function(v, opt){

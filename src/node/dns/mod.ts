@@ -6,6 +6,7 @@
 const dns = import.meta.use('dns');
 const os = import.meta.use('os');
 import { toErrnoException } from '../_internal/errno';
+import { typeMap, expandIPv6, shapeAnswers, reverseName } from './_internal';
 import * as promises from './promises';
 
 // ============================================================================
@@ -178,60 +179,15 @@ export function resolve(hostname: string, rrtype?: any, callback?: any): void {
         rrtype = 'A';
     }
 
-    const typeMap: Record<string, number> = {
-        'A': dns.A,
-        'AAAA': dns.AAAA,
-        'CNAME': dns.CNAME,
-        'MX': dns.MX,
-        'NAPTR': dns.NAPTR,
-        'NS': dns.NS,
-        'PTR': dns.PTR,
-        'SOA': dns.SOA,
-        'SRV': dns.SRV,
-        'TXT': dns.TXT,
-        'ANY': dns.A,
-    };
-
     const queryType = typeMap[rrtype] ?? dns.A;
 
     dns.query(hostname, queryType).then(
         answers => {
-            if (rrtype === 'A' || rrtype === 'AAAA') {
-                callback(null, answers.map((a: any) => a.address));
-            } else if (rrtype === 'CNAME') {
-                callback(null, answers.map((a: any) => a.cname));
-            } else if (rrtype === 'MX') {
-                callback(null, answers.map((a: any) => ({ priority: a.priority, exchange: a.exchange })));
-            } else if (rrtype === 'NS') {
-                callback(null, answers.map((a: any) => a.ns));
-            } else if (rrtype === 'PTR') {
-                callback(null, answers.map((a: any) => a.ptr));
-            } else if (rrtype === 'SOA') {
-                const a = answers[0] as CModuleDNS.SoaAnswer;
-                if (!a) {
-                    callback(toErrnoException(new Error('ENODATA'), 'query', hostname), null as any);
-                } else {
-                callback(null, {
-                    nsname: a.name,
-                    hostmaster: a.admin,
-                    serial: a.serial,
-                    refresh: a.refresh,
-                    retry: a.retry,
-                    expire: a.expire,
-                    minttl: a.minimum,
-                });
-                }
-            } else if (rrtype === 'SRV') {
-                callback(null, answers.map((a: any) => ({
-                    priority: a.priority,
-                    weight: a.weight,
-                    port: a.port,
-                    name: a.target,
-                })));
-            } else if (rrtype === 'TXT') {
-                callback(null, answers.map((a: any) => [a.txt]));
+            const result = shapeAnswers(rrtype, answers);
+            if (rrtype === 'SOA' && !result) {
+                callback(toErrnoException(new Error('ENODATA'), 'query', hostname), null as any);
             } else {
-                callback(null, answers);
+                callback(null, result);
             }
         },
         err => callback(toErrnoException(err, 'resolve', hostname))
@@ -325,23 +281,8 @@ export function resolveNaptr(hostname: string, callback: (err: NodeJS.ErrnoExcep
 // reverse
 // ============================================================================
 
-function expandIPv6(ip: string): string {
-    if (ip.includes('::')) {
-        const [left, right] = ip.split('::');
-        const leftParts = left ? left.split(':') : [];
-        const rightParts = right ? right.split(':') : [];
-        const missing = 8 - leftParts.length - rightParts.length;
-        return [...leftParts, ...Array(missing).fill('0'), ...rightParts]
-            .map(p => p.padStart(4, '0')).join('');
-    }
-    return ip.split(':').map(p => p.padStart(4, '0')).join('');
-}
-
 export function reverse(ip: string, callback: (err: NodeJS.ErrnoException | null, hostnames: string[]) => void): void {
-    const ptrName = ip.includes(':')
-        ? expandIPv6(ip).split('').reverse().join('.') + '.ip6.arpa'
-        : ip.split('.').reverse().join('.') + '.in-addr.arpa';
-    resolve(ptrName, 'PTR', callback);
+    resolve(reverseName(ip), 'PTR', callback);
 }
 
 // ============================================================================

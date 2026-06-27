@@ -151,8 +151,7 @@ async function denoWriteAnyFile(path: string | URL, data: string | Uint8Array | 
 
 function watchToIterator(path: string): AsyncIterableIterator<Deno.FsEvent> & { close(): void } {
     let watcher: CModuleFSWatch.FsWatcher | null = null;
-    let resolveNext: ((value: IteratorResult<Deno.FsEvent>) => void) | null = null;
-    let rejectNext: ((error: any) => void) | null = null;
+    let deferred: ReturnType<typeof Promise.withResolvers<IteratorResult<Deno.FsEvent>>> | null = null;
     const eventQueue: Deno.FsEvent[] = [];
     let isClosed = false;
 
@@ -169,10 +168,8 @@ function watchToIterator(path: string): AsyncIterableIterator<Deno.FsEvent> & { 
             }
 
             // wait for new events
-            return new Promise((resolve, reject) => {
-                resolveNext = resolve;
-                rejectNext = reject;
-            });
+            deferred = Promise.withResolvers();
+            return deferred.promise;
         },
 
         [Symbol.asyncIterator]() {
@@ -185,11 +182,8 @@ function watchToIterator(path: string): AsyncIterableIterator<Deno.FsEvent> & { 
         },
 
         async throw(error?: any): Promise<IteratorResult<Deno.FsEvent>> {
-            if (rejectNext) {
-                rejectNext(error);
-                rejectNext = null;
-                resolveNext = null;
-            }
+            deferred?.reject(error);
+            deferred = null;
             await this.close();
             return { done: true, value: undefined };
         },
@@ -204,43 +198,36 @@ function watchToIterator(path: string): AsyncIterableIterator<Deno.FsEvent> & { 
             }
 
             // if there is a pending promise, resolve it
-            if (resolveNext) {
-                resolveNext({ done: true, value: undefined });
-                resolveNext = null;
-                rejectNext = null;
-            }
+            deferred?.resolve({ done: true, value: undefined });
+            deferred = null;
         }
     };
 
     // initialize watcher
-    fswatch.watch(path, (filename: string, ev: CModuleFSWatch.FsEvent) => {
-        if (isClosed) return;
-        const event = {
-            kind: ev === 'rename' ? 'rename' : 'any',
-            paths: [filename]
-        } as Deno.FsEvent;
+    try {
+        watcher = fswatch.watch(path, (filename: string, ev: CModuleFSWatch.FsEvent) => {
+            if (isClosed) return;
+            const event = {
+                kind: ev === 'rename' ? 'rename' : 'any',
+                paths: [filename]
+            } as Deno.FsEvent;
 
-        // has pending event?
-        if (resolveNext) {
-            resolveNext({ done: false, value: event });
-            resolveNext = null;
-            rejectNext = null;
-        } else {
-            eventQueue.push(event);
+            // has pending event?
+            if (deferred) {
+                deferred.resolve({ done: false, value: event });
+                deferred = null;
+            } else {
+                eventQueue.push(event);
+            }
+        });
+        if (isClosed && watcher) {
+            watcher.close();
+            watcher = null;
         }
-    }).then(w => {
-        if (!isClosed) {
-            watcher = w;
-        } else {
-            w.close();
-        }
-    }).catch(error => {
-        if (rejectNext) {
-            rejectNext(error);
-            rejectNext = null;
-            resolveNext = null;
-        }
-    });
+    } catch (error) {
+        // @ts-expect-error TS can't see closure assignments to `deferred`
+        if (deferred) { deferred.reject(error); deferred = null; }
+    }
 
     return iterator;
 }
@@ -514,8 +501,7 @@ Object.assign(Deno, wrapFSns({
         const watchers: Map<string, AsyncIterableIterator<Deno.FsEvent> & { close(): void }> = new Map();
         let isClosed = false;
         const eventQueue: Deno.FsEvent[] = [];
-        let resolveNext: ((value: IteratorResult<Deno.FsEvent>) => void) | null = null;
-        let rejectNext: ((error: any) => void) | null = null;
+        let deferred: ReturnType<typeof Promise.withResolvers<IteratorResult<Deno.FsEvent>>> | null = null;
 
         paths.forEach(path => {
             try {
@@ -528,19 +514,17 @@ Object.assign(Deno, wrapFSns({
                         for await (const event of watcher) {
                             if (isClosed) break;
 
-                            if (resolveNext) {
-                                resolveNext({ done: false, value: event });
-                                resolveNext = null;
-                                rejectNext = null;
+                            if (deferred) {
+                                deferred.resolve({ done: false, value: event });
+                                deferred = null;
                             } else {
                                 eventQueue.push(event);
                             }
                         }
                     } catch (error) {
-                        if (rejectNext && !isClosed) {
-                            rejectNext(error);
-                            rejectNext = null;
-                            resolveNext = null;
+                        if (deferred && !isClosed) {
+                            deferred.reject(error);
+                            deferred = null;
                         }
                     }
                 })();
@@ -559,17 +543,14 @@ Object.assign(Deno, wrapFSns({
             }
 
             // wait for new events
-            return new Promise((resolve, reject) => {
-                resolveNext = resolve;
-                rejectNext = reject;
-            });
+            deferred = Promise.withResolvers();
+            return deferred.promise;
         }
 
         async function throws(error?: any): Promise<IteratorResult<Deno.FsEvent>> {
-            if (rejectNext) {
-                rejectNext(error);
-                rejectNext = null;
-                resolveNext = null;
+            if (deferred) {
+                deferred.reject(error);
+                deferred = null;
             }
             await iterator.close();
             return { done: true, value: undefined };
@@ -599,17 +580,16 @@ Object.assign(Deno, wrapFSns({
                 isClosed = true;
                 for (const [path, watcher] of watchers) {
                     try {
-                        await watcher.close();
+                        watcher.close();
                     } catch (error) {
                         console.error(`Error closing watcher for path: ${path}`, error);
                     }
                 }
                 watchers.clear();
 
-                if (resolveNext) {
-                    resolveNext({ done: true, value: undefined });
-                    resolveNext = null;
-                    rejectNext = null;
+                if (deferred) {
+                    deferred.resolve({ done: true, value: undefined });
+                    deferred = null;
                 }
             }
         };

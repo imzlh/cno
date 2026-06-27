@@ -135,12 +135,6 @@ export const inflateRaw = wrapCallback(inflateRawSync);
 export const gunzip = wrapCallback(gunzipSync);
 export const unzip = wrapCallback(unzipSync);
 
-
-
-
-
-
-
 // ============================================================================
 // Stream compress/decompress
 // ============================================================================
