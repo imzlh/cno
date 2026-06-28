@@ -84,9 +84,24 @@ function normalizeTcpHost(host: string): string {
 // Socket
 // ============================================================================
 
+/**
+ * Raw socket handle returned by the @cnojs/http core HttpResponse.upgrade().
+ * Backs a node:net Socket for the WebSocket-upgrade path so that bytes already
+ * buffered by the HTTP parser (upgradeLeftover) are replayed before live reads.
+ */
+export interface UpgradeHandle {
+    write(data: Uint8Array): Promise<void>;
+    read(size?: number): Promise<Uint8Array | null>;
+    onReadable(cb: (data: Uint8Array | null) => void, errHandler?: (err: Error) => void): void;
+    stopReading(): void;
+    close(): void;
+    isClosed(): boolean;
+}
+
 export class Socket extends Duplex {
     private _tcp: CModuleStreams.TCP | null = null;
     private _stream: CModuleStreams.Pipe | null = null;
+    private _upgradeHandle: UpgradeHandle | null = null;
     private _connecting: boolean = false;
     private _destroyed: boolean = false;
     private _readable: boolean = true;
@@ -126,6 +141,15 @@ export class Socket extends Duplex {
                 this.destroy(new Error('aborted'));
             });
         }
+    }
+
+    /** Build a Socket backed by a core @cnojs/http upgrade handle (WebSocket
+     *  upgrade path). Reads replay any buffered upgradeLeftover bytes first. */
+    static fromUpgradeHandle(handle: UpgradeHandle): Socket {
+        const socket = new Socket();
+        (socket as any)._upgradeHandle = handle;
+        socket.readyState = 'open';
+        return socket;
     }
 
     connect(options: TcpNetConnectOpts): this;
@@ -320,6 +344,11 @@ export class Socket extends Duplex {
     /** Sustained TCP read loop driven by Duplex _read */
     private _startTcpRead(): void {
         if (!this._tcp || this._destroyed) return;
+        // Duplex _read can be pulled before connect() resolves, racing the
+        // post-connect resume(). startRead() on an unconnected handle throws
+        // ENOTCONN — bail while still connecting; resume() starts the read once
+        // the connect promise settles.
+        if (this._connecting) return;
 
         (this._tcp as any).onread = (result: any, error: any) => {
             if (error) {
@@ -339,10 +368,30 @@ export class Socket extends Duplex {
         (this._tcp as any).startRead();
     }
 
+    /** Sustained read loop driven by the core upgrade handle. The handle replays
+     *  any bytes the HTTP parser already buffered (upgradeLeftover) on the first
+     *  onReadable call, so post-handshake WebSocket frames are never dropped. */
+    private _startUpgradeRead(): void {
+        if (!this._upgradeHandle || this._destroyed) return;
+        this._upgradeHandle.onReadable((data) => {
+            if (data === null) {
+                this.push(null);
+                this.emit('end');
+                return;
+            }
+            this.bytesRead += data.byteLength;
+            this.push(data);
+        }, (err) => {
+            this.emit('error', err);
+        });
+    }
+
     /** Duplex _read — called when consumer wants data */
     protected _read(size: number): void {
         if (this._destroyed) return;
-        if (this._tcp) {
+        if (this._upgradeHandle) {
+            this._startUpgradeRead();
+        } else if (this._tcp) {
             this._startTcpRead();
         } else if (this._stream) {
             this._startPipeRead();
@@ -358,7 +407,14 @@ export class Socket extends Duplex {
 
         const buffer = typeof chunk === 'string' ? engine.encodeString(chunk) : chunk as Uint8Array;
 
-        if (this._tcp) {
+        if (this._upgradeHandle) {
+            this._upgradeHandle.write(buffer).then(() => {
+                this.bytesWritten += buffer.byteLength;
+                callback();
+            }).catch((err: Error) => {
+                callback(err);
+            });
+        } else if (this._tcp) {
             this._tcp.write(buffer).then((written: number) => {
                 this.bytesWritten += written;
                 callback();
@@ -397,6 +453,11 @@ export class Socket extends Duplex {
         if (this._stream) {
             try { this._stream.close(); } catch {}
             this._stream = null;
+        }
+
+        if (this._upgradeHandle) {
+            try { this._upgradeHandle.close(); } catch {}
+            this._upgradeHandle = null;
         }
 
         // Sync parent Duplex destroyed state

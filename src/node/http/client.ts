@@ -154,10 +154,19 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
             ? parseInt(this._options.port)
             : this._options.port || (this.protocol === 'https:' ? 443 : 80);
 
+        if (this.protocol === 'https:') {
+            this.emit('error', new Error("Protocol \"https:\" not supported by node:http client. Use node:https instead."));
+            return;
+        }
+
         try {
-            const isIPv6 = this.host.includes(':');
-            const addrs = await dns.resolve(this.host, { family: isIPv6 ? os.AF_INET6 : os.AF_INET });
-            if (!addrs?.length) throw new Error(`DNS resolution failed for ${this.host}`);
+            // Bracketed (`[::1]`) or bare IPv6 literals have >1 colon; a `host:port`
+            // string has exactly one. Strip brackets before resolving.
+            const bracketed = this.host.startsWith('[') && this.host.endsWith(']');
+            const resolveHost = bracketed ? this.host.slice(1, -1) : this.host;
+            const isIPv6 = bracketed || (resolveHost.match(/:/g)?.length ?? 0) > 1;
+            const addrs = await dns.resolve(resolveHost, { family: isIPv6 ? os.AF_INET6 : os.AF_INET });
+            if (!addrs?.length) throw new Error(`DNS resolution failed for ${resolveHost}`);
             const addr = addrs.find((a: any) => a.family === (isIPv6 ? os.AF_INET6 : os.AF_INET)) || addrs[0];
 
             this._tcp = new streams.TCP(addr.family === 6 ? os.AF_INET6 : os.AF_INET);
@@ -280,7 +289,7 @@ export class ClientRequestImpl extends OutgoingMessageImpl implements ClientRequ
                     }
                     const consumed = (result as any).consumed as number | undefined;
                     if (consumed !== undefined && consumed < toParse.byteLength) {
-                        // Copy unparsed remainder 鈥?toParse may be a view of the reused buffer
+                        // Copy unparsed remainder — toParse may be a view of the reused buffer
                         pending = new Uint8Array(toParse.subarray(consumed));
                     }
                 }
@@ -416,7 +425,7 @@ export class Agent {
 
     createConnection(options: ClientRequestArgs, callback: (err: Error | null, socket: Socket) => void): Socket {
         const socket = new Socket();
-        const port = typeof options.port === 'string' ? parseInt(options.port) : options.port || 80;
+        const port = typeof options.port === 'string' ? parseInt(options.port) : options.port || this.defaultPort;
         const host = options.hostname || options.host || 'localhost';
 
         socket.connect(port, host, () => callback(null, socket)).on('error', (err) => callback(err, socket));

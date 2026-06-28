@@ -21,7 +21,7 @@ import type { IncomingHttpHeaders, OutgoingHttpHeader, OutgoingHttpHeaders, Inco
 import { IOpaque } from '../_internal/inject';
 export type { IncomingHttpHeaders, OutgoingHttpHeader, OutgoingHttpHeaders, IncomingMessage, OutgoingMessage, ServerResponse, ListenOptions, Server, RequestListener } from './types';
 const { createServer: createHttpServer } = (http as any).__cno as IOpaque;
-const debugNodeHttp = String((globalThis as any).process?.env?.DEBUG ?? '').includes('node-http');
+const debugNodeHttp = true;
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
@@ -37,6 +37,26 @@ function normalizeListenHost(host: string): string {
         return '127.0.0.1';
     }
     return host;
+}
+
+function isBodyForbiddenStatus(statusCode: number): boolean {
+    return (statusCode >= 100 && statusCode < 200) || statusCode === 204 || statusCode === 304;
+}
+
+function createAttachedSocket(tcp: CModuleStreams.TCP): Socket {
+    const socket = new Socket();
+    const localInfo = tcp.sockname;
+    const remoteInfo = tcp.peername;
+
+    (socket as any)._tcp = tcp;
+    socket.readyState = 'open';
+    socket.localAddress = localInfo.ip;
+    socket.localPort = localInfo.port;
+    socket.remoteAddress = remoteInfo.ip;
+    socket.remotePort = remoteInfo.port;
+    socket.remoteFamily = `IPv${remoteInfo.family}`;
+
+    return socket;
 }
 
 // Re-export from shared constants (single source of truth)
@@ -219,13 +239,8 @@ export class ServerResponseImpl extends OutgoingMessageImpl implements ServerRes
     strictContentLength: boolean = false;
     req: IncomingMessage | null = null;
 
-    private _tcp: CModuleStreams.TCP | null = null;
     private _ended: boolean = false;
     private _bodyLength: number = 0;
-
-    setTcp(tcp: CModuleStreams.TCP): void {
-        this._tcp = tcp;
-    }
 
     assignSocket(socket: Socket): void {
         this.socket = socket;
@@ -268,38 +283,23 @@ export class ServerResponseImpl extends OutgoingMessageImpl implements ServerRes
         return this;
     }
 
-    writeProcessingContinue(): void {
-        if (this._tcp && !this.headersSent) {
-            const version = this.req?.httpVersion || '1.1';
-            this._tcp.write(engine.encodeString(`HTTP/${version} 100 Continue\r\n\r\n`));
-        }
-    }
+    // Interim (1xx) responses require writing to the socket before the final
+    // response. ServerResponseImpl no longer owns the socket — the core
+    // @cnojs/http HttpResponse has no interim-write API yet — so these are
+    // no-ops. Vite/Connect do not use them. TODO: add an interim-write path to
+    // the core HttpResponse and route these through the adapter if needed.
+    writeProcessingContinue(): void {}
 
-    writeEarlyHints(hints: Record<string, string | string[]>, callback?: () => void): void {
-        if (this._tcp && !this.headersSent) {
-            const version = this.req?.httpVersion || '1.1';
-            let message = `HTTP/${version} 103 Early Hints\r\n`;
-            for (const [key, value] of Object.entries(hints)) {
-                if (Array.isArray(value)) {
-                    for (const v of value) message += `${key}: ${v}\r\n`;
-                } else {
-                    message += `${key}: ${value}\r\n`;
-                }
-            }
-            message += '\r\n';
-            this._tcp.write(engine.encodeString(message)).then(() => callback?.());
-        }
+    writeEarlyHints(_hints: Record<string, string | string[]>, callback?: () => void): void {
+        callback?.();
     }
 
     protected _sendHeaders(): void {
-        if (this.headersSent || !this._tcp) return;
-
-        const version = (this as any).req?.httpVersion || '1.1';
-        let headerStr = `HTTP/${version} ${this.statusCode} ${this.statusMessage}\r\n`;
-        headerStr += this._formatHeaders();
-        headerStr += '\r\n';
-
-        this._tcp.write(engine.encodeString(headerStr));
+        if (this.headersSent) return;
+        // State-only. All socket I/O flows through NodeResponseAdapter ->
+        // coreResponse (@cnojs/http), which is rebound onto this instance in
+        // ServerImpl.listen() before the request handler runs. This base impl
+        // exists only so any pre-override call keeps Node-facing state coherent.
         super._sendHeaders();
     }
 
@@ -320,18 +320,9 @@ export class ServerResponseImpl extends OutgoingMessageImpl implements ServerRes
         const data = typeof chunk === 'string' ? encoder.encode(chunk) : chunk as Uint8Array;
         this._bodyLength += data.length;
 
-        if (this.chunkedEncoding && this._tcp) {
-            const header = engine.encodeString(data.length.toString(16) + '\r\n');
-            const trailer = engine.encodeString('\r\n');
-            const frame = new Uint8Array(header.length + data.length + trailer.length);
-            frame.set(header, 0);
-            frame.set(data, header.length);
-            frame.set(trailer, header.length + data.length);
-            this._tcp.write(frame);
-        } else if (this._tcp) {
-            this._tcp.write(data);
-        }
-
+        // State-only. NodeResponseAdapter rebinds write() per request and owns
+        // all socket I/O via coreResponse (@cnojs/http). This base impl exists
+        // only for pre-override calls and must never touch the socket.
         const callback = typeof encodingOrCb === 'function' ? encodingOrCb : cb;
         callback?.();
         return true;
@@ -343,51 +334,20 @@ export class ServerResponseImpl extends OutgoingMessageImpl implements ServerRes
         else if (typeof encodingOrCb === 'function') { callback = encodingOrCb; }
         else if (typeof cb === 'function') { callback = cb; }
 
-        const encoder = new text!.Encoder(encodingOrCb as BufferEncoding);
-
         if (this._ended) {
             callback?.();
             return this;
         }
 
-        const doEnd = async () => {
-            if (!this._tcp) return;
-            try {
-                if (chunk !== undefined) {
-                    const data = typeof chunk === 'string' ? encoder.encode(chunk) : chunk as Uint8Array;
-                    if (!this.headersSent) {
-                        this.setHeader('Content-Length', data.length);
-                        this._sendHeaders();
-                        await this._tcp.write(data);
-                    } else if (this.chunkedEncoding) {
-                        await this._tcp.write(engine.encodeString(data.length.toString(16) + '\r\n'));
-                        await this._tcp.write(data);
-                        await this._tcp.write(engine.encodeString('\r\n'));
-                    } else {
-                        await this._tcp.write(data);
-                    }
-                } else if (!this.headersSent) {
-                    this.setHeader('Content-Length', '0');
-                    this._sendHeaders();
-                }
-
-                if (this.chunkedEncoding) {
-                    await this._tcp.write(engine.encodeString('0\r\n\r\n'));
-                }
-
-                this._ended = true;
-                this.writableEnded = true;
-                this.finished = true;
-                this.writableFinished = true;
-                this.emit('finish');
-                callback?.();
-            } catch (err) {
-                this.emit('error', err);
-                callback?.();
-            }
-        };
-
-        doEnd();
+        // State-only. NodeResponseAdapter rebinds end() per request and owns all
+        // socket I/O via coreResponse (@cnojs/http). This base impl exists only
+        // for pre-override calls and must never touch the socket.
+        this._ended = true;
+        this.writableEnded = true;
+        this.finished = true;
+        this.writableFinished = true;
+        this.emit('finish');
+        callback?.();
         return this;
     }
 }
@@ -421,10 +381,7 @@ class NodeResponseAdapter {
         return next;
     }
 
-    private collectHeaders(
-        statusMessageOrHeaders?: string | OutgoingHttpHeaders | readonly string[],
-        headers?: OutgoingHttpHeaders | readonly string[],
-    ): Array<[string, string]> {
+    private collectHeaders(): Array<[string, string]> {
         const allHeaders: Array<[string, string]> = [];
 
         for (const [key, value] of Object.entries(this.response.getHeaders())) {
@@ -433,32 +390,6 @@ class NodeResponseAdapter {
             } else {
                 allHeaders.push([key, String(value)]);
             }
-        }
-
-        const append = (input?: OutgoingHttpHeaders | readonly string[]) => {
-            if (!input) return;
-            if (Array.isArray(input)) {
-                for (let i = 0; i < input.length; i += 2) {
-                    const key = input[i];
-                    const value = input[i + 1];
-                    if (key !== undefined && value !== undefined) allHeaders.push([String(key), String(value)]);
-                }
-                return;
-            }
-            for (const [key, value] of Object.entries(input)) {
-                if (value === undefined) continue;
-                if (Array.isArray(value)) {
-                    for (const item of value) allHeaders.push([key, String(item)]);
-                } else {
-                    allHeaders.push([key, String(value)]);
-                }
-            }
-        };
-
-        if (typeof statusMessageOrHeaders === 'object' && statusMessageOrHeaders !== null && !Array.isArray(statusMessageOrHeaders)) {
-            append(statusMessageOrHeaders);
-        } else {
-            append(headers);
         }
 
         return allHeaders;
@@ -502,7 +433,7 @@ class NodeResponseAdapter {
 
         if (this.headWritten) return this.response;
 
-        const outHeaders = this.collectHeaders(statusMessageOrHeaders, headers);
+        const outHeaders = this.collectHeaders();
         this.response.headersSent = true;
         this.headWritten = true;
 
@@ -521,6 +452,19 @@ class NodeResponseAdapter {
             .catch((err) => this.response.emit('error', err));
 
         return this.response;
+    }
+
+    flushHeaders(): void {
+        if (this.response.headersSent) return;
+        if (
+            !isBodyForbiddenStatus(this.response.statusCode) &&
+            !this.response.hasHeader('content-length') &&
+            !this.response.hasHeader('transfer-encoding')
+        ) {
+            this.response.chunkedEncoding = true;
+            this.response.setHeader('Transfer-Encoding', 'chunked');
+        }
+        this.writeHead(this.response.statusCode, this.response.statusMessage);
     }
 
     write(chunk: any, encodingOrCb?: BufferEncoding | ((err?: Error | null) => void), cb?: (err?: Error | null) => void): boolean {
@@ -707,7 +651,9 @@ export class ServerImpl extends NetServer implements Server {
             const requestCallFrames = listenEntryCallFrames ?? captureNodeNetworkCallFrames();
             const requestHeaders = headerEntriesToRecord(req.headers);
             const requestUrl = buildNodeServerUrl('http:', req.url, requestHeaders, host);
-            const incoming = new IncomingMessageImpl(null);
+            const rawTcp = ((req as any).__cnoTcp ?? (res as any).__cnoTcp) as CModuleStreams.TCP | undefined;
+            const nodeSocket = rawTcp ? createAttachedSocket(rawTcp) : null;
+            const incoming = new IncomingMessageImpl(nodeSocket);
             incoming.method = req.method;
             incoming.url = req.url;
             incoming.httpVersion = req.httpVersion;
@@ -725,27 +671,42 @@ export class ServerImpl extends NetServer implements Server {
                 incoming.headersDistinct[lowerKey]!.push(value);
             }
 
+            // WebSocket / protocol upgrade. If the request carries Connection:
+            // upgrade + an Upgrade header and the server has an 'upgrade'
+            // listener, hand the raw socket off via the core upgrade() handle
+            // and emit Node's 'upgrade' event. The core handle replays any bytes
+            // the HTTP parser already buffered, so the first WS frames survive.
+            const connectionHeader = String(incoming.headers['connection'] ?? '').toLowerCase();
+            const isUpgrade = connectionHeader.split(',').some(t => t.trim() === 'upgrade')
+                && incoming.headers['upgrade'] !== undefined;
+            if (isUpgrade && this.listenerCount('upgrade') > 0) {
+                try {
+                    const handle = (res as any).upgrade();
+                    const upgradeSocket = Socket.fromUpgradeHandle(handle);
+                    // Node passes any already-buffered post-header bytes as `head`.
+                    // The core handle replays them through the read pump, so we
+                    // pass an empty head to avoid double-delivery.
+                    this.emit('upgrade', incoming, upgradeSocket, new Uint8Array(0));
+                } catch (err) {
+                    this.emit('error', err);
+                }
+                return;
+            }
+
             const requestBody = req.body;
-            if (requestBody instanceof Uint8Array) {
-                incoming.push(requestBody);
-                incoming.push(null);
-                incoming.complete = true;
-            } else if (requestBody instanceof ReadableStream) {
+            if (typeof requestBody === 'function') {
                 (async () => {
-                    const reader = requestBody.getReader();
                     try {
                         while (true) {
-                            const { done, value } = await reader.read();
-                            if (done) break;
-                            incoming.push(value);
+                            const chunk = await requestBody();
+                            if (chunk === null) break;
+                            incoming.push(chunk);
                         }
                         incoming.push(null);
                         incoming.complete = true;
                     } catch (err) {
                         incoming.aborted = true;
                         incoming.destroy(err as Error);
-                    } finally {
-                        reader.releaseLock();
                     }
                 })().catch(() => {});
             } else {
@@ -755,6 +716,12 @@ export class ServerImpl extends NetServer implements Server {
 
             const response = new ServerResponseImpl();
             response.req = incoming;
+            // NOTE: do NOT call response.setTcp(rawTcp) here. All response bytes
+            // must flow through the adapter -> coreResponse (@cnojs/http), which
+            // owns the socket. Giving ServerResponseImpl the raw TCP handle too
+            // creates two independent writers for one socket, which interleaves
+            // header/body/terminator writes and hangs the client mid-response.
+            if (nodeSocket) response.assignSocket(nodeSocket);
             const adapter = new NodeResponseAdapter(response, res, serveHook, requestId, requestUrl);
             const responseDone = new Promise<void>((resolve, reject) => {
                 response.once('finish', () => resolve());
@@ -777,6 +744,7 @@ export class ServerImpl extends NetServer implements Server {
                 });
             } catch {}
             response.writeHead = adapter.writeHead.bind(adapter) as any;
+            response.flushHeaders = adapter.flushHeaders.bind(adapter) as any;
             response.write = adapter.write.bind(adapter) as any;
             response.end = adapter.end.bind(adapter) as any;
 

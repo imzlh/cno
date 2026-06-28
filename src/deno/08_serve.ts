@@ -92,7 +92,13 @@ function createWebRequest(coreReq: HttpRequest, connInfo: { hostname: string; po
     return new Request(url.toString(), {
         method: coreReq.method,
         headers,
-        body: coreReq.body
+        body: coreReq.body ? new ReadableStream({
+            async pull(ctrl) {
+                const res = await coreReq.body!();
+                if (!res)   ctrl.close();
+                else        ctrl.enqueue(res);
+            }
+        }) : null
     });
 }
 

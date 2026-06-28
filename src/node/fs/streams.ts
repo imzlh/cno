@@ -303,7 +303,7 @@ export class WriteStream extends Writable {
             while (offset < chunk.length) {
                 const part = offset === 0 ? chunk : chunk.subarray(offset);
                 const position = this.position === null ? null : this.position + offset;
-                const written = await this.handle.write(part, position);
+                const written = await this.handle.write(part as Uint8Array<ArrayBuffer>, position);
                 if (written <= 0) throw new Error('write returned no bytes');
                 offset += written;
                 this.bytesWritten += written;

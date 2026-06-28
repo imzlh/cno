@@ -92,21 +92,21 @@ export function toNodeStat(stat: CModuleFS.Stats): import('fs').Stats {
         size: stat.size,
         blksize: stat.blksize,
         blocks: stat.blocks,
-        atimeMs: stat.atim.getTime(),
-        mtimeMs: stat.mtim.getTime(),
-        ctimeMs: stat.ctim.getTime(),
-        birthtimeMs: stat.birthtim.getTime(),
+        atimeMs: stat.atim?.getTime(),
+        mtimeMs: stat.mtim?.getTime(),
+        ctimeMs: stat.ctim?.getTime(),
+        birthtimeMs: stat.birthtim?.getTime(),
         atime: stat.atim,
         mtime: stat.mtim,
         ctime: stat.ctim,
         birthtime: stat.birthtim,
         isFile: () => stat.isFile,
         isDirectory: () => stat.isDirectory,
-        isBlockDevice: () => false,
-        isCharacterDevice: () => false,
+        isBlockDevice: () => stat.isBlockDevice,
+        isCharacterDevice: () => stat.isCharacterDevice,
         isSymbolicLink: () => stat.isSymbolicLink,
-        isFIFO: () => false,
-        isSocket: () => false,
+        isFIFO: () => stat.isFIFO,
+        isSocket: () => stat.isSocket,
     };
 }
 
@@ -348,7 +348,7 @@ export function randomHex(): string {
 /** Create an async Dir object from a CModuleAsyncFS directory iterator */
 export function createAsyncDir(
     pathStr: string,
-    dirHandle: CModuleAsyncFS.DirEntIterator,
+    dirHandle: CModuleAsyncFS.DirHandle,
 ): import('fs').Dir {
     let closed = false;
 

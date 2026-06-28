@@ -59,7 +59,7 @@ export function createBufferedCipher(
             }
             const result = concatBuffers(outChunks);
             outChunks = [];
-            return encodeOutput(result.buffer, outputEncoding);
+            return encodeOutput(result.buffer as ArrayBuffer, outputEncoding);
         },
         final(outputEncoding?: string) {
             const buf = concatBuffers(chunks);

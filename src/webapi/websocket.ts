@@ -5,21 +5,18 @@
  */
 
 import { HttpResponseParser } from "@cnojs/http/h1";
+import { type ISocket } from "@cnojs/http/socket";
 import { Headers } from "headers-polyfill";
 import { assert } from "../utils/assert";
-import { type ISocket } from "@cnojs/http/socket"
-import { connectTcp, buildRequest, readHeaders } from "../utils/http"
-import { CloseEvent, ErrorEvent, MessageEvent } from "./events";
-import { getWebSocketHook, captureUserNetworkCallFrames, type NetworkCallFrame, type NetworkSource, type WSFrameInfo } from '../utils/network-hooks';
+import { buildRequest, connectTcp, readHeaders } from "../utils/http";
 import { getTierLimits } from '../utils/memory-tier';
+import { captureUserNetworkCallFrames, getWebSocketHook, type NetworkCallFrame, type NetworkSource, type WSFrameInfo } from '../utils/network-hooks';
+import { CloseEvent, ErrorEvent, MessageEvent } from "./events";
 
 const engine = import.meta.use('engine');
 const algo = import.meta.use('algorithm');
 const crypto = import.meta.use('crypto');
-const debug = import.meta.use('debug');
 const timers = import.meta.use('timers');
-const streams = import.meta.use('streams');
-const ssl = import.meta.use('ssl');
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 type IWSSocket = Omit<ISocket, 'serverHandshake' | 'alpnProtocol' | 'read'>;
@@ -707,7 +704,7 @@ export class WebSocketStream {
             if (this.readableController) { try { this.readableController.close(); } catch { } this.readableController = null; }
             this._closedResolve({ closeCode: e.code, reason: e.reason });
         });
-        this.ws.addEventListener('error', (e: ErrorEvent) => {
+        this.ws.addEventListener('error', () => {
             const error = new Error('WebSocket connection failed');
             if (this._openedReject) { this._openedReject(error); this._openedReject = null; }
             if (this.readableController) { try { this.readableController.error(error); } catch { } this.readableController = null; }
