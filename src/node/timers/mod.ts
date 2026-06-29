@@ -21,7 +21,6 @@ export interface TimerOptions {
 
 class Timeout implements NodeJS.Timeout {
     #id: any;
-    #refed = true;
     #isInterval: boolean;
     #fn?: Function;
     #ms?: number;
@@ -36,16 +35,16 @@ class Timeout implements NodeJS.Timeout {
     }
 
     hasRef(): boolean {
-        return this.#refed;
+        return timer.hasRef(this.#id);
     }
 
     ref(): this {
-        this.#refed = true;
+        timer.refTimer(this.#id);
         return this;
     }
 
     unref(): this {
-        this.#refed = false;
+        timer.unrefTimer(this.#id);
         return this;
     }
 
@@ -81,6 +80,10 @@ class Timeout implements NodeJS.Timeout {
 
     get _onTimeout(): any {
         return null;
+    }
+
+    get __cno_timer_id(): number {
+        return Number(this.#id);
     }
 }
 

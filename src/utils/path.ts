@@ -39,17 +39,17 @@ export function getExtension(path: string): string {
 
 export function normalize(path: string): string {
     const abs = isPosixCompatible ? path[0] == '/' : /^[A-Za-z]{1,2}\:[\/\\]/.test(path);
+    const prefix = isPosixCompatible
+        ? (abs ? systemPathSplit : '')
+        : (abs ? path.slice(0, path.indexOf(':') + 1) + systemPathSplit : '');
     const out: string[] = [];
     let cur = '';
     let startPos = 0;
 
-    // Windows 绝对路径：保留盘符（如 C:）
     if (!isPosixCompatible && abs) {
         const colonIdx = path.indexOf(':');
-        out.push(path.substring(0, colonIdx + 1));
-        startPos = colonIdx + 2;  // 跳过 C:\
+        startPos = colonIdx + 2;
     }
-    // POSIX 绝对路径：跳过开头的 /
     else if (abs) {
         startPos = 1;
     }
@@ -69,5 +69,7 @@ export function normalize(path: string): string {
         }
     }
 
-    return out.join(systemPathSplit) || '.';
+    const body = out.join(systemPathSplit);
+    if (prefix) return body ? prefix + body : prefix;
+    return body || '.';
 }

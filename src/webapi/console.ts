@@ -12,87 +12,8 @@ function call(name: string, fallback: string, args: unknown[]): void {
     if (typeof fn === 'function') fn.apply(internal, args);
 }
 
-function inspect(value: unknown, depth = 4): string {
-    try {
-        if (typeof internal.inspect === 'function') {
-            return internal.inspect(value, { depth });
-        }
-    } catch { }
-    return String(value);
-}
-
-function json(value: unknown): string {
-    try {
-        const seen = new WeakSet<object>();
-        const out = JSON.stringify(value, (_key, current) => {
-            if (typeof current === 'object' && current !== null) {
-                if (seen.has(current)) return '[Circular]';
-                seen.add(current);
-            }
-            return current;
-        });
-        return out === undefined ? 'undefined' : out;
-    } catch {
-        return '[Circular]';
-    }
-}
-
-function format(template: string, ...args: unknown[]): string {
-    let result = '';
-    let argIndex = 0;
-
-    for (let i = 0; i < template.length; i++) {
-        if (template[i] !== '%' || i + 1 >= template.length) {
-            result += template[i];
-            continue;
-        }
-
-        const spec = template[++i];
-        if (spec === '%') {
-            result += '%';
-            continue;
-        }
-        if (argIndex >= args.length) {
-            result += `%${spec}`;
-            continue;
-        }
-
-        const arg = args[argIndex++];
-        switch (spec) {
-            case 's':
-                result += String(arg);
-                break;
-            case 'd':
-            case 'i':
-                result += typeof arg === 'bigint' ? String(arg) : String(Math.trunc(Number(arg)));
-                break;
-            case 'f':
-                result += typeof arg === 'bigint' ? String(arg) : String(Number(arg));
-                break;
-            case 'j':
-                result += json(arg);
-                break;
-            case 'o':
-                result += inspect(arg, 4);
-                break;
-            case 'O':
-                result += inspect(arg, 100);
-                break;
-            case 'c':
-                break;
-            default:
-                result += `%${spec}`;
-                argIndex--;
-                break;
-        }
-    }
-
-    if (argIndex < args.length) {
-        const rest = args.slice(argIndex).map((arg) => typeof arg === 'string' ? arg : inspect(arg, 2));
-        if (rest.length) result += `${result ? ' ' : ''}${rest.join(' ')}`;
-    }
-
-    return result;
+function format(...allArgs: unknown[]): string {
+    return String(internal.format.apply(internal, allArgs));
 }
 
 const webConsole = {

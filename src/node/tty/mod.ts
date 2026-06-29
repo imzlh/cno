@@ -157,7 +157,8 @@ export class WriteStream extends Writable {
 
     private writeToFd(chunk: any, _encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
         try {
-            const written = this.handle.writeSync(chunk);
+            const data = typeof chunk === 'string' ? engine.encodeString(chunk) : chunk;
+            const written = this.handle.writeSync(data);
             this.bytesWritten += written;
             this.refreshSize();
             callback();

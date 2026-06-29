@@ -1,15 +1,17 @@
-const console = import.meta.use('console');
 /**
  * Node.js events module
  * EventEmitter pattern implementation
  */
+
+import type { EventEmitter as IEventEmitter } from 'node:events';
+
+const console = import.meta.use('console');
 
 // ============================================================================
 // Type definitions
 // ============================================================================
 
 type EventMap<T> = Record<keyof T, any[]>;
-type EventNames<T extends EventMap<T>> = keyof T | string | symbol;
 type Listener<T extends EventMap<T>, E extends string | symbol> = (...args: any[]) => void;
 
 export interface EventEmitterOptions {
@@ -30,7 +32,7 @@ export interface EventEmitterAsyncResourceOptions extends EventEmitterOptions {
 // EventEmitter class
 // ============================================================================
 
-export class EventEmitter<T extends EventMap<T> = any> {
+export class EventEmitter<T extends EventMap<T> = any> implements IEventEmitter<T> {
     private _events: Map<string | symbol, Array<{ listener: Function; once: boolean }>> = new Map();
     private _maxListeners: number = 10;
     private _captureRejections: boolean = false;
@@ -202,7 +204,7 @@ export class EventEmitter<T extends EventMap<T> = any> {
         // Invoke listeners
         for (const { listener } of toCall) {
             try {
-                const result = listener(...args);
+                const result = listener.apply(this, args);
                 if (this._captureRejections && result instanceof Promise) {
                     result.catch((err) => {
                         this.emit(EventEmitter.captureRejectionSymbol, err, eventName, ...args);
@@ -230,12 +232,12 @@ export class EventEmitter<T extends EventMap<T> = any> {
         return Array.from(this._events.keys());
     }
 
-    listeners<E extends string | symbol>(eventName: E): Function[] {
+    listeners<E extends string | symbol>(eventName: E): any[] {
         const listeners = this._events.get(eventName);
         return listeners ? listeners.map(l => l.listener) : [];
     }
 
-    rawListeners<E extends string | symbol>(eventName: E): Function[] {
+    rawListeners<E extends string | symbol>(eventName: E): any[] {
         return this.listeners(eventName);
     }
 

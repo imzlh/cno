@@ -863,7 +863,7 @@ const webCrypto: Crypto = {
     },
 };
 
-Reflect.defineProperty(window, 'crypto', {
+Reflect.defineProperty(globalThis, 'crypto', {
     value: webCrypto,
     writable: false,
     enumerable: true,

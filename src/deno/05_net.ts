@@ -673,18 +673,111 @@ function caCertsPem(caCerts?: string[]): string | undefined {
     return certs.length ? certs.join('\n') : undefined;
 }
 
+/** True if the string looks like a bare IPv4 or IPv6 address literal. */
+function isIpLiteral(host: string): boolean {
+    // IPv6 literals arrive as "[::1]" or "::1"
+    const h = normalizeHostname(host);
+    // IPv4: four octets
+    if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h)) return true;
+    // IPv6: contains ':'
+    if (h.includes(':')) return true;
+    return false;
+}
+
 async function connectTcp(hostname: string, port: number, signal?: AbortSignal): Promise<CModuleStreams.TCP> {
     const host = normalizeHostname(hostname);
-    const family = isIPv6Hostname(host) ? 6 : 4;
-    const tcp = new stream.TCP(family === 6 ? os.AF_INET6 : os.AF_INET);
-    const dnsanswer = await withAbort(dnsCache.resolve(host, { family }), signal, () => tcp.close());
-    const ip = dnsanswer[0]?.ip;
-    if (!ip) {
-        tcp.close();
-        throw new Error(`Could not resolve hostname ${host}`);
+
+    // If the caller passed a literal IP, connect directly (no dual-stack logic needed).
+    if (isIpLiteral(host)) {
+        const family = host.includes(':') ? 6 : 4;
+        const tcp = new stream.TCP(family === 6 ? os.AF_INET6 : os.AF_INET);
+        await withAbort(tcp.connect({ ip: host, port }), signal, () => tcp.close());
+        return tcp;
     }
-    await withAbort(tcp.connect({ ip, port }), signal, () => tcp.close());
-    return tcp;
+
+    // Happy Eyeballs (RFC 8305): resolve both A + AAAA, race connections with
+    // a 250 ms head-start for IPv6.
+    const HAPPY_EYEBALLS_DELAY = 250;
+
+    const [v6addrs, v4addrs] = await Promise.all([
+        withAbort(dnsCache.resolve(host, { family: 6 }), signal).catch(() => []),
+        withAbort(dnsCache.resolve(host, { family: 4 }), signal).catch(() => []),
+    ]);
+
+    const v6ip = v6addrs[0]?.ip;
+    const v4ip = v4addrs[0]?.ip;
+
+    if (!v6ip && !v4ip) throw new Error(`Could not resolve hostname ${host}`);
+
+    // Only one family resolved — connect directly.
+    if (!v6ip) {
+        const tcp = new stream.TCP(os.AF_INET);
+        await withAbort(tcp.connect({ ip: v4ip!, port }), signal, () => tcp.close());
+        return tcp;
+    }
+    if (!v4ip) {
+        const tcp = new stream.TCP(os.AF_INET6);
+        await withAbort(tcp.connect({ ip: v6ip, port }), signal, () => tcp.close());
+        return tcp;
+    }
+
+    // Both families available — race with Happy Eyeballs delay.
+    return new Promise<CModuleStreams.TCP>((resolve, reject) => {
+        let settled = false;
+        let v4started = false;
+        let failCount = 0;
+        let lastError: unknown;
+        let v4timer: ReturnType<typeof timers.setTimeout> | undefined;
+        const tcpV6 = new stream.TCP(os.AF_INET6);
+        const tcpV4 = new stream.TCP(os.AF_INET);
+
+        function cancelTimer() {
+            if (v4timer !== undefined) {
+                timers.clearTimeout(v4timer);
+                v4timer = undefined;
+            }
+        }
+
+        function win(tcp: CModuleStreams.TCP) {
+            if (settled) return;
+            settled = true;
+            cancelTimer();
+            const loser = tcp === tcpV6 ? tcpV4 : tcpV6;
+            try { loser.close(); } catch { }
+            resolve(tcp);
+        }
+
+        function startV4() {
+            if (v4started || settled) return;
+            v4started = true;
+            cancelTimer();
+            withAbort(tcpV4.connect({ ip: v4ip, port }), signal, () => tcpV4.close())
+                .then(() => win(tcpV4), onFail);
+        }
+
+        function onFail(err: unknown) {
+            if (settled) return;
+            lastError = err;
+            failCount++;
+            if (!v4started) {
+                // v6 failed before the delay fired — start v4 immediately
+                startV4();
+                return;
+            }
+            if (failCount >= 2) {
+                // Both failed
+                settled = true;
+                reject(lastError);
+            }
+        }
+
+        // Start IPv6 immediately
+        withAbort(tcpV6.connect({ ip: v6ip, port }), signal, () => tcpV6.close())
+            .then(() => win(tcpV6), onFail);
+
+        // Start IPv4 after HAPPY_EYEBALLS_DELAY ms
+        v4timer = timers.setTimeout(startV4, HAPPY_EYEBALLS_DELAY);
+    });
 }
 
 class TcpListener extends Listener implements Deno.TcpListener {

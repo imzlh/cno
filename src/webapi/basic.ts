@@ -95,6 +95,10 @@ class TimeoutOrInterval extends Number implements NodeJS.Timeout {
     [Symbol.dispose]() {
         this.close();
     }
+
+    get __cno_timer_id() {
+        return Number(this.fd);
+    }
 }
 
 // @ts-ignore - __promisify__ is defined next

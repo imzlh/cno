@@ -263,7 +263,12 @@ export function styleText(format: string | string[], text: string, options?: { v
 }
 
 export function debuglog(section: string, callback?: (fn: (...args: any[]) => void) => void): (...args: any[]) => void {
-    const raw = String(os.getenv?.('NODE_DEBUG') ?? os.getenv?.('DEBUG') ?? '');
+    let raw: string | undefined;
+    try {
+        raw = String(os.getenv?.('NODE_DEBUG') ?? os.getenv?.('DEBUG'));
+    } catch {}
+    if (!raw) return () => {};
+    
     const enabled = raw.split(/[,\s]+/).some(part => part && (part === '*' || part.toLowerCase() === section.toLowerCase()));
     const logger = (...args: any[]) => {
         if (!enabled) return;
@@ -420,6 +425,10 @@ export interface PromisifyInterface {
 
 export function promisify<T>(fn: Function): (...args: any[]) => Promise<T> {
     const customSymbol = Symbol.for('nodejs.util.promisify.custom');
+
+    if (typeof fn !== 'function') {
+        throw new TypeError('The "original" argument must be of type Function');
+    }
 
     // Check for existing custom promisify implementation
     if ((fn as any)[customSymbol]) {
@@ -634,11 +643,13 @@ function processDoubleQuoted(raw: string, env: NodeJS.Dict<string>): string {
         } else if (raw[j] === '$' && j + 1 < raw.length && raw[j + 1] === '{') {
             // ${VAR} expansion
             const closeBrace = raw.indexOf('}', j + 2);
-            if (closeBrace !== -1) {
+            if (closeBrace !== -1) try {
                 const varName = raw.slice(j + 2, closeBrace);
                 const expanded = env[varName] ?? os.getenv(varName) ?? '';
                 out += expanded;
                 j = closeBrace;
+            } catch { 
+                out += raw[j];
             } else {
                 out += raw[j];
             }

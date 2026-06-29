@@ -67,6 +67,19 @@ export function randomFill<T extends ArrayBufferView>(buffer: T, offset?: number
     }
 }
 
+export function randomFillSync<T extends ArrayBufferView>(buffer: T, offset = 0, size?: number): T {
+    const sz = size ?? buffer.byteLength - offset;
+    if (offset < 0 || sz < 0 || offset + sz > buffer.byteLength) {
+        throw new RangeError('offset + size exceeds buffer length');
+    }
+    const randomData = new Uint8Array(crypto.randomBytes(sz));
+    const view = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+    for (let i = 0; i < sz; i++) {
+        view[offset + i] = randomData[i]!;
+    }
+    return buffer;
+}
+
 // ============================================================================
 // pbkdf2
 // ============================================================================

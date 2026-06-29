@@ -6,22 +6,47 @@
 import type { Stream } from '../../deno/04_stdio';
 import { EventEmitter } from '../events';
 
-const os = import.meta.use('os');
 const streams = import.meta.use('streams');
-const syncfs = import.meta.use('fs');
 const engine = import.meta.use('engine');
 const text = import.meta.use('text');
 
 const { stdin, stdout } = streams as any as Record<string, Stream>;
 
-function writeAnsi(fd: number, seq: string): void {
-    const data = engine.encodeString(seq);
-    try { syncfs.write(fd, data); } catch {}
+type OutputTarget = NodeJS.WritableStream | Stream;
+
+function isCnoStream(value: unknown): value is Stream {
+    return !!value && typeof value === 'object'
+        && typeof (value as { write?: unknown }).write === 'function'
+        && typeof (value as { writeSync?: unknown }).writeSync === 'function';
 }
 
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
+async function writeTarget(target: OutputTarget, data: string): Promise<void> {
+    if (isCnoStream(target)) {
+        const buf = engine.encodeString(data);
+        let written = 0;
+        while (written < buf.length) {
+            const n = await target.write(buf.subarray(written));
+            if (!n) throw new Error('Write failed');
+            written += n;
+        }
+        return;
+    }
+
+    await new Promise<void>((resolve, reject) => {
+        let settled = false;
+        const done = (err?: Error | null): void => {
+            if (settled) return;
+            settled = true;
+            if (err) reject(err);
+            else resolve();
+        };
+        try {
+            target.write(data, done);
+        } catch (err) {
+            done(err instanceof Error ? err : new Error(String(err)));
+        }
+    });
+}
 
 export interface ReadLineOptions {
     input: NodeJS.ReadableStream;
@@ -45,13 +70,9 @@ export interface Key {
     shift?: boolean;
 }
 
-// ---------------------------------------------------------------------------
-// Interface
-// ---------------------------------------------------------------------------
-
 export class Interface extends EventEmitter {
     private _input: NodeJS.ReadableStream;
-    private _output?: NodeJS.WritableStream;
+    private _output: OutputTarget;
     private _completer?: (line: string) => [string[], string];
     private _terminal: boolean;
     private _prompt = '';
@@ -66,12 +87,11 @@ export class Interface extends EventEmitter {
     private _paused = false;
     private _rawMode = false;
     private _prevMode = streams.TTY_MODE_RAW;
-    private _inputFd: number;
-    private _outputFd: number;
     private _readBuf = new Uint8Array(4096);
     private _lineBuf: string[] = [];
     private _reading = false;
     private _decoder = new text.Decoder(undefined, { stream: true });
+    private _outputQueue: Promise<void> = Promise.resolve();
 
     constructor(options: ReadLineOptions | NodeJS.ReadableStream) {
         super();
@@ -79,98 +99,93 @@ export class Interface extends EventEmitter {
             ? options as ReadLineOptions
             : { input: options };
         this._input = opts.input;
-        this._output = opts.output;
+        this._output = opts.output ?? stdout;
         this._completer = opts.completer;
-        this._inputFd = os.STDIN_FILENO;
-        this._outputFd = os.STDOUT_FILENO;
         this._terminal = opts.terminal ?? stdin.isTTY;
         this._historySize = Math.max(opts.historySize ?? 30, 0);
         this._removeHistoryDups = opts.removeHistoryDuplicates ?? true;
         this._prompt = opts.prompt ?? '> ';
 
-        if (opts.prompt) this._displayPrompt();
-        if (!this._paused) this._startRead();
-
-        if (this._terminal && stdin.isTTY)  try {
+        if (this._terminal && stdin.isTTY) try {
             const stream = stdin.__stream as CModuleStreams.TTY;
             this._prevMode = stream.mode;
             stream.mode = streams.TTY_MODE_RAW_VT;
             this._rawMode = true;
-        } catch {}
+        } catch { }
+
+        if (opts.signal) {
+            if (opts.signal.aborted) this.close();
+            else opts.signal.addEventListener('abort', () => this.close(), { once: true });
+        }
+
+        if (opts.prompt) this._displayPrompt();
+        if (!this._paused) this._startRead();
+    }
+
+    private _queueOutput(task: () => Promise<void>): Promise<void> {
+        const next = this._outputQueue.then(task, task);
+        this._outputQueue = next.catch((err) => {
+            this.emit('error', err instanceof Error ? err : new Error(String(err)));
+        });
+        return next;
+    }
+
+    private _scheduleWrite(data: string): void {
+        void this._queueOutput(() => writeTarget(this._output, data));
     }
 
     private _displayPrompt(): void {
         if (!this._terminal) return;
-        this._writeOutput(this._prompt);
-    }
-
-    private _writeOutput(data: string): void {
-        const buf = engine.encodeString(data);
-        let write = 0;
-        while (write < buf.length) {
-            const n = stdout.writeSync(buf.subarray(write));
-            if (!n) throw new Error('Write failed');
-            write += n;
-        }
+        this._scheduleWrite(this._prompt);
     }
 
     private _refreshLine(): void {
         if (!this._terminal) return;
-        const cols = this._getColumns();
-        const promptLines = this._prompt.length;
         const lineLen = this._line.length;
-        writeAnsi(this._outputFd, `\x1b[2K\r${this._prompt}${this._line}`);
-        if (this._cursorPos < lineLen) {
-            const moveBack = lineLen - this._cursorPos;
-            writeAnsi(this._outputFd, `\x1b[${moveBack}D`);
-        }
-    }
-
-    private _getColumns(): number {
-        if (!stdin.isTTY) return 80;
-        const stream = stdin.__stream as CModuleStreams.TTY;
-        return stream.size.width;
+        const moveBack = this._cursorPos < lineLen ? `\x1b[${lineLen - this._cursorPos}D` : '';
+        this._scheduleWrite(`\x1b[2K\r${this._prompt}${this._line}${moveBack}`);
     }
 
     private _startRead(): void {
         if (this._reading || this._closed || this._paused) return;
         this._reading = true;
-        this._readLoop();
+        this._readLoop().catch(() => {
+            this._reading = false;
+        });
     }
 
-    private _readLoop(): void {
-        if (this._closed || this._paused) { this._reading = false; return; }
+    private async _readLoop(): Promise<void> {
+        if (this._closed || this._paused) {
+            this._reading = false;
+            return;
+        }
+        const stream = stdin.__stream as CModuleStreams.Stream;
         try {
-            const n = syncfs.read(this._inputFd, this._readBuf);
-            if (n === 0) {
-                this._reading = false;
-                this.emit('close');
-                return;
+            while (!this._closed && !this._paused) {
+                const n = await stream.read(this._readBuf);
+                if (n === 0 || n === null) {
+                    this._reading = false;
+                    this.close();
+                    return;
+                }
+                const chunk = this._decoder.decode(this._readBuf.subarray(0, n));
+                this._processInput(chunk);
             }
-            const chunk = this._decoder.decode(this._readBuf.subarray(0, n));
-            this._processInput(chunk);
-            this._readLoop();
-        } catch {
+        } finally {
             this._reading = false;
         }
     }
 
     private _processInput(data: string): void {
-        if (this._rawMode) {
-            this._processRawInput(data);
-        } else {
-            this._processLineInput(data);
-        }
+        if (this._rawMode) this._processRawInput(data);
+        else this._processLineInput(data);
     }
 
     private _processLineInput(data: string): void {
         for (let i = 0; i < data.length; i++) {
             const ch = data[i];
             if (ch === '\r' || ch === '\n') {
-                // Treat \r\n as a single line ending
-                if (ch === '\r' && i + 1 < data.length && data[i + 1] === '\n') {
-                    i++;
-                }
+                if (ch === '\r' && i + 1 < data.length && data[i + 1] === '\n') i++;
                 const line = this._lineBuf.join('');
                 this._lineBuf = [];
                 this.emit('line', line);
@@ -186,7 +201,7 @@ export class Interface extends EventEmitter {
             const code = ch.charCodeAt(0);
 
             if (ch === '\r' || ch === '\n') {
-                this._writeOutput('\r\n');
+                this._scheduleWrite('\r\n');
                 this.emit('line', this._line);
                 this._addHistory(this._line);
                 this._line = '';
@@ -260,18 +275,17 @@ export class Interface extends EventEmitter {
     private _tabComplete(): void {
         if (!this._completer) return;
         try {
-            const [completions, prefix] = this._completer(this._line);
+            const [completions] = this._completer(this._line);
             if (completions.length === 1) {
-                this._line = completions[0];
+                this._line = completions[0]!;
                 this._cursorPos = this._line.length;
                 this._refreshLine();
             } else if (completions.length > 1) {
-                this._writeOutput('\r\n');
-                this._writeOutput(completions.join('  ') + '\r\n');
+                this._scheduleWrite(`\r\n${completions.join('  ')}\r\n`);
                 this._displayPrompt();
                 this._refreshLine();
             }
-        } catch {}
+        } catch { }
     }
 
     private _moveHistory(dir: number): void {
@@ -313,20 +327,20 @@ export class Interface extends EventEmitter {
         if (this._terminal) this._refreshLine();
     }
 
-    prompt(preserveCursor?: boolean): void {
+    prompt(_preserveCursor?: boolean): void {
         if (this._closed) return;
-        if (this._terminal) {
-            this._refreshLine();
-        } else {
-            this._displayPrompt();
-        }
+        if (this._terminal) this._refreshLine();
+        else this._displayPrompt();
         if (!this._reading && !this._paused) this._startRead();
     }
 
     question(query: string, callback: (answer: string) => void): void {
-        if (this._closed) { callback(''); return; }
-        this._writeOutput(query);
-        const onceLine = (line: string) => {
+        if (this._closed) {
+            callback('');
+            return;
+        }
+        this._scheduleWrite(query);
+        const onceLine = (line: string): void => {
             this.off('line', onceLine);
             callback(line);
         };
@@ -334,11 +348,20 @@ export class Interface extends EventEmitter {
         if (!this._reading && !this._paused) this._startRead();
     }
 
+    async questionAsync(query: string): Promise<string> {
+        if (this._closed) return '';
+        return await new Promise<string>((resolve) => {
+            this.question(query, resolve);
+        });
+    }
+
     close(): void {
         if (this._closed) return;
         this._closed = true;
         if (this._rawMode) {
-            (stdin.__stream as CModuleStreams.TTY).mode = this._prevMode;
+            try {
+                (stdin.__stream as CModuleStreams.TTY).mode = this._prevMode;
+            } catch { }
             this._rawMode = false;
         }
         this.emit('close');
@@ -355,7 +378,7 @@ export class Interface extends EventEmitter {
         return this;
     }
 
-    write(data: string | Buffer, key?: { ctrl?: boolean; meta?: boolean; shift?: boolean; name: string }): void {
+    write(data: string | Buffer, _key?: { ctrl?: boolean; meta?: boolean; shift?: boolean; name: string }): void {
         if (this._closed) return;
         const str = typeof data === 'string' ? data : new TextDecoder().decode(data as Uint8Array);
         this._processInput(str);
@@ -370,52 +393,31 @@ export class Interface extends EventEmitter {
     get line(): string { return this._line; }
 }
 
-// ---------------------------------------------------------------------------
-// Factory
-// ---------------------------------------------------------------------------
-
 export function createInterface(options: ReadLineOptions | NodeJS.ReadableStream): Interface {
     return new Interface(options);
 }
 
-// ---------------------------------------------------------------------------
-// Keypress events
-// ---------------------------------------------------------------------------
-
-export function emitKeypressEvents(stream: NodeJS.ReadableStream, iface?: Interface): void {
-    if (iface) {
-        iface.on('line', (line: string) => {
-            for (const ch of line) {
-                iface.emit('keypress', ch, { name: ch, sequence: ch } as Key);
-            }
-        });
-    }
+export function emitKeypressEvents(_stream: NodeJS.ReadableStream, iface?: Interface): void {
+    if (!iface) return;
+    iface.on('line', (line: string) => {
+        for (const ch of line) {
+            iface.emit('keypress', ch, { name: ch, sequence: ch } as Key);
+        }
+    });
 }
 
-// ---------------------------------------------------------------------------
-// ANSI cursor helpers
-// ---------------------------------------------------------------------------
-
 export function clearLine(stream: NodeJS.WritableStream, dir: -1 | 0 | 1, callback?: () => void): void {
-    const fd = os.STDOUT_FILENO;
-    if (dir === -1) writeAnsi(fd, '\x1b[1K');
-    else if (dir === 1) writeAnsi(fd, '\x1b[0K');
-    else writeAnsi(fd, '\x1b[2K');
-    callback?.();
+    const seq = dir === -1 ? '\x1b[1K' : dir === 1 ? '\x1b[0K' : '\x1b[2K';
+    stream.write(seq, () => callback?.());
 }
 
 export function clearScreenDown(stream: NodeJS.WritableStream, callback?: () => void): void {
-    writeAnsi(os.STDOUT_FILENO, '\x1b[0J');
-    callback?.();
+    stream.write('\x1b[0J', () => callback?.());
 }
 
 export function cursorTo(stream: NodeJS.WritableStream, x: number, y?: number, callback?: () => void): void {
-    if (y !== undefined) {
-        writeAnsi(os.STDOUT_FILENO, `\x1b[${y + 1};${x + 1}H`);
-    } else {
-        writeAnsi(os.STDOUT_FILENO, `\x1b[${x + 1}G`);
-    }
-    callback?.();
+    const seq = y !== undefined ? `\x1b[${y + 1};${x + 1}H` : `\x1b[${x + 1}G`;
+    stream.write(seq, () => callback?.());
 }
 
 export function moveCursor(stream: NodeJS.WritableStream, dx: number, dy: number, callback?: () => void): void {
@@ -424,9 +426,9 @@ export function moveCursor(stream: NodeJS.WritableStream, dx: number, dy: number
     else if (dx < 0) seq += `\x1b[${-dx}D`;
     if (dy > 0) seq += `\x1b[${dy}B`;
     else if (dy < 0) seq += `\x1b[${-dy}A`;
-    if (seq) writeAnsi(os.STDOUT_FILENO, seq);
-    callback?.();
+    if (!seq) {
+        callback?.();
+        return;
+    }
+    stream.write(seq, () => callback?.());
 }
-
-import * as promises from './promises';
-export { promises };

@@ -1,7 +1,6 @@
 import { createServer } from "@cnojs/http/server";
 
 const http = import.meta.use('http');
-const engine = import.meta.use('engine');
 
 export interface IOpaque {
     createServer: typeof createServer;

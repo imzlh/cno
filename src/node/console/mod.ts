@@ -3,6 +3,8 @@
  * Provides the Console class and the global console instance
  */
 
+const nativeConsole = import.meta.use('console') as Record<string, any>;
+
 export interface ConsoleOptions {
     stdout: NodeJS.WritableStream;
     stderr?: NodeJS.WritableStream;
@@ -220,6 +222,10 @@ function buildOutput(args: unknown[]): string {
     return text;
 }
 
+function formatOutput(...args: unknown[]): string {
+    return String(nativeConsole.format.apply(nativeConsole, args));
+}
+
 export class Console {
     private _stdout: NodeJS.WritableStream;
     private _stderr: NodeJS.WritableStream;
@@ -262,6 +268,10 @@ export class Console {
 
     log(...args: unknown[]): void {
         this._write(this._stdout, this._groupIndent + buildOutput(args));
+    }
+
+    format(...args: unknown[]): string {
+        return formatOutput(...args);
     }
 
     info(...args: unknown[]): void {
@@ -467,3 +477,70 @@ function pad(str: string, width: number): string {
     if (len >= width) return str.slice(0, width - 1) + '\u2026';
     return str + ' '.repeat(width - len);
 }
+
+type ConsoleMethod =
+    | 'assert'
+    | 'clear'
+    | 'count'
+    | 'countReset'
+    | 'debug'
+    | 'dir'
+    | 'dirxml'
+    | 'error'
+    | 'group'
+    | 'groupCollapsed'
+    | 'groupEnd'
+    | 'info'
+    | 'log'
+    | 'profile'
+    | 'profileEnd'
+    | 'table'
+    | 'time'
+    | 'timeEnd'
+    | 'timeLog'
+    | 'timeStamp'
+    | 'trace'
+    | 'warn';
+
+function forward(name: ConsoleMethod) {
+    return (...args: unknown[]) => {
+        const fn = nativeConsole[name];
+        if (typeof fn === 'function') {
+            return fn.apply(nativeConsole, args);
+        }
+        const fallback = (globalThis.console as Record<string, any> | undefined)?.[name];
+        if (typeof fallback === 'function') {
+            return fallback.apply(globalThis.console, args);
+        }
+    };
+}
+
+export function format(...args: unknown[]): string {
+    return formatOutput(...args);
+}
+
+export const log = forward('log');
+export const info = forward('info');
+export const warn = forward('warn');
+export const error = forward('error');
+export const debug = forward('debug');
+export const dir = forward('dir');
+export const dirxml = forward('dirxml');
+export const table = forward('table');
+export const trace = forward('trace');
+export const clear = forward('clear');
+export const assert = forward('assert');
+export const count = forward('count');
+export const countReset = forward('countReset');
+export const time = forward('time');
+export const timeLog = forward('timeLog');
+export const timeEnd = forward('timeEnd');
+export const timeStamp = forward('timeStamp');
+export const group = forward('group');
+export const groupCollapsed = forward('groupCollapsed');
+export const groupEnd = forward('groupEnd');
+export const profile = forward('profile');
+export const profileEnd = forward('profileEnd');
+
+export const context = nativeConsole.context;
+export const createTask = nativeConsole.createTask;

@@ -21,7 +21,6 @@ import type { IncomingHttpHeaders, OutgoingHttpHeader, OutgoingHttpHeaders, Inco
 import { IOpaque } from '../_internal/inject';
 export type { IncomingHttpHeaders, OutgoingHttpHeader, OutgoingHttpHeaders, IncomingMessage, OutgoingMessage, ServerResponse, ListenOptions, Server, RequestListener } from './types';
 const { createServer: createHttpServer } = (http as any).__cno as IOpaque;
-const debugNodeHttp = true;
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
@@ -360,6 +359,8 @@ class NodeResponseAdapter {
     private readonly requestUrl: string;
     private queue: Promise<void> = Promise.resolve();
     private headWritten = false;
+    private closed = false;
+    private failed = false;
 
     constructor(
         response: ServerResponseImpl,
@@ -373,12 +374,59 @@ class NodeResponseAdapter {
         this.serveHook = serveHook;
         this.requestId = requestId;
         this.requestUrl = requestUrl;
+        this.response.socket?.once('close', () => {
+            this.closed = true;
+            this.response.finished = true;
+            this.response.writableFinished = true;
+        });
     }
 
-    private enqueue<T>(op: () => Promise<T>): Promise<T> {
-        const next = this.queue.then(op, op);
+    private enqueue<T>(op: () => Promise<T>): Promise<T | undefined> {
+        const next = this.queue.then(async () => {
+            if (this.closed || this.failed) {
+                return undefined;
+            }
+            return op();
+        }, async () => {
+            if (this.closed || this.failed) {
+                return undefined;
+            }
+            return op();
+        });
         this.queue = next.then(() => undefined, () => undefined);
         return next;
+    }
+
+    private isConnectionCloseError(err: unknown): boolean {
+        const code = (err as { code?: unknown })?.code;
+        return code === 'ECONNRESET' || code === 'EPIPE' || code === 'ECONNABORTED';
+    }
+
+    private fail(err: unknown, callback?: (err?: Error | null) => void): void {
+        const error = err instanceof Error ? err : new Error(String(err));
+        if (this.failed) {
+            callback?.(error);
+            return;
+        }
+        this.closed = true;
+        this.failed = true;
+        this.response.finished = true;
+        this.response.writableFinished = true;
+        if (!this.response.writableEnded) {
+            this.response.writableEnded = true;
+        }
+        try {
+            this.serveHook?.onFinished?.({
+                requestId: this.requestId,
+                timestamp: nodeTs(),
+                success: false,
+                errorText: String(error.message ?? error),
+            });
+        } catch {}
+        if (!this.isConnectionCloseError(error)) {
+            this.response.emit('error', error);
+        }
+        callback?.(error);
     }
 
     private collectHeaders(): Array<[string, string]> {
@@ -449,7 +497,7 @@ class NodeResponseAdapter {
         } catch {}
 
         this.enqueue(() => this.coreResponse.writeHead(this.response.statusCode, this.response.statusMessage, outHeaders))
-            .catch((err) => this.response.emit('error', err));
+            .catch((err) => this.fail(err));
 
         return this.response;
     }
@@ -481,12 +529,10 @@ class NodeResponseAdapter {
                 try { this.serveHook?.onData?.({ requestId: this.requestId, timestamp: nodeTs(), data }); } catch {}
                 await this.coreResponse.write(data as Uint8Array);
             }).then(() => callback?.(), (err) => {
-                this.response.emit('error', err);
-                callback?.(err);
+                this.fail(err, callback);
             });
         } catch (err) {
-            this.response.emit('error', err);
-            callback?.(err as Error);
+            this.fail(err, callback);
         }
 
         return true;
@@ -535,7 +581,7 @@ class NodeResponseAdapter {
             this.response.emit('finish');
             callback?.();
         }, (err) => {
-            this.response.emit('error', err);
+            this.fail(err);
             callback?.();
         });
 
@@ -723,15 +769,14 @@ export class ServerImpl extends NetServer implements Server {
             // header/body/terminator writes and hangs the client mid-response.
             if (nodeSocket) response.assignSocket(nodeSocket);
             const adapter = new NodeResponseAdapter(response, res, serveHook, requestId, requestUrl);
+            let responseDoneError: unknown;
             const responseDone = new Promise<void>((resolve, reject) => {
                 response.once('finish', () => resolve());
                 response.once('error', (err) => reject(err));
             });
-            if (debugNodeHttp) {
-                console.log(`[node-http] request ${req.method} ${req.url}`);
-                response.once('finish', () => console.log(`[node-http] finish ${req.method} ${req.url} ${response.statusCode}`));
-                response.once('error', (err) => console.log(`[node-http] error ${req.method} ${req.url} ${String((err as Error)?.message ?? err)}`));
-            }
+            const responseDoneObserved = responseDone.catch((err) => {
+                responseDoneError = err;
+            });
             try {
                 serveHook?.onRequest?.({
                     requestId,
@@ -750,9 +795,9 @@ export class ServerImpl extends NetServer implements Server {
 
             try {
                 await this._requestListener(incoming, response);
-                if (debugNodeHttp) console.log(`[node-http] handler returned ${req.method} ${req.url}`);
                 if (!response.writableFinished) {
-                    await responseDone;
+                    await responseDoneObserved;
+                    if (responseDoneError !== undefined) throw responseDoneError;
                 }
             } catch (err) {
                 try { serveHook?.onFinished?.({ requestId, timestamp: nodeTs(), success: false, errorText: String((err as Error)?.message ?? err) }); } catch {}

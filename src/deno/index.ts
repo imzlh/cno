@@ -1,13 +1,146 @@
-import { errors } from "./01_errors";
 import packageJson from '../../package.json';
-import { getDenoArgs } from "../utils/args";
+import { buildDenoArgs } from "../utils/args";
+import { errors } from "./01_errors";
 
 const os = import.meta.use('os');
 const engine = import.meta.use('engine');
 const signal = import.meta.use('signals');
 const console = import.meta.use('console');
+const timers = import.meta.use('timers');
+const asyncfs = import.meta.use('asyncfs');
 
 const kInternal = Symbol('Deno.internal');
+
+// ─── Snapshot helpers ────────────────────────────────────────────────────────
+
+function urlToFsPath(url: string): string {
+    if (url.startsWith('file:///')) {
+        const raw = url.slice(7); // keep leading '/'
+        // On Windows: file:///C:/path → /C:/path → C:/path
+        if (/^\/[A-Za-z]:\//.test(raw)) return raw.slice(1).replace(/\//g, '\\');
+        return raw;
+    }
+    return url;
+}
+
+function snapshotDir(fsPath: string, overrideDir?: string): string {
+    if (overrideDir) return overrideDir;
+    const sep = fsPath.includes('\\') ? '\\' : '/';
+    const lastSep = Math.max(fsPath.lastIndexOf('/'), fsPath.lastIndexOf('\\'));
+    const dir = lastSep < 0 ? '.' : fsPath.slice(0, lastSep);
+    return dir + sep + '__snapshots__';
+}
+
+function snapshotFile(fsPath: string, overrideDir?: string): string {
+    const dir = snapshotDir(fsPath, overrideDir);
+    const sep = dir.includes('\\') ? '\\' : '/';
+    const lastSep = Math.max(fsPath.lastIndexOf('/'), fsPath.lastIndexOf('\\'));
+    const base = lastSep < 0 ? fsPath : fsPath.slice(lastSep + 1);
+    return dir + sep + base + '.snap';
+}
+
+// Per-file snapshot data: file path → { key → value }
+const snapCache = new Map<string, Map<string, string>>();
+
+async function loadSnapshots(file: string): Promise<Map<string, string>> {
+    const cached = snapCache.get(file);
+    if (cached) return cached;
+    const map = new Map<string, string>();
+    try {
+        const buf = await asyncfs.readFile(file);
+        const text = engine.decodeString(buf);
+        // Parse lines: each entry is   [key]\n<value>\n---
+        const blocks = text.split('\n---\n');
+        for (const block of blocks) {
+            const nl = block.indexOf('\n');
+            if (nl < 0) continue;
+            const header = block.slice(0, nl).trim();
+            if (!header.startsWith('[') || !header.endsWith(']')) continue;
+            const key = header.slice(1, -1);
+            map.set(key, block.slice(nl + 1));
+        }
+    } catch {
+        // File doesn't exist yet — start empty
+    }
+    snapCache.set(file, map);
+    return map;
+}
+
+async function saveSnapshots(file: string, map: Map<string, string>): Promise<void> {
+    const dir = snapshotDir(file);
+    try { await asyncfs.mkdir(dir); } catch { }
+    const parts: string[] = [];
+    for (const [key, value] of map) {
+        parts.push(`[${key}]\n${value}\n---`);
+    }
+    const text = parts.join('\n');
+    const fp = await asyncfs.open(file, 'w');
+    await fp.write(engine.encodeString(text));
+    fp.close();
+}
+
+// Counter per (snapFile, testName) to auto-number successive assertSnapshot calls
+const snapCounters = new Map<string, number>();
+
+const updateSnapshots =
+    (globalThis as any).__cts_update_snapshots === true ||
+    (typeof os.getenv === 'function' && os.getenv('DENO_SNAPSHOT_UPDATE') === '1');
+
+async function assertSnapshotImpl<T>(
+    actual: T,
+    origin: string,
+    testName: string,
+    options?: { name?: string; dir?: string; msg?: string; serializer?: (v: T) => string }
+): Promise<void> {
+    const fsPath = urlToFsPath(origin);
+    const snapFilePath = snapshotFile(fsPath, options?.dir);
+    const serialized = options?.serializer ? options.serializer(actual) : console.inspect(actual, { colors: false, depth: 10 });
+
+    const counterKey = `${snapFilePath}\0${testName}`;
+    const idx = (snapCounters.get(counterKey) ?? 0) + 1;
+    snapCounters.set(counterKey, idx);
+    const key = options?.name ?? `${testName} ${idx}`;
+
+    const map = await loadSnapshots(snapFilePath);
+
+    if (updateSnapshots || !map.has(key)) {
+        map.set(key, serialized);
+        await saveSnapshots(snapFilePath, map);
+        if (!updateSnapshots) console.log(`  snapshot created: ${key}`);
+        return;
+    }
+
+    const expected = map.get(key)!;
+    if (serialized !== expected) {
+        const msg = options?.msg ?? `Snapshot "${key}" mismatch.\n  actual:   ${serialized}\n  expected: ${expected}`;
+        throw new Error(msg);
+    }
+}
+
+// ─── Printf-style name formatting for each() ─────────────────────────────────
+
+function formatEachName(template: string, args: unknown[]): string {
+    // Object-style: $key substitution when there is one object argument
+    if (args.length === 1 && typeof args[0] === 'object' && args[0] !== null && !Array.isArray(args[0])) {
+        const obj = args[0] as Record<string, unknown>;
+        return template.replace(/\$([a-zA-Z_]\w*)/g, (_, k) => String(obj[k] ?? `$${k}`));
+    }
+    // printf-style
+    let idx = 0;
+    return template.replace(/%([dsifoO%])/g, (_, fmt) => {
+        if (fmt === '%') return '%';
+        const arg = args[idx++];
+        switch (fmt) {
+            case 'd': case 'i': return String(Math.trunc(Number(arg)));
+            case 's': return String(arg);
+            case 'f': return String(Number(arg));
+            case 'o': case 'O': return console.inspect(arg, { colors: false });
+            default: return String(arg);
+        }
+    });
+}
+
+// ─── Registry and helper types ────────────────────────────────────────────────
 
 function notSupported(): never {
     throw new errors.NotSupported("Not supported");
@@ -56,6 +189,11 @@ function createTestContext(name: string, origin: string, parent?: Deno.TestConte
         name,
         origin,
         parent,
+        async assertSnapshot<T>(actual: T, options?: {
+            name?: string; dir?: string; msg?: string; serializer?: (v: T) => string;
+        }): Promise<void> {
+            await assertSnapshotImpl(actual, origin, name, options);
+        },
         async step(definitionOrName: Deno.TestStepDefinition | string | ((t: Deno.TestContext) => void | Promise<void>), fn?: (t: Deno.TestContext) => void | Promise<void>): Promise<boolean> {
             let stepDef: Deno.TestStepDefinition;
 
@@ -175,6 +313,24 @@ function createTestFunction(): Deno.DenoTest {
         beforeEach:  (fn: () => void | Promise<void>) => { beforeEachHooks.push(fn); },
         afterEach:   (fn: () => void | Promise<void>) => { afterEachHooks.push(fn); },
         afterAll:    (fn: () => void | Promise<void>) => { afterAllHooks.push(fn); },
+        each<T extends readonly unknown[]>(cases: ReadonlyArray<T>) {
+            return (
+                name: string,
+                fn: (...args: any[]) => void | Promise<void>,
+                options?: Omit<Deno.TestDefinition, 'fn' | 'name'>
+            ) => {
+                for (const args of cases) {
+                    const caseArgs: unknown[] = Array.isArray(args) ? args : [args];
+                    const caseName = formatEachName(name, caseArgs);
+                    registerTest({
+                        name: caseName,
+                        fn: (t: Deno.TestContext) => (fn as any)(...caseArgs, t),
+                        ...options,
+                    });
+                }
+            };
+        },
+        sanitizer: () => { /* no-op: sanitizers not implemented */ },
     });
 
     return testObj as Deno.DenoTest;
@@ -204,12 +360,75 @@ function createBenchFunction(): {
 
 export async function startTest(contextName = '<core>', test = true, bench = true) {
     if (test) {
-        const tctx = createTestContext('main', contextName);
-        for (const testItem of testRegistry) try {
-            await tctx.step(testItem);
-        } catch (e) {
-            console.error(`  fail ${testItem.name}`);
-            console.error(e);
+        // Run beforeAll hooks
+        for (const hook of beforeAllHooks) {
+            try { await hook(); } catch (e) { console.error('beforeAll hook failed', e); }
+        }
+
+        const hasOnly = testRegistry.some(t => t.only);
+
+        for (const testItem of testRegistry) {
+            if (hasOnly && !testItem.only) continue;
+            if (testItem.ignore) {
+                console.warn(`  skip ${testItem.name}`);
+                continue;
+            }
+
+            const repeats: number = (testItem as any).repeats ?? 0;
+            const retryCount: number = (testItem as any).retry ?? 0;
+            const totalRuns = repeats + 1;
+
+            for (let run = 0; run < totalRuns; run++) {
+                const runLabel = totalRuns > 1 ? `${testItem.name} (${run + 1}/${totalRuns})` : testItem.name;
+
+                // beforeEach hooks
+                for (const hook of beforeEachHooks) {
+                    try { await hook(); } catch (e) { console.error(`beforeEach hook failed for ${runLabel}`, e); }
+                }
+
+                let lastError: unknown;
+                let success = false;
+
+                for (let attempt = 0; attempt <= retryCount; attempt++) {
+                    const stepCtx = createTestContext(runLabel, contextName);
+                    try {
+                        if (testItem.timeout && testItem.timeout > 0) {
+                            await Promise.race([
+                                testItem.fn(stepCtx),
+                                new Promise<never>((_, reject) =>
+                                    timers.setTimeout(() => reject(new Error(`Test timed out after ${testItem.timeout}ms`)), testItem.timeout!)
+                                ),
+                            ]);
+                        } else {
+                            await testItem.fn(stepCtx);
+                        }
+                        success = true;
+                        break;
+                    } catch (e) {
+                        lastError = e;
+                        if (attempt < retryCount) {
+                            console.warn(`  retry ${runLabel} (attempt ${attempt + 2}/${retryCount + 1})`);
+                        }
+                    }
+                }
+
+                if (success) {
+                    console.info(`  ok ${runLabel}`);
+                } else {
+                    console.error(`  fail ${runLabel}`, lastError);
+                    failedTests.push({ ...testItem, name: runLabel, error: toError(lastError) });
+                }
+
+                // afterEach hooks
+                for (const hook of afterEachHooks) {
+                    try { await hook(); } catch (e) { console.error(`afterEach hook failed for ${runLabel}`, e); }
+                }
+            }
+        }
+
+        // Run afterAll hooks
+        for (const hook of afterAllHooks) {
+            try { await hook(); } catch (e) { console.error('afterAll hook failed', e); }
         }
     }
 
@@ -236,14 +455,21 @@ export function getFailedTests(): IFailedTest[] {
     return failedTests;
 }
 
+function getTimerID(timer: any): number {
+    if (typeof timer === 'number')
+        return timer;
+    else if (typeof timer == 'object' && typeof timer.__cno_timer_id == 'number')
+        return timer.__cno_timer_id;
+    else
+        throw new Error('Invalid timer');
+}
+
 const uname = os.uname();
 Object.defineProperty(globalThis, "Deno", {
     value: {
         errors,
-
         pid: os.pid,
         ppid: os.ppid,
-        // args: set via getter below after object creation
         env: {
             get: safeGetEnv,
             set: os.setenv,
@@ -357,10 +583,10 @@ Object.defineProperty(globalThis, "Deno", {
         },
 
         refTimer(id) {
-            // todo?
+            timers.refTimer(getTimerID(id));
         },
         unrefTimer(id) {
-            // todo?
+            timers.unrefTimer(getTimerID(id));
         },
 
         uid() {
@@ -402,7 +628,9 @@ Object.defineProperty(globalThis, "Deno", {
     enumerable: true,
     configurable: true,
 });
-Object.defineProperty(Deno, "args", { get: getDenoArgs, enumerable: true, configurable: true });
+
+// delay setting args
+Reflect.defineProperty(Deno, 'args', { get: buildDenoArgs });
 
 // then import polyfills
 await import('./02_fs');
@@ -413,7 +641,7 @@ await import('./06_process');
 await import('./07_http');
 await import('./08_serve');
 await import('./09_cron');
-await import('./09_quic');
+// await import('./10_quic');
 
 // unstable APIs
 await import('./kv');

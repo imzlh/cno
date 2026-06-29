@@ -50,7 +50,10 @@ function getUserAgent(): string {
 }
 
 function getLanguage(): string {
-    const lang = os.getenv('LANG') || os.getenv('LC_ALL') || os.getenv('LC_MESSAGES');
+    let lang;
+    try {
+        lang = os.getenv('LANG') || os.getenv('LC_ALL') || os.getenv('LC_MESSAGES');
+    } catch {}
     if (lang) {
         const match = lang.match(/^([a-z]{2}_[A-Z]{2})/);
         if (match) {

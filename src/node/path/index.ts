@@ -17,15 +17,27 @@ import * as win32Ns from "jsr:@std/path/windows"
 export const sep = process.platform === 'win32' ? '\\' : '/'
 export const delimiter = process.platform === 'win32' ? ';' : ':'
 
+const posixCompat = {
+    ...posixNs,
+    sep: '/',
+    delimiter: ':',
+}
+
+const win32Compat = {
+    ...win32Ns,
+    sep: '\\',
+    delimiter: ';',
+}
+
 // Platform-specific namespace objects (Node.js path.posix / path.win32)
-export const posix = posixNs
-export const win32 = win32Ns
+export const posix = posixCompat
+export const win32 = win32Compat
 
 // Default export: everything in one object
 export default {
     ...stdPath,
     sep,
     delimiter,
-    posix: posixNs,
-    win32: win32Ns,
-}
+    posix: posixCompat,
+    win32: win32Compat,
+} as typeof import('node:path');

@@ -1,6 +1,7 @@
 import { fromError, PromiseRejectionEvent, EventTarget } from './events';
 
 const { onEvent, EventType } = import.meta.use('engine');
+const worker = import.meta.use('worker');
 
 // basic polyfills
 Object.defineProperties(globalThis, {
@@ -10,19 +11,16 @@ Object.defineProperties(globalThis, {
         enumerable: true,
         configurable: false
     },
-    self: {
-        value: globalThis,
-        writable: false,
-        enumerable: true,
-        configurable: false
-    },
-    window: {
-        value: globalThis,
-        writable: false,
-        enumerable: true,
-        configurable: false
-    }
 });
+
+if (worker.isWorker) {
+    Object.defineProperty(globalThis, 'self', {
+        value: globalThis,
+        writable: false,
+        enumerable: true,
+        configurable: false,
+    });
+}
 
 await Promise.all([
     import('./console'),
@@ -126,7 +124,7 @@ Reflect.set(globalThis, 'scheduler', scheduler);
 await import('./intl');
 
 // webtransport (QUIC)
-await import('./webtransport');
+// await import('./webtransport');
 
 // temporal
 // const { Temporal } = await import('temporal-polyfill');

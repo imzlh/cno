@@ -2,14 +2,17 @@
  * Node.js fs module - sync operations
  */
 
-const fs = import.meta.use('fs');
 import { toUint8Array, decodeBuffer, toNodeStat, toNodeDirent, parseFlags, pathToString, splitPathOrFd, describeFd, removeRecursiveSync, mkdirRecursiveSync, modeToNumber, timeToNumber, readFileFromFdSync, randomHex, type PathLike, type TimeLike, type Mode } from './utils';
 import { wrapSync } from '../_internal/errno';
 import { getTierLimits } from '../_internal/memory';
 import path from '../path';
-const { join } = path;
 
+const { join } = path;
 const { readBufSize: READ_BUF_SIZE } = getTierLimits();
+
+const os = import.meta.use('os');
+const fs = import.meta.use('fs');
+const engine = import.meta.use('engine');
 
 // ============================================================================
 // File read/write
@@ -239,14 +242,23 @@ export function readlinkSync(path: PathLike, options?: { encoding?: BufferEncodi
     const pathStr = pathToString(path);
     const result = wrapSync(() => fs.readlink(pathStr), 'readlinkSync', pathStr);
     const encoding = typeof options === 'string' ? options : options?.encoding;
-    if (encoding === 'buffer') return new TextEncoder().encode(result);
+    if (encoding === 'buffer') return engine.encodeString(result);
     return result;
 }
 
-export function realpathSync(path: PathLike, options?: { encoding?: BufferEncoding | 'buffer' } | BufferEncoding): string {
+export function realpathSync(_path: PathLike, options?: { encoding?: BufferEncoding | 'buffer' } | BufferEncoding): string {
+    const pathStr = pathToString(_path);
+    if (path.isAbsolute(pathStr)) {
+        return path.normalize(pathStr);
+    } else {
+        return path.join(os.cwd, pathStr);
+    }
+}
+
+Reflect.set(realpathSync, 'native', function (path: PathLike, options?: { encoding?: BufferEncoding | 'buffer' } | BufferEncoding) {
     const pathStr = pathToString(path);
     return wrapSync(() => fs.realpath(pathStr), 'realpathSync', pathStr);
-}
+});
 
 // ============================================================================
 // Permission operations

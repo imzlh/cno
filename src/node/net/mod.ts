@@ -276,6 +276,7 @@ export class Socket extends Duplex {
             this.emit('pause');
         }
         if (this._tcp) this._tcp.stopRead();
+        if (this._upgradeHandle) this._upgradeHandle.stopReading();
         return this;
     }
 
@@ -286,6 +287,7 @@ export class Socket extends Duplex {
             this.emit('resume');
         }
         if (this._tcp) this._startTcpRead();
+        if (this._upgradeHandle) this._startUpgradeRead();
         if (this._stream) this._stream.startRead();
         return this;
     }

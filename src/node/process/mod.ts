@@ -3,10 +3,12 @@
  * Provides current Node.js process information and control
  */
 
-import { EventEmitter } from '../events';
-import { Readable, Writable } from '../stream';
 import type { Stream as StdioStream } from '../../deno/04_stdio';
+import type { Args } from '../../utils/args';
 import { getTierLimits } from '../_internal/memory';
+import { EventEmitter } from '../events';
+import { IPCChannel } from '../ipc_channel';
+import { Readable, Writable } from '../stream';
 
 const os = import.meta.use('os');
 const engine = import.meta.use('engine');
@@ -14,25 +16,12 @@ const sig = import.meta.use('signals');
 const proc = import.meta.use('process');
 const streams = import.meta.use('streams');
 const console = import.meta.use('console');
-const { stdin: denoStdin, stdout: denoStdout, stderr: denoStderr } = streams as any as Record<string, StdioStream>;
 
 const { streamHighWaterMark: PROCESS_READ_STREAM_HWM } = getTierLimits();
 
-// ============================================================================
-// Command line arguments
-// ============================================================================
-
-const os_args = (function () {
-    const { args } = os;
-    for (let i = 0; i < args.length; i++) {
-        if (args[i][0] == '-') {
-            if (args[i][1] == '-') i++;
-        } else {
-            return args.slice(i);
-        }
-    }
-    return [];
-})();
+// @ts-ignore - ns
+const cno_args = os.__cno_args.get() as Args;
+const { stdin: denoStdin, stdout: denoStdout, stderr: denoStderr } = streams as any as Record<string, StdioStream>;
 
 // ============================================================================
 // Helper functions
@@ -319,26 +308,39 @@ function removeSignalListener(signalName: NodeJS.Signals, listener: () => void):
 // ============================================================================
 
 const envProxy = new Proxy({} as NodeJS.ProcessEnv, {
-    get(_, key: string): string | undefined {
-        return safeGetEnv(key);
+    get(target, key: string | symbol, receiver: any): any {
+        if (typeof key !== 'string') {
+            return Reflect.get(target, key, receiver);
+        }
+        const value = safeGetEnv(key);
+        if (value !== undefined) return value;
+        return Reflect.get(target, key, receiver);
     },
-    set(_, key: string, value: string): boolean {
+    set(target, key: string | symbol, value: string, receiver: any): boolean {
+        if (typeof key !== 'string') {
+            return Reflect.set(target, key, value, receiver);
+        }
         os.setenv(key, value);
         return true;
     },
-    has(_, key: string): boolean {
-        return safeGetEnv(key) !== undefined;
+    has(target, key: string | symbol): boolean {
+        if (typeof key !== 'string') return Reflect.has(target, key);
+        return safeGetEnv(key) !== undefined || Reflect.has(target, key);
     },
-    deleteProperty(_, key: string): boolean {
+    deleteProperty(target, key: string | symbol): boolean {
+        if (typeof key !== 'string') return Reflect.deleteProperty(target, key);
         os.unsetenv(key);
         return true;
     },
     ownKeys(): string[] {
         return os.envKeys();
     },
-    getOwnPropertyDescriptor(_, key: string): PropertyDescriptor | undefined {
+    getOwnPropertyDescriptor(target, key: string | symbol): PropertyDescriptor | undefined {
+        if (typeof key !== 'string') {
+            return Reflect.getOwnPropertyDescriptor(target, key);
+        }
         const value = safeGetEnv(key);
-        if (value === undefined) return undefined;
+        if (value === undefined) return Reflect.getOwnPropertyDescriptor(target, key);
         return {
             enumerable: true,
             configurable: true,
@@ -412,10 +414,10 @@ export const stdout: NodeJS.WriteStream = stdoutStream as any;
 export const stderr: NodeJS.WriteStream = stderrStream as any;
 export const stdin: NodeJS.ReadStream = stdinStream as any;
 
-const start_idx = (os_args[1] == 'run' || os_args[1] == 'repl') ? 2 : 1;
-export const argv: string[] = [os.exePath, ...os_args.slice(start_idx)];
-export const argv0: string = os_args[0] ?? os.exePath;
-export const execArgv: string[] = [];
+
+export const argv: string[] = [os.exePath, cno_args.entry, ...cno_args.args];
+export const argv0: string = cno_args.binary;
+export const execArgv: string[] = cno_args.internalArgs;
 
 export const pid: number = os.pid;
 export const ppid: number = os.ppid;
@@ -760,8 +762,6 @@ export const traceProcessWarnings: boolean = false;
 // ============================================================================
 // IPC Channel support (for child_process)
 // ============================================================================
-
-import { IPCChannel } from '../ipc_channel';
 
 let _ipcChannel: IPCChannel | null = null;
 

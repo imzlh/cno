@@ -6,6 +6,7 @@
 const wasm = import.meta.use('wasm');
 const os = import.meta.use('os');
 const syncfs = import.meta.use('fs');
+const engine = import.meta.use('engine');
 
 export interface WASIOptions {
     args?: string[];
@@ -56,7 +57,7 @@ export class WASI {
         return new Uint8Array(this._memBuf!, ptr, len);
     }
     private _str(ptr: number, len: number): string {
-        return new TextDecoder().decode(this._bytes(ptr, len));
+        return engine.decodeString(this._bytes(ptr, len));
     }
 
     constructor(options?: WASIOptions) {
@@ -195,7 +196,7 @@ export class WASI {
             const entries = Object.entries(this._env);
             for (let i = 0; i < entries.length; i++) {
                 this._wu32(environPtr + i * 4, offset);
-                const str = new TextEncoder().encode(`${entries[i][0]}=${entries[i][1]}\0`);
+                const str = engine.encodeString(`${entries[i][0]}=${entries[i][1]}\0`);
                 this._bytes(offset, str.length).set(str);
                 offset += str.length;
             }
@@ -212,7 +213,7 @@ export class WASI {
             let offset = argvBufPtr;
             for (let i = 0; i < this._args.length; i++) {
                 this._wu32(argvPtr + i * 4, offset);
-                const str = new TextEncoder().encode(`${this._args[i]}\0`);
+                const str = engine.encodeString(`${this._args[i]}\0`);
                 this._bytes(offset, str.length).set(str);
                 offset += str.length;
             }

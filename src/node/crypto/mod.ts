@@ -581,15 +581,28 @@ export function randomBytes(size: number, callback?: (err: Error | null, buf: Ui
     return new Uint8Array(crypto.randomBytes(size));
 }
 
+export function timingSafeEqual(a: ArrayBufferView | ArrayBuffer, b: ArrayBufferView | ArrayBuffer): boolean {
+    const left = a instanceof ArrayBuffer ? new Uint8Array(a) : new Uint8Array(a.buffer, a.byteOffset, a.byteLength);
+    const right = b instanceof ArrayBuffer ? new Uint8Array(b) : new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
+    if (left.byteLength !== right.byteLength) {
+        throw new RangeError('Input buffers must have the same byte length');
+    }
+
+    let diff = 0;
+    for (let i = 0; i < left.byteLength; i++) {
+        diff |= left[i]! ^ right[i]!;
+    }
+    return diff === 0;
+}
+
 // Web Crypto API compat (Node.js 17+)
 export function getRandomValues<T extends ArrayBufferView>(array: T): T {
     const bytes = crypto.randomBytes(array.byteLength);
-    // @ts-ignore - arraybufferview
-    new Uint8Array(array.buffer, array.byteOffset, array.byteLength).set(bytes);
+    new Uint8Array(array.buffer, array.byteOffset, array.byteLength).set(new Uint8Array(bytes));
     return array;
 }
 // Re-export random/kdf/hkdf from random.ts
-export { randomInt, randomFill, pbkdf2, pbkdf2Sync, pbkdf2Sha256, pbkdf2Sha512, hkdf, hkdfSync, hkdfSha256, hkdfSha512 } from './random';
+export { randomInt, randomFill, randomFillSync, pbkdf2, pbkdf2Sync, pbkdf2Sha256, pbkdf2Sha512, hkdf, hkdfSync, hkdfSha256, hkdfSha512 } from './random';
 
 // ============================================================================
 // RSA
@@ -968,9 +981,37 @@ export const constants = {
 };
 
 // ============================================================================
+// Algorithm enumeration (feature-detection probes)
+// ============================================================================
+
+// Only algorithms actually backed by the native crypto module are listed, so
+// getHashes()/getCiphers() reflect what createHash/createCipheriv can build.
+export function getHashes(): string[] {
+    return ['md5', 'sha1', 'sha224', 'sha256', 'sha384', 'sha512', 'sha3-224', 'sha3-256', 'sha3-384', 'sha3-512'];
+}
+
+export function getCiphers(): string[] {
+    return ['aes-128-cbc', 'aes-192-cbc', 'aes-256-cbc', 'aes-128-gcm', 'aes-192-gcm', 'aes-256-gcm'];
+}
+
+// ============================================================================
 // UUID
 // ============================================================================
 
 export function randomUUID(): string {
-    return crypto.randomUUID() as unknown as string;
+    // Node's crypto.randomUUID() is synchronous and returns a string. The native
+    // crypto.randomUUID() returns a Promise, so building the v4 UUID directly from
+    // random bytes avoids handing callers "[object Promise]" as an id.
+    const b = new Uint8Array(crypto.randomBytes(16));
+    b[6] = (b[6]! & 0x0f) | 0x40; // version 4
+    b[8] = (b[8]! & 0x3f) | 0x80; // variant 10xx (RFC 4122)
+    const h: string[] = [];
+    for (let i = 0; i < 16; i++) h.push(b[i]!.toString(16).padStart(2, '0'));
+    return (
+        h.slice(0, 4).join('') + '-' +
+        h.slice(4, 6).join('') + '-' +
+        h.slice(6, 8).join('') + '-' +
+        h.slice(8, 10).join('') + '-' +
+        h.slice(10, 16).join('')
+    );
 }
