@@ -44,9 +44,7 @@ function encode(s: string): Uint8Array {
     return engine.encodeString(s);
 }
 
-// ============================================================================
 // Low-level: event-driven parser
-// ============================================================================
 
 class LLHttpParser implements CNO.HttpParser {
     #parser: CModuleHTTP.Parser;
@@ -115,9 +113,7 @@ function createResponseParser(events: CNO.HttpParserEvents): CNO.HttpParser {
     return new LLHttpParser(http.RESPONSE, events);
 }
 
-// ============================================================================
 // High-level: StreamingHttpParser
-// ============================================================================
 
 class StreamingParser implements CNO.StreamingHttpParser {
     #parser: CModuleHTTP.Parser;
@@ -283,9 +279,7 @@ function createResponseStreamParser(onMessage: (msg: CNO.HttpResponseMessage) =>
     return new StreamingParser(http.RESPONSE, onMessage, onError);
 }
 
-// ============================================================================
 // One-shot parse
-// ============================================================================
 
 function parseRequest(data: Uint8Array | ArrayBuffer): CNO.HttpRequestMessage {
     const buf = data instanceof ArrayBuffer ? new Uint8Array(data) : data;
@@ -364,9 +358,7 @@ function parseResponse(data: Uint8Array | ArrayBuffer): CNO.HttpResponseMessage 
     return { statusCode, statusText, httpVersion: `${httpMajor}.${httpMinor}`, headers, body, keepAlive };
 }
 
-// ============================================================================
 // Format: structured data → raw HTTP bytes
-// ============================================================================
 
 function formatRequestHead(method: CNO.HttpMethod, url: string, headers: Headers, options?: CNO.HttpFormatOptions): Uint8Array {
     const ver = options?.httpVersion ?? '1.1';
@@ -418,9 +410,7 @@ function formatResponse(statusCode: number, statusText: string, headers: Headers
     return bodyBytes ? concat(head, bodyBytes) : head;
 }
 
-// ============================================================================
 // Web API interop
-// ============================================================================
 
 function toWebRequest(msg: CNO.HttpRequestMessage, base?: string | URL): Request {
     const url = base ? new URL(msg.url, base).toString() : msg.url;
@@ -462,9 +452,7 @@ async function fromWebResponse(res: Response): Promise<CNO.HttpResponseMessage> 
     };
 }
 
-// ============================================================================
 // Export to CNO namespace
-// ============================================================================
 
 Reflect.set(CNO, 'llhttp', {
     createRequestParser,

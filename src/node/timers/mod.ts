@@ -6,18 +6,14 @@
 
 const timer = import.meta.use('timers');
 
-// ============================================================================
 // TimerOptions
-// ============================================================================
 
 export interface TimerOptions {
     ref?: boolean;
     signal?: AbortSignal;
 }
 
-// ============================================================================
 // Timeout wrapper
-// ============================================================================
 
 class Timeout implements NodeJS.Timeout {
     #id: any;
@@ -87,9 +83,7 @@ class Timeout implements NodeJS.Timeout {
     }
 }
 
-// ============================================================================
 // Immediate wrapper
-// ============================================================================
 
 class Immediate implements NodeJS.Immediate {
     #canceled = false;
@@ -127,9 +121,7 @@ class Immediate implements NodeJS.Immediate {
     }
 }
 
-// ============================================================================
 // Timer functions
-// ============================================================================
 
 export function setTimeout<T>(callback: (...args: T[]) => void, ms?: number, ...args: T[]): NodeJS.Timeout {
     const delay = ms ?? 1;
@@ -167,9 +159,7 @@ export function clearImmediate(immediate: NodeJS.Immediate | undefined): void {
     if (immediate) immediate[Symbol.dispose]();
 }
 
-// ============================================================================
 // promises namespace
-// ============================================================================
 
 export const promises = {
     setTimeout<T = void>(delay?: number, value?: T, options?: TimerOptions): Promise<T> {

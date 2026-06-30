@@ -21,7 +21,7 @@ export {
 } from './client';
 
 import { STATUS_CODES, METHODS } from './server';
-import { createServer, ServerImpl, IncomingMessageImpl, ServerResponseImpl, OutgoingMessageImpl } from './server';
+import { createServer, ServerImpl, IncomingMessageImpl, ServerResponseImpl, OutgoingMessageImpl, validateHeaderName, validateHeaderValue } from './server';
 import { Agent, globalAgent, request, get, ClientRequestImpl } from './client';
 
 export default {
@@ -37,4 +37,6 @@ export default {
     createServer,
     request,
     get,
+    validateHeaderName,
+    validateHeaderValue,
 };

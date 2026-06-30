@@ -5,9 +5,7 @@
 const crypto = import.meta.use('crypto');
 import { toBuffer } from './helpers';
 
-// ============================================================================
 // randomInt / randomFill
-// ============================================================================
 
 export function randomInt(max: number): number;
 export function randomInt(min: number, max: number): number;
@@ -80,9 +78,7 @@ export function randomFillSync<T extends ArrayBufferView>(buffer: T, offset = 0,
     return buffer;
 }
 
-// ============================================================================
 // pbkdf2
-// ============================================================================
 
 export function pbkdf2(password: ArrayBuffer | Uint8Array | string, salt: ArrayBuffer | Uint8Array | string, iterations: number, keylen: number, digest: string, callback: (err: Error | null, derivedKey: Uint8Array) => void): void {
     try {
@@ -144,9 +140,7 @@ export function pbkdf2Sha512(
     return crypto.pbkdf2Sha512(toBuffer(password), toBuffer(salt), iterations, keylen);
 }
 
-// ============================================================================
 // hkdf
-// ============================================================================
 
 export function hkdf(digest: string, ikm: ArrayBuffer | Uint8Array, salt: ArrayBuffer | Uint8Array, info: ArrayBuffer | Uint8Array, keylen: number): ArrayBuffer {
     const ikmBuf = toBuffer(ikm);

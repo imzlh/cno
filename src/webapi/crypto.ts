@@ -5,9 +5,7 @@
 
 const crypto = import.meta.use('crypto');
 
-// ============================================================================
 // Type Definitions
-// ============================================================================
 
 type BufferSource = ArrayBuffer | ArrayBufferView;
 type HashAlgorithmIdentifier = AlgorithmIdentifier | string;
@@ -115,9 +113,7 @@ interface EcdhKeyDeriveParams extends Algorithm {
     public: CryptoKey;
 }
 
-// ============================================================================
 // Utility Functions
-// ============================================================================
 
 function toArrayBuffer(source: BufferSource): ArrayBuffer {
     if (source instanceof ArrayBuffer) return source;
@@ -168,9 +164,7 @@ function getHashOutputLength(algorithm: HashAlgorithmIdentifier): number {
     return lengths[normalized] || 32;
 }
 
-// ============================================================================
 // CryptoKey Implementation
-// ============================================================================
 
 class CryptoKeyImpl implements CryptoKey {
     constructor(
@@ -186,9 +180,7 @@ class CryptoKeyImpl implements CryptoKey {
     }
 }
 
-// ============================================================================
 // SubtleCrypto Implementation
-// ============================================================================
 
 class SubtleCrypto implements globalThis.SubtleCrypto {
     /**

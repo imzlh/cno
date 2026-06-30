@@ -4,6 +4,8 @@ export * as promises from './promises';
 import { Stream } from './mod';
 import * as stream from './mod';
 import * as streamPromises from './promises';
+import * as streamWeb from './web';
+import * as streamConsumers from './consumers';
 
 type StreamPipelineArgs =
     | [...streams: any[], callback: (error?: Error | null) => void]
@@ -41,8 +43,13 @@ export function finished(streamInstance: any, options?: any, callback?: (error?:
     return streamInstance;
 }
 
+export const web = streamWeb;
+export const consumers = streamConsumers;
+
 export default Object.assign(Stream, stream, {
     pipeline,
     finished,
     promises: streamPromises,
+    web: streamWeb,
+    consumers: streamConsumers,
 });

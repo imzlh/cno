@@ -7,9 +7,7 @@ import type { EventEmitter as IEventEmitter } from 'node:events';
 
 const console = import.meta.use('console');
 
-// ============================================================================
 // Type definitions
-// ============================================================================
 
 type EventMap<T> = Record<keyof T, any[]>;
 type Listener<T extends EventMap<T>, E extends string | symbol> = (...args: any[]) => void;
@@ -28,9 +26,7 @@ export interface EventEmitterAsyncResourceOptions extends EventEmitterOptions {
     requireManualDestroy?: boolean;
 }
 
-// ============================================================================
 // EventEmitter class
-// ============================================================================
 
 export class EventEmitter<T extends EventMap<T> = any> implements IEventEmitter<T> {
     private _events: Map<string | symbol, Array<{ listener: Function; once: boolean }>> = new Map();
@@ -362,9 +358,7 @@ export class EventEmitter<T extends EventMap<T> = any> implements IEventEmitter<
     }
 }
 
-// ============================================================================
 // EventEmitterAsyncResource
-// ============================================================================
 
 export class EventEmitterAsyncResource extends EventEmitter {
     constructor(options?: EventEmitterAsyncResourceOptions) {
@@ -376,9 +370,7 @@ export class EventEmitterAsyncResource extends EventEmitter {
     }
 }
 
-// ============================================================================
 // Helper functions
-// ============================================================================
 
 export function getEventListeners(emitter: EventEmitter | EventTarget, name: string | symbol): Function[] {
     return EventEmitter.getEventListeners(emitter, name);
@@ -394,4 +386,9 @@ export function on(emitter: EventEmitter, eventName: string, options?: StaticEve
 
 export function setMaxListeners(n: number, ...eventTargets: Array<EventEmitter | EventTarget>): void {
     EventEmitter.setMaxListeners(n, ...eventTargets);
+}
+
+export function addAbortListener(signal: AbortSignal, listener: () => void): { remove(): void } {
+    signal.addEventListener('abort', listener, { once: true });
+    return { remove: () => signal.removeEventListener('abort', listener) };
 }

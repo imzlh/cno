@@ -9,9 +9,7 @@ import { toErrnoException } from '../_internal/errno';
 import { typeMap, expandIPv6, shapeAnswers, reverseName } from './_internal';
 import * as promises from './promises';
 
-// ============================================================================
 // Constants
-// ============================================================================
 
 export const NODATA = 'ENODATA';
 export const FORMERR = 'EFORMERR';
@@ -38,9 +36,7 @@ export const LOADIPHLPAPI = 'ELOADIPHLPAPI';
 export const ADDRGETNETWORKPARAMS = 'EADDRGETNETWORKPARAMS';
 export const CANCELLED = 'ECANCELLED';
 
-// ============================================================================
 // Resolution options
-// ============================================================================
 
 export interface ResolveOptions {
     ttl?: boolean;
@@ -61,9 +57,7 @@ export interface LookupAllOptions extends LookupOptions {
     all: true;
 }
 
-// ============================================================================
 // Resolution record types
-// ============================================================================
 
 export interface MxRecord {
     priority: number;
@@ -105,9 +99,7 @@ export interface AnyRecord {
     value: string;
 }
 
-// ============================================================================
 // lookup - basic name resolution
-// ============================================================================
 
 export function lookup(hostname: string, callback: (err: NodeJS.ErrnoException | null, address: string, family: number) => void): void;
 export function lookup(hostname: string, options: LookupOneOptions, callback: (err: NodeJS.ErrnoException | null, address: string, family: number) => void): void;
@@ -157,9 +149,7 @@ export function lookupSync(hostname: string, options?: LookupOptions): string | 
     return addresses[0]?.ip ?? '';
 }
 
-// ============================================================================
 // resolve - resolve specific record types
-// ============================================================================
 
 export function resolve(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
 export function resolve(hostname: string, rrtype: 'A', callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
@@ -194,9 +184,7 @@ export function resolve(hostname: string, rrtype?: any, callback?: any): void {
     );
 }
 
-// ============================================================================
 // resolve4 / resolve6
-// ============================================================================
 
 export function resolve4(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
 export function resolve4(hostname: string, options: { ttl: true }, callback: (err: NodeJS.ErrnoException | null, addresses: Array<{ address: string; ttl: number }>) => void): void;
@@ -238,9 +226,7 @@ export function resolve6(hostname: string, options?: any, callback?: any): void 
     );
 }
 
-// ============================================================================
 // resolveCname / resolveMx / resolveNs / resolveTxt / resolveSrv / resolvePtr / resolveSoa
-// ============================================================================
 
 export function resolveCname(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void {
     resolve(hostname, 'CNAME', callback);
@@ -277,17 +263,13 @@ export function resolveNaptr(hostname: string, callback: (err: NodeJS.ErrnoExcep
     resolve(hostname, 'NAPTR', callback);
 }
 
-// ============================================================================
 // reverse
-// ============================================================================
 
 export function reverse(ip: string, callback: (err: NodeJS.ErrnoException | null, hostnames: string[]) => void): void {
     resolve(reverseName(ip), 'PTR', callback);
 }
 
-// ============================================================================
 // setServers / getServers
-// ============================================================================
 
 let _dnsServers: string[] = [];
 
@@ -305,8 +287,6 @@ export function setDefaultResultOrder(order: 'ipv4first' | 'verbatim'): void {
     _defaultResultOrder = order;
 }
 
-// ============================================================================
 // promises API
-// ============================================================================
 
 export { promises };

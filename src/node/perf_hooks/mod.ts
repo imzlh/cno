@@ -54,6 +54,7 @@ export class PerformanceNodeTiming {
 }
 
 export const performance = {
+    timeOrigin: globalThis.performance?.timeOrigin ?? Date.now(),
     now,
     mark(name: string): void { globalThis.performance?.mark?.(name); },
     measure(name: string, startMark: string, endMark?: string): void {
@@ -70,3 +71,70 @@ export const performance = {
     },
     timerify<T extends (...args: any[]) => any>(fn: T): T { return fn; },
 };
+
+export interface IntervalHistogram {
+    readonly min: number;
+    readonly max: number;
+    readonly mean: number;
+    readonly stddev: number;
+    readonly percentiles: Map<number, number>;
+    readonly exceeds: number;
+    enable(): boolean;
+    disable(): boolean;
+    reset(): void;
+    percentile(percentile: number): number;
+}
+
+export function monitorEventLoopDelay(options?: { resolution?: number }): IntervalHistogram {
+    const resolution = options?.resolution ?? 10;
+    let enabled = false;
+    let _timer: any;
+    const samples: number[] = [];
+    let _lastTime = performance.now();
+
+    const hist: IntervalHistogram = {
+        get min() { return samples.length ? Math.min(...samples) : 0; },
+        get max() { return samples.length ? Math.max(...samples) : 0; },
+        get mean() { return samples.length ? samples.reduce((a, b) => a + b, 0) / samples.length : 0; },
+        get stddev() {
+            if (!samples.length) return 0;
+            const m = hist.mean;
+            return Math.sqrt(samples.reduce((a, b) => a + (b - m) ** 2, 0) / samples.length);
+        },
+        get percentiles() {
+            const sorted = [...samples].sort((a, b) => a - b);
+            const m = new Map<number, number>();
+            for (const p of [50, 75, 90, 95, 99, 99.9]) {
+                const idx = Math.ceil(p / 100 * sorted.length) - 1;
+                m.set(p, sorted[Math.max(0, idx)] ?? 0);
+            }
+            return m;
+        },
+        get exceeds() { return 0; },
+        percentile(p: number) {
+            const sorted = [...samples].sort((a, b) => a - b);
+            const idx = Math.ceil(p / 100 * sorted.length) - 1;
+            return sorted[Math.max(0, idx)] ?? 0;
+        },
+        enable() {
+            if (enabled) return false;
+            enabled = true;
+            _lastTime = performance.now();
+            _timer = setInterval(() => {
+                const now = performance.now();
+                samples.push(now - _lastTime - resolution);
+                if (samples.length > 1000) samples.shift();
+                _lastTime = now;
+            }, resolution);
+            return true;
+        },
+        disable() {
+            if (!enabled) return false;
+            enabled = false;
+            clearInterval(_timer);
+            return true;
+        },
+        reset() { samples.length = 0; },
+    };
+    return hist;
+}

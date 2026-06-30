@@ -1,7 +1,8 @@
-// Stub for node:http2 — delegates to HTTPS with allowHTTP1: true
-// Only covers what Vite needs: createSecureServer + constants
+// node:http2 — redirects to h1. createSecureServer → https, createServer → http.
 
-import { createServer, type Server, type HttpsServerOptions } from '../https';
+import { createServer as createHttpsServer, type Server, type HttpsServerOptions } from '../https';
+import { createServer as createHttpServer } from '../http';
+import { EventEmitter } from '../events';
 
 export const constants = {
     NGHTTP2_NO_ERROR: 0,
@@ -19,7 +20,6 @@ export const constants = {
     NGHTTP2_INADEQUATE_SECURITY: 12,
     NGHTTP2_HTTP_1_1_REQUIRED: 13,
 
-    // Settings
     NGHTTP2_SETTINGS_HEADER_TABLE_SIZE: 1,
     NGHTTP2_SETTINGS_ENABLE_PUSH: 2,
     NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS: 4,
@@ -27,7 +27,6 @@ export const constants = {
     NGHTTP2_SETTINGS_MAX_FRAME_SIZE: 6,
     NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE: 7,
 
-    // Flags
     NGHTTP2_FLAG_NONE: 0,
     NGHTTP2_FLAG_END_STREAM: 1,
     NGHTTP2_FLAG_END_HEADERS: 4,
@@ -49,10 +48,6 @@ export interface Http2SecureServerOptions {
     [key: string]: any;
 }
 
-/**
- * Stub: creates an HTTPS server (h1 + TLS). When allowHTTP1 is true (Vite's
- * default), plain HTTP/1.1 over TLS is sufficient for the dev server.
- */
 export function createSecureServer(
     options: Http2SecureServerOptions,
     requestListener?: (...args: any[]) => void,
@@ -64,9 +59,41 @@ export function createSecureServer(
         passphrase: options.passphrase,
         pfx: options.pfx as any,
     };
-    return createServer(httpsOpts, requestListener as any) as any;
+    return createHttpsServer(httpsOpts, requestListener as any) as any;
 }
 
-// Re-export types that consumers might reference
+export function createServer(
+    optionsOrListener?: Record<string, any> | ((...args: any[]) => void),
+    requestListener?: (...args: any[]) => void,
+): Server {
+    if (typeof optionsOrListener === 'function') {
+        return createHttpServer({}, optionsOrListener as any) as any;
+    }
+    return createHttpServer(optionsOrListener ?? {}, requestListener as any) as any;
+}
+
+export function connect(
+    _authority: string | URL,
+    _options?: Record<string, any>,
+    listener?: (...args: any[]) => void,
+): any {
+    const session = new EventEmitter();
+    Object.assign(session, {
+        request() { throw new Error('HTTP/2 client sessions are not supported'); },
+        close(cb?: () => void) { cb?.(); },
+        destroy() {},
+        socket: null,
+        alpnProtocol: 'h2',
+        encrypted: false,
+        remoteSettings: {},
+        localSettings: {},
+        pendingSettingsAck: false,
+        type: 2,
+    });
+    if (listener) session.once('connect', listener);
+    queueMicrotask(() => session.emit('connect', session, session));
+    return session;
+}
+
 export type Http2Server = Server;
 export type Http2SecureServer = Server;

@@ -90,9 +90,7 @@ async function getSystemCa(): Promise<string | null> {
     _sysCaCache = null; return null;
 }
 
-// ============================================================================
 // HTTPS Server
-// ============================================================================
 
 export interface HttpsServerOptions extends TlsServerOptions {
     allowHalfOpen?: boolean;
@@ -297,9 +295,7 @@ export function createServer(optionsOrListener?: HttpsServerOptions | ((req: Inc
     return new Server(optionsOrListener as any, requestListener);
 }
 
-// ============================================================================
 // HTTPS Agent
-// ============================================================================
 
 export class Agent extends HttpAgent {
     defaultPort: number = 443;
@@ -339,9 +335,7 @@ export class Agent extends HttpAgent {
 
 export const globalAgent = new Agent();
 
-// ============================================================================
 // HTTPS Client Request
-// ============================================================================
 
 export interface RequestOptions extends ClientRequestArgs {
     ca?: string | string[] | Buffer | Buffer[];
@@ -658,9 +652,7 @@ export function get(options: RequestOptions | string | URL, callback?: (res: Inc
     return req;
 }
 
-// ============================================================================
 // Re-exports from tls
-// ============================================================================
 
 export {
     TLSSocket,
@@ -670,9 +662,7 @@ export {
     getCiphers,
 };
 
-// ============================================================================
 // Default export
-// ============================================================================
 
 export default {
     Agent,

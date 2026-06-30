@@ -5,9 +5,7 @@
 
 const zlib = import.meta.use('zlib');
 
-// ============================================================================
 // Constant exports
-// ============================================================================
 
 // Compression Levels
 export const NO_COMPRESSION = zlib.NO_COMPRESSION;
@@ -30,9 +28,7 @@ export const FULL_FLUSH = zlib.FULL_FLUSH;
 export const FINISH = zlib.FINISH;
 export const BLOCK = zlib.BLOCK;
 
-// ============================================================================
 // Type definitions
-// ============================================================================
 
 export interface ZlibOptions {
     flush?: number;
@@ -57,17 +53,13 @@ export interface BrotliOptions {
 
 export type CompressCallback = (err: Error | null, result?: Uint8Array) => void;
 
-// ============================================================================
 // Internal helper functions
-// ============================================================================
 
 function toUint8Array(data: ArrayBuffer | Uint8Array): Uint8Array {
     return data instanceof ArrayBuffer ? new Uint8Array(data) : data;
 }
 
-// ============================================================================
 // Sync compress/decompress
-// ============================================================================
 
 export function deflateSync(buffer: ArrayBuffer | Uint8Array, options?: ZlibOptions): Uint8Array {
     const level = options?.level ?? zlib.DEFAULT_COMPRESSION;
@@ -110,9 +102,7 @@ export function unzipSync(buffer: ArrayBuffer | Uint8Array, options?: ZlibOption
     return new Uint8Array(zlib.inflate(buffer));
 }
 
-// ============================================================================
 // Async compress/decompress (callback style)
-// ============================================================================
 
 type SyncFn = (buf: ArrayBuffer | Uint8Array, opts?: ZlibOptions) => Uint8Array;
 
@@ -135,9 +125,7 @@ export const inflateRaw = wrapCallback(inflateRawSync);
 export const gunzip = wrapCallback(gunzipSync);
 export const unzip = wrapCallback(unzipSync);
 
-// ============================================================================
 // Stream compress/decompress
-// ============================================================================
 
 import { Transform, TransformOptions } from '../stream';
 
@@ -208,9 +196,7 @@ export class Unzip extends Transform {
     _flush(cb: any) { _doFlush(this._handle, cb); }
 }
 
-// ============================================================================
 // Factory functions
-// ============================================================================
 
 function _create(Cls: any) { return (options?: ZlibOptions) => new Cls(options); }
 
@@ -222,9 +208,7 @@ export const createDeflateRaw = _create(DeflateRaw);
 export const createInflateRaw = _create(InflateRaw);
 export const createUnzip = _create(Unzip);
 
-// ============================================================================
 // Checksum
-// ============================================================================
 
 export function crc32(data: ArrayBuffer | Uint8Array, value?: number): number {
     return zlib.crc32(data, value);
@@ -234,9 +218,49 @@ export function adler32(data: ArrayBuffer | Uint8Array, value?: number): number 
     return zlib.adler32(data, value);
 }
 
-// ============================================================================
+// Brotli — use native if available, otherwise error
+
+function brotliCompressImpl(buffer: ArrayBuffer | Uint8Array): Uint8Array {
+    if (typeof (zlib as any).brotliCompress === 'function') {
+        return new Uint8Array((zlib as any).brotliCompress(buffer));
+    }
+    throw new Error('Brotli compression is not supported in this environment');
+}
+
+function brotliDecompressImpl(buffer: ArrayBuffer | Uint8Array): Uint8Array {
+    if (typeof (zlib as any).brotliDecompress === 'function') {
+        return new Uint8Array((zlib as any).brotliDecompress(buffer));
+    }
+    throw new Error('Brotli decompression is not supported in this environment');
+}
+
+export function brotliCompressSync(buffer: ArrayBuffer | Uint8Array, _options?: BrotliOptions): Uint8Array {
+    return brotliCompressImpl(buffer);
+}
+
+export function brotliDecompressSync(buffer: ArrayBuffer | Uint8Array, _options?: BrotliOptions): Uint8Array {
+    return brotliDecompressImpl(buffer);
+}
+
+export const brotliCompress = wrapCallback(brotliCompressSync as SyncFn);
+export const brotliDecompress = wrapCallback(brotliDecompressSync as SyncFn);
+
+export class BrotliCompress extends Transform {
+    _transform(chunk: any, _e: BufferEncoding, cb: any) {
+        try { cb(null, brotliCompressImpl(toUint8Array(chunk))); } catch (err) { cb(err); }
+    }
+}
+
+export class BrotliDecompress extends Transform {
+    _transform(chunk: any, _e: BufferEncoding, cb: any) {
+        try { cb(null, brotliDecompressImpl(toUint8Array(chunk))); } catch (err) { cb(err); }
+    }
+}
+
+export const createBrotliCompress = _create(BrotliCompress);
+export const createBrotliDecompress = _create(BrotliDecompress);
+
 // Constants
-// ============================================================================
 
 export const constants = {
     Z_NO_FLUSH: zlib.NO_FLUSH,

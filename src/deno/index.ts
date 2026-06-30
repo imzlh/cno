@@ -84,7 +84,7 @@ const snapCounters = new Map<string, number>();
 
 const updateSnapshots =
     (globalThis as any).__cts_update_snapshots === true ||
-    (typeof os.getenv === 'function' && os.getenv('DENO_SNAPSHOT_UPDATE') === '1');
+    safeGetEnv('DENO_SNAPSHOT_UPDATE') === '1';
 
 async function assertSnapshotImpl<T>(
     actual: T,

@@ -96,9 +96,7 @@ export class MessageDecoder extends EventEmitter {
     }
 }
 
-// ============================================================================
 // IPCChannel: wraps a bidirectional pipe with Node-compatible JSON framing.
-// ============================================================================
 
 type Pipe = CModuleStreams.Pipe;
 

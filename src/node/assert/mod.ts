@@ -607,23 +607,43 @@ export class CallTracker {
 
 // Mount all assertion methods on the assert function itself
 // so `const a = require('assert'); a.ok(true)` works (Node.js compat).
-(assert as any).ok = ok;
-(assert as any).fail = fail;
-(assert as any).equal = equal;
-(assert as any).notEqual = notEqual;
-(assert as any).strictEqual = strictEqual;
-(assert as any).notStrictEqual = notStrictEqual;
-(assert as any).deepEqual = deepEqual;
-(assert as any).notDeepEqual = notDeepEqual;
-(assert as any).deepStrictEqual = deepStrictEqual;
-(assert as any).notDeepStrictEqual = notDeepStrictEqual;
-(assert as any).throws = throws;
-(assert as any).doesNotThrow = doesNotThrow;
-(assert as any).rejects = rejects;
-(assert as any).doesNotReject = doesNotReject;
-(assert as any).match = match;
-(assert as any).doesNotMatch = doesNotMatch;
-(assert as any).ifError = ifError;
-(assert as any).AssertionError = AssertionError;
-(assert as any).CallTracker = CallTracker;
-(assert as any).partialDeepStrictEqual = partialDeepStrictEqual;
+assert.ok = ok;
+assert.fail = fail;
+assert.equal = equal;
+assert.notEqual = notEqual;
+assert.strictEqual = strictEqual;
+assert.notStrictEqual = notStrictEqual;
+assert.deepEqual = deepEqual;
+assert.notDeepEqual = notDeepEqual;
+assert.deepStrictEqual = deepStrictEqual;
+assert.notDeepStrictEqual = notDeepStrictEqual;
+assert.throws = throws;
+assert.doesNotThrow = doesNotThrow;
+assert.rejects = rejects;
+assert.doesNotReject = doesNotReject;
+assert.match = match;
+assert.doesNotMatch = doesNotMatch;
+assert.ifError = ifError;
+assert.AssertionError = AssertionError;
+assert.CallTracker = CallTracker;
+assert.partialDeepStrictEqual = partialDeepStrictEqual;
+
+// assert.strict — strict mode sub-namespace where equal/notEqual/deepEqual/notDeepEqual
+// use their strict counterparts. Created as a separate object so assert.equal
+// (loose equality) is unaffected.
+function strictAssert(condition: any, message?: string | Error): asserts condition {
+    if(false === condition)
+        throw message instanceof Error ? message : new Error(String(message));
+}
+export const strict: any = Object.assign(strictAssert, {
+    ok, fail,
+    equal: strictEqual, notEqual: notStrictEqual,
+    strictEqual, notStrictEqual,
+    deepEqual: deepStrictEqual, notDeepEqual: notDeepStrictEqual,
+    deepStrictEqual, notDeepStrictEqual,
+    throws, doesNotThrow, rejects, doesNotReject,
+    match, doesNotMatch, ifError,
+    AssertionError, CallTracker, partialDeepStrictEqual,
+});
+strict.strict = strict;
+assert.strict = strict;

@@ -34,9 +34,7 @@ export interface PipeOptions {
     end?: boolean;
 }
 
-// ============================================================================
 // Stream base class
-// ============================================================================
 
 export class Stream extends EventEmitter {
     destroyed: boolean = false;
@@ -115,9 +113,7 @@ export class Stream extends EventEmitter {
     }
 }
 
-// ============================================================================
 // Readable
-// ============================================================================
 
 export class Readable extends Stream {
     readable: boolean = true;
@@ -417,9 +413,7 @@ export class Readable extends Stream {
     }
 }
 
-// ============================================================================
 // Writable
-// ============================================================================
 
 export class Writable extends Stream {
     writable: boolean = true;
@@ -626,9 +620,7 @@ export class Writable extends Stream {
     }
 }
 
-// ============================================================================
 // Duplex
-// ============================================================================
 
 export class Duplex extends Writable {
     readable: boolean;
@@ -881,9 +873,7 @@ export class Duplex extends Writable {
     }
 }
 
-// ============================================================================
 // Transform
-// ============================================================================
 
 export class Transform extends Duplex {
     constructor(options?: TransformOptions) {
@@ -924,9 +914,7 @@ export class Transform extends Duplex {
     }
 }
 
-// ============================================================================
 // PassThrough
-// ============================================================================
 
 export class PassThrough extends Transform {
     constructor(options?: TransformOptions) {
@@ -938,9 +926,41 @@ export class PassThrough extends Transform {
     }
 }
 
-// ============================================================================
+// Stream static utilities (Node v18.1+)
+
+export function isDisturbed(stream: any): boolean {
+    if (stream instanceof Readable) return stream.readableEnded || stream.readableAborted || stream.destroyed;
+    if (stream instanceof Writable) return stream.writableEnded || stream.writableFinished || stream.destroyed;
+    return !!(stream && stream.destroyed);
+}
+
+export function isErrored(stream: any): boolean {
+    if (!stream) return false;
+    if (stream instanceof Readable) return !stream.readable;
+    if (stream instanceof Writable) return !stream.writable;
+    return false;
+}
+
+export function isReadable(stream: any): boolean {
+    if (stream instanceof Readable) return stream.readable && !stream.readableEnded;
+    return false;
+}
+
+export function compose(...streams: any[]): any {
+    if (streams.length < 2) throw new TypeError('compose requires at least two streams');
+    let pipelineFn: any;
+    for (let i = 0; i < streams.length - 1; i++) {
+        const src = streams[i];
+        const dst = streams[i + 1];
+        src.pipe(dst);
+        src.on('error', (err: Error) => {
+            if (!dst.destroyed) dst.destroy(err);
+        });
+    }
+    return streams[streams.length - 1];
+}
+
 // Factory functions
-// ============================================================================
 
 export function ReadableFrom(iterable: Iterable<any> | AsyncIterable<any>, options?: ReadableOptions): Readable {
     return Readable.from(iterable, options);

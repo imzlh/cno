@@ -3,12 +3,11 @@
  * Provides current Node.js process information and control
  */
 
-import type { Stream as StdioStream } from '../../deno/04_stdio';
 import type { Args } from '../../utils/args';
-import { getTierLimits } from '../_internal/memory';
 import { EventEmitter } from '../events';
 import { IPCChannel } from '../ipc_channel';
-import { Readable, Writable } from '../stream';
+import { stdout, stderr, stdin } from './streams';
+import { hrtime, memoryUsage, cpuUsage, resourceUsage } from './metrics';
 
 const os = import.meta.use('os');
 const engine = import.meta.use('engine');
@@ -17,15 +16,14 @@ const proc = import.meta.use('process');
 const streams = import.meta.use('streams');
 const console = import.meta.use('console');
 
-const { streamHighWaterMark: PROCESS_READ_STREAM_HWM } = getTierLimits();
-
 // @ts-ignore - ns
 const cno_args = os.__cno_args.get() as Args;
-const { stdin: denoStdin, stdout: denoStdout, stderr: denoStderr } = streams as any as Record<string, StdioStream>;
 
-// ============================================================================
+// Re-export streams and metrics under their original names
+export { stdout, stderr, stdin };
+export { hrtime, memoryUsage, cpuUsage, resourceUsage };
+
 // Helper functions
-// ============================================================================
 
 function safeGetEnv(env: string): string | undefined {
     try {
@@ -35,226 +33,7 @@ function safeGetEnv(env: string): string | undefined {
     }
 }
 
-// ============================================================================
-// Standard streams - reuse deno/04_stdio shared singleton
-// ============================================================================
-
-class ProcessWriteStream extends Writable {
-    #stdio: StdioStream;
-
-    constructor(stdio: StdioStream) {
-        super({
-            write: (chunk: any, encoding: string, callback: (error?: Error | null) => void) => {
-                const data = typeof chunk === 'string' ? engine.encodeString(chunk) : chunk;
-                stdio.write(data).then(() => callback(), callback);
-            },
-            final: (callback: (error?: Error | null) => void) => {
-                callback();
-            },
-        });
-        this.#stdio = stdio;
-    }
-
-    get fd(): number { return this.#stdio.fd; }
-
-    get isTTY(): boolean { return this.#stdio.isTTY; }
-
-    get columns(): number | undefined {
-        if (!this.#stdio.isTTY) return undefined;
-        try { return this.#stdio.size.width; } catch { return undefined; }
-    }
-
-    get rows(): number | undefined {
-        if (!this.#stdio.isTTY) return undefined;
-        try { return this.#stdio.size.height; } catch { return undefined; }
-    }
-
-    getColorDepth(env?: Record<string, string>): number {
-        if (!this.isTTY) return 1;
-        const forceColor = (env ?? process.env)['FORCE_COLOR'];
-        if (forceColor === '0') return 1;
-        if (forceColor === '1' || forceColor === '') return 4;
-        if (forceColor === '2') return 8;
-        if (forceColor === '3') return 24;
-        const term = (env ?? process.env)['TERM'] ?? '';
-        if (term === 'dumb') return 1;
-        if (/screen|^xterm|^vt100|^vt220|^rxvt|color|ansi|cygwin|linux/i.test(term)) return 16;
-        if (/^tmux([0-9]+)?$/i.test(term)) return 16;
-        return 4;
-    }
-
-    hasColors(depth?: number, env?: Record<string, string>): boolean {
-        if (depth === undefined) return this.isTTY;
-        return this.getColorDepth(env) >= depth;
-    }
-
-    writeSync(data: Uint8Array | string): number {
-        const d = typeof data === 'string' ? engine.encodeString(data) : data;
-        return this.#stdio.writeSync(d);
-    }
-
-    clearLine(dir: number, callback?: () => void): boolean {
-        const codes = dir === -1 ? '\x1b[1K' : dir === 1 ? '\x1b[0K' : '\x1b[2K';
-        this.write(codes, () => callback?.());
-        return true;
-    }
-
-    cursorTo(x: number, y?: number, callback?: () => void): boolean {
-        const code = y !== undefined ? `\x1b[${y + 1};${x + 1}H` : `\x1b[${x + 1}G`;
-        this.write(code, () => callback?.());
-        return true;
-    }
-
-    moveCursor(dx: number, dy: number, callback?: () => void): boolean {
-        let code = '';
-        if (dx > 0) code += `\x1b[${dx}C`;
-        else if (dx < 0) code += `\x1b[${-dx}D`;
-        if (dy > 0) code += `\x1b[${dy}B`;
-        else if (dy < 0) code += `\x1b[${-dy}A`;
-        this.write(code, () => callback?.());
-        return true;
-    }
-
-    getWindowSize(): [number, number] {
-        return [this.columns ?? 80, this.rows ?? 24];
-    }
-}
-
-class ProcessReadStream extends Readable {
-    #stdio: StdioStream;
-    #isRaw: boolean = false;
-
-    constructor(stdio: StdioStream) {
-        super({ highWaterMark: PROCESS_READ_STREAM_HWM });
-        this.#stdio = stdio;
-        this._read = this.#doRead.bind(this);
-    }
-
-    async #doRead(size: number): Promise<void> {
-        try {
-            const buf = new Uint8Array(size);
-            const n = await this.#stdio.read(buf as Uint8Array<ArrayBuffer>);
-            if (n === null) {
-                this.push(null);
-            } else {
-                this.push(buf.subarray(0, n));
-            }
-        } catch (e) {
-            this.destroy(e as any);
-        }
-    }
-
-    get fd(): number { return this.#stdio.fd; }
-
-    get isTTY(): boolean { return this.#stdio.isTTY; }
-
-    get isRaw(): boolean { return this.#isRaw; }
-
-    setRawMode(mode: boolean): this {
-        this.#stdio.setRaw(mode);
-        this.#isRaw = mode;
-        return this;
-    }
-
-    readSync(buf: Uint8Array<ArrayBuffer>): number | null {
-        return this.#stdio.readSync(buf);
-    }
-}
-
-// ============================================================================
-// hrtime implementation (high-precision based on performance.now)
-// ============================================================================
-
-const hrtimeOrigin = typeof performance !== 'undefined' ? performance.now() : Date.now();
-
-export function hrtime(time?: [number, number]): [number, number] {
-    const nowMicro = typeof performance !== 'undefined'
-        ? performance.now() - hrtimeOrigin
-        : Date.now() - hrtimeOrigin;
-    const totalNs = Math.round(nowMicro * 1e6);
-    const seconds = Math.floor(totalNs / 1e9);
-    const nanoseconds = totalNs % 1e9;
-
-    if (time) {
-        let diffSeconds = seconds - time[0];
-        let diffNanoseconds = nanoseconds - time[1];
-        if (diffNanoseconds < 0) {
-            diffSeconds -= 1;
-            diffNanoseconds += 1e9;
-        }
-        return [diffSeconds, diffNanoseconds];
-    }
-
-    return [seconds, nanoseconds];
-}
-
-hrtime.bigint = function (): bigint {
-    const [seconds, nanoseconds] = hrtime();
-    return BigInt(seconds) * BigInt(1e9) + BigInt(nanoseconds);
-};
-
-// ============================================================================
-// memoryUsage implementation
-// ============================================================================
-
-export function memoryUsage(): NodeJS.MemoryUsage {
-    const memory = os.memoryUsage();
-    return {
-        rss: memory['os.rss'],
-        heapTotal: memory['used'],
-        heapUsed: memory['used'],
-        external: memory['vm.used'],
-        arrayBuffers: memory['buffer.used'],
-    };
-}
-
-memoryUsage.rss = function (): number {
-    return os.memoryUsage()['os.rss'];
-};
-
-// ============================================================================
-// cpuUsage implementation
-// ============================================================================
-
-let lastCpuUsage = { user: 0, system: 0 };
-
-export function cpuUsage(previousValue?: NodeJS.CpuUsage): NodeJS.CpuUsage {
-    const cpus = os.cpuInfo();
-    if (cpus.length === 0) return { user: 0, system: 0 };
-
-    // Aggregate across all cores
-    let totalUser = 0, totalNice = 0, totalSys = 0, totalIdle = 0;
-    for (const cpu of cpus) {
-        totalUser += cpu.times.user;
-        totalNice += cpu.times.nice;
-        totalSys += cpu.times.sys;
-        totalIdle += cpu.times.idle;
-    }
-
-    const current = {
-        user: (totalUser + totalNice) * 1e6,  // ms → μs
-        system: totalSys * 1e6,
-    };
-
-    if (previousValue) {
-        return {
-            user: current.user - (previousValue.user || 0),
-            system: current.system - (previousValue.system || 0),
-        };
-    }
-
-    // First call: return delta since last call, or zero if first ever
-    const result = {
-        user: current.user - lastCpuUsage.user,
-        system: current.system - lastCpuUsage.system,
-    };
-    lastCpuUsage = { user: current.user, system: current.system };
-    return result;
-}
-
-// ============================================================================
 // Signal handling
-// ============================================================================
 
 const signalMap: Map<NodeJS.Signals, Map<() => void, CModuleSignals.SignalHandler>> = new Map();
 
@@ -303,9 +82,7 @@ function removeSignalListener(signalName: NodeJS.Signals, listener: () => void):
     }
 }
 
-// ============================================================================
 // Environment variables
-// ============================================================================
 
 const envProxy = new Proxy({} as NodeJS.ProcessEnv, {
     get(target, key: string | symbol, receiver: any): any {
@@ -349,9 +126,7 @@ const envProxy = new Proxy({} as NodeJS.ProcessEnv, {
     },
 });
 
-// ============================================================================
 // Process EventEmitter
-// ============================================================================
 
 class ProcessEventEmitter extends EventEmitter {
     override emit(event: string | Symbol, ...args: any[]): boolean {
@@ -397,23 +172,9 @@ class ProcessEventEmitter extends EventEmitter {
 
 const processEE = new ProcessEventEmitter();
 
-// ============================================================================
-// Standard stream instances
-// ============================================================================
-
-const stdoutStream = new ProcessWriteStream(denoStdout);
-const stderrStream = new ProcessWriteStream(denoStderr);
-const stdinStream = new ProcessReadStream(denoStdin);
-
-// ============================================================================
 // Process object
-// ============================================================================
+
 const uname = os.uname();
-
-export const stdout: NodeJS.WriteStream = stdoutStream as any;
-export const stderr: NodeJS.WriteStream = stderrStream as any;
-export const stdin: NodeJS.ReadStream = stdinStream as any;
-
 
 export const argv: string[] = [os.exePath, cno_args.entry, ...cno_args.args];
 export const argv0: string = cno_args.binary;
@@ -475,12 +236,14 @@ export function chdir(directory: string): void {
 
 export function exit(code?: number): never {
     const exitCode_ = code ?? exitCode ?? 0;
+    _exiting = true;
     processEE.emit('exit', exitCode_);
     os.exit(exitCode_);
     throw new Error('unreachable');
 }
 
 export let exitCode: number | undefined = undefined;
+export let _exiting: boolean = false;
 
 export const execPath: string = os.exePath;
 
@@ -490,12 +253,17 @@ export const version: string = 'v24.1.0';
 export const versions: NodeJS.ProcessVersions = {
     node: '24.1.0',
     v8: engine.versions.quickjs,
-    modules: '120',
-    http_parser: engine.versions.llhttp ?? '9.0.0',
+    modules: '127',
+    http_parser: engine.versions.llhttp ?? '9.2.1',
     uv: engine.versions.uv,
     zlib: engine.versions.zlib,
-    ares: '1.0',
+    ares: '1.34.4',
     openssl: engine.versions.openssl,
+    napi: '9',
+    icu: '76.1',
+    unicode: '16.0',
+    nghttp2: '1.62.1',
+    acorn: '8.14.0',
 };
 
 export const config: NodeJS.ProcessConfig = {
@@ -599,34 +367,6 @@ export const report: NodeJS.ProcessReport = {
     signal: 'SIGUSR2',
     writeReport: () => '',
 };
-
-export function resourceUsage(): NodeJS.ResourceUsage {
-    const mem = os.memoryUsage();
-    const cpus = os.cpuInfo();
-    let totalUser = 0, totalSys = 0;
-    for (const cpu of cpus) {
-        totalUser += cpu.times.user + cpu.times.nice;
-        totalSys += cpu.times.sys;
-    }
-    return {
-        fsRead: 0,
-        fsWrite: 0,
-        involuntaryContextSwitches: 0,
-        ipcReceived: 0,
-        ipcSent: 0,
-        majorPageFault: 0,
-        maxRSS: mem['os.rss'],
-        minorPageFault: 0,
-        sharedMemorySize: 0,
-        signalsCount: 0,
-        swappedOut: 0,
-        systemCPUTime: totalSys * 1e6,
-        unsharedDataSize: 0,
-        unsharedStackSize: 0,
-        userCPUTime: totalUser * 1e6,
-        voluntaryContextSwitches: 0,
-    };
-}
 
 export function emitWarning(warning: string | Error, options?: any): void {
     console.warn(warning);
@@ -737,6 +477,33 @@ export const sourceMapsEnabled: boolean = false;
 
 export function setSourceMapsEnabled(value: boolean): void { }
 
+export const domain: null = null;
+
+export const moduleLoadList: string[] = [];
+
+export function binding(id: string): any {
+    throw new Error(`process.binding('${id}') is not supported`);
+}
+
+export function _getActiveHandles(): object[] {
+    return [];
+}
+
+export function _getActiveRequests(): object[] {
+    return [];
+}
+
+export function openStdin(): typeof stdin {
+    stdin.resume();
+    return stdin;
+}
+
+export function getgroups(): number[] {
+    try { return (os as any).getgroups?.() ?? []; } catch { return []; }
+}
+
+export function initgroups(): void { unsupported('initgroups'); }
+
 export function threadCpuUsage(previousValue?: NodeJS.CpuUsage): NodeJS.CpuUsage {
     return cpuUsage(previousValue);
 }
@@ -759,9 +526,7 @@ export function hasUncaughtExceptionCaptureCallback(): boolean {
 
 export const traceProcessWarnings: boolean = false;
 
-// ============================================================================
 // IPC Channel support (for child_process)
-// ============================================================================
 
 let _ipcChannel: IPCChannel | null = null;
 
@@ -820,6 +585,7 @@ export function disconnect(): void {
         _ipcChannel = null;
     }
 }
+
 // ============================================================================
 // Child-side IPC bootstrap
 // ----------------------------------------------------------------------------

@@ -10,9 +10,7 @@ const engine = import.meta.use('engine');
 import { EventEmitter } from '../events';
 import { Duplex, Readable, Writable } from '../stream';
 
-// ============================================================================
 // Type definitions
-// ============================================================================
 
 export interface AddressInfo {
     address: string;
@@ -80,9 +78,7 @@ function normalizeTcpHost(host: string): string {
     return host;
 }
 
-// ============================================================================
 // Socket
-// ============================================================================
 
 /**
  * Raw socket handle returned by the @cnojs/http core HttpResponse.upgrade().
@@ -474,9 +470,7 @@ export class Socket extends Duplex {
     }
 }
 
-// ============================================================================
 // Server
-// ============================================================================
 
 export class Server extends EventEmitter {
     private _tcp: CModuleStreams.TCP | null = null;
@@ -674,9 +668,7 @@ export class Server extends EventEmitter {
     }
 }
 
-// ============================================================================
 // Factory functions
-// ============================================================================
 
 export function createServer(options?: ServerOpts, connectionListener?: (socket: Socket) => void): Server {
     return new Server(options, connectionListener);
@@ -708,9 +700,7 @@ export function createConnection(portOrPath: number | string | TcpNetConnectOpts
     return connect(portOrPath as any, hostOrCb as any, cb);
 }
 
-// ============================================================================
 // isIP / isIPv4 / isIPv6
-// ============================================================================
 
 export function isIP(input: string): number {
     if (isIPv4(input)) return 4;

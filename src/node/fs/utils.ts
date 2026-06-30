@@ -13,9 +13,7 @@ const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
 const asfs = import.meta.use('asyncfs');
 
-// ============================================================================
 // Shared type definitions (used across _promises.ts, callbacks.ts, sync.ts, async.ts)
-// ============================================================================
 
 export type PathLike = string | URL | Buffer;
 export type TimeLike = string | number | Date;
@@ -57,9 +55,7 @@ export function readFileFromFdSync(
     return out;
 }
 
-// ============================================================================
 // Data conversion
-// ============================================================================
 
 export function toUint8Array(data: string | Uint8Array | ArrayBuffer): Uint8Array<ArrayBuffer> {
     if (typeof data === 'string') {
@@ -76,9 +72,7 @@ export function decodeBuffer(buffer: Uint8Array<ArrayBuffer>, encoding?: BufferE
     return engine.decodeString(buffer);
 }
 
-// ============================================================================
 // Stats conversion
-// ============================================================================
 
 export function toNodeStat(stat: CModuleFS.Stats): import('fs').Stats {
     return {
@@ -110,9 +104,7 @@ export function toNodeStat(stat: CModuleFS.Stats): import('fs').Stats {
     };
 }
 
-// ============================================================================
 // Dirent conversion
-// ============================================================================
 
 export function toNodeDirent(
     name: string,
@@ -146,9 +138,7 @@ export function toNodeDirentAsync(ent: CModuleAsyncFS.DirEnt): import('fs').Dire
     };
 }
 
-// ============================================================================
 // Flag parsing
-// ============================================================================
 
 export function parseFlags(flag?: string | number): Exclude<CModuleFS.OpenFlags, number> {
     if (typeof flag === 'number') {
@@ -166,9 +156,7 @@ export function parseFlags(flag?: string | number): Exclude<CModuleFS.OpenFlags,
     return (flag || 'r') as Exclude<CModuleFS.OpenFlags, number>;
 }
 
-// ============================================================================
 // Path handling
-// ============================================================================
 
 export function pathToString(path: string | URL | Uint8Array): string {
     if (typeof path === 'string') return path;
@@ -191,9 +179,7 @@ export function describeFd(fd: number): string {
     return `fd:${fd}`;
 }
 
-// ============================================================================
 // Recursive deletion
-// ============================================================================
 
 export function removeRecursiveSync(targetPath: string): void {
     const stats = fs.stat(targetPath);
@@ -227,9 +213,7 @@ export async function removeRecursive(targetPath: string): Promise<void> {
     }
 }
 
-// ============================================================================
 // Recursive directory creation
-// ============================================================================
 
 function splitMkdirPath(pathStr: string): { root: string; parts: string[] } {
     const normalized = pathStr.replace(/\\/g, '/');
@@ -335,9 +319,7 @@ export function createFileHandle(fd: number, handle: CModuleAsyncFS.FileHandle) 
     };
 }
 
-// ============================================================================
 // Shared fs helpers
-// ============================================================================
 
 /** Generate a random hex string for mkdtemp (6 bytes = 12 hex chars) */
 export function randomHex(): string {

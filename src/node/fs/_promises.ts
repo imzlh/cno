@@ -21,9 +21,7 @@ function w<T>(promise: Promise<T>, syscall: string, path: string): Promise<T> {
     return wrapPromise(promise, syscall, path);
 }
 
-// ============================================================================
 // File read/write
-// ============================================================================
 
 export async function readFile(path: PathLike | number, options?: { encoding?: BufferEncoding | null; flag?: string | number } | BufferEncoding): Promise<string | Uint8Array> {
     const target = splitPathOrFd(path as PathLike | number);
@@ -70,9 +68,7 @@ export async function appendFile(path: PathLike | number, data: string | Uint8Ar
     }
 }
 
-// ============================================================================
 // File status
-// ============================================================================
 
 export async function access(path: PathLike): Promise<void> {
     const pathStr = pathToString(path);
@@ -91,9 +87,7 @@ export async function lstat(path: PathLike): Promise<import('fs').Stats> {
     return toNodeStat(st);
 }
 
-// ============================================================================
 // Directory operations
-// ============================================================================
 
 export async function mkdir(path: PathLike, options?: { mode?: number; recursive?: boolean } | number): Promise<string | undefined> {
     const pathStr = pathToString(path);
@@ -172,9 +166,7 @@ export async function opendir(path: PathLike): Promise<import('fs').Dir> {
     return createAsyncDir(pathStr, dirHandle);
 }
 
-// ============================================================================
 // File operations
-// ============================================================================
 
 export async function unlink(path: PathLike): Promise<void> {
     const pathStr = pathToString(path);
@@ -201,9 +193,7 @@ export async function truncate(path: PathLike, len?: number): Promise<void> {
     }
 }
 
-// ============================================================================
 // Link operations
-// ============================================================================
 
 export async function link(existingPath: PathLike, newPath: PathLike): Promise<void> {
     const existingStr = pathToString(existingPath);
@@ -238,9 +228,7 @@ Reflect.set(realpath, 'native', function (path: PathLike) {
     return w(asfs.realPath(pathStr), 'realpath', pathStr);
 });
 
-// ============================================================================
 // Permission operations
-// ============================================================================
 
 export async function chmod(path: PathLike, mode: Mode): Promise<void> {
     const pathStr = pathToString(path);
@@ -257,9 +245,7 @@ export async function lchown(path: PathLike, uid: number, gid: number): Promise<
     await w(asfs.lchown(pathStr, uid, gid), 'lchown', pathStr);
 }
 
-// ============================================================================
 // Time operations
-// ============================================================================
 
 export async function utimes(path: PathLike, atime: TimeLike, mtime: TimeLike): Promise<void> {
     const pathStr = pathToString(path);
@@ -271,9 +257,7 @@ export async function lutimes(path: PathLike, atime: TimeLike, mtime: TimeLike):
     await w(asfs.lutime(pathStr, timeToNumber(atime) / 1000, timeToNumber(mtime) / 1000), 'lutimes', pathStr);
 }
 
-// ============================================================================
 // statfs
-// ============================================================================
 
 export async function statfs(path: PathLike): Promise<import('fs').StatsFs> {
     const pathStr = pathToString(path);
@@ -289,9 +273,7 @@ export async function statfs(path: PathLike): Promise<import('fs').StatsFs> {
     };
 }
 
-// ============================================================================
 // Open file
-// ============================================================================
 
 export async function open(path: PathLike, flags?: string | number, mode?: Mode) {
     const flag = parseFlags(flags);
@@ -301,9 +283,7 @@ export async function open(path: PathLike, flags?: string | number, mode?: Mode)
     return createFileHandle(handle.fileno(), handle);
 }
 
-// ============================================================================
 // Missing exports
-// ============================================================================
 
 export async function lchmod(path: PathLike, mode: Mode): Promise<void> {
     // lchmod is typically not supported, simplified implementation

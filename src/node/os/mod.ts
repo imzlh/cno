@@ -49,9 +49,7 @@ export interface UserInfo<T> {
 
 export type NetworkInterfaceInfo = NetworkInterfaceInfoIPv4 | NetworkInterfaceInfoIPv6;
 
-// ============================================================================
 // Constants
-// ============================================================================
 
 export const constants = {
     UV_UDP_REUSEADDR: 0,
@@ -82,9 +80,7 @@ export const constants = {
     },
 };
 
-// ============================================================================
 // Constant properties
-// ============================================================================
 
 /** Path of the null device */
 export const devNull = uname.sysname === 'Windows_NT' ? '\\\\.\\NUL' : '/dev/null';
@@ -92,9 +88,7 @@ export const devNull = uname.sysname === 'Windows_NT' ? '\\\\.\\NUL' : '/dev/nul
 /** Operating system-specific end-of-line marker */
 export const EOL = uname.sysname === 'Windows_NT' ? '\r\n' : '\n';
 
-// ============================================================================
 // Function implementations
-// ============================================================================
 
 /**
  * Returns the operating system hostname

@@ -647,6 +647,10 @@ export class ServerImpl extends NetServer implements Server {
         return this;
     }
 
+    getTimeout(): number {
+        return this.timeout;
+    }
+
     closeAllConnections(): void {
         for (const socket of this._httpConnections) {
             socket.destroy();

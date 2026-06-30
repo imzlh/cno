@@ -12,9 +12,7 @@ const asfs = import.meta.use('asyncfs');
 
 type NoParamCallback = (err: NodeJS.ErrnoException | null) => void;
 
-// ============================================================================
 // File read/write - callback style
-// ============================================================================
 
 export function readFile(
     path: PathLike | number,
@@ -136,9 +134,7 @@ export function appendFile(path: PathLike | number, data: any, options?: any, ca
     );
 }
 
-// ============================================================================
 // File status - callback style
-// ============================================================================
 
 export function exists(path: PathLike, callback: (exists: boolean) => void): void {
     const pathStr = pathToString(path);
@@ -220,9 +216,7 @@ export function access(path: PathLike, mode?: any, callback?: any): void {
     );
 }
 
-// ============================================================================
 // Directory operations - callback style
-// ============================================================================
 
 export function mkdir(path: PathLike, callback: NoParamCallback): void;
 export function mkdir(path: PathLike, mode: Mode | { mode?: number; recursive?: boolean }, callback: NoParamCallback): void;
@@ -332,9 +326,7 @@ export function readdir(path: PathLike, options?: any, callback?: any): void {
     );
 }
 
-// ============================================================================
 // File operations - callback style
-// ============================================================================
 
 export function unlink(path: PathLike, callback: NoParamCallback): void {
     const pathStr = pathToString(path);
@@ -399,9 +391,7 @@ export function ftruncate(fd: number, len?: any, callback?: any): void {
     }
 }
 
-// ============================================================================
 // Link operations - callback style
-// ============================================================================
 
 export function link(existingPath: PathLike, newPath: PathLike, callback: NoParamCallback): void {
     const existingStr = pathToString(existingPath);
@@ -483,9 +473,7 @@ export function mkdtemp(prefix: string, options?: any, callback?: any): void {
     );
 }
 
-// ============================================================================
 // Permission operations - callback style
-// ============================================================================
 
 export function chmod(path: PathLike, mode: Mode, callback: NoParamCallback): void {
     const pathStr = pathToString(path);
@@ -534,9 +522,7 @@ export function lchown(path: PathLike, uid: number, gid: number, callback: NoPar
     asfs.lchown(pathStr, uid, gid).then(() => callback(null), err => callback(toErrnoException(err, 'lchown', pathStr)));
 }
 
-// ============================================================================
 // Time operations - callback style
-// ============================================================================
 
 export function utimes(path: PathLike, atime: TimeLike, mtime: TimeLike, callback: NoParamCallback): void {
     const pathStr = pathToString(path);
@@ -565,9 +551,7 @@ export function lutimes(path: PathLike, atime: TimeLike, mtime: TimeLike, callba
     ).then(() => callback(null), err => callback(toErrnoException(err, 'lutimes', pathStr)));
 }
 
-// ============================================================================
 // File descriptor operations - callback style
-// ============================================================================
 
 export function open(path: PathLike, callback: (err: NodeJS.ErrnoException | null, fd: number) => void): void;
 export function open(path: PathLike, flags: string | number, callback: (err: NodeJS.ErrnoException | null, fd: number) => void): void;
@@ -679,9 +663,7 @@ export function fdatasync(fd: number, callback: NoParamCallback): void {
     }
 }
 
-// ============================================================================
 // statfs - callback style
-// ============================================================================
 
 export function statfs(path: PathLike, callback: (err: NodeJS.ErrnoException | null, stats: import('fs').StatsFs) => void): void;
 export function statfs(
@@ -712,9 +694,7 @@ export function statfs(path: PathLike, options?: any, callback?: any): void {
     );
 }
 
-// ============================================================================
 // opendir - callback style
-// ============================================================================
 
 export function opendir(path: PathLike, callback: (err: NodeJS.ErrnoException | null, dir: import('fs').Dir) => void): void;
 export function opendir(

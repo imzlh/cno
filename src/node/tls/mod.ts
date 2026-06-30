@@ -14,9 +14,7 @@ const ssl = import.meta.use('ssl');
 const engine = import.meta.use('engine');
 const dns = import.meta.use('dns');
 
-// ============================================================================
 // Types
-// ============================================================================
 
 export interface TlsOptions {
     ca?: string | string[];
@@ -87,9 +85,7 @@ export interface PeerCertificate {
     raw: Buffer;
 }
 
-// ============================================================================
 // SecureContext
-// ============================================================================
 
 export class SecureContext {
     #context: CModuleSSL.Context;
@@ -125,9 +121,7 @@ export function createSecureContext(options?: SecureContextOptions): SecureConte
     return new SecureContext(options);
 }
 
-// ============================================================================
 // TLSSocket — Full Duplex stream
-// ============================================================================
 
 export class TLSSocket extends Duplex {
     #underlying: Duplex | CModuleStreams.Stream | null = null;
@@ -483,9 +477,7 @@ export class TLSSocket extends Duplex {
     }
 }
 
-// ============================================================================
 // Server
-// ============================================================================
 
 export class Server extends EventEmitter {
     #netServer: NetServer;
@@ -610,9 +602,7 @@ export class Server extends EventEmitter {
     set listening(val: boolean) { this.#listening = val; }
 }
 
-// ============================================================================
 // Factory functions
-// ============================================================================
 
 export function createServer(options?: TlsServerOptions, secureConnectionListener?: (socket: TLSSocket) => void): Server;
 export function createServer(secureConnectionListener?: (socket: TLSSocket) => void): Server;
@@ -723,9 +713,7 @@ export function connect(portOrOptions: number | TlsConnectOptions, hostOrOptions
     return tlsSocket;
 }
 
-// ============================================================================
 // Constants
-// ============================================================================
 
 export const DEFAULT_CIPHERS = ssl.ciphers.join(':');
 export const DEFAULT_ECDH_CURVE = 'auto';
@@ -742,4 +730,29 @@ export function convertProtocols(protocols: string[] | Buffer[] | Buffer): Buffe
         return protocols.map(p => typeof p === 'string' ? Buffer.from(p) : p as Buffer);
     }
     return [protocols as Buffer];
+}
+
+export function checkServerIdentity(servername: string, cert: PeerCertificate): Error | undefined {
+    const cn = (cert as any).subject?.CN ?? '';
+    const sans: string[] = (cert as any).subjectaltname
+        ? String((cert as any).subjectaltname).split(', ')
+              .filter((s: string) => s.startsWith('DNS:'))
+              .map((s: string) => s.slice(4))
+        : [];
+
+    const names = sans.length ? sans : (cn ? [cn] : []);
+    if (!names.length) return new Error('Cert has no name');
+
+    const host = servername.toLowerCase();
+    for (const name of names) {
+        const pattern = name.toLowerCase();
+        if (pattern === host) return undefined;
+        if (pattern.startsWith('*.')) {
+            const suffix = pattern.slice(2);
+            if (host.endsWith('.' + suffix) && !host.slice(0, host.length - suffix.length - 1).includes('.')) {
+                return undefined;
+            }
+        }
+    }
+    return new Error(`Hostname/IP does not match certificate's altnames: Host: ${servername}. is not in the cert's altnames`);
 }

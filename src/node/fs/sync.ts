@@ -14,9 +14,7 @@ const os = import.meta.use('os');
 const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
 
-// ============================================================================
 // File read/write
-// ============================================================================
 
 export function readFileSync(path: PathLike | number, options?: { encoding?: BufferEncoding | null; flag?: string | number } | BufferEncoding): string | Uint8Array {
     const target = splitPathOrFd(path as PathLike | number);
@@ -54,9 +52,7 @@ export function appendFileSync(path: PathLike | number, data: string | Uint8Arra
     }, 'appendFileSync', 'fd' in target ? describeFd(target.fd) : target.path);
 }
 
-// ============================================================================
 // File status
-// ============================================================================
 
 export function existsSync(path: PathLike): boolean {
     const pathStr = pathToString(path);
@@ -85,9 +81,7 @@ export function accessSync(path: PathLike, mode?: number): void {
     wrapSync(() => fs.access(pathStr, mode ?? fs.F_OK), 'accessSync', pathStr);
 }
 
-// ============================================================================
 // Directory operations
-// ============================================================================
 
 export function mkdirSync(path: PathLike, options?: { mode?: number; recursive?: boolean } | number): string | undefined {
     const pathStr = pathToString(path);
@@ -195,9 +189,7 @@ export function opendirSync(path: PathLike, options?: { encoding?: BufferEncodin
     return dir;
 }
 
-// ============================================================================
 // File operations
-// ============================================================================
 
 export function unlinkSync(path: PathLike): void {
     const pathStr = pathToString(path);
@@ -224,9 +216,7 @@ export function ftruncateSync(fd: number, len?: number): void {
     wrapSync(() => fs.ftruncate(fd, len ?? 0), 'ftruncateSync', describeFd(fd));
 }
 
-// ============================================================================
 // Link operations
-// ============================================================================
 
 export function linkSync(existingPath: PathLike, newPath: PathLike): void {
     const existingStr = pathToString(existingPath);
@@ -260,9 +250,7 @@ Reflect.set(realpathSync, 'native', function (path: PathLike, options?: { encodi
     return wrapSync(() => fs.realpath(pathStr), 'realpathSync', pathStr);
 });
 
-// ============================================================================
 // Permission operations
-// ============================================================================
 
 export function chmodSync(path: PathLike, mode: Mode): void {
     const pathStr = pathToString(path);
@@ -294,9 +282,7 @@ export function lchownSync(path: PathLike, uid: number, gid: number): void {
     wrapSync(() => fs.chown(pathStr, uid, gid), 'lchownSync', pathStr);
 }
 
-// ============================================================================
 // Time operations
-// ============================================================================
 
 export function utimesSync(path: PathLike, atime: TimeLike, mtime: TimeLike): void {
     const pathStr = pathToString(path);
@@ -309,9 +295,7 @@ export function lutimesSync(path: PathLike, atime: TimeLike, mtime: TimeLike): v
     wrapSync(() => fs.utimes(pathStr, timeToNumber(atime) / 1000, timeToNumber(mtime) / 1000), 'lutimesSync', pathStr);
 }
 
-// ============================================================================
 // Low-level file descriptor operations
-// ============================================================================
 
 export function openSync(path: PathLike, flags?: string | number, mode?: Mode): number {
     const pathStr = pathToString(path);
@@ -350,25 +334,19 @@ export function fdatasyncSync(fd: number): void {
     wrapSync(() => fs.fdatasync(fd), 'fdatasyncSync', describeFd(fd));
 }
 
-// ============================================================================
 // File locking
-// ============================================================================
 
 export function flockSync(fd: number, operation: number): void {
     wrapSync(() => fs.flock(fd, operation), 'flockSync', describeFd(fd));
 }
 
-// ============================================================================
 // statfs
-// ============================================================================
 
 export function statfsSync(path: PathLike, options?: { bigint?: boolean }): import('fs').StatsFs {
     throw new Error('statfsSync is not supported');
 }
 
-// ============================================================================
 // cp / cpSync
-// ============================================================================
 
 export interface CopyOptionsSync {
     mode?: Mode;

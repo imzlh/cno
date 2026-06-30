@@ -9,9 +9,7 @@ import * as types from './types';
 export { types };
 import { deepEqual as _deepEqual } from '../_internal/deep-equal';
 
-// ============================================================================
 // Type checks
-// ============================================================================
 
 export function isBoolean(value: unknown): value is boolean {
     return typeof value === 'boolean';
@@ -73,9 +71,7 @@ export function isBuffer(value: unknown): value is Uint8Array {
     return value instanceof Uint8Array;
 }
 
-// ============================================================================
 // Formatting
-// ============================================================================
 
 export function format(format?: string, ...args: any[]): string {
     if (format === undefined) {
@@ -170,9 +166,7 @@ export function formatWithOptions(inspectOptions: InspectOptions, format?: any, 
     return result;
 }
 
-// ============================================================================
 // VT control characters
-// ============================================================================
 
 // Matches the common ANSI/VT escape forms used in terminal output:
 //   - CSI: ESC [ ... command
@@ -306,9 +300,7 @@ export function isDeepStrictEqual(a: unknown, b: unknown): boolean {
     return _deepEqual(a, b, true);
 }
 
-// ============================================================================
 // inspect
-// ============================================================================
 
 export interface InspectOptions {
     showHidden?: boolean;
@@ -347,9 +339,7 @@ export function inspect(object: unknown, options?: InspectOptions): string {
 inspect.defaultOptions = defaultInspectOptions;
 inspect.custom = Symbol.for('nodejs.util.inspect.custom');
 
-// ============================================================================
 // Inheritance
-// ============================================================================
 
 export function inherits(constructor: Function, superConstructor: Function): void {
     if (constructor === undefined || constructor === null) {
@@ -372,9 +362,7 @@ export function inherits(constructor: Function, superConstructor: Function): voi
     });
 }
 
-// ============================================================================
 // deprecate
-// ============================================================================
 
 export function deprecate<T extends Function>(fn: T, message: string, code?: string): T {
     let warned = false;
@@ -397,9 +385,7 @@ export function deprecate<T extends Function>(fn: T, message: string, code?: str
     return deprecated;
 }
 
-// ============================================================================
 // callbackify
-// ============================================================================
 
 export function callbackify<T>(fn: (...args: any[]) => Promise<T>): (...args: any[]) => void {
     return function (this: any, ...args: any[]) {
@@ -415,9 +401,7 @@ export function callbackify<T>(fn: (...args: any[]) => Promise<T>): (...args: an
     };
 }
 
-// ============================================================================
 // promisify
-// ============================================================================
 
 export interface PromisifyInterface {
     __promisify__: Function;
@@ -460,17 +444,13 @@ export function promisify<T>(fn: Function): (...args: any[]) => Promise<T> {
 
 promisify.custom = Symbol.for('nodejs.util.promisify.custom');
 
-// ============================================================================
 // TextEncoder / TextDecoder
-// ============================================================================
 
 const { Encoder, Decoder } = import.meta.use('text')!;
 export const TextEncoder = Encoder;
 export const TextDecoder = Decoder;
 
-// ============================================================================
 // getSystemErrorMap / getSystemErrorName
-// ============================================================================
 
 export function getSystemErrorMap(): Map<number, [string, string]> {
     const errMod = import.meta.use('error');
@@ -492,9 +472,7 @@ export function getSystemErrorMessage(err: number): string {
     return entry ? entry[1] : `Unknown system error ${err}`;
 }
 
-// ============================================================================
 // parseEnv — .env file parser (Node.js 20.12+)
-// ============================================================================
 
 /**
  * Parse `.env` file content into a key-value object.

@@ -21,9 +21,7 @@ function resolveCurve(curve: string): 'p256' | 'p384' | 'p521' {
     }
 }
 
-// ============================================================================
 // createHash
-// ============================================================================
 
 export function createHash(algorithm: string): Hash {
     const a = normalizeHashAlgorithm(algorithm);
@@ -80,9 +78,7 @@ export function createHash(algorithm: string): Hash {
     throw new Error(`Unsupported hash algorithm: ${algorithm}`);
 }
 
-// ============================================================================
 // hash - one-shot hash
-// ============================================================================
 
 export function hash(algorithm: string, data: ArrayBuffer | Uint8Array | string, outputEncoding?: string): ArrayBuffer | string {
     const buf = toBuffer(data);
@@ -106,9 +102,7 @@ export function hash(algorithm: string, data: ArrayBuffer | Uint8Array | string,
     return encodeOutput(result, outputEncoding);
 }
 
-// ============================================================================
 // createHmac
-// ============================================================================
 
 export function createHmac(algorithm: string, key: ArrayBuffer | Uint8Array | string): Hmac {
     const keyBuf = toBuffer(key);
@@ -142,9 +136,7 @@ export function createHmac(algorithm: string, key: ArrayBuffer | Uint8Array | st
     };
 }
 
-// ============================================================================
 // hmac - one-shot HMAC
-// ============================================================================
 
 export function hmac(algorithm: string, key: ArrayBuffer | Uint8Array | string, data: ArrayBuffer | Uint8Array | string, outputEncoding?: string): ArrayBuffer | string {
     const keyBuf = toBuffer(key);
@@ -233,9 +225,7 @@ export function createHmacSha512(key: ArrayBuffer | Uint8Array | string): CModul
     return crypto.createHmacSha512(toBuffer(key));
 }
 
-// ============================================================================
 // createCipher / createDecipher
-// ============================================================================
 
 export function createCipheriv(algorithm: string, key: ArrayBuffer | Uint8Array, iv: ArrayBuffer | Uint8Array): Cipheriv {
     const keyBuf = toBuffer(key);
@@ -348,9 +338,7 @@ export function createDecipherAes256Cbc(
     return crypto.createDecipherAes256Cbc(toBuffer(key), toBuffer(iv));
 }
 
-// ============================================================================
 // createCipheriv GCM
-// ============================================================================
 
 export function createCipherivGCM(algorithm: string, key: ArrayBuffer | Uint8Array, iv: ArrayBuffer | Uint8Array, options?: { authTagLength?: number }): CipherGCM {
     const keyBuf = toBuffer(key);
@@ -518,9 +506,7 @@ export function aes256GcmDecrypt(
     return crypto.aes256GcmDecrypt(toBuffer(key), toBuffer(iv), toBuffer(data));
 }
 
-// ============================================================================
 // Encryption/Decryption - one-shot
-// ============================================================================
 
 export function cipheriv(algorithm: string, key: ArrayBuffer | Uint8Array, iv: ArrayBuffer | Uint8Array, data: ArrayBuffer | Uint8Array, outputEncoding?: string): ArrayBuffer | string {
     const keyBuf = toBuffer(key);
@@ -562,9 +548,7 @@ export function decipheriv(algorithm: string, key: ArrayBuffer | Uint8Array, iv:
     return encodeOutput(result, outputEncoding);
 }
 
-// ============================================================================
 // randomBytes
-// ============================================================================
 
 export function randomBytes(size: number): Uint8Array;
 export function randomBytes(size: number, callback: (err: Error | null, buf: Uint8Array) => void): void;
@@ -604,9 +588,7 @@ export function getRandomValues<T extends ArrayBufferView>(array: T): T {
 // Re-export random/kdf/hkdf from random.ts
 export { randomInt, randomFill, randomFillSync, pbkdf2, pbkdf2Sync, pbkdf2Sha256, pbkdf2Sha512, hkdf, hkdfSync, hkdfSha256, hkdfSha512 } from './random';
 
-// ============================================================================
 // RSA
-// ============================================================================
 
 export function generateKeyPairSync(type: 'rsa', options: { modulusLength: number }): { publicKey: ArrayBuffer; privateKey: ArrayBuffer };
 export function generateKeyPairSync(type: 'ec', options: { namedCurve: string }): { publicKey: ArrayBuffer; privateKey: ArrayBuffer };
@@ -649,9 +631,7 @@ export function generateKeyPair(type: string, options: any, callback: (err: Erro
     }
 }
 
-// ============================================================================
 // sign / verify
-// ============================================================================
 
 export function createSign(algorithm: string): Sign {
     let data: Uint8Array[] = [];
@@ -774,9 +754,7 @@ export function verifySha512(
     return crypto.verifySha512(toBuffer(key), toBuffer(data), toBuffer(signature));
 }
 
-// ============================================================================
 // ECDSA
-// ============================================================================
 
 export function ecdsaSign(curve: string, privateKey: ArrayBuffer | Uint8Array, data: ArrayBuffer | Uint8Array): ArrayBuffer {
     const keyBuf = toBuffer(privateKey);
@@ -803,9 +781,7 @@ export function ecdsaVerify(curve: string, publicKey: ArrayBuffer | Uint8Array, 
     }
 }
 
-// ============================================================================
 // ECDH
-// ============================================================================
 
 export function ecdhComputeSecret(curve: string, privateKey: ArrayBuffer | Uint8Array, publicKey: ArrayBuffer | Uint8Array): ArrayBuffer {
     const privBuf = toBuffer(privateKey);
@@ -888,9 +864,7 @@ export function ecdhDeriveP521(
     return crypto.ecdhDeriveP521(toBuffer(privateKey), toBuffer(publicKey));
 }
 
-// ============================================================================
 // RSA-OAEP
-// ============================================================================
 
 export function publicEncrypt(
     key: ArrayBuffer | Uint8Array | { key: ArrayBuffer | Uint8Array; oaepHash?: string; oaepLabel?: ArrayBuffer | Uint8Array },
@@ -946,9 +920,7 @@ export function rsaPssSha256Verify(key: ArrayBuffer | Uint8Array, data: ArrayBuf
     return crypto.rsaPssSha256Verify(toBuffer(key), toBuffer(data), toBuffer(signature), saltLength);
 }
 
-// ============================================================================
 // CRC32
-// ============================================================================
 
 export function crc32(data: ArrayBuffer | Uint8Array | string): number {
     return crypto.crc32(toBuffer(data));
@@ -970,9 +942,7 @@ export function hexDecode(data: string): ArrayBuffer {
     return crypto.hexDecode(data);
 }
 
-// ============================================================================
 // Encoding utilities
-// ============================================================================
 
 export const constants = {
     RSA_PKCS1_PADDING: 1,
@@ -980,9 +950,7 @@ export const constants = {
     RSA_PKCS1_OAEP_PADDING: 4,
 };
 
-// ============================================================================
 // Algorithm enumeration (feature-detection probes)
-// ============================================================================
 
 // Only algorithms actually backed by the native crypto module are listed, so
 // getHashes()/getCiphers() reflect what createHash/createCipheriv can build.
@@ -994,9 +962,7 @@ export function getCiphers(): string[] {
     return ['aes-128-cbc', 'aes-192-cbc', 'aes-256-cbc', 'aes-128-gcm', 'aes-192-gcm', 'aes-256-gcm'];
 }
 
-// ============================================================================
 // UUID
-// ============================================================================
 
 export function randomUUID(): string {
     // Node's crypto.randomUUID() is synchronous and returns a string. The native
@@ -1015,3 +981,8 @@ export function randomUUID(): string {
         h.slice(10, 16).join('')
     );
 }
+
+// Web Crypto API — re-export runtime globals so code that imports
+// `crypto.webcrypto` or `crypto.subtle` gets the real implementation.
+export const webcrypto: Crypto = (globalThis as any).crypto ?? {} as Crypto;
+export const subtle: SubtleCrypto = webcrypto.subtle ?? {} as SubtleCrypto;

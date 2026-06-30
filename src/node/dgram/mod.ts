@@ -29,9 +29,7 @@ function _getSocket(handle: CModuleUDP.UDP): CModuleSocket.PosixSocket | null {
     try { return sock.socket_from_fd(fd); } catch { return null; }
 }
 
-// ============================================================================
 // Type definitions
-// ============================================================================
 
 export interface AddressInfo {
     address: string;
@@ -64,9 +62,7 @@ export interface SocketOptions {
     signal?: AbortSignal;
 }
 
-// ============================================================================
 // Socket class
-// ============================================================================
 
 export class Socket extends EventEmitter {
     private _handle: CModuleUDP.UDP | null = null;
@@ -457,9 +453,7 @@ export class Socket extends EventEmitter {
     }
 }
 
-// ============================================================================
 // Factory functions
-// ============================================================================
 
 export function createSocket(type: 'udp4' | 'udp6', callback?: (msg: Uint8Array, rinfo: RemoteInfo) => void): Socket;
 export function createSocket(options: SocketOptions, callback?: (msg: Uint8Array, rinfo: RemoteInfo) => void): Socket;

@@ -391,6 +391,10 @@ export class Interface extends EventEmitter {
     get history(): string[] { return this._history; }
 
     get line(): string { return this._line; }
+
+    get closed(): boolean { return this._closed; }
+
+    getPrompt(): string { return this._prompt; }
 }
 
 export function createInterface(options: ReadLineOptions | NodeJS.ReadableStream): Interface {

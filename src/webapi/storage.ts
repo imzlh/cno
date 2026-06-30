@@ -9,9 +9,7 @@ const crypto = import.meta.use('crypto');
 const engine = import.meta.use('engine');
 const console = import.meta.use('console');
 
-// ============================================================================
 // Type Definitions
-// ============================================================================
 
 interface StorageOptions {
     /** Database file path */
@@ -43,9 +41,7 @@ interface StorageStats {
     available: number;
 }
 
-// ============================================================================
 // Storage Implementation
-// ============================================================================
 
 class Storage {
     private db: CModuleSQLite3.Sqlite3Handle | null = null;
@@ -672,9 +668,7 @@ class Storage {
     }
 }
 
-// ============================================================================
 // Storage Manager
-// ============================================================================
 
 class StorageManager {
     private storages: Map<string, Storage> = new Map();
@@ -752,9 +746,7 @@ class StorageManager {
     }
 }
 
-// ============================================================================
 // Global Instance and Exports
-// ============================================================================
 
 const storageManager = new StorageManager();
 

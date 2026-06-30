@@ -16,9 +16,7 @@ import { getTierLimits } from '../_internal/memory';
 
 const { readBufSize: READ_BUF_SIZE } = getTierLimits();
 
-// ============================================================================
 // Type definitions
-// ============================================================================
 
 export interface SpawnOptions {
     cwd?: string;
@@ -74,9 +72,7 @@ export interface ChildProcess extends EventEmitter {
     readonly connected: boolean;
 }
 
-// ============================================================================
 // ChildProcess class
-// ============================================================================
 
 function transformSignal(signal?: string | number): number | undefined {
     if (!signal) return;
@@ -275,9 +271,7 @@ class ChildProcessImpl extends EventEmitter implements ChildProcess {
     }
 }
 
-// ============================================================================
 // spawn
-// ============================================================================
 
 export function spawn(command: string): ChildProcess;
 export function spawn(command: string, options: SpawnOptions): ChildProcess;
@@ -375,9 +369,7 @@ export function spawn(command: string, argsOrOptions?: string[] | SpawnOptions, 
     return child;
 }
 
-// ============================================================================
 // exec
-// ============================================================================
 
 export function exec(command: string, callback?: (error: Error | null, stdout: string, stderr: string) => void): ChildProcess;
 export function exec(command: string, options: ExecOptions, callback?: (error: Error | null, stdout: string, stderr: string) => void): ChildProcess;
@@ -435,9 +427,7 @@ function collectOutput(
     });
 }
 
-// ============================================================================
 // execFile
-// ============================================================================
 
 export function execFile(file: string): ChildProcess;
 export function execFile(file: string, options: ExecFileOptions): ChildProcess;
@@ -483,9 +473,7 @@ export function execFile(
     return child;
 }
 
-// ============================================================================
 // fork
-// ============================================================================
 
 export function fork(modulePath: string, args?: string[], options?: SpawnOptions): ChildProcess {
     const forkArgs = args ?? [];
@@ -497,9 +485,7 @@ export function fork(modulePath: string, args?: string[], options?: SpawnOptions
     });
 }
 
-// ============================================================================
 // spawnSync / execSync / execFileSync
-// ============================================================================
 
 export interface SpawnSyncResult {
     pid?: number;
@@ -593,3 +579,29 @@ export function execFileSync(file: string, args?: string[], options?: ExecFileOp
     }
     return result.stdout ?? '';
 }
+
+// promises namespace
+
+export const promises = {
+    exec(command: string, options?: ExecOptions): Promise<{ stdout: string; stderr: string }> {
+        return new Promise((resolve, reject) => {
+            exec(command, options ?? {}, (error, stdout, stderr) => {
+                if (error) reject(Object.assign(error, { stdout, stderr }));
+                else resolve({ stdout: stdout as string, stderr: stderr as string });
+            });
+        });
+    },
+
+    execFile(file: string, args?: string[], options?: ExecFileOptions): Promise<{ stdout: string; stderr: string }> {
+        return new Promise((resolve, reject) => {
+            execFile(file, args ?? [], options ?? {}, (error, stdout, stderr) => {
+                if (error) reject(Object.assign(error, { stdout, stderr }));
+                else resolve({ stdout: stdout as string, stderr: stderr as string });
+            });
+        });
+    },
+
+    spawn(command: string, args?: string[], options?: SpawnOptions): ChildProcess {
+        return spawn(command, args ?? [], options ?? {});
+    },
+};
