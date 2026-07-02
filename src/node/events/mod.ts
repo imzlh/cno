@@ -38,9 +38,17 @@ export class EventEmitter<T extends EventMap<T> = any> implements IEventEmitter<
     static usingDomains = false;
 
     constructor(options?: EventEmitterOptions) {
+        this.ensureState();
         if (options?.captureRejections) {
             this._captureRejections = true;
         }
+    }
+
+    private ensureState(): void {
+        const self = this as any;
+        if (!(self._events instanceof Map)) self._events = new Map();
+        if (typeof self._maxListeners !== 'number' || Number.isNaN(self._maxListeners)) self._maxListeners = 10;
+        if (typeof self._captureRejections !== 'boolean') self._captureRejections = false;
     }
 
     // ============================================================================
@@ -52,6 +60,7 @@ export class EventEmitter<T extends EventMap<T> = any> implements IEventEmitter<
     }
 
     on<E extends string | symbol>(eventName: E, listener: Listener<T, E>): this {
+        this.ensureState();
         if (typeof listener !== 'function') {
             throw new TypeError('The "listener" argument must be of type Function');
         }
@@ -80,6 +89,7 @@ export class EventEmitter<T extends EventMap<T> = any> implements IEventEmitter<
     }
 
     once<E extends string | symbol>(eventName: E, listener: Listener<T, E>): this {
+        this.ensureState();
         if (typeof listener !== 'function') {
             throw new TypeError('The "listener" argument must be of type Function');
         }
@@ -100,6 +110,7 @@ export class EventEmitter<T extends EventMap<T> = any> implements IEventEmitter<
     }
 
     prependListener<E extends string | symbol>(eventName: E, listener: Listener<T, E>): this {
+        this.ensureState();
         if (typeof listener !== 'function') {
             throw new TypeError('The "listener" argument must be of type Function');
         }
@@ -115,6 +126,7 @@ export class EventEmitter<T extends EventMap<T> = any> implements IEventEmitter<
     }
 
     prependOnceListener<E extends string | symbol>(eventName: E, listener: Listener<T, E>): this {
+        this.ensureState();
         if (typeof listener !== 'function') {
             throw new TypeError('The "listener" argument must be of type Function');
         }
@@ -134,6 +146,7 @@ export class EventEmitter<T extends EventMap<T> = any> implements IEventEmitter<
     // ============================================================================
 
     removeListener<E extends string | symbol>(eventName: E, listener: Listener<T, E>): this {
+        this.ensureState();
         if (typeof listener !== 'function') {
             throw new TypeError('The "listener" argument must be of type Function');
         }
@@ -158,6 +171,7 @@ export class EventEmitter<T extends EventMap<T> = any> implements IEventEmitter<
     }
 
     removeAllListeners(eventName?: string | symbol): this {
+        this.ensureState();
         if (eventName === undefined) {
             this._events.clear();
         } else {
@@ -171,6 +185,7 @@ export class EventEmitter<T extends EventMap<T> = any> implements IEventEmitter<
     // ============================================================================
 
     emit<E extends string | symbol>(eventName: E, ...args: any[]): boolean {
+        this.ensureState();
         const listeners = this._events.get(eventName);
         if (!listeners || listeners.length === 0) {
             if (eventName === 'error') {
@@ -225,10 +240,12 @@ export class EventEmitter<T extends EventMap<T> = any> implements IEventEmitter<
     // ============================================================================
 
     eventNames(): Array<string | symbol> {
+        this.ensureState();
         return Array.from(this._events.keys());
     }
 
     listeners<E extends string | symbol>(eventName: E): any[] {
+        this.ensureState();
         const listeners = this._events.get(eventName);
         return listeners ? listeners.map(l => l.listener) : [];
     }
@@ -238,6 +255,7 @@ export class EventEmitter<T extends EventMap<T> = any> implements IEventEmitter<
     }
 
     listenerCount<E extends string | symbol>(eventName: E, listener?: Function): number {
+        this.ensureState();
         const listeners = this._events.get(eventName);
         if (!listeners) return 0;
         if (listener) {
@@ -251,10 +269,12 @@ export class EventEmitter<T extends EventMap<T> = any> implements IEventEmitter<
     // ============================================================================
 
     getMaxListeners(): number {
+        this.ensureState();
         return this._maxListeners;
     }
 
     setMaxListeners(n: number): this {
+        this.ensureState();
         if (typeof n !== 'number' || n < 0 || Number.isNaN(n)) {
             throw new RangeError('The value of "n" is out of range. It must be a non-negative number.');
         }

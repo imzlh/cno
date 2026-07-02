@@ -34,6 +34,16 @@ export interface PipeOptions {
     end?: boolean;
 }
 
+// Node normalizes non-object-mode chunks pushed into a Readable to Buffer
+// instances (readableAddChunk), so `chunk.toString()` downstream decodes as
+// UTF-8 instead of falling back to Array-style comma-joined byte values.
+function normalizeChunk(chunk: any, objectMode: boolean, encoding: BufferEncoding | undefined, defaultEncoding: BufferEncoding): any {
+    if (objectMode || chunk === null) return chunk;
+    if (typeof chunk === 'string') return Buffer.from(chunk, encoding || defaultEncoding);
+    if (chunk instanceof Uint8Array && !(chunk instanceof Buffer)) return Buffer.from(chunk);
+    return chunk;
+}
+
 // Stream base class
 
 export class Stream extends EventEmitter {
@@ -344,6 +354,8 @@ export class Readable extends Stream {
             if (state.flowing) this._emitReadableEndIfNeeded();
             return false;
         }
+
+        chunk = normalizeChunk(chunk, state.objectMode, encoding, state.defaultEncoding);
 
         if (state.flowing) {
             this.emit('data', chunk);
@@ -812,6 +824,8 @@ export class Duplex extends Writable {
             if (state.flowing) this._emitReadableEndIfNeeded();
             return false;
         }
+
+        chunk = normalizeChunk(chunk, state.objectMode, encoding, state.defaultEncoding);
 
         if (state.flowing) {
             this.emit('data', chunk);

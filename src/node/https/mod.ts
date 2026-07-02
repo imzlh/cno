@@ -10,18 +10,18 @@ import {
     Server as TlsServer,
     SecureContext,
     createSecureContext,
-    TlsServerOptions,
-    PeerCertificate,
     getCiphers,
 } from '../tls';
+import type { TlsServerOptions, PeerCertificate } from '../tls';
 import {
     IncomingMessageImpl,
     OutgoingMessageImpl,
     ServerResponseImpl,
-    IncomingHttpHeaders,
     METHODS as HTTP_METHODS,
 } from '../http/server';
-import { ClientRequestArgs, Agent as HttpAgent } from '../http/client';
+import type { IncomingHttpHeaders } from '../http/server';
+import { Agent as HttpAgent } from '../http/client';
+import type { ClientRequestArgs } from '../http/client';
 import {
     buildNodeServerUrl,
     buildNodeUrl,
@@ -658,9 +658,9 @@ export {
     TLSSocket,
     SecureContext,
     createSecureContext,
-    PeerCertificate,
     getCiphers,
 };
+export type { PeerCertificate, TlsServerOptions };
 
 // Default export
 

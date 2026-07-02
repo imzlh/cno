@@ -20,10 +20,7 @@ export function getExtraHTTPHeaders(): Record<string, string> { return _extraHTT
 
 // ---- CurlInit hook (applied to every CURL handle before perform) -----------
 
-export type CurlInitHook = (curl: CModuleCURL.CURL) => void;
-let _curlInitHook: CurlInitHook | null = null;
-export function setCurlInitHook(hook: CurlInitHook | null): void { _curlInitHook = hook; }
-export function getCurlInitHook(): CurlInitHook | null { return _curlInitHook; }
+export { type CurlInitHook, setCurlInitHook, getCurlInitHook } from '../../../cts/src/utils/curl';
 
 // ---- Fetch hooks -----------------------------------------------------------
 
