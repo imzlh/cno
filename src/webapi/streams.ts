@@ -134,13 +134,13 @@ class ReadableStreamController<R = any> implements globalThis.ReadableStreamDefa
 
         // Reject all pending reads
         for (const read of this.#pendingReads) {
-            read.reject(e);
+            queueMicrotask(() => read.reject(e));
         }
         this.#pendingReads = [];
 
         // Reject all closed promises
         for (const cb of this.#closedCallbacks) {
-            cb.reject(e);
+            queueMicrotask(() => cb.reject(e));
         }
         this.#closedCallbacks = [];
     }
@@ -168,7 +168,7 @@ class ReadableStreamController<R = any> implements globalThis.ReadableStreamDefa
 
         if (this.#state === 'errored') {
             const read = this.#pendingReads.shift();
-            if (read) read.reject(this.#storedError);
+            if (read) queueMicrotask(() => read.reject(this.#storedError));
             return;
         }
 
@@ -312,7 +312,7 @@ class ReadableStreamController<R = any> implements globalThis.ReadableStreamDefa
         if (this.#state === 'closed') {
             resolve();
         } else if (this.#state === 'errored') {
-            reject(this.#storedError);
+            queueMicrotask(() => reject(this.#storedError));
         } else {
             this.#closedCallbacks.push({ resolve, reject });
         }
@@ -411,6 +411,7 @@ export class ReadableStream<R = any> implements globalThis.ReadableStream<R> {
 
         const reader = this.getReader();
         const writer = dest.getWriter();
+        void reader.closed.catch(() => {});
         void writer.closed.catch(() => {});
         void writer.ready.catch(() => {});
 
@@ -593,6 +594,7 @@ class ReadableStreamDefaultReader<R = any> implements globalThis.ReadableStreamD
 
         const { promise, resolve, reject } = Promise.withResolvers<void>();
         this.#closedPromise = promise;
+        void promise.catch(() => {});
 
         // @ts-ignore
         stream._controller._addClosedCallback(resolve, reject);
@@ -662,17 +664,17 @@ class WritableStreamController implements globalThis.WritableStreamDefaultContro
         this.#storedError = e;
 
         for (const req of this.#writeRequests) {
-            req.reject(e);
+            queueMicrotask(() => req.reject(e));
         }
         this.#writeRequests = [];
 
         for (const cb of this.#closedCallbacks) {
-            cb.reject(e);
+            queueMicrotask(() => cb.reject(e));
         }
         this.#closedCallbacks = [];
 
         for (const cb of this.#readyCallbacks) {
-            cb.reject(e);
+            queueMicrotask(() => cb.reject(e));
         }
         this.#readyCallbacks = [];
     }
@@ -721,7 +723,7 @@ class WritableStreamController implements globalThis.WritableStreamDefaultContro
         await this.#sink.abort?.(reason);
 
         for (const cb of this.#closedCallbacks) {
-            cb.reject(reason);
+            queueMicrotask(() => cb.reject(reason));
         }
         this.#closedCallbacks = [];
     }
@@ -737,7 +739,7 @@ class WritableStreamController implements globalThis.WritableStreamDefaultContro
 
     #addReadyCallback(resolve: any, reject: any): void {
         if (this.#state === 'errored') {
-            reject(this.#storedError);
+            queueMicrotask(() => reject(this.#storedError));
         } else if (this.#getDesiredSize() > 0) {
             resolve();
         } else {
@@ -749,7 +751,7 @@ class WritableStreamController implements globalThis.WritableStreamDefaultContro
         if (this.#state === 'closed') {
             resolve();
         } else if (this.#state === 'errored') {
-            reject(this.#storedError);
+            queueMicrotask(() => reject(this.#storedError));
         } else {
             this.#closedCallbacks.push({ resolve, reject });
         }
@@ -814,11 +816,13 @@ class WritableStreamDefaultWriter implements globalThis.WritableStreamDefaultWri
 
         const ready = Promise.withResolvers<void>();
         this.#readyPromise = ready.promise;
+        void ready.promise.catch(() => {});
         // @ts-ignore
         stream._controller._addReadyCallback(ready.resolve, ready.reject);
 
         const closed = Promise.withResolvers<void>();
         this.#closedPromise = closed.promise;
+        void closed.promise.catch(() => {});
         // @ts-ignore
         stream._controller._addClosedCallback(closed.resolve, closed.reject);
     }
@@ -868,6 +872,7 @@ class WritableStreamDefaultWriter implements globalThis.WritableStreamDefaultWri
         // Update ready promise
         const ready = Promise.withResolvers<void>();
         this.#readyPromise = ready.promise;
+        void ready.promise.catch(() => {});
         // @ts-ignore
         this.#stream._controller._addReadyCallback(ready.resolve, ready.reject);
     }

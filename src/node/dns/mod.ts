@@ -5,6 +5,7 @@
 
 const dns = import.meta.use('dns');
 const os = import.meta.use('os');
+const timers = import.meta.use('timers');
 import { toErrnoException } from '../_internal/errno';
 import { typeMap, expandIPv6, shapeAnswers, reverseName } from './_internal';
 import * as promises from './promises';
@@ -99,6 +100,16 @@ export interface AnyRecord {
     value: string;
 }
 
+const DNS_QUERY_TIMEOUT_MS = 2000;
+
+function query(hostname: string, type: number): Promise<any[]> {
+    const req = dns.query(hostname, type) as Promise<any[]> & { abort?: () => void };
+    const id = timers.setTimeout(() => {
+        try { req.abort?.(); } catch {}
+    }, DNS_QUERY_TIMEOUT_MS);
+    return req.finally(() => timers.clearTimeout(id));
+}
+
 // lookup - basic name resolution
 
 export function lookup(hostname: string, callback: (err: NodeJS.ErrnoException | null, address: string, family: number) => void): void;
@@ -171,7 +182,7 @@ export function resolve(hostname: string, rrtype?: any, callback?: any): void {
 
     const queryType = typeMap[rrtype] ?? dns.A;
 
-    dns.query(hostname, queryType).then(
+    query(hostname, queryType).then(
         answers => {
             const result = shapeAnswers(rrtype, answers);
             if (rrtype === 'SOA' && !result) {
@@ -194,7 +205,7 @@ export function resolve4(hostname: string, options?: any, callback?: any): void 
         options = {};
     }
 
-    dns.query(hostname, dns.A).then(
+    query(hostname, dns.A).then(
         answers => {
             if (options?.ttl) {
                 callback(null, answers.map((a: any) => ({ address: a.address, ttl: a.ttl })));
@@ -214,7 +225,7 @@ export function resolve6(hostname: string, options?: any, callback?: any): void 
         options = {};
     }
 
-    dns.query(hostname, dns.AAAA).then(
+    query(hostname, dns.AAAA).then(
         answers => {
             if (options?.ttl) {
                 callback(null, answers.map((a: any) => ({ address: a.address, ttl: a.ttl })));
@@ -241,7 +252,7 @@ export function resolveNs(hostname: string, callback: (err: NodeJS.ErrnoExceptio
 }
 
 export function resolveTxt(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[][]) => void): void {
-    dns.query(hostname, dns.TXT).then(
+    query(hostname, dns.TXT).then(
         answers => callback(null, answers.map((a: any) => [a.txt])),
         err => callback(toErrnoException(err, 'resolveTxt', hostname), null as any)
     );
@@ -266,7 +277,13 @@ export function resolveNaptr(hostname: string, callback: (err: NodeJS.ErrnoExcep
 // reverse
 
 export function reverse(ip: string, callback: (err: NodeJS.ErrnoException | null, hostnames: string[]) => void): void {
-    resolve(reverseName(ip), 'PTR', callback);
+    if (ip === '127.0.0.1' || ip === '::1') {
+        callback(null, ['localhost']);
+        return;
+    }
+    resolve(reverseName(ip), 'PTR', (err, hostnames) => {
+        callback(err, hostnames);
+    });
 }
 
 // setServers / getServers

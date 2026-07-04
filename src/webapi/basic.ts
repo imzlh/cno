@@ -4,7 +4,7 @@ type TimerOptions = { signal?: AbortSignal };
 
 const crypto = import.meta.use('crypto');
 const engine = import.meta.use('engine');
-const text = import.meta.use('text')!;
+const text = import.meta.use('text');
 const os = import.meta.use('os');
 const timer = import.meta.use('timers');
 const streams = import.meta.use('streams');
@@ -36,7 +36,9 @@ globalThis.prompt = function(msg) {
     try {
         let line = '';
         while (true) {
-            const n = stdin.readSync(chunk);
+            // Read through the Stream wrapper: on POSIX it flips the fd to
+            // blocking so a raw readSync doesn't EAGAIN on an empty TTY.
+            const n = _stdin.readSync(chunk);
             if (!n) break;
             line += engine.decodeString(chunk.subarray(0, n));
             // Normal mode delivers a full line ending with \n
@@ -59,7 +61,7 @@ globalThis.TextEncoder = text.Encoder;
 globalThis.TextDecoder = text.Decoder;
 
 
-class TimeoutOrInterval extends Number implements NodeJS.Timeout {
+class TimeoutOrInterval extends Number {
     constructor(private fd: number, readonly _onTimeout: () => void) {
         super(fd);
     }
@@ -101,6 +103,37 @@ class TimeoutOrInterval extends Number implements NodeJS.Timeout {
     }
 }
 
+class Immediate extends Number {
+    constructor(private fd: number, readonly _onImmediate: () => void) {
+        super(fd);
+    }
+
+    close() {
+        timer.clearTimeout(this.fd);
+        return this;
+    }
+
+    ref() {
+        return this;
+    }
+
+    unref() {
+        return this;
+    }
+
+    hasRef() {
+        return false;
+    }
+
+    [Symbol.toPrimitive]() {
+        return this.fd;
+    }
+
+    [Symbol.dispose]() {
+        this.close();
+    }
+}
+
 // @ts-ignore - __promisify__ is defined next
 globalThis.setTimeout = function(cb: string | ((...args: any[]) => void), delay?: number | undefined, ...args: any[]) {
     if (typeof cb == 'string') {
@@ -134,6 +167,21 @@ globalThis.setInterval = function<any>(cb, timeout, ...args) {
     }, timeout ?? 0), cb);
 };
 
+// @ts-ignore - webapi
+globalThis.setImmediate = function(cb: (...args: any[]) => void, ...args: any[]) {
+    if (typeof cb !== 'function') {
+        throw new TypeError('callback must be a function');
+    }
+    const fd = timer.setTimeout(() => cb(...args), 0);
+    return new Immediate(fd, cb);
+};
+
+// @ts-ignore - webapi
+globalThis.clearImmediate = function(id: Immediate | number | undefined) {
+    if (!id) return;
+    timer.clearTimeout(Number(id));
+};
+
 globalThis.structuredClone = function(v, opt){
     return engine.deserialize(engine.serialize(v));
 }
@@ -142,7 +190,7 @@ globalThis.queueMicrotask = function(callback: () => void) {
     if (typeof callback !== 'function') {
         throw new TypeError('callback is not a function');
     }
-    Promise.resolve().then(callback);
+    Promise.resolve().then(() => callback());
 };
 
 globalThis.reportError = function(e) {

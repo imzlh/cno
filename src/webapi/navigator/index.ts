@@ -18,6 +18,26 @@ class BatteryManagerImpl extends EventTarget implements BatteryManager {
     onchange: EventListener | null = null;
 }
 
+class ClipboardImpl {
+    #text = '';
+
+    async readText(): Promise<string> {
+        return this.#text;
+    }
+
+    async writeText(text: string): Promise<void> {
+        this.#text = String(text);
+    }
+
+    async read(): Promise<never> {
+        throw new DOMException('Clipboard.read() is not supported in this environment', 'NotSupportedError');
+    }
+
+    async write(_items: any[]): Promise<never> {
+        throw new DOMException('Clipboard.write() is not supported in this environment', 'NotSupportedError');
+    }
+}
+
 class NavigatorImpl implements Navigator {
     private _core: NavigatorCoreImpl;
     private _permissions: ReturnType<typeof createPermissions>;
@@ -25,6 +45,7 @@ class NavigatorImpl implements Navigator {
     private _networkInfo: ReturnType<typeof createNetworkInformation>;
     private _opensocket: ReturnType<typeof createDirectSockets>;
     private _battery: BatteryManager | null = null;
+    private _clipboard = new ClipboardImpl();
 
     constructor() {
         this._core = new NavigatorCoreImpl();
@@ -44,6 +65,10 @@ class NavigatorImpl implements Navigator {
 
     get userAgent(): string {
         return this._core.userAgent;
+    }
+
+    get userAgentData(): any {
+        return undefined;
     }
 
     get vendor(): string {
@@ -126,6 +151,10 @@ class NavigatorImpl implements Navigator {
 
     get locks(): LockManager {
         return _lockManager;
+    }
+
+    get clipboard() {
+        return this._clipboard;
     }
 
     async getBattery(): Promise<BatteryManager> {

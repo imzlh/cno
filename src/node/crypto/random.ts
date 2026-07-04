@@ -5,6 +5,70 @@
 const crypto = import.meta.use('crypto');
 import { toBuffer } from './helpers';
 
+export interface ScryptOptions {
+    N?: number;
+    cost?: number;
+    r?: number;
+    blockSize?: number;
+    p?: number;
+    parallelization?: number;
+    maxmem?: number;
+}
+
+function readScryptNumberOption(options: ScryptOptions | undefined, primary: keyof ScryptOptions, fallback: keyof ScryptOptions, defaultValue: number): number {
+    const value = options?.[primary] ?? options?.[fallback];
+    if (value === undefined || value === 0) {
+        return defaultValue;
+    }
+    if (typeof value !== 'number') {
+        throw new TypeError(`The "${String(primary)}" argument must be of type number. Received type ${typeof value}`);
+    }
+    if (!Number.isInteger(value)) {
+        throw new RangeError(`The value of "${String(primary)}" is out of range. It must be an integer. Received ${value}`);
+    }
+    return value;
+}
+
+function parseScryptKeylen(keylen: number): number {
+    if (typeof keylen !== 'number') {
+        throw new TypeError(`The "keylen" argument must be of type number. Received type ${typeof keylen}`);
+    }
+    if (!Number.isInteger(keylen) || keylen < 0 || keylen > 0x7fffffff) {
+        throw new RangeError(`The value of "keylen" is out of range. It must be >= 0 && <= 2147483647. Received ${keylen}`);
+    }
+    return keylen;
+}
+
+function isPowerOfTwo(value: number): boolean {
+    return value > 1 && 2 ** Math.floor(Math.log2(value)) === value;
+}
+
+function parseScryptOptions(options?: ScryptOptions): { N: number; r: number; p: number; maxmem: number } {
+    if (options === undefined) {
+        return { N: 16384, r: 8, p: 1, maxmem: 32 * 1024 * 1024 };
+    }
+    if (options === null || typeof options !== 'object') {
+        throw new TypeError('The "options" argument must be of type object');
+    }
+
+    const N = readScryptNumberOption(options, 'N', 'cost', 16384);
+    const r = readScryptNumberOption(options, 'r', 'blockSize', 8);
+    const p = readScryptNumberOption(options, 'p', 'parallelization', 1);
+    const maxmem = options.maxmem ?? 32 * 1024 * 1024;
+
+    if (typeof maxmem !== 'number') {
+        throw new TypeError(`The "maxmem" argument must be of type number. Received type ${typeof maxmem}`);
+    }
+    if (!Number.isInteger(maxmem) || maxmem < 0 || maxmem > Number.MAX_SAFE_INTEGER) {
+        throw new RangeError(`The value of "maxmem" is out of range. It must be >= 0 && <= ${Number.MAX_SAFE_INTEGER}. Received ${maxmem}`);
+    }
+    if (!isPowerOfTwo(N) || r < 0 || p < 0) {
+        throw new RangeError('Invalid scrypt params');
+    }
+
+    return { N, r, p, maxmem };
+}
+
 // randomInt / randomFill
 
 export function randomInt(max: number): number;
@@ -138,6 +202,43 @@ export function pbkdf2Sha512(
     keylen: number,
 ): ArrayBuffer {
     return crypto.pbkdf2Sha512(toBuffer(password), toBuffer(salt), iterations, keylen);
+}
+
+// scrypt
+
+export function scrypt(password: ArrayBuffer | Uint8Array | string, salt: ArrayBuffer | Uint8Array | string, keylen: number, callback: (err: Error | null, derivedKey: Uint8Array) => void): void;
+export function scrypt(password: ArrayBuffer | Uint8Array | string, salt: ArrayBuffer | Uint8Array | string, keylen: number, options: ScryptOptions, callback: (err: Error | null, derivedKey: Uint8Array) => void): void;
+export function scrypt(
+    password: ArrayBuffer | Uint8Array | string,
+    salt: ArrayBuffer | Uint8Array | string,
+    keylen: number,
+    optionsOrCallback: ScryptOptions | ((err: Error | null, derivedKey: Uint8Array) => void),
+    maybeCallback?: (err: Error | null, derivedKey: Uint8Array) => void,
+): void {
+    const options = typeof optionsOrCallback === 'function' ? undefined : optionsOrCallback;
+    const callback = typeof optionsOrCallback === 'function' ? optionsOrCallback : maybeCallback;
+    if (!callback) throw new TypeError('callback is required');
+
+    queueMicrotask(() => {
+        try {
+            callback(null, scryptSync(password, salt, keylen, options));
+        } catch (err) {
+            callback(err as Error, new Uint8Array(0));
+        }
+    });
+}
+
+export function scryptSync(
+    password: ArrayBuffer | Uint8Array | string,
+    salt: ArrayBuffer | Uint8Array | string,
+    keylen: number,
+    options?: ScryptOptions,
+): Uint8Array {
+    keylen = parseScryptKeylen(keylen);
+    const { N, r, p, maxmem } = parseScryptOptions(options);
+    const passwordBuf = toBuffer(password);
+    const saltBuf = toBuffer(salt);
+    return new Uint8Array(crypto.scrypt(passwordBuf, saltBuf, keylen, N, r, p, maxmem));
 }
 
 // hkdf

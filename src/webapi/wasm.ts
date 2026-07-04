@@ -24,6 +24,14 @@ function toArrayBuffer(source: BufferSource): ArrayBuffer {
     return ret;
 }
 
+function toUint8Array(source: BufferSource): Uint8Array {
+    if (source instanceof Uint8Array) return source;
+    if (source instanceof ArrayBuffer) return new Uint8Array(source);
+    if (source.buffer instanceof SharedArrayBuffer)
+        throw new TypeError('SharedArrayBuffer is not supported');
+    return new Uint8Array(source.buffer, source.byteOffset, source.byteLength);
+}
+
 function wrapWasmError<T>(fn: () => T): T {
     try {
         return fn();
@@ -476,7 +484,7 @@ if (wasm) {
         [Symbol.toStringTag]: 'WebAssembly',
 
         validate(bufferSource: BufferSource): boolean {
-            return wasm.validate(toArrayBuffer(bufferSource));
+            return wasm.validate(toUint8Array(bufferSource));
         },
 
         compile(bufferSource: BufferSource): Promise<Module> {

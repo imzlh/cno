@@ -31,11 +31,26 @@ export function toBuffer(data: ArrayBuffer | Uint8Array | string, encoding: stri
 
 export function encodeOutput(data: ArrayBuffer, encoding?: string): ArrayBuffer | string {
     if (!encoding) return data;
-    if (encoding === 'hex') return crypto.hexEncode(data);
-    if (encoding === 'base64') return crypto.base64Encode(data);
-    if (encoding === 'base64url') {
+    const normalized = encoding.toLowerCase();
+    if (normalized === 'hex') return crypto.hexEncode(data);
+    if (normalized === 'base64') return crypto.base64Encode(data);
+    if (normalized === 'base64url') {
         const b64 = crypto.base64Encode(data) as string;
         return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    }
+    const bytes = new Uint8Array(data);
+    if (normalized === 'utf8' || normalized === 'utf-8') {
+        return engine.decodeString(bytes);
+    }
+    if (normalized === 'latin1' || normalized === 'binary') {
+        let out = '';
+        for (let i = 0; i < bytes.length; i++) out += String.fromCharCode(bytes[i]!);
+        return out;
+    }
+    if (normalized === 'ascii') {
+        let out = '';
+        for (let i = 0; i < bytes.length; i++) out += String.fromCharCode(bytes[i]! & 0x7f);
+        return out;
     }
     return data;
 }

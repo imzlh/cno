@@ -88,13 +88,14 @@ function createWebRequest(coreReq: HttpRequest, connInfo: { hostname: string; po
     const protocol = connInfo.secure ? 'https:' : 'http:';
     const base = `${protocol}//${host}`;
     const url = new URL(coreReq.url, base);
+    const bodyPoll = coreReq.body;
 
     return new Request(url.toString(), {
         method: coreReq.method,
         headers,
-        body: coreReq.body ? new ReadableStream({
+        body: bodyPoll ? new ReadableStream({
             async pull(ctrl) {
-                const res = await coreReq.body!();
+                const res = await bodyPoll();
                 if (!res)   ctrl.close();
                 else        ctrl.enqueue(res);
             }

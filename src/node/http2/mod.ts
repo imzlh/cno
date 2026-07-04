@@ -22,10 +22,16 @@ export const constants = {
 
     NGHTTP2_SETTINGS_HEADER_TABLE_SIZE: 1,
     NGHTTP2_SETTINGS_ENABLE_PUSH: 2,
-    NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS: 4,
-    NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE: 5,
-    NGHTTP2_SETTINGS_MAX_FRAME_SIZE: 6,
-    NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE: 7,
+    NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS: 3,
+    NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE: 4,
+    NGHTTP2_SETTINGS_MAX_FRAME_SIZE: 5,
+    NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE: 6,
+
+    HTTP2_HEADER_STATUS: ':status',
+    HTTP2_HEADER_METHOD: ':method',
+    HTTP2_HEADER_AUTHORITY: ':authority',
+    HTTP2_HEADER_SCHEME: ':scheme',
+    HTTP2_HEADER_PATH: ':path',
 
     NGHTTP2_FLAG_NONE: 0,
     NGHTTP2_FLAG_END_STREAM: 1,
@@ -49,15 +55,19 @@ export interface Http2SecureServerOptions {
 }
 
 export function createSecureServer(
-    options: Http2SecureServerOptions,
+    options?: Http2SecureServerOptions | ((...args: any[]) => void),
     requestListener?: (...args: any[]) => void,
 ): Server {
+    if (typeof options === 'function') {
+        requestListener = options;
+        options = undefined;
+    }
     const httpsOpts: HttpsServerOptions = {
-        key: options.key as string,
-        cert: options.cert as string,
-        ca: options.ca as any,
-        passphrase: options.passphrase,
-        pfx: options.pfx as any,
+        key: options?.key as string,
+        cert: options?.cert as string,
+        ca: options?.ca as any,
+        passphrase: options?.passphrase,
+        pfx: options?.pfx as any,
     };
     return createHttpsServer(httpsOpts, requestListener as any) as any;
 }

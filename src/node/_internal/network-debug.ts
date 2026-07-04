@@ -108,6 +108,7 @@ export interface ResponseParserContext {
     getHeaders: () => Record<string, any>;
     onResponse: (res: any) => void;
     onComplete: () => void;
+    skipBody?: boolean;
 }
 
 export function setupResponseParser(ctx: ResponseParserContext) {
@@ -153,8 +154,15 @@ export function setupResponseParser(ctx: ResponseParserContext) {
         }); } catch {}
         for (const chunk of pendingChunks) res.push(chunk);
         pendingChunks.length = 0;
+        if (ctx.skipBody && !res.complete) {
+            res.push(null);
+            res.complete = true;
+            finish(true);
+            ctx.onComplete();
+        }
     };
     parser.onBody = (buf: any, off: number, len: number) => {
+        if (ctx.skipBody) return;
         const data = new Uint8Array(buf as ArrayBuffer).slice(off, off + len);
         try { fetchHook?.onData?.({ requestId: ctx.requestId, timestamp: nodeTs(), data }); } catch {}
         if (res.statusCode === 0) pendingChunks.push(data);

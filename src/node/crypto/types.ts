@@ -3,6 +3,7 @@
  */
 
 export type BinaryInput = ArrayBuffer | Uint8Array | string;
+export type KeyInput = BinaryInput;
 
 export interface Hash {
     update(input: BinaryInput, encoding?: string): Hash;
@@ -50,10 +51,10 @@ export interface GcmDecryptResult {
 
 export interface Sign {
     update(input: BinaryInput, encoding?: string): Sign;
-    sign(privateKey: ArrayBuffer | Uint8Array, outputEncoding?: string): ArrayBuffer | string;
+    sign(privateKey: KeyInput, outputEncoding?: string): ArrayBuffer | string;
 }
 
 export interface Verify {
     update(input: BinaryInput, encoding?: string): Verify;
-    verify(publicKey: ArrayBuffer | Uint8Array, signature: ArrayBuffer | Uint8Array, signatureEncoding?: string): boolean;
+    verify(publicKey: KeyInput, signature: BinaryInput, signatureEncoding?: string): boolean;
 }

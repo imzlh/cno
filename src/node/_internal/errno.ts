@@ -89,6 +89,11 @@ const errnoToString: Record<number, string> = {
     [error.errno.E2BIG]:        'E2BIG',
 };
 
+const stringToErrno: Record<string, number> = {};
+for (const [errnoValue, code] of Object.entries(errnoToString)) {
+    stringToErrno[code] = Number(errnoValue);
+}
+
 /**
  * Convert C module errno error to Node.js ErrnoException
  * @param e - C module error (CModuleError.Error with negative .code errno)
@@ -134,6 +139,45 @@ export function toErrnoException(
     }
 
     return err;
+}
+
+/**
+ * Preserve ordinary JS errors, but normalize C-module errno errors to Node's
+ * ErrnoException shape so npm libraries can key off string error codes.
+ */
+export function normalizeErrnoError(
+    e: unknown,
+    syscall?: string,
+    path?: string,
+): Error {
+    if (e instanceof Error) {
+        const code = (e as CModuleError.Error).code;
+        if (typeof code === 'number' || typeof code === 'string') {
+            return toErrnoException(e, syscall, path);
+        }
+        return e;
+    }
+    return new Error(String(e));
+}
+
+/**
+ * Match both raw numeric circu errno values and Node-style string codes.
+ */
+export function matchesErrnoCode(
+    e: unknown,
+    ...codes: string[]
+): boolean {
+    if (!(e instanceof Error)) return false;
+
+    const err = e as NodeJS.ErrnoException & CModuleError.Error;
+    const code = err.code;
+    if (typeof code === 'string' && codes.includes(code)) return true;
+    if (typeof code === 'number') {
+        return codes.some((name) => stringToErrno[name] === code);
+    }
+
+    const message = String(err.message ?? '');
+    return codes.some((name) => message.startsWith(`${name}:`) || message.includes(`${name}: `));
 }
 
 /**

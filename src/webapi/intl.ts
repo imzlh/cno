@@ -2,6 +2,42 @@
 
 type CurrencyCode = 'USD' | 'EUR' | 'GBP' | 'CNY' | 'JPY' | 'KRW' | 'TWD' | 'HKD';
 type TimeUnit = 'second' | 'minute' | 'hour' | 'day' | 'week' | 'month' | 'year';
+const SUPPORTED_LOCALES = ['zh', 'zh-CN', 'zh-TW', 'en', 'en-US', 'en-GB'] as const;
+
+function canonicalizeLocale(locale: string): string {
+    const parts = String(locale).replace(/_/g, '-').split('-').filter(Boolean);
+    if (parts.length === 0) return '';
+    return parts.map((part, index) => {
+        if (index === 0) return part.toLowerCase();
+        if (part.length === 2) return part.toUpperCase();
+        if (part.length === 4) return part[0].toUpperCase() + part.slice(1).toLowerCase();
+        return part.toLowerCase();
+    }).join('-');
+}
+
+function normalizeLocale(locale?: string | string[]): string {
+    const first = Array.isArray(locale) ? locale[0] : locale;
+    const normalized = first ? canonicalizeLocale(first) : 'en-US';
+    if (!normalized) return 'en-US';
+    if (SUPPORTED_LOCALES.includes(normalized as (typeof SUPPORTED_LOCALES)[number])) return normalized;
+    if (normalized.startsWith('zh')) return 'zh-CN';
+    if (normalized.startsWith('en')) return 'en-US';
+    return normalized;
+}
+
+function supportedLocalesOf(locales: string | string[]): string[] {
+    const input = Array.isArray(locales) ? locales : [locales];
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const locale of input) {
+        const normalized = canonicalizeLocale(locale);
+        if (!SUPPORTED_LOCALES.includes(normalized as (typeof SUPPORTED_LOCALES)[number])) continue;
+        if (seen.has(normalized)) continue;
+        seen.add(normalized);
+        out.push(normalized);
+    }
+    return out;
+}
 
 // ============ Locale Data ============
 const localeData = {
@@ -88,11 +124,11 @@ class NumberFormat implements Intl.NumberFormat {
     private data: typeof localeData.zh | typeof localeData.en;
 
     static supportedLocalesOf(locales: string | string[], options?: Intl.NumberFormatOptions): string[] {
-        return Collator.supportedLocalesOf(locales);
+        return supportedLocalesOf(locales);
     }
 
     constructor(locale?: string | string[], options?: Intl.NumberFormatOptions) {
-        this.locale = Array.isArray(locale) ? locale[0] : (locale || 'en-US');
+        this.locale = normalizeLocale(locale);
         this.options = { style: 'decimal', useGrouping: true, ...options };
         
         const lang = this.locale.startsWith('zh') ? 'zh' : 'en';
@@ -162,6 +198,7 @@ class NumberFormat implements Intl.NumberFormat {
             locale: this.locale,
             numberingSystem: 'latn',
             style: this.options.style || 'decimal',
+            currency: this.options.currency,
             minimumFractionDigits: this.options.minimumFractionDigits || 0,
             maximumFractionDigits: this.options.maximumFractionDigits || 3,
             useGrouping: this.options.useGrouping !== false
@@ -179,8 +216,12 @@ class DateTimeFormat implements Intl.DateTimeFormat {
     private options: Intl.DateTimeFormatOptions;
     private data: typeof localeData.zh | typeof localeData.en;
 
+    static supportedLocalesOf(locales: string | string[]): string[] {
+        return supportedLocalesOf(locales);
+    }
+
     constructor(locale?: string | string[], options?: Intl.DateTimeFormatOptions) {
-        this.locale = Array.isArray(locale) ? locale[0] : (locale || 'en-US');
+        this.locale = normalizeLocale(locale);
         this.options = options || {};
         
         const lang = this.locale.startsWith('zh') ? 'zh' : 'en';
@@ -259,7 +300,7 @@ class RelativeTimeFormat implements Intl.RelativeTimeFormat {
     private data: typeof localeData.zh | typeof localeData.en;
 
     constructor(locale?: string | string[], options?: Intl.RelativeTimeFormatOptions) {
-        this.locale = Array.isArray(locale) ? locale[0] : (locale || 'en-US');
+        this.locale = normalizeLocale(locale);
         this.options = { numeric: 'always', style: 'long', ...options };
         
         const lang = this.locale.startsWith('zh') ? 'zh' : 'en';
@@ -313,7 +354,7 @@ class DisplayNames implements Intl.DisplayNames {
     private data: typeof localeData.zh | typeof localeData.en;
 
     constructor(locale?: string | string[], options?: Intl.DisplayNamesOptions) {
-        this.locale = Array.isArray(locale) ? locale[0] : (locale || 'en-US');
+        this.locale = normalizeLocale(locale);
         this.type = options?.type || 'language';
         
         const lang = this.locale.startsWith('zh') ? 'zh' : 'en';
@@ -343,23 +384,45 @@ class DisplayNames implements Intl.DisplayNames {
 
 // ============ Collator ============
 class Collator implements Intl.Collator {
-    constructor(locales?: Intl.LocalesArgument, options?: Intl.CollatorOptions) {}
+    private locale: string;
+    private options: Intl.CollatorOptions;
 
-    static supportedLocalesOf(_locales: string | string[]): string[] {
-        return ['zh', 'zh-CN', 'zh-TW', 'en', 'en-US', 'en-GB'].filter(loc => _locales.includes(loc));
-    }
-    
-    compare: (x: string, y: string) => number = (a, b) => a.localeCompare(b);
-    
-    resolvedOptions(): Intl.ResolvedCollatorOptions {
-        return {
-            locale: 'en-US',
+    constructor(locales?: Intl.LocalesArgument, options?: Intl.CollatorOptions) {
+        this.locale = normalizeLocale(locales as string | string[] | undefined);
+        this.options = {
             usage: 'sort',
             sensitivity: 'variant',
             ignorePunctuation: false,
-            collation: 'default',
             numeric: false,
             caseFirst: 'false',
+            ...options,
+        };
+    }
+
+    static supportedLocalesOf(locales: string | string[]): string[] {
+        return supportedLocalesOf(locales);
+    }
+    
+    compare: (x: string, y: string) => number = (a, b) => {
+        let left = String(a);
+        let right = String(b);
+        if (this.options.sensitivity === 'base') {
+            left = left.toLowerCase();
+            right = right.toLowerCase();
+        }
+        if (left === right) return 0;
+        return left < right ? -1 : 1;
+    };
+    
+    resolvedOptions(): Intl.ResolvedCollatorOptions {
+        return {
+            locale: this.locale,
+            usage: this.options.usage || 'sort',
+            sensitivity: this.options.sensitivity || 'variant',
+            ignorePunctuation: this.options.ignorePunctuation === true,
+            collation: 'default',
+            numeric: this.options.numeric === true,
+            caseFirst: this.options.caseFirst || 'false',
         };
     }
     
@@ -472,7 +535,7 @@ class ListFormat implements Intl.ListFormat {
     private locale: string;
     
     constructor(locale?: string | string[], _options?: Intl.ListFormatOptions) {
-        this.locale = Array.isArray(locale) ? locale[0] : (locale || 'en-US');
+        this.locale = normalizeLocale(locale);
     }
     
     format(list: Iterable<string>): string {
@@ -550,11 +613,19 @@ export class CustomIntl {
 
     getCanonicalLocales(locales: string | string[]): string[] {
         const input = Array.isArray(locales) ? locales : [locales];
-        return input.filter(loc => loc.startsWith('zh') || loc.startsWith('en'));
+        const out: string[] = [];
+        const seen = new Set<string>();
+        for (const locale of input) {
+            const normalized = canonicalizeLocale(locale);
+            if (!normalized || seen.has(normalized)) continue;
+            seen.add(normalized);
+            out.push(normalized);
+        }
+        return out;
     }
     
     supportedValuesOf(_key: string): string[] {
-        return ['zh', 'zh-CN', 'zh-TW', 'en', 'en-US', 'en-GB'];
+        return [...SUPPORTED_LOCALES];
     }
     
     get [Symbol.toStringTag]() {

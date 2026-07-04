@@ -171,7 +171,7 @@ class UDPSocketImpl implements UDPSocket {
 
     async bind(options: SocketOptions): Promise<void> {
         const isV4 = !options.localAddress?.includes(':');
-        this._udp = await udp.create(isV4 ? os.AF_INET : os.AF_INET6);
+        this._udp = new udp.UDP(isV4 ? os.AF_INET : os.AF_INET6);
 
         if (options.localAddress && options.localPort) {
             await this._udp.bind({

@@ -33,9 +33,11 @@ export class Event implements globalThis.Event {
     }
     stopPropagation(): void {
         this._stopped = true;
+        this.cancelBubble = true;
     }
     stopImmediatePropagation(): void {
         this._stopped = true;
+        this.cancelBubble = true;
     }
 
     get defaultPrevented(): boolean {
@@ -123,7 +125,6 @@ export class EventTarget implements globalThis.EventTarget {
                     if (idx !== -1) bucket.splice(idx, 1);
                 }
                 const fn = entry.listener;
-                // @ts-expect-error - polyfill Event vs global Event structural mismatch
                 if (typeof fn === 'function') fn.call(this, event);
                 else fn.handleEvent?.(event);
             }

@@ -170,7 +170,10 @@ export class ReadStream extends Readable {
                 : size;
             if (remaining <= 0) return null;
             const buffer = new Uint8Array(Math.max(1, Math.min(size, remaining)));
-            const bytesRead = await this.handle.read(buffer, this.position);
+            // native read() treats explicit null as offset 0, not "current offset" — omit the arg instead
+            const bytesRead = this.position === null
+                ? await this.handle.read(buffer)
+                : await this.handle.read(buffer, this.position);
             if (bytesRead <= 0) return null;
             this.bytesRead += bytesRead;
             if (this.position !== null) this.position += bytesRead;
@@ -256,7 +259,7 @@ export class WriteStream extends Writable {
         return super.destroy(error);
     }
 
-    protected override _write(chunk: any, encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
+    override _write(chunk: any, encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
         const bytes = chunkToBytes(chunk, encoding);
         this.writeChunk(bytes).then(
             () => callback(),
@@ -264,7 +267,7 @@ export class WriteStream extends Writable {
         );
     }
 
-    protected override _final(callback: (error?: Error | null) => void): void {
+    override _final(callback: (error?: Error | null) => void): void {
         try {
             if (this.autoClose) this.destroy();
             callback();
@@ -302,8 +305,10 @@ export class WriteStream extends Writable {
             let offset = 0;
             while (offset < chunk.length) {
                 const part = offset === 0 ? chunk : chunk.subarray(offset);
-                const position = this.position === null ? null : this.position + offset;
-                const written = await this.handle.write(part as Uint8Array<ArrayBuffer>, position);
+                // native write() treats explicit null as offset 0, not "current offset" — omit the arg instead
+                const written = this.position === null
+                    ? await this.handle.write(part as Uint8Array<ArrayBuffer>)
+                    : await this.handle.write(part as Uint8Array<ArrayBuffer>, this.position + offset);
                 if (written <= 0) throw new Error('write returned no bytes');
                 offset += written;
                 this.bytesWritten += written;

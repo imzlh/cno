@@ -1,6 +1,6 @@
 {
   "name": "cts",
-  "version": "2.9.0",
+  "version": "2.9.1",
   "description": "cts - circu.js bootstrap to provide full typescript experience",
   "main": "src/main.ts",
   "type": "module",
@@ -19,7 +19,7 @@
   "license": "MIT",
   "packageManager": "pnpm@10.17.1",
   "dependencies": {
-    "@cnojs/http": "^1",
+    "@cnojs/http": "workspace:../http",
     "@formatjs/intl": "^4.0.6",
     "@formatjs/intl-datetimeformat": "^7.0.6",
     "@formatjs/intl-displaynames": "^7.0.6",

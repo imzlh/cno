@@ -6,17 +6,18 @@
 const crypto = import.meta.use('crypto');
 
 // Re-export types from types.ts
-export type { BinaryInput, Hash, Hmac, Cipheriv, Decipheriv, CipherGCM, DecipherGCM, GcmEncryptResult, GcmDecryptResult, Sign, Verify } from './types';
-import type { BinaryInput, Hash, Hmac, Cipheriv, Decipheriv, CipherGCM, DecipherGCM, GcmEncryptResult, GcmDecryptResult, Sign, Verify } from './types';
+export type { BinaryInput, KeyInput, Hash, Hmac, Cipheriv, Decipheriv, CipherGCM, DecipherGCM, GcmEncryptResult, GcmDecryptResult, Sign, Verify } from './types';
+export type { ScryptOptions } from './random';
+import type { BinaryInput, KeyInput, Hash, Hmac, Cipheriv, Decipheriv, CipherGCM, DecipherGCM, GcmEncryptResult, GcmDecryptResult, Sign, Verify } from './types';
 
 // Import helpers from helpers.ts
 import { toBuffer, encodeOutput, concatBuffers, createBufferedCipher, createBufferedDecipher, isGcmAlgorithm, normalizeHashAlgorithm, oneShotHmac, createOneShotHmac, readAsymmetricCipherArgs } from './helpers';
 
 function resolveCurve(curve: string): 'p256' | 'p384' | 'p521' {
     switch (curve.toLowerCase()) {
-        case 'p256': case 'prime256v1': case 'secp256r1': return 'p256';
-        case 'p384': case 'secp384r1': return 'p384';
-        case 'p521': case 'secp521r1': return 'p521';
+        case 'p256': case 'p-256': case 'prime256v1': case 'secp256r1': return 'p256';
+        case 'p384': case 'p-384': case 'secp384r1': return 'p384';
+        case 'p521': case 'p-521': case 'secp521r1': return 'p521';
         default: throw new Error(`Unsupported curve: ${curve}`);
     }
 }
@@ -586,7 +587,7 @@ export function getRandomValues<T extends ArrayBufferView>(array: T): T {
     return array;
 }
 // Re-export random/kdf/hkdf from random.ts
-export { randomInt, randomFill, randomFillSync, pbkdf2, pbkdf2Sync, pbkdf2Sha256, pbkdf2Sha512, hkdf, hkdfSync, hkdfSha256, hkdfSha512 } from './random';
+export { randomInt, randomFill, randomFillSync, pbkdf2, pbkdf2Sync, pbkdf2Sha256, pbkdf2Sha512, scrypt, scryptSync, hkdf, hkdfSync, hkdfSha256, hkdfSha512 } from './random';
 
 // RSA
 
@@ -641,7 +642,7 @@ export function createSign(algorithm: string): Sign {
             data.push(toBuffer(input, encoding));
             return this;
         },
-        sign(privateKey: ArrayBuffer | Uint8Array, outputEncoding?: string) {
+        sign(privateKey: KeyInput, outputEncoding?: string) {
             const keyBuf = toBuffer(privateKey);
             const allData = concatBuffers(data);
             data = [];
@@ -673,9 +674,9 @@ export function createVerify(algorithm: string): Verify {
             data.push(toBuffer(input, encoding));
             return this;
         },
-        verify(publicKey: ArrayBuffer | Uint8Array, signature: ArrayBuffer | Uint8Array, signatureEncoding?: string) {
+        verify(publicKey: KeyInput, signature: BinaryInput, signatureEncoding?: string) {
             const keyBuf = toBuffer(publicKey);
-            const sigBuf = toBuffer(signature);
+            const sigBuf = toBuffer(signature, signatureEncoding);
             const allData = concatBuffers(data);
             data = [];
 
@@ -693,7 +694,7 @@ export function createVerify(algorithm: string): Verify {
     };
 }
 
-export function sign(algorithm: string, data: ArrayBuffer | Uint8Array, key: ArrayBuffer | Uint8Array): ArrayBuffer {
+export function sign(algorithm: string, data: BinaryInput, key: KeyInput): ArrayBuffer {
     const dataBuf = toBuffer(data);
     const keyBuf = toBuffer(key);
 
@@ -721,7 +722,7 @@ export function signSha512(key: ArrayBuffer | Uint8Array | string, data: ArrayBu
     return crypto.signSha512(toBuffer(key), toBuffer(data));
 }
 
-export function verify(algorithm: string, data: ArrayBuffer | Uint8Array, key: ArrayBuffer | Uint8Array, signature: ArrayBuffer | Uint8Array): boolean {
+export function verify(algorithm: string, data: BinaryInput, key: KeyInput, signature: BinaryInput): boolean {
     const dataBuf = toBuffer(data);
     const keyBuf = toBuffer(key);
     const sigBuf = toBuffer(signature);

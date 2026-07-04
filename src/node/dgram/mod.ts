@@ -64,394 +64,467 @@ export interface SocketOptions {
 
 // Socket class
 
-export class Socket extends EventEmitter {
-    private _handle: CModuleUDP.UDP | null = null;
-    private _type: 'udp4' | 'udp6';
-    private _reuseAddr: boolean;
-    private _ipv6Only: boolean;
-    private _bound: boolean = false;
-    private _connected: boolean = false;
-    private _address: AddressInfo | null = null;
-    private _remoteAddress: AddressInfo | null = null;
-    private _recvBufferSize: number = 65536;
-    private _sendBufferSize: number = 65536;
+function flattenPrototype(target: object): void {
+    const parent = Object.getPrototypeOf(target);
+    if (!parent || parent === Object.prototype) return;
 
+    for (const key of Object.getOwnPropertyNames(parent)) {
+        if (key === 'constructor' || Object.prototype.hasOwnProperty.call(target, key)) continue;
+        const descriptor = Object.getOwnPropertyDescriptor(parent, key);
+        if (descriptor) Object.defineProperty(target, key, descriptor);
+    }
+
+    for (const key of Object.getOwnPropertySymbols(parent)) {
+        if (Object.prototype.hasOwnProperty.call(target, key)) continue;
+        const descriptor = Object.getOwnPropertyDescriptor(parent, key);
+        if (descriptor) Object.defineProperty(target, key, descriptor);
+    }
+}
+
+export interface Socket extends EventEmitter {
     readonly isIPv6: boolean;
-
-    constructor(type: 'udp4' | 'udp6', reuseAddr?: boolean, ipv6Only?: boolean) {
-        super();
-        this._type = type;
-        this._reuseAddr = reuseAddr ?? false;
-        this._ipv6Only = ipv6Only ?? false;
-        this.isIPv6 = type === 'udp6';
-    }
-
-    async _init(): Promise<void> {
-        const af = this._type === 'udp6' ? os.AF_INET6 : os.AF_INET;
-        this._handle = await udp.create(af);
-    }
-
+    _handle: CModuleUDP.UDP | null;
+    _type: 'udp4' | 'udp6';
+    _reuseAddr: boolean;
+    _ipv6Only: boolean;
+    _bound: boolean;
+    _connected: boolean;
+    _address: AddressInfo | null;
+    _remoteAddress: AddressInfo | null;
+    _recvBufferSize: number;
+    _sendBufferSize: number;
+    _refd: boolean;
+    _init(): Promise<void>;
     bind(port?: number, address?: string, callback?: () => void): this;
     bind(options: BindOptions, callback?: () => void): this;
-    bind(portOrOptions?: number | BindOptions, addressOrCallback?: string | (() => void), callback?: () => void): this {
-        // Asynchronously bind
-        this._doBind(portOrOptions, addressOrCallback, callback);
-        return this;
-    }
-
-    private async _doBind(portOrOptions?: number | BindOptions, addressOrCallback?: string | (() => void), callback?: () => void): Promise<void> {
-        let port: number = 0;
-        let address: string = this._type === 'udp6' ? '::' : '0.0.0.0';
-        let cb: (() => void) | undefined;
-
-        if (typeof portOrOptions === 'object') {
-            port = portOrOptions.port ?? 0;
-            address = portOrOptions.address ?? address;
-            cb = addressOrCallback as (() => void) | undefined;
-            if (portOrOptions.signal) {
-                portOrOptions.signal.addEventListener('abort', () => {
-                    this.close();
-                });
-            }
-        } else {
-            port = portOrOptions ?? 0;
-            if (typeof addressOrCallback === 'string') {
-                address = addressOrCallback;
-            } else if (typeof addressOrCallback === 'function') {
-                cb = addressOrCallback;
-            }
-            if (callback) cb = callback;
-        }
-
-        try {
-            if (!this._handle) {
-                await this._init();
-            }
-
-            const flags = this._ipv6Only ? udp.UDP_IPV6ONLY : 0;
-
-            this._handle!.bind({ ip: address, port, flags });
-            this._bound = true;
-
-            const sockname = this._handle!.getsockname();
-            this._address = {
-                address: sockname.ip ?? address,
-                family: this._type === 'udp6' ? 'IPv6' : 'IPv4',
-                port: sockname.port ?? port,
-            };
-
-            this.emit('listening');
-            cb?.();
-
-            // Start receiving
-            this._startRecv();
-        } catch (err) {
-            this.emit('error', err);
-        }
-    }
-
-    private async _startRecv(): Promise<void> {
-        if (!this._handle || !this._bound) return;
-
-        const buffer = new Uint8Array(this._recvBufferSize);
-
-        while (this._handle && this._bound) {
-            try {
-                const result = await this._handle.recv(buffer);
-                if (result.nread > 0) {
-                    const msg = buffer.slice(0, result.nread);
-                    const rinfo: RemoteInfo = {
-                        address: result.addr?.ip ?? '',
-                        family: result.addr?.family === 6 ? 'IPv6' : 'IPv4',
-                        port: result.addr?.port ?? 0,
-                        size: result.nread,
-                    };
-                    this.emit('message', msg, rinfo);
-                }
-            } catch (err) {
-                if (this._handle) {
-                    this.emit('error', err);
-                }
-            }
-        }
-    }
-
+    _doBind(portOrOptions?: number | BindOptions, addressOrCallback?: string | (() => void), callback?: () => void): Promise<void>;
+    _startRecv(): Promise<void>;
     send(msg: string | Uint8Array | Array<string | Uint8Array>, port: number, address?: string, callback?: (error: Error | null, bytes?: number) => void): this;
     send(msg: string | Uint8Array | Array<string | Uint8Array>, port: number, address: string, callback: (error: Error | null, bytes?: number) => void): this;
-    send(msg: string | Uint8Array | Array<string | Uint8Array>, port: number, addressOrCallback?: string | ((error: Error | null, bytes?: number) => void), callback?: (error: Error | null, bytes?: number) => void): this {
-        // Asynchronously send
-        this._doSend(msg, port, addressOrCallback, callback);
-        return this;
-    }
+    _doSend(msg: string | Uint8Array | Array<string | Uint8Array>, port: number, addressOrCallback?: string | ((error: Error | null, bytes?: number) => void), callback?: (error: Error | null, bytes?: number) => void): Promise<void>;
+    connect(port: number, address?: string, callback?: () => void): Promise<this>;
+    disconnect(): Promise<this>;
+    address(): AddressInfo | null;
+    remoteAddress(): AddressInfo | null;
+    setBroadcast(flag: boolean): this;
+    setTTL(ttl: number): this;
+    setMulticastTTL(ttl: number): this;
+    setMulticastInterface(multicastInterface?: string): this;
+    setMulticastLoopback(flag: boolean): this;
+    addMembership(multicastAddress: string, multicastInterface?: string): void;
+    dropMembership(multicastAddress: string, multicastInterface?: string): void;
+    addSourceSpecificMembership(sourceAddress: string, groupAddress: string, multicastInterface?: string): void;
+    dropSourceSpecificMembership(sourceAddress: string, groupAddress: string, multicastInterface?: string): void;
+    getRecvBufferSize(): number;
+    setRecvBufferSize(size: number): this;
+    getSendBufferSize(): number;
+    setSendBufferSize(size: number): this;
+    ref(): this;
+    unref(): this;
+    close(callback?: () => void): this;
+    _doClose(callback?: () => void): Promise<void>;
+}
 
-    private async _doSend(msg: string | Uint8Array | Array<string | Uint8Array>, port: number, addressOrCallback?: string | ((error: Error | null, bytes?: number) => void), callback?: (error: Error | null, bytes?: number) => void): Promise<void> {
-        let address: string;
-        let cb: ((error: Error | null, bytes?: number) => void) | undefined;
+export interface SocketConstructor {
+    new (type: 'udp4' | 'udp6', reuseAddr?: boolean, ipv6Only?: boolean): Socket;
+    (type: 'udp4' | 'udp6', reuseAddr?: boolean, ipv6Only?: boolean): Socket;
+    prototype: Socket;
+}
 
+function initSocket(self: any, type: 'udp4' | 'udp6', reuseAddr?: boolean, ipv6Only?: boolean): void {
+    EventEmitter.call(self);
+    self._handle = null;
+    self._bound = false;
+    self._connected = false;
+    self._address = null;
+    self._remoteAddress = null;
+    self._recvBufferSize = 65536;
+    self._sendBufferSize = 65536;
+    self._refd = true;
+    self._type = type;
+    self._reuseAddr = reuseAddr ?? false;
+    self._ipv6Only = ipv6Only ?? false;
+    self.isIPv6 = type === 'udp6';
+}
+
+export const Socket: SocketConstructor = function Socket(this: any, type: 'udp4' | 'udp6', reuseAddr?: boolean, ipv6Only?: boolean) {
+    const target = this && (typeof this === 'object' || typeof this === 'function')
+        ? this
+        : Object.create(Socket.prototype);
+    initSocket(target, type, reuseAddr, ipv6Only);
+    return target;
+} as SocketConstructor;
+
+Object.setPrototypeOf(Socket, EventEmitter);
+Socket.prototype = Object.create(EventEmitter.prototype);
+
+Socket.prototype._init = async function _init(this: Socket): Promise<void> {
+    const af = this._type === 'udp6' ? os.AF_INET6 : os.AF_INET;
+    this._handle = new udp.UDP(af);
+};
+
+Socket.prototype.bind = function bind(this: Socket, portOrOptions?: number | BindOptions, addressOrCallback?: string | (() => void), callback?: () => void): Socket {
+    // Asynchronously bind
+    this._doBind(portOrOptions, addressOrCallback, callback);
+    return this;
+};
+
+Socket.prototype._doBind = async function _doBind(this: Socket, portOrOptions?: number | BindOptions, addressOrCallback?: string | (() => void), callback?: () => void): Promise<void> {
+    let port: number = 0;
+    let address: string = this._type === 'udp6' ? '::' : '0.0.0.0';
+    let cb: (() => void) | undefined;
+
+    if (typeof portOrOptions === 'object') {
+        port = portOrOptions.port ?? 0;
+        address = portOrOptions.address ?? address;
+        cb = addressOrCallback as (() => void) | undefined;
+        if (portOrOptions.signal) {
+            portOrOptions.signal.addEventListener('abort', () => {
+                this.close();
+            });
+        }
+    } else {
+        port = portOrOptions ?? 0;
         if (typeof addressOrCallback === 'string') {
             address = addressOrCallback;
-            cb = callback;
-        } else {
-            address = this._remoteAddress?.address ?? '127.0.0.1';
+        } else if (typeof addressOrCallback === 'function') {
             cb = addressOrCallback;
         }
-
-        let data: Uint8Array;
-        if (typeof msg === 'string') {
-            data = engine.encodeString(msg);
-        } else if (Array.isArray(msg)) {
-            const buffers = msg.map(m => typeof m === 'string' ? engine.encodeString(m) : m);
-            // @ts-ignore - Buffer.concat returns Buffer which is Uint8Array
-            data = Buffer.concat(buffers);
-        } else {
-            data = msg;
-        }
-
-        try {
-            if (!this._handle) {
-                await this._init();
-            }
-
-            const bytes = await this._handle!.send(data, { ip: address, port });
-            cb?.(null, bytes);
-            this.emit('send', bytes);
-        } catch (err) {
-            if (cb) {
-                cb(err as Error);
-            } else if (this.listenerCount('error') > 0) {
-                this.emit('error', err);
-            }
-        }
+        if (callback) cb = callback;
     }
 
-    async connect(port: number, address?: string, callback?: () => void): Promise<this> {
+    try {
         if (!this._handle) {
             await this._init();
         }
 
-        const addr = address ?? '127.0.0.1';
+        const flags = this._ipv6Only ? udp.UDP_IPV6ONLY : 0;
 
-        this._handle!.connect({ ip: addr, port });
-        this._connected = true;
+        this._handle!.bind({ ip: address, port }, flags);
+        this._bound = true;
 
-        const peername = this._handle!.getpeername();
-        this._remoteAddress = {
-            address: peername.ip ?? addr,
+        const sockname = this._handle!.getsockname();
+        this._address = {
+            address: sockname.ip ?? address,
             family: this._type === 'udp6' ? 'IPv6' : 'IPv4',
-            port: peername.port ?? port,
+            port: sockname.port ?? port,
         };
 
-        this.emit('connect');
-        callback?.();
+        this.emit('listening');
+        cb?.();
 
-        return this;
+        // Start receiving
+        this._startRecv();
+    } catch (err) {
+        this.emit('error', err);
     }
+};
 
-    async disconnect(): Promise<this> {
-        this._connected = false;
-        this._remoteAddress = null;
-        return this;
-    }
+Socket.prototype._startRecv = async function _startRecv(this: Socket): Promise<void> {
+    if (!this._handle || !this._bound) return;
 
-    address(): AddressInfo | null {
-        return this._address;
-    }
+    const buffer = new Uint8Array(this._recvBufferSize);
 
-    remoteAddress(): AddressInfo | null {
-        return this._remoteAddress;
-    }
-
-    setBroadcast(flag: boolean): this {
-        if (!this._handle) return this;
+    while (this._handle && this._bound) {
         try {
-            const s = _getSocket(this._handle);
-            if (!s) return this;
-            const val = new Uint8Array(4); new DataView(val.buffer).setUint32(0, flag ? 1 : 0, true);
-            s.setopt(sock.defines.SOL_SOCKET, sock.defines.SO_BROADCAST, val);
-        } catch { /* best-effort */ }
-        return this;
-    }
-
-    setTTL(ttl: number): this {
-        if (!this._handle) return this;
-        try {
-            const s = _getSocket(this._handle);
-            if (!s) return this;
-            const val = new Uint8Array(4); new DataView(val.buffer).setUint32(0, ttl, true);
-            s.setopt(sock.defines.IPPROTO_IP, 2, val);
-        } catch { /* best-effort */ }
-        return this;
-    }
-
-    setMulticastTTL(ttl: number): this {
-        if (!this._handle) return this;
-        try {
-            const s = _getSocket(this._handle);
-            if (!s) return this;
-            const val = new Uint8Array(4); new DataView(val.buffer).setUint32(0, ttl, true);
-            s.setopt(sock.defines.IPPROTO_IP, 10, val);
-        } catch { /* best-effort */ }
-        return this;
-    }
-
-    setMulticastInterface(multicastInterface?: string): this {
-        if (!this._handle) return this;
-        try {
-            const s = _getSocket(this._handle);
-            if (!s) return this;
-            const buf = new Uint8Array(4);
-            if (multicastInterface) {
-                const parts = multicastInterface.split('.');
-                if (parts.length === 4) {
-                    for (let i = 0; i < 4; i++) buf[i] = parseInt(parts[i]);
-                }
+            const result = await this._handle.recv(buffer);
+            if (result.nread > 0) {
+                const msg = Buffer.from(buffer.subarray(0, result.nread));
+                const rinfo: RemoteInfo = {
+                    address: result.addr?.ip ?? '',
+                    family: result.addr?.family === 6 ? 'IPv6' : 'IPv4',
+                    port: result.addr?.port ?? 0,
+                    size: result.nread,
+                };
+                this.emit('message', msg, rinfo);
             }
-            s.setopt(sock.defines.IPPROTO_IP, 12, buf);
-        } catch { /* best-effort */ }
-        return this;
+        } catch (err) {
+            if (this._handle) {
+                this.emit('error', err);
+            }
+        }
+    }
+};
+
+Socket.prototype.send = function send(this: Socket, msg: string | Uint8Array | Array<string | Uint8Array>, port: number, addressOrCallback?: string | ((error: Error | null, bytes?: number) => void), callback?: (error: Error | null, bytes?: number) => void): Socket {
+    // Asynchronously send
+    this._doSend(msg, port, addressOrCallback, callback);
+    return this;
+};
+
+Socket.prototype._doSend = async function _doSend(this: Socket, msg: string | Uint8Array | Array<string | Uint8Array>, port: number, addressOrCallback?: string | ((error: Error | null, bytes?: number) => void), callback?: (error: Error | null, bytes?: number) => void): Promise<void> {
+    let address: string;
+    let cb: ((error: Error | null, bytes?: number) => void) | undefined;
+
+    if (typeof addressOrCallback === 'string') {
+        address = addressOrCallback;
+        cb = callback;
+    } else {
+        address = this._remoteAddress?.address ?? '127.0.0.1';
+        cb = addressOrCallback;
     }
 
-    setMulticastLoopback(flag: boolean): this {
-        if (!this._handle) return this;
+    let data: Uint8Array;
+    if (typeof msg === 'string') {
+        data = engine.encodeString(msg);
+    } else if (Array.isArray(msg)) {
+        const buffers = msg.map(m => typeof m === 'string' ? engine.encodeString(m) : m);
+        // @ts-ignore - Buffer.concat returns Buffer which is Uint8Array
+        data = Buffer.concat(buffers);
+    } else {
+        data = msg;
+    }
+
+    try {
+        if (!this._handle) {
+            await this._init();
+        }
+
+        const bytes = await this._handle!.send(data, { ip: address, port });
+        cb?.(null, bytes);
+        this.emit('send', bytes);
+    } catch (err) {
+        if (cb) {
+            cb(err as Error);
+        } else if (this.listenerCount('error') > 0) {
+            this.emit('error', err);
+        }
+    }
+};
+
+Socket.prototype.connect = async function connect(this: Socket, port: number, address?: string, callback?: () => void): Promise<Socket> {
+    if (!this._handle) {
+        await this._init();
+    }
+
+    const addr = address ?? '127.0.0.1';
+
+    this._handle!.connect({ ip: addr, port });
+    this._connected = true;
+
+    const peername = this._handle!.getpeername();
+    this._remoteAddress = {
+        address: peername.ip ?? addr,
+        family: this._type === 'udp6' ? 'IPv6' : 'IPv4',
+        port: peername.port ?? port,
+    };
+
+    this.emit('connect');
+    callback?.();
+
+    return this;
+};
+
+Socket.prototype.disconnect = async function disconnect(this: Socket): Promise<Socket> {
+    this._connected = false;
+    this._remoteAddress = null;
+    return this;
+};
+
+Socket.prototype.address = function address(this: Socket): AddressInfo | null {
+    return this._address;
+};
+
+Socket.prototype.remoteAddress = function remoteAddress(this: Socket): AddressInfo | null {
+    return this._remoteAddress;
+};
+
+Socket.prototype.setBroadcast = function setBroadcast(this: Socket, flag: boolean): Socket {
+    if (!this._handle) return this;
+    try {
+        const s = _getSocket(this._handle);
+        if (!s) return this;
+        const val = new Uint8Array(4); new DataView(val.buffer).setUint32(0, flag ? 1 : 0, true);
+        s.setopt(sock.defines.SOL_SOCKET, sock.defines.SO_BROADCAST, val);
+    } catch { /* best-effort */ }
+    return this;
+};
+
+Socket.prototype.setTTL = function setTTL(this: Socket, ttl: number): Socket {
+    if (!this._handle) return this;
+    try {
+        const s = _getSocket(this._handle);
+        if (!s) return this;
+        const val = new Uint8Array(4); new DataView(val.buffer).setUint32(0, ttl, true);
+        s.setopt(sock.defines.IPPROTO_IP, 2, val);
+    } catch { /* best-effort */ }
+    return this;
+};
+
+Socket.prototype.setMulticastTTL = function setMulticastTTL(this: Socket, ttl: number): Socket {
+    if (!this._handle) return this;
+    try {
+        const s = _getSocket(this._handle);
+        if (!s) return this;
+        const val = new Uint8Array(4); new DataView(val.buffer).setUint32(0, ttl, true);
+        s.setopt(sock.defines.IPPROTO_IP, 10, val);
+    } catch { /* best-effort */ }
+    return this;
+};
+
+Socket.prototype.setMulticastInterface = function setMulticastInterface(this: Socket, multicastInterface?: string): Socket {
+    if (!this._handle) return this;
+    try {
+        const s = _getSocket(this._handle);
+        if (!s) return this;
+        const buf = new Uint8Array(4);
+        if (multicastInterface) {
+            const parts = multicastInterface.split('.');
+            if (parts.length === 4) {
+                for (let i = 0; i < 4; i++) buf[i] = parseInt(parts[i]);
+            }
+        }
+        s.setopt(sock.defines.IPPROTO_IP, 12, buf);
+    } catch { /* best-effort */ }
+    return this;
+};
+
+Socket.prototype.setMulticastLoopback = function setMulticastLoopback(this: Socket, flag: boolean): Socket {
+    if (!this._handle) return this;
+    try {
+        const s = _getSocket(this._handle);
+        if (!s) return this;
+        const val = new Uint8Array(4); new DataView(val.buffer).setUint32(0, flag ? 1 : 0, true);
+        s.setopt(sock.defines.IPPROTO_IP, 11, val);
+    } catch { /* best-effort */ }
+    return this;
+};
+
+Socket.prototype.addMembership = function addMembership(this: Socket, multicastAddress: string, multicastInterface?: string): void {
+    if (!this._handle) return;
+    try {
+        const s = _getSocket(this._handle);
+        if (!s) return;
+        const mreq = new Uint8Array(8);
+        const mcParts = multicastAddress.split('.');
+        if (mcParts.length === 4) {
+            for (let i = 0; i < 4; i++) mreq[i] = parseInt(mcParts[i]);
+        }
+        if (multicastInterface) {
+            const ifParts = multicastInterface.split('.');
+            if (ifParts.length === 4) {
+                for (let i = 0; i < 4; i++) mreq[4 + i] = parseInt(ifParts[i]);
+            }
+        }
+        s.setopt(sock.defines.IPPROTO_IP, IP_ADD_MEMBERSHIP, mreq);
+    } catch { /* best-effort */ }
+};
+
+Socket.prototype.dropMembership = function dropMembership(this: Socket, multicastAddress: string, multicastInterface?: string): void {
+    if (!this._handle) return;
+    try {
+        const s = _getSocket(this._handle);
+        if (!s) return;
+        const mreq = new Uint8Array(8);
+        const mcParts = multicastAddress.split('.');
+        if (mcParts.length === 4) {
+            for (let i = 0; i < 4; i++) mreq[i] = parseInt(mcParts[i]);
+        }
+        if (multicastInterface) {
+            const ifParts = multicastInterface.split('.');
+            if (ifParts.length === 4) {
+                for (let i = 0; i < 4; i++) mreq[4 + i] = parseInt(ifParts[i]);
+            }
+        }
+        s.setopt(sock.defines.IPPROTO_IP, IP_DROP_MEMBERSHIP, mreq);
+    } catch { /* best-effort */ }
+};
+
+Socket.prototype.addSourceSpecificMembership = function addSourceSpecificMembership(this: Socket, _sourceAddress: string, _groupAddress: string, _multicastInterface?: string): void {
+    // MCAST_JOIN_SOURCE_GROUP - C layer doesn't expose this constant
+    process.emitWarning?.('dgram.addSourceSpecificMembership() is not fully supported in this runtime', 'UnsupportedWarning');
+};
+
+Socket.prototype.dropSourceSpecificMembership = function dropSourceSpecificMembership(this: Socket, _sourceAddress: string, _groupAddress: string, _multicastInterface?: string): void {
+    process.emitWarning?.('dgram.dropSourceSpecificMembership() is not fully supported in this runtime', 'UnsupportedWarning');
+};
+
+Socket.prototype.getRecvBufferSize = function getRecvBufferSize(this: Socket): number {
+    if (this._handle) {
         try {
             const s = _getSocket(this._handle);
-            if (!s) return this;
-            const val = new Uint8Array(4); new DataView(val.buffer).setUint32(0, flag ? 1 : 0, true);
-            s.setopt(sock.defines.IPPROTO_IP, 11, val);
-        } catch { /* best-effort */ }
-        return this;
+            if (s) {
+                const val = s.getopt(sock.defines.SOL_SOCKET, sock.defines.SO_RCVBUF, 4);
+                return new DataView(val.buffer).getUint32(0, true);
+            }
+        } catch { /* fall through */ }
     }
+    return this._recvBufferSize;
+};
 
-    addMembership(multicastAddress: string, multicastInterface?: string): void {
-        if (!this._handle) return;
+Socket.prototype.setRecvBufferSize = function setRecvBufferSize(this: Socket, size: number): Socket {
+    this._recvBufferSize = size;
+    if (this._handle) {
         try {
             const s = _getSocket(this._handle);
-            if (!s) return;
-            const mreq = new Uint8Array(8);
-            const mcParts = multicastAddress.split('.');
-            if (mcParts.length === 4) {
-                for (let i = 0; i < 4; i++) mreq[i] = parseInt(mcParts[i]);
+            if (s) {
+                const val = new Uint8Array(4); new DataView(val.buffer).setUint32(0, size, true);
+                s.setopt(sock.defines.SOL_SOCKET, sock.defines.SO_RCVBUF, val);
             }
-            if (multicastInterface) {
-                const ifParts = multicastInterface.split('.');
-                if (ifParts.length === 4) {
-                    for (let i = 0; i < 4; i++) mreq[4 + i] = parseInt(ifParts[i]);
-                }
-            }
-            s.setopt(sock.defines.IPPROTO_IP, IP_ADD_MEMBERSHIP, mreq);
         } catch { /* best-effort */ }
     }
+    return this;
+};
 
-    dropMembership(multicastAddress: string, multicastInterface?: string): void {
-        if (!this._handle) return;
+Socket.prototype.getSendBufferSize = function getSendBufferSize(this: Socket): number {
+    if (this._handle) {
         try {
             const s = _getSocket(this._handle);
-            if (!s) return;
-            const mreq = new Uint8Array(8);
-            const mcParts = multicastAddress.split('.');
-            if (mcParts.length === 4) {
-                for (let i = 0; i < 4; i++) mreq[i] = parseInt(mcParts[i]);
+            if (s) {
+                const val = s.getopt(sock.defines.SOL_SOCKET, sock.defines.SO_SNDBUF, 4);
+                return new DataView(val.buffer).getUint32(0, true);
             }
-            if (multicastInterface) {
-                const ifParts = multicastInterface.split('.');
-                if (ifParts.length === 4) {
-                    for (let i = 0; i < 4; i++) mreq[4 + i] = parseInt(ifParts[i]);
-                }
+        } catch { /* fall through */ }
+    }
+    return this._sendBufferSize;
+};
+
+Socket.prototype.setSendBufferSize = function setSendBufferSize(this: Socket, size: number): Socket {
+    this._sendBufferSize = size;
+    if (this._handle) {
+        try {
+            const s = _getSocket(this._handle);
+            if (s) {
+                const val = new Uint8Array(4); new DataView(val.buffer).setUint32(0, size, true);
+                s.setopt(sock.defines.SOL_SOCKET, sock.defines.SO_SNDBUF, val);
             }
-            s.setopt(sock.defines.IPPROTO_IP, IP_DROP_MEMBERSHIP, mreq);
         } catch { /* best-effort */ }
     }
+    return this;
+};
 
-    addSourceSpecificMembership(_sourceAddress: string, _groupAddress: string, _multicastInterface?: string): void {
-        // MCAST_JOIN_SOURCE_GROUP - C layer doesn't expose this constant
-        process.emitWarning?.('dgram.addSourceSpecificMembership() is not fully supported in this runtime', 'UnsupportedWarning');
+Socket.prototype.ref = function ref(this: Socket): Socket {
+    this._refd = true;
+    return this;
+};
+
+Socket.prototype.unref = function unref(this: Socket): Socket {
+    this._refd = false;
+    return this;
+};
+
+Socket.prototype.close = function close(this: Socket, callback?: () => void): Socket {
+    this._doClose(callback);
+    return this;
+};
+
+Socket.prototype._doClose = async function _doClose(this: Socket, callback?: () => void): Promise<void> {
+    if (this._handle) {
+        this._bound = false;
+        this._handle.close();
+        this._handle = null;
     }
+    this.emit('close');
+    callback?.();
+};
 
-    dropSourceSpecificMembership(_sourceAddress: string, _groupAddress: string, _multicastInterface?: string): void {
-        process.emitWarning?.('dgram.dropSourceSpecificMembership() is not fully supported in this runtime', 'UnsupportedWarning');
-    }
+Object.defineProperty(Socket.prototype, 'constructor', {
+    value: Socket,
+    writable: true,
+    configurable: true,
+});
 
-    getRecvBufferSize(): number {
-        if (this._handle) {
-            try {
-                const s = _getSocket(this._handle);
-                if (s) {
-                    const val = s.getopt(sock.defines.SOL_SOCKET, sock.defines.SO_RCVBUF, 4);
-                    return new DataView(val.buffer).getUint32(0, true);
-                }
-            } catch { /* fall through */ }
-        }
-        return this._recvBufferSize;
-    }
-
-    setRecvBufferSize(size: number): this {
-        this._recvBufferSize = size;
-        if (this._handle) {
-            try {
-                const s = _getSocket(this._handle);
-                if (s) {
-                    const val = new Uint8Array(4); new DataView(val.buffer).setUint32(0, size, true);
-                    s.setopt(sock.defines.SOL_SOCKET, sock.defines.SO_RCVBUF, val);
-                }
-            } catch { /* best-effort */ }
-        }
-        return this;
-    }
-
-    getSendBufferSize(): number {
-        if (this._handle) {
-            try {
-                const s = _getSocket(this._handle);
-                if (s) {
-                    const val = s.getopt(sock.defines.SOL_SOCKET, sock.defines.SO_SNDBUF, 4);
-                    return new DataView(val.buffer).getUint32(0, true);
-                }
-            } catch { /* fall through */ }
-        }
-        return this._sendBufferSize;
-    }
-
-    setSendBufferSize(size: number): this {
-        this._sendBufferSize = size;
-        if (this._handle) {
-            try {
-                const s = _getSocket(this._handle);
-                if (s) {
-                    const val = new Uint8Array(4); new DataView(val.buffer).setUint32(0, size, true);
-                    s.setopt(sock.defines.SOL_SOCKET, sock.defines.SO_SNDBUF, val);
-                }
-            } catch { /* best-effort */ }
-        }
-        return this;
-    }
-
-    private _refd: boolean = true;
-
-    ref(): this {
-        this._refd = true;
-        return this;
-    }
-
-    unref(): this {
-        this._refd = false;
-        return this;
-    }
-
-    close(callback?: () => void): this {
-        this._doClose(callback);
-        return this;
-    }
-
-    private async _doClose(callback?: () => void): Promise<void> {
-        if (this._handle) {
-            this._bound = false;
-            this._handle.close();
-            this._handle = null;
-        }
-        this.emit('close');
-        callback?.();
-    }
-}
+flattenPrototype(Socket.prototype);
 
 // Factory functions
 

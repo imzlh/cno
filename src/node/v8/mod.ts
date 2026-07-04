@@ -287,7 +287,7 @@ export class Deserializer {
 
     readValue(): any {
         if (!this._headerRead) {
-            throw new Error('Deserializer header has not been read');
+            this.readHeader();
         }
         const length = this.readUint32();
         const bytes = this._readBytes(length);

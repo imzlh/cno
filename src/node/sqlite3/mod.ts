@@ -103,7 +103,27 @@ function splitEachArgs(args: any[]): { params?: BindParams; rowCallback?: RowCal
     return { params, rowCallback, completeCallback };
 }
 
-function bindStmt(stmt: Sqlite3Stmt, params?: BindParams): void {
+function normalizeBindParams(sql: string, params?: BindParams): BindParams | undefined {
+    if (params === undefined || !isBindObject(params)) return params;
+    const normalized: Record<string, any> = {};
+    for (const [key, value] of Object.entries(params)) {
+        if (/^[:@$]/.test(key)) {
+            normalized[key] = value;
+        } else if (sql.includes(`:${key}`)) {
+            normalized[`:${key}`] = value;
+        } else if (sql.includes(`@${key}`)) {
+            normalized[`@${key}`] = value;
+        } else if (sql.includes(`$${key}`)) {
+            normalized[`$${key}`] = value;
+        } else {
+            normalized[key] = value;
+        }
+    }
+    return normalized;
+}
+
+function bindStmt(stmt: Sqlite3Stmt, params?: BindParams, sql = ''): void {
+    params = normalizeBindParams(sql, params);
     if (params === undefined) {
         stmt.bind();
         return;
@@ -111,12 +131,14 @@ function bindStmt(stmt: Sqlite3Stmt, params?: BindParams): void {
     stmt.bind(params);
 }
 
-function runStmt(stmt: Sqlite3Stmt, params?: BindParams): void {
+function runStmt(stmt: Sqlite3Stmt, params?: BindParams, sql = ''): void {
+    params = normalizeBindParams(sql, params);
     if (params === undefined) stmt.run();
     else stmt.run(params);
 }
 
-function allStmt(stmt: Sqlite3Stmt, params?: BindParams): any[] {
+function allStmt(stmt: Sqlite3Stmt, params?: BindParams, sql = ''): any[] {
+    params = normalizeBindParams(sql, params);
     return params === undefined ? stmt.all() : stmt.all(params);
 }
 
@@ -148,7 +170,7 @@ export class Statement extends EventEmitter {
     bind(...args: any[]): this {
         const { params, callback } = splitArgs(args);
         try {
-            bindStmt(this.getStmt(), params);
+            bindStmt(this.getStmt(), params, this.sql);
             call(callback, this, [null]);
         } catch (err) {
             emitOrThrow(this, callback, this, err);
@@ -185,7 +207,7 @@ export class Statement extends EventEmitter {
         this.db.trace(this.sql);
         const started = Date.now();
         try {
-            runStmt(this.getStmt(), params);
+            runStmt(this.getStmt(), params, this.sql);
             this.lastID = this.db.lastInsertRowid();
             this.changes = this.db.changesCount();
             this.db.profile(this.sql, Date.now() - started);
@@ -201,7 +223,7 @@ export class Statement extends EventEmitter {
         this.db.trace(this.sql);
         const started = Date.now();
         try {
-            const row = allStmt(this.getStmt(), params)[0];
+            const row = allStmt(this.getStmt(), params, this.sql)[0];
             this.db.profile(this.sql, Date.now() - started);
             call(callback, this, [null, row]);
         } catch (err) {
@@ -215,7 +237,7 @@ export class Statement extends EventEmitter {
         this.db.trace(this.sql);
         const started = Date.now();
         try {
-            const rows = allStmt(this.getStmt(), params);
+            const rows = allStmt(this.getStmt(), params, this.sql);
             this.db.profile(this.sql, Date.now() - started);
             call(callback, this, [null, rows]);
         } catch (err) {
@@ -229,7 +251,7 @@ export class Statement extends EventEmitter {
         this.db.trace(this.sql);
         const started = Date.now();
         try {
-            const rows = allStmt(this.getStmt(), params);
+            const rows = allStmt(this.getStmt(), params, this.sql);
             this.db.profile(this.sql, Date.now() - started);
             for (const row of rows) call(rowCallback, this, [null, row]);
             call(completeCallback, this, [null, rows.length]);
@@ -246,7 +268,7 @@ export class Statement extends EventEmitter {
         this.db.trace(this.sql);
         const started = Date.now();
         try {
-            const rows = allStmt(this.getStmt(), params);
+            const rows = allStmt(this.getStmt(), params, this.sql);
             this.db.profile(this.sql, Date.now() - started);
             call(callback, this, [null, mapRows(rows)]);
         } catch (err) {

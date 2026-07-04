@@ -191,8 +191,9 @@ function createTestContext(name: string, origin: string, parent?: Deno.TestConte
         parent,
         async assertSnapshot<T>(actual: T, options?: {
             name?: string; dir?: string; msg?: string; serializer?: (v: T) => string;
-        }): Promise<void> {
-            await assertSnapshotImpl(actual, origin, name, options);
+        } | string): Promise<void> {
+            const snapshotOptions = typeof options === 'string' ? { msg: options } : options;
+            await assertSnapshotImpl(actual, origin, name, snapshotOptions);
         },
         async step(definitionOrName: Deno.TestStepDefinition | string | ((t: Deno.TestContext) => void | Promise<void>), fn?: (t: Deno.TestContext) => void | Promise<void>): Promise<boolean> {
             let stepDef: Deno.TestStepDefinition;
@@ -265,20 +266,23 @@ function isDefinition(obj: unknown): obj is Deno.TestDefinition {
 function parseTestArgs(args: unknown[], extra?: Partial<Deno.TestDefinition>): Deno.TestDefinition {
     if (args.length === 1) {
         const arg = args[0];
-        if (typeof arg === 'object' && arg !== null && 'fn' in arg && 'name' in arg) return { ...arg, ...extra } as Deno.TestDefinition;
-        if (typeof arg === 'function') return { name: arg.name || 'anonymous', fn: arg as any, ...extra };
+        if (typeof arg === 'object' && arg !== null && 'fn' in arg && 'name' in arg)
+            return { ...arg, ...extra } as Deno.TestDefinition;
+        if (typeof arg === 'function')
+            return { name: arg.name || 'anonymous', fn: arg as any, ...extra };
         throw new TypeError('Invalid test definition');
     } else if (args.length === 2) {
         const [a, b] = args;
-        if (typeof a === 'string') return { name: a, fn: b as any, ...extra };
+        if (typeof a === 'string')
+            return { name: a, fn: b as any, ...extra };
         if (typeof a === 'object' && typeof b === 'function') {
             const { name: _n, fn: _f, ...opts } = a as any;
-            return { name: (b as any).name || 'anonymous', fn: b as any, ...opts, ...extra };
+            return { name: _n ?? _f.name ?? 'anonymous', fn: b, ...opts, ...extra };
         }
         throw new TypeError('Invalid test definition');
     } else if (args.length === 3) {
         const { name: _n, fn: _f, ...opts } = args[1] as any;
-        return { name: args[0] as string, fn: args[2] as any, ...opts, ...extra };
+        return { name: args[0] ?? _n, fn: args[2], ...opts, ...extra };
     }
     throw new TypeError('Invalid test definition');
 }
@@ -333,7 +337,7 @@ function createTestFunction(): Deno.DenoTest {
         sanitizer: () => { /* no-op: sanitizers not implemented */ },
     });
 
-    return testObj as Deno.DenoTest;
+    return testObj as unknown as Deno.DenoTest;
 }
 
 function createBenchFunction(): {
@@ -483,7 +487,7 @@ Object.defineProperty(globalThis, "Deno", {
                 return env;
             },
         },
-        exit: code => os.exit(code ?? Deno.exitCode),
+        exit: (code?: number) => os.exit(code ?? Deno.exitCode),
         exitCode: 0,
         build: {
             arch: uname.machine,
@@ -502,7 +506,7 @@ Object.defineProperty(globalThis, "Deno", {
         chdir: (dir: string) => os.chdir(dir),
         get mainModule() {
             // @ts-ignore - cts api
-            return globalThis.__mainScript;
+            return String(globalThis.__mainScript ?? '');
         },
         execPath: () => os.exePath,
         noColor: safeGetEnv("NO_COLOR") != null,
@@ -536,8 +540,8 @@ Object.defineProperty(globalThis, "Deno", {
 
         // permission eco
         permissions: {
-            query(desc) { return Promise.resolve(this.querySync(desc)); },
-            querySync: desc => ({
+            query(desc: any) { return Promise.resolve(this.querySync(desc)); },
+            querySync: (desc: any) => ({
                 state: 'granted',
                 addEventListener: () => void 0,
                 removeEventListener: () => void 0,
@@ -551,7 +555,7 @@ Object.defineProperty(globalThis, "Deno", {
             revokeSync: notSupported,
         },
 
-        addSignalListener(sig, handler) {
+        addSignalListener(sig: any, handler: any) {
             // @ts-ignore
             const sigint = signal.signals[sig];
             if (typeof sigint != 'number')
@@ -563,7 +567,7 @@ Object.defineProperty(globalThis, "Deno", {
             signalMap[sig].set(handler, ret);
         },
 
-        removeSignalListener(sig, handler) {
+        removeSignalListener(sig: any, handler: any) {
             // @ts-ignore
             const sigint = signal.signals[sig];
             if (typeof sigint != 'number')
@@ -574,7 +578,7 @@ Object.defineProperty(globalThis, "Deno", {
             if (ret) ret.close();
         },
 
-        inspect(obj: any, opt) {
+        inspect(obj: any, opt?: { colors?: boolean; depth?: number; showHidden?: boolean }) {
             return console.inspect(obj, {
                 colors: opt?.colors ?? Deno.noColor,
                 depth: opt?.depth ?? undefined,
@@ -582,10 +586,10 @@ Object.defineProperty(globalThis, "Deno", {
             });
         },
 
-        refTimer(id) {
+        refTimer(id: any) {
             timers.refTimer(getTimerID(id));
         },
-        unrefTimer(id) {
+        unrefTimer(id: any) {
             timers.unrefTimer(getTimerID(id));
         },
 
@@ -623,7 +627,7 @@ Object.defineProperty(globalThis, "Deno", {
                 })).join(' ');
             },
         },
-    } as Partial<typeof Deno>,
+    } as unknown as Partial<typeof Deno>,
     writable: false,
     enumerable: true,
     configurable: true,

@@ -275,47 +275,69 @@ export async function mkdirRecursive(pathStr: string, mode?: number): Promise<vo
 }
 
 export function createFileHandle(fd: number, handle: CModuleAsyncFS.FileHandle) {
+    let closed = false;
+
+    async function ensureOpen(): Promise<void> {
+        if (closed) throw new Error('File handle is closed');
+    }
+
     return {
         fd,
         async read(buffer: Uint8Array<ArrayBuffer>, offset?: number, length?: number, position?: number | null) {
+            await ensureOpen();
             const o = offset ?? 0, l = length ?? buffer.length;
-            const bytesRead = await handle.read(buffer.subarray(o, o + l), position ?? null);
+            // native read() treats explicit null as offset 0, not "current offset" — omit the arg instead
+            const bytesRead = position == null
+                ? await handle.read(buffer.subarray(o, o + l))
+                : await handle.read(buffer.subarray(o, o + l), position);
             return { bytesRead, buffer };
         },
         async write(buffer: Uint8Array | string, offset?: number, length?: number, position?: number | null) {
+            await ensureOpen();
             const data = typeof buffer === 'string' ? toUint8Array(buffer) : buffer;
             const o = offset ?? 0, l = length ?? data.length;
-            const bytesWritten = await handle.write(data.subarray(o, o + l) as Uint8Array<ArrayBuffer>, position ?? null);
+            const bytesWritten = position == null
+                ? await handle.write(data.subarray(o, o + l) as Uint8Array<ArrayBuffer>)
+                : await handle.write(data.subarray(o, o + l) as Uint8Array<ArrayBuffer>, position);
             return { bytesWritten, buffer: data };
         },
-        async close() { await handle.close(); },
+        async close() {
+            if (closed) return;
+            closed = true;
+            await handle.close();
+        },
         async stat(ops?: StatFsOptions) {
+            await ensureOpen();
             if (ops?.bigint) throw new Error('bigint option is not supported');
             return toNodeStat(await handle.stat());
         },
-        async sync() { await handle.sync(); },
-        async datasync() { await handle.datasync(); },
-        async truncate(len?: number) { await handle.truncate(len ?? 0); },
-        async chmod(mode: Mode) { await handle.chmod(modeToNumber(mode)!); },
-        async chown(uid: number, gid: number) { await handle.chown(uid, gid); },
+        async sync() { await ensureOpen(); await handle.sync(); },
+        async datasync() { await ensureOpen(); await handle.datasync(); },
+        async truncate(len?: number) { await ensureOpen(); await handle.truncate(len ?? 0); },
+        async chmod(mode: Mode) { await ensureOpen(); await handle.chmod(modeToNumber(mode)!); },
+        async chown(uid: number, gid: number) { await ensureOpen(); await handle.chown(uid, gid); },
         async utimes(atime: TimeLike, mtime: TimeLike) {
+            await ensureOpen();
             await handle.utime(timeToNumber(atime) / 1000, timeToNumber(mtime) / 1000);
         },
         async appendFile(data: string | Uint8Array | ArrayBuffer) {
+            await ensureOpen();
             await handle.write(toUint8Array(data));
         },
         async readFile(options?: { encoding?: BufferEncoding | null } | BufferEncoding) {
+            await ensureOpen();
             const st = await handle.stat();
             const buf = new Uint8Array(st.size);
             let off = 0;
-            while (off < st.size) { const n = await handle.read(buf.subarray(off), null); if (n === 0) break; off += n; }
+            while (off < st.size) { const n = await handle.read(buf.subarray(off)); if (n === 0) break; off += n; }
             return decodeBuffer(buf, typeof options === 'string' ? options : options?.encoding);
         },
         async writeFile(data: string | Uint8Array | ArrayBuffer) {
+            await ensureOpen();
             await handle.truncate(0);
             await handle.write(toUint8Array(data));
         },
-        [Symbol.asyncDispose]() { return handle.close(); },
+        [Symbol.asyncDispose]() { return closed ? Promise.resolve() : this.close(); },
     };
 }
 

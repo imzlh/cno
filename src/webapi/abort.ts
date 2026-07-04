@@ -1,6 +1,6 @@
 import { DOMException } from "./events";
 
-const { setTimeout } = import.meta.use('timers');
+const { setTimeout, clearTimeout } = import.meta.use('timers');
 
 class AbortSignal extends EventTarget implements globalThis.AbortSignal {
     #aborted = false;

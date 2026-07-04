@@ -24,6 +24,8 @@ const closedSymbol = Symbol('closed');
 const messageQueueSymbol = Symbol('messageQueue');
 const dispatchQueuedSymbol = Symbol('dispatchQueued');
 const refedSymbol = Symbol('refed');
+const onMessageSymbol = Symbol('onmessage');
+const onMessageErrorSymbol = Symbol('onmessageerror');
 
 type QueuedMessage = { data: any; ports: MessagePort[] };
 
@@ -57,9 +59,19 @@ function validateTransferList(transferList?: readonly any[]): void {
     }
 }
 
+function createPortEvent(type: string, data: any, ports?: MessagePort[]): { type: string; data: any; ports?: MessagePort[] } {
+    const event: Record<string, any> = {};
+    Object.defineProperties(event, {
+        type: { value: type, enumerable: false, configurable: true, writable: true },
+        data: { value: data, enumerable: false, configurable: true, writable: true },
+        ports: { value: ports, enumerable: false, configurable: true, writable: true },
+    });
+    return event as { type: string; data: any; ports?: MessagePort[] };
+}
+
 function emitMessage(port: MessagePort, item: QueuedMessage): void {
     if ((port as any)[closedSymbol]) return;
-    const event = { type: 'message', data: item.data, ports: item.ports };
+    const event = createPortEvent('message', item.data, item.ports);
     port.emit('message', item.data);
     port.onmessage?.call(port, event);
 }
@@ -94,7 +106,7 @@ function wrapMessagePipe(pipe: CModuleWorker.MessagePipe): MessagePort {
     pipe.onmessageerror = (err: any) => {
         queueMicrotask(() => {
             if ((port as any)[closedSymbol]) return;
-            const event = { type: 'messageerror', data: err };
+            const event = createPortEvent('messageerror', err);
             port.emit('messageerror', err);
             port.onmessageerror?.call(port, event as any);
         });
@@ -115,14 +127,31 @@ function normalizeWorkerData(value: any): any {
 }
 
 export class MessagePort extends EventEmitter {
-    onmessage: ((this: MessagePort, ev: { type: string; data: any; ports?: MessagePort[] }) => any) | null = null;
-    onmessageerror: ((this: MessagePort, ev: { type: string; data: any }) => any) | null = null;
+    [onMessageSymbol]: ((this: MessagePort, ev: { type: string; data: any; ports?: MessagePort[] }) => any) | null = null;
+    [onMessageErrorSymbol]: ((this: MessagePort, ev: { type: string; data: any }) => any) | null = null;
     [otherPortSymbol]: MessagePort | null = null;
     [startedSymbol] = false;
     [closedSymbol] = false;
     [messageQueueSymbol]: QueuedMessage[] = [];
     [dispatchQueuedSymbol] = false;
     [refedSymbol] = true;
+
+    get onmessage(): ((this: MessagePort, ev: { type: string; data: any; ports?: MessagePort[] }) => any) | null {
+        return this[onMessageSymbol];
+    }
+
+    set onmessage(handler: ((this: MessagePort, ev: { type: string; data: any; ports?: MessagePort[] }) => any) | null) {
+        this[onMessageSymbol] = typeof handler === 'function' ? handler : null;
+        if (this[onMessageSymbol] && !this[startedSymbol]) this.start();
+    }
+
+    get onmessageerror(): ((this: MessagePort, ev: { type: string; data: any }) => any) | null {
+        return this[onMessageErrorSymbol];
+    }
+
+    set onmessageerror(handler: ((this: MessagePort, ev: { type: string; data: any }) => any) | null) {
+        this[onMessageErrorSymbol] = typeof handler === 'function' ? handler : null;
+    }
 
     postMessage(value: any, transferList?: any[]): void {
         validateCloneable(value);
@@ -237,8 +266,12 @@ export class Worker extends EventEmitter {
         this.threadName = options?.name ?? null;
         this.resourceLimits = { ...(options?.resourceLimits ?? {}) };
 
+        const entry = options?.eval
+            ? `eval:${filename.toString()}`
+            : filename.toString();
+
         this._native = new wk.Worker({
-            __cts_entry: filename.toString(),
+            __cts_entry: entry,
             __node_workerData: options?.workerData,
             __node_threadId: this.threadId,
             __node_threadName: this.threadName,

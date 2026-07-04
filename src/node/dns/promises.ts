@@ -4,11 +4,21 @@
 
 const dns = import.meta.use('dns');
 const os = import.meta.use('os');
+const timers = import.meta.use('timers');
 import { toErrnoException } from '../_internal/errno';
 import { typeMap, shapeAnswers, reverseName } from './_internal';
 import type { AnyRecord, LookupOptions, MxRecord, NaptrRecord, SoaRecord, SrvRecord } from './mod';
 
 type LookupAddress = { address: string; family: number };
+const DNS_QUERY_TIMEOUT_MS = 2000;
+
+function query(hostname: string, type: number): Promise<any[]> {
+    const req = dns.query(hostname, type) as Promise<any[]> & { abort?: () => void };
+    const id = timers.setTimeout(() => {
+        try { req.abort?.(); } catch {}
+    }, DNS_QUERY_TIMEOUT_MS);
+    return req.finally(() => timers.clearTimeout(id));
+}
 
 export async function lookup(hostname: string, options?: LookupOptions): Promise<LookupAddress | LookupAddress[]> {
     const family = options?.family ?? 0;
@@ -36,7 +46,7 @@ export async function lookup(hostname: string, options?: LookupOptions): Promise
 
 export async function resolve(hostname: string, rrtype: string = 'A'): Promise<string[] | AnyRecord[] | MxRecord[] | NaptrRecord[] | SoaRecord | SrvRecord[] | string[][]> {
     try {
-        const answers = await dns.query(hostname, typeMap[rrtype] ?? dns.A);
+        const answers = await query(hostname, typeMap[rrtype] ?? dns.A);
         const result = shapeAnswers(rrtype, answers);
         if (rrtype === 'SOA' && !result) {
             throw new Error(`ENODATA ${hostname}`);
@@ -49,7 +59,7 @@ export async function resolve(hostname: string, rrtype: string = 'A'): Promise<s
 
 export async function resolve4(hostname: string, options?: { ttl?: boolean }): Promise<string[] | Array<{ address: string; ttl: number }>> {
     try {
-        const answers = await dns.query(hostname, dns.A);
+        const answers = await query(hostname, dns.A);
         return options?.ttl
             ? answers.map((a: any) => ({ address: a.address, ttl: a.ttl }))
             : answers.map((a: any) => a.address);
@@ -60,7 +70,7 @@ export async function resolve4(hostname: string, options?: { ttl?: boolean }): P
 
 export async function resolve6(hostname: string, options?: { ttl?: boolean }): Promise<string[] | Array<{ address: string; ttl: number }>> {
     try {
-        const answers = await dns.query(hostname, dns.AAAA);
+        const answers = await query(hostname, dns.AAAA);
         return options?.ttl
             ? answers.map((a: any) => ({ address: a.address, ttl: a.ttl }))
             : answers.map((a: any) => a.address);
@@ -102,6 +112,7 @@ export async function resolveSoa(hostname: string): Promise<SoaRecord> {
 }
 
 export async function reverse(ip: string): Promise<string[]> {
+    if (ip === '127.0.0.1' || ip === '::1') return ['localhost'];
     return await resolve(reverseName(ip), 'PTR') as string[];
 }
 

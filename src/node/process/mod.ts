@@ -3,11 +3,11 @@
  * Provides current Node.js process information and control
  */
 
-import type { Args } from '../../utils/args';
 import { EventEmitter } from '../events';
 import { IPCChannel } from '../ipc_channel';
 import { stdout, stderr, stdin } from './streams';
 import { hrtime, memoryUsage, cpuUsage, resourceUsage } from './metrics';
+import { normalizeErrnoError } from '../_internal/errno';
 
 const os = import.meta.use('os');
 const engine = import.meta.use('engine');
@@ -16,8 +16,12 @@ const proc = import.meta.use('process');
 const streams = import.meta.use('streams');
 const console = import.meta.use('console');
 
+// argv shapes come from cno/src/utils/args via the os shared namespace — node
+// modules must not import across the node/ boundary (AGENT.md). Read once here;
+// cno-cli sets argv before any user code runs, so the snapshot is stable and
+// stays mutable like Node's real process.argv.
 // @ts-ignore - ns
-const cno_args = os.__cno_args.get() as Args;
+const cno_args = os.__cno_args;
 
 // Re-export streams and metrics under their original names
 export { stdout, stderr, stdin };
@@ -47,6 +51,7 @@ function throwIfUnsupportedSignal(signalName: NodeJS.Signals): void {
 
 function addSignalListener(signalName: NodeJS.Signals, listener: () => void): void {
     throwIfUnsupportedSignal(signalName);
+    if (!sig) throw new Error('signal handling is unavailable outside the main thread');
     const sigint = (sig.signals as any)[signalName];
     if (typeof sigint !== 'number') {
         throw new Error(`Invalid signal: ${signalName}`);
@@ -67,6 +72,7 @@ function addSignalListener(signalName: NodeJS.Signals, listener: () => void): vo
 
 function removeSignalListener(signalName: NodeJS.Signals, listener: () => void): void {
     throwIfUnsupportedSignal(signalName);
+    if (!sig) throw new Error('signal handling is unavailable outside the main thread');
     const sigint = (sig.signals as any)[signalName];
     if (typeof sigint !== 'number') {
         throw new Error(`Invalid signal: ${signalName}`);
@@ -176,9 +182,9 @@ const processEE = new ProcessEventEmitter();
 
 const uname = os.uname();
 
-export const argv: string[] = [os.exePath, cno_args.entry, ...cno_args.args];
-export const argv0: string = cno_args.binary;
-export const execArgv: string[] = cno_args.internalArgs;
+export const argv: string[] = cno_args.nodeArgv();
+export const argv0: string = cno_args.nodeArgv0();
+export const execArgv: string[] = cno_args.nodeExecArgv();
 
 export const pid: number = os.pid;
 export const ppid: number = os.ppid;
@@ -420,7 +426,16 @@ export let connected: boolean = false;
 export let channel: any = null;
 
 export function kill(pid: number, signal?: string | number): boolean {
-    proc.kill(pid, signal as any);
+    try {
+        proc.kill(pid, signal as any);
+    } catch (e) {
+        const err = normalizeErrnoError(e, 'kill');
+        if ((err as NodeJS.ErrnoException).code === 'UNKNOWN(-3)') {
+            (err as NodeJS.ErrnoException).code = 'ESRCH';
+            (err as NodeJS.ErrnoException).errno = -4043;
+        }
+        throw err;
+    }
     return true;
 }
 

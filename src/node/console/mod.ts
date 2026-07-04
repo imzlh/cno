@@ -465,9 +465,7 @@ function getTableColumns(data: unknown, columns?: string[]): TableColumn[] {
 
     const result: TableColumn[] = [];
     for (const [key, width] of cols) {
-        if (key === '(index)' || width > key.length) {
-            result.push({ key, width: Math.min(width, 50) + 2 });
-        }
+        result.push({ key, width: Math.min(Math.max(width, key.length), 50) + 2 });
     }
     return result;
 }

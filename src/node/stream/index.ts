@@ -7,6 +7,26 @@ import * as streamPromises from './promises';
 import * as streamWeb from './web';
 import * as streamConsumers from './consumers';
 
+(stream.Readable as typeof stream.Readable & {
+    fromWeb?: typeof streamWeb.readableFromWeb;
+    toWeb?: typeof streamWeb.readableToWeb;
+}).fromWeb = streamWeb.readableFromWeb;
+(stream.Readable as typeof stream.Readable & {
+    fromWeb?: typeof streamWeb.readableFromWeb;
+    toWeb?: typeof streamWeb.readableToWeb;
+}).toWeb = streamWeb.readableToWeb;
+(stream.Writable as typeof stream.Writable & {
+    fromWeb?: typeof streamWeb.writableFromWeb;
+    toWeb?: typeof streamWeb.writableToWeb;
+}).fromWeb = streamWeb.writableFromWeb;
+(stream.Writable as typeof stream.Writable & {
+    fromWeb?: typeof streamWeb.writableFromWeb;
+    toWeb?: typeof streamWeb.writableToWeb;
+}).toWeb = streamWeb.writableToWeb;
+(stream.Duplex as typeof stream.Duplex & {
+    fromWeb?: typeof streamWeb.duplexFromWeb;
+}).fromWeb = streamWeb.duplexFromWeb;
+
 type StreamPipelineArgs =
     | [...streams: any[], callback: (error?: Error | null) => void]
     | any[];

@@ -93,6 +93,11 @@ export function format(format?: string, ...args: any[]): string {
             const specifier = format[i + 1];
             i += 2;
 
+            if (specifier === '%') {
+                result += '%';
+                continue;
+            }
+
             // If no more args, keep the specifier literal
             if (argIndex >= args.length) {
                 result += '%' + specifier;
@@ -122,9 +127,6 @@ export function format(format?: string, ...args: any[]): string {
                 case 'o':
                 case 'O':
                     result += inspect(args[argIndex++], { depth: specifier === 'O' ? Infinity : 4 });
-                    break;
-                case '%':
-                    result += '%';
                     break;
                 default:
                     result += '%' + specifier;
@@ -446,7 +448,7 @@ promisify.custom = Symbol.for('nodejs.util.promisify.custom');
 
 // TextEncoder / TextDecoder
 
-const { Encoder, Decoder } = import.meta.use('text')!;
+const { Encoder, Decoder } = import.meta.use('text');
 export const TextEncoder = Encoder;
 export const TextDecoder = Decoder;
 

@@ -985,12 +985,12 @@ Object.assign(Deno, wrapFSns({
                 const tcp = new stream.TCP(isV4 ? os.AF_INET : os.AF_INET6);
                 tcp.bind({
                     ip: bindHost,
-                    port: opt.port
+                    port: opt.port ?? 80
                 })
                 tcp.listen(opt.tcpBacklog);
                 return new TcpListener(tcp, true, {
                     hostname: bindHost,
-                    port: opt.port,
+                    port: opt.port ?? 80,
                     transport: 'tcp'
                 });
             case 'unix':
@@ -1014,7 +1014,7 @@ Object.assign(Deno, wrapFSns({
         const tcp = new stream.TCP(isV4 ? os.AF_INET : os.AF_INET6);
         tcp.bind({
             ip: bindHost,
-            port: opt.port
+            port: opt.port ?? 443
         })
         tcp.listen(opt.tcpBacklog);
         const ctx = new ssl.Context({
@@ -1025,7 +1025,7 @@ Object.assign(Deno, wrapFSns({
         });
         const listener = new TlsListener(tcp, {
             hostname: bindHost,
-            port: opt.port,
+            port: opt.port ?? 443,
             transport: 'tcp'
         }, ctx);
         return listener;

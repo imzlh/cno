@@ -54,8 +54,10 @@ export type NetworkInterfaceInfo = NetworkInterfaceInfoIPv4 | NetworkInterfaceIn
 export const constants = {
     UV_UDP_REUSEADDR: 0,
 
+    // `signals` is null inside a worker thread (POSIX signals are process-wide,
+    // not per-thread) — fall back to an empty map instead of crashing on import.
     signals: Object.fromEntries(
-        Object.entries(sig.signals).map(([k, v]) => [k, v])
+        Object.entries(sig?.signals ?? {}).map(([k, v]) => [k, v])
     ) as { [key in NodeJS.Signals]: number },
 
     errno: Object.fromEntries(

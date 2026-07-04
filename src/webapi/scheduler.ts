@@ -4,6 +4,7 @@
  */
 
 type TaskPriority = 'user-blocking' | 'user-visible' | 'background';
+const { setTimeout, clearTimeout } = import.meta.use('timers');
 
 interface PostTaskOptions {
     priority?: TaskPriority;

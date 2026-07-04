@@ -292,12 +292,40 @@ export function createHook(callbacks: HookCallbacks): { enable(): void; disable(
 export function executionAsyncId(): AsyncId { return _currentId; }
 export function triggerAsyncId(): TriggerAsyncId { return _currentTriggerId; }
 
-export const asyncWrapProviders: Record<string, number> & (() => Record<string, number>) = Object.assign(
-    () => ({ PROMISE: 0, Timeout: 1, Immediate: 2, Interval: 3, Microtask: 4 }),
-    { PROMISE: 0, Timeout: 1, Immediate: 2, Interval: 3, Microtask: 4 } as Record<string, number>
-);
+export const asyncWrapProviders: Record<string, number> = {
+    PROMISE: 0,
+    Timeout: 1,
+    Immediate: 2,
+    Interval: 3,
+    Microtask: 4,
+};
 
 export function newAsyncId(): AsyncId { return _nextId++; }
+
+export class AsyncResource {
+    protected _asyncState: AsyncState;
+
+    constructor(type: string, triggerAsyncId?: AsyncId) {
+        this._asyncState = createState(type, triggerAsyncId ?? _currentId, this);
+    }
+
+    runInAsyncScope<T>(callback: (...args: any[]) => T, thisArg?: any, ...args: any[]): T {
+        return runInState(this._asyncState, callback, thisArg, args);
+    }
+
+    emitDestroy(): this {
+        settleState(this._asyncState);
+        return this;
+    }
+
+    asyncId(): AsyncId {
+        return this._asyncState.id;
+    }
+
+    triggerAsyncId(): TriggerAsyncId {
+        return this._asyncState.triggerId;
+    }
+}
 
 export class AsyncLocalStorage<T = unknown> {
     run<R>(store: T, callback: () => R): R {

@@ -6,7 +6,7 @@ const os = import.meta.use('os');
 
 import { Readable, Writable } from '../stream';
 import { Socket, Server as NetServer, AddressInfo } from '../net';
-import type { HttpRequest, HttpResponse } from '@cnojs/http/server';
+import type { HttpRequest, HttpResponse, Server as HttpServer } from '@cnojs/http/server';
 import {
     buildNodeServerUrl,
     captureNodeNetworkCallFrames,
@@ -17,6 +17,7 @@ import {
     normalizeHeaderRecord,
     toUint8Array,
 } from '../_internal/network-debug';
+import { normalizeErrnoError } from '../_internal/errno';
 import type { IncomingHttpHeaders, OutgoingHttpHeader, OutgoingHttpHeaders, IncomingMessage, OutgoingMessage, ServerResponse, ListenOptions, Server, RequestListener } from './types';
 import { IOpaque } from '../_internal/inject';
 export type { IncomingHttpHeaders, OutgoingHttpHeader, OutgoingHttpHeaders, IncomingMessage, OutgoingMessage, ServerResponse, ListenOptions, Server, RequestListener } from './types';
@@ -42,6 +43,18 @@ function isBodyForbiddenStatus(statusCode: number): boolean {
     return (statusCode >= 100 && statusCode < 200) || statusCode === 204 || statusCode === 304;
 }
 
+function createHeadersSentError(message = 'Cannot write headers after they are sent to the client'): Error & { code: string } {
+    return Object.assign(new Error(message), {
+        code: 'ERR_HTTP_HEADERS_SENT',
+    });
+}
+
+function createWriteAfterEndError(): Error & { code: string } {
+    return Object.assign(new Error('write after end'), {
+        code: 'ERR_STREAM_WRITE_AFTER_END',
+    });
+}
+
 function createAttachedSocket(tcp: CModuleStreams.TCP): Socket {
     const socket = new Socket();
     const localInfo = tcp.sockname;
@@ -61,295 +74,430 @@ function createAttachedSocket(tcp: CModuleStreams.TCP): Socket {
 // Re-export from shared constants (single source of truth)
 export { STATUS_CODES, METHODS } from './constants';
 
-export class IncomingMessageImpl extends Readable implements IncomingMessage {
-    socket: Socket | null;
-    httpVersion: string = '1.1';
-    httpVersionMajor: number = 1;
-    httpVersionMinor: number = 1;
-    complete: boolean = false;
-    headers: IncomingHttpHeaders = {};
-    headersDistinct: NodeJS.Dict<string[]> = {};
-    rawHeaders: string[] = [];
-    trailers: NodeJS.Dict<string> = {};
-    trailersDistinct: NodeJS.Dict<string[]> = {};
-    rawTrailers: string[] = [];
-    aborted: boolean = false;
-    method?: string;
-    url?: string;
-    statusCode?: number;
-    statusMessage?: string;
+// Old-style function-constructor + prototype pattern (mirrors Readable/Writable
+// in ../stream/mod.ts and EventEmitter in ../events/mod.ts). Real Node.js core
+// implements IncomingMessage/OutgoingMessage/ServerResponse/ClientRequest as
+// function constructors too, so mock/test-double libraries and middleware can
+// do `http.IncomingMessage.call(this)` + `util.inherits()` instead of
+// `class X extends http.IncomingMessage` (which ES6 class constructors reject
+// when invoked as a plain function).
+function flattenPrototype(target: object): void {
+    const parent = Object.getPrototypeOf(target);
+    if (!parent || parent === Object.prototype) return;
 
-    constructor(socket: Socket | null) {
-        super();
-        this.socket = socket;
+    for (const key of Object.getOwnPropertyNames(parent)) {
+        if (key === 'constructor' || Object.prototype.hasOwnProperty.call(target, key)) continue;
+        const descriptor = Object.getOwnPropertyDescriptor(parent, key);
+        if (descriptor) Object.defineProperty(target, key, descriptor);
     }
 
-    override push(chunk: any, encoding?: BufferEncoding): boolean {
-        if (chunk !== null && chunk !== undefined && typeof chunk !== 'string' && this.readableEncoding) {
-            chunk = engine.decodeString(chunk as Uint8Array);
-        }
-        return super.push(chunk, encoding);
-    }
-
-    // Push-based stream: data arrives externally, no pull needed
-    override _read(_size: number): void {}
-
-    get connection(): Socket | null {
-        return this.socket;
-    }
-
-    setTimeout(msecs: number, callback?: () => void): this {
-        this.socket?.setTimeout(msecs, callback);
-        return this;
-    }
-
-    destroy(error?: Error): this {
-        this.aborted = true;
-        super.destroy(error);
-        return this;
+    for (const key of Object.getOwnPropertySymbols(parent)) {
+        if (Object.prototype.hasOwnProperty.call(target, key)) continue;
+        const descriptor = Object.getOwnPropertyDescriptor(parent, key);
+        if (descriptor) Object.defineProperty(target, key, descriptor);
     }
 }
 
-export class OutgoingMessageImpl extends Writable implements OutgoingMessage {
-    socket: Socket | null = null;
-    writableEnded: boolean = false;
-    writableFinished: boolean = false;
-    headersSent: boolean = false;
-    sendDate: boolean = true;
-    finished: boolean = false;
-    chunkedEncoding: boolean = false;
-    shouldKeepAlive: boolean = false;
-    useChunkedEncodingByDefault: boolean = true;
+export interface IncomingMessageImpl extends IncomingMessage {}
 
-    protected _headers: OutgoingHttpHeaders = {};
-    protected _headerNames: Map<string, string> = new Map();
-    protected _trailers: OutgoingHttpHeaders = {};
-    protected _rawHeaderNames: string[] = [];
+export interface IncomingMessageImplConstructor {
+    new (socket: Socket | null): IncomingMessageImpl;
+    (socket: Socket | null): IncomingMessageImpl;
+    prototype: IncomingMessageImpl;
+}
 
-    get connection(): Socket | null {
+function initIncomingMessage(self: any, socket: Socket | null): void {
+    Readable.call(self);
+    self.socket = socket;
+    self.httpVersion = '1.1';
+    self.httpVersionMajor = 1;
+    self.httpVersionMinor = 1;
+    self.complete = false;
+    self.headers = {};
+    self.headersDistinct = {};
+    self.rawHeaders = [];
+    self.trailers = {};
+    self.trailersDistinct = {};
+    self.rawTrailers = [];
+    self.aborted = false;
+}
+
+export const IncomingMessageImpl: IncomingMessageImplConstructor = function IncomingMessageImpl(this: any, socket: Socket | null) {
+    const target = this && (typeof this === 'object' || typeof this === 'function')
+        ? this
+        : Object.create(IncomingMessageImpl.prototype);
+    initIncomingMessage(target, socket);
+    return target;
+} as IncomingMessageImplConstructor;
+
+Object.setPrototypeOf(IncomingMessageImpl, Readable);
+IncomingMessageImpl.prototype = Object.create(Readable.prototype);
+
+IncomingMessageImpl.prototype.push = function push(this: IncomingMessageImpl, chunk: any, encoding?: BufferEncoding): boolean {
+    if (chunk !== null && chunk !== undefined && typeof chunk !== 'string' && this.readableEncoding) {
+        chunk = engine.decodeString(chunk as Uint8Array);
+    }
+    return Readable.prototype.push.call(this, chunk, encoding);
+};
+
+// Push-based stream: data arrives externally, no pull needed
+IncomingMessageImpl.prototype._read = function _read(this: IncomingMessageImpl, _size: number): void {};
+
+Object.defineProperty(IncomingMessageImpl.prototype, 'connection', {
+    get(this: IncomingMessageImpl): Socket | null {
         return this.socket;
-    }
+    },
+    configurable: true,
+});
 
-    setTimeout(msecs: number, callback?: () => void): this {
-        if (this.socket) this.socket.setTimeout(msecs, callback);
-        else if (callback) this.once('socket', () => this.socket?.setTimeout(msecs, callback));
-        return this;
-    }
+IncomingMessageImpl.prototype.setTimeout = function setTimeout(this: IncomingMessageImpl, msecs: number, callback?: () => void): IncomingMessageImpl {
+    this.socket?.setTimeout(msecs, callback);
+    return this;
+};
 
-    protected _requireHeadersNotSent(): void {
-        if (this.headersSent) throw new Error('Cannot modify headers after they are sent to the client');
-    }
+IncomingMessageImpl.prototype.destroy = function destroy(this: IncomingMessageImpl, error?: Error): IncomingMessageImpl {
+    this.aborted = true;
+    Readable.prototype.destroy.call(this, error);
+    return this;
+};
 
-    setHeader(name: string, value: number | string | readonly string[]): this {
-        this._requireHeadersNotSent();
-        const key = name.toLowerCase();
+Object.defineProperty(IncomingMessageImpl.prototype, 'constructor', {
+    value: IncomingMessageImpl,
+    writable: true,
+    configurable: true,
+});
+
+flattenPrototype(IncomingMessageImpl.prototype);
+
+export interface OutgoingMessageImpl extends OutgoingMessage {
+    _headers: OutgoingHttpHeaders;
+    _headerNames: Map<string, string>;
+    _trailers: OutgoingHttpHeaders;
+    _rawHeaderNames: string[];
+    getRawHeaderNames(): string[];
+    _requireHeadersNotSent(): void;
+    _formatHeaders(): string;
+    _sendHeaders(): void;
+}
+
+export interface OutgoingMessageImplConstructor {
+    new (): OutgoingMessageImpl;
+    (): OutgoingMessageImpl;
+    prototype: OutgoingMessageImpl;
+}
+
+function initOutgoingMessage(self: any): void {
+    Writable.call(self);
+    self.socket = null;
+    self.writableEnded = false;
+    self.writableFinished = false;
+    self.headersSent = false;
+    self.sendDate = true;
+    self.finished = false;
+    self.chunkedEncoding = false;
+    self.shouldKeepAlive = false;
+    self.useChunkedEncodingByDefault = true;
+
+    self._headers = {};
+    self._headerNames = new Map();
+    self._trailers = {};
+    self._rawHeaderNames = [];
+}
+
+export const OutgoingMessageImpl: OutgoingMessageImplConstructor = function OutgoingMessageImpl(this: any) {
+    const target = this && (typeof this === 'object' || typeof this === 'function')
+        ? this
+        : Object.create(OutgoingMessageImpl.prototype);
+    initOutgoingMessage(target);
+    return target;
+} as OutgoingMessageImplConstructor;
+
+Object.setPrototypeOf(OutgoingMessageImpl, Writable);
+OutgoingMessageImpl.prototype = Object.create(Writable.prototype);
+
+Object.defineProperty(OutgoingMessageImpl.prototype, 'connection', {
+    get(this: OutgoingMessageImpl): Socket | null {
+        return this.socket;
+    },
+    configurable: true,
+});
+
+OutgoingMessageImpl.prototype.setTimeout = function setTimeout(this: OutgoingMessageImpl, msecs: number, callback?: () => void): OutgoingMessageImpl {
+    if (this.socket) this.socket.setTimeout(msecs, callback);
+    else if (callback) this.once('socket', () => this.socket?.setTimeout(msecs, callback));
+    return this;
+};
+
+OutgoingMessageImpl.prototype._requireHeadersNotSent = function _requireHeadersNotSent(this: OutgoingMessageImpl): void {
+    if (this.headersSent) throw createHeadersSentError('Cannot set headers after they are sent to the client');
+};
+
+OutgoingMessageImpl.prototype.setHeader = function setHeader(this: OutgoingMessageImpl, name: string, value: number | string | readonly string[]): OutgoingMessageImpl {
+    this._requireHeadersNotSent();
+    const key = name.toLowerCase();
+    this._headerNames.set(key, name);
+    this._headers[key] = value as OutgoingHttpHeader;
+    return this;
+};
+
+OutgoingMessageImpl.prototype.setHeaders = function setHeaders(this: OutgoingMessageImpl, headers: Headers | Map<string, number | string | readonly string[]>): OutgoingMessageImpl {
+    this._requireHeadersNotSent();
+    for (const [key, value] of headers) {
+        this.setHeader(key, value);
+    }
+    return this;
+};
+
+OutgoingMessageImpl.prototype.appendHeader = function appendHeader(this: OutgoingMessageImpl, name: string, value: string | readonly string[]): OutgoingMessageImpl {
+    this._requireHeadersNotSent();
+    const key = name.toLowerCase();
+    const existing = this._headers[key];
+    if (existing === undefined) {
         this._headerNames.set(key, name);
-        this._headers[key] = value as OutgoingHttpHeader;
-        return this;
+        this._headers[key] = Array.isArray(value) ? value : [value];
+    } else if (Array.isArray(existing)) {
+        this._headers[key] = [...existing, ...(Array.isArray(value) ? value : [value])];
+    } else {
+        this._headers[key] = [existing as string, ...(Array.isArray(value) ? value : [value])];
     }
+    return this;
+};
 
-    setHeaders(headers: Headers | Map<string, number | string | readonly string[]>): this {
-        this._requireHeadersNotSent();
+OutgoingMessageImpl.prototype.getHeader = function getHeader(this: OutgoingMessageImpl, name: string): number | string | string[] | undefined {
+    return this._headers[name.toLowerCase()];
+};
+
+OutgoingMessageImpl.prototype.getHeaders = function getHeaders(this: OutgoingMessageImpl): OutgoingHttpHeaders {
+    return { ...this._headers };
+};
+
+OutgoingMessageImpl.prototype.getHeaderNames = function getHeaderNames(this: OutgoingMessageImpl): string[] {
+    return Object.keys(this._headers);
+};
+
+OutgoingMessageImpl.prototype.getRawHeaderNames = function getRawHeaderNames(this: OutgoingMessageImpl): string[] {
+    return [...this._headerNames.values()];
+};
+
+OutgoingMessageImpl.prototype.hasHeader = function hasHeader(this: OutgoingMessageImpl, name: string): boolean {
+    return this._headers[name.toLowerCase()] !== undefined;
+};
+
+OutgoingMessageImpl.prototype.removeHeader = function removeHeader(this: OutgoingMessageImpl, name: string): void {
+    this._requireHeadersNotSent();
+    const key = name.toLowerCase();
+    delete this._headers[key];
+    this._headerNames.delete(key);
+};
+
+OutgoingMessageImpl.prototype.addTrailers = function addTrailers(this: OutgoingMessageImpl, headers: OutgoingHttpHeaders | ReadonlyArray<[string, string]>): void {
+    if (Array.isArray(headers)) {
         for (const [key, value] of headers) {
-            this.setHeader(key, value);
+            this._trailers[key.toLowerCase()] = value;
         }
-        return this;
+    } else {
+        for (const [key, value] of Object.entries(headers)) {
+            if (value !== undefined) this._trailers[key.toLowerCase()] = value;
+        }
     }
+};
 
-    appendHeader(name: string, value: string | readonly string[]): this {
-        this._requireHeadersNotSent();
-        const key = name.toLowerCase();
-        const existing = this._headers[key];
-        if (existing === undefined) {
-            this._headerNames.set(key, name);
-            this._headers[key] = Array.isArray(value) ? value : [value];
-        } else if (Array.isArray(existing)) {
-            this._headers[key] = [...existing, ...(Array.isArray(value) ? value : [value])];
+OutgoingMessageImpl.prototype.flushHeaders = function flushHeaders(this: OutgoingMessageImpl): void {
+    if (!this.headersSent) this._sendHeaders();
+};
+
+OutgoingMessageImpl.prototype._formatHeaders = function _formatHeaders(this: OutgoingMessageImpl): string {
+    let result = '';
+    for (const [key, value] of Object.entries(this._headers)) {
+        const name = this._headerNames.get(key) || key;
+        if (Array.isArray(value)) {
+            for (const v of value) result += `${name}: ${v}\r\n`;
         } else {
-            this._headers[key] = [existing as string, ...(Array.isArray(value) ? value : [value])];
+            result += `${name}: ${value}\r\n`;
         }
-        return this;
+    }
+    return result;
+};
+
+OutgoingMessageImpl.prototype._sendHeaders = function _sendHeaders(this: OutgoingMessageImpl): void {
+    this.headersSent = true;
+};
+
+Object.defineProperty(OutgoingMessageImpl.prototype, 'constructor', {
+    value: OutgoingMessageImpl,
+    writable: true,
+    configurable: true,
+});
+
+flattenPrototype(OutgoingMessageImpl.prototype);
+
+export interface ServerResponseImpl extends OutgoingMessageImpl, ServerResponse {
+    req: IncomingMessage | null;
+    _ended: boolean;
+    _bodyLength: number;
+    assignSocket(socket: Socket): void;
+    detachSocket(socket: Socket): void;
+}
+
+export interface ServerResponseImplConstructor {
+    new (): ServerResponseImpl;
+    (): ServerResponseImpl;
+    prototype: ServerResponseImpl;
+}
+
+function initServerResponse(self: any): void {
+    OutgoingMessageImpl.call(self);
+    self.statusCode = 200;
+    self.statusMessage = 'OK';
+    self.strictContentLength = false;
+    self.req = null;
+
+    self._ended = false;
+    self._bodyLength = 0;
+}
+
+export const ServerResponseImpl: ServerResponseImplConstructor = function ServerResponseImpl(this: any) {
+    const target = this && (typeof this === 'object' || typeof this === 'function')
+        ? this
+        : Object.create(ServerResponseImpl.prototype);
+    initServerResponse(target);
+    return target;
+} as ServerResponseImplConstructor;
+
+Object.setPrototypeOf(ServerResponseImpl, OutgoingMessageImpl);
+ServerResponseImpl.prototype = Object.create(OutgoingMessageImpl.prototype);
+
+ServerResponseImpl.prototype.assignSocket = function assignSocket(this: ServerResponseImpl, socket: Socket): void {
+    this.socket = socket;
+    socket.once('close', () => {
+        this.socket = null;
+    });
+};
+
+ServerResponseImpl.prototype.detachSocket = function detachSocket(this: ServerResponseImpl, socket: Socket): void {
+    this.socket = null;
+};
+
+ServerResponseImpl.prototype.writeHead = function writeHead(
+    this: ServerResponseImpl,
+    statusCode: number,
+    statusMessageOrHeaders?: string | OutgoingHttpHeaders | readonly string[],
+    headers?: OutgoingHttpHeaders | readonly string[]
+): ServerResponseImpl {
+    this._requireHeadersNotSent();
+
+    this.statusCode = statusCode;
+    if (typeof statusMessageOrHeaders === 'string') {
+        this.statusMessage = statusMessageOrHeaders;
+    } else if (statusMessageOrHeaders !== undefined) {
+        headers = statusMessageOrHeaders;
     }
 
-    getHeader(name: string): number | string | string[] | undefined {
-        return this._headers[name.toLowerCase()];
-    }
-
-    getHeaders(): OutgoingHttpHeaders {
-        return { ...this._headers };
-    }
-
-    getHeaderNames(): string[] {
-        return Object.keys(this._headers);
-    }
-
-    getRawHeaderNames(): string[] {
-        return [...this._rawHeaderNames];
-    }
-
-    hasHeader(name: string): boolean {
-        return this._headers[name.toLowerCase()] !== undefined;
-    }
-
-    removeHeader(name: string): void {
-        this._requireHeadersNotSent();
-        const key = name.toLowerCase();
-        delete this._headers[key];
-        this._headerNames.delete(key);
-    }
-
-    addTrailers(headers: OutgoingHttpHeaders | ReadonlyArray<[string, string]>): void {
+    if (headers) {
         if (Array.isArray(headers)) {
-            for (const [key, value] of headers) {
-                this._trailers[key.toLowerCase()] = value;
+            for (let i = 0; i < headers.length; i += 2) {
+                this.setHeader(headers[i], headers[i + 1]);
             }
         } else {
             for (const [key, value] of Object.entries(headers)) {
-                if (value !== undefined) this._trailers[key.toLowerCase()] = value;
+                if (value !== undefined) this.setHeader(key, value);
             }
         }
     }
 
-    flushHeaders(): void {
-        if (!this.headersSent) this._sendHeaders();
+    if (!this.hasHeader('date') && this.sendDate) {
+        this.setHeader('Date', new Date().toUTCString());
     }
 
-    protected _formatHeaders(): string {
-        let result = '';
-        for (const [key, value] of Object.entries(this._headers)) {
-            const name = this._headerNames.get(key) || key;
-            if (Array.isArray(value)) {
-                for (const v of value) result += `${name}: ${v}\r\n`;
-            } else {
-                result += `${name}: ${value}\r\n`;
-            }
-        }
-        return result;
+    this._sendHeaders();
+    return this;
+};
+
+// Interim (1xx) responses require writing to the socket before the final
+// response. ServerResponseImpl no longer owns the socket — the core
+// @cnojs/http HttpResponse has no interim-write API yet — so these are
+// no-ops. Vite/Connect do not use them. TODO: add an interim-write path to
+// the core HttpResponse and route these through the adapter if needed.
+ServerResponseImpl.prototype.writeProcessingContinue = function writeProcessingContinue(this: ServerResponseImpl): void {};
+
+ServerResponseImpl.prototype.writeEarlyHints = function writeEarlyHints(this: ServerResponseImpl, _hints: Record<string, string | string[]>, callback?: () => void): void {
+    callback?.();
+};
+
+ServerResponseImpl.prototype._sendHeaders = function _sendHeaders(this: ServerResponseImpl): void {
+    if (this.headersSent) return;
+    // State-only. All socket I/O flows through NodeResponseAdapter ->
+    // coreResponse (@cnojs/http), which is rebound onto this instance in
+    // ServerImpl.listen() before the request handler runs. This base impl
+    // exists only so any pre-override call keeps Node-facing state coherent.
+    OutgoingMessageImpl.prototype._sendHeaders.call(this);
+};
+
+ServerResponseImpl.prototype.write = function write(
+    this: ServerResponseImpl,
+    chunk: any,
+    encodingOrCb?: BufferEncoding | ((err?: Error | null) => void),
+    cb?: (err?: Error | null) => void
+): boolean {
+    if (this._ended) {
+        const callback = typeof encodingOrCb === 'function' ? encodingOrCb : cb;
+        const err = createWriteAfterEndError();
+        callback?.(err);
+        queueMicrotask(() => this.emit('error', err));
+        return false;
     }
 
-    protected _sendHeaders(): void {
-        this.headersSent = true;
-    }
-}
-
-export class ServerResponseImpl extends OutgoingMessageImpl implements ServerResponse {
-    statusCode: number = 200;
-    statusMessage: string = 'OK';
-    strictContentLength: boolean = false;
-    req: IncomingMessage | null = null;
-
-    private _ended: boolean = false;
-    private _bodyLength: number = 0;
-
-    assignSocket(socket: Socket): void {
-        this.socket = socket;
-        socket.on('close', () => {
-            this.socket = null;
-        });
-    }
-
-    detachSocket(socket: Socket): void {
-        this.socket = null;
-    }
-
-    writeHead(statusCode: number, statusMessageOrHeaders?: string | OutgoingHttpHeaders | readonly string[], headers?: OutgoingHttpHeaders | readonly string[]): this {
-        this._requireHeadersNotSent();
-
-        this.statusCode = statusCode;
-        if (typeof statusMessageOrHeaders === 'string') {
-            this.statusMessage = statusMessageOrHeaders;
-        } else if (statusMessageOrHeaders !== undefined) {
-            headers = statusMessageOrHeaders;
-        }
-
-        if (headers) {
-            if (Array.isArray(headers)) {
-                for (let i = 0; i < headers.length; i += 2) {
-                    this.setHeader(headers[i], headers[i + 1]);
-                }
-            } else {
-                for (const [key, value] of Object.entries(headers)) {
-                    if (value !== undefined) this.setHeader(key, value);
-                }
-            }
-        }
-
-        if (!this.hasHeader('date') && this.sendDate) {
-            this.setHeader('Date', new Date().toUTCString());
-        }
-
-        this._sendHeaders();
-        return this;
-    }
-
-    // Interim (1xx) responses require writing to the socket before the final
-    // response. ServerResponseImpl no longer owns the socket — the core
-    // @cnojs/http HttpResponse has no interim-write API yet — so these are
-    // no-ops. Vite/Connect do not use them. TODO: add an interim-write path to
-    // the core HttpResponse and route these through the adapter if needed.
-    writeProcessingContinue(): void {}
-
-    writeEarlyHints(_hints: Record<string, string | string[]>, callback?: () => void): void {
-        callback?.();
-    }
-
-    protected _sendHeaders(): void {
-        if (this.headersSent) return;
-        // State-only. All socket I/O flows through NodeResponseAdapter ->
-        // coreResponse (@cnojs/http), which is rebound onto this instance in
-        // ServerImpl.listen() before the request handler runs. This base impl
-        // exists only so any pre-override call keeps Node-facing state coherent.
-        super._sendHeaders();
-    }
-
-    write(chunk: any, encodingOrCb?: BufferEncoding | ((err?: Error | null) => void), cb?: (err?: Error | null) => void): boolean {
-        if (this._ended) {
-            const callback = typeof encodingOrCb === 'function' ? encodingOrCb : cb;
-            callback?.(new Error('write after end'));
-            return false;
-        }
-
-        if (!this.headersSent) {
+    if (!this.headersSent) {
+        if (!this.hasHeader('content-length') && !this.hasHeader('transfer-encoding')) {
             this.chunkedEncoding = true;
             this.setHeader('Transfer-Encoding', 'chunked');
-            this._sendHeaders();
         }
-
-        const encoder = new text!.Encoder(encodingOrCb as BufferEncoding);
-        const data = typeof chunk === 'string' ? encoder.encode(chunk) : chunk as Uint8Array;
-        this._bodyLength += data.length;
-
-        // State-only. NodeResponseAdapter rebinds write() per request and owns
-        // all socket I/O via coreResponse (@cnojs/http). This base impl exists
-        // only for pre-override calls and must never touch the socket.
-        const callback = typeof encodingOrCb === 'function' ? encodingOrCb : cb;
-        callback?.();
-        return true;
+        this._sendHeaders();
     }
 
-    end(chunk?: any, encodingOrCb?: BufferEncoding | (() => void), cb?: () => void): this {
-        let callback: (() => void) | undefined;
-        if (typeof chunk === 'function') { callback = chunk; chunk = undefined; }
-        else if (typeof encodingOrCb === 'function') { callback = encodingOrCb; }
-        else if (typeof cb === 'function') { callback = cb; }
+    const encoding = typeof encodingOrCb === 'string' ? encodingOrCb : undefined;
+    const encoder = new text!.Encoder(encoding);
+    const data = typeof chunk === 'string' ? encoder.encode(chunk) : chunk as Uint8Array;
+    this._bodyLength += data.length;
 
-        if (this._ended) {
-            callback?.();
-            return this;
-        }
+    // State-only. NodeResponseAdapter rebinds write() per request and owns
+    // all socket I/O via coreResponse (@cnojs/http). This base impl exists
+    // only for pre-override calls and must never touch the socket.
+    const callback = typeof encodingOrCb === 'function' ? encodingOrCb : cb;
+    callback?.();
+    return true;
+};
 
-        // State-only. NodeResponseAdapter rebinds end() per request and owns all
-        // socket I/O via coreResponse (@cnojs/http). This base impl exists only
-        // for pre-override calls and must never touch the socket.
-        this._ended = true;
-        this.writableEnded = true;
-        this.finished = true;
-        this.writableFinished = true;
-        this.emit('finish');
+ServerResponseImpl.prototype.end = function end(this: ServerResponseImpl, chunk?: any, encodingOrCb?: BufferEncoding | (() => void), cb?: () => void): ServerResponseImpl {
+    let callback: (() => void) | undefined;
+    if (typeof chunk === 'function') { callback = chunk; chunk = undefined; }
+    else if (typeof encodingOrCb === 'function') { callback = encodingOrCb; }
+    else if (typeof cb === 'function') { callback = cb; }
+
+    if (this._ended) {
         callback?.();
         return this;
     }
-}
+
+    // State-only. NodeResponseAdapter rebinds end() per request and owns all
+    // socket I/O via coreResponse (@cnojs/http). This base impl exists only
+    // for pre-override calls and must never touch the socket.
+    this._ended = true;
+    this.writableEnded = true;
+    this.finished = true;
+    this.writableFinished = true;
+    this.emit('finish');
+    callback?.();
+    return this;
+};
+
+Object.defineProperty(ServerResponseImpl.prototype, 'constructor', {
+    value: ServerResponseImpl,
+    writable: true,
+    configurable: true,
+});
+
+flattenPrototype(ServerResponseImpl.prototype);
 
 class NodeResponseAdapter {
     private readonly response: ServerResponseImpl;
@@ -361,6 +509,10 @@ class NodeResponseAdapter {
     private headWritten = false;
     private closed = false;
     private failed = false;
+    private finished = false;
+    private pendingBytes = 0;
+    private needDrain = false;
+    private suppressBody: boolean;
 
     constructor(
         response: ServerResponseImpl,
@@ -368,28 +520,40 @@ class NodeResponseAdapter {
         serveHook: ReturnType<typeof getNodeServeHook>,
         requestId: string,
         requestUrl: string,
+        suppressBody = false,
     ) {
         this.response = response;
         this.coreResponse = coreResponse;
         this.serveHook = serveHook;
         this.requestId = requestId;
         this.requestUrl = requestUrl;
+        this.suppressBody = suppressBody;
         this.response.socket?.once('close', () => {
             this.closed = true;
-            this.response.finished = true;
-            this.response.writableFinished = true;
+            if (!this.finished && !this.failed) {
+                this.fail(Object.assign(new Error('socket closed before response finished'), {
+                    code: 'ECONNRESET',
+                    syscall: 'write',
+                }));
+            }
         });
     }
 
-    private enqueue<T>(op: () => Promise<T>): Promise<T | undefined> {
+    private enqueue<T>(op: () => Promise<T>): Promise<T> {
         const next = this.queue.then(async () => {
             if (this.closed || this.failed) {
-                return undefined;
+                throw Object.assign(new Error('socket closed before response write completed'), {
+                    code: 'ECONNRESET',
+                    syscall: 'write',
+                });
             }
             return op();
         }, async () => {
             if (this.closed || this.failed) {
-                return undefined;
+                throw Object.assign(new Error('socket closed before response write completed'), {
+                    code: 'ECONNRESET',
+                    syscall: 'write',
+                });
             }
             return op();
         });
@@ -397,24 +561,22 @@ class NodeResponseAdapter {
         return next;
     }
 
-    private isConnectionCloseError(err: unknown): boolean {
-        const code = (err as { code?: unknown })?.code;
-        return code === 'ECONNRESET' || code === 'EPIPE' || code === 'ECONNABORTED';
+    private shouldSuppressBody(): boolean {
+        return this.suppressBody || isBodyForbiddenStatus(this.response.statusCode);
     }
 
     private fail(err: unknown, callback?: (err?: Error | null) => void): void {
-        const error = err instanceof Error ? err : new Error(String(err));
+        const error = normalizeErrnoError(err);
         if (this.failed) {
             callback?.(error);
             return;
         }
         this.closed = true;
         this.failed = true;
-        this.response.finished = true;
-        this.response.writableFinished = true;
         if (!this.response.writableEnded) {
             this.response.writableEnded = true;
         }
+        this.response.emit('close');
         try {
             this.serveHook?.onFinished?.({
                 requestId: this.requestId,
@@ -423,9 +585,7 @@ class NodeResponseAdapter {
                 errorText: String(error.message ?? error),
             });
         } catch {}
-        if (!this.isConnectionCloseError(error)) {
-            this.response.emit('error', error);
-        }
+        this.response.emit('error', error);
         callback?.(error);
     }
 
@@ -448,6 +608,10 @@ class NodeResponseAdapter {
         statusMessageOrHeaders?: string | OutgoingHttpHeaders | readonly string[],
         headers?: OutgoingHttpHeaders | readonly string[],
     ): ServerResponseImpl {
+        if (this.headWritten || this.response.headersSent) {
+            throw createHeadersSentError();
+        }
+
         this.response.statusCode = statusCode;
         if (typeof statusMessageOrHeaders === 'string') {
             this.response.statusMessage = statusMessageOrHeaders;
@@ -479,7 +643,14 @@ class NodeResponseAdapter {
             this.response.setHeader('Date', new Date().toUTCString());
         }
 
-        if (this.headWritten) return this.response;
+        if (
+            !this.shouldSuppressBody() &&
+            !this.response.hasHeader('content-length') &&
+            !this.response.hasHeader('transfer-encoding')
+        ) {
+            this.response.chunkedEncoding = true;
+            this.response.setHeader('Transfer-Encoding', 'chunked');
+        }
 
         const outHeaders = this.collectHeaders();
         this.response.headersSent = true;
@@ -517,25 +688,58 @@ class NodeResponseAdapter {
 
     write(chunk: any, encodingOrCb?: BufferEncoding | ((err?: Error | null) => void), cb?: (err?: Error | null) => void): boolean {
         const callback = typeof encodingOrCb === 'function' ? encodingOrCb : cb;
+        const encoding = typeof encodingOrCb === 'string' ? encodingOrCb : undefined;
+        if (this.response.writableEnded) {
+            const err = createWriteAfterEndError();
+            callback?.(err);
+            queueMicrotask(() => this.response.emit('error', err));
+            return false;
+        }
         if (!this.response.headersSent) {
-            this.response.chunkedEncoding = true;
-            this.response.setHeader('Transfer-Encoding', 'chunked');
+            if (
+                !this.shouldSuppressBody() &&
+                !this.response.hasHeader('content-length') &&
+                !this.response.hasHeader('transfer-encoding')
+            ) {
+                this.response.chunkedEncoding = true;
+                this.response.setHeader('Transfer-Encoding', 'chunked');
+            }
             this.writeHead(this.response.statusCode, this.response.statusMessage);
         }
 
         try {
-            const data = toUint8Array(chunk, engine.encodeString);
+            const encodeString = encoding ? (value: string) => new text!.Encoder(encoding).encode(value) : engine.encodeString;
+            const data = toUint8Array(chunk, encodeString);
+            if (this.shouldSuppressBody()) {
+                callback?.();
+                return true;
+            }
+            this.pendingBytes += data.byteLength;
             this.enqueue(async () => {
                 try { this.serveHook?.onData?.({ requestId: this.requestId, timestamp: nodeTs(), data }); } catch {}
                 await this.coreResponse.write(data as Uint8Array);
-            }).then(() => callback?.(), (err) => {
+            }).then(() => { this.settleWrite(data.byteLength); callback?.(); }, (err) => {
+                this.settleWrite(data.byteLength);
                 this.fail(err, callback);
             });
         } catch (err) {
             this.fail(err, callback);
         }
 
-        return true;
+        // Mirrors Writable's highWaterMark contract: once queued bytes catch
+        // up (settleWrite), a pipe() source paused on this return value needs
+        // an actual 'drain' — see needDrain/settleWrite.
+        const ok = this.pendingBytes < this.response.writableHighWaterMark;
+        if (!ok) this.needDrain = true;
+        return ok;
+    }
+
+    private settleWrite(byteLength: number): void {
+        this.pendingBytes -= byteLength;
+        if (this.needDrain && this.pendingBytes <= 0) {
+            this.needDrain = false;
+            this.response.emit('drain');
+        }
     }
 
     end(chunk?: any, encodingOrCb?: BufferEncoding | (() => void), cb?: () => void): ServerResponseImpl {
@@ -557,32 +761,48 @@ class NodeResponseAdapter {
         this.response.writableEnded = true;
 
         if (chunk === undefined && !this.response.headersSent) {
-            this.response.setHeader('Content-Length', '0');
+            if (
+                !this.shouldSuppressBody() &&
+                !this.response.hasHeader('content-length') &&
+                !this.response.hasHeader('transfer-encoding')
+            ) {
+                this.response.setHeader('Content-Length', '0');
+            }
             this.writeHead(this.response.statusCode, this.response.statusMessage);
         } else if (chunk !== undefined && !this.response.headersSent) {
-            const data = toUint8Array(chunk, engine.encodeString);
-            this.response.setHeader('Content-Length', String(data.byteLength));
+            const encoding = typeof encodingOrCb === 'string' ? encodingOrCb : undefined;
+            const encodeString = encoding ? (value: string) => new text!.Encoder(encoding).encode(value) : engine.encodeString;
+            const data = toUint8Array(chunk, encodeString);
+            if (
+                !this.shouldSuppressBody() &&
+                !this.response.hasHeader('content-length') &&
+                !this.response.hasHeader('transfer-encoding')
+            ) {
+                this.response.setHeader('Content-Length', String(data.byteLength));
+            }
             this.writeHead(this.response.statusCode, this.response.statusMessage);
             chunk = data;
         }
 
         this.enqueue(async () => {
-            if (chunk !== undefined) {
-                const data = chunk instanceof Uint8Array ? chunk : toUint8Array(chunk, engine.encodeString);
+            if (chunk !== undefined && !this.shouldSuppressBody()) {
+                const encoding = typeof encodingOrCb === 'string' ? encodingOrCb : undefined;
+                const encodeString = encoding ? (value: string) => new text!.Encoder(encoding).encode(value) : engine.encodeString;
+                const data = chunk instanceof Uint8Array ? chunk : toUint8Array(chunk, encodeString);
                 try { this.serveHook?.onData?.({ requestId: this.requestId, timestamp: nodeTs(), data }); } catch {}
                 await this.coreResponse.end(data as Uint8Array);
             } else {
                 await this.coreResponse.end();
             }
         }).then(() => {
+            this.finished = true;
             this.response.finished = true;
             this.response.writableFinished = true;
             try { this.serveHook?.onFinished?.({ requestId: this.requestId, timestamp: nodeTs(), success: true }); } catch {}
             this.response.emit('finish');
             callback?.();
         }, (err) => {
-            this.fail(err);
-            callback?.();
+            this.fail(err, callback as ((err?: Error | null) => void) | undefined);
         });
 
         return this.response;
@@ -621,7 +841,7 @@ export class ServerImpl extends NetServer implements Server {
     requestTimeout: number = 300000;
     listening: boolean = false;
 
-    private _httpServer: any = null;
+    private _httpServer: HttpServer | null = null;
     private _options: ServerOptions;
     private _requestListener: RequestListener;
     private _httpConnections: Set<Socket> = new Set();
@@ -752,16 +972,16 @@ export class ServerImpl extends NetServer implements Server {
                             if (chunk === null) break;
                             incoming.push(chunk);
                         }
-                        incoming.push(null);
                         incoming.complete = true;
+                        incoming.push(null);
                     } catch (err) {
                         incoming.aborted = true;
                         incoming.destroy(err as Error);
                     }
                 })().catch(() => {});
             } else {
-                incoming.push(null);
                 incoming.complete = true;
+                incoming.push(null);
             }
 
             const response = new ServerResponseImpl();
@@ -772,11 +992,26 @@ export class ServerImpl extends NetServer implements Server {
             // creates two independent writers for one socket, which interleaves
             // header/body/terminator writes and hangs the client mid-response.
             if (nodeSocket) response.assignSocket(nodeSocket);
-            const adapter = new NodeResponseAdapter(response, res, serveHook, requestId, requestUrl);
+            const adapter = new NodeResponseAdapter(response, res, serveHook, requestId, requestUrl, incoming.method === 'HEAD');
             let responseDoneError: unknown;
             const responseDone = new Promise<void>((resolve, reject) => {
-                response.once('finish', () => resolve());
-                response.once('error', (err) => reject(err));
+                const cleanup = () => {
+                    response.off('finish', onFinish);
+                    response.off('error', onError);
+                };
+                const onFinish = () => {
+                    cleanup();
+                    resolve();
+                };
+                const onError = (err: any) => {
+                    if (err?.code === 'ERR_STREAM_WRITE_AFTER_END' && response.writableEnded) {
+                        return;
+                    }
+                    cleanup();
+                    reject(err);
+                };
+                response.on('finish', onFinish);
+                response.on('error', onError);
             });
             const responseDoneObserved = responseDone.catch((err) => {
                 responseDoneError = err;
@@ -825,7 +1060,17 @@ export class ServerImpl extends NetServer implements Server {
         });
 
         this._httpServer = createNativeServer(host);
-        this._httpServer.listen();
+        this._httpServer.onRequestError = (err: Error, tcpSock) => {
+            const message = String((err as any)?.message ?? err);
+            if (/^Parse error:/.test(message)) {
+                let clientSocket: Socket | null = null;
+                try { if (tcpSock?.socket) clientSocket = createAttachedSocket(tcpSock.socket); } catch {}
+                this.emit('clientError', err, clientSocket);
+                return;
+            }
+            this.emit('error', err);
+        };
+        this._httpServer.listen(); 
         this._listening = true;
         this.listening = true;
         this._httpServer.acceptLoop().catch((err: unknown) => {
@@ -871,4 +1116,3 @@ export function validateHeaderValue(name: string, value: string): void {
         throw new TypeError(`Invalid character in header content ["${name}"]`);
     }
 }
-

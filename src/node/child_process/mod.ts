@@ -8,6 +8,7 @@ const os = import.meta.use('os');
 const signals = import.meta.use('signals');
 const engine = import.meta.use('engine');
 const text = import.meta.use('text');
+const fs = import.meta.use('fs');
 
 import { IPCChannel } from '../ipc_channel';
 import { EventEmitter } from '../events';
@@ -77,6 +78,7 @@ export interface ChildProcess extends EventEmitter {
 function transformSignal(signal?: string | number): number | undefined {
     if (!signal) return;
     if (typeof signal === 'string') {
+        if (!signals) throw new Error('signal handling is unavailable outside the main thread');
         if (!(signal in signals.signals)) throw new Error(`Unknown signal: ${signal}`);
         // @ts-ignore - signal map
         return signals.signals[signal];
@@ -84,192 +86,284 @@ function transformSignal(signal?: string | number): number | undefined {
     return signal;
 }
 
-class ChildProcessImpl extends EventEmitter implements ChildProcess {
-    private _process: CModuleProcess.ChildProcess | null = null;
-    private _killed: boolean = false;
-    private _exitCode: number | null = null;
-    private _signalCode: string | null = null;
-    private _stdin: Writable | null = null;
-    private _stdout: Readable | null = null;
-    private _stderr: Readable | null = null;
-    private _ipcChannel: IPCChannel | null = null;
+function isPathLikeCommand(command: string): boolean {
+    return command.includes('/') || command.includes('\\') || /^[A-Za-z]:[\\/]/.test(command);
+}
 
-    stdin: Writable | null = null;
-    stdout: Readable | null = null;
-    stderr: Readable | null = null;
-    pid: number = 0;
-    exitCode: number | null = null;
-    signalCode: string | null = null;
-    spawnargs: string[] = [];
-    spawnfile: string = '';
-    killed: boolean = false;
-    connected: boolean = false;
+function makeSpawnError(command: string, syscall: string): NodeJS.ErrnoException {
+    const err = new Error(`${syscall} ${command} ENOENT`) as NodeJS.ErrnoException;
+    err.code = 'ENOENT';
+    err.errno = -2;
+    err.syscall = syscall;
+    err.path = command;
+    return err;
+}
 
-    constructor() {
-        super();
+function getImmediateSpawnError(command: string, syscall: string): NodeJS.ErrnoException | null {
+    if (!isPathLikeCommand(command)) return null;
+    try {
+        if (fs.exists(command)) return null;
+    } catch {}
+    return makeSpawnError(command, syscall);
+}
+
+function flattenPrototype(target: object): void {
+    const parent = Object.getPrototypeOf(target);
+    if (!parent || parent === Object.prototype) return;
+
+    for (const key of Object.getOwnPropertyNames(parent)) {
+        if (key === 'constructor' || Object.prototype.hasOwnProperty.call(target, key)) continue;
+        const descriptor = Object.getOwnPropertyDescriptor(parent, key);
+        if (descriptor) Object.defineProperty(target, key, descriptor);
     }
 
-    _init(process: CModuleProcess.ChildProcess, command: string, args: string[], options: SpawnOptions): void {
-        this._process = process;
-        this.pid = process.pid;
-        this.spawnfile = command;
-        this.spawnargs = args;
-
-        // Set stdin
-        if (process.stdin) {
-            this._stdin = this._createWritable(process.stdin);
-            this.stdin = this._stdin;
-        }
-
-        // Set stdout
-        if (process.stdout) {
-            this._stdout = this._createReadable(process.stdout);
-            this.stdout = this._stdout;
-        }
-
-        // Set stderr
-        if (process.stderr) {
-            this._stderr = this._createReadable(process.stderr);
-            this.stderr = this._stderr;
-        }
-
-        // Asynchronously wait for process exit
-        this._waitExit();
-    }
-
-    private _createWritable(pipe: CModuleStreams.Pipe): Writable {
-        return new Writable({
-            write(chunk: any, encoding: BufferEncoding, callback: (error?: Error | null) => void) {
-                const data = chunk instanceof Uint8Array ? chunk : engine.encodeString(chunk);
-                pipe.write(data).then(() => callback()).catch(callback);
-            },
-            async final(callback: (error?: Error | null) => void) {
-                try { await pipe.shutdown(); } finally { callback(); }
-            },
-        });
-    }
-
-    private _createReadable(pipe: CModuleStreams.Pipe): Readable {
-        const readable = new Readable({
-            read() {
-                // Resume reading when the consumer has drained below the high water mark
-                try { pipe.startRead(); } catch {}
-            }
-        });
-
-        // Use callback-based read: pipe.onread pushes data into the Readable buffer
-        pipe.onread = (data: Uint8Array | null | undefined, err?: any) => {
-            if (err) { readable.destroy(err as Error); return; }
-            if (data === null || data === undefined) {
-                readable.push(null);
-                try { pipe.stopRead(); } catch {}
-                return;
-            }
-            const ok = readable.push(data);
-            if (!ok) {
-                // Back-pressure: stop reading until Readable drains
-                try { pipe.stopRead(); } catch {}
-            }
-        };
-
-        // Enter flowing mode so push() emits 'data' immediately.
-        // Must be after onread is set — resume() calls _read() → startRead().
-        readable.resume();
-        return readable;
-    }
-
-    private async _waitExit(): Promise<void> {
-        if (!this._process) return;
-
-        try {
-            const info = await this._process.wait();
-            this._exitCode = info.exit_status;
-            this.exitCode = info.exit_status;
-            this._signalCode = info.term_signal;
-            this.signalCode = info.term_signal;
-
-            this.emit('exit', this._exitCode, this._signalCode);
-            this.emit('close', this._exitCode, this._signalCode);
-        } catch (err) {
-            this.emit('error', err);
-        }
-    }
-
-    kill(signal?: string | number): boolean {
-        if (this._killed || !this._process) return false;
-
-        this._killed = true;
-        this.killed = true;
-
-        try {
-            this._process.kill(transformSignal(signal));
-            return true;
-        } catch {
-            return false;
-        }
-    }
-
-    disconnect(): void {
-        // Only the IPC channel is torn down on disconnect(). In Node, stdin/stdout/
-        // stderr are independent of the IPC channel and must stay open. Closing the
-        // channel emits 'close', whose handler (registered in _setupIPC) flips
-        // `connected` to false and emits 'disconnect' — so we must not emit it here
-        // again to avoid a duplicate event.
-        if (!this.connected || !this._ipcChannel) return;
-        this._ipcChannel.close();
-        this._ipcChannel = null;
-    }
-
-    unref(): void {
-        // FIXME: C module doesn't expose unref per child process
-    }
-
-    ref(): void {
-        // FIXME
-    }
-
-    send(message: any, _sendHandle?: any, _options?: any, callback?: (error: Error | null) => void): boolean {
-        if (!this._ipcChannel || !this._ipcChannel.connected) {
-            const err = new Error('IPC channel is not enabled for this child process. Use { stdio: [\'inherit\', \'inherit\', \'ipc\'] } to enable.') as NodeJS.ErrnoException;
-            err.code = 'ERR_IPC_CHANNEL_CLOSED';
-            if (callback) { callback(err); return false; }
-            this.emit('error', err);
-            return false;
-        }
-
-        try {
-            // Node sends user messages verbatim (no wrapper) so the peer —
-            // including a real node process — receives exactly what was sent.
-            this._ipcChannel.send(message);
-            if (callback) callback(null);
-            return true;
-        } catch (err) {
-            if (callback) callback(err as Error);
-            return false;
-        }
-    }
-
-    /**
-     * Set up IPC channel (called internally when stdio includes 'ipc')
-     */
-    _setupIPC(pipe: CModuleStreams.Pipe): void {
-        this._ipcChannel = new IPCChannel(pipe);
-        this.connected = true;
-
-        this._ipcChannel.on('message', (msg) => {
-            this.emit('message', msg);
-        });
-
-        this._ipcChannel.on('error', (err: Error) => {
-            this.emit('error', err);
-        });
-
-        this._ipcChannel.on('close', () => {
-            this.connected = false;
-            this.emit('disconnect');
-        });
+    for (const key of Object.getOwnPropertySymbols(parent)) {
+        if (Object.prototype.hasOwnProperty.call(target, key)) continue;
+        const descriptor = Object.getOwnPropertyDescriptor(parent, key);
+        if (descriptor) Object.defineProperty(target, key, descriptor);
     }
 }
+
+interface ChildProcessImpl extends ChildProcess {
+    // Override the readonly modifiers inherited from ChildProcess — the
+    // concrete implementation needs to mutate these internally.
+    pid: number;
+    exitCode: number | null;
+    signalCode: string | null;
+    spawnargs: string[];
+    spawnfile: string;
+    killed: boolean;
+    connected: boolean;
+
+    _process: CModuleProcess.ChildProcess | null;
+    _killed: boolean;
+    _exitCode: number | null;
+    _signalCode: string | null;
+    _stdin: Writable | null;
+    _stdout: Readable | null;
+    _stderr: Readable | null;
+    _ipcChannel: IPCChannel | null;
+    _init(process: CModuleProcess.ChildProcess, command: string, args: string[], options: SpawnOptions): void;
+    _createWritable(pipe: CModuleStreams.Pipe): Writable;
+    _createReadable(pipe: CModuleStreams.Pipe): Readable;
+    _waitExit(): Promise<void>;
+    kill(signal?: string | number): boolean;
+    disconnect(): void;
+    unref(): void;
+    ref(): void;
+    send(message: any, sendHandle?: any, options?: any, callback?: (error: Error | null) => void): boolean;
+    _setupIPC(pipe: CModuleStreams.Pipe): void;
+}
+
+interface ChildProcessImplConstructor {
+    new (): ChildProcessImpl;
+    (): ChildProcessImpl;
+    prototype: ChildProcessImpl;
+}
+
+function initChildProcessImpl(self: any): void {
+    EventEmitter.call(self);
+    self._process = null;
+    self._killed = false;
+    self._exitCode = null;
+    self._signalCode = null;
+    self._stdin = null;
+    self._stdout = null;
+    self._stderr = null;
+    self._ipcChannel = null;
+
+    self.stdin = null;
+    self.stdout = null;
+    self.stderr = null;
+    self.pid = 0;
+    self.exitCode = null;
+    self.signalCode = null;
+    self.spawnargs = [];
+    self.spawnfile = '';
+    self.killed = false;
+    self.connected = false;
+}
+
+const ChildProcessImpl: ChildProcessImplConstructor = function ChildProcessImpl(this: any) {
+    const target = this && (typeof this === 'object' || typeof this === 'function')
+        ? this
+        : Object.create(ChildProcessImpl.prototype);
+    initChildProcessImpl(target);
+    return target;
+} as ChildProcessImplConstructor;
+
+Object.setPrototypeOf(ChildProcessImpl, EventEmitter);
+ChildProcessImpl.prototype = Object.create(EventEmitter.prototype);
+
+ChildProcessImpl.prototype._init = function _init(this: ChildProcessImpl, process: CModuleProcess.ChildProcess, command: string, args: string[], options: SpawnOptions): void {
+    this._process = process;
+    this.pid = process.pid;
+    this.spawnfile = command;
+    this.spawnargs = args;
+
+    // Set stdin
+    if (process.stdin) {
+        this._stdin = this._createWritable(process.stdin);
+        this.stdin = this._stdin;
+    }
+
+    // Set stdout
+    if (process.stdout) {
+        this._stdout = this._createReadable(process.stdout);
+        this.stdout = this._stdout;
+    }
+
+    // Set stderr
+    if (process.stderr) {
+        this._stderr = this._createReadable(process.stderr);
+        this.stderr = this._stderr;
+    }
+
+    // Asynchronously wait for process exit
+    this._waitExit();
+};
+
+ChildProcessImpl.prototype._createWritable = function _createWritable(this: ChildProcessImpl, pipe: CModuleStreams.Pipe): Writable {
+    return new Writable({
+        write(chunk: any, encoding: BufferEncoding, callback: (error?: Error | null) => void) {
+            const data = chunk instanceof Uint8Array ? chunk : engine.encodeString(chunk);
+            pipe.write(data).then(() => callback()).catch(callback);
+        },
+        async final(callback: (error?: Error | null) => void) {
+            try { await pipe.shutdown(); } finally { callback(); }
+        },
+    });
+};
+
+ChildProcessImpl.prototype._createReadable = function _createReadable(this: ChildProcessImpl, pipe: CModuleStreams.Pipe): Readable {
+    const readable = new Readable({
+        read() {
+            // Resume reading when the consumer has drained below the high water mark
+            try { pipe.startRead(); } catch {}
+        }
+    });
+
+    // Use callback-based read: pipe.onread pushes data into the Readable buffer
+    pipe.onread = (data: Uint8Array | null | undefined, err?: any) => {
+        if (err) { readable.destroy(err as Error); return; }
+        if (data === null || data === undefined) {
+            readable.push(null);
+            try { pipe.stopRead(); } catch {}
+            return;
+        }
+        const ok = readable.push(data);
+        if (!ok) {
+            // Back-pressure: stop reading until Readable drains
+            try { pipe.stopRead(); } catch {}
+        }
+    };
+
+    // Enter flowing mode so push() emits 'data' immediately.
+    // Must be after onread is set — resume() calls _read() → startRead().
+    readable.resume();
+    return readable;
+};
+
+ChildProcessImpl.prototype._waitExit = async function _waitExit(this: ChildProcessImpl): Promise<void> {
+    if (!this._process) return;
+
+    try {
+        const info = await this._process.wait();
+        const exitCode = info.term_signal ? null : info.exit_status;
+        this._exitCode = exitCode;
+        this.exitCode = exitCode;
+        this._signalCode = info.term_signal;
+        this.signalCode = info.term_signal;
+
+        this.emit('exit', this._exitCode, this._signalCode);
+        this.emit('close', this._exitCode, this._signalCode);
+    } catch (err) {
+        this.emit('error', err);
+    }
+};
+
+ChildProcessImpl.prototype.kill = function kill(this: ChildProcessImpl, signal?: string | number): boolean {
+    if (this._killed || !this._process) return false;
+
+    this._killed = true;
+    this.killed = true;
+
+    try {
+        this._process.kill(transformSignal(signal));
+        return true;
+    } catch {
+        return false;
+    }
+};
+
+ChildProcessImpl.prototype.disconnect = function disconnect(this: ChildProcessImpl): void {
+    // Only the IPC channel is torn down on disconnect(). In Node, stdin/stdout/
+    // stderr are independent of the IPC channel and must stay open. Closing the
+    // channel emits 'close', whose handler (registered in _setupIPC) flips
+    // `connected` to false and emits 'disconnect' — so we must not emit it here
+    // again to avoid a duplicate event.
+    if (!this.connected || !this._ipcChannel) return;
+    this._ipcChannel.close();
+    this._ipcChannel = null;
+};
+
+ChildProcessImpl.prototype.unref = function unref(this: ChildProcessImpl): void {
+    // FIXME: C module doesn't expose unref per child process
+};
+
+ChildProcessImpl.prototype.ref = function ref(this: ChildProcessImpl): void {
+    // FIXME
+};
+
+ChildProcessImpl.prototype.send = function send(this: ChildProcessImpl, message: any, _sendHandle?: any, _options?: any, callback?: (error: Error | null) => void): boolean {
+    if (!this._ipcChannel || !this._ipcChannel.connected) {
+        const err = new Error('IPC channel is not enabled for this child process. Use { stdio: [\'inherit\', \'inherit\', \'ipc\'] } to enable.') as NodeJS.ErrnoException;
+        err.code = 'ERR_IPC_CHANNEL_CLOSED';
+        if (callback) { callback(err); return false; }
+        this.emit('error', err);
+        return false;
+    }
+
+    try {
+        // Node sends user messages verbatim (no wrapper) so the peer —
+        // including a real node process — receives exactly what was sent.
+        this._ipcChannel.send(message);
+        if (callback) callback(null);
+        return true;
+    } catch (err) {
+        if (callback) callback(err as Error);
+        return false;
+    }
+};
+
+/**
+ * Set up IPC channel (called internally when stdio includes 'ipc')
+ */
+ChildProcessImpl.prototype._setupIPC = function _setupIPC(this: ChildProcessImpl, pipe: CModuleStreams.Pipe): void {
+    this._ipcChannel = new IPCChannel(pipe);
+    this.connected = true;
+
+    this._ipcChannel.on('message', (msg) => {
+        this.emit('message', msg);
+    });
+
+    this._ipcChannel.on('error', (err: Error) => {
+        this.emit('error', err);
+    });
+
+    this._ipcChannel.on('close', () => {
+        this.connected = false;
+        this.emit('disconnect');
+    });
+};
+
+Object.defineProperty(ChildProcessImpl.prototype, 'constructor', {
+    value: ChildProcessImpl,
+    writable: true,
+    configurable: true,
+});
+
+flattenPrototype(ChildProcessImpl.prototype);
 
 // spawn
 
@@ -328,6 +422,14 @@ export function spawn(command: string, argsOrOptions?: string[] | SpawnOptions, 
     }
 
     const child = new ChildProcessImpl();
+    child.spawnfile = command;
+    child.spawnargs = args;
+
+    const immediateError = getImmediateSpawnError(command, 'spawn');
+    if (immediateError) {
+        queueMicrotask(() => child.emit('error', immediateError));
+        return child;
+    }
 
     // Set IPC option in spawn options
     if (hasIPC) {
@@ -341,8 +443,14 @@ export function spawn(command: string, argsOrOptions?: string[] | SpawnOptions, 
         spawnOpts.env = { ...baseEnv, NODE_CHANNEL_FD: '3' };
     }
 
-    const process = proc.spawn([command, ...args], spawnOpts);
-    child._init(process, command, args, opts);
+    let process: CModuleProcess.ChildProcess;
+    try {
+        process = proc.spawn([command, ...args], spawnOpts);
+        child._init(process, command, args, opts);
+    } catch (err) {
+        queueMicrotask(() => child.emit('error', err as Error));
+        return child;
+    }
 
     // Set up IPC channel if created
     if (hasIPC && process.ipc) {
@@ -529,6 +637,15 @@ export function spawnSync(command: string, args?: string[], options?: SpawnOptio
             opts.stdout = options.stdio;
             opts.stderr = options.stdio;
         }
+    }
+
+    const immediateError = getImmediateSpawnError(command, 'spawnSync');
+    if (immediateError) {
+        return {
+            error: immediateError,
+            status: null,
+            signal: null,
+        };
     }
 
     try {
