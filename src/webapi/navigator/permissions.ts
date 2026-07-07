@@ -33,6 +33,23 @@ const grantedPermissions: Set<PermissionName> = new Set([
     'background-sync',
 ]);
 
+const isPermissionName = (name: unknown): name is PermissionName => {
+    return typeof name === 'string' && Object.prototype.hasOwnProperty.call(defaultPermissions, name);
+};
+
+const getPermissionName = (permissionDescriptor: PermissionDescriptor): PermissionName => {
+    if (!permissionDescriptor || typeof permissionDescriptor !== 'object') {
+        throw new TypeError('Permission descriptor must be an object');
+    }
+
+    const { name } = permissionDescriptor;
+    if (!isPermissionName(name)) {
+        throw new TypeError('Permission descriptor has an invalid name');
+    }
+
+    return name;
+};
+
 class PermissionStatusImpl extends EventTarget implements PermissionStatus {
     readonly name: PermissionName;
     private _state: string;
@@ -63,7 +80,7 @@ class PermissionsImpl implements Permissions {
     private _statuses: Map<string, PermissionStatusImpl> = new Map();
 
     async query(permissionDescriptor: PermissionDescriptor): Promise<PermissionStatus> {
-        const name = permissionDescriptor.name;
+        const name = getPermissionName(permissionDescriptor);
         const key = name;
 
         let status = this._statuses.get(key);

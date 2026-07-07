@@ -1,26 +1,34 @@
 import { fromError, PromiseRejectionEvent, EventTarget } from './events';
 
 const { onEvent, EventType } = import.meta.use('engine');
-const worker = import.meta.use('worker');
 
 // basic polyfills
 Object.defineProperties(globalThis, {
     global: {
         value: globalThis,
-        writable: false,
+        writable: true,
         enumerable: true,
         configurable: false
     },
-});
-
-if (worker.isWorker) {
-    Object.defineProperty(globalThis, 'self', {
+    self: {
         value: globalThis,
         writable: false,
         enumerable: true,
         configurable: false,
-    });
-}
+    },
+    window: {
+        value: globalThis,
+        writable: false,
+        enumerable: true,
+        configurable: false,
+    },
+    name: {
+        value: '',
+        writable: true,
+        enumerable: true,
+        configurable: true,
+    },
+});
 
 await Promise.all([
     import('./console'),
@@ -31,9 +39,14 @@ await Promise.all([
 await Promise.all([
     import('./streams'),
     import('./url'),
+    import('./location'),
     import('./formdata'),
-    // @ts-ignore
-    import('urlpattern-polyfill'),
+    import('./urlpattern'),
+]);
+
+await Promise.all([
+    import('./file-reader'),
+    import('./image-data'),
 ]);
 
 // navigator
@@ -59,18 +72,18 @@ onEvent((eventName, eventData) => {
             event = new Event('exit');
             break;
         case EventType.JOB_EXCEPTION:
-            // @ts-ignore
             event = fromError(eventData);
             event.preventDefault(); // prevent default error event
             break;
-        case EventType.UNHANDLED_REJECTION:
+        case EventType.UNHANDLED_REJECTION: {
+            const [promise, reason] = eventData as CModuleEngine.GlobalEvents[CModuleEngine.EventType.UNHANDLED_REJECTION];
             event = new PromiseRejectionEvent('unhandledrejection', {
-                // @ts-ignore
-                promise: eventData[0],
-                // @ts-ignore
-                reason: eventData[1]
+                promise,
+                reason,
+                cancelable: true,
             }, true)
             break;
+        }
         case EventType.LOAD:
             event = new Event('load');
             break;
@@ -86,7 +99,7 @@ onEvent((eventName, eventData) => {
 await import('./worker');
 
 // headers
-const { Headers } = await import('headers-polyfill');
+const { Headers } = await import('./headers');
 Reflect.set(globalThis, 'Headers', Headers);
 
 // fetch & xhr polyfill (CNO secondary wrapping layer)

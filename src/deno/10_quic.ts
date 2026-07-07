@@ -1,25 +1,32 @@
-const nativeQuic = import.meta.use("@cnojs/quic") as any as typeof import('@cnojs/quic').default;
+import type nativeQuicModule from "@cnojs/quic";
+import { bytesToArrayBuffer } from "../utils/bytes";
+
+const nativeQuic: typeof nativeQuicModule = import.meta.use("@cnojs/quic");
 
 const DEFAULT_ALPN = "cno-quic";
+
+function closeQuicSocketQuietly(socket: CModuleExternalQuic.Socket): void {
+    try {
+        socket.close();
+    } catch {
+        // Closing an already-failed QUIC socket is best-effort.
+    }
+}
 
 function firstAlpn(protocols?: string[]): string {
     if (!protocols || protocols.length === 0) return DEFAULT_ALPN;
     return protocols[0];
 }
 
-function toArrayBuffer(data: Uint8Array): ArrayBuffer {
-    return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
-}
-
 class QuicSendStream extends WritableStream<Uint8Array> {
     readonly id: bigint;
     sendOrder = 0;
 
-    constructor(conn: any, id: number) {
+    constructor(conn: CModuleExternalQuic.Connection, id: number) {
         let closed = false;
         super({
             write(chunk) {
-                conn.sendStream(id, toArrayBuffer(chunk), false);
+                conn.sendStream(id, bytesToArrayBuffer(chunk), false);
             },
             close() {
                 if (!closed) {
@@ -56,7 +63,13 @@ class QuicReceiveStream extends ReadableStream<Uint8Array<ArrayBuffer>> {
     }
 }
 
-class QuicConnImpl {
+type QuicStreamEntry = {
+    readable: QuicReceiveStream;
+    writable?: QuicSendStream;
+    incomingQueued?: boolean;
+};
+
+class QuicConnImpl implements Deno.QuicConn {
     readonly endpoint: QuicEndpointImpl;
     readonly remoteAddr: Deno.NetAddr;
     readonly protocol?: string;
@@ -67,27 +80,27 @@ class QuicConnImpl {
     readonly handshake: Promise<void>;
     readonly closed: Promise<Deno.QuicCloseInfo>;
 
-    #conn: any;
-    #handshakeResolve!: () => void;
-    #closedResolve!: (info: Deno.QuicCloseInfo) => void;
+    #conn: CModuleExternalQuic.Connection;
+    #handshakeResolve: () => void;
+    #closedResolve: (info: Deno.QuicCloseInfo) => void;
     #datagrams: Uint8Array<ArrayBuffer>[] = [];
     #datagramWaiters: ((data: Uint8Array<ArrayBuffer>) => void)[] = [];
-    #streams = new Map<number, {
-        readable?: QuicReceiveStream;
-        writable?: QuicSendStream;
-        incomingQueued?: boolean;
-    }>();
+    #streams = new Map<number, QuicStreamEntry>();
     #bidiController?: ReadableStreamDefaultController<Deno.QuicBidirectionalStream>;
     #uniController?: ReadableStreamDefaultController<Deno.QuicReceiveStream>;
     #handshakeDone = false;
 
-    constructor(endpoint: QuicEndpointImpl, conn: any, remoteAddr: Deno.NetAddr, protocol?: string) {
+    constructor(endpoint: QuicEndpointImpl, conn: CModuleExternalQuic.Connection, remoteAddr: Deno.NetAddr, protocol?: string) {
         this.endpoint = endpoint;
         this.#conn = conn;
         this.remoteAddr = remoteAddr;
         this.protocol = protocol;
-        this.handshake = new Promise((resolve) => this.#handshakeResolve = resolve);
-        this.closed = new Promise((resolve) => this.#closedResolve = resolve);
+        const handshake = Promise.withResolvers<void>();
+        const closed = Promise.withResolvers<Deno.QuicCloseInfo>();
+        this.handshake = handshake.promise;
+        this.closed = closed.promise;
+        this.#handshakeResolve = handshake.resolve;
+        this.#closedResolve = closed.resolve;
         this.incomingBidirectionalStreams = new ReadableStream({
             start: (controller) => this.#bidiController = controller,
         });
@@ -108,7 +121,7 @@ class QuicConnImpl {
             this.#closedResolve({ closeCode, reason });
         };
         this.#conn.ondatagram = (data: ArrayBuffer) => {
-            const chunk = new Uint8Array(data) as Uint8Array<ArrayBuffer>;
+            const chunk = new Uint8Array(data);
             const waiter = this.#datagramWaiters.shift();
             if (waiter) waiter(chunk);
             else this.#datagrams.push(chunk);
@@ -121,37 +134,32 @@ class QuicConnImpl {
             const existed = this.#streams.has(id);
             const entry = this.#ensureStream(id, true);
             if (!existed) this.#queueIncomingStream(entry, true);
-            entry.readable!.push(new Uint8Array(data) as Uint8Array<ArrayBuffer>, fin);
+            entry.readable.push(new Uint8Array(data), fin);
         };
     }
 
-    #ensureStream(id: number, bidirectional: boolean) {
+    #ensureStream(id: number, bidirectional: boolean): QuicStreamEntry {
         let entry = this.#streams.get(id);
         if (!entry) {
             entry = { readable: new QuicReceiveStream(id) };
-            if (bidirectional) entry.writable = new QuicSendStream(this.#conn, id);
             this.#streams.set(id, entry);
         }
+        if (bidirectional && !entry.writable) entry.writable = new QuicSendStream(this.#conn, id);
         return entry;
     }
 
-    #queueIncomingStream(
-        entry: {
-            readable?: QuicReceiveStream;
-            writable?: QuicSendStream;
-            incomingQueued?: boolean;
-        },
-        bidirectional: boolean,
-    ) {
+    #queueIncomingStream(entry: QuicStreamEntry, bidirectional: boolean) {
         if (entry.incomingQueued) return;
         entry.incomingQueued = true;
         if (bidirectional) {
+            const writable = entry.writable;
+            if (!writable) throw new Error("QUIC bidirectional stream is missing writable side");
             this.#bidiController?.enqueue({
-                readable: entry.readable!,
-                writable: entry.writable!,
+                readable: entry.readable,
+                writable,
             });
         } else {
-            this.#uniController?.enqueue(entry.readable!);
+            this.#uniController?.enqueue(entry.readable);
         }
     }
 
@@ -162,7 +170,9 @@ class QuicConnImpl {
     async createBidirectionalStream(): Promise<Deno.QuicBidirectionalStream> {
         const id = this.#conn.openStream(true);
         const entry = this.#ensureStream(id, true);
-        return { readable: entry.readable!, writable: entry.writable! };
+        const writable = entry.writable;
+        if (!writable) throw new Error("QUIC bidirectional stream is missing writable side");
+        return { readable: entry.readable, writable };
     }
 
     async createUnidirectionalStream(): Promise<Deno.QuicSendStream> {
@@ -171,13 +181,13 @@ class QuicConnImpl {
     }
 
     async sendDatagram(data: Uint8Array): Promise<void> {
-        this.#conn.sendDatagram(toArrayBuffer(data));
+        this.#conn.sendDatagram(bytesToArrayBuffer(data));
     }
 
     async readDatagram(): Promise<Uint8Array<ArrayBuffer>> {
         const datagram = this.#datagrams.shift();
-        if (datagram) return datagram as Uint8Array<ArrayBuffer>;
-        return await new Promise((resolve) => this.#datagramWaiters.push(resolve)) as Uint8Array<ArrayBuffer>;
+        if (datagram) return datagram;
+        return await new Promise((resolve) => this.#datagramWaiters.push(resolve));
     }
 }
 
@@ -193,7 +203,7 @@ class QuicIncomingImpl implements Deno.QuicIncoming {
     }
 
     accept<ZRTT extends boolean>(): ZRTT extends true ? Deno.QuicConn : Promise<Deno.QuicConn> {
-        return Promise.resolve(this.#conn as unknown as Deno.QuicConn) as ZRTT extends true ? Deno.QuicConn : Promise<Deno.QuicConn>;
+        return Promise.resolve(this.#conn) as ZRTT extends true ? Deno.QuicConn : Promise<Deno.QuicConn>;
     }
 
     refuse(): void {
@@ -208,12 +218,12 @@ class QuicIncomingImpl implements Deno.QuicIncoming {
 class QuicListenerImpl implements Deno.QuicListener {
     readonly endpoint: QuicEndpointImpl;
     #incoming: QuicIncomingImpl[] = [];
-    #waiters: ((incoming: QuicIncomingImpl) => void)[] = [];
+    #waiters: PromiseWithResolvers<QuicIncomingImpl>[] = [];
     #stopped = false;
 
-    constructor(endpoint: QuicEndpointImpl, socket: any) {
+    constructor(endpoint: QuicEndpointImpl, socket: CModuleExternalQuic.Socket) {
         this.endpoint = endpoint;
-        socket.onconnection = (nativeConn: any) => {
+        socket.onconnection = (nativeConn: CModuleExternalQuic.Connection) => {
             const conn = new QuicConnImpl(
                 endpoint,
                 nativeConn,
@@ -222,7 +232,7 @@ class QuicListenerImpl implements Deno.QuicListener {
             );
             const incoming = new QuicIncomingImpl(conn);
             const waiter = this.#waiters.shift();
-            if (waiter) waiter(incoming);
+            if (waiter) waiter.resolve(incoming);
             else this.#incoming.push(incoming);
         };
     }
@@ -231,7 +241,9 @@ class QuicListenerImpl implements Deno.QuicListener {
         if (this.#stopped) return Promise.reject(new Error("QUIC listener stopped"));
         const incoming = this.#incoming.shift();
         if (incoming) return Promise.resolve(incoming);
-        return new Promise((resolve) => this.#waiters.push(resolve));
+        const waiter = Promise.withResolvers<QuicIncomingImpl>();
+        this.#waiters.push(waiter);
+        return waiter.promise;
     }
 
     async accept(): Promise<Deno.QuicConn> {
@@ -241,7 +253,7 @@ class QuicListenerImpl implements Deno.QuicListener {
     stop(): void {
         this.#stopped = true;
         const err = new Error("QUIC listener stopped");
-        for (const w of this.#waiters) w(Promise.reject(err) as any);
+        for (const waiter of this.#waiters) waiter.reject(err);
         this.#waiters.length = 0;
     }
 
@@ -252,7 +264,7 @@ class QuicListenerImpl implements Deno.QuicListener {
 
 class QuicEndpointImpl implements Deno.QuicEndpoint {
     readonly addr: Deno.NetAddr;
-    socket?: any;
+    socket?: CModuleExternalQuic.Socket;
     alpn = DEFAULT_ALPN;
 
     constructor(options: Deno.QuicEndpointOptions = {}) {
@@ -278,7 +290,7 @@ class QuicEndpointImpl implements Deno.QuicEndpoint {
 
     close(): void {
         if (this.socket) {
-            try { this.socket.close(); } catch {}
+            closeQuicSocketQuietly(this.socket);
             this.socket = undefined;
         }
     }
@@ -299,7 +311,7 @@ function connectQuic(options: Deno.ConnectQuicOptions<boolean>): Promise<Deno.Qu
         { transport: "udp", hostname: options.hostname, port: options.port },
         endpoint.alpn,
     );
-    return conn.handshake.then(() => conn as unknown as Deno.QuicConn);
+    return conn.handshake.then(() => conn);
 }
 
 Object.assign(Deno, {

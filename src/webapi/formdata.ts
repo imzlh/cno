@@ -1,46 +1,61 @@
 import { malloc } from "../utils/malloc";
 import { Buffer } from "node-buffer";
+import { bytesToArrayBuffer } from "../utils/bytes";
 
 const engine = import.meta.use('engine');
+const os = import.meta.use('os');
 const asfs = import.meta.use('asyncfs');
 const fs = import.meta.use('fs');
 
 type FormDataEntryValue = globalThis.File | string;
+type BlobPartSnapshot = Blob | Uint8Array<ArrayBuffer> | ArrayBuffer | string;
+
+const nativeLineEnding = os.uname().sysname === 'Windows_NT' ? '\r\n' : '\n';
+
+function requireArguments(name: string, actual: number, required: number): void {
+    if (actual >= required) return;
+    throw new TypeError(`${name} requires ${required} argument${required === 1 ? '' : 's'}`);
+}
 
 // ==================== FormData ====================
 
 class FormData implements globalThis.FormData {
     #entries: Array<[string, FormDataEntryValue]> = [];
 
-    constructor(form?: any) {
+    constructor(form?: unknown) {
         if (form) {
             throw new Error('HTMLFormElement parsing not supported in CNO');
         }
     }
 
     append(name: string, value: string | Blob, filename?: string): void {
+        requireArguments('FormData.append', arguments.length, 2);
         const key = String(name);
 
         if (value instanceof Blob) {
             const file = blobToFile(value, filename);
             this.#entries.push([key, file]);
         } else {
+            if (arguments.length >= 3) throw new TypeError('FormData.append filename requires a Blob value');
             this.#entries.push([key, String(value)]);
         }
     }
 
     delete(name: string): void {
+        requireArguments('FormData.delete', arguments.length, 1);
         const key = String(name);
         this.#entries = this.#entries.filter(([k]) => k !== key);
     }
 
     get(name: string): FormDataEntryValue | null {
+        requireArguments('FormData.get', arguments.length, 1);
         const key = String(name);
         const entry = this.#entries.find(([k]) => k === key);
         return entry ? entry[1] : null;
     }
 
     getAll(name: string): FormDataEntryValue[] {
+        requireArguments('FormData.getAll', arguments.length, 1);
         const key = String(name);
         return this.#entries
             .filter(([k]) => k === key)
@@ -48,16 +63,22 @@ class FormData implements globalThis.FormData {
     }
 
     has(name: string): boolean {
+        requireArguments('FormData.has', arguments.length, 1);
         const key = String(name);
         return this.#entries.some(([k]) => k === key);
     }
 
     set(name: string, value: string | Blob, filename?: string): void {
+        requireArguments('FormData.set', arguments.length, 2);
         const key = String(name);
 
-        const newValue: FormDataEntryValue = value instanceof Blob
-            ? blobToFile(value, filename)
-            : String(value);
+        let newValue: FormDataEntryValue;
+        if (value instanceof Blob) {
+            newValue = blobToFile(value, filename);
+        } else {
+            if (arguments.length >= 3) throw new TypeError('FormData.set filename requires a Blob value');
+            newValue = String(value);
+        }
 
         let found = false;
         this.#entries = this.#entries.filter(([k]) => {
@@ -81,9 +102,13 @@ class FormData implements globalThis.FormData {
 
     forEach(
         callback: (value: FormDataEntryValue, key: string, parent: this) => void,
-        thisArg?: any
+        thisArg?: unknown
     ): void {
-        for (const [key, value] of this.#entries) {
+        if (arguments.length < 1 || typeof callback !== 'function') {
+            throw new TypeError('FormData.forEach requires a callback');
+        }
+        for (let i = 0; i < this.#entries.length; i++) {
+            const [key, value] = this.#entries[i];
             callback.call(thisArg, value, key, this);
         }
     }
@@ -115,8 +140,11 @@ class FormData implements globalThis.FormData {
 
 // ==================== Blob ====================
 
+const denoCustomInspect = Symbol.for('Deno.customInspect');
+export const blobBytesSymbol = Symbol.for('cno.blob.bytes');
+
 class Blob implements globalThis.Blob {
-    #parts: Array<BufferSource | globalThis.Blob | string>;
+    #parts: BlobPartSnapshot[];
     #type: string;
     #size: number;
 
@@ -124,7 +152,8 @@ class Blob implements globalThis.Blob {
         blobParts?: BlobPart[],
         options?: BlobPropertyBag
     ) {
-        this.#parts = blobParts ? [...blobParts] : [];
+        const endings = normalizeEndings(options?.endings ?? 'transparent');
+        this.#parts = blobParts ? blobParts.map((part) => snapshotBlobPart(part, endings)) : [];
         this.#type = normalizeType(options?.type ?? '');
         this.#size = calculateSize(this.#parts);
     }
@@ -150,19 +179,20 @@ class Blob implements globalThis.Blob {
 
     async arrayBuffer(): Promise<ArrayBuffer> {
         const buffer = this.#toBuffer();
-        return buffer.buffer.slice(
-            buffer.byteOffset,
-            buffer.byteOffset + buffer.byteLength
-        ) as ArrayBuffer;
+        return bytesToArrayBuffer(buffer);
     }
 
     bytes(): Promise<Uint8Array<ArrayBuffer>> {
         return Promise.resolve(new Uint8Array(this.#toBuffer()));
     }
 
+    [blobBytesSymbol](): Uint8Array<ArrayBuffer> {
+        return new Uint8Array(this.#toBuffer());
+    }
+
     async text(): Promise<string> {
         const buffer = this.#toBuffer();
-        return buffer.toString('utf-8');
+        return engine.decodeString(buffer);
     }
 
     stream(): ReadableStream<Uint8Array<ArrayBuffer>> {
@@ -180,15 +210,8 @@ class Blob implements globalThis.Blob {
         const chunks: Uint8Array[] = [];
 
         for (const part of this.#parts) {
-            if (typeof part === 'string') {
-                chunks.push(engine.encodeString(part));
-            } else if (part instanceof Blob) {
-                chunks.push(part.#toBuffer() as Uint8Array);
-            } else if (ArrayBuffer.isView(part)) {
-                chunks.push(new Uint8Array(part.buffer, part.byteOffset, part.byteLength));
-            } else if (part instanceof ArrayBuffer) {
-                chunks.push(new Uint8Array(part));
-            }
+            if (part instanceof Blob) chunks.push(part.#toBuffer());
+            else chunks.push(blobPartBytes(part));
         }
 
         return Buffer.concat(chunks);
@@ -200,6 +223,11 @@ class Blob implements globalThis.Blob {
 
     toString() {
         return `Blob { size: ${this.#size}, type: "${this.#type}" }`
+    }
+
+    [denoCustomInspect]() {
+        if (!(this instanceof Blob)) return 'Blob { }';
+        return this.toString();
     }
 }
 
@@ -216,6 +244,7 @@ class File extends Blob implements globalThis.File {
         fileName: string,
         options?: FilePropertyBag
     ) {
+        requireArguments('File.constructor', arguments.length, 2);
         super(fileBits, options);
         this.#name = String(fileName);
         this.#lastModified = options?.lastModified ?? Date.now();
@@ -233,6 +262,18 @@ class File extends Blob implements globalThis.File {
         return '';
     }
 
+    get [Symbol.toStringTag]() {
+        return 'File';
+    }
+
+    toString() {
+        return `File { name: "${this.#name}", size: ${this.size}, type: "${this.type}" }`
+    }
+
+    [denoCustomInspect]() {
+        return this.toString();
+    }
+
     static async fromPath(path: string, options?: {
         type?: string;
         name?: string;
@@ -247,8 +288,11 @@ class File extends Blob implements globalThis.File {
         } catch {
         }
 
+        const filePart = buffer.byteOffset === 0 && buffer.byteLength === buffer.buffer.byteLength
+            ? buffer
+            : buffer.slice();
         const file = new File(
-            [buffer.buffer as ArrayBuffer],
+            [filePart],
             fileName,
             {
                 type: options?.type ?? guessContentType(fileName),
@@ -301,10 +345,12 @@ class File extends Blob implements globalThis.File {
                 async pull(controller) {
                     const buf = malloc(controller);
                     try {
-                        const readed = await fileHandle!.read(buf);
+                        const handle = fileHandle;
+                        if (!handle) throw new Error('file stream was pulled before open');
+                        const readed = await handle.read(buf);
                         if (!readed) {
                             controller.close();
-                            fileHandle!.close();
+                            handle.close();
                             fileHandle = undefined;
                             return;
                         }
@@ -314,7 +360,10 @@ class File extends Blob implements globalThis.File {
                     }
                 },
                 cancel() {
-                    if (fileHandle) { fileHandle.close(); fileHandle = undefined; }
+                    if (fileHandle) {
+                        fileHandle.close();
+                        fileHandle = undefined;
+                    }
                 },
             });
         };
@@ -327,7 +376,7 @@ class File extends Blob implements globalThis.File {
 
 const blobToFile = (blob: Blob, filename?: string): globalThis.File => {
     if (blob instanceof File) {
-        return filename ? new File([blob], filename, { type: blob.type }) : blob;
+        return filename !== undefined ? new File([blob], filename, { type: blob.type }) : blob;
     }
 
     return new File(
@@ -337,7 +386,7 @@ const blobToFile = (blob: Blob, filename?: string): globalThis.File => {
     );
 };
 
-const normalizeType = (type: string): string => {
+const normalizeType = (type: unknown): string => {
     const normalized = String(type).toLowerCase();
     // Type must be ASCII and match pattern
     if (!/^[\x20-\x7E]*$/.test(normalized)) {
@@ -346,18 +395,45 @@ const normalizeType = (type: string): string => {
     return normalized;
 };
 
-const calculateSize = (parts: Array<BufferSource | globalThis.Blob | string>): number => {
+const normalizeEndings = (endings: unknown): EndingType => {
+    const value = String(endings);
+    if (value === 'transparent' || value === 'native') return value;
+    throw new TypeError(`Invalid Blob endings: ${value}`);
+};
+
+const normalizeLineEndings = (value: string): string => {
+    return value.replace(/\r\n|\r|\n/g, nativeLineEnding);
+};
+
+const snapshotBlobPart = (part: unknown, endings: EndingType): BlobPartSnapshot => {
+    if (part instanceof Blob) return part;
+    if (ArrayBuffer.isView(part)) {
+        return new Uint8Array(part.buffer, part.byteOffset, part.byteLength).slice();
+    }
+    if (part instanceof ArrayBuffer) return part.slice(0);
+    const string = String(part);
+    return endings === 'native' ? normalizeLineEndings(string) : string;
+};
+
+const blobPartBytes = (part: Exclude<BlobPartSnapshot, Blob>): Uint8Array => {
+    if (typeof part === 'string') return engine.encodeString(part);
+    if (ArrayBuffer.isView(part)) return new Uint8Array(part.buffer, part.byteOffset, part.byteLength);
+    if (part instanceof ArrayBuffer) return new Uint8Array(part);
+    return engine.encodeString(String(part));
+};
+
+const calculateSize = (parts: BlobPartSnapshot[]): number => {
     let size = 0;
 
     for (const part of parts) {
-        if (typeof part === 'string') {
-            size += Buffer.byteLength(part, 'utf-8');
-        } else if (part instanceof Blob) {
+        if (part instanceof Blob) {
             size += part.size;
         } else if (ArrayBuffer.isView(part)) {
             size += part.byteLength;
         } else if (part instanceof ArrayBuffer) {
             size += part.byteLength;
+        } else {
+            size += Buffer.byteLength(String(part), 'utf-8');
         }
     }
 

@@ -42,8 +42,49 @@ type IWSMeta = {
     responseHeaders?: Array<[string, string]>;
 } | undefined;
 
+type ServeRuntimeOptions =
+    Deno.ServeOptions &
+    Partial<Deno.ServeTcpOptions> &
+    Partial<Deno.ServeUnixOptions> &
+    Partial<Deno.TlsCertifiedKeyPem> &
+    Deno.ServeInit;
+
+function hasServeHandler(options: Deno.ServeOptions): options is Deno.ServeOptions & Deno.ServeInit {
+    return typeof Reflect.get(options, 'handler') === 'function';
+}
+
+function optionalStringOption(options: object, key: string): string | undefined {
+    const value = Reflect.get(options, key);
+    return typeof value === 'string' ? value : undefined;
+}
+
+function optionalNumberOption(options: object, key: string): number | undefined {
+    const value = Reflect.get(options, key);
+    return typeof value === 'number' ? value : undefined;
+}
+
 function serveTs(): number {
     return Date.now() / 1000;
+}
+
+function errorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
+}
+
+function emitServeHookQuietly(callback: () => void): void {
+    try {
+        callback();
+    } catch {
+        // Inspector hooks are observers; hook failures must not affect serve().
+    }
+}
+
+async function cancelReaderQuietly(reader: ReadableStreamDefaultReader<Uint8Array>, reason: unknown): Promise<void> {
+    try {
+        await reader.cancel(reason);
+    } catch {
+        // Downstream is already failing; keep the original write error.
+    }
 }
 
 function newServeRequestId(): string {
@@ -128,9 +169,11 @@ class ResponseAdapter {
         if (this.finishedEmitted) return;
         this.finishedEmitted = true;
         const serveHook = getServeHook();
-        if (serveHook) try {
-            serveHook.onFinished?.({ requestId: this.requestId, success, errorText, timestamp: serveTs() });
-        } catch { }
+        if (serveHook) {
+            emitServeHookQuietly(() => {
+                serveHook.onFinished?.({ requestId: this.requestId, success, errorText, timestamp: serveTs() });
+            });
+        }
     }
 
     verify(res: Response): void {
@@ -157,9 +200,7 @@ class ResponseAdapter {
             assert(!contentLength, 'Transfer-Encoding: chunked and Content-Length cannot coexist');
         }
 
-        if (res.body && (res.body instanceof ReadableStream) && !transferEncoding && !contentLength) {
-            assert(contentType, 'Streamed body exists but no Content-Type, Content-Length or Transfer-Encoding specified');
-        }
+        void contentType;
     }
 
     async sendResponse(response: Response): Promise<void> {
@@ -183,36 +224,41 @@ class ResponseAdapter {
         const headers = Array.from(headers2.entries());
         const statusText = response.statusText ?? http.strstatus(response.status);
         const serveHook = getServeHook();
-        if (serveHook) try {
-            serveHook.onResponse?.({
-                requestId: this.requestId,
-                url: this.url,
-                status: response.status,
-                statusText,
-                headers: headersToRecord(headers2),
-                timestamp: serveTs()
+        if (serveHook) {
+            emitServeHookQuietly(() => {
+                serveHook.onResponse?.({
+                    requestId: this.requestId,
+                    url: this.url,
+                    status: response.status,
+                    statusText,
+                    headers: headersToRecord(headers2),
+                    timestamp: serveTs()
+                });
             });
-        } catch { }
+        }
         await this.coreRes.writeHead(response.status, statusText, headers);
 
-        if (hasBody) {
-            const reader = response.body!.getReader();
+        const body = response.body;
+        if (hasBody && body) {
+            const reader = body.getReader();
             try {
                 while (true) {
                     const { done, value } = await reader.read();
                     if (done) break;
-                    if (serveHook) try {
-                        serveHook.onData?.({ requestId: this.requestId, data: value, timestamp: serveTs() });
-                    } catch { }
+                    if (serveHook) {
+                        emitServeHookQuietly(() => {
+                            serveHook.onData?.({ requestId: this.requestId, data: value, timestamp: serveTs() });
+                        });
+                    }
                     await this.coreRes.write(value);
                 }
             } catch (err) {
-                const message = String((err as Error)?.message ?? err);
+                const message = errorMessage(err);
                 this.emitFinished(false, message);
                 // Propagate downstream cancellation/write failure back to the
                 // upstream body source (for example fetch -> curl), otherwise
                 // the producer keeps downloading after the client has gone away.
-                try { await reader.cancel(err); } catch {}
+                await cancelReaderQuietly(reader, err);
                 this.coreRes.close();
                 throw new ServeResponseWriteError(message);
             } finally {
@@ -233,24 +279,27 @@ class ResponseAdapter {
         const headers = Array.from(response.headers.entries());
         const statusText = response.statusText ?? http.strstatus(response.status);
         const serveHook = getServeHook();
-        if (serveHook) try {
-            serveHook.onResponse?.({
-                requestId: this.requestId,
-                url: this.url,
-                status: response.status,
-                statusText,
-                headers: headersToRecord(response.headers),
-                timestamp: serveTs()
+        if (serveHook) {
+            emitServeHookQuietly(() => {
+                serveHook.onResponse?.({
+                    requestId: this.requestId,
+                    url: this.url,
+                    status: response.status,
+                    statusText,
+                    headers: headersToRecord(response.headers),
+                    timestamp: serveTs()
+                });
+                this.emitFinished(true);
             });
-            this.emitFinished(true);
-        } catch { }
+        }
         await this.coreRes.writeHead(response.status, statusText, headers);
 
         // Upgrade connection
         const conn = this.coreRes.upgrade();
 
         // Execute WebSocket handler
-        if (response[kWebSocket]) {
+        const websocketHandler = response[kWebSocket];
+        if (websocketHandler) {
             Reflect.set(conn, kWSMeta, {
                 source: 'serve',
                 requestId: this.requestId,
@@ -260,7 +309,7 @@ class ResponseAdapter {
                 responseHeaders: headers,
                 callFrames: this.requestCallFrames,
             } as IWSMeta);
-            response[kWebSocket]!(conn);
+            websocketHandler(conn);
         }
     }
 }
@@ -272,23 +321,25 @@ class ResponseAdapter {
 /**
  * HTTP server wrapper (implements Deno.HttpServer interface)
  */
-class DenoHttpServer implements Deno.HttpServer<Deno.NetAddr> {
+class DenoHttpServer implements Deno.HttpServer<Deno.Addr> {
     private server: Server;
     private finishedPromise: Promise<void>;
-    private finishedResolve!: () => void;
-    public readonly addr: Deno.NetAddr;
+    private finishedResolve: () => void;
+    public readonly addr: Deno.Addr;
 
     constructor(server: Server) {
         this.server = server;
-        this.finishedPromise = new Promise<void>(resolve => {
-            this.finishedResolve = resolve;
-        });
+        const finished = Promise.withResolvers<void>();
+        this.finishedPromise = finished.promise;
+        this.finishedResolve = finished.resolve;
         const addr = server.address();
-        this.addr = {
-            transport: 'tcp',
-            hostname: addr?.ip ?? '::',
-            port: addr?.port ?? 80
-        };
+        this.addr = addr && 'path' in addr
+            ? { transport: 'unix', path: addr.path }
+            : {
+                transport: 'tcp',
+                hostname: addr?.ip ?? '::',
+                port: addr?.port ?? 80
+            };
     }
 
     get finished(): Promise<void> {
@@ -296,23 +347,16 @@ class DenoHttpServer implements Deno.HttpServer<Deno.NetAddr> {
     }
 
     ref(): void {
-        // Not implemented (Txiki.js doesn't have ref/unref)
+        // Txiki.js server handles do not expose ref/unref.
     }
 
     unref(): void {
-        // Not implemented
+        // Kept as the matching no-op for ref().
     }
 
     async shutdown(): Promise<void> {
         await this.server.shutdown();
         this.finishedResolve();
-    }
-
-    then<TResult1 = void, TResult2 = never>(
-        onfulfilled?: ((value: void) => TResult1 | PromiseLike<TResult1>) | null,
-        onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null
-    ): Promise<TResult1 | TResult2> {
-        return this.finishedPromise.then(onfulfilled, onrejected);
     }
 
     [Symbol.asyncDispose](): Promise<void> {
@@ -336,7 +380,7 @@ function serve(
     // Capture call frames HERE — the user's code is on the stack.
     // Inside the server callback the stack is all internal infra.
     const serveEntryCallFrames = captureServeCallFrames();
-    let options: Deno.ServeOptions & Deno.ServeTcpOptions & { handler: Deno.ServeHandler };
+    let options: ServeRuntimeOptions;
 
     // Handle overloads
     if (typeof optionsOrHandler === 'function') {
@@ -345,11 +389,9 @@ function serve(
             port: 8000
         };
     } else {
-        // @ts-ignore
-        options = optionsOrHandler;
-        if (handler) {
-            options.handler = handler;
-        }
+        const optionHandler = handler ?? (hasServeHandler(optionsOrHandler) ? optionsOrHandler.handler : undefined);
+        if (!optionHandler) throw new TypeError('Handler is required');
+        options = { ...optionsOrHandler, handler: optionHandler };
     }
 
     // Validate handler
@@ -357,10 +399,7 @@ function serve(
         throw new TypeError('Handler is required');
     }
 
-    // Check for Unix socket
-    if ('path' in options && options.path) {
-        throw new Deno.errors.NotSupported('Unix socket server not yet implemented');
-    }
+    const unixPath = 'path' in options ? options.path : undefined;
 
     // Create core server
     const coreServer = createServer(
@@ -375,9 +414,16 @@ function serve(
             try {
                 // Create Web API Request
                 const addr = coreServer.address();
+                const denoAddr: Deno.Addr = addr && 'path' in addr
+                    ? { transport: 'unix', path: addr.path }
+                    : {
+                        hostname: addr?.ip || '0.0.0.0',
+                        port: addr?.port ?? options.port ?? 8000,
+                        transport: 'tcp'
+                    };
                 const webRequest = createWebRequest(req, {
-                    hostname: addr?.ip || '0.0.0.0',
-                    port: addr?.port || options.port || 8000,
+                    hostname: denoAddr.transport === 'tcp' ? denoAddr.hostname : 'localhost',
+                    port: denoAddr.transport === 'tcp' ? denoAddr.port : 80,
                     secure: coreServer.isSecure
                 });
                 req.body = null;
@@ -385,16 +431,14 @@ function serve(
 
                 // Create connection info
                 const connInfo: Deno.ServeHandlerInfo = {
-                    remoteAddr: {
-                        hostname: addr?.ip || '0.0.0.0',
-                        port: addr?.port || 0,
-                        transport: 'tcp'
-                    },
+                    remoteAddr: denoAddr,
                     completed: Promise.resolve() // Simplified
                 };
 
                 // Call user handler
-                const webResponse = await options.handler!(webRequest, connInfo);
+                const handler = options.handler;
+                if (!handler) throw new TypeError('Deno.serve requires a handler');
+                const webResponse = await handler(webRequest, connInfo);
                 if (!webResponse || !(webResponse instanceof Response)) {
                     throw new TypeError('Handler must return a Response');
                 }
@@ -404,18 +448,20 @@ function serve(
                     responseCallFrames = captureServeCallFrames();
                     setResponseInitiatorCallFrames(webResponse, responseCallFrames);
                 }
-                if (serveHook && requestId && !requestReported) try {
-                    serveHook.onRequest?.({
-                        requestId,
-                        url: requestUrl,
-                        method: req.method,
-                        headers: headersArrayToRecord(req.headers),
-                        postData: requestPostData,
-                        callFrames: requestEntryCallFrames,
-                        timestamp: requestStartTime,
+                if (serveHook && requestId && !requestReported) {
+                    emitServeHookQuietly(() => {
+                        serveHook.onRequest?.({
+                            requestId,
+                            url: requestUrl,
+                            method: req.method,
+                            headers: headersArrayToRecord(req.headers),
+                            postData: requestPostData,
+                            callFrames: requestEntryCallFrames,
+                            timestamp: requestStartTime,
+                        });
+                        requestReported = true;
                     });
-                    requestReported = true;
-                } catch { }
+                }
 
                 const adapter = new ResponseAdapter(res, req.method, requestId, requestUrl, req.headers, requestEntryCallFrames);
                 adapter.verify(webResponse);
@@ -425,10 +471,8 @@ function serve(
                 if (error instanceof ServeResponseWriteError) {
                     // The adapter already reported loadingFailed and closed the connection.
                 } else if (!(error instanceof errors.ConnectionReset)) {
-                    // Send 500 error
+                    // Give user code the same error-recovery hook Deno.serve exposes.
                     try {
-                        const body = 'Internal Server Error';
-                        const headers: Array<[string, string]> = [['Content-Type', 'text/plain']];
                         if (serveHook && requestId && !requestReported) {
                             serveHook.onRequest?.({
                                 requestId,
@@ -441,37 +485,38 @@ function serve(
                             });
                             requestReported = true;
                         }
-                        if (serveHook && requestId) {
-                            serveHook.onResponse?.({
-                                requestId,
-                                url: requestUrl,
-                                status: 500,
-                                statusText: 'Internal Server Error',
-                                headers: headersArrayToRecord(headers),
-                                timestamp: serveTs()
-                            });
-                            serveHook.onData?.({ requestId, data: engine.encodeString(body) as Uint8Array, timestamp: serveTs() });
+
+                        let errorResponse: Response | undefined;
+                        if (options.onError) {
+                            const handled = await options.onError(error);
+                            if (handled instanceof Response) errorResponse = handled;
                         }
-                        await res.writeHead(500, 'Internal Server Error', headers);
-                        await res.end(body);
-                        if (serveHook && requestId) serveHook.onFinished?.({ requestId, success: true, timestamp: serveTs() });
-                    } catch (e) {
-                        // Ignore
+                        errorResponse ??= new Response('Internal Server Error', {
+                            status: 500,
+                            headers: { 'Content-Type': 'text/plain' },
+                        });
+
+                        const adapter = new ResponseAdapter(res, req.method, requestId, requestUrl, req.headers, requestEntryCallFrames);
+                        adapter.verify(errorResponse);
+                        await adapter.sendResponse(errorResponse);
+                    } catch {
+                        // Keep the connection failure isolated from the accept loop.
                     }
                 } else if (serveHook && requestId) {
-                    try {
-                        serveHook.onFinished?.({ requestId, success: false, errorText: String((error as Error)?.message ?? error), timestamp: serveTs() });
-                    } catch { }
+                    emitServeHookQuietly(() => {
+                        serveHook.onFinished?.({ requestId, success: false, errorText: errorMessage(error), timestamp: serveTs() });
+                    });
                 }
             }
         },
         {
-            hostname: options.hostname || '0.0.0.0',
-            port: options.port || 8000,
-            cert: ('cert' in options) ? options.cert as string : undefined,
-            key: ('key' in options) ? options.key as string : undefined,
-            keepAliveTimeout: ('keepAliveTimeout' in options) ? options.keepAliveTimeout as number : undefined,
-            requestTimeout: ('requestTimeout' in options) ? options.requestTimeout as number : undefined,
+            hostname: unixPath ? '0.0.0.0' : options.hostname || '0.0.0.0',
+            port: unixPath ? 0 : options.port ?? 8000,
+            path: unixPath,
+            cert: optionalStringOption(options, 'cert'),
+            key: optionalStringOption(options, 'key'),
+            keepAliveTimeout: optionalNumberOption(options, 'keepAliveTimeout'),
+            requestTimeout: optionalNumberOption(options, 'requestTimeout'),
         }
     );
 
@@ -488,11 +533,7 @@ function serve(
 
     // Call onListen callback if provided
     if (options.onListen) {
-        options.onListen({
-            hostname: httpServer.addr.hostname,
-            port: httpServer.addr.port,
-            transport: 'tcp'
-        });
+        options.onListen(httpServer.addr);
     }
 
     return httpServer;
@@ -522,18 +563,17 @@ function upgradeWebSocket(
     const upgradeHeader = request.headers.get('upgrade')?.toLowerCase();
     const connectionHeader = request.headers.get('connection')?.toLowerCase();
     const wsKey = request.headers.get('sec-websocket-key');
-    const wsVersion = request.headers.get('sec-websocket-version');
 
-    if (upgradeHeader !== 'websocket' || !connectionHeader?.includes('upgrade')) {
-        throw new TypeError('Not a WebSocket upgrade request');
+    if (upgradeHeader !== 'websocket') {
+        throw new TypeError("Invalid Header: 'upgrade' header must contain 'websocket'");
     }
 
-    if (wsVersion !== '13') {
-        throw new TypeError('Unsupported WebSocket version');
+    if (!connectionHeader?.includes('upgrade')) {
+        throw new TypeError("Invalid Header: 'connection' header must contain 'Upgrade'");
     }
 
     if (!wsKey) {
-        throw new TypeError('Missing Sec-WebSocket-Key header');
+        throw new TypeError("Invalid Header: 'sec-websocket-key' header must be set");
     }
 
     // Build response headers
@@ -594,7 +634,6 @@ function createWebSocketFromISocket(conn: Promise<ISocket>): globalThis.WebSocke
 /* ------------------------------------------------------------------ */
 
 Object.assign(Deno, wrapFSns({
-    // @ts-ignore
-    serve,
+    serve: serve as typeof Deno.serve,
     upgradeWebSocket
 }));

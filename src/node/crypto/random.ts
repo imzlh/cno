@@ -3,7 +3,15 @@
  */
 
 const crypto = import.meta.use('crypto');
-import { toBuffer } from './helpers';
+import { normalizeHashAlgorithm, oneShotHmac, toBuffer } from './helpers';
+import { Buffer } from '../buffer';
+import type { BinaryInput } from './types';
+
+type RandomFillBuffer = ArrayBuffer | ArrayBufferView;
+
+function asError(error: unknown): Error {
+    return error instanceof Error ? error : new Error(String(error));
+}
 
 export interface ScryptOptions {
     N?: number;
@@ -69,22 +77,86 @@ function parseScryptOptions(options?: ScryptOptions): { N: number; r: number; p:
     return { N, r, p, maxmem };
 }
 
+function assertCallback(callback: unknown): asserts callback is (...args: unknown[]) => void {
+    if (typeof callback !== 'function') {
+        throw new TypeError('The "callback" argument must be of type function');
+    }
+}
+
 // randomInt / randomFill
 
+const RANDOM_INT_MAX = 0x1000000000000;
+const RANDOM_INT_MAX_RANGE = RANDOM_INT_MAX - 1;
+
+function assertRandomInt(name: string, value: number): void {
+    if (!Number.isSafeInteger(value)) {
+        throw new TypeError(`The "${name}" argument must be a safe integer`);
+    }
+}
+
+function assertRandomFillBuffer(buffer: unknown): asserts buffer is RandomFillBuffer {
+    if (!(buffer instanceof ArrayBuffer) && !ArrayBuffer.isView(buffer)) {
+        throw new TypeError('The "buf" argument must be an instance of ArrayBuffer or ArrayBufferView');
+    }
+}
+
+function parseRandomFillRange(buffer: RandomFillBuffer, offset: number, size: number): { off: number; sz: number } {
+    if (typeof offset !== 'number') {
+        throw new TypeError('The "offset" argument must be of type number');
+    }
+    if (!Number.isFinite(offset) || offset < 0 || offset > buffer.byteLength) {
+        throw new RangeError('The value of "offset" is out of range');
+    }
+    if (typeof size !== 'number') {
+        throw new TypeError('The "size" argument must be of type number');
+    }
+
+    const off = Math.trunc(offset);
+    const sz = Math.trunc(size);
+    if (!Number.isFinite(size) || sz < 0 || off + sz > buffer.byteLength) {
+        throw new RangeError('The value of "size + offset" is out of range');
+    }
+    return { off, sz };
+}
+
 export function randomInt(max: number): number;
+export function randomInt(max: number, callback: (err: Error | null, n: number) => void): void;
 export function randomInt(min: number, max: number): number;
-export function randomInt(min: number, max?: number, callback?: (err: Error | null, n: number) => void): number | void {
-    if (max === undefined) {
+export function randomInt(min: number, max: number, callback: (err: Error | null, n: number) => void): void;
+export function randomInt(min: number, max?: number | ((err: Error | null, n: number) => void), callback?: (err: Error | null, n: number) => void): number | void {
+    if (typeof max === 'function') {
+        callback = max;
+        max = min;
+        min = 0;
+    } else if (max === undefined) {
         max = min;
         min = 0;
     }
 
+    assertRandomInt('min', min);
+    assertRandomInt('max', max);
     const range = max - min;
-    const limit = Math.floor(0x100000000 / range) * range;
+    if (range <= 0) {
+        throw new RangeError(`The value of "max" must be greater than the value of "min"`);
+    }
+    if (range > RANDOM_INT_MAX_RANGE) {
+        throw new RangeError(`The value of "max - min" must be <= ${RANDOM_INT_MAX_RANGE}`);
+    }
+    if (callback !== undefined && typeof callback !== 'function') {
+        throw new TypeError('The "callback" argument must be of type function');
+    }
+
+    const limit = Math.floor(RANDOM_INT_MAX / range) * range;
+    const bytes = new Uint8Array(6);
     let value: number;
     do {
-        const bytes = new Uint8Array(crypto.randomBytes(4));
-        value = (bytes[0] << 24 | bytes[1] << 16 | bytes[2] << 8 | bytes[3]) >>> 0;
+        crypto.randomFill(bytes);
+        value = bytes[0] * 0x10000000000
+            + bytes[1] * 0x100000000
+            + bytes[2] * 0x1000000
+            + bytes[3] * 0x10000
+            + bytes[4] * 0x100
+            + bytes[5];
     } while (value >= limit);
     const result = min + (value % range);
 
@@ -95,86 +167,91 @@ export function randomInt(min: number, max?: number, callback?: (err: Error | nu
     return result;
 }
 
-export function randomFill<T extends ArrayBufferView>(buffer: T, callback: (err: Error | null, buf: T) => void): void;
-export function randomFill<T extends ArrayBufferView>(buffer: T, offset: number, callback: (err: Error | null, buf: T) => void): void;
-export function randomFill<T extends ArrayBufferView>(buffer: T, offset: number, size: number, callback: (err: Error | null, buf: T) => void): void;
-export function randomFill<T extends ArrayBufferView>(buffer: T, offset?: number | ((err: Error | null, buf: T) => void), size?: number | ((err: Error | null, buf: T) => void), callback?: (err: Error | null, buf: T) => void): void {
+export function randomFill<T extends RandomFillBuffer>(buffer: T, callback: (err: Error | null, buf: T) => void): void;
+export function randomFill<T extends RandomFillBuffer>(buffer: T, offset: number, callback: (err: Error | null, buf: T) => void): void;
+export function randomFill<T extends RandomFillBuffer>(buffer: T, offset: number, size: number, callback: (err: Error | null, buf: T) => void): void;
+export function randomFill<T extends RandomFillBuffer>(buffer: T, offset?: number | ((err: Error | null, buf: T) => void), size?: number | ((err: Error | null, buf: T) => void), callback?: (err: Error | null, buf: T) => void): void {
+    assertRandomFillBuffer(buffer);
+    let fillOffset = 0;
+    let fillSize: number | undefined;
     if (typeof offset === 'function') {
         callback = offset;
-        offset = 0;
-        size = buffer.byteLength;
+        fillSize = buffer.byteLength;
     } else if (typeof size === 'function') {
         callback = size;
-        size = buffer.byteLength - (offset as number);
+        fillOffset = offset ?? 0;
+        fillSize = buffer.byteLength - fillOffset;
+    } else {
+        fillOffset = offset ?? 0;
+        fillSize = size;
     }
 
-    const off = offset as number;
-    const sz = size as number;
-    const cb = callback!;
-
-    if (off < 0 || sz < 0 || off + sz > buffer.byteLength) {
-        cb(new RangeError('offset + size exceeds buffer length'), buffer);
-        return;
+    if (typeof callback !== 'function') {
+        throw new TypeError('The "callback" argument must be of type function');
     }
+
+    const { off, sz } = parseRandomFillRange(
+        buffer,
+        fillOffset,
+        fillSize === undefined ? buffer.byteLength - Math.trunc(fillOffset) : fillSize,
+    );
+    const cb = callback;
 
     try {
-        const randomData = new Uint8Array(crypto.randomBytes(sz));
-        const view = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
-        for (let i = 0; i < sz; i++) {
-            view[off + i] = randomData[i];
-        }
-        cb(null, buffer);
+        crypto.randomFill(buffer, off, sz);
     } catch (err) {
-        cb(err as Error, buffer);
+        cb(asError(err), buffer);
+        return;
     }
+    cb(null, buffer);
 }
 
-export function randomFillSync<T extends ArrayBufferView>(buffer: T, offset = 0, size?: number): T {
-    const sz = size ?? buffer.byteLength - offset;
-    if (offset < 0 || sz < 0 || offset + sz > buffer.byteLength) {
-        throw new RangeError('offset + size exceeds buffer length');
-    }
-    const randomData = new Uint8Array(crypto.randomBytes(sz));
-    const view = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
-    for (let i = 0; i < sz; i++) {
-        view[offset + i] = randomData[i]!;
-    }
+export function randomFillSync<T extends RandomFillBuffer>(buffer: T, offset = 0, size?: number): T {
+    assertRandomFillBuffer(buffer);
+    const { off, sz } = parseRandomFillRange(buffer, offset, size ?? buffer.byteLength - Math.trunc(offset));
+    crypto.randomFill(buffer, off, sz);
     return buffer;
 }
 
 // pbkdf2
 
-export function pbkdf2(password: ArrayBuffer | Uint8Array | string, salt: ArrayBuffer | Uint8Array | string, iterations: number, keylen: number, digest: string, callback: (err: Error | null, derivedKey: Uint8Array) => void): void {
-    try {
-        const passwordBuf = toBuffer(password);
-        const saltBuf = toBuffer(salt);
-        let result: ArrayBuffer;
-
-        switch (digest.toLowerCase()) {
-            case 'sha256':
-                result = crypto.pbkdf2Sha256(passwordBuf, saltBuf, iterations, keylen);
-                break;
-            case 'sha512':
-                result = crypto.pbkdf2Sha512(passwordBuf, saltBuf, iterations, keylen);
-                break;
-            default:
-                throw new Error(`Unsupported digest: ${digest}`);
+export function pbkdf2(password: ArrayBuffer | Uint8Array | string, salt: ArrayBuffer | Uint8Array | string, iterations: number, keylen: number, digest: string, callback: (err: Error | null, derivedKey: Buffer) => void): void {
+    assertCallback(callback);
+    queueMicrotask(() => {
+        let result: Buffer;
+        try {
+            result = pbkdf2Sync(password, salt, iterations, keylen, digest);
+        } catch (err) {
+            callback(asError(err), Buffer.alloc(0));
+            return;
         }
-
-        callback(null, new Uint8Array(result));
-    } catch (err) {
-        callback(err as Error, new Uint8Array(0));
-    }
+        callback(null, result);
+    });
 }
 
-export function pbkdf2Sync(password: ArrayBuffer | Uint8Array | string, salt: ArrayBuffer | Uint8Array | string, iterations: number, keylen: number, digest: string): Uint8Array {
+export function pbkdf2Sync(password: ArrayBuffer | Uint8Array | string, salt: ArrayBuffer | Uint8Array | string, iterations: number, keylen: number, digest: string): Buffer {
     const passwordBuf = toBuffer(password);
     const saltBuf = toBuffer(salt);
     let result: ArrayBuffer;
 
-    switch (digest.toLowerCase()) {
+    switch (normalizeHashAlgorithm(digest)) {
+        case 'md5':
+            result = pbkdf2Digest(passwordBuf, saltBuf, iterations, keylen, 'md5', 16);
+            break;
+        case 'ripemd160':
+            result = pbkdf2Digest(passwordBuf, saltBuf, iterations, keylen, 'ripemd160', 20);
+            break;
+        case 'sha1':
+            result = pbkdf2Digest(passwordBuf, saltBuf, iterations, keylen, 'sha1', 20);
+            break;
+        case 'sha224':
+            result = pbkdf2Digest(passwordBuf, saltBuf, iterations, keylen, 'sha224', 28);
+            break;
         case 'sha256':
             result = crypto.pbkdf2Sha256(passwordBuf, saltBuf, iterations, keylen);
+            break;
+        case 'sha384':
+            result = pbkdf2Digest(passwordBuf, saltBuf, iterations, keylen, 'sha384', 48);
             break;
         case 'sha512':
             result = crypto.pbkdf2Sha512(passwordBuf, saltBuf, iterations, keylen);
@@ -183,7 +260,51 @@ export function pbkdf2Sync(password: ArrayBuffer | Uint8Array | string, salt: Ar
             throw new Error(`Unsupported digest: ${digest}`);
     }
 
-    return new Uint8Array(result);
+    return Buffer.from(result);
+}
+
+function pbkdf2Digest(
+    passwordBuf: Uint8Array,
+    saltBytes: Uint8Array,
+    iterations: number,
+    keylen: number,
+    digest: string,
+    hashLen: number,
+): ArrayBuffer {
+    if (iterations < 1 || keylen < 1) {
+        throw new RangeError('Invalid iterations or keylen');
+    }
+
+    const blocks = Math.ceil(keylen / hashLen);
+    const out = new Uint8Array(blocks * hashLen);
+
+    for (let block = 1; block <= blocks; block++) {
+        const input = new Uint8Array(saltBytes.length + 4);
+        input.set(saltBytes);
+        input[input.length - 4] = (block >>> 24) & 0xff;
+        input[input.length - 3] = (block >>> 16) & 0xff;
+        input[input.length - 2] = (block >>> 8) & 0xff;
+        input[input.length - 1] = block & 0xff;
+
+        let u = new Uint8Array(oneShotHmac(digest, passwordBuf, input));
+        const t = new Uint8Array(u);
+        for (let i = 1; i < iterations; i++) {
+            u = new Uint8Array(oneShotHmac(digest, passwordBuf, u));
+            for (let j = 0; j < hashLen; j++) t[j] ^= u[j];
+        }
+        out.set(t, (block - 1) * hashLen);
+    }
+
+    return out.slice(0, keylen).buffer;
+}
+
+export function pbkdf2Sha1(
+    password: BinaryInput,
+    salt: BinaryInput,
+    iterations: number,
+    keylen: number,
+): ArrayBuffer {
+    return pbkdf2Digest(toBuffer(password), toBuffer(salt), iterations, keylen, 'sha1', 20);
 }
 
 export function pbkdf2Sha256(
@@ -206,25 +327,33 @@ export function pbkdf2Sha512(
 
 // scrypt
 
-export function scrypt(password: ArrayBuffer | Uint8Array | string, salt: ArrayBuffer | Uint8Array | string, keylen: number, callback: (err: Error | null, derivedKey: Uint8Array) => void): void;
-export function scrypt(password: ArrayBuffer | Uint8Array | string, salt: ArrayBuffer | Uint8Array | string, keylen: number, options: ScryptOptions, callback: (err: Error | null, derivedKey: Uint8Array) => void): void;
+export function scrypt(password: ArrayBuffer | Uint8Array | string, salt: ArrayBuffer | Uint8Array | string, keylen: number, callback: (err: Error | null, derivedKey: Buffer) => void): void;
+export function scrypt(password: ArrayBuffer | Uint8Array | string, salt: ArrayBuffer | Uint8Array | string, keylen: number, options: ScryptOptions, callback: (err: Error | null, derivedKey: Buffer) => void): void;
 export function scrypt(
     password: ArrayBuffer | Uint8Array | string,
     salt: ArrayBuffer | Uint8Array | string,
     keylen: number,
-    optionsOrCallback: ScryptOptions | ((err: Error | null, derivedKey: Uint8Array) => void),
-    maybeCallback?: (err: Error | null, derivedKey: Uint8Array) => void,
+    optionsOrCallback: ScryptOptions | ((err: Error | null, derivedKey: Buffer) => void),
+    maybeCallback?: (err: Error | null, derivedKey: Buffer) => void,
 ): void {
     const options = typeof optionsOrCallback === 'function' ? undefined : optionsOrCallback;
     const callback = typeof optionsOrCallback === 'function' ? optionsOrCallback : maybeCallback;
-    if (!callback) throw new TypeError('callback is required');
+    assertCallback(callback);
+
+    // Match Node's eager validation: invalid params throw before any async work
+    // is queued, while valid inputs still resolve through the callback.
+    parseScryptKeylen(keylen);
+    parseScryptOptions(options);
 
     queueMicrotask(() => {
+        let result: Buffer;
         try {
-            callback(null, scryptSync(password, salt, keylen, options));
+            result = scryptSync(password, salt, keylen, options);
         } catch (err) {
-            callback(err as Error, new Uint8Array(0));
+            callback(asError(err), Buffer.alloc(0));
+            return;
         }
+        callback(null, result);
     });
 }
 
@@ -233,20 +362,27 @@ export function scryptSync(
     salt: ArrayBuffer | Uint8Array | string,
     keylen: number,
     options?: ScryptOptions,
-): Uint8Array {
+): Buffer {
     keylen = parseScryptKeylen(keylen);
     const { N, r, p, maxmem } = parseScryptOptions(options);
     const passwordBuf = toBuffer(password);
     const saltBuf = toBuffer(salt);
-    return new Uint8Array(crypto.scrypt(passwordBuf, saltBuf, keylen, N, r, p, maxmem));
+    return Buffer.from(crypto.scrypt(passwordBuf, saltBuf, keylen, N, r, p, maxmem));
 }
 
 // hkdf
 
-export function hkdf(digest: string, ikm: ArrayBuffer | Uint8Array, salt: ArrayBuffer | Uint8Array, info: ArrayBuffer | Uint8Array, keylen: number): ArrayBuffer {
+function assertHkdfInfo(info: Uint8Array): void {
+    if (info.byteLength > 1024) {
+        throw new RangeError('The "info" argument must not contain more than 1024 bytes');
+    }
+}
+
+function deriveHkdf(digest: string, ikm: BinaryInput, salt: BinaryInput, info: BinaryInput, keylen: number): ArrayBuffer {
     const ikmBuf = toBuffer(ikm);
     const saltBuf = salt ? toBuffer(salt) : undefined;
     const infoBuf = info ? toBuffer(info) : undefined;
+    if (infoBuf) assertHkdfInfo(infoBuf);
 
     switch (digest.toLowerCase()) {
         case 'sha256':
@@ -258,24 +394,38 @@ export function hkdf(digest: string, ikm: ArrayBuffer | Uint8Array, salt: ArrayB
     }
 }
 
-export function hkdfSync(digest: string, ikm: ArrayBuffer | Uint8Array, salt: ArrayBuffer | Uint8Array, info: ArrayBuffer | Uint8Array, keylen: number): ArrayBuffer {
-    return hkdf(digest, ikm, salt, info, keylen);
+export function hkdf(digest: string, ikm: BinaryInput, salt: BinaryInput, info: BinaryInput, keylen: number, callback: (err: Error | null, derivedKey?: ArrayBuffer) => void): void {
+    assertCallback(callback);
+    queueMicrotask(() => {
+        let result: ArrayBuffer;
+        try {
+            result = deriveHkdf(digest, ikm, salt, info, keylen);
+        } catch (err) {
+            callback(asError(err));
+            return;
+        }
+        callback(null, result);
+    });
+}
+
+export function hkdfSync(digest: string, ikm: BinaryInput, salt: BinaryInput, info: BinaryInput, keylen: number): ArrayBuffer {
+    return deriveHkdf(digest, ikm, salt, info, keylen);
 }
 
 export function hkdfSha256(
-    ikm: ArrayBuffer | Uint8Array | string,
+    ikm: BinaryInput,
     keylen: number,
-    salt?: ArrayBuffer | Uint8Array | string,
-    info?: ArrayBuffer | Uint8Array | string,
+    salt?: BinaryInput,
+    info?: BinaryInput,
 ): ArrayBuffer {
     return crypto.hkdfSha256(toBuffer(ikm), keylen, salt ? toBuffer(salt) : undefined, info ? toBuffer(info) : undefined);
 }
 
 export function hkdfSha512(
-    ikm: ArrayBuffer | Uint8Array | string,
+    ikm: BinaryInput,
     keylen: number,
-    salt?: ArrayBuffer | Uint8Array | string,
-    info?: ArrayBuffer | Uint8Array | string,
+    salt?: BinaryInput,
+    info?: BinaryInput,
 ): ArrayBuffer {
     return crypto.hkdfSha512(toBuffer(ikm), keylen, salt ? toBuffer(salt) : undefined, info ? toBuffer(info) : undefined);
 }

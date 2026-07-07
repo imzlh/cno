@@ -1,12 +1,32 @@
-import { DOMException, EventTarget } from "../events";
-import { getFetchHook, getFetchInterceptHook, captureUserNetworkCallFrames, getCurlInitHook, type NetworkCallFrame } from "../../utils/network-hooks";
+import { DOMException, EventTarget, ProgressEvent } from "../events";
+import { bytesToArrayBuffer } from "../../utils/bytes";
+import { getFetchHook, getFetchInterceptHook, captureUserNetworkCallFrames, getCurlInitHook, type InterceptResult, type NetworkCallFrame } from "../../utils/network-hooks";
 import { attachCurlDebugTrace, buildConnectionInfo, CHARSET_RE, type CurlDebugTrace, curlMod, Decoder, engine, getCurlPool, parseHeaders, responseBodyToBytes, serializeBody, toCurlBody, truncateHookPostData } from "./helpers";
+import { isLocalFetchProtocol, loadLocalProtocol, type LocalProtocolResponse } from "./protocols";
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
+
+const crypto = import.meta.use('crypto');
 
 let _xhrRequestIdCounter = 0;
 function newRequestId(): string {
     return `fetch-${++_xhrRequestIdCounter}`;
+}
+
+function emitXhrNetworkHookQuietly(callback: () => void): void {
+    try {
+        callback();
+    } catch {
+        // Network hooks are CDP observers; XHR behavior must not depend on them.
+    }
+}
+
+function abortCurlQuietly(curl: CModuleCURL.CURL): void {
+    try {
+        curl.abort();
+    } catch {
+        // Abort is best-effort once user code has requested XHR cancellation.
+    }
 }
 
 const XHR_UNSENT = 0;
@@ -16,6 +36,19 @@ const XHR_LOADING = 3;
 const XHR_DONE = 4;
 
 type XMLHttpRequestResponseType = '' | 'arraybuffer' | 'blob' | 'document' | 'json' | 'text';
+type XHREventType = 'readystatechange' | 'load' | 'error' | 'abort' | 'loadstart' | 'loadend' | 'progress' | 'timeout';
+type XHREventHandler<T extends Event = Event> = ((this: XMLHttpRequest, ev: T) => unknown) | null;
+const RESPONSE_TYPES = new Set(['', 'arraybuffer', 'blob', 'document', 'json', 'text']);
+const FORBIDDEN_METHODS = new Set(['CONNECT', 'TRACE', 'TRACK']);
+const METHOD_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+
+function normalizeMethod(method: string): string {
+    const raw = String(method);
+    if (!METHOD_RE.test(raw)) throw new DOMException('Invalid HTTP method', 'SyntaxError');
+    const normalized = raw.toUpperCase();
+    if (FORBIDDEN_METHODS.has(normalized)) throw new DOMException('Forbidden HTTP method', 'SecurityError');
+    return normalized;
+}
 
 export class XMLHttpRequest extends EventTarget {
     static readonly UNSENT = XHR_UNSENT;
@@ -36,35 +69,59 @@ export class XMLHttpRequest extends EventTarget {
     responseURL: string = '';
     timeout: number = 0;
     withCredentials: boolean = false;
-    responseType: XMLHttpRequestResponseType = '';
     upload: EventTarget = new EventTarget();
 
     private _url: string = '';
     private _method: string = '';
+    private _responseType: XMLHttpRequestResponseType = '';
     private _headers: Array<[string, string]> = [];
     private _responseHeaders: string = '';
     private _responseHeaderMap: Map<string, string> | null = null;
-    private _response: any = null;
+    private _response: unknown = null;
     private _responseText: string = '';
     private _aborted: boolean = false;
     private _curl: CModuleCURL.CURL | null = null;
     private _async: boolean = true;
     private _user: string | null = null;
     private _password: string | null = null;
+    private _overrideMimeType: string | null = null;
 
-    onreadystatechange: ((this: XMLHttpRequest, ev: Event) => any) | null = null;
-    onload: ((this: XMLHttpRequest, ev: Event) => any) | null = null;
-    onerror: ((this: XMLHttpRequest, ev: Event) => any) | null = null;
-    onabort: ((this: XMLHttpRequest, ev: Event) => any) | null = null;
-    onloadstart: ((this: XMLHttpRequest, ev: ProgressEvent) => any) | null = null;
-    onloadend: ((this: XMLHttpRequest, ev: ProgressEvent) => any) | null = null;
-    onprogress: ((this: XMLHttpRequest, ev: ProgressEvent) => any) | null = null;
-    ontimeout: ((this: XMLHttpRequest, ev: ProgressEvent) => any) | null = null;
+    onreadystatechange: XHREventHandler = null;
+    onload: XHREventHandler = null;
+    onerror: XHREventHandler = null;
+    onabort: XHREventHandler = null;
+    onloadstart: XHREventHandler<ProgressEvent> = null;
+    onloadend: XHREventHandler<ProgressEvent> = null;
+    onprogress: XHREventHandler<ProgressEvent> = null;
+    ontimeout: XHREventHandler<ProgressEvent> = null;
 
-    private _emit(type: string): void {
+    private _eventHandler(type: Exclude<XHREventType, 'loadstart' | 'loadend' | 'progress' | 'timeout'>): XHREventHandler {
+        switch (type) {
+            case 'readystatechange': return this.onreadystatechange;
+            case 'load': return this.onload;
+            case 'error': return this.onerror;
+            case 'abort': return this.onabort;
+        }
+    }
+
+    private _progressHandler(type: 'loadstart' | 'loadend' | 'progress' | 'timeout'): XHREventHandler<ProgressEvent> {
+        switch (type) {
+            case 'loadstart': return this.onloadstart;
+            case 'loadend': return this.onloadend;
+            case 'progress': return this.onprogress;
+            case 'timeout': return this.ontimeout;
+        }
+    }
+
+    private _emit(type: XHREventType): void {
+        if (type === 'loadstart' || type === 'loadend' || type === 'progress' || type === 'timeout') {
+            const evt = new ProgressEvent(type);
+            this._progressHandler(type)?.call(this, evt);
+            this.dispatchEvent(evt);
+            return;
+        }
         const evt = new Event(type);
-        const handler = (this as any)[`on${type}`];
-        if (typeof handler === 'function') handler.call(this, evt);
+        this._eventHandler(type)?.call(this, evt);
         this.dispatchEvent(evt);
     }
 
@@ -73,8 +130,23 @@ export class XMLHttpRequest extends EventTarget {
         this._emit('readystatechange');
     }
 
+    get responseType(): XMLHttpRequestResponseType {
+        return this._responseType;
+    }
+
+    set responseType(value: XMLHttpRequestResponseType) {
+        if (this.readyState === XHR_LOADING || this.readyState === XHR_DONE || (this.readyState === XHR_OPENED && this._curl !== null)) {
+            throw new DOMException('InvalidStateError', 'InvalidStateError');
+        }
+        const next = String(value);
+        if (!RESPONSE_TYPES.has(next)) {
+            throw new TypeError(`Invalid XMLHttpRequest responseType: ${next}`);
+        }
+        this._responseType = next as XMLHttpRequestResponseType;
+    }
+
     open(method: string, url: string, async: boolean = true, user?: string | null, password?: string | null): void {
-        this._method = method.toUpperCase();
+        this._method = normalizeMethod(method);
         this._url = url;
         this._async = async;
         this._user = user ?? null;
@@ -86,12 +158,14 @@ export class XMLHttpRequest extends EventTarget {
         this._responseHeaders = '';
         this._responseHeaderMap = null;
         this._headers = [];
+        this._overrideMimeType = null;
         this.status = 0;
         this.statusText = '';
-        this.readyState = XHR_OPENED;
+        this._setState(XHR_OPENED);
     }
 
     setRequestHeader(name: string, value: string): void {
+        if (this.readyState !== XHR_OPENED) throw new DOMException('InvalidStateError', 'InvalidStateError');
         this._headers.push([name, value]);
     }
 
@@ -112,26 +186,47 @@ export class XMLHttpRequest extends EventTarget {
         return this._responseHeaders;
     }
 
-    overrideMimeType(_mime: string): void {
-        // Not implemented
+    overrideMimeType(mime: string): void {
+        if (this.readyState === XHR_LOADING || this.readyState === XHR_DONE) {
+            throw new DOMException('InvalidStateError', 'InvalidStateError');
+        }
+        this._overrideMimeType = String(mime);
     }
 
     abort(): void {
         if (this.readyState === XHR_UNSENT || this.readyState === XHR_DONE) return;
         this._aborted = true;
         if (this._curl) {
-            try { this._curl.abort(); } catch {}
+            abortCurlQuietly(this._curl);
         }
         this.readyState = XHR_DONE;
         this._emit('abort');
         this._emit('loadend');
     }
 
-    send(body?: any): void {
+    send(body?: BodyInit | null): void {
         if (this.readyState !== XHR_OPENED) throw new DOMException('InvalidStateError', 'InvalidStateError');
         if (this._aborted) return;
 
         this._emit('loadstart');
+
+        let parsedUrl: URL | null = null;
+        try {
+            parsedUrl = new URL(this._url);
+        } catch {}
+        if (parsedUrl) {
+            const localPromise = loadLocalProtocol(parsedUrl, this._url);
+            localPromise.then((response) => {
+                if (this._aborted || !response) return;
+                this._handleLocalResponse(response);
+            }).catch(() => {
+                if (this._aborted) return;
+                this.readyState = XHR_DONE;
+                this._emit('error');
+                this._emit('loadend');
+            });
+            if (isLocalFetchProtocol(parsedUrl.protocol)) return;
+        }
 
         const curl = new curlMod.CURL(getCurlPool());
         getCurlInitHook()?.(curl);
@@ -153,10 +248,7 @@ export class XMLHttpRequest extends EventTarget {
 
         // Basic auth from open() user/password — UTF-8 encode then base64 (RFC 7617)
         if (this._user !== null) {
-            const credBytes = engine.encodeString(`${this._user}:${this._password ?? ''}`) as Uint8Array;
-            let credStr = '';
-            for (let i = 0; i < credBytes.length; i++) credStr += String.fromCharCode(credBytes[i]!);
-            hdrs['Authorization'] = `Basic ${btoa(credStr)}`;
+            hdrs['Authorization'] = `Basic ${crypto.base64Encode(engine.encodeString(`${this._user}:${this._password ?? ''}`))}`;
         }
 
         curl.setUrl(this._url)
@@ -184,8 +276,9 @@ export class XMLHttpRequest extends EventTarget {
                 requestId: reqId, url: this._url, method: this._method,
                 headers: hdrs, postData: truncateHookPostData(bodyBytes ?? null), resourceType: 'XHR',
             }).then(result => {
+                if (this._aborted) return;
                 if (result?.action === 'fulfill') {
-                    this._handleInterceptedFulfill(result as any);
+                    this._handleInterceptedFulfill(result);
                 } else if (result?.action === 'fail') {
                     this.readyState = XHR_DONE;
                     this._emit('error');
@@ -193,7 +286,9 @@ export class XMLHttpRequest extends EventTarget {
                 } else {
                     this._doPerform(curl, netHook, reqId, hdrs, bodyBytes, reqCallFrames, curlTrace);
                 }
-            }).catch(() => this._doPerform(curl, netHook, reqId, hdrs, bodyBytes, reqCallFrames, curlTrace));
+            }).catch(() => {
+                if (!this._aborted) this._doPerform(curl, netHook, reqId, hdrs, bodyBytes, reqCallFrames, curlTrace);
+            });
         } else {
             this._doPerform(curl, netHook, reqId, hdrs, bodyBytes, reqCallFrames, curlTrace);
         }
@@ -203,9 +298,11 @@ export class XMLHttpRequest extends EventTarget {
         const ts = () => Date.now() / 1000;
         const reqStartTime = Date.now() / 1000;
 
-        if (netHook) try {
-            netHook.onRequest?.({ requestId: reqId, url: this._url, method: this._method, headers: hdrs, postData: truncateHookPostData(bodyBytes ?? null), callFrames: reqCallFrames, resourceType: 'XHR', timestamp: reqStartTime });
-        } catch {}
+        if (netHook) {
+            emitXhrNetworkHookQuietly(() => {
+                netHook.onRequest?.({ requestId: reqId, url: this._url, method: this._method, headers: hdrs, postData: truncateHookPostData(bodyBytes ?? null), callFrames: reqCallFrames, resourceType: 'XHR', timestamp: reqStartTime });
+            });
+        }
 
         const handleDone = (response: CModuleCURL.Response): void => {
             if (this._aborted) return;
@@ -215,15 +312,17 @@ export class XMLHttpRequest extends EventTarget {
             const resHdrs: Record<string, string> = {};
             parseHeaders(response.headers).forEach(([k, v]) => { resHdrs[k] = v; });
 
-            if (netHook) try {
-                netHook.onResponse?.({
-                    requestId: reqId, url: this._url, status: response.status,
-                    headers: resHdrs, requestHeaders: hdrs, resourceType: 'XHR', connection: conn, timestamp: ts()
+            if (netHook) {
+                emitXhrNetworkHookQuietly(() => {
+                    netHook.onResponse?.({
+                        requestId: reqId, url: this._url, status: response.status,
+                        headers: resHdrs, requestHeaders: hdrs, resourceType: 'XHR', connection: conn, timestamp: ts()
+                    });
+                    const bytes = responseBodyToBytes(response.body);
+                    netHook.onData?.({ requestId: reqId, data: bytes, timestamp: ts() });
+                    netHook.onFinished?.({ requestId: reqId, success: true, connection: conn, timestamp: ts() });
                 });
-                const bytes = responseBodyToBytes(response.body);
-                netHook.onData?.({ requestId: reqId, data: bytes, timestamp: ts() });
-                netHook.onFinished?.({ requestId: reqId, success: true, connection: conn, timestamp: ts() });
-            } catch {}
+            }
 
             this._handleResponse(response);
         };
@@ -231,9 +330,11 @@ export class XMLHttpRequest extends EventTarget {
         if (this._async) {
             curl.perform().then(handleDone).catch(() => {
                 if (this._aborted) return;
-                if (netHook) try {
-                    netHook.onFinished?.({ requestId: reqId, success: false, errorText: 'network error', timestamp: ts() });
-                } catch {}
+                if (netHook) {
+                    emitXhrNetworkHookQuietly(() => {
+                        netHook.onFinished?.({ requestId: reqId, success: false, errorText: 'network error', timestamp: ts() });
+                    });
+                }
                 this.readyState = XHR_DONE;
                 this._emit('error');
                 this._emit('loadend');
@@ -245,9 +346,11 @@ export class XMLHttpRequest extends EventTarget {
                 handleDone(curl.performSync());
             } catch {
                 if (!this._aborted) {
-                    if (netHook) try {
-                        netHook.onFinished?.({ requestId: reqId, success: false, errorText: 'network error', timestamp: ts() });
-                    } catch {}
+                    if (netHook) {
+                        emitXhrNetworkHookQuietly(() => {
+                            netHook.onFinished?.({ requestId: reqId, success: false, errorText: 'network error', timestamp: ts() });
+                        });
+                    }
                     this.readyState = XHR_DONE;
                     this._emit('error');
                     this._emit('loadend');
@@ -258,7 +361,7 @@ export class XMLHttpRequest extends EventTarget {
         }
     }
 
-    private _handleInterceptedFulfill(result: { responseCode: number; responseHeaders: Array<[string, string]>; body: Uint8Array }): void {
+    private _handleInterceptedFulfill(result: Extract<InterceptResult, { action: 'fulfill' }>): void {
         const hdrs: string[] = [];
         for (const [k, v] of result.responseHeaders) hdrs.push(`${k}: ${v}`);
         this._responseHeaders = hdrs.join('\r\n');
@@ -266,8 +369,27 @@ export class XMLHttpRequest extends EventTarget {
         this.status = result.responseCode;
         this.statusText = '';
         this.responseURL = this._url;
-        const bytes = result.body;
+        const bytes: Uint8Array = new globalThis.Uint8Array(result.body.byteLength);
+        bytes.set(result.body);
+        this._setState(XHR_HEADERS_RECEIVED);
         this._applyBody(bytes, result.responseHeaders.find(([k]) => k.toLowerCase() === 'content-type')?.[1]);
+        this._setState(XHR_LOADING);
+        this._setState(XHR_DONE);
+        this._emit('progress');
+        this._emit('load');
+        this._emit('loadend');
+    }
+
+    private _handleLocalResponse(response: LocalProtocolResponse): void {
+        const hdrs: string[] = [];
+        for (const [k, v] of response.headers) hdrs.push(`${k}: ${v}`);
+        this.status = response.status;
+        this.statusText = '';
+        this.responseURL = response.url;
+        this._responseHeaders = hdrs.join('\r\n');
+        this._responseHeaderMap = null;
+        this._setState(XHR_HEADERS_RECEIVED);
+        this._applyBody(response.body, response.headers.get('content-type') ?? undefined);
         this._setState(XHR_LOADING);
         this._setState(XHR_DONE);
         this._emit('progress');
@@ -280,7 +402,12 @@ export class XMLHttpRequest extends EventTarget {
         this.statusText = '';
         this._responseHeaders = response.headers;
         this._responseHeaderMap = null;
-        try { this.responseURL = this._curl?.getInfo(curlMod.CURLINFO_EFFECTIVE_URL) as string || this._url; } catch { this.responseURL = this._url; }
+        try {
+            const responseURL = this._curl?.getInfo(curlMod.CURLINFO_EFFECTIVE_URL);
+            this.responseURL = typeof responseURL === 'string' && responseURL.length > 0 ? responseURL : this._url;
+        } catch {
+            this.responseURL = this._url;
+        }
 
         this._setState(XHR_HEADERS_RECEIVED);
 
@@ -295,32 +422,41 @@ export class XMLHttpRequest extends EventTarget {
     }
 
     private _applyBody(bytes: Uint8Array, contentType?: string): void {
-        switch (this.responseType) {
+        const effectiveContentType = this._overrideMimeType ?? contentType;
+        switch (this._responseType) {
             case '':
             case 'text': {
-                const m = contentType ? CHARSET_RE.exec(contentType) : null;
+                const m = effectiveContentType ? CHARSET_RE.exec(effectiveContentType) : null;
                 this._responseText = new Decoder(m?.[1]).decode(bytes);
                 this._response = this._responseText;
                 break;
             }
             case 'json':
-                try { this._response = JSON.parse(new Decoder(undefined).decode(bytes)); }
-                catch { this._response = null; }
+                try {
+                    this._response = JSON.parse(new Decoder(undefined).decode(bytes));
+                } catch {
+                    this._response = null;
+                }
                 break;
             case 'arraybuffer':
-                this._response = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+                this._response = bytesToArrayBuffer(bytes);
                 break;
             case 'blob':
-                this._response = new Blob([bytes]);
+                this._response = new Blob([bytes], effectiveContentType ? { type: effectiveContentType.split(';', 1)[0].trim() } : undefined);
                 break;
             default: {
-                const m = contentType ? CHARSET_RE.exec(contentType) : null;
+                const m = effectiveContentType ? CHARSET_RE.exec(effectiveContentType) : null;
                 this._responseText = new Decoder(m?.[1]).decode(bytes);
                 this._response = this._responseText;
             }
         }
     }
 
-    get response(): any { return this._response; }
-    get responseText(): string { return this._responseText; }
+    get response(): unknown { return this._response; }
+    get responseText(): string {
+        if (this._responseType !== '' && this._responseType !== 'text') {
+            throw new DOMException('InvalidStateError', 'InvalidStateError');
+        }
+        return this._responseText;
+    }
 }

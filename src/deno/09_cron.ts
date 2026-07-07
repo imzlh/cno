@@ -48,6 +48,8 @@ const DAY_NAMES: Record<string, number> = {
 
 const MAX_RETRIES = 5;
 const MAX_BACKOFF_MS = 60 * 60 * 1000;
+const MAX_CRON_JOBS = 100;
+const activeCronJobs = new Map<string, () => void>();
 
 function fail(message: string): never {
     throw new TypeError(`Deno.cron: ${message}`);
@@ -56,8 +58,10 @@ function fail(message: string): never {
 function normalizeValue(field: CronField, raw: string | number): number {
     if (typeof raw === 'number') return normalizeNumber(field, raw);
     const value = raw.trim().toLowerCase();
-    if (field === 'month' && value in MONTH_NAMES) return MONTH_NAMES[value]!;
-    if (field === 'dayOfWeek' && value in DAY_NAMES) return DAY_NAMES[value]!;
+    const monthName = MONTH_NAMES[value];
+    if (field === 'month' && monthName !== undefined) return monthName;
+    const dayName = DAY_NAMES[value];
+    if (field === 'dayOfWeek' && dayName !== undefined) return dayName;
     const num = Number(value);
     if (!Number.isInteger(num)) fail(`invalid ${field} value "${raw}"`);
     return normalizeNumber(field, num);
@@ -144,12 +148,19 @@ function compileMatcher(source: string | Deno.CronSchedule): Matcher {
     if (typeof source === 'string') {
         const fields = source.trim().split(/\s+/);
         if (fields.length !== 5) fail(`expected 5 cron fields, got ${fields.length}`);
-        const [minute, hour, dayOfMonth, month, dayOfWeek] = fields;
-        const minuteSet = parseStringField('minute', minute!);
-        const hourSet = parseStringField('hour', hour!);
-        const dayOfMonthSet = parseStringField('dayOfMonth', dayOfMonth!);
-        const monthSet = parseStringField('month', month!);
-        const dayOfWeekSet = parseStringField('dayOfWeek', dayOfWeek!);
+        const minute = fields[0];
+        const hour = fields[1];
+        const dayOfMonth = fields[2];
+        const month = fields[3];
+        const dayOfWeek = fields[4];
+        if (minute === undefined || hour === undefined || dayOfMonth === undefined || month === undefined || dayOfWeek === undefined) {
+            fail(`expected 5 cron fields, got ${fields.length}`);
+        }
+        const minuteSet = parseStringField('minute', minute);
+        const hourSet = parseStringField('hour', hour);
+        const dayOfMonthSet = parseStringField('dayOfMonth', dayOfMonth);
+        const monthSet = parseStringField('month', month);
+        const dayOfWeekSet = parseStringField('dayOfWeek', dayOfWeek);
         return {
             minute: minuteSet,
             hour: hourSet,
@@ -229,7 +240,9 @@ function nextRunAt(schedule: CompiledSchedule, now: Date): Date {
         const month = cursor.getUTCMonth() + 1;
         const nextMonth = nextAllowedValue(matcher.monthValues, month);
         if (nextMonth === null) {
-            cursor.setUTCFullYear(cursor.getUTCFullYear() + 1, matcher.monthValues[0]! - 1, 1);
+            const firstMonth = matcher.monthValues[0];
+            if (firstMonth === undefined) fail('empty month schedule');
+            cursor.setUTCFullYear(cursor.getUTCFullYear() + 1, firstMonth - 1, 1);
             cursor.setUTCHours(0, 0, 0, 0);
             continue;
         }
@@ -285,6 +298,12 @@ function normalizeOptions(options?: CronOptions): Required<CronOptions> {
     return { backoffSchedule: backoff, signal: options?.signal ?? new AbortController().signal };
 }
 
+function validateName(name: string): void {
+    if (!name.trim()) fail('name must be a non-empty string');
+    if (name.length > 64) fail(`name cannot exceed 64 characters: current length ${name.length}`);
+    if (!/^[A-Za-z0-9_-]+$/.test(name)) fail('invalid name');
+}
+
 async function sleep(ms: number, signal?: AbortSignal): Promise<void> {
     if (ms <= 0) return;
     if (signal?.aborted) throw signal.reason ?? new DOMException('Aborted', 'AbortError');
@@ -333,27 +352,34 @@ async function runWithBackoff(name: string, backoffSchedule: number[], signal: A
                 emitCronError(name, error);
                 return;
             }
-            await sleep(backoffSchedule[attempt]!, signal);
+            const delay = backoffSchedule[attempt];
+            if (delay === undefined) return;
+            await sleep(delay, signal);
         }
     }
 }
 
-function createCronJob(name: string, schedule: string | Deno.CronSchedule, options: Required<CronOptions>, handler: () => Promise<void> | void): void {
+function createCronJob(name: string, schedule: string | Deno.CronSchedule, options: Required<CronOptions>, handler: () => Promise<void> | void): Promise<void> {
     const compiled = compileSchedule(schedule);
     let timerId: number | null = null;
     let stopped = false;
     let running = false;
+    let resolveJob: (() => void) | undefined;
 
     const stop = () => {
+        if (stopped) return;
         stopped = true;
         if (timerId !== null) {
             timers.clearTimeout(timerId);
             timerId = null;
         }
+        options.signal?.removeEventListener('abort', stop);
+        activeCronJobs.delete(name);
+        resolveJob?.();
     };
 
     if (options.signal) {
-        if (options.signal.aborted) return;
+        if (options.signal.aborted) return Promise.resolve();
         options.signal.addEventListener('abort', stop, { once: true });
     }
 
@@ -376,25 +402,36 @@ function createCronJob(name: string, schedule: string | Deno.CronSchedule, optio
         }, delay);
     };
 
+    activeCronJobs.set(name, stop);
     scheduleNext();
+    return new Promise<void>((resolve) => {
+        resolveJob = resolve;
+        if (stopped) resolve();
+    });
 }
 
-async function cron(
+function cron(
     name: string,
     schedule: string | Deno.CronSchedule,
     optionsOrHandler: CronOptions | (() => Promise<void> | void),
     maybeHandler?: () => Promise<void> | void,
 ): Promise<void> {
-    if (typeof name !== 'string' || !name.trim()) fail('name must be a non-empty string');
+    if (typeof name !== 'string') fail('name must be a non-empty string');
+    validateName(name);
     if (typeof schedule !== 'string' && (typeof schedule !== 'object' || schedule === null)) {
         fail('schedule must be a cron string or object');
     }
 
+    if (typeof optionsOrHandler === 'function' && maybeHandler !== undefined) {
+        fail('a single handler is required: two handlers were specified');
+    }
     const handler = typeof optionsOrHandler === 'function' ? optionsOrHandler : maybeHandler;
     if (typeof handler !== 'function') fail('handler must be a function');
+    if (activeCronJobs.has(name)) fail('job with this name already exists');
+    if (activeCronJobs.size >= MAX_CRON_JOBS) fail('too many cron jobs');
 
     const options = normalizeOptions(typeof optionsOrHandler === 'function' ? undefined : optionsOrHandler);
-    createCronJob(name, schedule, options, handler);
+    return createCronJob(name, schedule, options, handler);
 }
 
 Reflect.set(globalThis.Deno, 'cron', cron);

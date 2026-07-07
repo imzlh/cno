@@ -1,2 +1,2 @@
 export * from './mod';
-export * as default from './mod';
+export { default } from './mod';

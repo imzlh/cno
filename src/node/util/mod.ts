@@ -9,6 +9,17 @@ import * as types from './types';
 export { types };
 import { deepEqual as _deepEqual } from '../_internal/deep-equal';
 
+type AnyCallable = { bivarianceHack(...args: unknown[]): unknown }['bivarianceHack'];
+type InheritableFunction = AnyCallable & { prototype: object };
+
+function readEnv(name: string): string | undefined {
+    try {
+        return os.getenv(name) ?? undefined;
+    } catch {
+        return undefined;
+    }
+}
+
 // Type checks
 
 export function isBoolean(value: unknown): value is boolean {
@@ -47,7 +58,7 @@ export function isError(value: unknown): value is Error {
     return value instanceof Error;
 }
 
-export function isFunction(value: unknown): value is Function {
+export function isFunction(value: unknown): value is AnyCallable {
     return typeof value === 'function';
 }
 
@@ -73,7 +84,19 @@ export function isBuffer(value: unknown): value is Uint8Array {
 
 // Formatting
 
-export function format(format?: string, ...args: any[]): string {
+function formatNumber(value: unknown): string {
+    if (typeof value === 'bigint') return `${value}n`;
+    if (typeof value === 'symbol') return 'NaN';
+    return String(Number(value));
+}
+
+function formatInteger(value: unknown): string {
+    if (typeof value === 'bigint') return `${value}n`;
+    if (typeof value === 'symbol') return 'NaN';
+    return String(parseInt(String(value), 10));
+}
+
+export function format(format?: unknown, ...args: unknown[]): string {
     if (format === undefined) {
         return '';
     }
@@ -109,13 +132,13 @@ export function format(format?: string, ...args: any[]): string {
                     result += String(args[argIndex++]);
                     break;
                 case 'd':
-                    result += Number(args[argIndex++]);
+                    result += formatNumber(args[argIndex++]);
                     break;
                 case 'i':
-                    result += Math.floor(Number(args[argIndex++]));
+                    result += formatInteger(args[argIndex++]);
                     break;
                 case 'f':
-                    result += parseFloat(args[argIndex++]);
+                    result += parseFloat(String(args[argIndex++]));
                     break;
                 case 'j':
                     try {
@@ -126,7 +149,10 @@ export function format(format?: string, ...args: any[]): string {
                     break;
                 case 'o':
                 case 'O':
-                    result += inspect(args[argIndex++], { depth: specifier === 'O' ? Infinity : 4 });
+                    result += inspect(args[argIndex++], {
+                        depth: specifier === 'O' ? Infinity : 4,
+                        showHidden: specifier === 'o',
+                    });
                     break;
                 default:
                     result += '%' + specifier;
@@ -145,12 +171,12 @@ export function format(format?: string, ...args: any[]): string {
     return result;
 }
 
-export function formatWithOptions(inspectOptions: InspectOptions, format?: any, ...args: any[]): string {
-    if (!format) {
+export function formatWithOptions(inspectOptions: InspectOptions, format?: unknown, ...args: unknown[]): string {
+    if (format === undefined) {
         return '';
     }
-    // Use the first arg as the format object, remaining args for %s/%d/%j/%o substitution
-    const inspectOpts: any = {
+
+    const inspectOpts: InspectOptions = {
         colors: inspectOptions.colors,
         depth: inspectOptions.depth ?? undefined,
         showHidden: inspectOptions.showHidden,
@@ -160,11 +186,71 @@ export function formatWithOptions(inspectOptions: InspectOptions, format?: any, 
         compact: inspectOptions.compact,
         sorted: inspectOptions.sorted,
     };
-    const result = console.inspect(format, inspectOpts);
-    // Append remaining arguments (format substitution)
-    if (args.length > 0) {
-        return result + ' ' + args.map(a => inspect(a, inspectOptions)).join(' ');
+
+    if (typeof format !== 'string') {
+        const result = console.inspect(format, inspectOpts);
+        if (args.length > 0) {
+            return result + ' ' + args.map(a => console.inspect(a, inspectOpts)).join(' ');
+        }
+        return result;
     }
+
+    let result = '';
+    let argIndex = 0;
+    let i = 0;
+    while (i < format.length) {
+        if (format[i] === '%' && i + 1 < format.length) {
+            const specifier = format[i + 1];
+            i += 2;
+            if (specifier === '%') {
+                result += '%';
+                continue;
+            }
+            if (argIndex >= args.length) {
+                result += '%' + specifier;
+                continue;
+            }
+            switch (specifier) {
+                case 's':
+                    result += String(args[argIndex++]);
+                    break;
+                case 'd':
+                    result += formatNumber(args[argIndex++]);
+                    break;
+                case 'i':
+                    result += formatInteger(args[argIndex++]);
+                    break;
+                case 'f':
+                    result += parseFloat(String(args[argIndex++]));
+                    break;
+                case 'j':
+                    try {
+                        result += JSON.stringify(args[argIndex++]);
+                    } catch {
+                        result += '[Circular]';
+                    }
+                    break;
+                case 'o':
+                case 'O':
+                    result += console.inspect(args[argIndex++], {
+                        ...inspectOpts,
+                        depth: specifier === 'O' ? Infinity : inspectOpts.depth,
+                        showHidden: specifier === 'o' ? true : inspectOpts.showHidden,
+                    });
+                    break;
+                default:
+                    result += '%' + specifier;
+                    break;
+            }
+        } else {
+            result += format[i++];
+        }
+    }
+
+    while (argIndex < args.length) {
+        result += ' ' + console.inspect(args[argIndex++], inspectOpts);
+    }
+
     return result;
 }
 
@@ -249,8 +335,9 @@ export function styleText(format: string | string[], text: string, options?: { v
         } catch {}
     }
     let out = text;
-    for (let i = formats.length - 1; i >= 0; i--) {
-        const name = formats[i]!;
+    for (let i = 0; i < formats.length; i++) {
+        const name = formats[i];
+        if (name === undefined) continue;
         const open = ANSI_STYLE_OPEN[name];
         const close = ANSI_STYLE_CLOSE[name];
         if (open && close) out = `${open}${out}${close}`;
@@ -258,21 +345,20 @@ export function styleText(format: string | string[], text: string, options?: { v
     return out;
 }
 
-export function debuglog(section: string, callback?: (fn: (...args: any[]) => void) => void): (...args: any[]) => void {
-    let raw: string | undefined;
-    try {
-        raw = String(os.getenv?.('NODE_DEBUG') ?? os.getenv?.('DEBUG'));
-    } catch {}
+export function debuglog(section: string, callback?: (fn: (...args: unknown[]) => void) => void): (...args: unknown[]) => void {
+    const raw = readEnv('NODE_DEBUG') ?? readEnv('DEBUG');
     if (!raw) return () => {};
     
     const enabled = raw.split(/[,\s]+/).some(part => part && (part === '*' || part.toLowerCase() === section.toLowerCase()));
-    const logger = (...args: any[]) => {
+    const logger = (...args: unknown[]) => {
         if (!enabled) return;
         console.error(`${section.toUpperCase()} ${format(...args)}`);
     };
     if (callback) callback(logger);
     return logger;
 }
+
+export const debug = debuglog;
 
 export function toUSVString(value: unknown): string {
     const input = String(value);
@@ -343,7 +429,7 @@ inspect.custom = Symbol.for('nodejs.util.inspect.custom');
 
 // Inheritance
 
-export function inherits(constructor: Function, superConstructor: Function): void {
+export function inherits(constructor: InheritableFunction, superConstructor: InheritableFunction): void {
     if (constructor === undefined || constructor === null) {
         throw new TypeError('The constructor to inherit from must be non-null');
     }
@@ -366,10 +452,10 @@ export function inherits(constructor: Function, superConstructor: Function): voi
 
 // deprecate
 
-export function deprecate<T extends Function>(fn: T, message: string, code?: string): T {
+export function deprecate<T extends AnyCallable>(fn: T, message: string, code?: string): T {
     let warned = false;
 
-    const deprecated = function (this: any, ...args: any[]) {
+    const deprecated = function (this: ThisParameterType<T>, ...args: Parameters<T>): ReturnType<T> {
         if (!warned) {
             warned = true;
             if (code) {
@@ -378,8 +464,8 @@ export function deprecate<T extends Function>(fn: T, message: string, code?: str
                 console.warn(`DeprecationWarning: ${message}`);
             }
         }
-        return fn.apply(this, args);
-    } as any;
+        return Reflect.apply(fn, this, args) as ReturnType<T>;
+    } as T;
 
     Object.defineProperty(deprecated, 'name', { value: fn.name });
     Object.defineProperty(deprecated, 'length', { value: fn.length });
@@ -389,16 +475,30 @@ export function deprecate<T extends Function>(fn: T, message: string, code?: str
 
 // callbackify
 
-export function callbackify<T>(fn: (...args: any[]) => Promise<T>): (...args: any[]) => void {
-    return function (this: any, ...args: any[]) {
+export function callbackify<T, F extends (...args: never[]) => Promise<T>>(fn: F): (...args: unknown[]) => void {
+    if (typeof fn !== 'function') {
+        throw new TypeError('The "original" argument must be of type function');
+    }
+
+    return function (this: unknown, ...args: unknown[]) {
         const callback = args.pop();
         if (typeof callback !== 'function') {
             throw new TypeError('Callback must be a function');
         }
 
-        fn.apply(this, args).then(
+        Reflect.apply(fn, this, args).then(
             (result) => callback(null, result),
-            (err) => callback(err)
+            (err) => {
+                if (err) {
+                    callback(err);
+                    return;
+                }
+                const wrapped = Object.assign(new Error('Promise was rejected with falsy value'), {
+                    code: 'ERR_FALSY_VALUE_REJECTION',
+                    reason: err,
+                });
+                callback(wrapped);
+            }
         );
     };
 }
@@ -406,10 +506,10 @@ export function callbackify<T>(fn: (...args: any[]) => Promise<T>): (...args: an
 // promisify
 
 export interface PromisifyInterface {
-    __promisify__: Function;
+    __promisify__: AnyCallable;
 }
 
-export function promisify<T>(fn: Function): (...args: any[]) => Promise<T> {
+export function promisify<T>(fn: AnyCallable): (...args: unknown[]) => Promise<T> {
     const customSymbol = Symbol.for('nodejs.util.promisify.custom');
 
     if (typeof fn !== 'function') {
@@ -417,19 +517,24 @@ export function promisify<T>(fn: Function): (...args: any[]) => Promise<T> {
     }
 
     // Check for existing custom promisify implementation
-    if ((fn as any)[customSymbol]) {
-        return (fn as any)[customSymbol];
+    const custom = Reflect.get(fn, customSymbol);
+    if (typeof custom === 'function') {
+        return custom as (...args: unknown[]) => Promise<T>;
+    }
+    const legacyCustom = Reflect.get(fn, '__promisify__');
+    if (typeof legacyCustom === 'function') {
+        return legacyCustom as (...args: unknown[]) => Promise<T>;
     }
 
-    const promisified = (...args: any[]) => {
+    const promisified = function(this: unknown, ...args: unknown[]) {
         return new Promise<T>((resolve, reject) => {
-            fn(...args, (err: Error | null, result: T) => {
+            Reflect.apply(fn, this, [...args, (err: Error | null, result: T) => {
                 if (err) {
                     reject(err);
                 } else {
                     resolve(result);
                 }
-            });
+            }]);
         });
     };
 
@@ -448,9 +553,9 @@ promisify.custom = Symbol.for('nodejs.util.promisify.custom');
 
 // TextEncoder / TextDecoder
 
-const { Encoder, Decoder } = import.meta.use('text');
-export const TextEncoder = Encoder;
-export const TextDecoder = Decoder;
+const { Encoder: NativeTextEncoder, Decoder: NativeTextDecoder } = import.meta.use('text');
+export const TextEncoder = globalThis.TextEncoder ?? NativeTextEncoder;
+export const TextDecoder = globalThis.TextDecoder ?? NativeTextDecoder;
 
 // getSystemErrorMap / getSystemErrorName
 
@@ -459,19 +564,391 @@ export function getSystemErrorMap(): Map<number, [string, string]> {
     const map = new Map<number, [string, string]>();
     for (const [name, code] of Object.entries(errMod.errno)) {
         if (name === 'OK' || name === 'UNKNOWN') continue;
-        map.set(code as number, [name, errMod.strerror(code as number)]);
+        if (typeof code !== 'number') continue;
+        const message = errMod.strerror(code).replace(new RegExp(`^${name}:\\s*`), '');
+        map.set(code, [name, message]);
     }
     return map;
 }
 
-export function getSystemErrorName(err: number): string {
-    const entry = getSystemErrorMap().get(err);
-    return entry ? entry[0] : `Unknown system error ${err}`;
+function validateSystemErrorCode(err: unknown): number {
+    if (typeof err !== 'number') {
+        throw new TypeError('The "err" argument must be of type number');
+    }
+    if (!Number.isInteger(err) || err >= 0) {
+        throw new RangeError(`The value of "err" is out of range. It must be a negative integer. Received ${err}`);
+    }
+    return err;
 }
 
-export function getSystemErrorMessage(err: number): string {
-    const entry = getSystemErrorMap().get(err);
-    return entry ? entry[1] : `Unknown system error ${err}`;
+export function getSystemErrorName(err: number): string | undefined {
+    const entry = getSystemErrorMap().get(validateSystemErrorCode(err));
+    return entry?.[0];
+}
+
+export function getSystemErrorMessage(err: number): string | undefined {
+    const entry = getSystemErrorMap().get(validateSystemErrorCode(err));
+    return entry?.[1];
+}
+
+type ParseArgsOption = {
+    type: 'string' | 'boolean';
+    short?: string;
+    multiple?: boolean;
+    default?: string | boolean | Array<string | boolean>;
+};
+
+type ParseArgsToken =
+    | { kind: 'option'; name: string; rawName: string; index: number; value?: string; inlineValue?: boolean }
+    | { kind: 'positional'; index: number; value: string }
+    | { kind: 'option-terminator'; index: number };
+
+function parseArgsError(code: string, message: string): TypeError {
+    return Object.assign(new TypeError(message), { code });
+}
+
+export function parseArgs(options: {
+    args?: string[];
+    options?: Record<string, ParseArgsOption>;
+    strict?: boolean;
+    allowPositionals?: boolean;
+    allowNegative?: boolean;
+    tokens?: boolean;
+} = {}): { values: Record<string, unknown>; positionals: string[]; tokens?: ParseArgsToken[] } {
+    const args = options.args ?? [];
+    const defs = options.options ?? {};
+    const strict = options.strict !== false;
+    const allowPositionals = options.allowPositionals === true || !strict;
+    const values: Record<string, unknown> = Object.create(null);
+    const positionals: string[] = [];
+    const tokens: ParseArgsToken[] = [];
+    const shorts = new Map<string, string>();
+
+    for (const [name, def] of Object.entries(defs)) {
+        if (def.short) shorts.set(def.short, name);
+        if ('default' in def) values[name] = Array.isArray(def.default) ? [...def.default] : def.default;
+    }
+
+    const pushPositional = (value: string, index: number) => {
+        if (!allowPositionals) {
+            throw parseArgsError('ERR_PARSE_ARGS_UNEXPECTED_POSITIONAL',
+                `Unexpected argument '${value}'. This command does not take positional arguments`);
+        }
+        positionals.push(value);
+        if (options.tokens) tokens.push({ kind: 'positional', index, value });
+    };
+
+    const setValue = (name: string, value: string | boolean) => {
+        const def = defs[name];
+        if (def?.multiple) {
+            const current = values[name];
+            const list: Array<string | boolean> = Array.isArray(current) ? current : [];
+            list.push(value);
+            values[name] = list;
+            return;
+        }
+        values[name] = value;
+    };
+
+    const readOption = (name: string, rawName: string, index: number, inlineValue: string | undefined) => {
+        const def = defs[name];
+        if (!def && strict) {
+            throw parseArgsError('ERR_PARSE_ARGS_UNKNOWN_OPTION', `Unknown option '${rawName}'`);
+        }
+
+        if (def?.type === 'string') {
+            if (inlineValue !== undefined) {
+                setValue(name, inlineValue);
+                if (options.tokens) tokens.push({ kind: 'option', name, rawName, index, value: inlineValue, inlineValue: true });
+                return;
+            }
+            const next = args[index + 1];
+            if (next === undefined || (strict && next.startsWith('-'))) {
+                if (!strict) {
+                    setValue(name, true);
+                    if (options.tokens) tokens.push({ kind: 'option', name, rawName, index });
+                    return;
+                }
+                throw parseArgsError('ERR_PARSE_ARGS_INVALID_OPTION_VALUE', `Option '${rawName} <value>' argument missing`);
+            }
+            if (!strict && next.startsWith('-')) {
+                setValue(name, true);
+                if (options.tokens) tokens.push({ kind: 'option', name, rawName, index });
+                return;
+            }
+            setValue(name, next);
+            if (options.tokens) tokens.push({ kind: 'option', name, rawName, index, value: next, inlineValue: false });
+            return 1;
+        }
+
+        if (def?.type === 'boolean') {
+            if (inlineValue !== undefined) {
+                if (strict) {
+                    throw parseArgsError('ERR_PARSE_ARGS_INVALID_OPTION_VALUE', `Option '${rawName}' does not take an argument`);
+                }
+                setValue(name, inlineValue);
+                if (options.tokens) tokens.push({ kind: 'option', name, rawName, index, value: inlineValue, inlineValue: true });
+                return;
+            }
+            setValue(name, true);
+            if (options.tokens) tokens.push({ kind: 'option', name, rawName, index });
+            return;
+        }
+
+        setValue(name, inlineValue ?? true);
+        if (options.tokens) {
+            const token: ParseArgsToken = { kind: 'option', name, rawName, index };
+            if (inlineValue !== undefined) {
+                token.value = inlineValue;
+                token.inlineValue = true;
+            }
+            tokens.push(token);
+        }
+    };
+
+    for (let i = 0; i < args.length; i++) {
+        const arg = String(args[i]);
+        if (arg === '--') {
+            if (options.tokens) tokens.push({ kind: 'option-terminator', index: i });
+            for (let j = i + 1; j < args.length; j++) pushPositional(String(args[j]), j);
+            break;
+        }
+
+        if (arg.startsWith('--') && arg.length > 2) {
+            const body = arg.slice(2);
+            const eq = body.indexOf('=');
+            const rawName = eq === -1 ? arg : `--${body.slice(0, eq)}`;
+            let name = eq === -1 ? body : body.slice(0, eq);
+            const inlineValue = eq === -1 ? undefined : body.slice(eq + 1);
+            if (options.allowNegative && name.startsWith('no-')) {
+                const positive = name.slice(3);
+                const def = defs[positive];
+                if (def?.type === 'boolean') {
+                    setValue(positive, false);
+                    if (options.tokens) tokens.push({ kind: 'option', name: positive, rawName: arg, index: i });
+                    continue;
+                }
+            }
+            const consumed = readOption(name, rawName, i, inlineValue);
+            if (consumed) i += consumed;
+            continue;
+        }
+
+        if (arg.startsWith('-') && arg.length > 1) {
+            const rawShort = arg.slice(1);
+            const eq = rawShort.indexOf('=');
+            const short = eq === -1 ? rawShort : rawShort.slice(0, eq);
+            const name = shorts.get(short) ?? short;
+            const rawName = eq === -1 ? arg : `-${short}`;
+            const inlineValue = eq === -1 ? undefined : rawShort.slice(eq + 1);
+            const consumed = readOption(name, rawName, i, inlineValue);
+            if (consumed) i += consumed;
+            continue;
+        }
+
+        pushPositional(arg, i);
+    }
+
+    const result: { values: Record<string, unknown>; positionals: string[]; tokens?: ParseArgsToken[] } = {
+        values,
+        positionals,
+    };
+    if (options.tokens) result.tokens = tokens;
+    return result;
+}
+
+const MIME_TOKEN_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+
+function assertMimeToken(kind: string, value: string): void {
+    if (!MIME_TOKEN_RE.test(value)) {
+        throw new TypeError(`Invalid MIME ${kind}: ${value}`);
+    }
+}
+
+function assertMimeParamValue(value: string): void {
+    for (let i = 0; i < value.length; i++) {
+        const code = value.charCodeAt(i);
+        if (code === 0x0a || code === 0x0d) {
+            throw new TypeError(`Invalid MIME parameter value: ${value}`);
+        }
+    }
+}
+
+function splitMimeSections(value: string): string[] {
+    const sections: string[] = [];
+    let start = 0;
+    let quoted = false;
+    let escaped = false;
+    for (let i = 0; i < value.length; i++) {
+        const ch = value[i];
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (quoted && ch === '\\') {
+            escaped = true;
+            continue;
+        }
+        if (ch === '"') {
+            quoted = !quoted;
+            continue;
+        }
+        if (!quoted && ch === ';') {
+            sections.push(value.slice(start, i));
+            start = i + 1;
+        }
+    }
+    sections.push(value.slice(start));
+    return sections;
+}
+
+function unquoteMimeParamValue(value: string): string | undefined {
+    const trimmed = value.trim();
+    if (trimmed.length === 0) return undefined;
+    if (!trimmed.startsWith('"')) return /[\r\n]/.test(trimmed) ? undefined : trimmed;
+    if (!trimmed.endsWith('"') || trimmed.length === 1) return undefined;
+    let out = '';
+    let escaped = false;
+    for (let i = 1; i < trimmed.length - 1; i++) {
+        const ch = trimmed[i];
+        if (ch === undefined) continue;
+        if (escaped) {
+            out += ch;
+            escaped = false;
+        } else if (ch === '\\') {
+            escaped = true;
+        } else {
+            out += ch;
+        }
+    }
+    return /[\r\n]/.test(out) ? undefined : out;
+}
+
+function quoteMimeParamValue(value: string): string {
+    if (value.length > 0 && MIME_TOKEN_RE.test(value)) return value;
+    return `"${value.replace(/["\\]/g, '\\$&')}"`;
+}
+
+export class MIMEParams {
+    #map = new Map<string, string>();
+
+    constructor(entries: Array<[string, string]> = []) {
+        for (const [key, value] of entries) {
+            const name = String(key).toLowerCase();
+            if (this.#map.has(name)) continue;
+            this.#map.set(name, String(value));
+        }
+    }
+
+    get(key: string): string | null {
+        if (arguments.length < 1) throw new TypeError('MIMEParams.get requires 1 argument');
+        return this.#map.get(String(key).toLowerCase()) ?? null;
+    }
+
+    has(key: string): boolean {
+        if (arguments.length < 1) throw new TypeError('MIMEParams.has requires 1 argument');
+        return this.#map.has(String(key).toLowerCase());
+    }
+
+    set(key: string, value: string): void {
+        if (arguments.length < 2) throw new TypeError('MIMEParams.set requires 2 arguments');
+        const name = String(key).toLowerCase();
+        assertMimeToken('parameter name', name);
+        const next = String(value);
+        assertMimeParamValue(next);
+        this.#map.set(name, next);
+    }
+
+    delete(key: string): void {
+        if (arguments.length < 1) throw new TypeError('MIMEParams.delete requires 1 argument');
+        this.#map.delete(String(key).toLowerCase());
+    }
+
+    entries(): IterableIterator<[string, string]> {
+        return this.#map.entries();
+    }
+
+    keys(): IterableIterator<string> {
+        return this.#map.keys();
+    }
+
+    values(): IterableIterator<string> {
+        return this.#map.values();
+    }
+
+    toString(): string {
+        return [...this.#map]
+            .map(([key, value]) => `${key}=${quoteMimeParamValue(value)}`)
+            .join(';');
+    }
+
+    toJSON(): string {
+        return this.toString();
+    }
+
+    [Symbol.iterator](): IterableIterator<[string, string]> {
+        return this.entries();
+    }
+}
+
+export class MIMEType {
+    type: string;
+    subtype: string;
+    params: MIMEParams;
+
+    constructor(value: string) {
+        const [essence = '', ...rawParams] = splitMimeSections(String(value));
+        const normalizedEssence = essence.trim();
+        const slash = normalizedEssence.indexOf('/');
+        if (slash <= 0 || slash !== normalizedEssence.lastIndexOf('/') || slash === normalizedEssence.length - 1) {
+            throw new TypeError(`Invalid MIME type: ${value}`);
+        }
+        const type = normalizedEssence.slice(0, slash);
+        const subtype = normalizedEssence.slice(slash + 1);
+        assertMimeToken('type', type);
+        assertMimeToken('subtype', subtype);
+        this.type = type.toLowerCase();
+        this.subtype = subtype.toLowerCase();
+        const params: Array<[string, string]> = [];
+        for (const param of rawParams) {
+            const trimmed = param.trim();
+            if (!trimmed) continue;
+            const index = trimmed.indexOf('=');
+            if (index === -1) continue;
+            const name = trimmed.slice(0, index).trim().toLowerCase();
+            if (!MIME_TOKEN_RE.test(name) || params.some(([key]) => key === name)) continue;
+            const paramValue = unquoteMimeParamValue(trimmed.slice(index + 1));
+            if (paramValue === undefined) continue;
+            params.push([name, paramValue]);
+        }
+        this.params = new MIMEParams(params);
+    }
+
+    get essence(): string {
+        return `${this.type}/${this.subtype}`;
+    }
+
+    toString(): string {
+        const params = this.params.toString();
+        return params ? `${this.essence};${params}` : this.essence;
+    }
+}
+
+export function transferableAbortController(): AbortController {
+    return new AbortController();
+}
+
+export function transferableAbortSignal(signal: AbortSignal): AbortSignal {
+    return signal;
+}
+
+export function aborted(signal: AbortSignal, _resource: object): Promise<Event> {
+    if (signal.aborted) {
+        return Promise.resolve(new Event('abort'));
+    }
+    return new Promise<Event>((resolve) => {
+        signal.addEventListener('abort', () => resolve(new Event('abort')), { once: true });
+    });
 }
 
 // parseEnv — .env file parser (Node.js 20.12+)
@@ -503,7 +980,10 @@ export function parseEnv(content: string): NodeJS.Dict<string> {
 
         // Skip blank lines and pure comment lines
         const trimmed = line.trim();
-        if (!trimmed || trimmed[0] === '#') { i++; continue; }
+        if (!trimmed || trimmed[0] === '#') {
+            i++;
+            continue;
+        }
 
         // Strip optional `export` prefix
         if (trimmed.startsWith('export ')) {
@@ -523,7 +1003,10 @@ export function parseEnv(content: string): NodeJS.Dict<string> {
         }
 
         const key = line.slice(0, eqIdx).trim();
-        if (!key) { i++; continue; }
+        if (!key) {
+            i++;
+            continue;
+        }
 
         let value: string;
         const rest = line.slice(eqIdx + 1);
@@ -623,13 +1106,11 @@ function processDoubleQuoted(raw: string, env: NodeJS.Dict<string>): string {
         } else if (raw[j] === '$' && j + 1 < raw.length && raw[j + 1] === '{') {
             // ${VAR} expansion
             const closeBrace = raw.indexOf('}', j + 2);
-            if (closeBrace !== -1) try {
+            if (closeBrace !== -1) {
                 const varName = raw.slice(j + 2, closeBrace);
-                const expanded = env[varName] ?? os.getenv(varName) ?? '';
+                const expanded = env[varName] ?? readEnv(varName) ?? '';
                 out += expanded;
                 j = closeBrace;
-            } catch { 
-                out += raw[j];
             } else {
                 out += raw[j];
             }
@@ -660,3 +1141,47 @@ function findInlineComment(s: string): number {
     }
     return -1;
 }
+
+export default {
+    types,
+    isBoolean,
+    isNull,
+    isNullOrUndefined,
+    isNumber,
+    isString,
+    isSymbol,
+    isUndefined,
+    isObject,
+    isError,
+    isFunction,
+    isRegExp,
+    isArray,
+    isDate,
+    isPrimitive,
+    isBuffer,
+    format,
+    formatWithOptions,
+    stripVTControlCharacters,
+    styleText,
+    debuglog,
+    debug,
+    toUSVString,
+    isDeepStrictEqual,
+    inspect,
+    inherits,
+    deprecate,
+    callbackify,
+    promisify,
+    TextEncoder,
+    TextDecoder,
+    getSystemErrorMap,
+    getSystemErrorName,
+    getSystemErrorMessage,
+    parseArgs,
+    MIMEParams,
+    MIMEType,
+    transferableAbortController,
+    transferableAbortSignal,
+    aborted,
+    parseEnv,
+};

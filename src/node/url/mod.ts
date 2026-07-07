@@ -6,9 +6,84 @@
  * separate so Node semantics do not depend on quirks in that polyfill.
  */
 
-const { URL, URLSearchParams } = globalThis;
+const NativeURL = globalThis.URL;
+const URLSearchParams = globalThis.URLSearchParams;
+const nativePathnameGetter = Object.getOwnPropertyDescriptor(NativeURL.prototype, 'pathname')?.get;
+const nativeSearchGetter = Object.getOwnPropertyDescriptor(NativeURL.prototype, 'search')?.get;
+const nativeProtocolGetter = Object.getOwnPropertyDescriptor(NativeURL.prototype, 'protocol')?.get;
+const nativeUsernameGetter = Object.getOwnPropertyDescriptor(NativeURL.prototype, 'username')?.get;
+const nativePasswordGetter = Object.getOwnPropertyDescriptor(NativeURL.prototype, 'password')?.get;
+const nativeHostGetter = Object.getOwnPropertyDescriptor(NativeURL.prototype, 'host')?.get;
+const nativeHashGetter = Object.getOwnPropertyDescriptor(NativeURL.prototype, 'hash')?.get;
 
-export { URL, URLSearchParams };
+interface PatchedUrl extends globalThis.URL {
+    __nodeUrlPatched?: true;
+}
+
+function encodeUrlSpaces(value: string): string {
+    return value.replace(/ /g, '%20');
+}
+
+function computeUrlHref(url: globalThis.URL): string {
+    const protocol = nativeProtocolGetter?.call(url) ?? '';
+    const username = nativeUsernameGetter?.call(url) ?? '';
+    const password = nativePasswordGetter?.call(url) ?? '';
+    const host = nativeHostGetter?.call(url) ?? '';
+    const hash = nativeHashGetter?.call(url) ?? '';
+    const auth = username ? `${username}${password ? `:${password}` : ''}@` : '';
+    return `${protocol}//${auth}${host}${encodeUrlSpaces(nativePathnameGetter?.call(url) ?? '')}${encodeUrlSpaces(nativeSearchGetter?.call(url) ?? '')}${hash}`;
+}
+
+function patchUrlInstance<T extends globalThis.URL>(url: T): T {
+    if ((url as PatchedUrl).__nodeUrlPatched) return url;
+    Object.defineProperties(url, {
+        __nodeUrlPatched: { value: true, configurable: true },
+        pathname: {
+            configurable: true,
+            enumerable: true,
+            get() {
+                return encodeUrlSpaces(nativePathnameGetter?.call(url) ?? '');
+            },
+        },
+        search: {
+            configurable: true,
+            enumerable: true,
+            get() {
+                return encodeUrlSpaces(nativeSearchGetter?.call(url) ?? '');
+            },
+        },
+        href: {
+            configurable: true,
+            enumerable: true,
+            get() {
+                return computeUrlHref(url);
+            },
+        },
+        toString: {
+            configurable: true,
+            value() {
+                return computeUrlHref(this as globalThis.URL);
+            },
+        },
+        toJSON: {
+            configurable: true,
+            value() {
+                return computeUrlHref(this as globalThis.URL);
+            },
+        },
+    });
+    return url;
+}
+
+export const URL = function URL(this: unknown, input: string | globalThis.URL, base?: string | globalThis.URL) {
+    return patchUrlInstance(new NativeURL(input, base));
+} as typeof globalThis.URL;
+
+Object.setPrototypeOf(URL, NativeURL);
+URL.prototype = NativeURL.prototype;
+Reflect.set(globalThis, 'URL', URL);
+
+export { URLSearchParams };
 
 type ParsedQuery = Record<string, string | string[]>;
 
@@ -31,6 +106,10 @@ export interface UrlWithParsedQuery extends Omit<UrlWithStringQuery, 'query'> {
     query: ParsedQuery;
 }
 
+type MutableParsedUrl = Omit<UrlWithStringQuery, 'query'> & {
+    query: string | ParsedQuery | null;
+};
+
 type UrlObject = Partial<Omit<UrlWithStringQuery, 'query'>> & {
     query?: string | Record<string, unknown> | null;
 };
@@ -43,16 +122,22 @@ const WINDOWS_DRIVE_RE = /^[a-zA-Z]:[\\/]/;
 function stringifyQuery(query: Record<string, unknown>): string {
     const pairs: string[] = [];
     for (const [key, value] of Object.entries(query)) {
-        if (value === undefined || value === null) continue;
         if (Array.isArray(value)) {
             for (const item of value) {
-                pairs.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(item))}`);
+                pairs.push(`${encodeURIComponent(key)}=${encodeURIComponent(stringifyQueryPrimitive(item))}`);
             }
         } else {
-            pairs.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`);
+            pairs.push(`${encodeURIComponent(key)}=${encodeURIComponent(stringifyQueryPrimitive(value))}`);
         }
     }
     return pairs.join('&');
+}
+
+function stringifyQueryPrimitive(value: unknown): string {
+    if (value === null || value === undefined) return '';
+    if (typeof value === 'number') return Number.isFinite(value) ? String(value) : '';
+    if (typeof value === 'bigint' || typeof value === 'boolean' || typeof value === 'string') return String(value);
+    return '';
 }
 
 function parseQuery(query: string): ParsedQuery {
@@ -86,6 +171,14 @@ function safeDecode(value: string): string {
 
 function encodeAuth(value: string): string {
     return encodeURIComponent(value).replace(/%3A/gi, ':');
+}
+
+function encodePathname(value: string): string {
+    return value.replace(/[?#]/g, ch => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`);
+}
+
+function formatHostname(hostname: string): string {
+    return hostname.includes(':') && !hostname.startsWith('[') ? `[${hostname}]` : hostname;
 }
 
 function decodeAuth(value: string): string {
@@ -141,7 +234,7 @@ export function parse(urlStr: string, parseQueryString = false, slashesDenoteHos
     }
 
     let rest = urlStr.trim();
-    const result: UrlWithStringQuery = {
+    const result: MutableParsedUrl = {
         protocol: null,
         slashes: null,
         auth: null,
@@ -207,10 +300,11 @@ export function parse(urlStr: string, parseQueryString = false, slashesDenoteHos
     if (queryIndex !== -1) {
         result.search = rest.slice(queryIndex);
         const query = rest.slice(queryIndex + 1);
-        result.query = parseQueryString ? parseQuery(query) as any : query;
+        result.query = parseQueryString ? parseQuery(query) : query;
         rest = rest.slice(0, queryIndex);
     } else if (parseQueryString) {
-        result.query = Object.create(null) as any;
+        const query: ParsedQuery = Object.create(null);
+        result.query = query;
     }
 
     if (rest || result.host || result.protocol) {
@@ -277,7 +371,7 @@ export function format(url: string | URL | UrlObject, options?: {
 
     let host = url.host ?? null;
     if (!host && url.hostname) {
-        host = url.hostname;
+        host = formatHostname(String(url.hostname));
         if (url.port) host += `:${url.port}`;
     }
 
@@ -289,7 +383,7 @@ export function format(url: string | URL | UrlObject, options?: {
 
     let pathname = url.pathname ?? '';
     if (pathname && host && !pathname.startsWith('/')) pathname = `/${pathname}`;
-    out += pathname;
+    out += encodePathname(pathname);
 
     let search = url.search ?? null;
     if (!search && url.query && typeof url.query === 'object') {
@@ -330,11 +424,11 @@ export function resolve(from: string, to: string): string {
         return new URL(to, new URL(from)).href;
     } catch {
         if (/^[a-z][a-z0-9.+-]*:/i.test(to) || to.startsWith('//')) return to;
-        const base = parse(from);
-        const target = parse(to);
+        const base = parse(from) as MutableParsedUrl;
+        const target = parse(to) as MutableParsedUrl;
         if (target.search && !target.pathname) {
             base.search = target.search;
-            base.query = target.query as any;
+            base.query = target.query;
             base.hash = target.hash;
             base.path = `${base.pathname ?? ''}${target.search}`;
             return format(base);
@@ -384,7 +478,7 @@ function basicToDigit(code: number): number {
 }
 
 function punyEncode(input: string): string {
-    const codePoints = Array.from(input, ch => ch.codePointAt(0)!);
+    const codePoints = Array.from(input, ch => ch.codePointAt(0)).filter((code): code is number => code !== undefined);
     const output: string[] = [];
     let n = PC_INITIAL_N;
     let delta = 0;
@@ -488,12 +582,20 @@ function validAsciiLabel(label: string): boolean {
 export function domainToASCII(domain: string): string {
     const input = String(domain);
     if (input === '') return '';
+    if (/^\[[0-9A-Fa-f:.]+\]$/.test(input)) return input;
 
     try {
         const labels = splitDomain(input);
         let invalid = false;
         const converted = labels.map(label => {
             if (label === '') return '';
+            if (/^xn--/i.test(label)) {
+                if (!/^[\x00-\x7F]+$/.test(label)) {
+                    invalid = true;
+                    return '';
+                }
+                punyDecode(label.slice(4));
+            }
             if (/^[\x00-\x7F]+$/.test(label)) {
                 if (validAsciiLabel(label)) return label.toLowerCase();
                 invalid = true;
@@ -538,9 +640,13 @@ function assertFileUrl(value: URL): void {
 
 function runtimeSpecToLocalPath(spec: string): string | null {
     try {
-        const cts = (globalThis as any)[Symbol.for('cts.internal')];
-        if (typeof cts?.specToLocalPath === 'function') {
-            return cts.specToLocalPath(spec);
+        const cts = Reflect.get(globalThis, Symbol.for('cts.internal'));
+        const specToLocalPath = cts && (typeof cts === 'object' || typeof cts === 'function')
+            ? Reflect.get(cts, 'specToLocalPath')
+            : undefined;
+        if (typeof specToLocalPath === 'function') {
+            const path = Reflect.apply(specToLocalPath, cts, [spec]);
+            return typeof path === 'string' ? path : null;
         }
     } catch {}
     return null;
@@ -593,8 +699,11 @@ export function fileURLToPath(url: string | URL): string {
 }
 
 function getCwd(): string {
-    const proc = (globalThis as any).process;
-    if (proc && typeof proc.cwd === 'function') return proc.cwd();
+    const proc = Reflect.get(globalThis, 'process');
+    const cwd = (proc && (typeof proc === 'object' || typeof proc === 'function'))
+        ? Reflect.get(proc, 'cwd')
+        : undefined;
+    if (typeof cwd === 'function') return String(Reflect.apply(cwd, proc, []));
     try {
         return import.meta.use('os').cwd;
     } catch {

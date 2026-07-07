@@ -27,39 +27,63 @@ import * as streamConsumers from './consumers';
     fromWeb?: typeof streamWeb.duplexFromWeb;
 }).fromWeb = streamWeb.duplexFromWeb;
 
+type StreamCallback = (error?: Error | null) => void;
 type StreamPipelineArgs =
-    | [...streams: any[], callback: (error?: Error | null) => void]
-    | any[];
+    | [...streams: unknown[], callback: StreamCallback]
+    | unknown[];
+type PipelineOptionsLike = { signal?: AbortSignal };
+type FinishedOptions = { error?: boolean; readable?: boolean; writable?: boolean; signal?: AbortSignal };
 
-export function pipeline(...args: StreamPipelineArgs): any {
-    const callback = typeof args[args.length - 1] === 'function'
-        ? args.pop() as (error?: Error | null) => void
-        : undefined;
-    const streams = args as any[];
-    const promise = (streamPromises.pipeline as any)(...streams);
-    if (callback) {
-        promise.then(
-            () => callback(null),
-            (error: Error) => callback(error),
-        );
+function assertCallback(name: string, callback: unknown): asserts callback is StreamCallback {
+    if (typeof callback !== 'function') {
+        throw new TypeError(`The "${name}" argument must be of type function`);
     }
-    return streams[streams.length - 1];
 }
 
-export function finished(streamInstance: any, options?: any, callback?: (error?: Error | null) => void): any {
+function isPipelineOptions(value: unknown): value is PipelineOptionsLike {
+    return !!value && typeof value === 'object' && 'signal' in value;
+}
+
+function isFinishedOptions(value: FinishedOptions | StreamCallback | undefined): value is FinishedOptions | undefined {
+    return value === undefined || typeof value !== 'function';
+}
+
+function lastPipelineStream(args: unknown[]): unknown {
+    for (let i = args.length - 1; i >= 0; i--) {
+        if (!isPipelineOptions(args[i])) return args[i];
+    }
+    return undefined;
+}
+
+export function pipeline(...args: StreamPipelineArgs): unknown {
+    const callback = args.pop();
+    assertCallback('callback', callback);
+    const streams = args as Parameters<typeof streamPromises.pipeline>;
+    const promise = streamPromises.pipeline(...streams);
+    const returnValue = lastPipelineStream(args);
+    promise.then(
+        () => callback(null),
+        (error: Error) => callback(error),
+    );
+    return returnValue;
+}
+
+export function finished(
+    streamInstance: Stream | globalThis.ReadableStream | globalThis.WritableStream,
+    options?: FinishedOptions | StreamCallback,
+    callback?: StreamCallback
+): Stream | globalThis.ReadableStream | globalThis.WritableStream {
     let cb = callback;
-    let opts = options;
+    const opts = isFinishedOptions(options) ? options : undefined;
     if (typeof options === 'function') {
         cb = options;
-        opts = undefined;
     }
-    const promise = (streamPromises.finished as any)(streamInstance, opts);
-    if (cb) {
-        promise.then(
-            () => cb!(null),
-            (error: Error) => cb!(error),
-        );
-    }
+    assertCallback('callback', cb);
+    const promise = streamPromises.finished(streamInstance, opts);
+    promise.then(
+        () => cb(null),
+        (error: Error) => cb(error),
+    );
     return streamInstance;
 }
 

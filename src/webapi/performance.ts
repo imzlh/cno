@@ -1,5 +1,7 @@
 import { DOMException, EventTarget } from "./events";
+import { structuredCloneWithTransfer } from "../node/_internal/structured-clone";
 const console = import.meta.use('console');
+const denoCustomInspect = Symbol.for('Deno.customInspect');
 
 // Store native performance.now reference
 const nativePerformanceNow = globalThis.performance?.now?.bind(globalThis.performance) ?? (() => Date.now());
@@ -10,17 +12,60 @@ type PerformanceEntryType =
     | 'navigation'
     | 'resource'
     | 'paint'
-    | 'frame';
+    | 'frame'
+    | 'function'
+    | 'node';
+type EventLoopUtilization = { idle: number; active: number; utilization: number };
 
 type PerformanceObserverCallback = (
     list: PerformanceObserverEntryList,
     observer: PerformanceObserver
 ) => void;
+type PerformanceEventHandler = ((this: Performance, ev: Event) => unknown) | null;
 
 interface PerformanceObserverInit {
     entryTypes?: PerformanceEntryType[];
     type?: PerformanceEntryType;
     buffered?: boolean;
+}
+
+const constructorKey = {};
+
+function emitPerformanceObserverCallback(
+    callback: PerformanceObserverCallback,
+    list: PerformanceObserverEntryList,
+    observer: PerformanceObserver,
+): void {
+    try {
+        callback(list, observer);
+    } catch (error) {
+        console.error('Error in PerformanceObserver callback:', error);
+    }
+}
+
+function setFunctionNameQuietly(fn: Function, name: string): void {
+    try {
+        Object.defineProperty(fn, 'name', { value: name, configurable: true });
+    } catch {
+        // Function names are cosmetic for timerified callbacks.
+    }
+}
+
+function cloneDetail(detail: unknown): unknown {
+    return detail === undefined ? null : structuredCloneWithTransfer(detail);
+}
+
+function isPerformanceEntryType(type: string): type is PerformanceEntryType {
+    return PerformanceObserver.supportedEntryTypes.some((entryType) => entryType === type);
+}
+
+function currentPerformance(): Performance {
+    return globalThis.performance as Performance;
+}
+
+function isThenable(value: unknown): value is PromiseLike<unknown> {
+    if ((typeof value !== 'object' && typeof value !== 'function') || value === null) return false;
+    return typeof Reflect.get(value, 'then') === 'function';
 }
 
 // ==================== PerformanceEntry ====================
@@ -30,15 +75,17 @@ class PerformanceEntry<ET extends PerformanceEntryType> implements globalThis.Pe
     readonly entryType: ET;
     readonly startTime: number;
     readonly duration: number;
-    readonly detail: any;
+    readonly detail: unknown;
 
     constructor(
+        key: object,
         name: string,
         entryType: ET,
         startTime: number,
         duration: number,
-        detail?: any
+        detail?: unknown
     ) {
+        if (key !== constructorKey) throw new TypeError('Illegal constructor');
         this.name = name;
         this.entryType = entryType;
         this.startTime = startTime;
@@ -49,7 +96,7 @@ class PerformanceEntry<ET extends PerformanceEntryType> implements globalThis.Pe
     }
 
     toJSON(): object {
-        const obj: any = {
+        const obj: Record<string, unknown> = {
             name: this.name,
             entryType: this.entryType,
             startTime: this.startTime,
@@ -60,17 +107,24 @@ class PerformanceEntry<ET extends PerformanceEntryType> implements globalThis.Pe
         }
         return obj;
     }
+
+    [denoCustomInspect]() {
+        const className = this?.constructor?.name || 'PerformanceEntry';
+        if (!(this instanceof PerformanceEntry)) return `${className} {}`;
+        return `${className} ${console.inspect(this.toJSON(), { colors: false })}`;
+    }
 }
 
 // ==================== PerformanceMark ====================
 
 class PerformanceMark extends PerformanceEntry<'mark'> implements globalThis.PerformanceMark {
-    public detail: any;
+    public detail: unknown;
 
     constructor(name: string, options?: PerformanceMarkOptions) {
         const startTime = options?.startTime ?? nativePerformanceNow();
-        super(name, 'mark', startTime, 0, options?.detail);
-        this.detail = options?.detail;
+        const detail = cloneDetail(options?.detail);
+        super(constructorKey, name, 'mark', startTime, 0, detail);
+        this.detail = detail;
     }
 }
 
@@ -78,12 +132,14 @@ class PerformanceMark extends PerformanceEntry<'mark'> implements globalThis.Per
 
 class PerformanceMeasure extends PerformanceEntry<'measure'> implements globalThis.PerformanceMeasure {
     constructor(
+        key: object,
         name: string,
         startTime: number,
         duration: number,
-        detail?: any
+        detail?: unknown
     ) {
-        super(name, 'measure', startTime, duration, detail);
+        if (key !== constructorKey) throw new TypeError('Illegal constructor');
+        super(constructorKey, name, 'measure', startTime, duration, cloneDetail(detail));
     }
 }
 
@@ -103,7 +159,7 @@ class PerformanceNavigationTiming extends PerformanceEntry<'navigation'> {
 
     constructor() {
         const now = nativePerformanceNow();
-        super('navigation', 'navigation', 0, now);
+        super(constructorKey, 'navigation', 'navigation', 0, now);
 
         this.domInteractive = now;
         this.domContentLoadedEventStart = now;
@@ -158,7 +214,7 @@ class PerformanceResourceTiming extends PerformanceEntry<'resource'> {
         initiatorType: string,
         transferSize: number = 0
     ) {
-        super(name, 'resource', startTime, duration);
+        super(constructorKey, name, 'resource', startTime, duration);
 
         this.initiatorType = initiatorType;
         this.fetchStart = startTime;
@@ -195,6 +251,22 @@ class PerformanceResourceTiming extends PerformanceEntry<'resource'> {
             encodedBodySize: this.encodedBodySize,
             decodedBodySize: this.decodedBodySize
         };
+    }
+}
+
+// ==================== Node-compatible Performance Timing ====================
+
+class PerformanceNodeTiming extends PerformanceEntry<'node'> {
+    readonly bootstrapComplete: number;
+    readonly environment: number = 0;
+    readonly idleTime: number = 0;
+    readonly loopExit: number = 0;
+    readonly loopStart: number = 0;
+    readonly v8Start: number = 0;
+
+    constructor() {
+        super(constructorKey, 'node', 'node', 0, 0);
+        this.bootstrapComplete = nativePerformanceNow();
     }
 }
 
@@ -242,7 +314,8 @@ class PerformanceObserver {
         'navigation',
         'resource',
         'paint',
-        'frame'
+        'frame',
+        'function'
     ];
 
     constructor(callback: PerformanceObserverCallback) {
@@ -280,7 +353,7 @@ class PerformanceObserver {
         this.#buffered = buffered ?? false;
         this.#connected = true;
 
-        const perf = globalThis.performance as unknown as Performance;
+        const perf = currentPerformance();
         perf._registerObserver(this);
 
         if (this.#buffered) {
@@ -297,12 +370,12 @@ class PerformanceObserver {
         this.#connected = false;
         this.#observedTypes.clear();
 
-        const perf = globalThis.performance as unknown as Performance;
+        const perf = currentPerformance();
         perf._unregisterObserver(this);
     }
 
     takeRecords(): globalThis.PerformanceEntry[] {
-        const perf = globalThis.performance as unknown as Performance;
+        const perf = currentPerformance();
         return perf._takeRecordsForObserver(this);
     }
 
@@ -310,19 +383,13 @@ class PerformanceObserver {
         if (!this.#connected) return;
 
         const filteredEntries = entries.filter(entry =>
-            // @ts-ignore string to EntryType
-            this.#observedTypes.has(entry.entryType)
+            isPerformanceEntryType(entry.entryType) && this.#observedTypes.has(entry.entryType)
         );
 
         if (filteredEntries.length === 0) return;
 
         const list = new PerformanceObserverEntryList(filteredEntries);
-
-        try {
-            this.#callback(list, this);
-        } catch (error) {
-            console.error('Error in PerformanceObserver callback:', error);
-        }
+        emitPerformanceObserverCallback(this.#callback, list, this);
     }
 
     _observes(type: PerformanceEntryType): boolean {
@@ -340,25 +407,108 @@ class Performance extends EventTarget implements globalThis.Performance {
     #timeOrigin: number;
     #resourceTimingBufferSize: number = 250;
     #navigationTiming: PerformanceNavigationTiming;
+    #nodeTiming = new PerformanceNodeTiming();
+    #onResourceTimingBufferFull: PerformanceEventHandler = null;
+    #onResourceTimingBufferFullListener: EventListener | null = null;
 
-    get nodeTiming(): never {
-        throw new DOMException('Not implemented', 'DOMException');
+    get nodeTiming(): PerformanceNodeTiming {
+        return this.#nodeTiming;
     }
 
-    markResourceTiming(): never {
-        throw new DOMException('Not implemented', 'DOMException');
+    markResourceTiming(
+        this: Performance | undefined,
+        timingInfo: { startTime?: number; endTime?: number; transferSize?: number; encodedBodySize?: number } = {},
+        requestedUrl = '',
+        initiatorType = 'other',
+        _global?: unknown,
+        _cacheMode?: string,
+        bodyInfo?: { transferSize?: number; encodedBodySize?: number } | string,
+        _responseStatus?: number,
+    ): PerformanceResourceTiming {
+        const performance = this instanceof Performance ? this : currentPerformance();
+        const start = Number.isFinite(timingInfo.startTime) ? Number(timingInfo.startTime) : performance.now();
+        const end = Number.isFinite(timingInfo.endTime) ? Number(timingInfo.endTime) : start;
+        const body = bodyInfo && typeof bodyInfo === 'object' ? bodyInfo : timingInfo;
+        const transferSize = Number.isFinite(body.transferSize)
+            ? Number(body.transferSize)
+            : Number.isFinite(body.encodedBodySize)
+                ? Number(body.encodedBodySize)
+                : 0;
+        const entry = new PerformanceResourceTiming(
+            String(requestedUrl),
+            start,
+            Math.max(0, end - start),
+            String(initiatorType || 'other'),
+            transferSize,
+        );
+        performance.#addEntry(entry);
+        performance.#trimResourceTimings();
+        return entry;
     }
 
-    eventLoopUtilization(): never {
-        throw new DOMException('Not implemented', 'DOMException');
+    eventLoopUtilization(): EventLoopUtilization {
+        return { idle: 0, active: 0, utilization: 0 };
     }
 
-    timerify(): never {
-        throw new DOMException('Not implemented', 'DOMException');
+    timerify<T extends (...args: unknown[]) => unknown>(fn: T): T {
+        if (typeof fn !== 'function') throw new TypeError('The "fn" argument must be of type function');
+        const performance = this;
+        const wrapped = function(this: unknown, ...args: unknown[]) {
+            const start = performance.now();
+            const record = () => {
+                const duration = Math.max(0, performance.now() - start);
+                performance.#addEntry(new PerformanceEntry(
+                    constructorKey,
+                    fn.name || 'anonymous',
+                    'function',
+                    start,
+                    duration,
+                    [...args],
+                ));
+            };
+            try {
+                const result = fn.apply(this, args);
+                if (isThenable(result)) {
+                    return result.then(
+                        (value) => {
+                            record();
+                            return value;
+                        },
+                        (error) => {
+                            record();
+                            throw error;
+                        },
+                    );
+                }
+                record();
+                return result;
+            } catch (error) {
+                record();
+                throw error;
+            }
+        };
+        setFunctionNameQuietly(wrapped, `timerified ${fn.name || 'anonymous'}`);
+        return wrapped as T;
     }
 
-    onresourcetimingbufferfull(): never {
-        throw new DOMException('Not implemented', 'DOMException');
+    get onresourcetimingbufferfull(): PerformanceEventHandler {
+        return this.#onResourceTimingBufferFull;
+    }
+
+    set onresourcetimingbufferfull(handler: PerformanceEventHandler) {
+        if (this.#onResourceTimingBufferFullListener) {
+            this.removeEventListener('resourcetimingbufferfull', this.#onResourceTimingBufferFullListener);
+            this.#onResourceTimingBufferFullListener = null;
+        }
+        if (typeof handler !== 'function') {
+            this.#onResourceTimingBufferFull = null;
+            return;
+        }
+
+        const listener: EventListener = (event) => handler.call(this, event);
+        this.#onResourceTimingBufferFull = handler;
+        this.#onResourceTimingBufferFullListener = listener;
+        this.addEventListener('resourcetimingbufferfull', listener);
     }
 
     // Navigation Timing (deprecated but widely used)
@@ -392,7 +542,8 @@ class Performance extends EventTarget implements globalThis.Performance {
         redirectCount: number;
     };
 
-    constructor() {
+    constructor(key: object) {
+        if (key !== constructorKey) throw new TypeError('Illegal constructor');
         super();
         const startTime = nativePerformanceNow();
         this.#timeOrigin = Date.now() - startTime;
@@ -484,7 +635,7 @@ class Performance extends EventTarget implements globalThis.Performance {
         const name = String(measureName);
         let startTime: number;
         let endTime: number;
-        let detail: any;
+        let detail: unknown;
 
         if (typeof startOrOptions === 'object' && startOrOptions !== null) {
             const options = startOrOptions;
@@ -529,7 +680,7 @@ class Performance extends EventTarget implements globalThis.Performance {
         }
 
         const duration = endTime - startTime;
-        const measure = new PerformanceMeasure(name, startTime, duration, detail);
+        const measure = new PerformanceMeasure(constructorKey, name, startTime, duration, detail);
         this.#addEntry(measure);
 
         return measure;
@@ -575,6 +726,9 @@ class Performance extends EventTarget implements globalThis.Performance {
     }
 
     setResourceTimingBufferSize(maxSize: number): void {
+        if (arguments.length === 0) {
+            throw new TypeError('Failed to execute setResourceTimingBufferSize: 1 argument required');
+        }
         const size = Number(maxSize);
         if (size < 0 || !Number.isInteger(size)) {
             throw new TypeError('Buffer size must be a non-negative integer');
@@ -620,10 +774,13 @@ class Performance extends EventTarget implements globalThis.Performance {
 
     toJSON(): object {
         return {
-            timeOrigin: this.timeOrigin,
-            timing: { ...this.timing },
-            navigation: { ...this.navigation }
+            timeOrigin: this.timeOrigin
         };
+    }
+
+    [denoCustomInspect]() {
+        if (!(this instanceof Performance)) return 'Performance {}';
+        return `Performance ${console.inspect(this.toJSON(), { colors: false })}`;
     }
 
     #resolveTimestamp(markNameOrTimestamp: string | number): number {
@@ -666,20 +823,20 @@ class Performance extends EventTarget implements globalThis.Performance {
                 const toRemove = typed.length - 1000;
                 let removed = 0;
                 this.#entries = this.#entries.filter(e => {
-                    if (removed < toRemove && e.entryType === entry.entryType) { removed++; return false; }
+                    if (removed < toRemove && e.entryType === entry.entryType) {
+                        removed++;
+                        return false;
+                    }
                     return true;
                 });
             }
         }
 
         for (const observer of this.#observers) {
-            // @ts-ignore string to EntryType
-            if (observer._observes(entry.entryType)) {
-                if (!this.#pendingEntries.has(observer)) {
-                    this.#pendingEntries.set(observer, []);
-                }
-                // @ts-ignore string to EntryType
-                this.#pendingEntries.get(observer)!.push(entry);
+            if (isPerformanceEntryType(entry.entryType) && observer._observes(entry.entryType)) {
+                const entries = this.#pendingEntries.get(observer) ?? [];
+                entries.push(entry);
+                this.#pendingEntries.set(observer, entries);
             }
         }
 
@@ -707,8 +864,7 @@ class Performance extends EventTarget implements globalThis.Performance {
     }
 
     _getBufferedEntries(types: PerformanceEntryType[]): globalThis.PerformanceEntry[] {
-        // @ts-ignore
-        return this.#entries.filter(entry => types.includes(entry.entryType));
+        return this.#entries.filter(entry => isPerformanceEntryType(entry.entryType) && types.includes(entry.entryType));
     }
 
     _takeRecordsForObserver(observer: PerformanceObserver): globalThis.PerformanceEntry[] {
@@ -718,7 +874,10 @@ class Performance extends EventTarget implements globalThis.Performance {
     }
 }
 
-const performanceInstance = new Performance();
+Object.defineProperty(Performance, 'length', { value: 0, configurable: true });
+Object.defineProperty(PerformanceEntry, 'length', { value: 0, configurable: true });
+
+const performanceInstance = new Performance(constructorKey);
 
 // Preserve native now() function
 const originalNow = nativePerformanceNow;
@@ -735,3 +894,4 @@ Reflect.set(globalThis, 'PerformanceObserver', PerformanceObserver);
 Reflect.set(globalThis, 'PerformanceObserverEntryList', PerformanceObserverEntryList);
 Reflect.set(globalThis, 'PerformanceNavigationTiming', PerformanceNavigationTiming);
 Reflect.set(globalThis, 'PerformanceResourceTiming', PerformanceResourceTiming);
+Reflect.set(globalThis, 'PerformanceNodeTiming', PerformanceNodeTiming);

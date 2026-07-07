@@ -5,6 +5,7 @@
 
 const http = import.meta.use('http');
 const engine = import.meta.use('engine');
+const algorithm = import.meta.use('algorithm');
 
 const METHODS: CNO.HttpMethod[] = [
     "DELETE", "GET", "HEAD", "POST", "PUT", "CONNECT",
@@ -17,8 +18,15 @@ const METHODS: CNO.HttpMethod[] = [
 
 const CRLF = new Uint8Array([0x0D, 0x0A]);
 
-const decode = (buf: any, off: number, len: number): string =>
-    engine.decodeString(new Uint8Array(buf as ArrayBuffer).slice(off, off + len));
+type HttpStreamMessage = CNO.HttpRequestMessage | CNO.HttpResponseMessage;
+
+function toByteView(buf: CModuleHTTP.BufferSource): Uint8Array {
+    if (buf instanceof ArrayBuffer) return new Uint8Array(buf);
+    return new Uint8Array(new globalThis.Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength));
+}
+
+const decode = (buf: CModuleHTTP.BufferSource, off: number, len: number): string =>
+    engine.decodeString(toByteView(buf).subarray(off, off + len));
 
 function mapState(raw: CModuleHTTP.ParserState, parserType: 0 | 1): CNO.HttpParserState {
     return {
@@ -33,11 +41,7 @@ function mapState(raw: CModuleHTTP.ParserState, parserType: 0 | 1): CNO.HttpPars
 }
 
 function concat(...parts: Uint8Array[]): Uint8Array {
-    const total = parts.reduce((s, p) => s + p.length, 0);
-    const out = new Uint8Array(total);
-    let off = 0;
-    for (const p of parts) { out.set(p, off); off += p.length; }
-    return out;
+    return algorithm.bytesConcat(parts);
 }
 
 function encode(s: string): Uint8Array {
@@ -59,24 +63,24 @@ class LLHttpParser implements CNO.HttpParser {
     }
 
     #wire(): void {
-        if (this.#events.onUrl)
-            this.#parser.onUrl = (buf, off, len) => { this.#events.onUrl!(decode(buf, off, len)); };
-        if (this.#events.onStatus)
-            this.#parser.onStatus = (buf, off, len) => { this.#events.onStatus!(decode(buf, off, len)); };
-        if (this.#events.onHeaderField)
-            this.#parser.onHeaderField = (buf, off, len) => { this.#events.onHeaderField!(decode(buf, off, len)); };
-        if (this.#events.onHeaderValue)
-            this.#parser.onHeaderValue = (buf, off, len) => { this.#events.onHeaderValue!(decode(buf, off, len)); };
-        if (this.#events.onHeadersComplete)
-            this.#parser.onHeadersComplete = () => { this.#events.onHeadersComplete!(mapState(this.#parser.state, this.#type)); };
-        if (this.#events.onBody)
-            this.#parser.onBody = (buf, off, len) => { this.#events.onBody!(new Uint8Array(buf as ArrayBuffer).slice(off, off + len)); };
-        if (this.#events.onMessageComplete)
-            this.#parser.onMessageComplete = () => { this.#events.onMessageComplete!(); };
-        if (this.#events.onChunkHeader)
-            this.#parser.onChunkHeader = () => { this.#events.onChunkHeader!(0); };
-        if (this.#events.onChunkComplete)
-            this.#parser.onChunkComplete = () => { this.#events.onChunkComplete!(); };
+        const onUrl = this.#events.onUrl;
+        if (onUrl) this.#parser.onUrl = (buf, off, len) => { onUrl(decode(buf, off, len)); };
+        const onStatus = this.#events.onStatus;
+        if (onStatus) this.#parser.onStatus = (buf, off, len) => { onStatus(decode(buf, off, len)); };
+        const onHeaderField = this.#events.onHeaderField;
+        if (onHeaderField) this.#parser.onHeaderField = (buf, off, len) => { onHeaderField(decode(buf, off, len)); };
+        const onHeaderValue = this.#events.onHeaderValue;
+        if (onHeaderValue) this.#parser.onHeaderValue = (buf, off, len) => { onHeaderValue(decode(buf, off, len)); };
+        const onHeadersComplete = this.#events.onHeadersComplete;
+        if (onHeadersComplete) this.#parser.onHeadersComplete = () => { onHeadersComplete(mapState(this.#parser.state, this.#type)); };
+        const onBody = this.#events.onBody;
+        if (onBody) this.#parser.onBody = (buf, off, len) => { onBody(toByteView(buf).slice(off, off + len)); };
+        const onMessageComplete = this.#events.onMessageComplete;
+        if (onMessageComplete) this.#parser.onMessageComplete = () => { onMessageComplete(); };
+        const onChunkHeader = this.#events.onChunkHeader;
+        if (onChunkHeader) this.#parser.onChunkHeader = () => { onChunkHeader(0); };
+        const onChunkComplete = this.#events.onChunkComplete;
+        if (onChunkComplete) this.#parser.onChunkComplete = () => { onChunkComplete(); };
     }
 
     execute(data: Uint8Array | ArrayBuffer): CNO.HttpParserResult {
@@ -115,10 +119,10 @@ function createResponseParser(events: CNO.HttpParserEvents): CNO.HttpParser {
 
 // High-level: StreamingHttpParser
 
-class StreamingParser implements CNO.StreamingHttpParser {
+class StreamingParser<T extends HttpStreamMessage> implements CNO.StreamingHttpParser {
     #parser: CModuleHTTP.Parser;
     #type: 0 | 1;
-    #onMessage: (msg: any) => void;
+    #onMessage: (msg: T) => void;
     #onError?: (err: Error) => void;
 
     // Per-message accumulation
@@ -137,7 +141,7 @@ class StreamingParser implements CNO.StreamingHttpParser {
     #hasBody = false;
     #expectContinue = false;
 
-    constructor(type: 0 | 1, onMessage: (msg: any) => void, onError?: (err: Error) => void) {
+    constructor(type: 0 | 1, onMessage: (msg: T) => void, onError?: (err: Error) => void) {
         this.#type = type;
         this.#onMessage = onMessage;
         this.#onError = onError;
@@ -206,7 +210,7 @@ class StreamingParser implements CNO.StreamingHttpParser {
 
         this.#parser.onBody = (buf, off, len) => {
             if (this.#bodyCtrl) {
-                this.#bodyCtrl.enqueue(new Uint8Array(buf as ArrayBuffer).slice(off, off + len));
+                this.#bodyCtrl.enqueue(toByteView(buf).slice(off, off + len));
             }
         };
 
@@ -217,7 +221,7 @@ class StreamingParser implements CNO.StreamingHttpParser {
             }
 
             const httpVersion = `${this.#httpMajor}.${this.#httpMinor}`;
-            let msg: any;
+            let msg: HttpStreamMessage;
 
             if (this.#type === http.REQUEST) {
                 msg = {
@@ -240,7 +244,7 @@ class StreamingParser implements CNO.StreamingHttpParser {
                 };
             }
 
-            this.#onMessage(msg);
+            this.#onMessage(msg as T);
 
             // Reset for next message on keep-alive
             if (this.#keepAlive) {
@@ -272,11 +276,11 @@ class StreamingParser implements CNO.StreamingHttpParser {
 }
 
 function createRequestStreamParser(onMessage: (msg: CNO.HttpRequestMessage) => void, onError?: (err: Error) => void): CNO.StreamingHttpParser {
-    return new StreamingParser(http.REQUEST, onMessage, onError);
+    return new StreamingParser<CNO.HttpRequestMessage>(http.REQUEST, onMessage, onError);
 }
 
 function createResponseStreamParser(onMessage: (msg: CNO.HttpResponseMessage) => void, onError?: (err: Error) => void): CNO.StreamingHttpParser {
-    return new StreamingParser(http.RESPONSE, onMessage, onError);
+    return new StreamingParser<CNO.HttpResponseMessage>(http.RESPONSE, onMessage, onError);
 }
 
 // One-shot parse
@@ -305,7 +309,7 @@ function parseRequest(data: Uint8Array | ArrayBuffer): CNO.HttpRequestMessage {
         httpMajor = s.httpMajor;
         httpMinor = s.httpMinor;
     };
-    parser.onBody = (b, off, len) => { bodyChunks.push(new Uint8Array(b as ArrayBuffer).slice(off, off + len)); };
+    parser.onBody = (b, off, len) => { bodyChunks.push(toByteView(b).slice(off, off + len)); };
 
     const result = parser.execute(buf);
     if (result.errno !== 0 && result.name !== 'HPE_PAUSED_UPGRADE') {
@@ -343,7 +347,7 @@ function parseResponse(data: Uint8Array | ArrayBuffer): CNO.HttpResponseMessage 
         httpMinor = s.httpMinor;
         if (!statusText) statusText = http.strstatus(statusCode);
     };
-    parser.onBody = (b, off, len) => { bodyChunks.push(new Uint8Array(b as ArrayBuffer).slice(off, off + len)); };
+    parser.onBody = (b, off, len) => { bodyChunks.push(toByteView(b).slice(off, off + len)); };
 
     const result = parser.execute(buf);
     if (result.errno !== 0) {

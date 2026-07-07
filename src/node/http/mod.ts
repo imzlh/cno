@@ -24,9 +24,12 @@ import { STATUS_CODES, METHODS } from './server';
 import { createServer, ServerImpl, IncomingMessageImpl, ServerResponseImpl, OutgoingMessageImpl, validateHeaderName, validateHeaderValue } from './server';
 import { Agent, globalAgent, request, get, ClientRequestImpl } from './client';
 
+export const maxHeaderSize = 16384;
+
 export default {
     METHODS,
     STATUS_CODES,
+    maxHeaderSize,
     IncomingMessage: IncomingMessageImpl,
     OutgoingMessage: OutgoingMessageImpl,
     ServerResponse: ServerResponseImpl,

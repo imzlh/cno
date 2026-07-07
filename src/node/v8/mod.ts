@@ -5,11 +5,14 @@
 
 const engine = import.meta.use('engine');
 const os = import.meta.use('os');
+const algorithm = import.meta.use('algorithm');
 import { concatChunks } from '../_internal/buffer';
 
 const WIRE_VERSION = 1;
 const HEADER_BYTES = Uint8Array.from([0x43, 0x54, 0x53, 0x56, 0x38, WIRE_VERSION]);
 const NativePromise = globalThis.Promise;
+type HookCallable = (...args: never[]) => unknown;
+type UnknownCallable = (...args: unknown[]) => unknown;
 
 let cachedFlags = '';
 let promiseHookInstalled = false;
@@ -18,19 +21,30 @@ const initHooks = new Set<(promise: Promise<unknown>, parent?: Promise<unknown>)
 const beforeHooks = new Set<(promise: Promise<unknown>) => void>();
 const afterHooks = new Set<(promise: Promise<unknown>) => void>();
 const settledHooks = new Set<(promise: Promise<unknown>) => void>();
-const trackedPromises = new WeakSet<object>();
+const trackedPromises = new WeakSet<Promise<unknown>>();
 
 function fnv1a32(input: string): number {
-    let hash = 0x811c9dc5;
-    for (let i = 0; i < input.length; i++) {
-        hash ^= input.charCodeAt(i);
-        hash = Math.imul(hash, 0x01000193) >>> 0;
-    }
-    return hash >>> 0;
+    return algorithm.fnv1a32(engine.encodeString(input));
 }
 
-function asUint8Array(value: Buffer | Uint8Array | ArrayBufferView): Uint8Array {
+function assertArrayBufferView(value: unknown, name: string): asserts value is ArrayBufferView {
+    if (!ArrayBuffer.isView(value)) {
+        throw new TypeError(`${name} must be a TypedArray or a DataView`);
+    }
+}
+
+function asUint8Array(value: ArrayBufferView): Uint8Array {
+    assertArrayBufferView(value, 'buffer');
     return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+}
+
+function normalizeRawByteLength(length: unknown, available: number): number {
+    if (length === undefined) return available;
+    const normalized = Number(length);
+    if (!Number.isFinite(normalized) || normalized < 0) {
+        throw new Error('ReadRawBytes() failed');
+    }
+    return Math.trunc(normalized);
 }
 
 function toBuffer(value: Uint8Array): Buffer {
@@ -57,32 +71,36 @@ function writeDoubleLE(value: number): Uint8Array {
     return out;
 }
 
-function ensureHookCallback(name: string, callback: Function): void {
+function ensureHookCallback(name: string, callback: HookCallable): void {
     if (typeof callback !== 'function') {
         throw new TypeError(`The "${name}" hook must be a function`);
     }
-    if ((callback as Function).constructor?.name === 'AsyncFunction') {
+    const constructor = Reflect.get(callback, 'constructor');
+    const constructorName = constructor && (typeof constructor === 'object' || typeof constructor === 'function')
+        ? Reflect.get(constructor, 'name')
+        : undefined;
+    if (constructorName === 'AsyncFunction') {
         throw new TypeError(`The "${name}" hook must be a plain function`);
     }
 }
 
-function invokeHookSet<T extends Function>(hooks: Set<T>, ...args: any[]): void {
-    for (const hook of hooks) hook(...args);
+function invokeHookSet<T extends (...args: never[]) => unknown>(hooks: Set<T>, ...args: Parameters<T>): void {
+    for (const hook of hooks) Reflect.apply(hook, undefined, args);
 }
 
 function installPromiseHookDispatcher(): void {
     if (promiseHookInstalled) return;
     const trackPromise = (promise: Promise<unknown>, parent?: Promise<unknown>) => {
-        if (trackedPromises.has(promise as object)) return;
-        trackedPromises.add(promise as object);
+        if (trackedPromises.has(promise)) return;
+        trackedPromises.add(promise);
         invokeHookSet(initHooks, promise, parent);
         NativePromise.prototype.then.call(
             promise,
-            (value: any) => {
+            (value: unknown) => {
                 invokeHookSet(settledHooks, promise);
                 return value;
             },
-            (error: any) => {
+            (error: unknown) => {
                 invokeHookSet(settledHooks, promise);
                 throw error;
             },
@@ -90,31 +108,48 @@ function installPromiseHookDispatcher(): void {
     };
 
     class HookedPromise<T> extends NativePromise<T> {
-        constructor(executor: any) {
-            super(executor as any);
+        constructor(executor: ConstructorParameters<PromiseConstructor>[0]) {
+            super(executor);
             trackPromise(this);
         }
 
         then<TResult1 = T, TResult2 = never>(
             onFulfilled?: ((value: T) => TResult1 | PromiseLike<TResult1>) | null,
-            onRejected?: ((reason: any) => TResult2 | PromiseLike<TResult2>) | null,
+            onRejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
         ): Promise<TResult1 | TResult2> {
-            let continuation!: Promise<unknown>;
-            const wrap = (callback: Function | null | undefined) => {
+            let continuation: Promise<unknown> | undefined;
+            const wrapFulfilled = (
+                callback: ((value: T) => TResult1 | PromiseLike<TResult1>) | null | undefined,
+            ): ((value: T) => TResult1 | PromiseLike<TResult1>) | undefined => {
                 if (typeof callback !== 'function') return callback ?? undefined;
-                return function(this: any, ...args: any[]) {
-                    invokeHookSet(beforeHooks, continuation);
+                return function(this: unknown, value: T) {
+                    if (continuation) invokeHookSet(beforeHooks, continuation);
                     try {
-                        return callback.apply(this, args);
+                        return Reflect.apply(callback, this, [value]) as TResult1 | PromiseLike<TResult1>;
                     } finally {
-                        invokeHookSet(afterHooks, continuation);
+                        if (continuation) invokeHookSet(afterHooks, continuation);
+                    }
+                };
+            };
+            const wrapRejected = (
+                callback: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null | undefined,
+            ): ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | undefined => {
+                if (typeof callback !== 'function') return callback ?? undefined;
+                return function(this: unknown, reason: unknown) {
+                    if (continuation) invokeHookSet(beforeHooks, continuation);
+                    try {
+                        return Reflect.apply(callback, this, [reason]) as TResult2 | PromiseLike<TResult2>;
+                    } finally {
+                        if (continuation) invokeHookSet(afterHooks, continuation);
                     }
                 };
             };
 
+            const wrappedFulfilled = wrapFulfilled(onFulfilled);
+            const wrappedRejected = wrapRejected(onRejected);
             const result = super.then(
-                wrap(onFulfilled as any) as any,
-                wrap(onRejected as any) as any,
+                wrappedFulfilled,
+                wrappedRejected,
             );
             continuation = result as Promise<unknown>;
             trackPromise(continuation, this);
@@ -122,11 +157,11 @@ function installPromiseHookDispatcher(): void {
         }
     }
 
-    globalThis.Promise = HookedPromise as unknown as PromiseConstructor;
+    globalThis.Promise = HookedPromise as PromiseConstructor;
     promiseHookInstalled = true;
 }
 
-function addHook<T extends Function>(name: string, target: Set<T>, callback: T): () => void {
+function addHook<T extends HookCallable>(name: string, target: Set<T>, callback: T): () => void {
     ensureHookCallback(name, callback);
     installPromiseHookDispatcher();
     target.add(callback);
@@ -182,7 +217,10 @@ export function getHeapCodeStatistics(): {
 }
 
 export function setFlagsFromString(flags: string): void {
-    cachedFlags = String(flags);
+    if (typeof flags !== 'string') {
+        throw new TypeError(`The "flags" argument must be of type string. Received type ${typeof flags}`);
+    }
+    cachedFlags = flags;
 }
 
 export function enableTimeTravel(): void {}
@@ -191,11 +229,9 @@ export function disableTimeTravel(): void {}
 export class Serializer {
     protected _chunks: Uint8Array[] = [];
     protected _headerWritten = false;
-    protected _released = false;
     protected _transferredArrayBuffers = new Map<number, ArrayBuffer>();
 
     protected _ensureWritable(): void {
-        if (this._released) throw new Error('Serializer has already released its buffer');
     }
 
     protected _push(chunk: Uint8Array): void {
@@ -209,7 +245,7 @@ export class Serializer {
         this._headerWritten = true;
     }
 
-    writeValue(val: any): boolean {
+    writeValue(val: unknown): boolean {
         this.writeHeader();
         const encoded = engine.serialize(val);
         this.writeUint32(encoded.byteLength);
@@ -219,9 +255,9 @@ export class Serializer {
 
     releaseBuffer(): Buffer {
         this._ensureWritable();
-        this._released = true;
         const out = concatChunks(this._chunks);
         this._chunks = [];
+        this._headerWritten = false;
         return toBuffer(out);
     }
 
@@ -242,6 +278,7 @@ export class Serializer {
     }
 
     writeRawBytes(buffer: ArrayBufferView): void {
+        assertArrayBufferView(buffer, 'source');
         const raw = asUint8Array(buffer);
         this._push(new Uint8Array(raw));
     }
@@ -257,6 +294,7 @@ export class Deserializer {
     protected _transferredArrayBuffers = new Map<number, ArrayBuffer>();
 
     constructor(data: Buffer | Uint8Array | ArrayBufferView) {
+        assertArrayBufferView(data, 'buffer');
         this._buffer = asUint8Array(data);
     }
 
@@ -275,17 +313,15 @@ export class Deserializer {
 
     readHeader(): boolean {
         const header = this._readBytes(HEADER_BYTES.byteLength);
-        for (let i = 0; i < HEADER_BYTES.byteLength; i++) {
-            if (header[i] !== HEADER_BYTES[i]) {
-                throw new Error('Invalid or unsupported wire format');
-            }
+        if (!algorithm.bytesEqual(header, HEADER_BYTES)) {
+            throw new Error('Invalid or unsupported wire format');
         }
         this._headerRead = true;
         this._wireFormatVersion = header[HEADER_BYTES.byteLength - 1] ?? 0;
         return true;
     }
 
-    readValue(): any {
+    readValue(): unknown {
         if (!this._headerRead) {
             this.readHeader();
         }
@@ -323,21 +359,48 @@ export class Deserializer {
         return new DataView(chunk.buffer, chunk.byteOffset, chunk.byteLength).getFloat64(0, true);
     }
 
-    readRawBytes(length: number): Buffer {
-        return toBuffer(this._readBytes(length));
+    readRawBytes(length?: number): Buffer {
+        return toBuffer(this._readBytes(normalizeRawByteLength(length, this._buffer.byteLength - this._offset)));
     }
 }
 
 export class DefaultDeserializer extends Deserializer {}
 
-export function serialize(value: any): Buffer {
+function containsFunction(value: unknown, seen = new WeakSet<object>()): boolean {
+    if (typeof value === 'function') return true;
+    if (!value || typeof value !== 'object') return false;
+    if (seen.has(value)) return false;
+    seen.add(value);
+    if (Array.isArray(value)) return value.some((item) => containsFunction(item, seen));
+    if (value instanceof Map) {
+        for (const [key, item] of value) {
+            if (containsFunction(key, seen) || containsFunction(item, seen)) return true;
+        }
+        return false;
+    }
+    if (value instanceof Set) {
+        for (const item of value) {
+            if (containsFunction(item, seen)) return true;
+        }
+        return false;
+    }
+    for (const item of Object.values(value)) {
+        if (containsFunction(item, seen)) return true;
+    }
+    return false;
+}
+
+export function serialize(value: unknown): Buffer {
+    if (containsFunction(value)) {
+        throw new Error('() => {} could not be cloned');
+    }
     const serializer = new DefaultSerializer();
     serializer.writeHeader();
     serializer.writeValue(value);
     return serializer.releaseBuffer();
 }
 
-export function deserialize(buf: Buffer | Uint8Array): any {
+export function deserialize(buf: Buffer | Uint8Array): unknown {
     const deserializer = new DefaultDeserializer(buf);
     deserializer.readHeader();
     return deserializer.readValue();
@@ -349,9 +412,9 @@ export function cachedDataVersionTag(): number {
 
 export const startupSnapshot = {
     isBuildingSnapshot(): boolean { return false; },
-    addSerializeCallback(_cb: Function, _data?: any): void {},
-    addDeserializeCallback(_cb: Function, _data?: any): void {},
-    setDeserializeMainFunction(_cb: Function, _data?: any): void {},
+    addSerializeCallback(_cb: UnknownCallable, _data?: unknown): void {},
+    addDeserializeCallback(_cb: UnknownCallable, _data?: unknown): void {},
+    setDeserializeMainFunction(_cb: UnknownCallable, _data?: unknown): void {},
 };
 
 export const promiseHooks = {

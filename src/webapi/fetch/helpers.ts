@@ -1,7 +1,8 @@
-import { Headers } from "headers-polyfill";
+import { Headers } from "../headers";
 import { DOMException } from "../events";
 import { type FetchConnectionInfo } from "../../utils/network-hooks";
 import { getTierLimits } from "../../utils/memory-tier";
+import { toOwnedBytes } from "../../utils/bytes";
 import type { Request } from "./request";
 
 const { maxPendingBodyBytes, streamHighWaterMark, hookPayloadCap } = getTierLimits();
@@ -11,9 +12,19 @@ export const curlMod = import.meta.use("curl");
 export const asyncfs = import.meta.use("asyncfs");
 export const os = import.meta.use("os");
 export const engine = import.meta.use("engine");
+const algorithm = import.meta.use("algorithm");
 export const { Decoder } = import.meta.use("text");
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
+type BodyIterable = Iterable<unknown> | AsyncIterable<unknown>;
+
+async function closeFileQuietly(file: CModuleAsyncFS.FileHandle): Promise<void> {
+    try {
+        await file.close();
+    } catch {
+        // Keep the original body serialization error visible.
+    }
+}
 
 // Pre-compiled regexes (avoid recompilation in hot paths).
 export const HTTP_LINE_RE = /^HTTP\//i;
@@ -124,7 +135,9 @@ export function buildConnectionInfo(curl: CModuleCURL.CURL, reqStartTime: number
                 dataInStart: trace?.dataInStart,
             },
         };
-    } catch { return undefined; }
+    } catch {
+        return undefined;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -154,11 +167,11 @@ export function closeCurlPool(): void {
 // Helpers
 // ---------------------------------------------------------------------------
 
-export function abortError(signal?: AbortSignal): any {
+export function abortError(signal?: AbortSignal): unknown {
     return signal?.reason ?? new DOMException('The operation was aborted', 'AbortError');
 }
 
-export function timeoutError(): any {
+export function timeoutError(): DOMException {
     return new DOMException('The operation timed out', 'TimeoutError');
 }
 
@@ -170,8 +183,11 @@ export function compressionAcceptEncoding(headers: Headers): string | undefined 
     return trimmed === 'identity' ? 'identity' : undefined;
 }
 
-export function isCurlTimeoutError(err: any): boolean {
-    return err?.code === 28 || TIMEOUT_ERR_RE.test(String(err?.message ?? err));
+export function isCurlTimeoutError(err: unknown): boolean {
+    const record = (typeof err === 'object' || typeof err === 'function') && err !== null ? err : undefined;
+    const code = record ? Reflect.get(record, 'code') : undefined;
+    const message = record ? Reflect.get(record, 'message') : undefined;
+    return code === 28 || TIMEOUT_ERR_RE.test(String(message ?? err));
 }
 
 export function throwIfAborted(signal?: AbortSignal): void {
@@ -181,11 +197,9 @@ export function throwIfAborted(signal?: AbortSignal): void {
 
 export function mergeChunks(chunks: Uint8Array[]): Uint8Array {
     if (chunks.length === 0) return new Uint8Array(0);
-    if (chunks.length === 1) return chunks[0]!;
-    const total = chunks.reduce((s, c) => s + c.length, 0);
-    const merged = new Uint8Array(total); let off = 0;
-    for (const c of chunks) { merged.set(c, off); off += c.length; }
-    return merged;
+    const first = chunks[0];
+    if (chunks.length === 1 && first !== undefined) return first;
+    return toOwnedBytes(algorithm.bytesConcat(chunks));
 }
 
 export function rawHeadersToHeaders(raw: string): Headers {
@@ -202,7 +216,8 @@ export function parseHeaders(raw: string): Array<[string, string]> {
     let last: [string, string] | null = null;
     const lines = raw.split(/\r?\n/);
     for (let i = 0; i < lines.length; i++) {
-        const line = lines[i]!;
+        const line = lines[i];
+        if (line === undefined) continue;
         if (!line) continue;
         if (HTTP_LINE_RE.test(line)) { out.length = 0; last = null; continue; }
         const ch = line.charCodeAt(0);
@@ -217,39 +232,90 @@ export function parseHeaders(raw: string): Array<[string, string]> {
 }
 
 /**
- * Convert Headers to array of pairs — preserves duplicate headers (e.g. Set-Cookie).
- */
-export function headersToArray(headers: Headers): Array<[string, string]> {
-    const out: Array<[string, string]> = [];
-    headers.forEach((value: string, key: string) => { out.push([key, value]); });
-    return out;
-}
-
-/**
  * Convert array of header pairs to Record for curl.setHeaders().
  * Note: duplicates are merged (last wins) — curl API limitation.
  */
 export function responseBodyToBytes(body?: string | ArrayBuffer): Uint8Array {
     if (!body) return new Uint8Array(0);
     if (typeof body === "string") return engine.encodeString(body);
-    return new Uint8Array(body) as Uint8Array;
+    return new Uint8Array(body);
 }
 
-export function isReadableStreamLike(body: any): body is ReadableStream<Uint8Array> {
-    return !!body && typeof body === 'object' && typeof body.getReader === 'function';
+export function isReadableStreamLike(body: unknown): body is ReadableStream<Uint8Array> {
+    return !!body && typeof body === 'object' && typeof Reflect.get(body, 'getReader') === 'function';
 }
 
-export function serializeBody(body: any): Uint8Array | null {
+function bytesWithArrayBuffer(body: globalThis.Uint8Array<ArrayBufferLike>): Uint8Array {
+    return body.buffer instanceof ArrayBuffer
+        ? new Uint8Array(body.buffer, body.byteOffset, body.byteLength)
+        : toOwnedBytes(body);
+}
+
+function isAsyncIterable(body: BodyIterable): body is AsyncIterable<unknown> {
+    return typeof Reflect.get(body, Symbol.asyncIterator) === 'function';
+}
+
+function isIterable(body: BodyIterable): body is Iterable<unknown> {
+    return typeof Reflect.get(body, Symbol.iterator) === 'function';
+}
+
+function blobFilename(value: Blob): string {
+    const name = Reflect.get(value, 'name');
+    return typeof name === 'string' && name.length > 0 ? name : 'blob';
+}
+
+export function isBodyIterable(body: unknown): body is BodyIterable {
+    if (!body || typeof body !== 'object') return false;
+    if (body instanceof String) return false;
+    if (body instanceof URLSearchParams) return false;
+    if (body instanceof Blob) return false;
+    if (body instanceof FormData) return false;
+    if (ArrayBuffer.isView(body) || body instanceof ArrayBuffer) return false;
+    return typeof Reflect.get(body, Symbol.asyncIterator) === 'function'
+        || typeof Reflect.get(body, Symbol.iterator) === 'function';
+}
+
+export function serializeBody(body: unknown): Uint8Array | null {
     if (body === null || body === undefined) return null;
     if (isReadableStreamLike(body)) return null;
-    if (body instanceof Uint8Array) return body as Uint8Array;
-    if (ArrayBuffer.isView(body)) return new Uint8Array(body.buffer as ArrayBuffer, body.byteOffset, body.byteLength);
-    if (body instanceof ArrayBuffer) return new Uint8Array(body) as Uint8Array;
-    if (typeof body === 'string') return engine.encodeString(body) as Uint8Array;
-    if (body instanceof URLSearchParams) return engine.encodeString(body.toString()) as Uint8Array;
+    if (body instanceof Uint8Array) return bytesWithArrayBuffer(body);
+    if (ArrayBuffer.isView(body)) return toOwnedBytes(new Uint8Array(body.buffer, body.byteOffset, body.byteLength));
+    if (body instanceof ArrayBuffer) return new Uint8Array(body);
+    if (typeof body === 'string') return engine.encodeString(body);
+    if (body instanceof String) return engine.encodeString(String(body));
+    if (body instanceof URLSearchParams) return engine.encodeString(body.toString());
     if (body instanceof Blob) return null; // async, handled separately
     if (body instanceof FormData) return null; // async, handled separately
-    return engine.encodeString(JSON.stringify(body)) as Uint8Array;
+    if (isBodyIterable(body)) return null;
+    return engine.encodeString(String(body));
+}
+
+function serializeBodyChunk(chunk: unknown): Uint8Array {
+    const data = serializeBody(chunk);
+    if (data === null) throw new TypeError('Body iterable chunks must be serializable body parts');
+    return data;
+}
+
+export function iterableBodyToStream(body: BodyIterable): ReadableStream<Uint8Array> {
+    const iterator = isAsyncIterable(body)
+        ? body[Symbol.asyncIterator]()
+        : isIterable(body)
+            ? body[Symbol.iterator]()
+            : undefined;
+    if (!iterator) throw new TypeError('Body iterable chunks must be iterable');
+    return new ReadableStream<Uint8Array>({
+        async pull(controller) {
+            const next = await iterator.next();
+            if (next.done) {
+                controller.close();
+                return;
+            }
+            controller.enqueue(serializeBodyChunk(next.value));
+        },
+        async cancel() {
+            await iterator.return?.();
+        },
+    });
 }
 
 export function isNullBodyStatus(status: number): boolean {
@@ -281,9 +347,9 @@ export function truncateHookPostData(body?: Uint8Array | null): Uint8Array | nul
 }
 
 export function toCurlBody(body: globalThis.Uint8Array<ArrayBufferLike>): Uint8Array | ArrayBuffer {
-    return body.byteOffset === 0 && body.byteLength === body.buffer.byteLength
-        ? body.buffer as ArrayBuffer
-        : body as Uint8Array;
+    return body.buffer instanceof ArrayBuffer && body.byteOffset === 0 && body.byteLength === body.buffer.byteLength
+        ? body.buffer
+        : toOwnedBytes(body);
 }
 
 export type PreparedRequestBody =
@@ -310,7 +376,7 @@ async function writeStreamToTempFile(stream: ReadableStream<Uint8Array>, signal?
             }
         }
     } catch (err) {
-        try { await file.close(); } catch {}
+        await closeFileQuietly(file);
         await asyncfs.unlink(path).catch(() => {});
         throw err;
     } finally {
@@ -328,37 +394,8 @@ export async function prepareRequestBody(request: Request): Promise<PreparedRequ
     }
     if (!request.body) return { kind: 'none' };
     request.bodyUsed = true;
-    const streamed = await writeStreamToTempFile(request.body as ReadableStream<Uint8Array>, request.signal);
+    const streamed = await writeStreamToTempFile(request.body, request.signal);
     return { kind: 'file', path: streamed.path, size: streamed.size };
-}
-
-// ---------------------------------------------------------------------------
-// KMP byte-pattern search — O(n+m) instead of O(n×m)
-// ---------------------------------------------------------------------------
-
-function buildKMPTable(needle: Uint8Array): Int32Array {
-    const m = needle.length;
-    const table = new Int32Array(m);
-    let j = 0;
-    for (let i = 1; i < m; i++) {
-        while (j > 0 && needle[i] !== needle[j]) j = table[j - 1]!;
-        if (needle[i] === needle[j]) j++;
-        table[i] = j;
-    }
-    return table;
-}
-
-function kmpSearch(haystack: Uint8Array, needle: Uint8Array, from: number, table: Int32Array): number {
-    const n = haystack.length;
-    const m = needle.length;
-    if (m === 0) return from;
-    let j = 0;
-    for (let i = from; i < n; i++) {
-        while (j > 0 && haystack[i] !== needle[j]) j = table[j - 1]!;
-        if (haystack[i] === needle[j]) j++;
-        if (j === m) return i - m + 1;
-    }
-    return -1;
 }
 
 // ---------------------------------------------------------------------------
@@ -370,22 +407,24 @@ export async function serializeFormData(fd: FormData, boundary: string = createM
     const entries: Array<[string, FormDataEntryValue]> = [];
     fd.forEach((value, key) => { entries.push([key, value]); });
     for (let i = 0; i < entries.length; i++) {
-        const [key, value] = entries[i]!;
+        const entry = entries[i];
+        if (entry === undefined) continue;
+        const [key, value] = entry;
         let header = `--${boundary}\r\nContent-Disposition: form-data; name="${key}"`;
         if (value instanceof Blob) {
-            const filename = (value as File).name || 'blob';
+            const filename = blobFilename(value);
             header += `; filename="${filename}"\r\nContent-Type: ${value.type || 'application/octet-stream'}`;
         }
         header += '\r\n\r\n';
-        parts.push(engine.encodeString(header) as Uint8Array);
+        parts.push(engine.encodeString(header));
         if (value instanceof Blob) {
             parts.push(new Uint8Array(await value.arrayBuffer()));
         } else {
-            parts.push(engine.encodeString(value) as Uint8Array);
+            parts.push(engine.encodeString(value));
         }
-        parts.push(engine.encodeString('\r\n') as Uint8Array);
+        parts.push(engine.encodeString('\r\n'));
     }
-    parts.push(engine.encodeString(`--${boundary}--\r\n`) as Uint8Array);
+    parts.push(engine.encodeString(`--${boundary}--\r\n`));
     return mergeChunks(parts);
 }
 
@@ -399,18 +438,15 @@ export function parseUrlEncoded(body: Uint8Array): FormData {
 
 // Pre-built CRLF2 needle for parseMultipart (avoids per-call allocation).
 const CRLF2 = new Uint8Array([0x0d, 0x0a, 0x0d, 0x0a]);
-const CRLF2_TABLE = buildKMPTable(CRLF2);
 
 export function parseMultipart(body: Uint8Array, boundary: string): FormData {
     const fd = new FormData();
-    const delimiter = engine.encodeString(`\r\n--${boundary}`) as Uint8Array;
-    const firstBnd = engine.encodeString(`--${boundary}`) as Uint8Array;
-    const delimTable = buildKMPTable(delimiter);
-    const firstTable = buildKMPTable(firstBnd);
+    const delimiter = engine.encodeString(`\r\n--${boundary}`);
+    const firstBnd = engine.encodeString(`--${boundary}`);
     let pos = 0;
 
     // Find first boundary (may or may not have leading CRLF).
-    pos = kmpSearch(body, firstBnd, 0, firstTable);
+    pos = algorithm.bytesIndexOf(body, firstBnd, 0);
     if (pos < 0) return fd;
     pos += firstBnd.length;
 
@@ -421,7 +457,7 @@ export function parseMultipart(body: Uint8Array, boundary: string): FormData {
         if (body[pos] === 0x2d && body[pos + 1] === 0x2d) break;
 
         // Parse part headers until blank line.
-        const hdrEnd = kmpSearch(body, CRLF2, pos, CRLF2_TABLE);
+        const hdrEnd = algorithm.bytesIndexOf(body, CRLF2, pos);
         if (hdrEnd < 0) break;
         const hdrStr = engine.decodeString(body.subarray(pos, hdrEnd));
         pos = hdrEnd + 4;
@@ -433,7 +469,7 @@ export function parseMultipart(body: Uint8Array, boundary: string): FormData {
         const name = nameMatch?.[1] ?? '';
 
         // Find next boundary.
-        const nextBnd = kmpSearch(body, delimiter, pos, delimTable);
+        const nextBnd = algorithm.bytesIndexOf(body, delimiter, pos);
         if (nextBnd < 0) break;
         // Body is everything before the CRLF that precedes the boundary.
         const partBody = body.subarray(pos, nextBnd);
@@ -444,7 +480,7 @@ export function parseMultipart(body: Uint8Array, boundary: string): FormData {
             const blob = new Blob([partBody], { type: ct });
             // File polyfill: Blob + name.
             Object.defineProperty(blob, 'name', { value: filenameMatch[1] });
-            fd.append(name, blob as any, filenameMatch[1]);
+            fd.append(name, blob, filenameMatch[1]);
         } else {
             fd.append(name, engine.decodeString(partBody));
         }

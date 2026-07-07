@@ -5,35 +5,35 @@ import {
     KvKey, KvEntryMaybe, KvSetOptions,
     KvQueueOptions, serializeKey, serializeValue,
     deserializeValue,
+    COMMIT_VERSIONSTAMP_KEY,
     rawKeyToCursor,
+    KV_QUEUE_PREFIX,
+    DEFAULT_QUEUE_BACKOFF,
+    type KvQueueEntry,
+    prepareQueueEntry,
+    generateVersionstamp,
+    resolveCommitVersionstampKey,
+    validateExpireIn,
     validateKey,
-    validateValue
+    validateValue,
+    type RawKey
 } from './types';
 import { KvDatabase } from './db';
 import { createListIterator } from './iterator';
 import { AtomicOperation } from './atomic';
 
-const QUEUE_PREFIX = '__kv_queue__';
-const MAX_QUEUE_DELAY = 30 * 24 * 60 * 60 * 1000; // 30 days
 const { setInterval, clearInterval } = import.meta.use('timers');
 const console = import.meta.use('console');
 
 interface WatchSubscription {
-    keys: KvKey[];
-    rawKeys: Uint8Array[];
+    keys: readonly KvKey[];
+    rawKeys: RawKey[];
     keyIds: string[];
     controller: ReadableStreamDefaultController<KvEntryMaybe<unknown>[]>;
     lastValues: Map<string, { versionstamp: string | null; value: unknown }>;
 }
 
-interface QueueEntry {
-    id: string;
-    data: unknown;
-    retryCount: number;
-    scheduledAt: number;
-    undeliveredKeys?: KvKey[];
-    backoffSchedule?: number[];
-}
+type KvEntryTuple<T extends readonly unknown[]> = { [K in keyof T]: Deno.KvEntryMaybe<T[K]> };
 
 export class Kv implements Deno.Kv {
     private db: KvDatabase;
@@ -96,7 +96,7 @@ export class Kv implements Deno.Kv {
     }
 
     commitVersionstamp(): symbol {
-        return Symbol('commitVersionstamp');
+        return COMMIT_VERSIONSTAMP_KEY;
     }
 
     [Symbol.dispose](): void {
@@ -130,6 +130,9 @@ export class Kv implements Deno.Kv {
         options?: { consistency?: Deno.KvConsistencyLevel }
     ): Promise<{ [K in keyof T]: Deno.KvEntryMaybe<T[K]> }> {
         this.checkClosed();
+        if (keys.length > 10) {
+            throw new TypeError('Too many ranges (max 10)');
+        }
         
         for (const key of keys) {
             validateKey(key);
@@ -154,28 +157,24 @@ export class Kv implements Deno.Kv {
             }
         });
         
-        return results as { [K in keyof T]: Deno.KvEntryMaybe<T[K]> };
+        return results as KvEntryTuple<T>;
     }
 
     set(key: KvKey, value: unknown, options?: KvSetOptions): Promise<{ ok: true; versionstamp: string }> {
         this.checkClosed();
-        validateKey(key);
+        validateKey(key, { allowCommitVersionstamp: true });
         validateValue(value);
         
-        if (options?.expireIn !== undefined) {
-            if (options.expireIn < 0) {
-                throw new TypeError('expireIn must be non-negative');
-            }
-            if (options.expireIn > MAX_QUEUE_DELAY) {
-                throw new TypeError('expireIn cannot exceed 30 days');
-            }
-        }
-        
-        const rawKey = serializeKey(key);
+        validateExpireIn(options?.expireIn);
+
+        const versionstamp = generateVersionstamp();
+        const finalKey = resolveCommitVersionstampKey(key, versionstamp);
+        validateKey(finalKey);
+        const rawKey = serializeKey(finalKey);
         const serializedValue = serializeValue(value);
-        const versionstamp = this.db.set(rawKey, serializedValue, options?.expireIn);
+        this.db.set(rawKey, serializedValue, options?.expireIn, versionstamp);
         
-        this.notifyWatchers(key);
+        this.notifyWatchers(finalKey);
         
         return Promise.resolve({ ok: true, versionstamp });
     }
@@ -201,47 +200,29 @@ export class Kv implements Deno.Kv {
     atomic(): Deno.AtomicOperation {
         this.checkClosed();
         
-        return new AtomicOperation(this.db);
+        return new AtomicOperation(this.db, {
+            notify: (key) => this.notifyWatchers(key),
+            deliverQueue: (entry, rawQueueKey) => this.scheduleQueueDelivery(entry, rawQueueKey),
+        });
     }
 
     enqueue(data: unknown, options?: KvQueueOptions): Promise<Deno.KvCommitResult> {
         this.checkClosed();
         validateValue(data);
         
-        const id = crypto.randomUUID();
-        const delay = Math.min(options?.delay ?? 0, MAX_QUEUE_DELAY);
-        const scheduledAt = Date.now() + delay;
+        const prepared = prepareQueueEntry(data, options);
+        const rawQueueKey = serializeKey(prepared.key);
+        const versionstamp = this.db.set(rawQueueKey, serializeValue(prepared.entry), prepared.delay + 86400000);
         
-        const queueEntry: QueueEntry = {
-            id,
-            data,
-            retryCount: 0,
-            scheduledAt,
-            undeliveredKeys: options?.keysIfUndelivered,
-            backoffSchedule: options?.backoffSchedule ?? [100, 200, 400, 800],
-        };
-        
-        const queueKey: KvKey = [QUEUE_PREFIX, scheduledAt, id];
-        const rawQueueKey = serializeKey(queueKey);
-        const versionstamp = this.db.set(rawQueueKey, serializeValue(queueEntry), delay + 86400000);
-        
-        if (delay === 0) {
-            queueMicrotask(() => {
-                const deliveryKey = `${queueEntry.id}:${queueEntry.retryCount}`;
-                if (this.pendingDeliveries.has(deliveryKey)) return;
-                const promise = this.deliverMessage(queueEntry, rawQueueKey)
-                    .finally(() => {
-                        this.pendingDeliveries.delete(deliveryKey);
-                    });
-                this.pendingDeliveries.set(deliveryKey, promise);
-            });
-        }
+        if (prepared.delay === 0) this.scheduleQueueDelivery(prepared.entry, rawQueueKey);
         
         return Promise.resolve({ ok: true, versionstamp });
     }
 
     listenQueue(handler: (value: unknown) => Promise<void> | void): Promise<void> {
-        this.checkClosed();
+        if (this._closed) {
+            throw new Error('Queue already closed');
+        }
 
         this.queueHandlers.push(handler);
 
@@ -268,20 +249,23 @@ export class Kv implements Deno.Kv {
                 const lastValues = new Map<string, { versionstamp: string | null; value: unknown }>();
                 const rawKeys = keys.map(key => serializeKey(key));
                 const keyIds = rawKeys.map(rawKey => rawKeyToCursor(rawKey));
-                
+
                 subscription = {
-                    keys: keys as KvKey[],
+                    keys,
                     rawKeys,
                     keyIds,
                     controller: controller as ReadableStreamDefaultController<KvEntryMaybe<unknown>[]>,
                     lastValues,
                 };
-                
+
                 self.watchSubscriptions.add(subscription);
                 
                 const initialValues = keys.map((key, index) => {
-                    const rawKey = rawKeys[index]!;
-                    const keyId = keyIds[index]!;
+                    const rawKey = rawKeys[index];
+                    const keyId = keyIds[index];
+                    if (!rawKey || !keyId) {
+                        return { key, value: null, versionstamp: null };
+                    }
                     const entry = self.db.get(rawKey);
                     
                     let value: KvEntryMaybe<unknown>;
@@ -303,10 +287,10 @@ export class Kv implements Deno.Kv {
                     }
                     
                     return value;
-                });
+                }) as KvEntryTuple<T>;
                 
                 try {
-                    controller.enqueue(initialValues as any);
+                    controller.enqueue(initialValues);
                 } catch {
                     // Stream might be cancelled
                 }
@@ -319,7 +303,19 @@ export class Kv implements Deno.Kv {
         });
     }
 
-    private async deliverMessage(entry: QueueEntry, rawQueueKey?: Uint8Array): Promise<void> {
+    private scheduleQueueDelivery(entry: KvQueueEntry, rawQueueKey?: RawKey): void {
+        queueMicrotask(() => {
+            const deliveryKey = `${entry.id}:${entry.retryCount}`;
+            if (this.pendingDeliveries.has(deliveryKey)) return;
+            const promise = this.deliverMessage(entry, rawQueueKey)
+                .finally(() => {
+                    this.pendingDeliveries.delete(deliveryKey);
+                });
+            this.pendingDeliveries.set(deliveryKey, promise);
+        });
+    }
+
+    private async deliverMessage(entry: KvQueueEntry, rawQueueKey?: RawKey): Promise<void> {
         if (this._closed || this.queueHandlers.length === 0) return;
         
         for (const handler of this.queueHandlers) {
@@ -331,30 +327,31 @@ export class Kv implements Deno.Kv {
                 return;
             } catch (err) {
                 console.error('Queue handler error:', err);
-                if (entry.undeliveredKeys && entry.undeliveredKeys.length > 0) {
-                    const backoffSchedule = entry.backoffSchedule ?? [100, 200, 400, 800];
-                    const nextRetry = entry.retryCount + 1;
+                const backoffSchedule = entry.backoffSchedule ?? DEFAULT_QUEUE_BACKOFF;
+                const nextRetry = entry.retryCount + 1;
+
+                if (nextRetry <= backoffSchedule.length) {
+                    const delay = backoffSchedule[nextRetry - 1] ?? DEFAULT_QUEUE_BACKOFF[0];
+                    if (delay === undefined) return;
+                    const newEntry: KvQueueEntry = {
+                        ...entry,
+                        retryCount: nextRetry,
+                        scheduledAt: Date.now() + delay,
+                    };
                     
-                    if (nextRetry <= backoffSchedule.length) {
-                        const delay = backoffSchedule[nextRetry - 1];
-                        const newEntry: QueueEntry = {
-                            ...entry,
-                            retryCount: nextRetry,
-                            scheduledAt: Date.now() + delay,
-                        };
-                        
-                        const queueKey: KvKey = [QUEUE_PREFIX, newEntry.scheduledAt, entry.id];
-                        this.db.set(serializeKey(queueKey), serializeValue(newEntry), delay + 86400000);
-                    } else {
-                        for (const key of entry.undeliveredKeys) {
-                            try {
-                                await this.set(key, { undelivered: entry.data, id: entry.id });
-                            } catch {
-                                // Ignore
-                            }
+                    const queueKey: KvKey = [KV_QUEUE_PREFIX, newEntry.scheduledAt, entry.id];
+                    this.db.set(serializeKey(queueKey), serializeValue(newEntry), delay + 86400000);
+                } else if (entry.undeliveredKeys && entry.undeliveredKeys.length > 0) {
+                    for (const key of entry.undeliveredKeys) {
+                        try {
+                            await this.set(key, entry.data);
+                        } catch {
+                            // Ignore
                         }
                     }
                 }
+                if (rawQueueKey) this.db.delete(rawQueueKey);
+                return;
             }
         }
     }
@@ -363,10 +360,10 @@ export class Kv implements Deno.Kv {
         if (this._closed) return;
         
         const now = Date.now();
-        const prefix: KvKey = [QUEUE_PREFIX];
-        const endPrefix: KvKey = [QUEUE_PREFIX, now + 1];
+        const prefix: KvKey = [KV_QUEUE_PREFIX];
+        const endPrefix: KvKey = [KV_QUEUE_PREFIX, now + 1];
         
-        const iterator = createListIterator<QueueEntry>(this.db, {
+        const iterator = createListIterator<KvQueueEntry>(this.db, {
             prefix,
             end: endPrefix,
         });
@@ -377,12 +374,12 @@ export class Kv implements Deno.Kv {
                 if (queueEntry.scheduledAt <= now) {
                     const deliveryKey = `${queueEntry.id}:${queueEntry.retryCount}`;
                     if (!this.pendingDeliveries.has(deliveryKey)) {
-                        const promise = this.deliverMessage(queueEntry)
+                        const rawQueueKey = serializeKey(entry.key as KvKey);
+                        const promise = this.deliverMessage(queueEntry, rawQueueKey)
                             .finally(() => {
                                 this.pendingDeliveries.delete(deliveryKey);
                             });
                         this.pendingDeliveries.set(deliveryKey, promise);
-                        
                         this.db.delete(serializeKey(entry.key as KvKey));
                     }
                 }
@@ -409,8 +406,11 @@ export class Kv implements Deno.Kv {
                 }
                 
                 const values = sub.keys.map((key, index) => {
-                    const rawKey = index === keyIndex ? rawChangedKey : sub.rawKeys[index]!;
-                    const keyId = sub.keyIds[index]!;
+                    const rawKey = index === keyIndex ? rawChangedKey : sub.rawKeys[index];
+                    const keyId = sub.keyIds[index];
+                    if (!rawKey || !keyId) {
+                        return { key, value: null, versionstamp: null };
+                    }
                     const e = index === keyIndex ? changedEntry : null;
                     
                     if (e) {

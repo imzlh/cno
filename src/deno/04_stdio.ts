@@ -3,10 +3,22 @@
 
 import { stdin, stdout, stderr } from "../utils/stdio";
 
+const os = import.meta.use('os');
+
 export type { Stream } from "../utils/stdio";
 
-Object.assign(Deno, {
+type DenoStdioNamespace = {
+    stdin: typeof Deno.stdin & { rid: number };
+    stdout: typeof Deno.stdout & { rid: number };
+    stderr: typeof Deno.stderr & { rid: number };
+    consoleSize(): { rows: number; columns: number };
+    isatty(fd: number): boolean;
+};
+
+const denoStdioNs: DenoStdioNamespace = {
     stdin: {
+        rid: os.STDIN_FILENO,
+
         close(){
             stdin.close();
         },
@@ -15,11 +27,11 @@ Object.assign(Deno, {
             return stdin.isTTY;
         },
 
-        read(p) {
-            return stdin.read(p as Uint8Array<ArrayBuffer>);
+        read(p: Uint8Array<ArrayBuffer>) {
+            return stdin.read(p);
         },
 
-        readSync(p) {
+        readSync(p: Uint8Array) {
             return stdin.readSync(p);
         },
 
@@ -27,12 +39,14 @@ Object.assign(Deno, {
             return stdin.createReadStream();
         },
 
-        setRaw(mode, options) {
+        setRaw(mode: boolean, options?: Deno.SetRawOptions) {
             stdin.setRaw(mode);
         },
     },
 
     stdout: {
+        rid: os.STDOUT_FILENO,
+
         close() {
             stdout.close();
         },
@@ -41,11 +55,11 @@ Object.assign(Deno, {
             return stdout.isTTY;
         },
 
-        write(data) {
+        write(data: Uint8Array) {
             return stdout.write(data);
         },
 
-        writeSync(data) {
+        writeSync(data: Uint8Array) {
             return stdout.writeSync(data);
         },
 
@@ -54,15 +68,17 @@ Object.assign(Deno, {
         }
     },
     stderr: {
+        rid: os.STDERR_FILENO,
+
         close() {
             return stderr.close();
         },
 
-        write(p) {
+        write(p: Uint8Array) {
             return stderr.write(p);
         },
 
-        writeSync(p) {
+        writeSync(p: Uint8Array) {
             return stderr.writeSync(p);
         },
 
@@ -81,7 +97,16 @@ Object.assign(Deno, {
             rows: sz.height,
             columns: sz.width
         };
+    },
+
+    isatty(fd: number) {
+        if (fd === os.STDIN_FILENO) return stdin.isTTY;
+        if (fd === os.STDOUT_FILENO) return stdout.isTTY;
+        if (fd === os.STDERR_FILENO) return stderr.isTTY;
+        return false;
     }
-} as Partial<typeof Deno>);
+};
+
+Object.assign(Deno, denoStdioNs);
 
 export { stdin, stdout, stderr };

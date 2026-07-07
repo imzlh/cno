@@ -1,14 +1,44 @@
-import { Headers } from "headers-polyfill";
+import { Headers } from "../headers";
 import { type NetworkCallFrame } from "../../utils/network-hooks";
-import { BOUNDARY_RE, Decoder, ensureFormDataContentType, engine, isReadableStreamLike, mergeChunks, parseMultipart, parseUrlEncoded, serializeBody, serializeFormData } from "./helpers";
+import { bytesToArrayBuffer } from "../../utils/bytes";
+import { BOUNDARY_RE, Decoder, ensureFormDataContentType, isBodyIterable, isReadableStreamLike, iterableBodyToStream, mergeChunks, parseMultipart, parseUrlEncoded, serializeBody, serializeFormData } from "./helpers";
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
+type RequestBodySource = BodyInit | ReadableStream<Uint8Array> | Uint8Array | null;
+
+const METHOD_SEPARATORS = '()<>@,;:\\"/[]?={}';
+const FORBIDDEN_METHODS = new Set(['CONNECT', 'TRACE', 'TRACK']);
+const NORMALIZED_METHODS = new Set(['DELETE', 'GET', 'HEAD', 'OPTIONS', 'POST', 'PUT']);
+
+function isMethodTokenCode(code: number): boolean {
+    return code > 0x20 && code < 0x7f && METHOD_SEPARATORS.indexOf(String.fromCharCode(code)) === -1;
+}
+
+function normalizeRequestMethod(value: unknown): string {
+    const method = String(value);
+    if (method.length === 0) throw new TypeError(`'${method}' is not a valid HTTP method`);
+    for (let i = 0; i < method.length; i++) {
+        if (!isMethodTokenCode(method.charCodeAt(i))) {
+            throw new TypeError(`'${method}' is not a valid HTTP method`);
+        }
+    }
+
+    const upper = method.toUpperCase();
+    if (FORBIDDEN_METHODS.has(upper)) throw new TypeError(`'${method}' HTTP method is unsupported.`);
+    return NORMALIZED_METHODS.has(upper) ? upper : method;
+}
+
+function requestInitMethod(init: RequestInit | undefined, fallback: string): string {
+    return init && 'method' in init && init.method !== undefined
+        ? normalizeRequestMethod(init.method)
+        : fallback;
+}
 
 export class Request implements globalThis.Request {
     public readonly url: string;
     public readonly method: string;
     public readonly headers: Headers;
-    public readonly body: ReadableStream | null;
+    public readonly body: ReadableStream<Uint8Array> | null;
     public bodyUsed: boolean = false;
     public readonly cache: RequestCache;
     public readonly credentials: RequestCredentials;
@@ -23,7 +53,7 @@ export class Request implements globalThis.Request {
     public readonly isHistoryNavigation = false;
     public readonly isReloadNavigation = false;
     public readonly duplex: 'half' = 'half';
-    private _bodySource: any = null;
+    private _bodySource: RequestBodySource = null;
     private _bodyBuffer: Uint8Array | null = null;
     private _initiatorCallFrames?: NetworkCallFrame[];
     private _formDataBoundary?: string;
@@ -31,29 +61,46 @@ export class Request implements globalThis.Request {
     constructor(input: URL | string | Request, init?: RequestInit) {
         if (input instanceof URL) {
             this.url = input.href;
-            this.method = init?.method?.toUpperCase() || 'GET';
+            this.method = requestInitMethod(init, 'GET');
             this.headers = new Headers(init?.headers);
         } else if (typeof input === 'string') {
             this.url = input;
-            this.method = init?.method?.toUpperCase() || 'GET';
+            this.method = requestInitMethod(init, 'GET');
             this.headers = new Headers(init?.headers);
         } else if (input instanceof Request) {
             this.url = input.url;
-            this.method = init?.method?.toUpperCase() || input.method;
+            this.method = requestInitMethod(init, input.method);
             // init.headers fully replaces input.headers per spec
             this.headers = init?.headers !== undefined ? new Headers(init.headers) : new Headers(input.headers);
             if (!init?.body && input.body && !input.bodyUsed) {
-                this._bodySource = input._bodySource;
-                this._bodyBuffer = input._bodyBuffer;
+                if (input._bodyBuffer) {
+                    this._bodyBuffer = input._bodyBuffer;
+                    this._bodySource = input._bodyBuffer;
+                } else {
+                    const [original, clone] = input.body.tee();
+                    const trackedOriginal = input.trackBodyStream(original);
+                    Object.defineProperty(input, 'body', { value: trackedOriginal, writable: false, configurable: true });
+                    input._bodySource = trackedOriginal;
+                    this._bodySource = clone;
+                }
             }
-        } else throw new TypeError('Invalid input:' + input);
+        } else {
+            this.url = String(input);
+            this.method = requestInitMethod(init, 'GET');
+            this.headers = new Headers(init?.headers);
+        }
         if (init?.body !== undefined && init?.body !== null) this._bodySource = init.body;
         const base = input instanceof Request ? input : undefined;
-        this.cache = init?.cache || base?.cache || 'default'; this.credentials = init?.credentials || base?.credentials || 'same-origin';
-        this.destination = '' as RequestDestination; this.integrity = init?.integrity || base?.integrity || '';
-        this.keepalive = init?.keepalive ?? base?.keepalive ?? false; this.mode = init?.mode || base?.mode || 'cors';
-        this.redirect = init?.redirect || base?.redirect || 'follow'; this.referrer = init?.referrer || base?.referrer || 'about:client';
-        this.referrerPolicy = init?.referrerPolicy || base?.referrerPolicy || ''; this.signal = init?.signal ?? base?.signal ?? new AbortController().signal;
+        this.cache = init?.cache || base?.cache || 'default';
+        this.credentials = init?.credentials || base?.credentials || 'same-origin';
+        this.destination = '' as RequestDestination;
+        this.integrity = init?.integrity || base?.integrity || '';
+        this.keepalive = init?.keepalive ?? base?.keepalive ?? false;
+        this.mode = init?.mode || base?.mode || 'cors';
+        this.redirect = init?.redirect || base?.redirect || 'follow';
+        this.referrer = init?.referrer || base?.referrer || 'about:client';
+        this.referrerPolicy = init?.referrerPolicy || base?.referrerPolicy || '';
+        this.signal = init?.signal ?? base?.signal ?? new AbortController().signal;
         if (this._bodyBuffer == null) {
             const directBody = serializeBody(this._bodySource);
             if (directBody !== null) this._bodyBuffer = directBody;
@@ -61,23 +108,97 @@ export class Request implements globalThis.Request {
         if (this._bodySource instanceof FormData) {
             this._formDataBoundary = ensureFormDataContentType(this.headers);
         }
-        this.body = this._bodySource ? this.createBodyStream() : null;
+        this.body = this._bodySource ? this.trackBodyStream(this.createBodyStream()) : null;
         if (['GET', 'HEAD'].includes(this.method) && this.body) throw new TypeError(`Request with ${this.method} method cannot have body`);
     }
 
     private createBodyStream(): ReadableStream<Uint8Array> {
         const s = this._bodySource;
-        if (isReadableStreamLike(s)) return s as ReadableStream<Uint8Array>;
+        if (isReadableStreamLike(s)) return s;
         const data = this._bodyBuffer ?? serializeBody(s);
-        if (data !== null) { const cap = data; return new ReadableStream({ start(c: any) { c.enqueue(cap); c.close(); } }); }
-        if (s instanceof Blob) return new ReadableStream({ pull: async (c: any) => { c.enqueue(new Uint8Array(await s.arrayBuffer())); c.close(); } });
-        if (s instanceof FormData) return new ReadableStream({ start: async (c: any) => { const buf = await serializeFormData(s, this._formDataBoundary); c.enqueue(buf); c.close(); } });
-        return new ReadableStream({ start(c: any) { c.close(); } });
+        if (data !== null) {
+            const cap = data;
+            return new ReadableStream({
+                start(c: ReadableStreamDefaultController<Uint8Array>) {
+                    c.enqueue(cap);
+                    c.close();
+                },
+            });
+        }
+        if (s instanceof Blob) {
+            return new ReadableStream({
+                pull: async (c: ReadableStreamDefaultController<Uint8Array>) => {
+                    c.enqueue(new Uint8Array(await s.arrayBuffer()));
+                    c.close();
+                },
+            });
+        }
+        if (s instanceof FormData) {
+            return new ReadableStream({
+                start: async (c: ReadableStreamDefaultController<Uint8Array>) => {
+                    const buf = await serializeFormData(s, this._formDataBoundary);
+                    c.enqueue(buf);
+                    c.close();
+                },
+            });
+        }
+        if (isBodyIterable(s)) return iterableBodyToStream(s);
+        return new ReadableStream({
+            start(c: ReadableStreamDefaultController<Uint8Array>) {
+                c.close();
+            },
+        });
+    }
+
+    private trackBodyStream(stream: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
+        const markUsed = () => { this.bodyUsed = true; };
+        const getReader = stream.getReader.bind(stream);
+        stream.getReader = ((options?: ReadableStreamGetReaderOptions) => {
+            const reader = getReader(options) as ReadableStreamDefaultReader<Uint8Array>;
+            const read = reader.read.bind(reader);
+            const cancel = reader.cancel.bind(reader);
+            reader.read = () => {
+                markUsed();
+                return read();
+            };
+            reader.cancel = (reason?: unknown) => {
+                markUsed();
+                return cancel(reason);
+            };
+            return reader;
+        }) as typeof stream.getReader;
+        const cancel = stream.cancel.bind(stream);
+        stream.cancel = (reason?: unknown) => {
+            markUsed();
+            return cancel(reason);
+        };
+        return stream;
     }
 
     clone(): Request {
         if (this.bodyUsed) throw new TypeError('Already read');
-        const cloned = new Request(this.url, { method: this.method, headers: this.headers, body: this._bodySource, cache: this.cache, credentials: this.credentials, integrity: this.integrity, keepalive: this.keepalive, mode: this.mode, redirect: this.redirect, referrer: this.referrer, referrerPolicy: this.referrerPolicy, signal: this.signal });
+        let clonedBody: RequestBodySource = this._bodyBuffer ?? this._bodySource;
+        if (this.body && !this._bodyBuffer) {
+            const [original, clone] = this.body.tee();
+            const trackedOriginal = this.trackBodyStream(original);
+            Object.defineProperty(this, 'body', { value: trackedOriginal, writable: false, configurable: true });
+            this._bodySource = trackedOriginal;
+            clonedBody = clone;
+        }
+        const cloned = new Request(this.url, {
+            method: this.method,
+            headers: this.headers,
+            body: clonedBody,
+            cache: this.cache,
+            credentials: this.credentials,
+            integrity: this.integrity,
+            keepalive: this.keepalive,
+            mode: this.mode,
+            redirect: this.redirect,
+            referrer: this.referrer,
+            referrerPolicy: this.referrerPolicy,
+            signal: this.signal,
+        });
         cloned._initiatorCallFrames = this._initiatorCallFrames;
         return cloned;
     }
@@ -101,14 +222,30 @@ export class Request implements globalThis.Request {
         if (!this.body) return null;
         const chunks: Uint8Array[] = [];
         const reader = this.body.getReader();
-        try { while (true) { const { done, value } = await reader.read(); if (done) break; chunks.push(value); } }
-        finally { reader.releaseLock(); }
+        try {
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                chunks.push(value);
+            }
+        } finally {
+            reader.releaseLock();
+        }
         this._bodyBuffer = mergeChunks(chunks);
         return this._bodyBuffer;
     }
 
-    async arrayBuffer(): Promise<ArrayBuffer> { const b = await this.getBodyBuffer(); if (!b) return new ArrayBuffer(0); return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength); }
-    async bytes(): Promise<Uint8Array> { const b = await this.getBodyBuffer(); if (!b) return new Uint8Array(0); return b; }
+    async arrayBuffer(): Promise<ArrayBuffer> {
+        const b = await this.getBodyBuffer();
+        if (!b) return new ArrayBuffer(0);
+        return bytesToArrayBuffer(b);
+    }
+
+    async bytes(): Promise<Uint8Array> {
+        const b = await this.getBodyBuffer();
+        if (!b) return new Uint8Array(0);
+        return b;
+    }
     async blob(): Promise<Blob> { return new Blob([await this.arrayBuffer()], { type: this.headers.get('content-type') || 'application/octet-stream' }); }
     async formData(): Promise<FormData> {
         if (this._bodySource instanceof FormData) return this._bodySource;
@@ -117,12 +254,13 @@ export class Request implements globalThis.Request {
         const ct = this.headers.get('content-type') ?? '';
         if (ct.includes('multipart/form-data')) {
             const m = BOUNDARY_RE.exec(ct);
-            if (!m) throw new TypeError('Missing multipart boundary');
-            return parseMultipart(buf, m[1]!);
+            const boundary = m?.[1];
+            if (!boundary) throw new TypeError('Missing multipart boundary');
+            return parseMultipart(buf, boundary);
         }
         if (ct.includes('application/x-www-form-urlencoded')) return parseUrlEncoded(buf);
         throw new TypeError(`Unsupported content type for formData(): ${ct}`);
     }
     async text(): Promise<string> { return new Decoder().decode(new Uint8Array(await this.arrayBuffer())); }
-    async json<T = any>(): Promise<T> { return JSON.parse(await this.text()); }
+    async json<T = unknown>(): Promise<T> { return JSON.parse(await this.text()); }
 }

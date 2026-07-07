@@ -317,12 +317,14 @@ export type FetchInterceptHook = {
     onRequest?(info: FetchInterceptInfo): Promise<InterceptResult | null>;
 };
 
+const fetchInterceptHookSymbol = Symbol.for('cno.fetchInterceptHook');
 let fetchInterceptHook: FetchInterceptHook | null = null;
 
 export function setFetchInterceptHook(hook: FetchInterceptHook | null): void {
     fetchInterceptHook = hook;
+    Reflect.set(globalThis, fetchInterceptHookSymbol, hook);
 }
 
 export function getFetchInterceptHook(): FetchInterceptHook | null {
-    return fetchInterceptHook;
+    return (Reflect.get(globalThis, fetchInterceptHookSymbol) as FetchInterceptHook | null | undefined) ?? fetchInterceptHook;
 }

@@ -33,16 +33,31 @@ const SUBCOMMAND_SET = new Set<string>(SUBCOMMANDS);
 export function parseArgs(argv: string[], binary: string): Args {
     const out: Args = { binary, internalArgs: [], actionArgs: [], entry: 'repl', args: [] };
     let i = 0;
-    while (i < argv.length && argv[i][0] === '-') out.internalArgs.push(argv[i++]);
-    if (i < argv.length) {
-        if (SUBCOMMAND_SET.has(argv[i])) {
-            out.action = argv[i++];
-            while (i < argv.length && argv[i][0] === '-') out.actionArgs.push(argv[i++]);
+    for (let arg = argv[i]; arg !== undefined && arg[0] === '-'; arg = argv[i]) {
+        out.internalArgs.push(arg);
+        i++;
+    }
+    const action = argv[i];
+    if (action !== undefined) {
+        if (SUBCOMMAND_SET.has(action)) {
+            out.action = action;
+            i++;
+            for (let arg = argv[i]; arg !== undefined && arg[0] === '-'; arg = argv[i]) {
+                out.actionArgs.push(arg);
+                i++;
+            }
         } else {
             out.action = 'run';
         }
-        if (i < argv.length) out.entry = argv[i++];
-        while (i < argv.length) out.args.push(argv[i++]);
+        const entry = argv[i];
+        if (entry !== undefined) {
+            out.entry = entry;
+            i++;
+        }
+        for (let arg = argv[i]; arg !== undefined; arg = argv[i]) {
+            out.args.push(arg);
+            i++;
+        }
     }
     return out;
 }
@@ -53,6 +68,8 @@ let args: Args = parseArgs(os.args.slice(1), os.args[0]);
 
 export default function setArgs(usrargs: Args) {
     args = usrargs;
+    const refresh = Reflect.get(os, '__cno_process_args_refresh');
+    if (typeof refresh === 'function') refresh();
 }
 
 export function getArgs(): Args {
@@ -67,9 +84,9 @@ export function buildDenoArgs(): string[] {
     return [...args.args];
 }
 
-/** Runtime process.argv — [entry, ...scriptArgs]. execPath is exposed separately. */
+/** Node process.argv — [execPath, entry, ...scriptArgs]. */
 export function buildNodeArgv(): string[] {
-    return [args.entry, ...args.args];
+    return [args.binary, args.entry, ...args.args];
 }
 
 /** Node process.argv0 — the name cno was invoked as. */

@@ -3,13 +3,12 @@
  */
 
 
-import type { Dirent } from 'fs';
-import { wrapPromise } from '../_internal/errno';
+import { normalizeErrnoError, wrapPromise } from '../_internal/errno';
 import { getTierLimits } from '../_internal/memory';
 import path from '../path';
-import { createAsyncDir, createFileHandle, decodeBuffer, mkdirRecursive, modeToNumber, parseFlags, pathToString, randomHex, readFileFromFdSync, removeRecursive, splitPathOrFd, timeToNumber, toNodeDirentAsync, toNodeStat, toUint8Array, type Mode, type PathLike, type TimeLike } from './utils';
+import { createAsyncDir, createFileHandle, decodeBuffer, encodePathResult, mkdirRecursive, modeToNumber, parseFlags, pathToString, randomHex, readDirEntries, readFileFromFdSync, removeRecursive, splitPathOrFd, timeToNumber, toNodeDirentAsync, toNodeStat, toNodeStatFs, toUint8Array, validateOpendirOptions, assertCopyFileMode, makeAbortError, type Mode, type PathLike, type TimeLike } from './utils';
 
-const { join } = path;
+const { dirname, join } = path;
 const { readBufSize: READ_BUF_SIZE } = getTierLimits();
 
 const asfs = import.meta.use('asyncfs');
@@ -17,26 +16,73 @@ const fs = import.meta.use('fs');
 const os = import.meta.use('os');
 
 // Helper: wrap asyncfs calls, auto-convert errno to ErrnoException
-function w<T>(promise: Promise<T>, syscall: string, path: string): Promise<T> {
-    return wrapPromise(promise, syscall, path);
+function w<T>(promise: Promise<T>, syscall: string, path: string, dest?: string): Promise<T> {
+    return wrapPromise(promise, syscall, path, dest);
 }
 
 // File read/write
 
-export async function readFile(path: PathLike | number, options?: { encoding?: BufferEncoding | null; flag?: string | number } | BufferEncoding): Promise<string | Uint8Array> {
-    const target = splitPathOrFd(path as PathLike | number);
+export async function readFile(path: PathLike | number, options?: { encoding?: BufferEncoding | null; flag?: string | number; signal?: AbortSignal } | BufferEncoding): Promise<string | Uint8Array> {
+    const target = splitPathOrFd(path);
     const encoding = typeof options === 'string' ? options : options?.encoding;
+    const flag = typeof options === 'object' ? options?.flag : undefined;
+    const signal = typeof options === 'object' ? options?.signal : undefined;
+    if (signal?.aborted) throw makeAbortError(signal);
     const buffer = 'fd' in target
         ? readFileFromFdSync(fs.read, target.fd, READ_BUF_SIZE)
-        : await w(asfs.readFile(target.path), 'readFile', target.path);
+        : flag === undefined
+            ? await withAbort(w(asfs.readFile(target.path), 'readFile', target.path), signal)
+            : await withAbort(readFileWithFlag(target.path, flag), signal);
+    if (signal?.aborted) throw makeAbortError(signal);
     return decodeBuffer(buffer, encoding);
 }
 
+async function withAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+    if (!signal) return promise;
+    if (signal.aborted) throw makeAbortError(signal);
+    return await new Promise<T>((resolve, reject) => {
+        const onAbort = () => {
+            cleanup();
+            reject(makeAbortError(signal));
+        };
+        const cleanup = () => signal.removeEventListener('abort', onAbort);
+        signal.addEventListener('abort', onAbort, { once: true });
+        promise.then(
+            value => {
+                cleanup();
+                resolve(value);
+            },
+            err => {
+                cleanup();
+                reject(err);
+            },
+        );
+    });
+}
+
+async function readFileWithFlag(path: string, flag: string | number): Promise<Uint8Array<ArrayBuffer>> {
+    const handle = await w(asfs.open(path, parseFlags(flag)), 'readFile', path);
+    try {
+        const st = await handle.stat();
+        const buf = new Uint8Array(st.size);
+        let off = 0;
+        while (off < st.size) {
+            const n = await handle.read(buf.subarray(off));
+            if (n === 0) break;
+            off += n;
+        }
+        return buf;
+    } finally {
+        await handle.close();
+    }
+}
+
 export async function writeFile(path: PathLike | number, data: string | Uint8Array | ArrayBuffer, options?: { encoding?: BufferEncoding | null; mode?: Mode; flag?: string | number } | BufferEncoding | number): Promise<void> {
-    const target = splitPathOrFd(path as PathLike | number);
+    const target = splitPathOrFd(path);
     const mode = typeof options === 'object' ? modeToNumber(options?.mode) : typeof options === 'number' ? options : undefined;
-    const flag = typeof options === 'object' ? parseFlags(options?.flag) : 'w';
-    const buffer = toUint8Array(data);
+    const flag = typeof options === 'object' && options?.flag !== undefined ? parseFlags(options.flag) : 'w';
+    const encoding = typeof options === 'string' ? options : typeof options === 'object' ? options?.encoding : undefined;
+    const buffer = toUint8Array(data, encoding);
     if ('fd' in target) {
         fs.ftruncate(target.fd, 0);
         fs.write(target.fd, buffer);
@@ -52,15 +98,17 @@ export async function writeFile(path: PathLike | number, data: string | Uint8Arr
 }
 
 export async function appendFile(path: PathLike | number, data: string | Uint8Array | ArrayBuffer, options?: { encoding?: BufferEncoding | null; mode?: Mode; flag?: string | number } | BufferEncoding | number): Promise<void> {
-    const target = splitPathOrFd(path as PathLike | number);
+    const target = splitPathOrFd(path);
     const mode = typeof options === 'object' ? modeToNumber(options?.mode) : typeof options === 'number' ? options : undefined;
-    const buffer = toUint8Array(data);
+    const flag = typeof options === 'object' && options?.flag !== undefined ? parseFlags(options.flag) : 'a';
+    const encoding = typeof options === 'string' ? options : typeof options === 'object' ? options?.encoding : undefined;
+    const buffer = toUint8Array(data, encoding);
     if ('fd' in target) {
         fs.write(target.fd, buffer);
         return;
     }
 
-    const handle = await w(asfs.open(target.path, 'a', mode), 'appendFile', target.path);
+    const handle = await w(asfs.open(target.path, flag, mode), 'appendFile', target.path);
     try {
         await handle.write(buffer);
     } finally {
@@ -75,16 +123,16 @@ export async function access(path: PathLike): Promise<void> {
     await w(asfs.stat(pathStr), 'stat', pathStr);
 }
 
-export async function stat(path: PathLike): Promise<import('fs').Stats> {
+export async function stat(path: PathLike, options?: { bigint?: boolean }): Promise<import('fs').Stats> {
     const pathStr = pathToString(path);
     const st = await w(asfs.stat(pathStr), 'stat', pathStr);
-    return toNodeStat(st);
+    return toNodeStat(st, options);
 }
 
-export async function lstat(path: PathLike): Promise<import('fs').Stats> {
+export async function lstat(path: PathLike, options?: { bigint?: boolean }): Promise<import('fs').Stats> {
     const pathStr = pathToString(path);
     const st = await w(asfs.lstat(pathStr), 'lstat', pathStr);
-    return toNodeStat(st);
+    return toNodeStat(st, options);
 }
 
 // Directory operations
@@ -135,32 +183,24 @@ export async function rm(path: PathLike, options?: { force?: boolean; recursive?
     }
 }
 
-export async function readdir(path: PathLike, options?: { encoding?: BufferEncoding | 'buffer'; withFileTypes?: boolean; recursive?: boolean } | BufferEncoding): Promise<string[] | import('fs').Dirent[]> {
+export async function readdir(path: PathLike, options?: { encoding?: BufferEncoding | 'buffer'; withFileTypes?: boolean; recursive?: boolean } | BufferEncoding): Promise<Array<string | Buffer> | import('fs').Dirent[]> {
     const pathStr = pathToString(path);
     const withFileTypes = typeof options === 'object' ? options?.withFileTypes : false;
-
-    const dirHandle = await w(asfs.readDir(pathStr), 'readdir', pathStr);
+    const recursive = typeof options === 'object' ? options?.recursive === true : false;
 
     try {
+        const entries = await readDirEntries(pathStr, recursive);
         if (withFileTypes) {
-            const entries: Dirent[] = [];
-            for await (const entry of dirHandle) {
-                entries.push(toNodeDirentAsync(entry));
-            }
-            return entries;
-        } else {
-            const names: string[] = [];
-            for await (const entry of dirHandle) {
-                names.push(entry.name);
-            }
-            return names;
+            return entries.map(entry => toNodeDirentAsync(entry));
         }
-    } finally {
-        await dirHandle.close();
+        return entries.map(entry => encodePathResult(entry.name, options));
+    } catch (err) {
+        throw normalizeErrnoError(err, 'readdir', pathStr);
     }
 }
 
-export async function opendir(path: PathLike): Promise<import('fs').Dir> {
+export async function opendir(path: PathLike, options?: { encoding?: BufferEncoding; bufferSize?: number }): Promise<import('fs').Dir> {
+    validateOpendirOptions(options);
     const pathStr = pathToString(path);
     const dirHandle = await w(asfs.readDir(pathStr), 'readdir', pathStr);
     return createAsyncDir(pathStr, dirHandle);
@@ -175,12 +215,15 @@ export async function unlink(path: PathLike): Promise<void> {
 
 export async function rename(oldPath: PathLike, newPath: PathLike): Promise<void> {
     const oldStr = pathToString(oldPath);
-    await w(asfs.rename(oldStr, pathToString(newPath)), 'rename', oldStr);
+    const newStr = pathToString(newPath);
+    await w(asfs.rename(oldStr, newStr), 'rename', oldStr, newStr);
 }
 
-export async function copyFile(src: PathLike, dest: PathLike): Promise<void> {
+export async function copyFile(src: PathLike, dest: PathLike, mode?: number): Promise<void> {
     const srcStr = pathToString(src);
-    await w(asfs.copyFile(srcStr, pathToString(dest)), 'copyFile', srcStr);
+    const destStr = pathToString(dest);
+    assertCopyFileMode(srcStr, destStr, mode);
+    await w(asfs.copyFile(srcStr, destStr), 'copyFile', srcStr, destStr);
 }
 
 export async function truncate(path: PathLike, len?: number): Promise<void> {
@@ -203,7 +246,7 @@ export async function link(existingPath: PathLike, newPath: PathLike): Promise<v
 export async function symlink(target: PathLike, path: PathLike, type?: 'file' | 'dir' | 'junction'): Promise<void> {
     // Windows: DIR=1, JUNCTION=2, FILE=0 (no flags). SymlinkType enum lacks FILE,
     // so we use 0 for file symlinks which is the correct Windows API value.
-    const symlinkType = type === 'dir' ? asfs.SymlinkType.DIR : type === 'junction' ? asfs.SymlinkType.JUNCTION : 0 as any;
+    const symlinkType: CModuleAsyncFS.SymlinkType = type === 'dir' ? asfs.SymlinkType.DIR : type === 'junction' ? asfs.SymlinkType.JUNCTION : 0;
     const pathStr = pathToString(path);
     await w(asfs.symlink(pathToString(target), pathStr, symlinkType), 'symlink', pathStr);
 }
@@ -232,7 +275,7 @@ Reflect.set(realpath, 'native', function (path: PathLike) {
 
 export async function chmod(path: PathLike, mode: Mode): Promise<void> {
     const pathStr = pathToString(path);
-    await w(asfs.chmod(pathStr, modeToNumber(mode)!), 'chmod', pathStr);
+    await w(asfs.chmod(pathStr, modeToNumber(mode)), 'chmod', pathStr);
 }
 
 export async function chown(path: PathLike, uid: number, gid: number): Promise<void> {
@@ -249,28 +292,20 @@ export async function lchown(path: PathLike, uid: number, gid: number): Promise<
 
 export async function utimes(path: PathLike, atime: TimeLike, mtime: TimeLike): Promise<void> {
     const pathStr = pathToString(path);
-    await w(asfs.utime(pathStr, timeToNumber(atime) / 1000, timeToNumber(mtime) / 1000), 'utimes', pathStr);
+    await w(asfs.utime(pathStr, timeToNumber(atime), timeToNumber(mtime)), 'utimes', pathStr);
 }
 
 export async function lutimes(path: PathLike, atime: TimeLike, mtime: TimeLike): Promise<void> {
     const pathStr = pathToString(path);
-    await w(asfs.lutime(pathStr, timeToNumber(atime) / 1000, timeToNumber(mtime) / 1000), 'lutimes', pathStr);
+    await w(asfs.lutime(pathStr, timeToNumber(atime), timeToNumber(mtime)), 'lutimes', pathStr);
 }
 
 // statfs
 
-export async function statfs(path: PathLike): Promise<import('fs').StatsFs> {
+export async function statfs(path: PathLike, options?: { bigint?: boolean }): Promise<import('fs').StatsFs> {
     const pathStr = pathToString(path);
     const result = await w(asfs.statFs(pathStr), 'statfs', pathStr);
-    return {
-        type: result.type,
-        bsize: result.bsize,
-        blocks: result.blocks,
-        bfree: result.bfree,
-        bavail: result.bavail,
-        files: result.files,
-        ffree: result.ffree,
-    };
+    return toNodeStatFs(result, options);
 }
 
 // Open file
@@ -290,16 +325,19 @@ export async function lchmod(path: PathLike, mode: Mode): Promise<void> {
     await chmod(path, mode);
 }
 
-export async function mkdtemp(prefix: string, options?: { encoding?: BufferEncoding | null } | BufferEncoding): Promise<string> {
+export async function mkdtemp(prefix: string, options?: { encoding?: BufferEncoding | 'buffer' | null } | BufferEncoding): Promise<string | Buffer> {
     const dirPath = prefix + randomHex();
+    const result = encodePathResult(dirPath, options);
     await w(asfs.mkdir(dirPath), 'mkdir', dirPath);
-    return dirPath;
+    return result;
 }
 
-export async function mkdtempDisposable(prefix: string, options?: { encoding?: BufferEncoding | null } | BufferEncoding): Promise<{ path: string; cleanup: () => Promise<void> }> {
-    const dirPath = await mkdtemp(prefix, options);
+export async function mkdtempDisposable(prefix: string, options?: { encoding?: BufferEncoding | 'buffer' | null } | BufferEncoding): Promise<{ path: string | Buffer; cleanup: () => Promise<void> }> {
+    const dirPath = prefix + randomHex();
+    const result = encodePathResult(dirPath, options);
+    await w(asfs.mkdir(dirPath), 'mkdir', dirPath);
     return {
-        path: dirPath,
+        path: result,
         async cleanup() {
             await removeRecursive(dirPath);
         },
@@ -341,9 +379,9 @@ export function watch(path: PathLike, options?: { persistent?: boolean; recursiv
     };
 
     try {
-        watcher = fswatch.watch(pathStr, (filename: string, event: string) => {
+        watcher = fswatch.watch(pathStr, (filename, event) => {
             pushEvent({ eventType: event, filename });
-        });
+        }, !!options?.recursive);
     } catch {
         void close();
     }
@@ -360,7 +398,8 @@ export function watch(path: PathLike, options?: { persistent?: boolean; recursiv
         async next() {
             if (closed) return { done: true, value: undefined };
             if (queue.length > 0) {
-                return { done: false, value: queue.shift()! };
+                const value = queue.shift();
+                if (value !== undefined) return { done: false, value };
             }
             return new Promise((resolve) => {
                 resolveNext = resolve;
@@ -379,6 +418,10 @@ export async function cp(source: PathLike, destination: PathLike, opts?: { force
     
     try {
         const stats = await w(asfs.lstat(srcStr), 'cp', srcStr);
+        if (opts?.filter) {
+            const shouldCopy = await opts.filter(srcStr, destStr);
+            if (!shouldCopy) return;
+        }
 
         if (stats.isDirectory) {
             await w(asfs.mkdir(destStr), 'cp', destStr);
@@ -388,20 +431,15 @@ export async function cp(source: PathLike, destination: PathLike, opts?: { force
                     const srcPath = join(srcStr, entry.name);
                     const destPath = join(destStr, entry.name);
 
-                    if (opts?.filter) {
-                        const shouldCopy = await opts.filter(srcPath, destPath);
-                        if (!shouldCopy) continue;
-                    }
-
                     await cp(srcPath, destPath, opts);
                 }
             } finally {
                 await dir.close();
             }
         } else {
-            if (opts?.filter) {
-                const shouldCopy = await opts.filter(srcStr, destStr);
-                if (!shouldCopy) return;
+            const parent = dirname(destStr);
+            if (parent && parent !== destStr) {
+                await mkdirRecursive(parent);
             }
             await w(asfs.copyFile(srcStr, destStr), 'cp', srcStr);
         }
@@ -437,12 +475,19 @@ function globToRegex(pattern: string): RegExp {
             i++;
         } else if (c === '[') {
             const j = pattern.indexOf(']', i);
-            if (j === -1) { regex += '\\['; i++; }
-            else { regex += pattern.slice(i, j + 1).replace(/\\/g, '\\\\'); i = j + 1; }
+            if (j === -1) {
+                regex += '\\[';
+                i++;
+            } else {
+                regex += pattern.slice(i, j + 1).replace(/\\/g, '\\\\');
+                i = j + 1;
+            }
         } else if (c === '{') {
             const j = pattern.indexOf('}', i);
-            if (j === -1) { regex += '\\{'; i++; }
-            else {
+            if (j === -1) {
+                regex += '\\{';
+                i++;
+            } else {
                 const inner = pattern.slice(i + 1, j).split(',').map(s => globToRegex(s).source).join('|');
                 regex += `(?:${inner})`;
                 i = j + 1;
@@ -465,6 +510,14 @@ export async function* glob(pattern: string | readonly string[], options?: { cwd
     const regexes = patterns.map(p => globToRegex(p));
     const excludeRegexes = excludes.map(p => globToRegex(p));
 
+    async function lstatOrNull(path: string): Promise<CModuleAsyncFS.StatResult | null> {
+        try {
+            return await w(asfs.lstat(path), 'lstat', path);
+        } catch {
+            return null;
+        }
+    }
+
     async function* walk(dir: string): AsyncIterableIterator<string> {
         let entries: string[];
         try {
@@ -478,8 +531,8 @@ export async function* glob(pattern: string | readonly string[], options?: { cwd
         for (const name of entries) {
             const full = join(dir, name);
             let rel = full.slice(cwd.length + 1);
-            let stat: any;
-            try { stat = await w(asfs.lstat(full), 'lstat', full); } catch { continue; }
+            const stat = await lstatOrNull(full);
+            if (!stat) continue;
             if (excludeRegexes.some(r => r.test(rel))) continue;
             if (regexes.some(r => r.test(rel))) yield rel;
             if (stat.isDirectory) yield* walk(full);

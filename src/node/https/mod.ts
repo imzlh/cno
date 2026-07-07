@@ -4,51 +4,56 @@
  */
 
 import { EventEmitter } from '../events';
-import { Duplex } from '../stream';
 import {
     TLSSocket,
     Server as TlsServer,
     SecureContext,
+    connect as connectSecureSocket,
     createSecureContext,
     getCiphers,
 } from '../tls';
-import type { TlsServerOptions, PeerCertificate } from '../tls';
+import type { TlsOptions, TlsServerOptions, PeerCertificate } from '../tls';
 import {
+    applyRequestCommonOptions,
+    type ClientHooks,
+    type ClientRequestState,
+    abortRequest,
+    cleanupRequest,
+    connectRequest,
+    connectRequestWithAgent,
+    connectSecureTransport,
+    destroyRequest,
+    endRequest,
+    getSystemCa,
+    initClientRequestState,
+    mergeUrlOptions,
+    normalizeRequestOptions,
+    setRequestTimeout,
+    writeRequest,
+} from '../_internal/http-client';
+import {
+    createServerRequestObjects,
+    createHeadersSentError,
+    createWriteAfterEndError,
     IncomingMessageImpl,
+    isBodyForbiddenStatus,
     OutgoingMessageImpl,
     ServerResponseImpl,
     METHODS as HTTP_METHODS,
     STATUS_CODES,
 } from '../http/server';
-import type { IncomingHttpHeaders } from '../http/server';
 import { Agent as HttpAgent } from '../http/client';
 import type { ClientRequestArgs } from '../http/client';
+import type { ListenOptions as NetListenOptions } from '../net';
 import {
-    buildNodeServerUrl,
-    buildNodeUrl,
-    captureNodeNetworkCallFrames,
-    getNodeFetchHook,
     getNodeServeHook,
-    headerEntriesToRecord,
-    nextNodeRequestId,
     nodeTs,
-    normalizeHeaderRecord,
-    setupResponseParser,
-    toUint8Array,
 } from '../_internal/network-debug';
-import { concatChunks } from '../_internal/buffer';
-import { normalizeErrnoError } from '../_internal/errno';
+import { ServerResponseAdapter } from '../_internal/server-response-adapter';
+import { dispatchServerRequest } from '../_internal/server-request-runtime';
+import { createServerRequestParser, type ParsedServerRequest } from '../_internal/server-request-parser';
 
-const streams = import.meta.use('streams');
-const dns = import.meta.use('dns');
-const os = import.meta.use('os');
 const engine = import.meta.use('engine');
-const httpParser = import.meta.use('http');
-const timers = import.meta.use('timers');
-const ssl = import.meta.use('ssl');
-const asfs = import.meta.use('asyncfs');
-const windows = import.meta.use('win32');
-const fs = import.meta.use('fs');
 
 function flattenPrototype(target: object): void {
     const parent = Object.getPrototypeOf(target);
@@ -67,46 +72,101 @@ function flattenPrototype(target: object): void {
     }
 }
 
-// ---------------------------------------------------------------------------
-// System CA discovery (mirrors http/src/connection.ts findSystemCaPath)
-// ---------------------------------------------------------------------------
+function writeTlsChunk(socket: TLSSocket, data: Uint8Array): Promise<void> {
+    return new Promise((resolve, reject) => {
+        socket.write(data, (err?: Error | null) => {
+            if (err) reject(err);
+            else resolve();
+        });
+    });
+}
 
-let _sysCaCache: string | null | undefined = undefined;
+function endTlsSocket(socket: TLSSocket): Promise<void> {
+    return new Promise((resolve, reject) => {
+        socket.end((err?: Error | null) => {
+            if (err) reject(err);
+            else resolve();
+        });
+    });
+}
 
-async function getSystemCa(): Promise<string | null> {
-    if (_sysCaCache !== undefined) return _sysCaCache;
-    const sysname = os.uname().sysname;
-    const candidates: string[] = sysname === 'Linux' ? [
-        '/etc/ssl/certs/ca-certificates.crt',
-        '/etc/pki/tls/certs/ca-bundle.crt',
-        '/etc/pki/tls/cert.pem',
-        '/etc/ssl/cert.pem',
-    ] : sysname === 'Darwin' ? [
-        '/etc/ssl/cert.pem',
-        '/opt/homebrew/etc/openssl@3/cert.pem',
-        '/usr/local/etc/openssl@3/cert.pem',
-    ] : sysname === 'FreeBSD' ? [
-        '/usr/local/share/certs/ca-root-nss.crt',
-        '/etc/ssl/cert.pem',
-    ] : [];
-
-    for (const p of candidates) {
-        try { if ((await asfs.stat(p)).isFile) { _sysCaCache = p; return p; } } catch {}
+function shouldCloseServerConnection(incoming: IncomingMessageImpl): boolean {
+    const connection = String(incoming.headers['connection'] ?? '').toLowerCase();
+    if (connection.split(',').some((token) => token.trim() === 'close')) return true;
+    if (incoming.httpVersionMajor === 1 && incoming.httpVersionMinor === 0) {
+        return !connection.split(',').some((token) => token.trim() === 'keep-alive');
     }
+    return false;
+}
 
-    if (sysname === 'Windows_NT') {
-        const tmpDir = (os as any).tmpDir || 'C:\\Windows\\Temp';
-        const tmp = tmpDir + '\\cno-ca-bundle.pem';
-        try {
-            const certs = windows!.exportCerts();
-            if (certs?.length) {
-                await fs.writeFile(tmp, engine.encodeString(certs.join('\n')));
-                _sysCaCache = tmp; return tmp;
-            }
-        } catch {}
+class TlsResponseAdapter extends ServerResponseAdapter<ServerResponseImpl> {
+    constructor(
+        response: ServerResponseImpl,
+        socket: TLSSocket,
+        serveHook: ReturnType<typeof getNodeServeHook>,
+        requestId: string,
+        requestUrl: string,
+        suppressBody = false,
+        closeAfterResponse = false,
+        responseTurn: Promise<void> = Promise.resolve(),
+        releaseResponseTurn?: () => void,
+    ) {
+        let turnReleased = false;
+        const releaseTurn = () => {
+            if (turnReleased) return;
+            turnReleased = true;
+            releaseResponseTurn?.();
+        };
+        super(response, {
+            closeSource: socket,
+            writeHead: async (res, headers) => {
+                await responseTurn;
+                const lines = [`HTTP/1.1 ${res.statusCode} ${res.statusMessage}`];
+                for (const [key, value] of headers) lines.push(`${key}: ${value}`);
+                lines.push('', '');
+                await writeTlsChunk(socket, engine.encodeString(lines.join('\r\n')));
+            },
+            writeBody: async (res, data) => {
+                await responseTurn;
+                if (res.chunkedEncoding) {
+                    await writeTlsChunk(socket, engine.encodeString(`${data.byteLength.toString(16)}\r\n`));
+                    await writeTlsChunk(socket, data);
+                    await writeTlsChunk(socket, engine.encodeString('\r\n'));
+                    return;
+                }
+                await writeTlsChunk(socket, data);
+            },
+            finish: async (res) => {
+                await responseTurn;
+                try {
+                    if (res.chunkedEncoding) {
+                        await writeTlsChunk(socket, engine.encodeString('0\r\n\r\n'));
+                    }
+                    if (closeAfterResponse) {
+                        await endTlsSocket(socket);
+                    }
+                } finally {
+                    releaseTurn();
+                }
+            },
+            abort: (_res, err) => {
+                releaseTurn();
+                socket.destroy();
+            },
+            normalizeError: (err) => {
+                releaseTurn();
+                return err instanceof Error ? err : new Error(String(err));
+            },
+        }, serveHook, {
+            isBodyForbiddenStatus,
+            createHeadersSentError,
+            createWriteAfterEndError,
+        }, requestId, requestUrl, suppressBody);
+
+        if (closeAfterResponse && !response.hasHeader('connection')) {
+            response.setHeader('Connection', 'close');
+        }
     }
-
-    _sysCaCache = null; return null;
 }
 
 // HTTPS Server
@@ -117,10 +177,18 @@ export interface HttpsServerOptions extends TlsServerOptions {
     rejectUnauthorized?: boolean;
 }
 
+type HttpsRequestListener = (req: IncomingMessageImpl, res: ServerResponseImpl) => void;
+type ServerListenArgs =
+    | [port?: number, hostname?: string, backlog?: number, listeningListener?: () => void]
+    | [port?: number, hostname?: string, listeningListener?: () => void]
+    | [port?: number, backlog?: number, listeningListener?: () => void]
+    | [path: string, backlog?: number, listeningListener?: () => void]
+    | [options: NetListenOptions, listeningListener?: () => void]
+    | [handle: unknown, backlog?: number, listeningListener?: () => void];
+
 export interface Server extends EventEmitter {
     _tlsServer: TlsServer;
-    _requestListener: ((req: IncomingMessageImpl, res: ServerResponseImpl) => void) | null;
-    _requestSerial: number;
+    _requestListener: HttpsRequestListener | null;
     _timeout: number;
     _timeoutCallback: ((socket: TLSSocket) => void) | null;
 
@@ -128,7 +196,8 @@ export interface Server extends EventEmitter {
     listen(port?: number, hostname?: string, listeningListener?: () => void): this;
     listen(port?: number, backlog?: number, listeningListener?: () => void): this;
     listen(path: string, backlog?: number, listeningListener?: () => void): this;
-    listen(options: any, listeningListener?: () => void): this;
+    listen(options: NetListenOptions, listeningListener?: () => void): this;
+    listen(handle: unknown, backlog?: number, listeningListener?: () => void): this;
 
     close(callback?: (err?: Error) => void): this;
     address(): { address: string; family: string; port: number } | string | null;
@@ -139,165 +208,126 @@ export interface Server extends EventEmitter {
 }
 
 export interface ServerConstructor {
-    new (options?: HttpsServerOptions, requestListener?: (req: IncomingMessageImpl, res: ServerResponseImpl) => void): Server;
-    new (requestListener?: (req: IncomingMessageImpl, res: ServerResponseImpl) => void): Server;
-    (options?: HttpsServerOptions, requestListener?: (req: IncomingMessageImpl, res: ServerResponseImpl) => void): Server;
-    (requestListener?: (req: IncomingMessageImpl, res: ServerResponseImpl) => void): Server;
+    new (options?: HttpsServerOptions, requestListener?: HttpsRequestListener): Server;
+    new (requestListener?: HttpsRequestListener): Server;
+    (options?: HttpsServerOptions, requestListener?: HttpsRequestListener): Server;
+    (requestListener?: HttpsRequestListener): Server;
     prototype: Server;
 }
 
+function normalizeServerOptions(
+    optionsOrListener?: HttpsServerOptions | HttpsRequestListener,
+    requestListener?: HttpsRequestListener,
+): { options: HttpsServerOptions; requestListener: HttpsRequestListener | null } {
+    if (typeof optionsOrListener === 'function') {
+        return { options: {}, requestListener: optionsOrListener };
+    }
+    return {
+        options: optionsOrListener || {},
+        requestListener: requestListener || null,
+    };
+}
+
+function dispatchHttpsServerRequest(
+    self: Server,
+    tlsSocket: TLSSocket,
+    incoming: IncomingMessageImpl,
+    response: ServerResponseImpl,
+    serveHook: ReturnType<typeof getNodeServeHook>,
+    meta: ParsedServerRequest,
+    responseTurn?: Promise<void>,
+    releaseResponseTurn?: () => void,
+): Promise<void> {
+    const listener = self._requestListener;
+    if (!listener) return Promise.resolve();
+
+    const adapter = new TlsResponseAdapter(
+        response,
+        tlsSocket,
+        serveHook,
+        meta.requestId,
+        meta.requestUrl,
+        incoming.method === 'HEAD',
+        shouldCloseServerConnection(incoming),
+        responseTurn,
+        releaseResponseTurn,
+    );
+    return dispatchServerRequest({
+        listener,
+        incoming,
+        response,
+        adapter,
+        serveHook,
+        requestId: meta.requestId,
+        timestamp: nodeTs(),
+        url: meta.requestUrl,
+        method: incoming.method || 'GET',
+        headers: meta.requestHeaders,
+        postData: meta.postData,
+        callFrames: meta.requestCallFrames,
+        onError: (err) => self.emit('error', err),
+    }).catch((err) => self.emit('error', err));
+}
+
+function handleHttpsServerConnection(self: Server, tlsSocket: TLSSocket): void {
+    if (!self._requestListener) return;
+
+    const serveHook = getNodeServeHook();
+    const responses = new WeakMap<IncomingMessageImpl, ServerResponseImpl>();
+    let responseTurn = Promise.resolve();
+
+    const parser = createServerRequestParser({
+        createIncoming: () => {
+            const timeoutCallback = self._timeoutCallback;
+            const { incoming, response } = createServerRequestObjects(
+                tlsSocket,
+                self._timeout,
+                timeoutCallback ? () => timeoutCallback(tlsSocket) : undefined,
+            );
+            responses.set(incoming, response);
+            return incoming;
+        },
+        protocol: 'https:',
+        requestIdPrefix: 'https-serve',
+        onRequest: (incoming, meta) => {
+            const response = responses.get(incoming);
+            responses.delete(incoming);
+            if (!response) return;
+
+            const { promise: responseTurnDone, resolve: releaseResponseTurn } = Promise.withResolvers<void>();
+            const currentResponseTurn = responseTurn;
+            responseTurn = responseTurn.then(() => responseTurnDone, () => responseTurnDone);
+
+            dispatchHttpsServerRequest(self, tlsSocket, incoming, response, serveHook, meta, currentResponseTurn, releaseResponseTurn);
+        },
+        onParseError: (err) => {
+            self.emit('clientError', err, tlsSocket);
+            tlsSocket.destroy(err);
+        },
+    });
+
+    tlsSocket.on('data', (chunk: Uint8Array) => {
+        parser.feed(chunk);
+    });
+}
+
 function initServer(
-    self: any,
-    optionsOrListener?: HttpsServerOptions | ((req: IncomingMessageImpl, res: ServerResponseImpl) => void),
-    requestListener?: (req: IncomingMessageImpl, res: ServerResponseImpl) => void
+    self: Server,
+    optionsOrListener?: HttpsServerOptions | HttpsRequestListener,
+    requestListener?: HttpsRequestListener,
 ): void {
     EventEmitter.call(self);
 
     self._requestListener = null;
-    self._requestSerial = 0;
     self._timeout = 0;
     self._timeoutCallback = null;
 
-    let options: HttpsServerOptions = {};
-    if (typeof optionsOrListener === 'function') {
-        self._requestListener = optionsOrListener;
-    } else if (optionsOrListener) {
-        options = optionsOrListener;
-        if (requestListener) self._requestListener = requestListener;
-    }
+    const normalized = normalizeServerOptions(optionsOrListener, requestListener);
+    const options = normalized.options;
+    self._requestListener = normalized.requestListener;
 
     self._tlsServer = new TlsServer(options, (tlsSocket: TLSSocket) => {
-        if (!self._requestListener) return;
-        const serveHook = getNodeServeHook();
-        const requestBodyChunks: Uint8Array[] = [];
-
-        const incoming = new IncomingMessageImpl(null);
-        incoming.socket = tlsSocket as any;
-        incoming.setTimeout(self._timeout, self._timeoutCallback ? () => self._timeoutCallback!(tlsSocket) : undefined);
-
-        const response = new ServerResponseImpl();
-        response.req = incoming;
-
-        const parser = new httpParser.Parser(httpParser.REQUEST);
-        let currentHeaderField = '';
-
-        const decode = (buf: any, off: number, len: number) =>
-            engine.decodeString(new Uint8Array(buf as ArrayBuffer).slice(off, off + len));
-
-        parser.onUrl = (buf: any, off: number, len: number) => {
-            incoming.url = decode(buf, off, len);
-        };
-        parser.onHeaderField = (buf: any, off: number, len: number) => {
-            currentHeaderField = decode(buf, off, len).toLowerCase();
-        };
-        parser.onHeaderValue = (buf: any, off: number, len: number) => {
-            const value = decode(buf, off, len);
-            incoming.headers[currentHeaderField as keyof IncomingHttpHeaders] = value as any;
-            incoming.rawHeaders.push(currentHeaderField, value);
-        };
-        parser.onHeadersComplete = () => {
-            incoming.httpVersion = `${parser.state.httpMajor}.${parser.state.httpMinor}`;
-            incoming.httpVersionMajor = parser.state.httpMajor;
-            incoming.httpVersionMinor = parser.state.httpMinor;
-            incoming.method = HTTP_METHODS[parser.state.method] || 'GET';
-        };
-        parser.onBody = (buf: any, off: number, len: number) => {
-            const chunk = new Uint8Array(buf as ArrayBuffer).slice(off, off + len);
-            requestBodyChunks.push(chunk);
-            incoming.push(chunk);
-        };
-        parser.onMessageComplete = () => {
-            incoming.push(null);
-            incoming.complete = true;
-            const requestId = nextNodeRequestId('https-serve');
-            const requestHeaders = normalizeHeaderRecord(incoming.headers as Record<string, string | string[] | undefined>);
-            const requestUrl = buildNodeServerUrl('https:', incoming.url, requestHeaders);
-            const requestCallFrames = captureNodeNetworkCallFrames();
-            let finished = false;
-            const finish = (success: boolean, errorText?: string) => {
-                if (finished) return;
-                finished = true;
-                try {
-                    serveHook?.onFinished?.({ requestId, timestamp: nodeTs(), success, errorText });
-                } catch {}
-            };
-            try {
-                serveHook?.onRequest?.({
-                    requestId,
-                    timestamp: nodeTs(),
-                    url: requestUrl,
-                    method: incoming.method || 'GET',
-                    headers: requestHeaders,
-                    postData: concatChunks(requestBodyChunks),
-                    callFrames: requestCallFrames,
-                });
-            } catch {}
-
-            const originalWrite = response.write.bind(response);
-            response.write = ((chunk: any, encodingOrCb?: BufferEncoding | ((err?: Error | null) => void), cb?: (err?: Error | null) => void) => {
-                const result = originalWrite(chunk, encodingOrCb as any, cb as any);
-                try {
-                    const data = toUint8Array(chunk, engine.encodeString);
-                    serveHook?.onData?.({ requestId, timestamp: nodeTs(), data });
-                } catch {}
-                return result;
-            }) as any;
-
-            let responseReported = false;
-            const reportResponse = () => {
-                if (responseReported) return;
-                responseReported = true;
-                serveHook?.onResponse?.({
-                    requestId,
-                    timestamp: nodeTs(),
-                    url: requestUrl,
-                    status: response.statusCode,
-                    statusText: response.statusMessage,
-                    headers: normalizeHeaderRecord(response.getHeaders()),
-                });
-            };
-
-            const originalWriteHead = response.writeHead.bind(response);
-            response.writeHead = ((...args: Parameters<typeof originalWriteHead>) => {
-                const result = originalWriteHead(...args);
-                try { reportResponse(); } catch {}
-                return result;
-            }) as typeof response.writeHead;
-
-            const originalEnd = response.end.bind(response);
-            response.end = ((...args: any[]) => {
-                const result = originalEnd(...args);
-                try {
-                    reportResponse();
-                    const chunk = args[0];
-                    if (chunk !== undefined) {
-                        const data = toUint8Array(chunk, engine.encodeString);
-                        serveHook?.onData?.({ requestId, timestamp: nodeTs(), data });
-                    }
-                    finish(true);
-                } catch {}
-                return result;
-            }) as any;
-
-            if (self._requestListener) {
-                try {
-                    self._requestListener(incoming, response);
-                } catch (err) {
-                    finish(false, String((err as Error)?.message ?? err));
-                    throw err;
-                }
-            }
-        };
-
-        tlsSocket.on('data', (chunk: Uint8Array) => {
-            const ab = chunk.buffer instanceof SharedArrayBuffer
-                ? new Uint8Array(chunk).buffer
-                : chunk.buffer;
-            const result = parser.execute(ab.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength));
-            if (result.errno !== 0) {
-                tlsSocket.destroy(new Error('HTTP parse error'));
-            }
-        });
+        handleHttpsServerConnection(self, tlsSocket);
     });
 
     self._tlsServer.on('listening', () => self.emit('listening'));
@@ -307,13 +337,11 @@ function initServer(
 }
 
 export const Server: ServerConstructor = function Server(
-    this: any,
-    optionsOrListener?: HttpsServerOptions | ((req: IncomingMessageImpl, res: ServerResponseImpl) => void),
-    requestListener?: (req: IncomingMessageImpl, res: ServerResponseImpl) => void
+    this: Server | undefined,
+    optionsOrListener?: HttpsServerOptions | HttpsRequestListener,
+    requestListener?: HttpsRequestListener,
 ) {
-    const target = this && (typeof this === 'object' || typeof this === 'function')
-        ? this
-        : Object.create(Server.prototype);
+    const target: Server = this ?? Object.create(Server.prototype);
     initServer(target, optionsOrListener, requestListener);
     return target;
 } as ServerConstructor;
@@ -321,8 +349,8 @@ export const Server: ServerConstructor = function Server(
 Object.setPrototypeOf(Server, EventEmitter);
 Server.prototype = Object.create(EventEmitter.prototype);
 
-Server.prototype.listen = function listen(this: Server, ...args: any[]): Server {
-    (this._tlsServer.listen as any)(...args);
+Server.prototype.listen = function listen(this: Server, ...args: ServerListenArgs): Server {
+    this._tlsServer.listen(...args);
     return this;
 };
 
@@ -366,45 +394,58 @@ Object.defineProperty(Server.prototype, 'constructor', {
 
 flattenPrototype(Server.prototype);
 
-export function createServer(options?: HttpsServerOptions, requestListener?: (req: IncomingMessageImpl, res: ServerResponseImpl) => void): Server;
-export function createServer(requestListener?: (req: IncomingMessageImpl, res: ServerResponseImpl) => void): Server;
-export function createServer(optionsOrListener?: HttpsServerOptions | ((req: IncomingMessageImpl, res: ServerResponseImpl) => void), requestListener?: (req: IncomingMessageImpl, res: ServerResponseImpl) => void): Server {
-    return new Server(optionsOrListener as any, requestListener);
+export function createServer(options?: HttpsServerOptions, requestListener?: HttpsRequestListener): Server;
+export function createServer(requestListener?: HttpsRequestListener): Server;
+export function createServer(optionsOrListener?: HttpsServerOptions | HttpsRequestListener, requestListener?: HttpsRequestListener): Server {
+    return new Server(optionsOrListener, requestListener);
 }
 
 // HTTPS Agent
+
+interface HttpsRequestOptions extends ClientRequestArgs {
+    ca?: TlsOptions['ca'];
+    cert?: TlsOptions['cert'];
+    key?: TlsOptions['key'];
+    rejectUnauthorized?: boolean;
+    servername?: string;
+    ciphers?: string;
+}
 
 export class Agent extends HttpAgent {
     defaultPort: number = 443;
     protocol: string = 'https:';
 
-    createConnection(options: ClientRequestArgs, callback: (err: Error | null, socket: any) => void): any {
+    createConnection(options: HttpsRequestOptions, callback: (err: Error | null, socket: TLSSocket | null) => void): TLSSocket | null {
         const port = typeof options.port === 'string' ? parseInt(options.port) : options.port || 443;
         const host = options.hostname || options.host || 'localhost';
+        const rejectUnauthorized = options.rejectUnauthorized ?? true;
+        const servername = options.servername ?? host;
+        let done = false;
 
-        const secureContext = new SecureContext({
-            ca: (options as any).ca,
-            cert: (options as any).cert,
-            key: (options as any).key,
-            ciphers: (options as any).ciphers,
-        });
+        const finish = (err: Error | null, socket: TLSSocket | null = null) => {
+            if (done) return;
+            done = true;
+            callback(err, socket);
+        };
 
-        const family = host.includes(':') ? os.AF_INET6 : os.AF_INET;
+        (async () => {
+            let ca = options.ca;
+            if (!ca && rejectUnauthorized) {
+                ca = (await getSystemCa()) ?? undefined;
+            }
 
-        dns.resolve(host, { family }).then((addrs: any[]) => {
-            if (!addrs?.length) throw new Error(`DNS resolution failed for ${host}`);
-            const addr = addrs.find((a: any) => a.family === (family === os.AF_INET6 ? 6 : 4)) || addrs[0];
-            const tcp = new streams.TCP(family);
-            const tlsSocket = new TLSSocket(tcp, {
-                isServer: false,
-                rejectUnauthorized: (options as any).rejectUnauthorized ?? true,
-                secureContext,
-                servername: (options as any).servername ?? host,
+            const tlsSocket = connectSecureSocket({
+                ...options,
+                port,
+                host,
+                servername,
+                rejectUnauthorized,
+                ca,
+                noDelay: true,
             });
-            tcp.connect({ ip: addr.ip, port }).then(() => {
-                tlsSocket.on('secureConnect', () => callback(null, tlsSocket));
-            }).catch((err: Error) => { callback(err, null); });
-        }).catch((err: Error) => { callback(err, null); });
+            tlsSocket.once('secureConnect', () => finish(null, tlsSocket));
+            tlsSocket.once('error', (err: Error) => finish(err));
+        })().catch((err: Error) => finish(err));
 
         return null;
     }
@@ -414,41 +455,40 @@ export const globalAgent = new Agent();
 
 // HTTPS Client Request
 
-export interface RequestOptions extends ClientRequestArgs {
-    ca?: string | string[] | Buffer | Buffer[];
-    cert?: string | string[] | Buffer | Buffer[];
-    key?: string | string[] | Buffer | Buffer[] | { pem: string | Buffer; passphrase?: string }[];
-    rejectUnauthorized?: boolean;
-    servername?: string;
-    ciphers?: string;
-}
+export interface RequestOptions extends HttpsRequestOptions {}
 
-interface HttpsClientRequest extends OutgoingMessageImpl {
+interface HttpsClientRequest extends OutgoingMessageImpl, ClientRequestState<TLSSocket> {
     aborted: boolean;
+    agent: Agent | boolean;
     host: string;
     protocol: string;
     method: string;
     path: string;
+    onSocket(socket: TLSSocket): void;
 
     _tlsSocket: TLSSocket | null;
     _options: RequestOptions;
     _callback: ((res: IncomingMessageImpl) => void) | null;
     _aborted: boolean;
-    _timeoutId: any;
+    _timeoutId: number | null;
     _requestBody: Uint8Array[];
     _bodySent: boolean;
-    _tcp: any;
+    _tcp: Socket | null;
     _requestId: string;
-    _requestCallFrames: any;
-
-    _doRequest(): Promise<void>;
-    _readResponse(): void;
-    write(chunk: any, encodingOrCb?: BufferEncoding | ((err?: Error) => void), cb?: (err?: Error) => void): boolean;
-    end(chunk?: any, encodingOrCb?: BufferEncoding | (() => void), cb?: () => void): this;
-    abort(): void;
-    destroy(error?: Error): this;
-    setTimeout(timeout: number, callback?: () => void): this;
-    _cleanup(): void;
+    _requestCallFrames: ClientRequestState<TLSSocket>['_requestCallFrames'];
+    _abortHandler: (() => void) | null;
+    _streamedBeforeEnd: boolean;
+    _sendChain: Promise<void>;
+    _chunkedEncoding: boolean;
+    _headerFlushStarted: boolean;
+    _header: string | null;
+    outputData: Array<{ data: string }>;
+    _connectPromise: Promise<void> | null;
+    _streamErrored: boolean;
+    _transport: TLSSocket | null;
+    _transportCleanup: (() => void) | null;
+    _connect(): Promise<void>;
+    _implicitHeader(): void;
 }
 
 interface HttpsClientRequestConstructor {
@@ -457,50 +497,33 @@ interface HttpsClientRequestConstructor {
     prototype: HttpsClientRequest;
 }
 
-function initHttpsClientRequest(self: any, url: string | URL | RequestOptions, cb?: (res: IncomingMessageImpl) => void): void {
-    OutgoingMessageImpl.call(self);
+const HTTPS_CLIENT_HOOKS: ClientHooks<HttpsClientRequest> = {
+    defaultPort: 443,
+    defaultUserAgent: 'Node.js/https',
+    requestIdPrefix: 'https-fetch',
+    waitForSecureConnect: true,
+    connect: (request) => connectSecureTransport(request, 443),
+    onTransportAssigned: (request, transport) => {
+        request._tlsSocket = transport as TLSSocket;
+        request._tcp = null;
+    },
+};
 
-    self.aborted = false;
-    self.host = 'localhost';
-    self.protocol = 'https:';
-    self.method = 'GET';
-    self.path = '/';
+function initHttpsClientRequest(self: HttpsClientRequest, url: string | URL | RequestOptions, cb?: (res: IncomingMessageImpl) => void): void {
+    OutgoingMessageImpl.call(self);
+    initClientRequestState(self, cb);
 
     self._tlsSocket = null;
-    self._callback = null;
-    self._aborted = false;
-    self._timeoutId = null;
-    self._requestBody = [];
-    self._bodySent = false;
     self._tcp = null;
-    self._requestId = '';
-    self._requestCallFrames = captureNodeNetworkCallFrames();
+    self._options = typeof url === 'string' || url instanceof URL
+        ? mergeUrlOptions<RequestOptions>(url)
+        : normalizeRequestOptions(url);
 
-    if (typeof url === 'string') {
-        const parsed = new URL(url);
-        self._options = {
-            protocol: parsed.protocol,
-            hostname: parsed.hostname,
-            port: parsed.port,
-            path: parsed.pathname + parsed.search,
-            auth: parsed.username || parsed.password ? `${parsed.username}:${parsed.password}` : undefined,
-        };
-    } else if (url instanceof URL) {
-        self._options = {
-            protocol: url.protocol,
-            hostname: url.hostname,
-            port: url.port,
-            path: url.pathname + url.search,
-            auth: url.username || url.password ? `${url.username}:${url.password}` : undefined,
-        };
-    } else {
-        self._options = url;
-    }
-
-    self._callback = cb || null;
     self.method = self._options.method?.toUpperCase() || 'GET';
     self.path = self._options.path || '/';
     self.host = self._options.hostname || self._options.host || 'localhost';
+    self.protocol = 'https:';
+    self.agent = self._options.agent ?? globalAgent;
 
     if (self._options.headers) {
         if (Array.isArray(self._options.headers)) {
@@ -514,23 +537,15 @@ function initHttpsClientRequest(self: any, url: string | URL | RequestOptions, c
         }
     }
 
-    if (self._options.timeout) {
-        self.setTimeout(self._options.timeout);
-    }
-
-    if (self._options.signal) {
-        self._options.signal.addEventListener('abort', () => self.abort(), { once: true });
-    }
+    applyRequestCommonOptions(self);
 }
 
 const HttpsClientRequest: HttpsClientRequestConstructor = function HttpsClientRequest(
-    this: any,
+    this: HttpsClientRequest | undefined,
     url: string | URL | RequestOptions,
     cb?: (res: IncomingMessageImpl) => void
 ) {
-    const target = this && (typeof this === 'object' || typeof this === 'function')
-        ? this
-        : Object.create(HttpsClientRequest.prototype);
+    const target: HttpsClientRequest = this ?? Object.create(HttpsClientRequest.prototype);
     initHttpsClientRequest(target, url, cb);
     return target;
 } as HttpsClientRequestConstructor;
@@ -538,246 +553,49 @@ const HttpsClientRequest: HttpsClientRequestConstructor = function HttpsClientRe
 Object.setPrototypeOf(HttpsClientRequest, OutgoingMessageImpl);
 HttpsClientRequest.prototype = Object.create(OutgoingMessageImpl.prototype);
 
-HttpsClientRequest.prototype._doRequest = async function _doRequest(this: HttpsClientRequest): Promise<void> {
-    const fetchHook = getNodeFetchHook();
-    this._requestId = this._requestId || nextNodeRequestId('https-fetch');
-    const requestStartTime = nodeTs();
-    const requestBody = concatChunks(this._requestBody);
-    const port = typeof this._options.port === 'string'
-        ? parseInt(this._options.port)
-        : this._options.port || 443;
-
-    try {
-        const isIPv6 = this.host.includes(':');
-        const addrs = await dns.resolve(this.host, { family: isIPv6 ? os.AF_INET6 : os.AF_INET });
-        if (!addrs?.length) throw new Error(`DNS resolution failed for ${this.host}`);
-        const addr = addrs.find((a: any) => a.family === (isIPv6 ? os.AF_INET6 : os.AF_INET)) || addrs[0];
-
-        const family = addr.family === 6 ? os.AF_INET6 : os.AF_INET;
-        this._tcp = new streams.TCP(family);
-        await this._tcp.connect({ ip: addr.ip, port });
-        this._tcp.setNoDelay(true);
-
-        if (this._aborted) {
-            this._cleanup();
-            return;
-        }
-
-        const rejectUnauthorized = this._options.rejectUnauthorized ?? true;
-        let caPath = this._options.ca as string | undefined;
-        if (!caPath && rejectUnauthorized) {
-            caPath = (await getSystemCa()) ?? undefined;
-        }
-
-        const secureContext = new SecureContext({
-            ca: caPath,
-            cert: this._options.cert as any,
-            key: this._options.key as any,
-            ciphers: this._options.ciphers,
-        });
-
-        this._tlsSocket = new TLSSocket(this._tcp, {
-            isServer: false,
-            rejectUnauthorized,
-            secureContext,
-            servername: this._options.servername ?? this.host,
-        });
-
-        this.socket = this._tlsSocket as any;
-        this.emit('socket', this._tlsSocket);
-
-        await new Promise<void>((resolve, reject) => {
-            const timeout = timers.setTimeout(() => reject(new Error('TLS handshake timeout')), 10000);
-            this._tlsSocket!.on('secureConnect', () => {
-                timers.clearTimeout(timeout);
-                if (rejectUnauthorized && !this._tlsSocket!.authorized) {
-                    reject(this._tlsSocket!.authorizationError ?? new Error('Certificate verification failed'));
-                } else {
-                    resolve();
-                }
-            });
-            this._tlsSocket!.on('error', (err) => { timers.clearTimeout(timeout); reject(err); });
-        });
-
-        if (!this.hasHeader('host')) {
-            this.setHeader('Host', port === 443 ? this.host : `${this.host}:${port}`);
-        }
-
-        if (this._options.auth && !this.hasHeader('authorization')) {
-            this.setHeader('Authorization', `Basic ${btoa(this._options.auth)}`);
-        }
-
-        if (!this.hasHeader('user-agent')) {
-            this.setHeader('User-Agent', 'Node.js/https');
-        }
-
-        if (!this.hasHeader('connection')) {
-            this.setHeader('Connection', 'close');
-        }
-
-        const bodyLength = this._requestBody.reduce((sum, chunk) => sum + chunk.length, 0);
-        if (bodyLength > 0 && !this.hasHeader('content-length')) {
-            this.setHeader('Content-Length', bodyLength);
-        }
-
-        let requestLine = `${this.method} ${this.path} HTTP/1.1\r\n`;
-        requestLine += this._formatHeaders();
-        requestLine += '\r\n';
-
-        try {
-            fetchHook?.onRequest?.({
-                requestId: this._requestId,
-                timestamp: requestStartTime,
-                url: buildNodeUrl(this.protocol, this.host, this.path),
-                method: this.method,
-                headers: normalizeHeaderRecord(this.getHeaders()),
-                postData: requestBody ?? undefined,
-                callFrames: this._requestCallFrames,
-                resourceType: 'Fetch',
-            });
-        } catch {}
-
-        this._tlsSocket.write(engine.encodeString(requestLine));
-        this.headersSent = true;
-
-        for (const chunk of this._requestBody) {
-            this._tlsSocket.write(chunk);
-        }
-        this._bodySent = true;
-
-        this._readResponse();
-    } catch (err) {
-        try {
-            fetchHook?.onFinished?.({
-                requestId: this._requestId,
-                timestamp: nodeTs(),
-                success: false,
-                errorText: String((err as Error)?.message ?? err),
-            });
-        } catch {}
-        this.emit('error', err);
+HttpsClientRequest.prototype._connect = function _connect(this: HttpsClientRequest): Promise<void> {
+    if (this.agent && typeof this.agent === 'object' && typeof this.agent.addRequest === 'function') {
+        return connectRequestWithAgent(this, HTTPS_CLIENT_HOOKS, this.agent);
     }
+    return connectRequest(this, HTTPS_CLIENT_HOOKS);
 };
 
-HttpsClientRequest.prototype._readResponse = function _readResponse(this: HttpsClientRequest): void {
-    if (!this._tlsSocket) return;
-
-    const res = new IncomingMessageImpl(null);
-    (res as any).socket = this._tlsSocket;
-    const { parser, finish } = setupResponseParser({
-        requestId: this._requestId,
-        protocol: this.protocol, host: this.host, path: this.path,
-        res, getHeaders: () => this.getHeaders(),
-        onResponse: (_res) => { this.emit('response', _res); if (this._callback) this._callback(_res); },
-        onComplete: () => { this._cleanup(); },
-    });
-    let failed = false;
-    const failResponse = (message: string, error?: Error) => {
-        if (failed) return;
-        failed = true;
-        const normalized = normalizeErrnoError(error ?? Object.assign(new Error(message), { code: 'ECONNRESET' }), 'read');
-        if (!res.complete) {
-            res.aborted = true;
-            try { res.emit('aborted'); } catch {}
-            res.destroy(normalized);
-        }
-        if (!this._aborted) this.emit('error', normalized);
-        finish(false, String(normalized.message ?? normalized));
-        this._cleanup();
-    };
-
-    this._tlsSocket.on('data', (chunk: Uint8Array) => {
-        const ab = chunk.buffer instanceof SharedArrayBuffer
-            ? new Uint8Array(chunk).buffer
-            : chunk.buffer;
-        const result = parser.execute(ab.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength));
-        if (result.errno !== 0) {
-            failResponse('HTTP parse error');
-        }
-    });
-
-    this._tlsSocket.on('end', () => {
-        if (!res.complete) {
-            failResponse('socket hang up');
-            return;
-        }
-        this._cleanup();
-    });
-
-    this._tlsSocket.on('error', (err: Error) => {
-        failResponse(err.message, err);
-    });
+HttpsClientRequest.prototype.onSocket = function onSocket(this: HttpsClientRequest, socket: TLSSocket): void {
+    this.socket = socket;
+    this._transport = socket;
+    this._tlsSocket = socket;
+    this._tcp = null;
+    this.emit('socket', socket);
 };
 
-HttpsClientRequest.prototype.write = function write(this: HttpsClientRequest, chunk: any, encodingOrCb?: BufferEncoding | ((err?: Error) => void), cb?: (err?: Error) => void): boolean {
-    if (this._bodySent) {
-        const callback = typeof encodingOrCb === 'function' ? encodingOrCb : cb;
-        callback?.(new Error('Request body already sent'));
-        return false;
-    }
-    const data = typeof chunk === 'string' ? engine.encodeString(chunk) : chunk as Uint8Array;
-    this._requestBody.push(data);
-    const callback = typeof encodingOrCb === 'function' ? encodingOrCb : cb;
-    callback?.();
-    return true;
+HttpsClientRequest.prototype._implicitHeader = function _implicitHeader(this: HttpsClientRequest): void {
+    this._header = `${this.method} ${this.path} HTTP/1.1\r\n${this._formatHeaders()}\r\n`;
 };
 
-HttpsClientRequest.prototype.end = function end(this: HttpsClientRequest, chunk?: any, encodingOrCb?: BufferEncoding | (() => void), cb?: () => void): HttpsClientRequest {
-    let callback: (() => void) | undefined;
-    if (typeof chunk === 'function') { callback = chunk; chunk = undefined; }
-    else if (typeof encodingOrCb === 'function') { callback = encodingOrCb; }
-    else if (typeof cb === 'function') { callback = cb; }
+HttpsClientRequest.prototype.write = function write(this: HttpsClientRequest, chunk: unknown, encodingOrCb?: BufferEncoding | ((err?: Error) => void), cb?: (err?: Error) => void): boolean {
+    return writeRequest(this, chunk, encodingOrCb, cb, HTTPS_CLIENT_HOOKS);
+};
 
-    if (chunk !== undefined) {
-        const data = typeof chunk === 'string' ? engine.encodeString(chunk) : chunk as Uint8Array;
-        this._requestBody.push(data);
-    }
-
-    this._doRequest().then(() => callback?.()).catch((err) => {
-        this.emit('error', err);
-        callback?.();
-    });
-
-    return this;
+HttpsClientRequest.prototype.end = function end(this: HttpsClientRequest, chunk?: unknown, encodingOrCb?: BufferEncoding | (() => void), cb?: () => void): HttpsClientRequest {
+    return endRequest(this, chunk, encodingOrCb, cb, HTTPS_CLIENT_HOOKS) as HttpsClientRequest;
 };
 
 HttpsClientRequest.prototype.abort = function abort(this: HttpsClientRequest): void {
-    if (this._aborted) return;
-    this._aborted = true;
-    this.aborted = true;
-    this.emit('abort');
-    this.destroy();
+    abortRequest(this);
 };
 
 HttpsClientRequest.prototype.destroy = function destroy(this: HttpsClientRequest, error?: Error): HttpsClientRequest {
-    this._cleanup();
-    if (error) this.emit('error', error);
-    return this;
+    return destroyRequest(this, error) as HttpsClientRequest;
 };
 
 HttpsClientRequest.prototype.setTimeout = function setTimeout(this: HttpsClientRequest, timeout: number, callback?: () => void): HttpsClientRequest {
-    if (this._timeoutId) timers.clearTimeout(this._timeoutId);
-    this._timeoutId = timers.setTimeout(() => {
-        this.emit('timeout');
-        this.destroy(new Error('Timeout'));
-    }, timeout);
-    if (callback) this.once('timeout', callback);
-    return this;
+    return setRequestTimeout(this, timeout, callback) as HttpsClientRequest;
 };
 
 HttpsClientRequest.prototype._cleanup = function _cleanup(this: HttpsClientRequest): void {
-    if (this._timeoutId) {
-        timers.clearTimeout(this._timeoutId);
-        this._timeoutId = null;
-    }
-    if (this._tlsSocket) {
-        try { this._tlsSocket.destroy(); } catch {}
-        this._tlsSocket = null;
-    }
-    if (this._tcp) {
-        try { this._tcp.close(); } catch {}
-        this._tcp = null;
-    }
+    cleanupRequest(this);
+    this._tlsSocket = null;
+    this._tcp = null;
 };
 
 Object.defineProperty(HttpsClientRequest.prototype, 'constructor', {
@@ -788,12 +606,29 @@ Object.defineProperty(HttpsClientRequest.prototype, 'constructor', {
 
 flattenPrototype(HttpsClientRequest.prototype);
 
-export function request(options: RequestOptions | string | URL, callback?: (res: IncomingMessageImpl) => void): HttpsClientRequest {
-    return new HttpsClientRequest(options, callback);
+export function request(url: string | URL, options: RequestOptions, callback?: (res: IncomingMessageImpl) => void): HttpsClientRequest;
+export function request(options: RequestOptions | string | URL, callback?: (res: IncomingMessageImpl) => void): HttpsClientRequest;
+export function request(
+    urlOrOptions: RequestOptions | string | URL,
+    optionsOrCallback?: RequestOptions | ((res: IncomingMessageImpl) => void),
+    callback?: (res: IncomingMessageImpl) => void,
+): HttpsClientRequest {
+    if ((typeof urlOrOptions === 'string' || urlOrOptions instanceof URL) && optionsOrCallback && typeof optionsOrCallback === 'object') {
+        return new HttpsClientRequest(mergeUrlOptions<RequestOptions>(urlOrOptions, optionsOrCallback), callback);
+    }
+    return new HttpsClientRequest(urlOrOptions, optionsOrCallback as ((res: IncomingMessageImpl) => void) | undefined);
 }
 
-export function get(options: RequestOptions | string | URL, callback?: (res: IncomingMessageImpl) => void): HttpsClientRequest {
-    const req = request(options, callback);
+export function get(url: string | URL, options: RequestOptions, callback?: (res: IncomingMessageImpl) => void): HttpsClientRequest;
+export function get(options: RequestOptions | string | URL, callback?: (res: IncomingMessageImpl) => void): HttpsClientRequest;
+export function get(
+    urlOrOptions: RequestOptions | string | URL,
+    optionsOrCallback?: RequestOptions | ((res: IncomingMessageImpl) => void),
+    callback?: (res: IncomingMessageImpl) => void,
+): HttpsClientRequest {
+    const req = (typeof urlOrOptions === 'string' || urlOrOptions instanceof URL) && optionsOrCallback && typeof optionsOrCallback === 'object'
+        ? request(urlOrOptions, optionsOrCallback, callback)
+        : request(urlOrOptions, optionsOrCallback as ((res: IncomingMessageImpl) => void) | undefined);
     req.end();
     return req;
 }

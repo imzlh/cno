@@ -3,6 +3,19 @@ import { api, DownloadEngine, DownloadOptions, setCookie, log, colors, showStats
 import { AUDIO_QUALITIES, OUTPUT_FORMATS } from "./types.ts";
 import type { ISongDetail } from "./api/types.ts";
 
+type SearchArtist = { id: number; name: string };
+type SearchSong = {
+    id: number;
+    name: string;
+    dt?: number;
+    duration?: number;
+    ar?: SearchArtist[];
+    artists?: SearchArtist[];
+};
+type AlbumSummary = { id: number; name: string; size?: number };
+type PlaylistTrackRef = number | { id: number };
+type PlaylistSummary = { name: string; trackIds?: PlaylistTrackRef[] };
+
 const defaultOpts: DownloadOptions = {
     outputDir: "musicout/", format: "mp3", quality: "standard",
     embedCover: true, embedLyric: true, concurrency: 1,
@@ -94,10 +107,10 @@ async function handleSearchSong(engine: DownloadEngine) {
         const kw = prompt("\n歌曲名称 (回车退出): ");
         if (!kw) break;
         const d = await api.search(kw, 1, 20);
-        const songs: any[] = d?.result?.songs || [];
+        const songs = (d?.result?.songs || []) as SearchSong[];
         if (!songs.length) { log.warning("未找到"); break; }
         songs.forEach((s, i) => {
-            const ar = (s.ar || s.artists || []).map((a: any) => a.name).join(', ');
+            const ar = (s.ar || s.artists || []).map((a) => a.name).join(', ');
             console.log(`  ${i + 1}. ${s.name} - ${ar} [${formatDuration(s.dt || s.duration)}]`);
         });
         const sel = prompt("选择 (逗号分隔, all=全部): ");
@@ -117,9 +130,9 @@ async function handleSearchArtist(engine: DownloadEngine) {
         const kw = prompt("\n歌手名称 (回车退出): ");
         if (!kw) break;
         const d = await api.search(kw, 100, 10);
-        const artists = d?.result?.artists || [];
+        const artists = (d?.result?.artists || []) as SearchArtist[];
         if (!artists.length) { log.warning("未找到"); break; }
-        artists.forEach((a: any, i: number) => console.log(`  ${i + 1}. ${a.name} (ID:${a.id})`));
+        artists.forEach((a, i: number) => console.log(`  ${i + 1}. ${a.name} (ID:${a.id})`));
         const idx = parseInt(prompt("选择: ") || "0") - 1;
         if (idx < 0 || idx >= artists.length) break;
         const artist = artists[idx];
@@ -136,8 +149,8 @@ async function handleSearchArtist(engine: DownloadEngine) {
             case "2": await downloadAllAlbums(engine, artist.id, artist.name); break;
             case "3": {
                 const ad = await api.getArtistAlbums(artist.id);
-                const albums = ad?.data?.hotAlbums || [];
-                albums.forEach((a: any, i: number) => console.log(`  ${i + 1}. ${a.name} (${a.size || 0}首)`));
+                const albums = (ad?.data?.hotAlbums || []) as AlbumSummary[];
+                albums.forEach((a, i: number) => console.log(`  ${i + 1}. ${a.name} (${a.size || 0}首)`));
                 const ai = parseInt(prompt("选择: ") || "0") - 1;
                 if (ai >= 0 && ai < albums.length) {
                     const { songs, album } = await getAlbumSongs(albums[ai].id);
@@ -171,9 +184,9 @@ async function handleDownloadPlaylist(engine: DownloadEngine) {
         const id = Number(input.match(/\d+/)?.[0]);
         if (!id) break;
         const d = await api.getPlaylistDetail(id);
-        const p = d?.data?.playlist || d?.playlist;
+        const p = (d?.data?.playlist || d?.playlist) as PlaylistSummary | undefined;
         if (!p) { log.error("无法获取歌单"); break; }
-        const ids = (p.trackIds || []).map((t: any) => typeof t === 'number' ? t : t.id);
+        const ids = (p.trackIds || []).map((t) => typeof t === 'number' ? t : t.id);
         const allSongs: ISongDetail[] = [];
         for (let i = 0; i < ids.length; i += 50) {
             const sd = await api.getSongDetail(ids.slice(i, i + 50));

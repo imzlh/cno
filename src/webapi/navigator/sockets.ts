@@ -1,14 +1,23 @@
 import type { SocketOptions, TCPSocket, UDPSocket, UDPMessage, DirectSockets } from './types';
+import { concatChunks } from '../../utils/bytes';
 
 const stream = import.meta.use('streams');
 const udp = import.meta.use('udp');
 const os = import.meta.use('os');
 
+async function closeSocketHandleQuietly(handle: { close(): void | Promise<void> }): Promise<void> {
+    try {
+        await handle.close();
+    } catch {
+        // close() is best-effort once the stream side is being torn down.
+    }
+}
+
 class TCPSocketImpl implements TCPSocket {
     private _tcp: CModuleStreams.TCP;
     private _readable: ReadableStream<Uint8Array>;
     private _writable: WritableStream<Uint8Array>;
-    private _closedResolve!: () => void;
+    private _closedResolve: () => void;
     private _closed: Promise<void>;
     private _buffer: Uint8Array;
     private _pendingData: Uint8Array | null = null;
@@ -18,15 +27,14 @@ class TCPSocketImpl implements TCPSocket {
         this._tcp = new stream.TCP(isV4 ? os.AF_INET : os.AF_INET6);
         this._buffer = new Uint8Array(65536);
 
-        this._closed = new Promise<void>((resolve) => {
-            this._closedResolve = resolve;
-        });
+        const closed = Promise.withResolvers<void>();
+        this._closed = closed.promise;
+        this._closedResolve = closed.resolve;
 
         this._readable = new ReadableStream<Uint8Array>({
             start: (controller) => {
                 const processData = (data: Uint8Array) => {
                     if (data.length === 0) {
-                        // @ts-ignore
                         this._tcp.startRead();
                         return;
                     }
@@ -36,11 +44,9 @@ class TCPSocketImpl implements TCPSocket {
                     if (data.byteLength > n) {
                         this._pendingData = data.subarray(n);
                     }
-                    // @ts-ignore
                     this._tcp.startRead();
                 };
 
-                // @ts-ignore
                 this._tcp.onread = (data: Uint8Array | null | undefined, err?: CModuleError.Error) => {
                     if (data === undefined) {
                         if (err) {
@@ -53,21 +59,17 @@ class TCPSocketImpl implements TCPSocket {
                         return;
                     }
                     if (this._pendingData) {
-                        const combined = new Uint8Array(this._pendingData.byteLength + data.byteLength);
-                        combined.set(this._pendingData);
-                        combined.set(data, this._pendingData.byteLength);
+                        const combined = concatChunks([this._pendingData, data]);
                         this._pendingData = null;
                         processData(combined);
                     } else {
                         processData(data);
                     }
                 };
-                // @ts-ignore
                 this._tcp.startRead();
             },
             cancel: () => {
-                // @ts-ignore
-                this._tcp.onread = null;
+                Reflect.set(this._tcp, 'onread', null);
                 this._tcp.stopRead();
                 this._pendingData = null;
                 this.close();
@@ -112,9 +114,7 @@ class TCPSocketImpl implements TCPSocket {
     }
 
     async close(): Promise<void> {
-        try {
-            this._tcp.close();
-        } catch {}
+        await closeSocketHandleQuietly(this._tcp);
         this._closedResolve();
     }
 }
@@ -123,16 +123,16 @@ class UDPSocketImpl implements UDPSocket {
     private _udp: CModuleUDP.UDP | null = null;
     private _readable: ReadableStream<UDPMessage>;
     private _writable: WritableStream<UDPMessage>;
-    private _closedResolve!: () => void;
+    private _closedResolve: () => void;
     private _closed: Promise<void>;
     private _buffer: Uint8Array;
 
     constructor(options: SocketOptions) {
         this._buffer = new Uint8Array(65536);
 
-        this._closed = new Promise<void>((resolve) => {
-            this._closedResolve = resolve;
-        });
+        const closed = Promise.withResolvers<void>();
+        this._closed = closed.promise;
+        this._closedResolve = closed.resolve;
 
         this._readable = new ReadableStream<UDPMessage>({
             pull: async (controller) => {
@@ -195,9 +195,7 @@ class UDPSocketImpl implements UDPSocket {
 
     async close(): Promise<void> {
         if (this._udp) {
-            try {
-                await this._udp.close();
-            } catch {}
+            await closeSocketHandleQuietly(this._udp);
         }
         this._closedResolve();
     }

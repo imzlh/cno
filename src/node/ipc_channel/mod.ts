@@ -15,7 +15,7 @@
  * escaped), the 0x0A byte is an unambiguous delimiter even across multi-byte
  * UTF-8 sequences (continuation bytes are 0x80-0xBF and can never be 0x0A).
  *
- * User messages are transmitted verbatim as any JSON value (object, array,
+ * User messages are transmitted verbatim as arbitrary JSON values (object, array,
  * string, number, boolean or null). Internal control messages are objects
  * whose `cmd` field begins with "NODE_" (e.g. NODE_HANDLE); these are kept off
  * the user 'message' stream. This is exactly Node's framing, so a circu
@@ -25,23 +25,53 @@
 
 import { EventEmitter } from '../events';
 import { getMemoryTier } from '../_internal/memory';
+import { toOwnedBytes } from '../_internal/buffer';
 
 const engine = import.meta.use('engine');
+const algorithm = import.meta.use('algorithm');
+const timers = import.meta.use('timers');
 
 const NEWLINE = 0x0a;
+const ADVANCED_HEADER_BYTES = 4;
 // Guard against unbounded buffering — tier-aware cap
 const MAX_BUFFER_BYTES = getMemoryTier() === 'low' ? 4 * 1024 * 1024
                        : getMemoryTier() === 'normal' ? 64 * 1024 * 1024
                        : 256 * 1024 * 1024;
 
-function isInternalMessage(message: any): boolean {
+export type IPCSerialization = 'json' | 'advanced';
+
+function isInternalMessage(message: unknown): boolean {
+    const cmd = message !== null && typeof message === 'object'
+        ? Reflect.get(message, 'cmd')
+        : undefined;
     return (
-        message !== null &&
-        typeof message === 'object' &&
-        typeof message.cmd === 'string' &&
-        message.cmd.length > 5 &&
-        message.cmd.slice(0, 5) === 'NODE_'
+        typeof cmd === 'string' &&
+        cmd.length > 5 &&
+        cmd.slice(0, 5) === 'NODE_'
     );
+}
+
+function arrayBufferViewToJsonArray(value: ArrayBufferView): unknown[] {
+    if (value instanceof DataView) {
+        return Array.from(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
+    }
+    if (value instanceof BigInt64Array || value instanceof BigUint64Array) {
+        return Array.from(value, (entry) => entry.toString());
+    }
+    if (
+        value instanceof Int8Array ||
+        value instanceof Uint8Array ||
+        value instanceof Uint8ClampedArray ||
+        value instanceof Int16Array ||
+        value instanceof Uint16Array ||
+        value instanceof Int32Array ||
+        value instanceof Uint32Array ||
+        value instanceof Float32Array ||
+        value instanceof Float64Array
+    ) {
+        return Array.from(value);
+    }
+    return [];
 }
 
 // ============================================================================
@@ -50,49 +80,132 @@ function isInternalMessage(message: any): boolean {
 // ============================================================================
 
 export class MessageDecoder extends EventEmitter {
-    private _buffer: Uint8Array = new Uint8Array(0);
+    private _chunks: Uint8Array[] = [];
+    private _bufferedBytes = 0;
+    private _discardUntilDelimiter = false;
+    private _serialization: IPCSerialization;
+
+    constructor(serialization: IPCSerialization = 'json') {
+        super();
+        this._serialization = serialization;
+    }
 
     feed(data: Uint8Array): void {
         if (!data || data.length === 0) return;
-        if (this._buffer.length + data.length > MAX_BUFFER_BYTES) {
+        if (this._serialization === 'json' && this._discardUntilDelimiter) {
+            const newline = algorithm.bytesIndexOf(data, NEWLINE);
+            if (newline === -1) return;
+            this._discardUntilDelimiter = false;
+            data = data.subarray(newline + 1);
+            if (data.length === 0) return;
+        }
+        if (this._bufferedBytes + data.length > MAX_BUFFER_BYTES) {
             this.emit('error', new RangeError('IPC receive buffer overflow'));
             this.reset();
             return;
         }
-        const merged = new Uint8Array(this._buffer.length + data.length);
-        merged.set(this._buffer);
-        merged.set(data, this._buffer.length);
-        this._buffer = merged;
+        this._chunks.push(data);
+        this._bufferedBytes += data.length;
         this._processBuffer();
     }
 
     private _processBuffer(): void {
-        let start = 0;
-        for (let i = 0; i < this._buffer.length; i++) {
-            if (this._buffer[i] !== NEWLINE) continue;
-            // Bytes [start, i) are one complete UTF-8 JSON message (skip empty).
-            if (i > start) {
-                const lineBytes = this._buffer.subarray(start, i);
+        if (this._serialization === 'advanced') {
+            this._processAdvancedBuffer();
+            return;
+        }
+
+        for (;;) {
+            let chunkIndex = -1;
+            let newline = -1;
+            let bytesBefore = 0;
+            for (let i = 0; i < this._chunks.length; i++) {
+                const chunk = this._chunks[i];
+                if (!chunk) continue;
+                newline = algorithm.bytesIndexOf(chunk, NEWLINE);
+                if (newline !== -1) {
+                    chunkIndex = i;
+                    break;
+                }
+                bytesBefore += chunk.length;
+            }
+            if (chunkIndex === -1) break;
+
+            // Bytes before the delimiter are one complete UTF-8 JSON message.
+            const frameLength = bytesBefore + newline;
+            const lineBytes = frameLength > 0 ? this._readFrame(chunkIndex, newline) : undefined;
+            this._consumeFrame(chunkIndex, newline, frameLength + 1);
+            if (lineBytes) {
                 let parsed: unknown;
                 let ok = true;
                 try {
-                    parsed = JSON.parse(engine.decodeString(lineBytes as Uint8Array<ArrayBuffer>));
+                    parsed = JSON.parse(engine.decodeString(lineBytes));
                 } catch {
                     ok = false;
                 }
                 if (ok) this.emit('message', parsed);
                 else this.emit('error', new Error('Invalid IPC message'));
             }
-            start = i + 1;
-        }
-        // Retain any trailing bytes belonging to a not-yet-terminated message.
-        if (start > 0) {
-            this._buffer = this._buffer.slice(start);
         }
     }
 
+    private _processAdvancedBuffer(): void {
+        for (;;) {
+            if (this._bufferedBytes < ADVANCED_HEADER_BYTES) return;
+            const data = algorithm.bytesConcat(this._chunks);
+            const frameLength = (
+                (data[0] << 24) |
+                (data[1] << 16) |
+                (data[2] << 8) |
+                data[3]
+            ) >>> 0;
+            if (frameLength > MAX_BUFFER_BYTES) {
+                this.emit('error', new RangeError('IPC receive buffer overflow'));
+                this.reset();
+                return;
+            }
+            const totalLength = ADVANCED_HEADER_BYTES + frameLength;
+            if (data.length < totalLength) return;
+
+            const frame = toOwnedBytes(data.subarray(ADVANCED_HEADER_BYTES, totalLength));
+            const rest = data.subarray(totalLength);
+            this._chunks = rest.length > 0 ? [toOwnedBytes(rest)] : [];
+            this._bufferedBytes = rest.length;
+
+            try {
+                this.emit('message', engine.deserialize(frame));
+            } catch {
+                this.emit('error', new Error('Invalid IPC message'));
+            }
+        }
+    }
+
+    private _readFrame(chunkIndex: number, newline: number): Uint8Array<ArrayBuffer> {
+        const chunk = this._chunks[chunkIndex];
+        if (!chunk) return new Uint8Array(0);
+        if (chunkIndex === 0) return toOwnedBytes(chunk.subarray(0, newline));
+        const parts = this._chunks.slice(0, chunkIndex);
+        parts.push(chunk.subarray(0, newline));
+        return toOwnedBytes(algorithm.bytesConcat(parts));
+    }
+
+    private _consumeFrame(chunkIndex: number, newline: number, consumed: number): void {
+        const chunk = this._chunks[chunkIndex];
+        if (!chunk) return;
+        const restOffset = newline + 1;
+        if (restOffset < chunk.length) {
+            if (chunkIndex > 0) this._chunks.splice(0, chunkIndex);
+            this._chunks[0] = chunk.subarray(restOffset);
+        } else {
+            this._chunks.splice(0, chunkIndex + 1);
+        }
+        this._bufferedBytes -= consumed;
+    }
+
     reset(): void {
-        this._buffer = new Uint8Array(0);
+        this._discardUntilDelimiter = this._bufferedBytes > 0;
+        this._chunks = [];
+        this._bufferedBytes = 0;
     }
 }
 
@@ -104,13 +217,18 @@ export class IPCChannel extends EventEmitter {
     private _pipe: Pipe | null;
     private _decoder: MessageDecoder;
     private _connected: boolean = false;
+    private _serialization: IPCSerialization;
+    private _pendingWrites = 0;
+    private _closeAfterWrites = false;
+    private _unrefWhenIdle = false;
 
-    constructor(pipe: Pipe) {
+    constructor(pipe: Pipe, serialization: IPCSerialization = 'json') {
         super();
         this._pipe = pipe;
-        this._decoder = new MessageDecoder();
+        this._serialization = serialization;
+        this._decoder = new MessageDecoder(serialization);
 
-        this._decoder.on('message', (msg: any) => {
+        this._decoder.on('message', (msg: unknown) => {
             if (isInternalMessage(msg)) {
                 // Control traffic (e.g. NODE_HANDLE). Handle/socket passing is not
                 // supported over this channel; expose it for observers but keep it
@@ -164,31 +282,97 @@ export class IPCChannel extends EventEmitter {
         if (!this._connected || !this._pipe) {
             throw new Error('IPC channel is not connected');
         }
-        const json = JSON.stringify(message);
+        const frame = this._serialization === 'advanced'
+            ? this._encodeAdvancedFrame(message)
+            : this._encodeJsonFrame(message);
+        // pipe.write returns a promise; surface async write failures as channel
+        // errors instead of leaving an unhandled rejection.
+        this._pendingWrites++;
+        if (this._unrefWhenIdle) this._pipe.ref();
+        this._pipe.write(frame)
+            .catch((err: Error) => this.emit('error', err))
+            .finally(() => {
+                this._pendingWrites--;
+                if (this._pendingWrites !== 0) return;
+                if (this._closeAfterWrites) {
+                    this._closeNow();
+                    return;
+                }
+                if (this._unrefWhenIdle) {
+                    const pipe = this._pipe;
+                    timers.setTimeout(() => {
+                        if (this._pendingWrites === 0 && this._unrefWhenIdle && this._pipe === pipe) {
+                            pipe?.unref();
+                        }
+                    }, 0);
+                }
+            });
+    }
+
+    private _encodeJsonFrame(message: unknown): Uint8Array {
+        const json = JSON.stringify(message, (_key, value) => {
+            if (ArrayBuffer.isView(value)) return arrayBufferViewToJsonArray(value);
+            return value;
+        });
         if (json === undefined) {
             throw new TypeError('IPC message could not be serialized');
         }
-        const frame = engine.encodeString(json + '\n');
-        // pipe.write returns a promise; surface async write failures as channel
-        // errors instead of leaving an unhandled rejection.
-        const result = this._pipe.write(frame) as unknown as Promise<number> | undefined;
-        if (result && typeof (result as Promise<number>).catch === 'function') {
-            (result as Promise<number>).catch((err: Error) => this.emit('error', err));
-        }
+        return engine.encodeString(json + '\n');
+    }
+
+    private _encodeAdvancedFrame(message: unknown): Uint8Array {
+        const payload = engine.serialize(message);
+        const length = payload.byteLength;
+        if (length > 0xffffffff) throw new RangeError('IPC message is too large');
+        const frame = new Uint8Array(ADVANCED_HEADER_BYTES + length);
+        frame[0] = (length >>> 24) & 0xff;
+        frame[1] = (length >>> 16) & 0xff;
+        frame[2] = (length >>> 8) & 0xff;
+        frame[3] = length & 0xff;
+        frame.set(payload, ADVANCED_HEADER_BYTES);
+        return frame;
     }
 
     close(): void {
-        if (this._pipe) {
-            try {
-                this._pipe.close();
-            } catch { /* ignore */ }
-            this._pipe = null;
+        if (this._pendingWrites > 0) {
+            this._closeAfterWrites = true;
+            this._connected = false;
+            return;
         }
+        this._closeNow();
+    }
+
+    private _closeNow(): void {
+        const pipe = this._pipe;
+        if (pipe) {
+            this._pipe = null;
+            try {
+                pipe.ref();
+                pipe.shutdown()
+                    .catch(() => undefined)
+                    .finally(() => {
+                        try { pipe.close(); } catch { /* ignore */ }
+                    });
+            } catch {
+                try { pipe.close(); } catch { /* ignore */ }
+            }
+        }
+        this._closeAfterWrites = false;
         this._decoder.reset();
         if (this._connected) {
             this._connected = false;
             this.emit('close');
         }
+    }
+
+    ref(): void {
+        this._unrefWhenIdle = false;
+        this._pipe?.ref();
+    }
+
+    unref(): void {
+        this._unrefWhenIdle = true;
+        if (this._pendingWrites === 0) this._pipe?.unref();
     }
 
     get connected(): boolean {

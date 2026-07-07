@@ -26,14 +26,6 @@ interface StorageOptions {
     autoVacuum?: boolean;
 }
 
-interface StorageEventInit {
-    key: string | null;
-    oldValue: string | null;
-    newValue: string | null;
-    url: string;
-    storageArea: Storage | null;
-}
-
 interface StorageStats {
     count: number;
     totalSize: number;
@@ -41,12 +33,23 @@ interface StorageStats {
     available: number;
 }
 
+type StorageEventListener = (event: StorageEvent) => void;
+type StorageRow = CModuleSQLite3.SqliteRow;
+
+function emitStorageListener(listener: StorageEventListener, event: StorageEvent): void {
+    try {
+        listener(event);
+    } catch (e) {
+        console.error('Error in storage event listener:', e);
+    }
+}
+
 // Storage Implementation
 
 class Storage {
     private db: CModuleSQLite3.Sqlite3Handle | null = null;
     private options: Required<StorageOptions>;
-    private eventListeners: Map<string, Set<Function>> = new Map();
+    private eventListeners: Map<string, Set<StorageEventListener>> = new Map();
     private stmtCache: Map<string, CModuleSQLite3.Sqlite3Stmt> = new Map();
     private _initialized = false;
 
@@ -72,7 +75,19 @@ class Storage {
     }
 
     private getDb(): CModuleSQLite3.Sqlite3Handle {
-        return this.db!;
+        if (!this.db) throw new Error('Storage database is not initialized');
+        return this.db;
+    }
+
+    private getStmt(name: string): CModuleSQLite3.Sqlite3Stmt {
+        const stmt = this.stmtCache.get(name);
+        if (!stmt) throw new Error(`Storage statement is not prepared: ${name}`);
+        return stmt;
+    }
+
+    private firstRow(rows: StorageRow[]): StorageRow | null {
+        const row = rows[0];
+        return row === undefined ? null : row;
     }
 
     private ensureDb(): void {
@@ -91,7 +106,7 @@ class Storage {
     /**
      * Debug logging
      */
-    private log(...args: any[]): void {
+    private log(...args: unknown[]): void {
         if (this.options.debug) {
             console.log(`[Storage:${this.options.name}]`, ...args);
         }
@@ -287,11 +302,7 @@ class Storage {
         const listeners = this.eventListeners.get('storage');
         if (listeners) {
             for (const listener of listeners) {
-                try {
-                    listener(event);
-                } catch (e) {
-                    console.error('Error in storage event listener:', e);
-                }
+                emitStorageListener(listener, event);
             }
         }
     }
@@ -302,9 +313,9 @@ class Storage {
     private checkQuota(additionalSize: number): void {
         if (this.options.quota <= 0) return;
 
-        const stmt = this.stmtCache.get(Storage.STMT_SIZE)!;
+        const stmt = this.getStmt(Storage.STMT_SIZE);
         const result = stmt.all([]);
-        const currentSize = result[0]!.total as number;
+        const currentSize = Number(this.firstRow(result)?.total ?? 0);
 
         if (currentSize + additionalSize > this.options.quota) {
             throw new DOMException(
@@ -324,8 +335,9 @@ class Storage {
             const result = existingStmt.all([key]);
             existingStmt.finalize();
             
-            if (result.length > 0) {
-                return result[0]!.created_at as number;
+            const row = this.firstRow(result);
+            if (row) {
+                return Number(row.created_at);
             }
         } catch (error) {
             this.log('Error getting created_at:', error);
@@ -345,9 +357,9 @@ class Storage {
     get length(): number {
         this.ensureDb();
         try {
-            const stmt = this.stmtCache.get(Storage.STMT_COUNT)!;
+            const stmt = this.getStmt(Storage.STMT_COUNT);
             const result = stmt.all([]);
-            return result[0]!.count as number;
+            return Number(this.firstRow(result)?.count ?? 0);
         } catch (error) {
             this.log('Error getting length:', error);
             return 0;
@@ -360,14 +372,16 @@ class Storage {
     getItem(key: string): string | null {
         this.ensureDb();
         try {
-            const stmt = this.stmtCache.get(Storage.STMT_GET)!;
-            const result = stmt.all([key]);
+            const stringKey = String(key);
+            const stmt = this.getStmt(Storage.STMT_GET);
+            const result = stmt.all([stringKey]);
 
-            if (result.length === 0) {
+            const row = this.firstRow(result);
+            if (!row) {
                 return null;
             }
 
-            return result[0]!.value as string;
+            return typeof row.value === 'string' ? row.value : String(row.value ?? '');
         } catch (error) {
             this.log('Error getting item:', error);
             return null;
@@ -380,33 +394,34 @@ class Storage {
     setItem(key: string, value: string): void {
         this.ensureDb();
         try {
+            const stringKey = String(key);
             // Convert value to string (Web Storage API behavior)
             const stringValue = String(value);
-            const size = stringValue.length * 2; // Approximate UTF-16 size
+            const size = (stringKey.length + stringValue.length) * 2; // Approximate UTF-16 size
             const now = Date.now();
 
             // Check if key exists to get old value for event
-            const oldValue = this.getItem(key);
+            const oldValue = this.getItem(stringKey);
 
             // Check quota before writing
             if (oldValue === null) {
                 this.checkQuota(size);
             } else {
-                const oldSize = oldValue.length * 2;
+                const oldSize = (stringKey.length + oldValue.length) * 2;
                 this.checkQuota(size - oldSize);
             }
 
             // For INSERT OR REPLACE, we need to preserve created_at
-            const createdTime = oldValue === null ? now : this.getCreatedTimeForUpdate(key, now);
+            const createdTime = oldValue === null ? now : this.getCreatedTimeForUpdate(stringKey, now);
 
             // Insert or update using INSERT OR REPLACE
-            const stmt = this.stmtCache.get(Storage.STMT_SET)!;
-            stmt.run([key, stringValue, size, createdTime, now]);
+            const stmt = this.getStmt(Storage.STMT_SET);
+            stmt.run([stringKey, stringValue, size, createdTime, now]);
 
-            this.log(`Set item: ${key} (${size} bytes)`);
+            this.log(`Set item: ${stringKey} (${size} bytes)`);
 
             // Dispatch storage event
-            this.dispatchStorageEvent(key, oldValue, stringValue);
+            this.dispatchStorageEvent(stringKey, oldValue, stringValue);
         } catch (error) {
             this.log('Error setting item:', error);
             throw error;
@@ -419,21 +434,22 @@ class Storage {
     removeItem(key: string): void {
         this.ensureDb();
         try {
+            const stringKey = String(key);
             // Get old value for event
-            const oldValue = this.getItem(key);
+            const oldValue = this.getItem(stringKey);
 
             if (oldValue === null) {
                 return; // Key doesn't exist
             }
 
             // Delete item
-            const stmt = this.stmtCache.get(Storage.STMT_DELETE)!;
-            stmt.run([key]);
+            const stmt = this.getStmt(Storage.STMT_DELETE);
+            stmt.run([stringKey]);
 
-            this.log(`Removed item: ${key}`);
+            this.log(`Removed item: ${stringKey}`);
 
             // Dispatch storage event
-            this.dispatchStorageEvent(key, oldValue, null);
+            this.dispatchStorageEvent(stringKey, oldValue, null);
         } catch (error) {
             this.log('Error removing item:', error);
             throw error;
@@ -446,7 +462,7 @@ class Storage {
     clear(): void {
         this.ensureDb();
         try {
-            const stmt = this.stmtCache.get(Storage.STMT_CLEAR)!;
+            const stmt = this.getStmt(Storage.STMT_CLEAR);
             stmt.run([]);
 
             this.log('Cleared all items');
@@ -470,16 +486,18 @@ class Storage {
     key(index: number): string | null {
         this.ensureDb();
         try {
+            index = Number(index);
             if (index < 0) return null;
 
-            const stmt = this.stmtCache.get(Storage.STMT_KEYS)!;
+            const stmt = this.getStmt(Storage.STMT_KEYS);
             const result = stmt.all([]);
 
             if (index >= result.length) {
                 return null;
             }
 
-            return result[index]!.key as string;
+            const row = result[index];
+            return typeof row?.key === 'string' ? row.key : null;
         } catch (error) {
             this.log('Error getting key at index:', error);
             return null;
@@ -496,9 +514,9 @@ class Storage {
     keys(): string[] {
         this.ensureDb();
         try {
-            const stmt = this.stmtCache.get(Storage.STMT_KEYS)!;
+            const stmt = this.getStmt(Storage.STMT_KEYS);
             const result = stmt.all([]);
-            return result.map(row => row.key as string);
+            return result.map(row => String(row.key));
         } catch (error) {
             this.log('Error getting keys:', error);
             return [];
@@ -514,7 +532,7 @@ class Storage {
             const stmt = this.getDb().prepare('SELECT value FROM storage ORDER BY key');
             const result = stmt.all([]);
             stmt.finalize();
-            return result.map(row => row.value as string);
+            return result.map(row => String(row.value ?? ''));
         } catch (error) {
             this.log('Error getting values:', error);
             return [];
@@ -530,7 +548,7 @@ class Storage {
             const stmt = this.getDb().prepare('SELECT key, value FROM storage ORDER BY key');
             const result = stmt.all([]);
             stmt.finalize();
-            return result.map(row => [row.key as string, row.value as string]);
+            return result.map(row => [String(row.key ?? ''), String(row.value ?? '')]);
         } catch (error) {
             this.log('Error getting entries:', error);
             return [];
@@ -550,14 +568,14 @@ class Storage {
     getStats(): StorageStats {
         this.ensureDb();
         try {
-            const countStmt = this.stmtCache.get(Storage.STMT_COUNT)!;
-            const sizeStmt = this.stmtCache.get(Storage.STMT_SIZE)!;
+            const countStmt = this.getStmt(Storage.STMT_COUNT);
+            const sizeStmt = this.getStmt(Storage.STMT_SIZE);
 
             const countResult = countStmt.all([]);
             const sizeResult = sizeStmt.all([]);
 
-            const count = countResult[0]!.count as number;
-            const totalSize = sizeResult[0]!.total as number;
+            const count = Number(this.firstRow(countResult)?.count ?? 0);
+            const totalSize = Number(this.firstRow(sizeResult)?.total ?? 0);
             const quota = this.options.quota;
             const available = quota > 0 ? quota - totalSize : Infinity;
 
@@ -591,17 +609,19 @@ class Storage {
     /**
      * Add event listener
      */
-    addEventListener(type: string, listener: Function): void {
-        if (!this.eventListeners.has(type)) {
-            this.eventListeners.set(type, new Set());
+    addEventListener(type: string, listener: StorageEventListener): void {
+        let listeners = this.eventListeners.get(type);
+        if (!listeners) {
+            listeners = new Set();
+            this.eventListeners.set(type, listeners);
         }
-        this.eventListeners.get(type)!.add(listener);
+        listeners.add(listener);
     }
 
     /**
      * Remove event listener
      */
-    removeEventListener(type: string, listener: Function): void {
+    removeEventListener(type: string, listener: StorageEventListener): void {
         const listeners = this.eventListeners.get(type);
         if (listeners) {
             listeners.delete(listener);
@@ -668,6 +688,74 @@ class Storage {
     }
 }
 
+const storageProxyCache = new WeakMap<Storage, Storage>();
+const storageInternalProps = new Set(['db', 'options', 'eventListeners', 'stmtCache', '_initialized']);
+
+const isHiddenStorageProp = (prop: PropertyKey): prop is string =>
+    typeof prop === 'string' && storageInternalProps.has(prop);
+
+function createStorageProxy(storage: Storage): Storage {
+    const cached = storageProxyCache.get(storage);
+    if (cached) return cached;
+
+    const proxy = new Proxy(storage, {
+        get(target, prop, receiver) {
+            if (typeof prop === 'string' && (isHiddenStorageProp(prop) || !(prop in target))) {
+                const value = target.getItem(prop);
+                return value === null ? undefined : value;
+            }
+            const value = Reflect.get(target, prop, target);
+            return typeof value === 'function' ? value.bind(target) : value;
+        },
+
+        set(target, prop, value, receiver) {
+            if (typeof prop === 'string' && (isHiddenStorageProp(prop) || !(prop in target))) {
+                target.setItem(prop, String(value));
+                return true;
+            }
+            return Reflect.set(target, prop, value, target);
+        },
+
+        has(target, prop) {
+            if (typeof prop === 'string' && (isHiddenStorageProp(prop) || !(prop in target))) {
+                return target.getItem(prop) !== null;
+            }
+            return Reflect.has(target, prop);
+        },
+
+        deleteProperty(target, prop) {
+            if (typeof prop === 'string' && target.getItem(prop) !== null) {
+                target.removeItem(prop);
+                return true;
+            }
+            return Reflect.deleteProperty(target, prop);
+        },
+
+        ownKeys(target) {
+            const targetKeys = Reflect.ownKeys(target).filter(prop => !isHiddenStorageProp(prop));
+            const keys = target.keys().filter(key => isHiddenStorageProp(key) || !Reflect.has(target, key));
+            return [...targetKeys, ...keys];
+        },
+
+        getOwnPropertyDescriptor(target, prop) {
+            if (isHiddenStorageProp(prop)) {
+                const value = target.getItem(prop);
+                if (value === null) return undefined;
+                return { value, writable: true, enumerable: true, configurable: true };
+            }
+            const descriptor = Reflect.getOwnPropertyDescriptor(target, prop);
+            if (descriptor) return descriptor;
+            if (typeof prop !== 'string' || prop in target) return undefined;
+            const value = target.getItem(prop);
+            if (value === null) return undefined;
+            return { value, writable: true, enumerable: true, configurable: true };
+        }
+    });
+
+    storageProxyCache.set(storage, proxy);
+    return proxy;
+}
+
 // Storage Manager
 
 class StorageManager {
@@ -683,8 +771,9 @@ class StorageManager {
      * Create or get storage instance
      */
     getStorage(name: string, path?: string, options?: Partial<StorageOptions>): Storage {
-        if (this.storages.has(name)) {
-            return this.storages.get(name)!;
+        const existing = this.storages.get(name);
+        if (existing) {
+            return existing;
         }
 
         const storagePath = path || this.getDefaultPath(name);
@@ -703,16 +792,28 @@ class StorageManager {
      * Get default storage path
      */
     private getDefaultPath(name: string): string {
-        const genenv = (env: string) => {
-            try{
+        const getEnv = (env: string): string => {
+            try {
                 return os.getenv(env) || '';
-            } catch (error) {
+            } catch {
                 return '';
             }
-        }
+        };
+        const writableRoot = (dir: string): boolean => {
+            if (!dir) return false;
+            const probe = `${dir}/.cno-storage-probe-${os.pid}`;
+            try {
+                fs.writeFile(probe, new ArrayBuffer(0));
+                fs.unlink(probe);
+                return true;
+            } catch {
+                return false;
+            }
+        };
         const cwd = os.cwd || os.tmpDir || '/tmp';
         const hash = crypto.hexEncode(crypto.md5(engine.encodeString(cwd)));
-        const homeDir = genenv('HOME') || os.tmpDir || cwd;
+        const preferred = getEnv('CNO_STORAGE_DIR') || getEnv('HOME') || os.tmpDir || cwd;
+        const homeDir = writableRoot(preferred) ? preferred : (os.tmpDir || cwd);
         const baseDir = `${homeDir}/.storage/${hash}`;
         return `${baseDir}/${name}.db`;
     }
@@ -754,14 +855,14 @@ const storageManager = new StorageManager();
  * Get localStorage instance (persistent)
  */
 export function getLocalStorage(path?: string): Storage {
-    return storageManager.getStorage('localStorage', path);
+    return createStorageProxy(storageManager.getStorage('localStorage', path));
 }
 
 /**
  * Get sessionStorage instance (persistent, but typically cleared)
  */
 export function getSessionStorage(path?: string): Storage {
-    return storageManager.getStorage('sessionStorage', path);
+    return createStorageProxy(storageManager.getStorage('sessionStorage', path));
 }
 
 /**
@@ -769,11 +870,11 @@ export function getSessionStorage(path?: string): Storage {
  */
 export function createStorage(name: string, options?: StorageOptions): Storage {
     const path = options?.path || storageManager['getDefaultPath'](name);
-    return new Storage({
+    return createStorageProxy(new Storage({
         name,
         path,
         ...options
-    });
+    }));
 }
 
 /**
@@ -788,15 +889,21 @@ function StorageCtor(): never {
 }
 StorageCtor.prototype = Storage.prototype;
 
-// 安全地挂载到 globalThis，避免重复初始化
-if (!globalThis.localStorage) {
-    globalThis.localStorage = getLocalStorage();
-}
-if (!globalThis.sessionStorage) {
-    globalThis.sessionStorage = getSessionStorage();
-}
-// @ts-ignore
-if (!globalThis.Storage) {
-    // @ts-ignore
-    globalThis.Storage = StorageCtor;
+const localStorageInstance = getLocalStorage();
+const sessionStorageInstance = getSessionStorage();
+
+Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    enumerable: true,
+    get: () => localStorageInstance,
+    set: () => {}
+});
+Object.defineProperty(globalThis, 'sessionStorage', {
+    configurable: true,
+    enumerable: true,
+    get: () => sessionStorageInstance,
+    set: () => {}
+});
+if (!Reflect.get(globalThis, 'Storage')) {
+    Reflect.set(globalThis, 'Storage', StorageCtor);
 }

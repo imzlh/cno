@@ -5,15 +5,20 @@
  * globalThis.console behaves the same as import.meta.use('console').
  */
 
-const internal = import.meta.use('console') as Record<string, any>;
+const internal = import.meta.use('console');
+type ConsoleMethod = keyof typeof internal;
+type NativeConsoleFunction = (this: typeof internal, ...args: unknown[]) => unknown;
 
-function call(name: string, fallback: string, args: unknown[]): void {
+function call(name: ConsoleMethod, fallback: ConsoleMethod, args: unknown[]): void {
     const fn = internal[name] ?? internal[fallback];
-    if (typeof fn === 'function') fn.apply(internal, args);
+    if (typeof fn === 'function') Reflect.apply(fn as NativeConsoleFunction, internal, args);
 }
 
 function format(...allArgs: unknown[]): string {
-    return String(internal.format.apply(internal, allArgs));
+    const fn = internal.format;
+    return typeof fn === 'function'
+        ? String(Reflect.apply(fn, internal, allArgs))
+        : allArgs.map(String).join(' ');
 }
 
 const webConsole = {
@@ -102,6 +107,8 @@ const webConsole = {
 
     format,
 };
+
+Object.setPrototypeOf(webConsole, Object.create(Object.prototype));
 
 Object.defineProperty(globalThis, 'console', {
     value: webConsole,

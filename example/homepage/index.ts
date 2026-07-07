@@ -7,6 +7,16 @@ const app = new Hono();
 // 数据存储文件路径
 const DATA_FILE = "./data/submissions.json";
 
+interface Submission {
+  id: string;
+  name: string;
+  email: string;
+  message: string;
+  interests: unknown[];
+  rating: number;
+  timestamp: string;
+}
+
 // 确保数据目录存在
 try {
   await Deno.mkdir("./data", { recursive: true });
@@ -24,17 +34,18 @@ try {
 }
 
 // 辅助函数：读写数据
-async function readSubmissions() {
+async function readSubmissions(): Promise<Submission[]> {
   try {
     const data = await Deno.readTextFile(DATA_FILE);
-    return JSON.parse(data);
+    const parsed = JSON.parse(data);
+    return Array.isArray(parsed) ? parsed as Submission[] : [];
   } catch (error) {
     console.error("读取数据失败:", error);
     return [];
   }
 }
 
-async function writeSubmissions(submissions: any[]) {
+async function writeSubmissions(submissions: Submission[]) {
   try {
     await Deno.writeTextFile(DATA_FILE, JSON.stringify(submissions, null, 2));
     return true;
@@ -67,7 +78,7 @@ app.get("/api/submissions", async (c) => {
 
 app.post("/api/submit", async (c) => {
   try {
-    const body = await c.req.json();
+    const body = await c.req.json() as Partial<Submission>;
     
     // 验证必需字段
     if (!body.name || !body.email) {
@@ -122,7 +133,7 @@ app.delete("/api/submission/:id", async (c) => {
     const submissions = await readSubmissions();
     
     const initialLength = submissions.length;
-    const filtered = submissions.filter((s: any) => s.id !== id);
+    const filtered = submissions.filter((s) => s.id !== id);
     
     if (filtered.length === initialLength) {
       return c.json(

@@ -12,7 +12,7 @@ interface ClashProxy {
     type: string;
     server: string;
     port: number;
-    [key: string]: any;
+    [key: string]: unknown;
 }
 
 interface ClashConfig {
@@ -25,7 +25,7 @@ interface ClashConfig {
     proxies: ClashProxy[];
     "proxy-groups": ProxyGroup[];
     rules: string[];
-    [key: string]: any;
+    [key: string]: unknown;
 }
 
 interface ProxyGroup {
@@ -34,7 +34,7 @@ interface ProxyGroup {
     proxies: string[];
     url?: string;
     interval?: number;
-    [key: string]: any;
+    [key: string]: unknown;
 }
 
 // 默认Clash模板
@@ -462,7 +462,7 @@ function generateClashConfig(
 }
 
 // JSON 转 YAML
-function jsonToYaml(obj: any, indent = 0): string {
+function jsonToYaml(obj: unknown, indent = 0): string {
     const spaces = "  ".repeat(indent);
     let result = "";
 
@@ -497,7 +497,7 @@ function jsonToYaml(obj: any, indent = 0): string {
     return result;
 }
 
-function formatValue(value: any): string {
+function formatValue(value: unknown): string {
     if (typeof value === "string") {
         if (
             value.includes(":") ||

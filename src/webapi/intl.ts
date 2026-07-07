@@ -3,6 +3,7 @@
 type CurrencyCode = 'USD' | 'EUR' | 'GBP' | 'CNY' | 'JPY' | 'KRW' | 'TWD' | 'HKD';
 type TimeUnit = 'second' | 'minute' | 'hour' | 'day' | 'week' | 'month' | 'year';
 const SUPPORTED_LOCALES = ['zh', 'zh-CN', 'zh-TW', 'en', 'en-US', 'en-GB'] as const;
+const RELATIVE_TIME_UNITS = new Set<TimeUnit>(['second', 'minute', 'hour', 'day', 'week', 'month', 'year']);
 
 function canonicalizeLocale(locale: string): string {
     const parts = String(locale).replace(/_/g, '-').split('-').filter(Boolean);
@@ -15,7 +16,7 @@ function canonicalizeLocale(locale: string): string {
     }).join('-');
 }
 
-function normalizeLocale(locale?: string | string[]): string {
+function normalizeLocale(locale?: Intl.LocalesArgument): string {
     const first = Array.isArray(locale) ? locale[0] : locale;
     const normalized = first ? canonicalizeLocale(first) : 'en-US';
     if (!normalized) return 'en-US';
@@ -23,6 +24,12 @@ function normalizeLocale(locale?: string | string[]): string {
     if (normalized.startsWith('zh')) return 'zh-CN';
     if (normalized.startsWith('en')) return 'en-US';
     return normalized;
+}
+
+function normalizeRelativeTimeUnit(unit: Intl.RelativeTimeFormatUnit): TimeUnit {
+    const singular = unit.endsWith('s') ? unit.slice(0, -1) : unit;
+    if (RELATIVE_TIME_UNITS.has(singular as TimeUnit)) return singular as TimeUnit;
+    throw new RangeError(`Invalid relative time unit: ${unit}`);
 }
 
 function supportedLocalesOf(locales: string | string[]): string[] {
@@ -308,17 +315,19 @@ class RelativeTimeFormat implements Intl.RelativeTimeFormat {
     }
 
     format(value: number, unit: Intl.RelativeTimeFormatUnit): string {
+        const normalizedUnit = normalizeRelativeTimeUnit(unit);
         const rtData = this.data.relativeTime;
         
         // Auto mode for special cases
         if (this.options.numeric === 'auto' && Math.abs(value) <= 1) {
-            // @ts-ignore
-            const autoText = rtData.auto[unit as TimeUnit]?.[value.toString()];
+            const autoValues = rtData.auto[normalizedUnit];
+            const autoKey = value === -1 ? '-1' : value === 0 ? '0' : value === 1 ? '1' : undefined;
+            const autoText = autoKey ? autoValues?.[autoKey] : undefined;
             if (autoText) return autoText;
         }
         
         const absValue = Math.abs(value);
-        const unitData = rtData.units[unit as TimeUnit];
+        const unitData = rtData.units[normalizedUnit];
         const unitText = absValue === 1 ? unitData.one : unitData.other;
         const formatted = unitText.replace('{0}', absValue.toString());
         
@@ -388,7 +397,7 @@ class Collator implements Intl.Collator {
     private options: Intl.CollatorOptions;
 
     constructor(locales?: Intl.LocalesArgument, options?: Intl.CollatorOptions) {
-        this.locale = normalizeLocale(locales as string | string[] | undefined);
+        this.locale = normalizeLocale(locales);
         this.options = {
             usage: 'sort',
             sensitivity: 'variant',
@@ -533,32 +542,53 @@ class Locale implements Intl.Locale {
 // ============ ListFormat ============
 class ListFormat implements Intl.ListFormat {
     private locale: string;
+    private type: Intl.ListFormatType;
+    private style: Intl.ListFormatStyle;
     
-    constructor(locale?: string | string[], _options?: Intl.ListFormatOptions) {
+    constructor(locale?: string | string[], options?: Intl.ListFormatOptions) {
         this.locale = normalizeLocale(locale);
+        this.type = options?.type ?? 'conjunction';
+        this.style = options?.style ?? 'long';
+    }
+
+    private middleSeparator(): string {
+        if (this.locale.startsWith('zh')) return '、';
+        if (this.type === 'unit') return this.style === 'narrow' ? ' ' : ', ';
+        return ', ';
+    }
+
+    private finalSeparator(length: number): string {
+        if (this.locale.startsWith('zh')) return this.type === 'disjunction' ? '或' : '和';
+        if (this.type === 'disjunction') return length > 2 ? ', or ' : ' or ';
+        if (this.type === 'unit') return this.style === 'narrow' ? ' ' : ', ';
+        return length > 2 ? ', and ' : ' and ';
     }
     
     format(list: Iterable<string>): string {
-        const arr = Array.from(list);
-        if (arr.length === 0) return '';
-        if (arr.length === 1) return arr[0];
-        if (arr.length === 2) return arr.join(this.locale.startsWith('zh') ? '和' : ' and ');
-        
-        const last = arr[arr.length - 1];
-        const rest = arr.slice(0, -1).join(this.locale.startsWith('zh') ? '、' : ', ');
-        return rest + (this.locale.startsWith('zh') ? '和' : ', and ') + last;
+        return this.formatToParts(list).map(part => part.value).join('');
     }
     
     formatToParts(list: Iterable<string>): { type: "element" | "literal"; value: string; }[] {
-        const formatted = this.format(list);
-        return [{ type: 'element', value: formatted }];
+        const arr = Array.from(list, value => String(value));
+        const parts: { type: "element" | "literal"; value: string; }[] = [];
+        for (let i = 0; i < arr.length; i++) {
+            if (i > 0) {
+                parts.push({
+                    type: 'literal',
+                    value: i === arr.length - 1 ? this.finalSeparator(arr.length) : this.middleSeparator(),
+                });
+            }
+            const value = arr[i];
+            if (value !== undefined) parts.push({ type: 'element', value });
+        }
+        return parts;
     }
     
     resolvedOptions(): Intl.ResolvedListFormatOptions {
         return {
             locale: this.locale,
-            type: 'conjunction',
-            style: 'long'
+            type: this.type,
+            style: this.style
         };
     }
     

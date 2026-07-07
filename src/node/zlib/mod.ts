@@ -30,6 +30,10 @@ export const BLOCK = zlib.BLOCK;
 
 // Type definitions
 
+function asError(error: unknown): Error {
+    return error instanceof Error ? error : new Error(String(error));
+}
+
 export interface ZlibOptions {
     flush?: number;
     finishFlush?: number;
@@ -51,68 +55,136 @@ export interface BrotliOptions {
     maxOutputLength?: number;
 }
 
-export type CompressCallback = (err: Error | null, result?: Uint8Array) => void;
+export type ZlibInput = string | ArrayBuffer | ArrayBufferView;
+export type CompressCallback = (err: Error | null, result?: Buffer) => void;
+type ZlibHandle = {
+    deflate(input: Uint8Array, flush?: number): Uint8Array;
+    inflate(input: Uint8Array, flush?: number): Uint8Array;
+    finish(): Uint8Array;
+    close?: () => void;
+    reset?: () => void;
+    params?: (level: number, strategy: number) => void;
+};
+type TransformCallback = (err: unknown, result?: Buffer) => void;
+type ZlibStreamCtor<T extends Transform, O> = new (options?: O & TransformOptions) => T;
+type BrotliNative = {
+    brotliCompress?: (input: Uint8Array) => Uint8Array;
+    brotliDecompress?: (input: Uint8Array) => Uint8Array;
+};
+const nativeBrotli: BrotliNative = zlib;
 
 // Internal helper functions
 
-function toUint8Array(data: ArrayBuffer | Uint8Array): Uint8Array {
-    return data instanceof ArrayBuffer ? new Uint8Array(data) : data;
+function finishTransform(cb: TransformCallback, operation: () => Buffer): void {
+    try {
+        cb(null, operation());
+    } catch (err) {
+        cb(err);
+    }
+}
+
+function toUint8Array(data: ZlibInput): Uint8Array {
+    if (typeof data === 'string') return Buffer.from(data);
+    if (data instanceof ArrayBuffer) return new Uint8Array(data);
+    if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    throw new TypeError('The "buffer" argument must be a string, Buffer, TypedArray, DataView, or ArrayBuffer');
+}
+
+function validateZlibInput(data: ZlibInput): void {
+    if (typeof data === 'string' || data instanceof ArrayBuffer || ArrayBuffer.isView(data)) return;
+    throw new TypeError('The "buffer" argument must be a string, Buffer, TypedArray, DataView, or ArrayBuffer');
+}
+
+function validateOptions(options?: { flush?: number; finishFlush?: number; maxOutputLength?: number }): void {
+    if (options?.flush !== undefined && !Number.isInteger(options.flush)) {
+        throw new TypeError('The "options.flush" property must be an integer');
+    }
+    if (options?.finishFlush !== undefined && !Number.isInteger(options.finishFlush)) {
+        throw new TypeError('The "options.finishFlush" property must be an integer');
+    }
+    if (options?.maxOutputLength !== undefined && (!Number.isInteger(options.maxOutputLength) || options.maxOutputLength < 0)) {
+        throw new RangeError('The "options.maxOutputLength" property must be a non-negative integer');
+    }
+}
+
+function checkMaxOutputLength(output: Buffer, options?: { maxOutputLength?: number }): Buffer {
+    const max = options?.maxOutputLength;
+    if (max !== undefined && output.byteLength > max) {
+        throw new RangeError(`Cannot create a Buffer larger than ${max} bytes`);
+    }
+    return output;
 }
 
 // Sync compress/decompress
 
-export function deflateSync(buffer: ArrayBuffer | Uint8Array, options?: ZlibOptions): Uint8Array {
+export function deflateSync(buffer: ZlibInput, options?: ZlibOptions): Buffer {
+    validateOptions(options);
     const level = options?.level ?? zlib.DEFAULT_COMPRESSION;
-    return new Uint8Array(zlib.deflate(buffer, level));
+    return checkMaxOutputLength(Buffer.from(zlib.deflate(toUint8Array(buffer), level)), options);
 }
 
-export function deflateRawSync(buffer: ArrayBuffer | Uint8Array, options?: ZlibOptions): Uint8Array {
+export function deflateRawSync(buffer: ZlibInput, options?: ZlibOptions): Buffer {
+    validateOptions(options);
     const level = options?.level ?? zlib.DEFAULT_COMPRESSION;
-    return new Uint8Array(zlib.deflateRaw(buffer, level));
+    return checkMaxOutputLength(Buffer.from(zlib.deflateRaw(toUint8Array(buffer), level)), options);
 }
 
-export function gzipSync(buffer: ArrayBuffer | Uint8Array, options?: ZlibOptions): Uint8Array {
+export function gzipSync(buffer: ZlibInput, options?: ZlibOptions): Buffer {
+    validateOptions(options);
     const level = options?.level ?? zlib.DEFAULT_COMPRESSION;
-    return new Uint8Array(zlib.gzip(buffer, level));
+    return checkMaxOutputLength(Buffer.from(zlib.gzip(toUint8Array(buffer), level)), options);
 }
 
-export function inflateSync(buffer: ArrayBuffer | Uint8Array, options?: ZlibOptions): Uint8Array {
-    return new Uint8Array(zlib.inflate(buffer));
+export function inflateSync(buffer: ZlibInput, options?: ZlibOptions): Buffer {
+    validateOptions(options);
+    return checkMaxOutputLength(Buffer.from(zlib.inflate(toUint8Array(buffer))), options);
 }
 
-export function inflateRawSync(buffer: ArrayBuffer | Uint8Array, options?: ZlibOptions): Uint8Array {
-    return new Uint8Array(zlib.inflateRaw(buffer));
+export function inflateRawSync(buffer: ZlibInput, options?: ZlibOptions): Buffer {
+    validateOptions(options);
+    return checkMaxOutputLength(Buffer.from(zlib.inflateRaw(toUint8Array(buffer))), options);
 }
 
-export function gunzipSync(buffer: ArrayBuffer | Uint8Array, options?: ZlibOptions): Uint8Array {
-    return new Uint8Array(zlib.gunzip(buffer));
+export function gunzipSync(buffer: ZlibInput, options?: ZlibOptions): Buffer {
+    validateOptions(options);
+    return checkMaxOutputLength(Buffer.from(zlib.gunzip(toUint8Array(buffer))), options);
 }
 
-export function unzipSync(buffer: ArrayBuffer | Uint8Array, options?: ZlibOptions): Uint8Array {
-    const buf = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+export function unzipSync(buffer: ZlibInput, options?: ZlibOptions): Buffer {
+    validateOptions(options);
+    const buf = toUint8Array(buffer);
     // Auto-detect format by magic number
     if (buf[0] === 0x1f && buf[1] === 0x8b) {
-        return new Uint8Array(zlib.gunzip(buffer));
+        return checkMaxOutputLength(Buffer.from(zlib.gunzip(buf)), options);
     }
     if (buf[0] === 0x78 && (buf[1] === 0x01 || buf[1] === 0x5e || buf[1] === 0x9c || buf[1] === 0xda)) {
-        return new Uint8Array(zlib.inflate(buffer));
+        return checkMaxOutputLength(Buffer.from(zlib.inflate(buf)), options);
     }
     // Try gunzip first, then inflate
-    try { return new Uint8Array(zlib.gunzip(buffer)); } catch {}
-    return new Uint8Array(zlib.inflate(buffer));
+    try {
+        return checkMaxOutputLength(Buffer.from(zlib.gunzip(buf)), options);
+    } catch {
+        // Fall through to raw zlib inflate for ambiguous payloads.
+    }
+    return checkMaxOutputLength(Buffer.from(zlib.inflate(buf)), options);
 }
 
 // Async compress/decompress (callback style)
 
-type SyncFn = (buf: ArrayBuffer | Uint8Array, opts?: ZlibOptions) => Uint8Array;
+type SyncFn = (buf: ZlibInput, opts?: ZlibOptions) => Buffer;
 
 function wrapCallback(syncFn: SyncFn) {
-    return function(buffer: ArrayBuffer | Uint8Array, optionsOrCallback: ZlibOptions | CompressCallback, callback?: CompressCallback) {
+    return function(buffer: ZlibInput, optionsOrCallback?: ZlibOptions | CompressCallback, callback?: CompressCallback) {
         const opts = typeof optionsOrCallback === 'function' ? {} : optionsOrCallback;
         const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
+        if (typeof cb !== 'function') {
+            throw new TypeError('The "callback" argument must be of type function');
+        }
+        validateZlibInput(buffer);
+        const input = new Uint8Array(toUint8Array(buffer));
         queueMicrotask(() => {
-            try { cb?.(null, syncFn(buffer, opts)); }
-            catch (err) { cb?.(err as Error); }
+            try { cb(null, syncFn(input, opts)); }
+            catch (err) { cb(asError(err)); }
         });
     };
 }
@@ -146,20 +218,69 @@ function flattenPrototype(target: object): void {
     }
 }
 
-function _doTransform(handle: any, chunk: any, compress: boolean, cb: any) {
+function receiverOrCreate<T extends object>(receiver: T | undefined, prototype: object): T {
+    const target: T = receiver && (typeof receiver === 'object' || typeof receiver === 'function')
+        ? receiver
+        : Object.create(prototype);
+    return target;
+}
+
+function toTransformOptions(o?: ZlibOptions & TransformOptions): TransformOptions | undefined {
+    if (!o) return undefined;
+    const {
+        flush: _flush,
+        finishFlush: _finishFlush,
+        level: _level,
+        strategy: _strategy,
+        memLevel: _memLevel,
+        maxOutputLength: _maxOutputLength,
+        ...rest
+    } = o;
+    return rest;
+}
+
+function _doTransform(handle: ZlibHandle, chunk: ZlibInput, compress: boolean, cb: TransformCallback) {
     try {
         const fn = compress ? 'deflate' : 'inflate';
-        cb(null, new Uint8Array(handle[fn](toUint8Array(chunk))));
+        const output = Buffer.from(handle[fn](toUint8Array(chunk)));
+        cb(null, output.length > 0 ? output : undefined);
     } catch (err) { cb(err); }
 }
 
-function _doFlush(handle: any, cb: any) {
-    try { cb(null, new Uint8Array(handle.finish())); }
-    catch (err) { cb(err); }
+function installHandleCompat(handle: ZlibHandle): ZlibHandle {
+    handle.close ??= () => {};
+    return handle;
+}
+
+function processChunk(handle: ZlibHandle, chunk: ZlibInput, compress: boolean, flush?: number): Buffer {
+    const fn = compress ? 'deflate' : 'inflate';
+    try {
+        return Buffer.from(handle[fn](toUint8Array(chunk), flush));
+    } catch (err) {
+        if (/already finished/i.test(asError(err).message)) {
+            return Buffer.alloc(0);
+        }
+        throw err;
+    }
+}
+
+function _doFlush(handle: ZlibHandle, cb: TransformCallback) {
+    try {
+        const output = Buffer.from(handle.finish());
+        cb(null, output.length > 0 ? output : undefined);
+    } catch (err) {
+        if (/already finished/i.test(asError(err).message)) {
+            cb();
+            return;
+        }
+        cb(err);
+    }
 }
 
 export interface Deflate extends Transform {
-    _handle: any;
+    _handle: ZlibHandle;
+    _processChunk(chunk: ZlibInput, flush?: number): Buffer;
+    close(): void;
 }
 
 export interface DeflateConstructor {
@@ -168,15 +289,14 @@ export interface DeflateConstructor {
     prototype: Deflate;
 }
 
-function initDeflate(self: any, o?: ZlibOptions & TransformOptions): void {
-    Transform.call(self, o);
-    self._handle = zlib.createDeflate(..._opts(o));
+function initDeflate(self: Deflate, o?: ZlibOptions & TransformOptions): void {
+    validateOptions(o);
+    Transform.call(self, toTransformOptions(o));
+    self._handle = installHandleCompat(zlib.createDeflate(..._opts(o)));
 }
 
-export const Deflate: DeflateConstructor = function Deflate(this: any, o?: ZlibOptions & TransformOptions) {
-    const target = this && (typeof this === 'object' || typeof this === 'function')
-        ? this
-        : Object.create(Deflate.prototype);
+export const Deflate: DeflateConstructor = function Deflate(this: Deflate | undefined, o?: ZlibOptions & TransformOptions) {
+    const target = receiverOrCreate(this, Deflate.prototype);
     initDeflate(target, o);
     return target;
 } as DeflateConstructor;
@@ -184,12 +304,20 @@ export const Deflate: DeflateConstructor = function Deflate(this: any, o?: ZlibO
 Object.setPrototypeOf(Deflate, Transform);
 Deflate.prototype = Object.create(Transform.prototype);
 
-Deflate.prototype._transform = function _transform(this: Deflate, chunk: any, _e: BufferEncoding, cb: any): void {
+Deflate.prototype._transform = function _transform(this: Deflate, chunk: ZlibInput, _e: BufferEncoding, cb: TransformCallback): void {
     _doTransform(this._handle, chunk, true, cb);
 };
 
-Deflate.prototype._flush = function _flush(this: Deflate, cb: any): void {
+Deflate.prototype._flush = function _flush(this: Deflate, cb: TransformCallback): void {
     _doFlush(this._handle, cb);
+};
+
+Deflate.prototype._processChunk = function _processChunk(this: Deflate, chunk: ZlibInput, flush?: number): Buffer {
+    return processChunk(this._handle, chunk, true, flush);
+};
+
+Deflate.prototype.close = function close(this: Deflate): void {
+    this._handle.close?.();
 };
 
 Object.defineProperty(Deflate.prototype, 'constructor', {
@@ -207,7 +335,9 @@ const _opts = (o?: ZlibOptions) => [
 ] as const;
 
 export interface Inflate extends Transform {
-    _handle: any;
+    _handle: ZlibHandle;
+    _processChunk(chunk: ZlibInput, flush?: number): Buffer;
+    close(): void;
 }
 
 export interface InflateConstructor {
@@ -216,15 +346,14 @@ export interface InflateConstructor {
     prototype: Inflate;
 }
 
-function initInflate(self: any, o?: ZlibOptions & TransformOptions): void {
-    Transform.call(self, o);
-    self._handle = zlib.createInflate();
+function initInflate(self: Inflate, o?: ZlibOptions & TransformOptions): void {
+    validateOptions(o);
+    Transform.call(self, toTransformOptions(o));
+    self._handle = installHandleCompat(zlib.createInflate());
 }
 
-export const Inflate: InflateConstructor = function Inflate(this: any, o?: ZlibOptions & TransformOptions) {
-    const target = this && (typeof this === 'object' || typeof this === 'function')
-        ? this
-        : Object.create(Inflate.prototype);
+export const Inflate: InflateConstructor = function Inflate(this: Inflate | undefined, o?: ZlibOptions & TransformOptions) {
+    const target = receiverOrCreate(this, Inflate.prototype);
     initInflate(target, o);
     return target;
 } as InflateConstructor;
@@ -232,12 +361,20 @@ export const Inflate: InflateConstructor = function Inflate(this: any, o?: ZlibO
 Object.setPrototypeOf(Inflate, Transform);
 Inflate.prototype = Object.create(Transform.prototype);
 
-Inflate.prototype._transform = function _transform(this: Inflate, chunk: any, _e: BufferEncoding, cb: any): void {
+Inflate.prototype._transform = function _transform(this: Inflate, chunk: ZlibInput, _e: BufferEncoding, cb: TransformCallback): void {
     _doTransform(this._handle, chunk, false, cb);
 };
 
-Inflate.prototype._flush = function _flush(this: Inflate, cb: any): void {
+Inflate.prototype._flush = function _flush(this: Inflate, cb: TransformCallback): void {
     _doFlush(this._handle, cb);
+};
+
+Inflate.prototype._processChunk = function _processChunk(this: Inflate, chunk: ZlibInput, flush?: number): Buffer {
+    return processChunk(this._handle, chunk, false, flush);
+};
+
+Inflate.prototype.close = function close(this: Inflate): void {
+    this._handle.close?.();
 };
 
 Object.defineProperty(Inflate.prototype, 'constructor', {
@@ -249,7 +386,9 @@ Object.defineProperty(Inflate.prototype, 'constructor', {
 flattenPrototype(Inflate.prototype);
 
 export interface Gzip extends Transform {
-    _handle: any;
+    _handle: ZlibHandle;
+    _processChunk(chunk: ZlibInput, flush?: number): Buffer;
+    close(): void;
 }
 
 export interface GzipConstructor {
@@ -258,15 +397,14 @@ export interface GzipConstructor {
     prototype: Gzip;
 }
 
-function initGzip(self: any, o?: ZlibOptions & TransformOptions): void {
-    Transform.call(self, o);
-    self._handle = zlib.createGzip(..._opts(o));
+function initGzip(self: Gzip, o?: ZlibOptions & TransformOptions): void {
+    validateOptions(o);
+    Transform.call(self, toTransformOptions(o));
+    self._handle = installHandleCompat(zlib.createGzip(..._opts(o)));
 }
 
-export const Gzip: GzipConstructor = function Gzip(this: any, o?: ZlibOptions & TransformOptions) {
-    const target = this && (typeof this === 'object' || typeof this === 'function')
-        ? this
-        : Object.create(Gzip.prototype);
+export const Gzip: GzipConstructor = function Gzip(this: Gzip | undefined, o?: ZlibOptions & TransformOptions) {
+    const target = receiverOrCreate(this, Gzip.prototype);
     initGzip(target, o);
     return target;
 } as GzipConstructor;
@@ -274,12 +412,20 @@ export const Gzip: GzipConstructor = function Gzip(this: any, o?: ZlibOptions & 
 Object.setPrototypeOf(Gzip, Transform);
 Gzip.prototype = Object.create(Transform.prototype);
 
-Gzip.prototype._transform = function _transform(this: Gzip, chunk: any, _e: BufferEncoding, cb: any): void {
+Gzip.prototype._transform = function _transform(this: Gzip, chunk: ZlibInput, _e: BufferEncoding, cb: TransformCallback): void {
     _doTransform(this._handle, chunk, true, cb);
 };
 
-Gzip.prototype._flush = function _flush(this: Gzip, cb: any): void {
+Gzip.prototype._flush = function _flush(this: Gzip, cb: TransformCallback): void {
     _doFlush(this._handle, cb);
+};
+
+Gzip.prototype._processChunk = function _processChunk(this: Gzip, chunk: ZlibInput, flush?: number): Buffer {
+    return processChunk(this._handle, chunk, true, flush);
+};
+
+Gzip.prototype.close = function close(this: Gzip): void {
+    this._handle.close?.();
 };
 
 Object.defineProperty(Gzip.prototype, 'constructor', {
@@ -291,7 +437,9 @@ Object.defineProperty(Gzip.prototype, 'constructor', {
 flattenPrototype(Gzip.prototype);
 
 export interface Gunzip extends Transform {
-    _handle: any;
+    _handle: ZlibHandle;
+    _processChunk(chunk: ZlibInput, flush?: number): Buffer;
+    close(): void;
 }
 
 export interface GunzipConstructor {
@@ -300,15 +448,14 @@ export interface GunzipConstructor {
     prototype: Gunzip;
 }
 
-function initGunzip(self: any, o?: ZlibOptions & TransformOptions): void {
-    Transform.call(self, o);
-    self._handle = zlib.createGunzip();
+function initGunzip(self: Gunzip, o?: ZlibOptions & TransformOptions): void {
+    validateOptions(o);
+    Transform.call(self, toTransformOptions(o));
+    self._handle = installHandleCompat(zlib.createGunzip());
 }
 
-export const Gunzip: GunzipConstructor = function Gunzip(this: any, o?: ZlibOptions & TransformOptions) {
-    const target = this && (typeof this === 'object' || typeof this === 'function')
-        ? this
-        : Object.create(Gunzip.prototype);
+export const Gunzip: GunzipConstructor = function Gunzip(this: Gunzip | undefined, o?: ZlibOptions & TransformOptions) {
+    const target = receiverOrCreate(this, Gunzip.prototype);
     initGunzip(target, o);
     return target;
 } as GunzipConstructor;
@@ -316,12 +463,20 @@ export const Gunzip: GunzipConstructor = function Gunzip(this: any, o?: ZlibOpti
 Object.setPrototypeOf(Gunzip, Transform);
 Gunzip.prototype = Object.create(Transform.prototype);
 
-Gunzip.prototype._transform = function _transform(this: Gunzip, chunk: any, _e: BufferEncoding, cb: any): void {
+Gunzip.prototype._transform = function _transform(this: Gunzip, chunk: ZlibInput, _e: BufferEncoding, cb: TransformCallback): void {
     _doTransform(this._handle, chunk, false, cb);
 };
 
-Gunzip.prototype._flush = function _flush(this: Gunzip, cb: any): void {
+Gunzip.prototype._flush = function _flush(this: Gunzip, cb: TransformCallback): void {
     _doFlush(this._handle, cb);
+};
+
+Gunzip.prototype._processChunk = function _processChunk(this: Gunzip, chunk: ZlibInput, flush?: number): Buffer {
+    return processChunk(this._handle, chunk, false, flush);
+};
+
+Gunzip.prototype.close = function close(this: Gunzip): void {
+    this._handle.close?.();
 };
 
 Object.defineProperty(Gunzip.prototype, 'constructor', {
@@ -333,7 +488,9 @@ Object.defineProperty(Gunzip.prototype, 'constructor', {
 flattenPrototype(Gunzip.prototype);
 
 export interface DeflateRaw extends Transform {
-    _handle: any;
+    _handle: ZlibHandle;
+    _processChunk(chunk: ZlibInput, flush?: number): Buffer;
+    close(): void;
 }
 
 export interface DeflateRawConstructor {
@@ -342,15 +499,14 @@ export interface DeflateRawConstructor {
     prototype: DeflateRaw;
 }
 
-function initDeflateRaw(self: any, o?: ZlibOptions & TransformOptions): void {
-    Transform.call(self, o);
-    self._handle = zlib.createDeflateRaw(..._opts(o));
+function initDeflateRaw(self: DeflateRaw, o?: ZlibOptions & TransformOptions): void {
+    validateOptions(o);
+    Transform.call(self, toTransformOptions(o));
+    self._handle = installHandleCompat(zlib.createDeflateRaw(..._opts(o)));
 }
 
-export const DeflateRaw: DeflateRawConstructor = function DeflateRaw(this: any, o?: ZlibOptions & TransformOptions) {
-    const target = this && (typeof this === 'object' || typeof this === 'function')
-        ? this
-        : Object.create(DeflateRaw.prototype);
+export const DeflateRaw: DeflateRawConstructor = function DeflateRaw(this: DeflateRaw | undefined, o?: ZlibOptions & TransformOptions) {
+    const target = receiverOrCreate(this, DeflateRaw.prototype);
     initDeflateRaw(target, o);
     return target;
 } as DeflateRawConstructor;
@@ -358,12 +514,20 @@ export const DeflateRaw: DeflateRawConstructor = function DeflateRaw(this: any, 
 Object.setPrototypeOf(DeflateRaw, Transform);
 DeflateRaw.prototype = Object.create(Transform.prototype);
 
-DeflateRaw.prototype._transform = function _transform(this: DeflateRaw, chunk: any, _e: BufferEncoding, cb: any): void {
+DeflateRaw.prototype._transform = function _transform(this: DeflateRaw, chunk: ZlibInput, _e: BufferEncoding, cb: TransformCallback): void {
     _doTransform(this._handle, chunk, true, cb);
 };
 
-DeflateRaw.prototype._flush = function _flush(this: DeflateRaw, cb: any): void {
+DeflateRaw.prototype._flush = function _flush(this: DeflateRaw, cb: TransformCallback): void {
     _doFlush(this._handle, cb);
+};
+
+DeflateRaw.prototype._processChunk = function _processChunk(this: DeflateRaw, chunk: ZlibInput, flush?: number): Buffer {
+    return processChunk(this._handle, chunk, true, flush);
+};
+
+DeflateRaw.prototype.close = function close(this: DeflateRaw): void {
+    this._handle.close?.();
 };
 
 Object.defineProperty(DeflateRaw.prototype, 'constructor', {
@@ -375,7 +539,9 @@ Object.defineProperty(DeflateRaw.prototype, 'constructor', {
 flattenPrototype(DeflateRaw.prototype);
 
 export interface InflateRaw extends Transform {
-    _handle: any;
+    _handle: ZlibHandle;
+    _processChunk(chunk: ZlibInput, flush?: number): Buffer;
+    close(): void;
 }
 
 export interface InflateRawConstructor {
@@ -384,15 +550,14 @@ export interface InflateRawConstructor {
     prototype: InflateRaw;
 }
 
-function initInflateRaw(self: any, o?: ZlibOptions & TransformOptions): void {
-    Transform.call(self, o);
-    self._handle = zlib.createInflateRaw();
+function initInflateRaw(self: InflateRaw, o?: ZlibOptions & TransformOptions): void {
+    validateOptions(o);
+    Transform.call(self, toTransformOptions(o));
+    self._handle = installHandleCompat(zlib.createInflateRaw());
 }
 
-export const InflateRaw: InflateRawConstructor = function InflateRaw(this: any, o?: ZlibOptions & TransformOptions) {
-    const target = this && (typeof this === 'object' || typeof this === 'function')
-        ? this
-        : Object.create(InflateRaw.prototype);
+export const InflateRaw: InflateRawConstructor = function InflateRaw(this: InflateRaw | undefined, o?: ZlibOptions & TransformOptions) {
+    const target = receiverOrCreate(this, InflateRaw.prototype);
     initInflateRaw(target, o);
     return target;
 } as InflateRawConstructor;
@@ -400,12 +565,20 @@ export const InflateRaw: InflateRawConstructor = function InflateRaw(this: any, 
 Object.setPrototypeOf(InflateRaw, Transform);
 InflateRaw.prototype = Object.create(Transform.prototype);
 
-InflateRaw.prototype._transform = function _transform(this: InflateRaw, chunk: any, _e: BufferEncoding, cb: any): void {
+InflateRaw.prototype._transform = function _transform(this: InflateRaw, chunk: ZlibInput, _e: BufferEncoding, cb: TransformCallback): void {
     _doTransform(this._handle, chunk, false, cb);
 };
 
-InflateRaw.prototype._flush = function _flush(this: InflateRaw, cb: any): void {
+InflateRaw.prototype._flush = function _flush(this: InflateRaw, cb: TransformCallback): void {
     _doFlush(this._handle, cb);
+};
+
+InflateRaw.prototype._processChunk = function _processChunk(this: InflateRaw, chunk: ZlibInput, flush?: number): Buffer {
+    return processChunk(this._handle, chunk, false, flush);
+};
+
+InflateRaw.prototype.close = function close(this: InflateRaw): void {
+    this._handle.close?.();
 };
 
 Object.defineProperty(InflateRaw.prototype, 'constructor', {
@@ -417,7 +590,9 @@ Object.defineProperty(InflateRaw.prototype, 'constructor', {
 flattenPrototype(InflateRaw.prototype);
 
 export interface Unzip extends Transform {
-    _handle: any;
+    _handle: ZlibHandle;
+    _processChunk(chunk: ZlibInput, flush?: number): Buffer;
+    close(): void;
 }
 
 export interface UnzipConstructor {
@@ -426,15 +601,14 @@ export interface UnzipConstructor {
     prototype: Unzip;
 }
 
-function initUnzip(self: any, o?: ZlibOptions & TransformOptions): void {
-    Transform.call(self, o);
-    self._handle = zlib.createGunzip();
+function initUnzip(self: Unzip, o?: ZlibOptions & TransformOptions): void {
+    validateOptions(o);
+    Transform.call(self, toTransformOptions(o));
+    self._handle = installHandleCompat(zlib.createGunzip());
 }
 
-export const Unzip: UnzipConstructor = function Unzip(this: any, o?: ZlibOptions & TransformOptions) {
-    const target = this && (typeof this === 'object' || typeof this === 'function')
-        ? this
-        : Object.create(Unzip.prototype);
+export const Unzip: UnzipConstructor = function Unzip(this: Unzip | undefined, o?: ZlibOptions & TransformOptions) {
+    const target = receiverOrCreate(this, Unzip.prototype);
     initUnzip(target, o);
     return target;
 } as UnzipConstructor;
@@ -442,12 +616,20 @@ export const Unzip: UnzipConstructor = function Unzip(this: any, o?: ZlibOptions
 Object.setPrototypeOf(Unzip, Transform);
 Unzip.prototype = Object.create(Transform.prototype);
 
-Unzip.prototype._transform = function _transform(this: Unzip, chunk: any, _e: BufferEncoding, cb: any): void {
+Unzip.prototype._transform = function _transform(this: Unzip, chunk: ZlibInput, _e: BufferEncoding, cb: TransformCallback): void {
     _doTransform(this._handle, chunk, false, cb);
 };
 
-Unzip.prototype._flush = function _flush(this: Unzip, cb: any): void {
+Unzip.prototype._flush = function _flush(this: Unzip, cb: TransformCallback): void {
     _doFlush(this._handle, cb);
+};
+
+Unzip.prototype._processChunk = function _processChunk(this: Unzip, chunk: ZlibInput, flush?: number): Buffer {
+    return processChunk(this._handle, chunk, false, flush);
+};
+
+Unzip.prototype.close = function close(this: Unzip): void {
+    this._handle.close?.();
 };
 
 Object.defineProperty(Unzip.prototype, 'constructor', {
@@ -460,7 +642,9 @@ flattenPrototype(Unzip.prototype);
 
 // Factory functions
 
-function _create(Cls: any) { return (options?: ZlibOptions) => new Cls(options); }
+function _create<T extends Transform, O>(Cls: ZlibStreamCtor<T, O>) {
+    return (options?: O) => new Cls(options);
+}
 
 export const createDeflate = _create(Deflate);
 export const createInflate = _create(Inflate);
@@ -472,36 +656,38 @@ export const createUnzip = _create(Unzip);
 
 // Checksum
 
-export function crc32(data: ArrayBuffer | Uint8Array, value?: number): number {
-    return zlib.crc32(data, value);
+export function crc32(data: ZlibInput, value?: number): number {
+    return zlib.crc32(toUint8Array(data), value);
 }
 
-export function adler32(data: ArrayBuffer | Uint8Array, value?: number): number {
-    return zlib.adler32(data, value);
+export function adler32(data: ZlibInput, value?: number): number {
+    return zlib.adler32(toUint8Array(data), value);
 }
 
 // Brotli — use native if available, otherwise error
 
-function brotliCompressImpl(buffer: ArrayBuffer | Uint8Array): Uint8Array {
-    if (typeof (zlib as any).brotliCompress === 'function') {
-        return new Uint8Array((zlib as any).brotliCompress(buffer));
+function brotliCompressImpl(buffer: ZlibInput, options?: BrotliOptions): Buffer {
+    validateOptions(options);
+    if (typeof nativeBrotli.brotliCompress === 'function') {
+        return checkMaxOutputLength(Buffer.from(nativeBrotli.brotliCompress(toUint8Array(buffer))), options);
     }
     throw new Error('Brotli compression is not supported in this environment');
 }
 
-function brotliDecompressImpl(buffer: ArrayBuffer | Uint8Array): Uint8Array {
-    if (typeof (zlib as any).brotliDecompress === 'function') {
-        return new Uint8Array((zlib as any).brotliDecompress(buffer));
+function brotliDecompressImpl(buffer: ZlibInput, options?: BrotliOptions): Buffer {
+    validateOptions(options);
+    if (typeof nativeBrotli.brotliDecompress === 'function') {
+        return checkMaxOutputLength(Buffer.from(nativeBrotli.brotliDecompress(toUint8Array(buffer))), options);
     }
     throw new Error('Brotli decompression is not supported in this environment');
 }
 
-export function brotliCompressSync(buffer: ArrayBuffer | Uint8Array, _options?: BrotliOptions): Uint8Array {
-    return brotliCompressImpl(buffer);
+export function brotliCompressSync(buffer: ZlibInput, options?: BrotliOptions): Buffer {
+    return brotliCompressImpl(buffer, options);
 }
 
-export function brotliDecompressSync(buffer: ArrayBuffer | Uint8Array, _options?: BrotliOptions): Uint8Array {
-    return brotliDecompressImpl(buffer);
+export function brotliDecompressSync(buffer: ZlibInput, options?: BrotliOptions): Buffer {
+    return brotliDecompressImpl(buffer, options);
 }
 
 export const brotliCompress = wrapCallback(brotliCompressSync as SyncFn);
@@ -515,10 +701,9 @@ export interface BrotliCompressConstructor {
     prototype: BrotliCompress;
 }
 
-export const BrotliCompress: BrotliCompressConstructor = function BrotliCompress(this: any, options?: BrotliOptions & TransformOptions) {
-    const target = this && (typeof this === 'object' || typeof this === 'function')
-        ? this
-        : Object.create(BrotliCompress.prototype);
+export const BrotliCompress: BrotliCompressConstructor = function BrotliCompress(this: BrotliCompress | undefined, options?: BrotliOptions & TransformOptions) {
+    const target = receiverOrCreate(this, BrotliCompress.prototype);
+    validateOptions(options);
     Transform.call(target, options);
     return target;
 } as BrotliCompressConstructor;
@@ -526,8 +711,8 @@ export const BrotliCompress: BrotliCompressConstructor = function BrotliCompress
 Object.setPrototypeOf(BrotliCompress, Transform);
 BrotliCompress.prototype = Object.create(Transform.prototype);
 
-BrotliCompress.prototype._transform = function _transform(this: BrotliCompress, chunk: any, _e: BufferEncoding, cb: any): void {
-    try { cb(null, brotliCompressImpl(toUint8Array(chunk))); } catch (err) { cb(err); }
+BrotliCompress.prototype._transform = function _transform(this: BrotliCompress, chunk: ZlibInput, _e: BufferEncoding, cb: TransformCallback): void {
+    finishTransform(cb, () => brotliCompressImpl(chunk));
 };
 
 Object.defineProperty(BrotliCompress.prototype, 'constructor', {
@@ -546,10 +731,9 @@ export interface BrotliDecompressConstructor {
     prototype: BrotliDecompress;
 }
 
-export const BrotliDecompress: BrotliDecompressConstructor = function BrotliDecompress(this: any, options?: BrotliOptions & TransformOptions) {
-    const target = this && (typeof this === 'object' || typeof this === 'function')
-        ? this
-        : Object.create(BrotliDecompress.prototype);
+export const BrotliDecompress: BrotliDecompressConstructor = function BrotliDecompress(this: BrotliDecompress | undefined, options?: BrotliOptions & TransformOptions) {
+    const target = receiverOrCreate(this, BrotliDecompress.prototype);
+    validateOptions(options);
     Transform.call(target, options);
     return target;
 } as BrotliDecompressConstructor;
@@ -557,8 +741,8 @@ export const BrotliDecompress: BrotliDecompressConstructor = function BrotliDeco
 Object.setPrototypeOf(BrotliDecompress, Transform);
 BrotliDecompress.prototype = Object.create(Transform.prototype);
 
-BrotliDecompress.prototype._transform = function _transform(this: BrotliDecompress, chunk: any, _e: BufferEncoding, cb: any): void {
-    try { cb(null, brotliDecompressImpl(toUint8Array(chunk))); } catch (err) { cb(err); }
+BrotliDecompress.prototype._transform = function _transform(this: BrotliDecompress, chunk: ZlibInput, _e: BufferEncoding, cb: TransformCallback): void {
+    finishTransform(cb, () => brotliDecompressImpl(chunk));
 };
 
 Object.defineProperty(BrotliDecompress.prototype, 'constructor', {

@@ -9,7 +9,7 @@ const engine = import.meta.use('engine');
 
 import { EventEmitter } from '../events';
 import { Duplex, Readable, Writable } from '../stream';
-import { normalizeErrnoError } from '../_internal/errno';
+import { matchesErrnoCode, normalizeErrnoError } from '../_internal/errno';
 
 // Type definitions
 
@@ -34,7 +34,7 @@ export interface TcpNetConnectOpts {
     localPort?: number;
     family?: number;
     hints?: number;
-    lookup?: (hostname: string, options: any, callback: (err: Error | null, address: string, family: number) => void) => void;
+    lookup?: (hostname: string, options: unknown, callback: (err: Error | null, address: string, family: number) => void) => void;
     noDelay?: boolean;
     keepAlive?: boolean;
     keepAliveInitialDelay?: number;
@@ -77,6 +77,67 @@ function normalizeTcpHost(host: string): string {
     if (!host || host === '*') return '0.0.0.0';
     if (host === 'localhost') return '127.0.0.1';
     return host;
+}
+
+function isUnsupportedSocketOption(error: unknown): boolean {
+    return String(error && typeof error === 'object' && 'message' in error ? error.message : error)
+        .includes('Not implemented');
+}
+
+function setTcpNoDelay(tcp: CModuleStreams.TCP, enabled: boolean): void {
+    try { tcp.setNoDelay(enabled); }
+    catch (error) { if (!isUnsupportedSocketOption(error)) throw error; }
+}
+
+function keepAliveDelayToSeconds(delayMs: number): number {
+    if (!Number.isFinite(delayMs) || delayMs <= 0) return 0;
+    return Math.max(1, Math.ceil(delayMs / 1000));
+}
+
+function setTcpKeepAlive(tcp: CModuleStreams.TCP, enabled: boolean, delayMs: number): void {
+    const delay = enabled ? keepAliveDelayToSeconds(delayMs) : 0;
+    try { tcp.setKeepAlive(enabled, delay); }
+    catch (error) { if (!isUnsupportedSocketOption(error)) throw error; }
+}
+
+function stopPipeReadQuietly(pipe: CModuleStreams.Pipe): void {
+    try {
+        pipe.stopRead();
+    } catch {
+        // Ignore best-effort cleanup failures.
+    }
+}
+
+function closeTcpQuietly(tcp: CModuleStreams.TCP): void {
+    try {
+        tcp.close();
+    } catch {
+        // Ignore best-effort cleanup failures.
+    }
+}
+
+function closePipeQuietly(pipe: CModuleStreams.Pipe): void {
+    try {
+        pipe.close();
+    } catch {
+        // Ignore best-effort cleanup failures.
+    }
+}
+
+function closeUpgradeHandleQuietly(handle: UpgradeHandle): void {
+    try {
+        handle.close();
+    } catch {
+        // Ignore best-effort cleanup failures.
+    }
+}
+
+function emitErrorQuietly(emitter: EventEmitter, error: Error): void {
+    try {
+        emitter.emit('error', error);
+    } catch {
+        // Preserve destroy() cleanup even if an error listener throws.
+    }
 }
 
 // Flattens a prototype chain onto `target` for interop with consumers that
@@ -130,7 +191,7 @@ export interface Socket extends Duplex {
     _address: AddressInfo | null;
     _remoteAddress: AddressInfo | null;
     _timeout: number | null;
-    _timeoutId: any;
+    _timeoutId: ReturnType<typeof setTimeout> | null;
     _keepAlive: boolean;
     _keepAliveDelay: number;
     _noDelay: boolean;
@@ -140,6 +201,7 @@ export interface Socket extends Duplex {
     _tcpReadStarted: boolean;
     _pipeReadStarted: boolean;
     _upgradeReadStarted: boolean;
+    _refed: boolean;
 
     bytesRead: number;
     bytesWritten: number;
@@ -168,7 +230,7 @@ export interface Socket extends Duplex {
     _startTcpRead(): void;
     _startUpgradeRead(): void;
     _read(size: number): void;
-    _write(chunk: any, encoding: BufferEncoding, callback: (error?: Error | null) => void): void;
+    _write(chunk: string | Uint8Array, encoding: BufferEncoding, callback: (error?: Error | null) => void): void;
     destroy(error?: Error): this;
 }
 
@@ -181,7 +243,10 @@ export interface SocketConstructor {
     fromUpgradeHandle(handle: UpgradeHandle): Socket;
 }
 
-function initSocket(self: any, options?: SocketConstructorOpts): void {
+type NativeReadResult = Uint8Array<ArrayBuffer> | null | undefined;
+type NativeReadError = CModuleError.Error | undefined;
+
+function initSocket(self: Socket, options?: SocketConstructorOpts): void {
     Duplex.call(self, { allowHalfOpen: options?.allowHalfOpen });
 
     self._tcp = null;
@@ -204,6 +269,7 @@ function initSocket(self: any, options?: SocketConstructorOpts): void {
     self._tcpReadStarted = false;
     self._pipeReadStarted = false;
     self._upgradeReadStarted = false;
+    self._refed = true;
 
     self.bytesRead = 0;
     self.bytesWritten = 0;
@@ -225,8 +291,8 @@ function initSocket(self: any, options?: SocketConstructorOpts): void {
     }
 }
 
-export const Socket: SocketConstructor = function Socket(this: any, options?: SocketConstructorOpts) {
-    const target = this && (typeof this === 'object' || typeof this === 'function')
+export const Socket: SocketConstructor = function Socket(this: Socket | undefined, options?: SocketConstructorOpts) {
+    const target: Socket = this && (typeof this === 'object' || typeof this === 'function')
         ? this
         : Object.create(Socket.prototype);
     initSocket(target, options);
@@ -238,7 +304,7 @@ Socket.prototype = Object.create(Duplex.prototype);
 
 Socket.fromUpgradeHandle = function fromUpgradeHandle(handle: UpgradeHandle): Socket {
     const socket = new Socket();
-    (socket as any)._upgradeHandle = handle;
+    socket._upgradeHandle = handle;
     socket.readyState = 'open';
     return socket;
 };
@@ -253,6 +319,9 @@ function handleSocketEof(socket: Socket): void {
     socket._pipeReadStarted = false;
     socket._upgradeReadStarted = false;
     socket.push(null);
+    if (!socket._readableState.flowing && socket._readableState.buffer.length === 0) {
+        socket._emitReadableEndIfNeeded();
+    }
 
     if (!socket._allowHalfOpen && !socket.writableEnded) {
         socket.readyState = 'readOnly';
@@ -311,18 +380,19 @@ Socket.prototype.connect = function connect(
         connectListener = typeof hostOrCb === 'function' ? hostOrCb : undefined;
 
         const pipe = new streams.Pipe();
-        pipe.connect(portOrPath as string).then(() => {
-            this._stream = pipe;
+        this._stream = pipe;
+        pipe.connect(portOrPath).then(() => {
             this.connecting = false;
             this._connecting = false;
             this.readyState = 'open';
             this.emit('connect');
             if (connectListener) connectListener();
             if (!this._destroyed) this._startPipeRead();
-        }).catch((err: any) => {
+        }).catch((err) => {
             this.emit('error', normalizeErrnoError(err, 'connect'));
             this.destroy();
         });
+        if (!this._refed) pipe.unref();
 
         return this;
     }
@@ -333,28 +403,30 @@ Socket.prototype.connect = function connect(
 
     host = normalizeTcpHost(host);
     const family = host.includes(':') ? os.AF_INET6 : os.AF_INET;
-    this._tcp = new streams.TCP(family);
+    const tcp = new streams.TCP(family);
+    this._tcp = tcp;
+    if (port === undefined) throw new TypeError('Port is required');
 
     if (this._noDelay) {
-        this._tcp.setNoDelay(true);
+        setTcpNoDelay(tcp, true);
     }
 
-    this._tcp.connect({ ip: host, port: port! }).then(() => {
+    tcp.connect({ ip: host, port }).then(() => {
         this.connecting = false;
         this._connecting = false;
         this.readyState = 'open';
 
-        const localInfo = this._tcp!.sockname;
+        const localInfo = tcp.sockname;
         this.localAddress = localInfo.ip;
         this.localPort = localInfo.port;
 
-        const remoteInfo = this._tcp!.peername;
+        const remoteInfo = tcp.peername;
         this.remoteAddress = remoteInfo.ip;
         this.remotePort = remoteInfo.port;
         this.remoteFamily = `IPv${remoteInfo.family}`;
 
         if (this._keepAlive) {
-            this._tcp!.setKeepAlive(true, this._keepAliveDelay);
+            setTcpKeepAlive(tcp, true, this._keepAliveDelay);
         }
 
         this.emit('connect');
@@ -370,9 +442,14 @@ Socket.prototype.connect = function connect(
 
 Socket.prototype._startPipeRead = function _startPipeRead(this: Socket): void {
     if (!this._stream || this._destroyed || this._pipeReadStarted) return;
+    if (this._connecting) return;
     this._pipeReadStarted = true;
-    this._stream.onread = (result: any, error: any) => {
-        if (error) { this.emit('error', normalizeErrnoError(error, 'read')); return; }
+    this._stream.onread = (result: NativeReadResult, error: NativeReadError) => {
+        if (error) {
+            if ((this._destroyed || this.readyState === 'closed') && matchesErrnoCode(error, 'ECANCELED', 'EBADF')) return;
+            this.emit('error', normalizeErrnoError(error, 'read'));
+            return;
+        }
         if (result === null || result === undefined) {
             handleSocketEof(this);
             return;
@@ -394,17 +471,31 @@ Socket.prototype.pause = function pause(this: Socket): Socket {
         state.flowing = false;
         this.emit('pause');
     }
-    if (this._tcp) { this._tcp.stopRead(); this._tcpReadStarted = false; }
+    if (this._tcp) {
+        this._tcp.stopRead();
+        this._tcpReadStarted = false;
+    }
     if (this._stream && this._pipeReadStarted) {
-        try { this._stream.stopRead(); } catch {}
+        stopPipeReadQuietly(this._stream);
         this._pipeReadStarted = false;
     }
-    if (this._upgradeHandle) { this._upgradeHandle.stopReading(); this._upgradeReadStarted = false; }
+    if (this._upgradeHandle) {
+        this._upgradeHandle.stopReading();
+        this._upgradeReadStarted = false;
+    }
     return this;
 };
 
 Socket.prototype.resume = function resume(this: Socket): Socket {
     const state = this._readableState;
+    if (state.readableListening && this.listenerCount('data') === 0) {
+        this.emit('resume');
+        this._read(state.highWaterMark);
+        if (this._tcp) this._startTcpRead();
+        if (this._upgradeHandle) this._startUpgradeRead();
+        if (this._stream) this._startPipeRead();
+        return this;
+    }
     if (!state.flowing) {
         state.flowing = true;
         this.emit('resume');
@@ -412,6 +503,7 @@ Socket.prototype.resume = function resume(this: Socket): Socket {
     if (this._tcp) this._startTcpRead();
     if (this._upgradeHandle) this._startUpgradeRead();
     if (this._stream) this._startPipeRead();
+    queueMicrotask(() => this._duplexReadAndResolve());
     return this;
 };
 
@@ -434,7 +526,7 @@ Socket.prototype.setTimeout = function (this: Socket, timeout: number, callback?
 Socket.prototype.setNoDelay = function setNoDelay(this: Socket, noDelay?: boolean): Socket {
     this._noDelay = noDelay ?? true;
     if (this._tcp) {
-        this._tcp.setNoDelay(this._noDelay);
+        setTcpNoDelay(this._tcp, this._noDelay);
     }
     return this;
 };
@@ -443,7 +535,7 @@ Socket.prototype.setKeepAlive = function setKeepAlive(this: Socket, enable?: boo
     this._keepAlive = enable ?? true;
     this._keepAliveDelay = initialDelay ?? 0;
     if (this._tcp) {
-        this._tcp.setKeepAlive(this._keepAlive, this._keepAliveDelay);
+        setTcpKeepAlive(this._tcp, this._keepAlive, this._keepAliveDelay);
     }
     return this;
 };
@@ -461,12 +553,16 @@ Socket.prototype.address = function address(this: Socket): AddressInfo | {} {
 };
 
 Socket.prototype.unref = function unref(this: Socket): Socket {
+    this._refed = false;
     if (this._tcp) this._tcp.unref();
+    if (this._stream) this._stream.unref();
     return this;
 };
 
 Socket.prototype.ref = function ref(this: Socket): Socket {
+    this._refed = true;
     if (this._tcp) this._tcp.ref();
+    if (this._stream) this._stream.ref();
     return this;
 };
 
@@ -483,8 +579,9 @@ Socket.prototype._startTcpRead = function _startTcpRead(this: Socket): void {
     if (this._tcpReadStarted) return;
     this._tcpReadStarted = true;
 
-    (this._tcp as any).onread = (result: any, error: any) => {
+    this._tcp.onread = (result: NativeReadResult, error: NativeReadError) => {
         if (error) {
+            if ((this._destroyed || this.readyState === 'closed') && matchesErrnoCode(error, 'ECANCELED', 'EBADF')) return;
             this.emit('error', normalizeErrnoError(error, 'read'));
             return;
         }
@@ -492,12 +589,11 @@ Socket.prototype._startTcpRead = function _startTcpRead(this: Socket): void {
             handleSocketEof(this);
             return;
         }
-        const data = result as Uint8Array;
-        this.bytesRead += data.byteLength;
-        this.push(data);
+        this.bytesRead += result.byteLength;
+        this.push(result);
     };
 
-    (this._tcp as any).startRead();
+    this._tcp.startRead();
 };
 
 /** Sustained read loop driven by the core upgrade handle. The handle replays
@@ -533,7 +629,7 @@ Socket.prototype._read = function _read(this: Socket, size: number): void {
 };
 
 /** Duplex _write — called by _writeBuffered with one chunk at a time */
-Socket.prototype._write = function _write(this: Socket, chunk: any, encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
+Socket.prototype._write = function _write(this: Socket, chunk: string | Uint8Array, encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
     if (this._destroyed || (!this._allowHalfOpen && this._peerEnded)) {
         callback(Object.assign(new Error(this._peerEnded ? 'broken pipe' : 'Socket is destroyed'), {
             code: this._peerEnded ? 'EPIPE' : 'ERR_SOCKET_CLOSED',
@@ -570,7 +666,7 @@ Socket.prototype._write = function _write(this: Socket, chunk: any, encoding: Bu
         return;
     }
 
-    const buffer = typeof chunk === 'string' ? engine.encodeString(chunk) : chunk as Uint8Array;
+    const buffer = typeof chunk === 'string' ? engine.encodeString(chunk) : chunk;
 
     if (this._upgradeHandle) {
         this._upgradeHandle.write(buffer).then(() => {
@@ -632,20 +728,21 @@ Socket.prototype._final = function _final(this: Socket, callback: (error?: Error
     this.writable = false;
     this._writable = false;
 
-    let shutdownResult: any;
+    const closingUpgradeHandle = !!this._upgradeHandle;
+    let shutdownResult: Promise<void> | void;
     try {
         if (this._upgradeHandle) {
             this._upgradeHandle.close();
             shutdownResult = undefined;
         } else if (this._stream) {
-            shutdownResult = (this._stream as any).shutdown();
+            shutdownResult = this._stream.shutdown();
         } else if (this._tcp) {
-            shutdownResult = (this._tcp as any).shutdown();
+            shutdownResult = this._tcp.shutdown();
         } else {
             shutdownResult = undefined;
         }
     } catch (err) {
-        callback(normalizeErrnoError(err as Error, 'shutdown'));
+        callback(normalizeErrnoError(err, 'shutdown'));
         return;
     }
 
@@ -653,17 +750,32 @@ Socket.prototype._final = function _final(this: Socket, callback: (error?: Error
     Promise.resolve(shutdownResult).then(() => {
         callback();
         queueMicrotask(() => {
+            if (closingUpgradeHandle && !this._destroyed) {
+                this.destroy();
+                return;
+            }
             if (this._peerEnded && this.writableFinished && !this._destroyed) {
                 this.destroy();
             }
         });
     }, (err) => {
-        callback(normalizeErrnoError(err as Error, 'shutdown'));
+        if (
+            (this._destroyed || this._peerEnded || this.readyState === 'closed') &&
+            matchesErrnoCode(err, 'ECANCELED', 'EBADF', 'EPIPE')
+        ) {
+            callback();
+            return;
+        }
+        callback(normalizeErrnoError(err, 'shutdown'));
     });
 };
 
 Socket.prototype.destroy = function destroy(this: Socket, error?: Error): Socket {
     if (this._destroyed) return this;
+    if (this._peerEnded && !error && !this.readableEnded && this._readableState.buffer.length === 0) {
+        this._readableState.ended = true;
+        this._emitReadableEndIfNeeded();
+    }
     this._destroyed = true;
     this._peerEnded = true;
     this.readyState = 'closed';
@@ -676,18 +788,18 @@ Socket.prototype.destroy = function destroy(this: Socket, error?: Error): Socket
     }
 
     if (this._tcp) {
-        try { this._tcp.close(); } catch {}
+        closeTcpQuietly(this._tcp);
         this._tcp = null;
     }
 
     if (this._stream) {
-        try { this._stream.stopRead(); } catch {}
-        try { this._stream.close(); } catch {}
+        stopPipeReadQuietly(this._stream);
+        closePipeQuietly(this._stream);
         this._stream = null;
     }
 
     if (this._upgradeHandle) {
-        try { this._upgradeHandle.close(); } catch {}
+        closeUpgradeHandleQuietly(this._upgradeHandle);
         this._upgradeHandle = null;
     }
 
@@ -695,7 +807,7 @@ Socket.prototype.destroy = function destroy(this: Socket, error?: Error): Socket
     this.destroyed = true;
 
     if (error) {
-        try { this.emit('error', normalizeErrnoError(error)); } catch {}
+        emitErrorQuietly(this, normalizeErrnoError(error));
     }
     queueMicrotask(() => this.emit('close', !!error));
 
@@ -730,7 +842,7 @@ export interface Server extends EventEmitter {
     listen(port?: number, backlog?: number, listeningListener?: () => void): this;
     listen(path: string, backlog?: number, listeningListener?: () => void): this;
     listen(options: ListenOptions, listeningListener?: () => void): this;
-    listen(handle: any, backlog?: number, listeningListener?: () => void): this;
+    listen(handle: unknown, backlog?: number, listeningListener?: () => void): this;
 
     _acceptLoop(): Promise<void>;
     address(): AddressInfo | string | null;
@@ -748,7 +860,7 @@ export interface ServerConstructor {
     prototype: Server;
 }
 
-function initServer(self: any, options?: ServerOpts | ((socket: Socket) => void), connectionListener?: (socket: Socket) => void): void {
+function initServer(self: Server, options?: ServerOpts | ((socket: Socket) => void), connectionListener?: (socket: Socket) => void): void {
     EventEmitter.call(self);
 
     self._tcp = null;
@@ -779,11 +891,11 @@ function initServer(self: any, options?: ServerOpts | ((socket: Socket) => void)
 }
 
 export const Server: ServerConstructor = function Server(
-    this: any,
+    this: Server | undefined,
     options?: ServerOpts | ((socket: Socket) => void),
     connectionListener?: (socket: Socket) => void
 ) {
-    const target = this && (typeof this === 'object' || typeof this === 'function')
+    const target: Server = this && (typeof this === 'object' || typeof this === 'function')
         ? this
         : Object.create(Server.prototype);
     initServer(target, options, connectionListener);
@@ -793,7 +905,11 @@ export const Server: ServerConstructor = function Server(
 Object.setPrototypeOf(Server, EventEmitter);
 Server.prototype = Object.create(EventEmitter.prototype);
 
-Server.prototype.listen = function listen(this: Server, portOrPathOrOptions?: number | string | ListenOptions | any, ...args: any[]): Server {
+Server.prototype.listen = function listen(
+    this: Server,
+    portOrPathOrOptions?: unknown,
+    ...args: Array<string | number | (() => void)>
+): Server {
     let port: number | undefined;
     let host: string = '0.0.0.0';
     let backlog: number = 511;
@@ -809,15 +925,27 @@ Server.prototype.listen = function listen(this: Server, portOrPathOrOptions?: nu
         }
     } else if (typeof portOrPathOrOptions === 'string') {
         const pipePath = portOrPathOrOptions;
+        for (const arg of args) {
+            if (typeof arg === 'number') backlog = arg;
+            else if (typeof arg === 'function') listeningListener = arg;
+        }
         this._pipe = new streams.Pipe();
         try {
             this._pipe.bind(pipePath);
             this._pipe.listen(backlog ?? 511);
-            this._pipe.onconnection = (error: any, client: any) => {
-                if (error) { this.emit('error', error); return; }
+            this._pipe.onconnection = (error: CModuleError.Error | undefined, client: CModuleStreams.Stream | undefined) => {
+                if (error) {
+                    if (!this._listening || matchesErrnoCode(error, 'ECANCELED', 'EBADF')) return;
+                    this.emit('error', error);
+                    return;
+                }
+                if (!client) return;
                 const socket = new Socket({ allowHalfOpen: this._allowHalfOpen });
-                (socket as any)._stream = client;
+                socket._stream = client as CModuleStreams.Pipe;
                 socket.emit('connect');
+                if (this._pauseOnConnect) {
+                    socket.pause();
+                }
                 this.emit('connection', socket);
                 if (!this._pauseOnConnect && !socket._destroyed) socket._startPipeRead();
             };
@@ -825,17 +953,17 @@ Server.prototype.listen = function listen(this: Server, portOrPathOrOptions?: nu
             this._listening = true;
             if (listeningListener) this.once('listening', listeningListener);
             this.emit('listening');
-        } catch (err: any) {
+        } catch (err) {
             this.emit('error', err);
         }
         return this;
-    } else if (typeof portOrPathOrOptions === 'object') {
+    } else if (portOrPathOrOptions && typeof portOrPathOrOptions === 'object') {
         const options = portOrPathOrOptions as ListenOptions;
         port = options.port;
         host = options.host ?? '0.0.0.0';
         backlog = options.backlog ?? 511;
         ipv6Only = options.ipv6Only ?? false;
-        listeningListener = args[0];
+        if (typeof args[0] === 'function') listeningListener = args[0];
     }
 
     host = normalizeTcpHost(host);
@@ -870,11 +998,14 @@ Server.prototype._acceptLoop = function _acceptLoop(this: Server): Promise<void>
     const tcp = this._tcp;
     if (!tcp) return Promise.resolve();
     return new Promise((rs, rj) => tcp.onconnection = (error, clientTcp) => {
-        if (error || !clientTcp) return rj(error);
+        if (error || !clientTcp) {
+            if (!this._listening || matchesErrnoCode(error, 'ECANCELED', 'EBADF')) return rs();
+            return rj(error);
+        }
         if (!this._listening) return rs();
 
         const socket = new Socket();
-        (socket as any)._tcp = clientTcp;
+        socket._tcp = clientTcp;
         socket.readyState = 'open';
 
         const localInfo = (clientTcp as CModuleStreams.TCP).sockname;
@@ -894,11 +1025,13 @@ Server.prototype._acceptLoop = function _acceptLoop(this: Server): Promise<void>
             this.connections = this._connections.size;
         });
 
-        this.emit('connection', socket);
-
         if (this._pauseOnConnect) {
             socket.pause();
-        } else if (!socket._destroyed) {
+        }
+
+        this.emit('connection', socket);
+
+        if (!this._pauseOnConnect && !socket._destroyed) {
             socket._startTcpRead();
         }
     });
@@ -933,6 +1066,12 @@ Server.prototype.close = function close(this: Server, callback?: (err?: Error) =
         } catch { }
         this._tcp = null;
     }
+    if (this._pipe) {
+        try {
+            this._pipe.close();
+        } catch { }
+        this._pipe = null;
+    }
 
     this.emit('close');
     callback?.();
@@ -942,11 +1081,13 @@ Server.prototype.close = function close(this: Server, callback?: (err?: Error) =
 
 Server.prototype.ref = function ref(this: Server): Server {
     if (this._tcp) this._tcp.ref();
+    if (this._pipe) this._pipe.ref();
     return this;
 };
 
 Server.prototype.unref = function unref(this: Server): Server {
     if (this._tcp) this._tcp.unref();
+    if (this._pipe) this._pipe.unref();
     return this;
 };
 
@@ -987,7 +1128,139 @@ export function createConnection(options: TcpNetConnectOpts, connectListener?: (
 export function createConnection(port: number, host?: string, connectListener?: () => void): Socket;
 export function createConnection(path: string, connectListener?: () => void): Socket;
 export function createConnection(portOrPath: number | string | TcpNetConnectOpts, hostOrCb?: string | (() => void), cb?: () => void): Socket {
-    return connect(portOrPath as any, hostOrCb as any, cb);
+    if (typeof portOrPath === 'object') {
+        return connect(portOrPath, typeof hostOrCb === 'function' ? hostOrCb : undefined);
+    }
+    if (typeof portOrPath === 'number') {
+        return typeof hostOrCb === 'string'
+            ? connect(portOrPath, hostOrCb, cb)
+            : connect(portOrPath, 'localhost', hostOrCb);
+    }
+    return connect(portOrPath, hostOrCb as (() => void) | undefined);
+}
+
+type BlockListFamily = 'ipv4' | 'ipv6';
+type BlockListRule = {
+    family: BlockListFamily;
+    start: bigint;
+    end: bigint;
+    rule: string;
+};
+
+function parseIpv4(address: string): bigint | null {
+    if (!isIPv4(address)) return null;
+    const parts = address.split('.').map((part) => Number(part));
+    const [a, b, c, d] = parts;
+    if (a === undefined || b === undefined || c === undefined || d === undefined) return null;
+    return BigInt(((a << 24) >>> 0) + (b << 16) + (c << 8) + d);
+}
+
+function parseIpv6(address: string): bigint | null {
+    if (!address.includes(':')) return null;
+    const halves = address.split('::');
+    if (halves.length > 2) return null;
+
+    const left = halves[0] ? halves[0].split(':').filter(Boolean) : [];
+    const right = halves[1] ? halves[1].split(':').filter(Boolean) : [];
+    const missing = 8 - left.length - right.length;
+    if (missing < 0) return null;
+
+    const parts = [...left, ...Array(missing).fill('0'), ...right];
+    if (parts.length !== 8) return null;
+
+    let value = 0n;
+    for (const part of parts) {
+        if (!/^[0-9a-fA-F]{1,4}$/.test(part)) return null;
+        value = (value << 16n) + BigInt(parseInt(part, 16));
+    }
+    return value;
+}
+
+function parseBlockListAddress(address: string, type?: string): { family: BlockListFamily; value: bigint; normalized: string } {
+    const requested = type?.toLowerCase();
+    if (requested !== undefined && requested !== 'ipv4' && requested !== 'ipv6') {
+        throw new TypeError('The "type" argument must be either "ipv4" or "ipv6"');
+    }
+
+    const text = String(address);
+    const ipv4 = parseIpv4(text);
+    if (ipv4 !== null) {
+        if (requested === 'ipv6') throw new TypeError('Address family mismatch');
+        return { family: 'ipv4', value: ipv4, normalized: text };
+    }
+
+    const ipv6 = parseIpv6(text);
+    if (ipv6 !== null) {
+        if (requested === 'ipv4') throw new TypeError('Address family mismatch');
+        return { family: 'ipv6', value: ipv6, normalized: text.toLowerCase() };
+    }
+
+    throw new TypeError('Invalid IP address');
+}
+
+function blockListMaxBits(family: BlockListFamily): number {
+    return family === 'ipv4' ? 32 : 128;
+}
+
+function blockListLabel(family: BlockListFamily): string {
+    return family === 'ipv4' ? 'IPv4' : 'IPv6';
+}
+
+export class BlockList {
+    #rules: BlockListRule[] = [];
+
+    addAddress(address: string, type?: string): void {
+        const parsed = parseBlockListAddress(address, type);
+        this.#rules.push({
+            family: parsed.family,
+            start: parsed.value,
+            end: parsed.value,
+            rule: `Address: ${blockListLabel(parsed.family)} ${parsed.normalized}`,
+        });
+    }
+
+    addRange(start: string, end: string, type?: string): void {
+        const from = parseBlockListAddress(start, type);
+        const to = parseBlockListAddress(end, type);
+        if (from.family !== to.family) throw new TypeError('Address family mismatch');
+        if (from.value > to.value) throw new RangeError('Start address must be less than or equal to end address');
+        this.#rules.push({
+            family: from.family,
+            start: from.value,
+            end: to.value,
+            rule: `Range: ${blockListLabel(from.family)} ${from.normalized}-${to.normalized}`,
+        });
+    }
+
+    addSubnet(net: string, prefix: number, type?: string): void {
+        const parsed = parseBlockListAddress(net, type);
+        const max = blockListMaxBits(parsed.family);
+        if (!Number.isInteger(prefix) || prefix < 0 || prefix > max) {
+            throw new RangeError('Subnet prefix is out of range');
+        }
+
+        const hostBits = BigInt(max - prefix);
+        const allBits = (1n << BigInt(max)) - 1n;
+        const hostMask = hostBits === 0n ? 0n : (1n << hostBits) - 1n;
+        const network = parsed.value & (allBits ^ hostMask);
+        this.#rules.push({
+            family: parsed.family,
+            start: network,
+            end: network | hostMask,
+            rule: `Subnet: ${blockListLabel(parsed.family)} ${parsed.normalized}/${prefix}`,
+        });
+    }
+
+    check(address: string, type?: string): boolean {
+        const parsed = parseBlockListAddress(address, type);
+        return this.#rules.some((rule) =>
+            rule.family === parsed.family && parsed.value >= rule.start && parsed.value <= rule.end
+        );
+    }
+
+    get rules(): string[] {
+        return this.#rules.map((rule) => rule.rule);
+    }
 }
 
 // isIP / isIPv4 / isIPv6

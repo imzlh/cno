@@ -9,8 +9,8 @@ const cnoSsl = {
         return ssl.createSelfSignedCert(options);
     },
 
-    loadPEM(data: string, type?: string): { subject?: string; type?: string; bits?: number } | null {
-        return ssl.loadPEM(data, type as any);
+    loadPEM(data: string, type?: "certificate" | "key"): { subject?: string; type?: string; bits?: number } | null {
+        return ssl.loadPEM(data, type);
     },
 
     get version(): string {

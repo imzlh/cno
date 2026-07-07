@@ -1,20 +1,41 @@
 // CacheStorage + Cache — in-memory implementation for cno runtime.
 // Matches the subset of the Cache API tested by Deno's cache_api_test.ts.
 
-import { Response } from "./fetch";
+import { Response as CnoResponse } from "./fetch";
+import { bytesToArrayBuffer } from "../utils/bytes";
 import { getMemoryTier } from "../utils/memory-tier";
-
-declare const globalThis: any;
 
 const ILLEGAL = Symbol('cache.illegal');
 
 // Max cache entries per Cache instance, tier-aware
 const MAX_ENTRIES = getMemoryTier() === 'low' ? 64 : getMemoryTier() === 'normal' ? 256 : 1024;
 
-function toRequestKey(input: string | URL | Request): Request {
-    if (typeof input === 'string') return new globalThis.Request(input);
-    if (input instanceof URL) return new globalThis.Request(input.href);
-    return input as Request;
+function toRequestKey(input: RequestInfo | URL): Request {
+    return input instanceof Request ? input : new Request(input);
+}
+
+function assertGetRequest(request: Request): void {
+    if (request.method !== 'GET') {
+        throw new TypeError('Cache only supports GET requests');
+    }
+}
+
+function cloneStoredRequest(request: Request): Request {
+    return request.clone();
+}
+
+function urlsMatch(storedUrl: string, candidateUrl: string, ignoreSearch?: boolean): boolean {
+    if (!ignoreSearch) return storedUrl === candidateUrl;
+
+    try {
+        const stored = new URL(storedUrl);
+        const candidate = new URL(candidateUrl);
+        return stored.origin === candidate.origin
+            && stored.pathname === candidate.pathname
+            && stored.hash === candidate.hash;
+    } catch {
+        return storedUrl.split('?')[0] === candidateUrl.split('?')[0];
+    }
 }
 
 // Parse Vary header and return the list of field names (lower-cased).
@@ -34,9 +55,16 @@ function varyMatches(stored: Request, candidate: Request, responseHeaders: Heade
 
 interface CacheEntry {
     request: Request;
-    response: Response;
+    response: globalThis.Response;
     responseHeaders: Headers;
     body: Uint8Array;
+}
+
+function queryMatches(entry: CacheEntry, request: Request, options?: CacheQueryOptions): boolean {
+    if (!options?.ignoreMethod && request.method !== 'GET') return false;
+    if (!urlsMatch(entry.request.url, request.url, options?.ignoreSearch)) return false;
+    if (!options?.ignoreVary && !varyMatches(entry.request, request, entry.responseHeaders)) return false;
+    return true;
 }
 
 class CacheImpl implements Cache {
@@ -56,8 +84,9 @@ class CacheImpl implements Cache {
         return c;
     }
 
-    async put(request: RequestInfo | URL, response: Response): Promise<void> {
-        const req = toRequestKey(request as string | URL | Request);
+    async put(request: RequestInfo | URL, response: globalThis.Response): Promise<void> {
+        const req = toRequestKey(request);
+        assertGetRequest(req);
 
         // Vary: * is forbidden
         if ((response.headers.get('Vary') ?? '').split(',').map(s => s.trim()).includes('*')) {
@@ -68,17 +97,17 @@ class CacheImpl implements Cache {
         if (response.bodyUsed) throw new TypeError('Body already consumed');
         let body: Uint8Array;
         try {
-            body = await (response as any).bytes();
+            body = await response.bytes();
         } catch (e) {
             // Body read failed — do not store, re-throw
             throw e;
         }
 
-        const responseHeaders = new (globalThis.Headers as typeof Headers)(response.headers);
+        const responseHeaders = new Headers(response.headers);
 
-        // Overwrite existing entry with same URL (ignoring Vary for overwrite lookup)
-        const idx = this.#entries.findIndex(e => e.request.url === req.url && varyMatches(e.request, req, e.responseHeaders));
-        const entry: CacheEntry = { request: req, response, responseHeaders, body };
+        // Overwrite existing entry with same URL and compatible Vary constraints.
+        const idx = this.#entries.findIndex(e => queryMatches(e, req));
+        const entry: CacheEntry = { request: cloneStoredRequest(req), response, responseHeaders, body };
         if (idx >= 0) {
             this.#entries[idx] = entry;
         } else {
@@ -90,47 +119,64 @@ class CacheImpl implements Cache {
         }
     }
 
-    async match(request: RequestInfo | URL, _options?: CacheQueryOptions): Promise<Response | undefined> {
-        const req = toRequestKey(request as string | URL | Request);
-        const entry = this.#entries.find(e => e.request.url === req.url && varyMatches(e.request, req, e.responseHeaders));
+    async match(request: RequestInfo | URL, options?: CacheQueryOptions): Promise<globalThis.Response | undefined> {
+        const req = toRequestKey(request);
+        const entry = this.#entries.find(e => queryMatches(e, req, options));
         if (!entry) return undefined;
         // Return a fresh Response backed by the stored bytes
-        return new Response(entry.body.buffer.slice(entry.body.byteOffset, entry.body.byteOffset + entry.body.byteLength), {
+        return new CnoResponse(bytesToArrayBuffer(entry.body), {
             status: entry.response.status,
             statusText: entry.response.statusText,
             headers: entry.responseHeaders,
         });
     }
 
-    async matchAll(request?: RequestInfo | URL, _options?: CacheQueryOptions): Promise<Response[]> {
+    async matchAll(request?: RequestInfo | URL, options?: CacheQueryOptions): Promise<globalThis.Response[]> {
         if (request === undefined) return this.#entries.map(e =>
-            new (globalThis.Response as typeof Response)(e.body, { status: e.response.status, headers: e.responseHeaders })
+            new CnoResponse(e.body, { status: e.response.status, headers: e.responseHeaders })
         );
-        const req = toRequestKey(request as string | URL | Request);
+        const req = toRequestKey(request);
         return this.#entries
-            .filter(e => e.request.url === req.url && varyMatches(e.request, req, e.responseHeaders))
-            .map(e => new (globalThis.Response as typeof Response)(e.body, { status: e.response.status, headers: e.responseHeaders }));
+            .filter(e => queryMatches(e, req, options))
+            .map(e => new CnoResponse(e.body, { status: e.response.status, headers: e.responseHeaders }));
     }
 
-    async delete(request: RequestInfo | URL, _options?: CacheQueryOptions): Promise<boolean> {
-        const req = toRequestKey(request as string | URL | Request);
+    async delete(request: RequestInfo | URL, options?: CacheQueryOptions): Promise<boolean> {
+        const req = toRequestKey(request);
         const before = this.#entries.length;
-        this.#entries = this.#entries.filter(e => !(e.request.url === req.url && varyMatches(e.request, req, e.responseHeaders)));
+        this.#entries = this.#entries.filter(e => !queryMatches(e, req, options));
         return this.#entries.length < before;
     }
 
-    async keys(request?: RequestInfo | URL, _options?: CacheQueryOptions): Promise<ReadonlyArray<Request>> {
-        if (request === undefined) return this.#entries.map(e => e.request);
-        const req = toRequestKey(request as string | URL | Request);
-        return this.#entries.filter(e => e.request.url === req.url).map(e => e.request);
+    async keys(request?: RequestInfo | URL, options?: CacheQueryOptions): Promise<ReadonlyArray<Request>> {
+        if (request === undefined) return this.#entries.map(e => cloneStoredRequest(e.request));
+        const req = toRequestKey(request);
+        return this.#entries.filter(e => queryMatches(e, req, options)).map(e => cloneStoredRequest(e.request));
     }
 
-    async add(_request: RequestInfo | URL): Promise<void> {
-        throw new Error('Cache.add() not supported');
+    async add(request: RequestInfo | URL): Promise<void> {
+        const req = toRequestKey(request);
+        assertGetRequest(req);
+        const response = await fetch(req.clone());
+        if (!response.ok) {
+            throw new TypeError(`Request failed with status ${response.status}`);
+        }
+        await this.put(req, response);
     }
 
-    async addAll(_requests: RequestInfo[]): Promise<void> {
-        throw new Error('Cache.addAll() not supported');
+    async addAll(requests: RequestInfo[]): Promise<void> {
+        const reqs = Array.from(requests, toRequestKey);
+        for (const req of reqs) assertGetRequest(req);
+        const entries = await Promise.all(reqs.map(async (req) => {
+            const response = await fetch(req.clone());
+            if (!response.ok) {
+                throw new TypeError(`Request failed with status ${response.status}`);
+            }
+            return { req, response };
+        }));
+        for (const { req, response } of entries) {
+            await this.put(req, response);
+        }
     }
     
     get [Symbol.toStringTag]() {
@@ -162,9 +208,13 @@ class CacheStorageImpl implements CacheStorage {
         return [...this.#caches.keys()];
     }
 
-    async match(_request: RequestInfo | URL, _options?: MultiCacheQueryOptions): Promise<Response | undefined> {
+    async match(request: RequestInfo | URL, options?: MultiCacheQueryOptions): Promise<globalThis.Response | undefined> {
+        if (options?.cacheName) {
+            return await this.#caches.get(options.cacheName)?.match(request, options);
+        }
+
         for (const cache of this.#caches.values()) {
-            const res = await cache.match(_request as any);
+            const res = await cache.match(request, options);
             if (res) return res;
         }
         return undefined;

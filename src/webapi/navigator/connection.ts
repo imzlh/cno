@@ -27,7 +27,12 @@ class NetworkInformationImpl extends EventTarget implements NetworkInformation {
     }
 
     get type(): 'bluetooth' | 'cellular' | 'ethernet' | 'none' | 'wifi' | 'wimax' | 'other' | 'unknown' {
-        const interfaces = os.networkInterfaces();
+        let interfaces: ReturnType<typeof os.networkInterfaces>;
+        try {
+            interfaces = os.networkInterfaces();
+        } catch {
+            return 'unknown';
+        }
         for (const iface of interfaces) {
             if (!iface.internal) {
                 if (iface.name.startsWith('wlan') || iface.name.startsWith('wifi')) {
@@ -61,7 +66,12 @@ class NavigatorOnLineImpl {
     }
 
     get onLine(): boolean {
-        const interfaces = os.networkInterfaces();
+        let interfaces: ReturnType<typeof os.networkInterfaces>;
+        try {
+            interfaces = os.networkInterfaces();
+        } catch {
+            return false;
+        }
         for (const iface of interfaces) {
             if (!iface.internal && iface.address) {
                 return true;

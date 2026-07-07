@@ -17,7 +17,63 @@ import {
     isForeignFunction,
     isForeignStatic,
 } from './types';
-import { UnsafePointer, createPointerObject } from './pointer';
+import { UnsafePointer, bufferSourceBytes, createPointerObject } from './pointer';
+
+const nativeTypes = new Set([
+    'u8', 'i8', 'u16', 'i16', 'u32', 'i32', 'u64', 'i64',
+    'f32', 'f64', 'bool', 'pointer', 'buffer', 'function', 'usize', 'isize',
+]);
+
+function validateNativeType(type: unknown, allowVoid: boolean): void {
+    if (type === 'void') {
+        if (allowVoid) return;
+        throw new TypeError('Invalid native type: void');
+    }
+    if (typeof type === 'string') {
+        if (!nativeTypes.has(type)) throw new TypeError(`Invalid native type: ${type}`);
+        return;
+    }
+    if (type && typeof type === 'object' && 'struct' in type) {
+        const members = Reflect.get(type, 'struct');
+        if (!Array.isArray(members)) throw new TypeError('Invalid native struct type');
+        for (const member of members) validateNativeType(member, false);
+        return;
+    }
+    throw new TypeError(`Invalid native type: ${String(type)}`);
+}
+
+function validateForeignLibraryInterface(symbols: unknown): asserts symbols is ForeignLibraryInterface {
+    if (symbols === null || typeof symbols !== 'object') {
+        throw new TypeError('DynamicLibrary symbols must be an object');
+    }
+    for (const sym of Object.values(symbols)) {
+        if (sym === null || typeof sym !== 'object') {
+            throw new TypeError('ForeignFunction or ForeignStatic must be an object');
+        }
+        if ('parameters' in sym) {
+            const parameters = Reflect.get(sym, 'parameters');
+            if (!Array.isArray(parameters)) throw new TypeError('ForeignFunction parameters must be an array');
+            for (const type of parameters) validateNativeType(type, false);
+            validateNativeType(Reflect.get(sym, 'result'), true);
+            continue;
+        }
+        if ('type' in sym) {
+            validateNativeType(Reflect.get(sym, 'type'), false);
+            continue;
+        }
+        throw new TypeError('Invalid foreign symbol definition');
+    }
+}
+
+function toNumberArg(value: unknown): number {
+    return Number(value);
+}
+
+function toBigIntArg(value: unknown): bigint {
+    if (typeof value === 'bigint') return value;
+    if (typeof value === 'number' || typeof value === 'string' || typeof value === 'boolean') return BigInt(value);
+    return BigInt(Number(value));
+}
 
 class DynamicLibraryImpl<S extends ForeignLibraryInterface> implements DynamicLibrary<S> {
     private lib: CModuleFFI.UvLib;
@@ -43,36 +99,36 @@ class DynamicLibraryImpl<S extends ForeignLibraryInterface> implements DynamicLi
     }
 
     private createSymbols(def: S): StaticForeignLibraryInterface<S> {
-        const result: any = {};
+        const result: Partial<Record<keyof S, unknown>> = {};
         
         for (const [name, sym] of Object.entries(def)) {
             const symbolName = sym.name ?? name;
+            const key = name as keyof S;
             
             try {
                 const symPtr = this.lib.symbol(symbolName);
                 
                 if (isForeignFunction(sym)) {
-                    result[name] = this.createFunction(symPtr, sym);
+                    result[key] = this.createFunction(symPtr, sym);
                 } else if (isForeignStatic(sym)) {
-                    result[name] = this.createStatic(symPtr, sym);
+                    result[key] = this.createStatic(symPtr, sym);
                 }
             } catch (err) {
                 if (sym.optional) {
-                    result[name] = null;
+                    result[key] = null;
                 } else {
                     throw err;
                 }
             }
         }
         
-        return result;
+        return result as StaticForeignLibraryInterface<S>;
     }
 
-    private createFunction(symPtr: CModuleFFI.UvDlSym, def: ForeignFunction): Function {
-        const native = ffi;
+    private createFunction(symPtr: CModuleFFI.UvDlSym, def: ForeignFunction): (...args: unknown[]) => unknown {
         const cif = this.createCif(def.parameters, def.result);
         
-        const fn = (...args: any[]): any => {
+        const fn = (...args: unknown[]): unknown => {
             if (this.closed) {
                 throw new Error('Library is closed');
             }
@@ -93,7 +149,7 @@ class DynamicLibraryImpl<S extends ForeignLibraryInterface> implements DynamicLi
         return fn;
     }
 
-    private createStatic(symPtr: CModuleFFI.UvDlSym, def: ForeignStatic): any {
+    private createStatic(symPtr: CModuleFFI.UvDlSym, def: ForeignStatic): unknown {
         const native = ffi;
         const size = getTypeSize(def.type);
         const buf = native.ptrToBuffer(symPtr.addr, size);
@@ -109,7 +165,7 @@ class DynamicLibraryImpl<S extends ForeignLibraryInterface> implements DynamicLi
         if (!cif) {
             const retType = this.toFfiType(result);
             const argTypes = parameters.map(p => this.toFfiType(p));
-            cif = new ffi.FfiCif(retType, argTypes);
+            cif = new ffi.FfiCif(retType, ...argTypes);
             this.cifCache.set(cacheKey, cif);
         }
         return cif;
@@ -124,7 +180,7 @@ class DynamicLibraryImpl<S extends ForeignLibraryInterface> implements DynamicLi
     private toFfiType(
         type: NativeType | 'void'
     ): CModuleFFI.FfiType {
-        if (type === 'void') return ffi.FfiType.type_void;
+        if (type === 'void') return ffi.type_void;
         if (typeof type !== 'string') {
             if ('struct' in type) {
                 const memberTypes = type.struct.map(t => this.toFfiType(t));
@@ -132,7 +188,7 @@ class DynamicLibraryImpl<S extends ForeignLibraryInterface> implements DynamicLi
             }
         }
         
-        const typeMap: Record<string, keyof typeof ffi.FfiType> = {
+        const typeMap: Record<Extract<NativeType, string>, keyof typeof ffi> = {
             'u8': 'type_uint8',
             'i8': 'type_sint8',
             'u16': 'type_uint16',
@@ -151,16 +207,16 @@ class DynamicLibraryImpl<S extends ForeignLibraryInterface> implements DynamicLi
             'isize': 'type_ssize',
         };
         
-        const propName = typeMap[type as string];
+        const propName = typeMap[type];
         if (!propName) {
             throw new TypeError(`Unknown type: ${type}`);
         }
         
-        return ffi.FfiType[propName] as CModuleFFI.FfiType;
+        return ffi[propName] as CModuleFFI.FfiType;
     }
 
     private toFfiArg(
-        value: any,
+        value: unknown,
         type: NativeType
     ): Uint8Array | bigint {
         if (typeof type === 'string') {
@@ -168,19 +224,22 @@ class DynamicLibraryImpl<S extends ForeignLibraryInterface> implements DynamicLi
                 case 'u8':
                 case 'i8': {
                     const buf = new Uint8Array(1);
-                    buf[0] = value;
+                    const num = toNumberArg(value);
+                    buf[0] = num;
                     return buf;
                 }
                 case 'u16':
                 case 'i16': {
                     const buf = new ArrayBuffer(2);
-                    new DataView(buf).setUint16(0, value, true);
+                    const num = toNumberArg(value);
+                    new DataView(buf).setUint16(0, num, true);
                     return new Uint8Array(buf);
                 }
                 case 'u32':
                 case 'i32': {
                     const buf = new ArrayBuffer(4);
-                    new DataView(buf).setUint32(0, value, true);
+                    const num = toNumberArg(value);
+                    new DataView(buf).setUint32(0, num, true);
                     return new Uint8Array(buf);
                 }
                 case 'u64':
@@ -188,17 +247,20 @@ class DynamicLibraryImpl<S extends ForeignLibraryInterface> implements DynamicLi
                 case 'usize':
                 case 'isize': {
                     const buf = new ArrayBuffer(8);
-                    new DataView(buf).setBigUint64(0, BigInt(value), true);
+                    const num = toBigIntArg(value);
+                    new DataView(buf).setBigUint64(0, num, true);
                     return new Uint8Array(buf);
                 }
                 case 'f32': {
                     const buf = new ArrayBuffer(4);
-                    new DataView(buf).setFloat32(0, value, true);
+                    const num = toNumberArg(value);
+                    new DataView(buf).setFloat32(0, num, true);
                     return new Uint8Array(buf);
                 }
                 case 'f64': {
                     const buf = new ArrayBuffer(8);
-                    new DataView(buf).setFloat64(0, value, true);
+                    const num = toNumberArg(value);
+                    new DataView(buf).setFloat64(0, num, true);
                     return new Uint8Array(buf);
                 }
                 case 'bool': {
@@ -211,21 +273,10 @@ class DynamicLibraryImpl<S extends ForeignLibraryInterface> implements DynamicLi
                 case 'function': {
                     if (value === null) return 0n;
                     if (typeof value === 'object' && 'pointer' in value) {
-                        return UnsafePointer.value(value.pointer);
+                        return UnsafePointer.value(value.pointer as PointerValue);
                     }
                     if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {
-                        let buf: Uint8Array;
-                        if (value instanceof ArrayBuffer) {
-                            buf = new Uint8Array(value);
-                        } else if (value instanceof Uint8Array) {
-                            buf = value;
-                        } else {
-                            buf = new Uint8Array(
-                                (value as ArrayBufferView).buffer,
-                                (value as ArrayBufferView).byteOffset,
-                                (value as ArrayBufferView).byteLength
-                            );
-                        }
+                        const buf = bufferSourceBytes(value);
                         return ffi.getArrayBufPtr(buf);
                     }
                     return UnsafePointer.value(value as PointerValue);
@@ -235,19 +286,13 @@ class DynamicLibraryImpl<S extends ForeignLibraryInterface> implements DynamicLi
         
         if (typeof type === 'object' && 'struct' in type) {
             if (value instanceof Uint8Array) return value;
-            if (ArrayBuffer.isView(value)) {
-                return new Uint8Array(
-                    (value as ArrayBufferView).buffer,
-                    (value as ArrayBufferView).byteOffset,
-                    (value as ArrayBufferView).byteLength
-                );
-            }
+            if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) return bufferSourceBytes(value);
         }
         
         return new Uint8Array(0);
     }
 
-    private fromFfiResult(buf: Uint8Array, type: NativeResultType): any {
+    private fromFfiResult(buf: Uint8Array, type: NativeResultType): unknown {
         if (type === 'void') return undefined;
         
         if (typeof type === 'string') {
@@ -286,6 +331,7 @@ export function dlopen<const S extends ForeignLibraryInterface>(
     filename: string | URL,
     symbols: S,
 ): DynamicLibrary<S> {
+    validateForeignLibraryInterface(symbols);
     return new DynamicLibraryImpl(filename, symbols);
 }
 

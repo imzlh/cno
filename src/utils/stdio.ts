@@ -9,18 +9,25 @@
 import { malloc } from "./malloc";
 import { isPosixCompatible, isWindows } from "./platform";
 import { wrapFsClassDec as wrap } from "./wrap";
+import { arrayBufferBackedBytes } from "./bytes";
 
 const os = import.meta.use('os');
 const pipe = import.meta.use('streams');
 const asyncfs = import.meta.use('asyncfs');
 const sfs = import.meta.use('fs');
 
-type AnyStream = CModuleStreams.Pipe | CModuleStreams.TTY | FileStdio;
+type AnyStream = CModuleStreams.Pipe | CModuleStreams.TTY | FileStdio | NullStdio;
 
 const lockings: Record<number, boolean> = {
     [os.STDIN_FILENO]: false,
     [os.STDOUT_FILENO]: false,
     [os.STDERR_FILENO]: false,
+};
+
+const asyncQueues: Record<number, Promise<void>> = {
+    [os.STDIN_FILENO]: Promise.resolve(),
+    [os.STDOUT_FILENO]: Promise.resolve(),
+    [os.STDERR_FILENO]: Promise.resolve(),
 };
 
 function lock(fd: number) {
@@ -34,6 +41,19 @@ function unlock(fd: number) {
 
 function tryLock(fd: number) {
     if (lockings[fd]) throw new Error("File is already locked");
+}
+
+async function queueFd<T>(fd: number, op: () => Promise<T>): Promise<T> {
+    const previous = asyncQueues[fd] ?? Promise.resolve();
+    let release = () => {};
+    const current = new Promise<void>(resolve => { release = resolve; });
+    asyncQueues[fd] = previous.then(() => current, () => current);
+    await previous.catch(() => {});
+    try {
+        return await op();
+    } finally {
+        release();
+    }
 }
 
 /**
@@ -52,10 +72,17 @@ function readSyncBlocking(stream: CModuleStreams.Stream, fd: number, buf: Uint8A
     }
     let restore = false;
     try {
-        try { stream.setBlocking(true); restore = true; } catch {}
+        try {
+            stream.setBlocking(true);
+            restore = true;
+        } catch {}
         return stream.readSync(buf);
     } finally {
-        if (restore) try { stream.setBlocking(false); } catch {}
+        if (restore) {
+            try {
+                stream.setBlocking(false);
+            } catch {}
+        }
     }
 }
 
@@ -73,20 +100,23 @@ class FileStdio {
     }
 
     async read(buf: Uint8Array): Promise<number | null> {
-        const n = await this.#h.read(buf as Uint8Array<ArrayBuffer>, this.#pos);
-        if (n === null) return null;
+        if (buf.byteLength === 0) return 0;
+        const n = await this.#h.read(arrayBufferBackedBytes(buf), this.#pos);
+        if (n === null || n === 0) return null;
         this.#pos += n;
         return n;
     }
 
     readSync(buf: Uint8Array): number | null {
+        if (buf.byteLength === 0) return 0;
         const n = sfs.pread(this.#h.fileno(), buf, this.#pos);
+        if (n === 0) return null;
         this.#pos += n;
         return n;
     }
 
     async write(data: Uint8Array): Promise<number> {
-        const n = await this.#h.write(data as Uint8Array<ArrayBuffer>, this.#pos);
+        const n = await this.#h.write(arrayBufferBackedBytes(data), this.#pos);
         this.#pos += n;
         return n;
     }
@@ -102,54 +132,93 @@ class FileStdio {
     }
 }
 
+class NullStdio {
+    async read(_buf: Uint8Array): Promise<number | null> {
+        return null;
+    }
+
+    readSync(_buf: Uint8Array): number | null {
+        return null;
+    }
+
+    async write(data: Uint8Array): Promise<number> {
+        return data.byteLength;
+    }
+
+    writeSync(data: Uint8Array): number {
+        return data.byteLength;
+    }
+
+    close() {}
+}
+
 export class Stream {
-    protected type: 'pipe' | 'tty' | 'file';
+    protected type: 'pipe' | 'tty' | 'file' | 'null';
     protected stream: AnyStream;
     readonly fd: number;
 
-    constructor(fd: number, read = true) {
-        const type = os.guessHandle(fd);
-
+    constructor(fd: number, read = true, allowInvalid = false) {
         this.fd = fd;
-        switch (type) {
-            // normal pipe
-            case "udp":
-            case "pipe":
-            case "tcp":
-            case "unknown":
-                this.stream = new pipe.Pipe();
-                this.stream.open(fd);
-                this.type = 'pipe';
-            break;
-            case "tty":
-                this.stream = new pipe.TTY(fd, read);
-                this.type = 'tty';
-                try {
-                    this.stream.mode = pipe.TTY_MODE_NORMAL;
-                } catch {}
-                if (isWindows && !isPosixCompatible) {
-                    // Sync should use $CONIN instead
-                    this.fd = sfs.open('CONIN$', 'r', 0);
-                }
-            break;
-            case "file":
-                this.stream = new FileStdio(fd);
-                this.type = 'file';
-            break;
+        if (allowInvalid) {
+            try {
+                sfs.fstat(fd);
+            } catch {
+                this.stream = new NullStdio();
+                this.type = 'null';
+                return;
+            }
+        }
+        try {
+            const type = os.guessHandle(fd);
+            switch (type) {
+                // normal pipe
+                case "udp":
+                case "pipe":
+                case "tcp":
+                case "unknown":
+                    {
+                        const stream = new pipe.Pipe();
+                        stream.open(fd);
+                        this.stream = stream;
+                    }
+                    this.type = 'pipe';
+                break;
+                case "tty":
+                    {
+                        const stream = new pipe.TTY(fd, read);
+                        this.stream = stream;
+                        try {
+                            stream.mode = pipe.TTY_MODE_NORMAL;
+                        } catch {}
+                    }
+                    this.type = 'tty';
+                    if (isWindows && !isPosixCompatible) {
+                        // Sync should use $CONIN instead
+                        this.fd = sfs.open('CONIN$', 'r', 0);
+                    }
+                break;
+                case "file":
+                    this.stream = new FileStdio(fd);
+                    this.type = 'file';
+                break;
+            }
+        } catch (e) {
+            if (!allowInvalid) throw e;
+            this.stream = new NullStdio();
+            this.type = 'null';
         }
     }
 
     @wrap
     async write(data: Uint8Array) {
-        lock(this.fd);
-        try { return await this.stream.write(data); }
-        finally { unlock(this.fd); }
+        if (data.byteLength === 0) return 0;
+        return queueFd(this.fd, () => this.stream.write(data));
     }
 
     @wrap
     async read(buf: Uint8Array<ArrayBuffer>): Promise<number | null> {
-        lock(this.fd);
-        try {
+        if (buf.byteLength === 0) return 0;
+        return queueFd(this.fd, async () => {
             if (this.type == 'file') {
                 return await (this.stream as FileStdio).read(buf);
             } else {
@@ -161,11 +230,12 @@ export class Stream {
                     return null;
                 }
             }
-        } finally { unlock(this.fd); }
+        });
     }
 
     @wrap
     readSync(buf: Uint8Array): number | null {
+        if (buf.byteLength === 0) return 0;
         if (this.type == 'file') {
             tryLock(this.fd);
             try { return (this.stream as FileStdio).readSync(buf); }
@@ -180,10 +250,13 @@ export class Stream {
 
     @wrap
     writeSync(data: Uint8Array): number {
+        if (data.byteLength === 0) return 0;
         if (this.type == 'file') {
             tryLock(this.fd);
             try { return (this.stream as FileStdio).writeSync(data); }
             finally { unlock(this.fd); }
+        } else if (this.type == 'null') {
+            return (this.stream as NullStdio).writeSync(data);
         } else {
             return sfs.write(this.fd, data);
         }
@@ -266,9 +339,9 @@ export class Stream {
 }
 
 // stdio singletons — the single owner of fds 0/1/2.
-export const stdin = new Stream(os.STDIN_FILENO, true);
-export const stdout = new Stream(os.STDOUT_FILENO, false);
-export const stderr = new Stream(os.STDERR_FILENO, false);
+export const stdin = new Stream(os.STDIN_FILENO, true, true);
+export const stdout = new Stream(os.STDOUT_FILENO, false, true);
+export const stderr = new Stream(os.STDERR_FILENO, false, true);
 
 // Expose to the node polyfill via the native `streams` namespace (node reaches
 // them with import.meta.use('streams') instead of importing across the boundary).

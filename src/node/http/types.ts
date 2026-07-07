@@ -1,5 +1,8 @@
 import { Readable, Writable } from "../stream";
 import { Socket, Server as NetServer } from "../net";
+import type { TLSSocket } from "../tls";
+
+export type MessageSocket = Socket | TLSSocket;
 
 export interface IncomingHttpHeaders extends NodeJS.Dict<string | string[]> {
     accept?: string | undefined;
@@ -66,15 +69,15 @@ export interface IncomingHttpHeaders extends NodeJS.Dict<string | string[]> {
     'www-authenticate'?: string | undefined;
 }
 
-export type OutgoingHttpHeader = number | string | string[];
+export type OutgoingHttpHeader = number | string | readonly (number | string)[];
 export interface OutgoingHttpHeaders extends NodeJS.Dict<OutgoingHttpHeader> {
     [header: string]: OutgoingHttpHeader | undefined;
 }
 
 
 export interface IncomingMessage extends Readable {
-    socket: Socket | null;
-    connection: Socket | null;
+    socket: MessageSocket | null;
+    connection: MessageSocket | null;
     httpVersion: string;
     httpVersionMajor: number;
     httpVersionMinor: number;
@@ -95,8 +98,8 @@ export interface IncomingMessage extends Readable {
 }
 
 export interface OutgoingMessage extends Writable {
-    socket: Socket | null;
-    connection: Socket | null;
+    socket: MessageSocket | null;
+    connection: MessageSocket | null;
     writableEnded: boolean;
     writableFinished: boolean;
     headersSent: boolean;
@@ -109,7 +112,7 @@ export interface OutgoingMessage extends Writable {
     setHeader(name: string, value: number | string | readonly string[]): this;
     setHeaders(headers: Headers | Map<string, number | string | readonly string[]>): this;
     appendHeader(name: string, value: string | readonly string[]): this;
-    getHeader(name: string): number | string | string[] | undefined;
+    getHeader(name: string): OutgoingHttpHeader | undefined;
     getHeaders(): OutgoingHttpHeaders;
     getHeaderNames(): string[];
     hasHeader(name: string): boolean;

@@ -131,7 +131,7 @@ class SnakeGame {
     private menuOption: number;
     private gameBoard: CellType[][];
     private foodEaten: number;
-    private difficultyOptions = ["easy", "medium", "hard"];
+    private difficultyOptions: Array<GameConfig["difficulty"]> = ["easy", "medium", "hard"];
     private menuOptions = ["开始游戏", "难度选择", "墙壁模式", "加障碍物", "退出游戏"];
 
     constructor() {
@@ -539,10 +539,9 @@ class SnakeGame {
                 this.state = GameState.Playing;
                 break;
             case 1: // 难度选择
-                // @ts-ignore
                 this.config.difficulty = this.difficultyOptions[
                     (this.difficultyOptions.indexOf(this.config.difficulty) + 1) % this.difficultyOptions.length
-                ];
+                ] ?? "medium";
                 console.log(`难度已设置为 ${this.config.difficulty}`);
                 await new Promise(resolve => setTimeout(resolve, 1000));
                 break;

@@ -3,18 +3,41 @@ import type {
     NetworkCallFrame,
     ServeHook,
 } from '../../utils/network-hooks';
+import { viewToUint8Array } from './buffer';
 
-const debug = import.meta.use('debug') as {
-    __cnoNetworkHooks?: {
-        getFetchHook?: () => FetchHook | null;
-        getServeHook?: () => ServeHook | null;
-        captureCallFrames?: () => NetworkCallFrame[] | undefined;
-    };
-};
+const debug = import.meta.use('debug');
 
 let nodeRequestSeq = 0;
 
 type HeaderValue = number | string | string[] | readonly string[] | undefined;
+type HeaderMap = Record<string, string | string[]>;
+
+interface ResponseParserMessage {
+    statusCode?: number;
+    statusMessage?: string;
+    httpVersion: string;
+    httpVersionMajor: number;
+    httpVersionMinor: number;
+    headers: HeaderMap;
+    headersDistinct: Record<string, string[]>;
+    rawHeaders: string[];
+    trailers: HeaderMap;
+    trailersDistinct: Record<string, string[]>;
+    rawTrailers: string[];
+    complete: boolean;
+    push(chunk: Uint8Array | null): boolean;
+}
+
+export interface ResponseInformation {
+    statusCode: number;
+    statusMessage: string;
+    httpVersion: string;
+    httpVersionMajor: number;
+    httpVersionMinor: number;
+    headers: HeaderMap;
+    headersDistinct: Record<string, string[]>;
+    rawHeaders: string[];
+}
 
 export function nodeTs(): number {
     return Date.now() / 1000;
@@ -26,7 +49,10 @@ export function nextNodeRequestId(prefix: string): string {
 
 export function captureNodeNetworkCallFrames(): NetworkCallFrame[] | undefined {
     try {
-        return debug.__cnoNetworkHooks?.captureCallFrames?.();
+        const hooks = Reflect.get(debug, '__cnoNetworkHooks');
+        if (!hooks || typeof hooks !== 'object') return undefined;
+        const captureCallFrames = Reflect.get(hooks, 'captureCallFrames');
+        return typeof captureCallFrames === 'function' ? captureCallFrames() : undefined;
     } catch {
         return undefined;
     }
@@ -34,7 +60,10 @@ export function captureNodeNetworkCallFrames(): NetworkCallFrame[] | undefined {
 
 export function getNodeFetchHook(): FetchHook | null {
     try {
-        return debug.__cnoNetworkHooks?.getFetchHook?.() ?? null;
+        const hooks = Reflect.get(debug, '__cnoNetworkHooks');
+        if (!hooks || typeof hooks !== 'object') return null;
+        const getFetchHook = Reflect.get(hooks, 'getFetchHook');
+        return typeof getFetchHook === 'function' ? getFetchHook() ?? null : null;
     } catch {
         return null;
     }
@@ -42,19 +71,22 @@ export function getNodeFetchHook(): FetchHook | null {
 
 export function getNodeServeHook(): ServeHook | null {
     try {
-        return debug.__cnoNetworkHooks?.getServeHook?.() ?? null;
+        const hooks = Reflect.get(debug, '__cnoNetworkHooks');
+        if (!hooks || typeof hooks !== 'object') return null;
+        const getServeHook = Reflect.get(hooks, 'getServeHook');
+        return typeof getServeHook === 'function' ? getServeHook() ?? null : null;
     } catch {
         return null;
     }
 }
 
-export function normalizeHeaderValue(value: HeaderValue): string | undefined {
+export function normalizeHeaderValue(value: unknown): string | undefined {
     if (value === undefined) return undefined;
     if (Array.isArray(value)) return value.map(item => String(item)).join(', ');
     return String(value);
 }
 
-export function normalizeHeaderRecord(headers: Record<string, HeaderValue>): Record<string, string> {
+export function normalizeHeaderRecord(headers: object): Record<string, string> {
     const out: Record<string, string> = {};
     for (const [key, value] of Object.entries(headers)) {
         const normalized = normalizeHeaderValue(value);
@@ -73,7 +105,7 @@ export function toUint8Array(chunk: unknown, encodeString: (value: string) => Ui
     if (chunk instanceof Uint8Array) return chunk;
     if (typeof chunk === 'string') return encodeString(chunk);
     if (ArrayBuffer.isView(chunk)) {
-        return new Uint8Array(chunk.buffer as ArrayBuffer, chunk.byteOffset, chunk.byteLength);
+        return viewToUint8Array(chunk);
     }
     if (chunk instanceof ArrayBuffer) return new Uint8Array(chunk);
     return encodeString(String(chunk ?? ''));
@@ -104,11 +136,20 @@ export interface ResponseParserContext {
     protocol: string;
     host: string;
     path: string;
-    res: any;  // IncomingMessageImpl or compatible (must have push())
-    getHeaders: () => Record<string, any>;
-    onResponse: (res: any) => void;
+    res: ResponseParserMessage;
+    getHeaders: () => Record<string, HeaderValue>;
+    onResponse: (res: ResponseParserMessage) => void;
+    onInformation?: (info: ResponseInformation) => void;
+    onConnect?: (res: ResponseParserMessage) => void;
+    onUpgrade?: (res: ResponseParserMessage) => void;
     onComplete: () => void;
+    connectMode?: boolean;
     skipBody?: boolean;
+}
+
+function viewParserBuffer(buffer: CModuleHTTP.BufferSource): Uint8Array {
+    if (buffer instanceof ArrayBuffer) return new Uint8Array(buffer);
+    return new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
 }
 
 export function setupResponseParser(ctx: ResponseParserContext) {
@@ -121,28 +162,108 @@ export function setupResponseParser(ctx: ResponseParserContext) {
     const parser = new httpNative.Parser(httpNative.RESPONSE);
     const res = ctx.res;
     let currentHeaderField = '';
+    let currentHeaderValue = '';
+    let currentHeaderPart: 'field' | 'value' | null = null;
+    let currentStatusMessage = '';
+    let currentHeaders: HeaderMap = {};
+    let currentHeadersDistinct: Record<string, string[]> = {};
+    let currentRawHeaders: string[] = [];
+    let currentMessageInformational = false;
+    let currentMessageConnect = false;
+    let currentMessageUpgrade = false;
+    let responseStarted = false;
     const pendingChunks: Uint8Array[] = [];
 
-    const decode = (buf: any, off: number, len: number) =>
-        engine.decodeString(new Uint8Array(buf as ArrayBuffer).slice(off, off + len));
-
-    parser.onStatus = (buf: any, off: number, len: number) => { res.statusMessage = decode(buf, off, len); };
-    parser.onHeaderField = (buf: any, off: number, len: number) => { currentHeaderField = decode(buf, off, len).toLowerCase(); };
-    parser.onHeaderValue = (buf: any, off: number, len: number) => {
-        const value = decode(buf, off, len);
-        const existing = res.headers[currentHeaderField];
+    const decode = (buf: CModuleHTTP.BufferSource, off: number, len: number) =>
+        engine.decodeString(viewParserBuffer(buf).subarray(off, off + len));
+    const resetMessageHeaders = () => {
+        currentHeaderField = '';
+        currentHeaderValue = '';
+        currentHeaderPart = null;
+        currentStatusMessage = '';
+        currentHeaders = {};
+        currentHeadersDistinct = {};
+        currentRawHeaders = [];
+    };
+    const flushHeader = () => {
+        if (!currentHeaderField) return;
+        const lowerField = currentHeaderField.toLowerCase();
+        const targetHeaders = responseStarted ? res.trailers : currentHeaders;
+        const targetDistinct = responseStarted ? res.trailersDistinct : currentHeadersDistinct;
+        const targetRaw = responseStarted ? res.rawTrailers : currentRawHeaders;
+        const existing = targetHeaders[lowerField];
         if (existing) {
-            if (Array.isArray(existing)) existing.push(value);
-            else res.headers[currentHeaderField] = [existing, value];
-        } else { res.headers[currentHeaderField] = value; }
-        res.rawHeaders.push(currentHeaderField, value);
-        (res.headersDistinct[currentHeaderField] ??= []).push(value);
+            if (Array.isArray(existing)) existing.push(currentHeaderValue);
+            else targetHeaders[lowerField] = [existing, currentHeaderValue];
+        } else {
+            targetHeaders[lowerField] = currentHeaderValue;
+        }
+        targetRaw.push(currentHeaderField, currentHeaderValue);
+        (targetDistinct[lowerField] ??= []).push(currentHeaderValue);
+        currentHeaderField = '';
+        currentHeaderValue = '';
+        currentHeaderPart = null;
+    };
+
+    parser.onStatus = (buf, off, len) => { currentStatusMessage += decode(buf, off, len); };
+    parser.onHeaderField = (buf, off, len) => {
+        if (currentHeaderPart === 'value') flushHeader();
+        currentHeaderField += decode(buf, off, len);
+        currentHeaderPart = 'field';
+    };
+    parser.onHeaderValue = (buf, off, len) => {
+        currentHeaderValue += decode(buf, off, len);
+        currentHeaderPart = 'value';
     };
     parser.onHeadersComplete = () => {
-        res.statusCode = parser.state.status;
-        res.httpVersion = `${parser.state.httpMajor}.${parser.state.httpMinor}`;
+        flushHeader();
+        const statusCode = parser.state.status;
+        const httpVersion = `${parser.state.httpMajor}.${parser.state.httpMinor}`;
+        const isUpgrade = statusCode === 101 || parser.state.upgrade;
+        if (ctx.connectMode) {
+            responseStarted = true;
+            res.statusCode = statusCode;
+            res.statusMessage = currentStatusMessage;
+            res.httpVersion = httpVersion;
+            res.httpVersionMajor = parser.state.httpMajor;
+            res.httpVersionMinor = parser.state.httpMinor;
+            res.headers = currentHeaders;
+            res.headersDistinct = currentHeadersDistinct;
+            res.rawHeaders = currentRawHeaders;
+            currentMessageConnect = true;
+            ctx.onConnect?.(res);
+            return;
+        }
+        if (statusCode >= 100 && statusCode < 200 && statusCode !== 101) {
+            currentMessageInformational = true;
+            ctx.onInformation?.({
+                statusCode,
+                statusMessage: currentStatusMessage,
+                httpVersion,
+                httpVersionMajor: parser.state.httpMajor,
+                httpVersionMinor: parser.state.httpMinor,
+                headers: currentHeaders,
+                headersDistinct: currentHeadersDistinct,
+                rawHeaders: currentRawHeaders,
+            });
+            resetMessageHeaders();
+            return;
+        }
+
+        responseStarted = true;
+        res.statusCode = statusCode;
+        res.statusMessage = currentStatusMessage;
+        res.httpVersion = httpVersion;
         res.httpVersionMajor = parser.state.httpMajor;
         res.httpVersionMinor = parser.state.httpMinor;
+        res.headers = currentHeaders;
+        res.headersDistinct = currentHeadersDistinct;
+        res.rawHeaders = currentRawHeaders;
+        if (isUpgrade) {
+            currentMessageUpgrade = true;
+            ctx.onUpgrade?.(res);
+            return;
+        }
         ctx.onResponse(res);
         try { fetchHook?.onResponse?.({
             requestId: ctx.requestId, timestamp: nodeTs(),
@@ -155,21 +276,35 @@ export function setupResponseParser(ctx: ResponseParserContext) {
         for (const chunk of pendingChunks) res.push(chunk);
         pendingChunks.length = 0;
         if (ctx.skipBody && !res.complete) {
-            res.push(null);
             res.complete = true;
+            res.push(null);
             finish(true);
             ctx.onComplete();
         }
     };
-    parser.onBody = (buf: any, off: number, len: number) => {
-        if (ctx.skipBody) return;
-        const data = new Uint8Array(buf as ArrayBuffer).slice(off, off + len);
+    parser.onBody = (buf, off, len) => {
+        if (ctx.skipBody || currentMessageInformational || currentMessageConnect) return;
+        const data = viewParserBuffer(buf).slice(off, off + len);
         try { fetchHook?.onData?.({ requestId: ctx.requestId, timestamp: nodeTs(), data }); } catch {}
-        if (res.statusCode === 0) pendingChunks.push(data);
+        if (!responseStarted) pendingChunks.push(data);
         else res.push(data);
     };
     parser.onMessageComplete = () => {
-        res.push(null); res.complete = true;
+        if (currentMessageInformational) {
+            currentMessageInformational = false;
+            return;
+        }
+        flushHeader();
+        if (currentMessageConnect) {
+            res.complete = true;
+            return;
+        }
+        if (currentMessageUpgrade) {
+            res.complete = true;
+            return;
+        }
+        res.complete = true;
+        res.push(null);
         finish(true);
         ctx.onComplete();
     };

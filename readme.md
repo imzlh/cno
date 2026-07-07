@@ -1,446 +1,167 @@
-# CTS
+# cno
 
-Enable your circu.js to run Deno applications.
+`cno/` is the runtime polyfill layer used by `cno-cli`. It installs Web APIs,
+Deno APIs, Node.js compatibility modules, and the `CNO` namespace on top of the
+`circu.js` native runtime.
 
-## Description
+This directory is loaded by the CLI through:
 
-CTS (Circu.js TypeScript Runtime) is a TypeScript bootstrap that provides full TypeScript experience for circu.js. It implements Web API and Deno API polyfills, enabling Deno applications to run in circu.js environment.
-
-Built on QuickJS engine, CTS bridges the gap between circu.js runtime and Deno's API surface, making it possible to run Deno-compatible code with minimal modifications.
-
-## Status
-
-### WebAPI
-- [x] Event
-  - [x] Event
-  - [x] EventTarget
-  - [x] CustomEvent
-  - [x] MessageEvent
-  - [x] CloseEvent
-  - [x] ErrorEvent
-  - [x] StorageEvent
-  - [x] PromiseRejectionEvent
-- [x] URL、URLPattern
-  - [x] URL
-  - [x] URLSearchParams
-  - [x] URLPattern (polyfill)
-- [x] Stream
-  - [x] ReadableStream
-  - [x] WritableStream
-  - [x] TransformStream
-  - [x] ReadableStreamDefaultController
-  - [x] WritableStreamDefaultController
-- [x] Blob、FormData
-  - [x] Blob
-  - [x] File
-  - [x] FileReader
-  - [x] FormData
-- [x] AbortSignal
-  - [x] AbortController
-  - [x] AbortSignal
-- [x] Header Request Response
-  - [x] Headers
-  - [x] Request
-  - [x] Response
-- [x] fetch
-  - [x] fetch API
-  - [x] Redirect handling
-  - [x] Connection pooling
-  - [x] Keep-alive support
-- [x] WebSocket
-  - [x] WebSocket client
-  - [x] WebSocket server upgrade
-  - [x] RFC 6455 compliant
-- [x] CryptoSubtle crypto
-  - [x] crypto.getRandomValues
-  - [x] SHA-1, SHA-256, SHA-384, SHA-512
-  - [x] AES-CBC, AES-GCM, AES-CTR
-  - [x] RSA-OAEP, RSA-PSS, RSASSA-PKCS1-v1_5
-  - [x] ECDSA, ECDH
-  - [x] HMAC, PBKDF2
-  - [x] Key generation, import, export
-- [x] performance
-  - [x] performance.now()
-  - [x] performance.mark()
-  - [x] performance.measure()
-  - [x] PerformanceObserver
-- [x] wasm
-  - [x] WebAssembly.compile
-  - [x] WebAssembly.instantiate
-  - [x] WebAssembly.compileStreaming
-  - [x] WebAssembly.instantiateStreaming
-- [x] Storage
-  - [x] localStorage
-  - [x] sessionStorage
-  - [x] SQLite-backed persistence
-  - [x] WAL mode support
-- [x] Temporal
-  - [ ] Temporal (polyfill available, not enabled)
-- [x] Intl
-  - [x] DateTimeFormat
-  - [x] NumberFormat
-  - [x] RelativeTimeFormat
-  - [x] DisplayNames
-  - [x] Locale data (zh, en)
-- [x] more
-  - [x] atob / btoa
-  - [x] TextEncoder / TextDecoder
-  - [x] setTimeout / setInterval / clearTimeout
-  - [x] structuredClone
-  - [x] alert / prompt / confirm
-  - [x] close
-  - [x] reportError
-  - [x] EventSource (SSE)
-
-### Deno
-- [x] permission (partial)
-  - [x] permissions.query (always granted)
-  - [ ] permissions.request
-  - [ ] permissions.revoke
-- [-] unstable
-  - [x] ffi
-  - [x] kv
-  - [-] vsock
-  - [-] multicast
-  - [-] datagram (soon)
-  - [-] bundle (Deno.bundle)
-  - [-] cron
-  - [-] ws stream (soon)
-- [x] basic
-  - [x] Deno.pid / Deno.ppid
-  - [x] Deno.args
-  - [x] Deno.env
-  - [x] Deno.exit / Deno.exitCode
-  - [x] Deno.build
-  - [x] Deno.version
-  - [x] Deno.cwd / Deno.chdir
-  - [x] Deno.mainModule
-  - [x] Deno.execPath
-  - [x] Deno.noColor
-  - [x] Deno.memoryUsage
-  - [x] Deno.systemMemoryInfo
-  - [x] Deno.hostname
-  - [x] Deno.loadavg
-  - [x] Deno.osRelease
-  - [x] Deno.osUptime
-  - [x] Deno.uid / Deno.gid
-  - [x] Deno.inspect
-  - [x] Deno.errors
-  - [x] Deno.addSignalListener
-  - [x] Deno.removeSignalListener
-- [x] net
-  - [x] Deno.connect (TCP, Unix)
-  - [x] Deno.connectTls
-  - [x] Deno.listen (TCP, Unix)
-  - [x] Deno.listenTls
-  - [x] Deno.startTls
-  - [x] Deno.resolveDns (A, AAAA, CNAME, MX, NS, PTR, SOA, SRV, TXT, CAA, NAPTR)
-  - [x] Deno.networkInterfaces
-  - [x] TcpConn / TlsConn / UnixConn
-  - [x] Listener / TcpListener / TlsListener
-- [x] fs
-  - [x] Deno.readFile / readTextFile
-  - [x] Deno.writeFile / writeTextFile
-  - [x] Deno.readDir
-  - [x] Deno.mkdir
-  - [x] Deno.remove
-  - [x] Deno.rename
-  - [x] Deno.copyFile
-  - [x] Deno.stat / lstat
-  - [x] Deno.truncate
-  - [x] Deno.chmod / chown
-  - [x] Deno.link / symlink / readLink
-  - [x] Deno.realPath
-  - [x] Deno.makeTempDir / makeTempFile
-  - [x] Deno.open / FsFile
-  - [x] Deno.watchFs
-- [x] terminal
-  - [x] Deno.stdin
-  - [x] Deno.stdout
-  - [x] Deno.stderr
-  - [x] Deno.consoleSize
-  - [x] isTerminal
-  - [x] setRaw
-- [-] process
-  - [x] Deno.Command
-  - [x] Deno.kill
-  - [x] ChildProcess
-  - [x] spawn / output / outputSync
-  - [ ] Deno.umask
-- [x] serve
-  - [x] Deno.serve
-  - [x] HTTP/1.1 server
-  - [x] HTTPS support
-  - [x] Request/Response handling
-- [x] serve ws
-  - [x] Deno.upgradeWebSocket
-  - [x] WebSocket server
-
-### CNO Namespace
-- [x] CNO.openpty - PTY spawning
-- [x] CNO.engine
-  - [x] serialize / deserialize
-  - [x] evalModule
-  - [x] compileModule
-
-### Node.js Compatibility
-- [-] fs
-  - [x] readFileSync / readFile
-  - [x] writeFileSync / writeFile
-  - [x] appendFileSync
-  - [x] existsSync
-  - [x] statSync / lstatSync / fstatSync
-  - [x] accessSync
-  - [x] mkdirSync / mkdirSync (recursive)
-  - [x] rmdirSync / rmSync
-  - [x] readdirSync
-  - [x] renameSync
-  - [x] copyFileSync
-  - [x] unlinkSync
-  - [x] readlinkSync / symlinkSync / linkSync
-  - [x] realpathSync
-  - [x] truncateSync / ftruncateSync
-  - [x] chmodSync / chownSync / fchmodSync / fchownSync
-  - [x] utimesSync / futimesSync
-  - [x] openSync / closeSync
-  - [x] readSync / writeSync
-  - [x] fsyncSync / fdatasyncSync
-  - [x] mkdirpSync
-  - [x] promises API (async fs operations)
-  - [x] callback API
-  - [x] constants (F_OK, R_OK, W_OK, X_OK, etc.)
-- [x] path
-  - [x] join, resolve, normalize, dirname, basename, extname
-  - [x] relative, isAbsolute
-  - [x] parse, format
-  - [x] sep, delimiter
-  - [x] win32, posix namespaces
-- [x] os
-  - [x] hostname, type, platform, arch
-  - [x] release, version, uptime
-  - [x] cpus, loadavg, freemem, totalmem
-  - [x] homedir, tmpdir, userinfo
-  - [x] networkInterfaces
-  - [x] EOL, constants
-- [x] dns
-  - [x] lookup, resolve
-  - [x] resolve4, resolve6
-  - [x] reverse
-  - [x] promises API
-- [x] events
-  - [x] EventEmitter
-  - [x] once, on, off
-  - [x] captureRejectionSymbol
-- [x] util
-  - [x] promisify, callbackify
-  - [x] inherits
-  - [x] isDeepStrictEqual
-  - [x] format, inspect
-  - [x] types (isArray, isNull, etc.)
-- [-] crypto
-  - [x] createHash (SHA-1, SHA-256, SHA-512, MD5)
-  - [x] createHmac
-  - [x] createCipher / createDecipher
-  - [x] createSign / createVerify
-  - [x] randomBytes
-  - [x] pbkdf2 / pbkdf2Sync
-  - [x] scrypt / scryptSync
-  - [x] constants
-- [-] stream
-  - [x] Stream (base class)
-  - [x] Readable
-  - [x] Writable
-  - [x] Duplex
-  - [x] Transform
-  - [x] PassThrough
-  - [x] pipeline, finished
-  - [x] Readable.from
-  - [x] promises namespace
-  - [x] addAbortSignal
-- [-] net
-  - [x] Socket
-  - [x] Server
-  - [x] createServer
-  - [x] connect / createConnection
-  - [x] isIP, isIPv4, isIPv6
-  - [x] setNoDelay, setKeepAlive
-  - [x] setTimeout, ref, unref
-- [-] child_process
-  - [x] spawn
-  - [x] exec, execFile
-  - [x] execSync, execFileSync
-  - [x] fork (partial)
-  - [x] ChildProcess class
-  - [x] stdin/stdout/stderr streams
-- [x] buffer
-  - [x] Buffer class
-  - [x] Buffer.from, Buffer.alloc, Buffer.allocUnsafe
-  - [x] Buffer.concat, Buffer.isBuffer
-  - [x] Buffer.byteLength
-  - [x] toString, toJSON, equals, compare
-  - [x] slice, subarray, copy, fill
-  - [x] readInt*, writeInt*, readUInt*, writeUInt*
-  - [x] transcode
-- [-] zlib
-  - [x] deflate / deflateSync / deflateRaw / deflateRawSync
-  - [x] inflate / inflateSync / inflateRaw / inflateRawSync
-  - [x] gzip / gzipSync / gunzip / gunzipSync
-  - [x] unzip / unzipSync
-  - [x] brotliCompress / brotliDecompress
-  - [x] constants (compression levels, strategies, etc.)
-  - [x] createDeflate, createInflate, etc.
-- [-] dgram
-  - [x] createSocket (udp4, udp6)
-  - [x] bind, send, close
-  - [x] addMembership, dropMembership
-  - [x] setBroadcast, setTTL, setMulticastTTL
-  - [x] address, remoteAddress
-  - [x] message, listening, error, close events
-- [-] process
-  - [x] argv, argv0, execArgv
-  - [x] env (Proxy-based)
-  - [x] cwd, chdir
-  - [x] exit, exitCode
-  - [x] pid, ppid
-  - [x] platform, arch
-  - [x] version, versions
-  - [x] title
-  - [x] execPath
-  - [x] memoryUsage, cpuUsage
-  - [x] hrtime, uptime
-  - [x] nextTick
-  - [x] kill, abort
-  - [x] signal handling (on, off, once)
-  - [x] getuid, getgid, geteuid, getegid
-  - [x] umask
-  - [x] config, release, features
-  - [x] report, resourceUsage
-  - [x] emitWarning
-  - [x] permission.has
-- [x] timers
-  - [x] setTimeout, clearTimeout
-  - [x] setInterval, clearInterval
-  - [x] setImmediate, clearImmediate
-  - [x] promises namespace (setTimeout, scheduler)
-
-## Architecture
-
-CTS loads in the following order:
-
-1. **WebAPI** (`src/webapi/`) - Web standard API polyfills
-2. **Deno** (`src/deno/`) - Deno runtime API implementation
-3. **CJS** (`src/cjs/`) - CNO private namespace and extensions (PTY, engine)
-4. **Module** (`src/module/`) - HTTP module (fetch, websocket, SSE, server)
-
-## Project Structure
-
-```
-denort/
-├── src/
-│   ├── main.ts              # Entry point
-│   ├── webapi/              # Web API polyfills
-│   │   ├── basic.ts         # atob, btoa, TextEncoder, timers, etc.
-│   │   ├── url.ts           # URL, URLSearchParams
-│   │   ├── streams.ts       # ReadableStream, WritableStream
-│   │   ├── crypto.ts        # SubtleCrypto implementation
-│   │   ├── performance.ts   # Performance API
-│   │   ├── storage.ts       # localStorage, sessionStorage
-│   │   ├── intl.ts          # Intl API
-│   │   ├── wasm.ts          # WebAssembly
-│   │   └── events.ts        # Event, EventTarget
-│   ├── deno/                # Deno API implementation
-│   │   ├── 00_permission.ts # Permission system
-│   │   ├── 01_errors.ts     # Deno error classes
-│   │   ├── 02_fs.ts         # File system operations
-│   │   ├── 03_fopen.ts      # File handle (FsFile)
-│   │   ├── 04_stdio.ts      # stdin, stdout, stderr
-│   │   ├── 05_net.ts        # TCP, TLS, Unix sockets
-│   │   ├── 06_process.ts    # Process spawning
-│   │   ├── 07_http.ts       # HTTP utilities
-│   │   └── 08_serve.ts      # Deno.serve, upgradeWebSocket
-│   ├── cjs/                 # CNO namespace
-│   │   ├── pty.ts           # PTY spawning
-│   │   └── engine.ts        # Engine utilities
-│   ├── module/              # HTTP module
-│   │   └── http/
-│   │       ├── fetch.ts     # fetch API
-│   │       ├── websocket.ts # WebSocket
-│   │       ├── sse.ts       # EventSource
-│   │       ├── server.ts    # HTTP server
-│   │       ├── connection.ts# Connection pooling
-│   │       └── http.ts      # HTTP parser/builder
-│   ├── node/                # Node.js compatibility
-│   └── utils/               # Utility functions
-├── example/                 # Example projects
-├── types/                   # Type definitions
-├── dist.js                  # Bundled output
-└── Makefile
+```ts
+await import('../cno/src/main');
 ```
 
-## Build
+`cno/src/main.ts` currently installs, in order:
 
-```bash
-# Install dependencies
-pnpm install
-
-# Build bundle
-pnpm run build
-
-# Bundle to single file
-pnpm run bundle
-
-# Build node polyfills (requires cts)
-make
+```text
+webapi/index
+deno/index
+cno/index
+node/_internal/inject
 ```
 
-## Usage
+## Directory Layout
 
-After building, `dist.js` can be loaded in circu.js environment to provide Deno-compatible APIs.
+| Path | Role |
+| --- | --- |
+| `src/webapi/` | Web platform APIs such as fetch, streams, events, URL, crypto, WebSocket |
+| `src/deno/` | Deno namespace APIs such as fs, net, process, serve, kv, ffi |
+| `src/node/` | Node.js builtin modules and globals |
+| `src/cno/` | CNO-specific APIs such as engine helpers, pty, ssl, compression |
+| `src/utils/` | Shared runtime helpers |
+| `src/type/` | Type declarations for the CNO namespace |
+| `utils/` | Build/install helpers for Node polyfill files |
+| `example/` | Small usage examples |
 
-```javascript
-// File system
-const data = await Deno.readTextFile("./example.txt");
-console.log(data);
+## Web API Layer
 
-// HTTP client
-const response = await fetch("https://api.example.com/data");
-const json = await response.json();
+The Web API layer is installed from `src/webapi/index.ts`. It provides the
+browser-like globals that Deno-style programs expect, including:
 
-// HTTP server
-Deno.serve({ port: 8000 }, (request) => {
-  return new Response("Hello World");
-});
+- timers and microtasks
+- console
+- events and `EventTarget`
+- `URL`, `URLSearchParams`, and `URLPattern`
+- `TextEncoder` and `TextDecoder`
+- `Blob`, `File`, `FormData`
+- `ReadableStream`, `WritableStream`, `TransformStream`
+- `AbortController` and `AbortSignal`
+- `fetch`, `Request`, `Response`, `Headers`, and `XMLHttpRequest`
+- `WebSocket`, `EventSource`, and WebTransport-related entry points
+- `crypto` and `crypto.subtle`
+- `performance`
+- `navigator`
+- `localStorage`, `sessionStorage`, and Cache API pieces
+- WebAssembly helpers
 
-// WebSocket
-const ws = new WebSocket("wss://example.com/socket");
-ws.onmessage = (e) => console.log(e.data);
+HTTP fetch currently uses the fetch implementation under
+`src/webapi/fetch/`, backed by native/runtime facilities. Long-lived protocol
+transports also use helpers from `@cnojs/http`.
 
-// Process spawning
-const cmd = new Deno.Command("echo", { args: ["hello"] });
-const { stdout } = await cmd.output();
+## Deno Layer
 
-// Network
-const conn = await Deno.connect({ hostname: "example.com", port: 80 });
-await conn.write(new TextEncoder().encode("GET / HTTP/1.1\r\n\r\n"));
+The Deno namespace is assembled in `src/deno/index.ts` and split into numbered
+modules:
+
+| File | Area |
+| --- | --- |
+| `00_permission.ts` | Permission compatibility surface |
+| `01_errors.ts` | `Deno.errors` |
+| `02_fs.ts` | File system functions |
+| `03_fopen.ts` | `Deno.open` and file handles |
+| `04_stdio.ts` | stdin, stdout, stderr |
+| `05_net.ts` | TCP, TLS, Unix sockets, DNS |
+| `06_process.ts` | `Deno.Command` and process handling |
+| `07_http.ts` | HTTP client helpers |
+| `08_serve.ts` | `Deno.serve` and websocket upgrade |
+| `09_cron.ts` | Cron compatibility surface |
+| `10_quic.ts` | QUIC/WebTransport integration |
+| `ffi/` | `Deno.dlopen` and unsafe pointer/callback APIs |
+| `kv/` | SQLite-backed KV implementation |
+
+Permissions are compatibility-oriented rather than a sandbox. Deno permission
+flags accepted by the CLI are currently no-ops.
+
+## Node.js Layer
+
+Node builtin modules live under `src/node/<name>/`. Each module generally has:
+
+```text
+mod.ts    implementation and exports
+index.ts  resolver-facing entry
 ```
 
-## Dependencies
+Implemented or partially implemented surfaces include:
 
-### Web API Polyfills
-- `web-streams-polyfill` - Streams API
-- `formdata-polyfill` - FormData
-- `blob-polyfill` - Blob/File
-- `abortcontroller-polyfill` - AbortController/AbortSignal
-- `urlpattern-polyfill` - URLPattern
-- `whatwg-url` - URL implementation
-- `headers-polyfill` - Headers API
-- `temporal-polyfill` - Temporal API
-- `@formatjs/intl` - Intl API
+```text
+assert, async_hooks, buffer, child_process, console, constants, crypto,
+dgram, diagnostics_channel, dns, events, fs, http, http2, https, inspector,
+ipc_channel, module, net, os, path, perf_hooks, process, punycode,
+querystring, readline, repl, sqlite, sqlite3, stream, string_decoder, timers,
+tls, tty, url, util, v8, vm, wasi, worker_threads, zlib
+```
 
-### Build Tools
-- `esbuild` - Bundling
-- `sucrase` - TypeScript transformation
+`src/node/_internal/inject.ts` wires selected globals:
 
-## License
+- `process`
+- `Buffer`
+- `http.__cno` for Node HTTP server integration
 
-MIT
+Node builtin polyfills are resolved by CTS from the cache directory. In a
+development checkout, refresh them with:
+
+```sh
+build/stage/cno setup
+```
+
+## CNO Namespace
+
+`src/cno/index.ts` installs project-specific APIs under `CNO`, including:
+
+- `CNO.engine`
+- `CNO.openpty`
+- SSL helpers
+- compression helpers
+- llhttp helpers
+
+These are runtime-specific APIs, not Deno or Node compatibility APIs.
+
+## Compatibility Status
+
+This README lists implementation areas and source ownership. It is not a claim
+that every listed upstream API is complete. Use `../docs/compatibility.md` for
+status language and compatibility boundaries.
+
+## Build And Validation
+
+From the repository root:
+
+```sh
+pnpm run type-check
+cmake --build build
+```
+
+After changing only `cno/src/node/` files, the staged runtime usually only
+needs its cached Node polyfills refreshed:
+
+```sh
+build/stage/cno setup
+```
+
+Focused test buckets:
+
+```sh
+build/stage/cno test tests/webapi
+build/stage/cno test tests/deno
+build/stage/cno test tests/node
+```
+
+## Maintenance Notes
+
+- Keep Node module implementations inside `cno/src/node/` unless there is a
+  deliberate shared runtime boundary.
+- Use `import.meta.use()` for native runtime modules instead of global shortcuts
+  inside polyfill code.
+- When runtime behavior changes, check the exported TypeScript surface where
+  applicable.
+- The old package name in `cno/package.json` is not a reliable description of
+  this directory; treat this README and the source layout as the current guide.

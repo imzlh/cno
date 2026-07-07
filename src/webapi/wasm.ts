@@ -11,10 +11,37 @@
  * @see {@link https://webassembly.github.io/spec/js-api/}
  */
 
-const wasm = import.meta.use('wasm')!;
-const engine = import.meta.use('engine')!;
+const wasmModule = import.meta.use('wasm');
+if (!wasmModule) throw new Error('WASM support is not available in this build');
+const wasm = wasmModule;
+const engine = import.meta.use('engine');
 
 type BufferSource = ArrayBuffer | ArrayBufferView;
+type WasmImportObject = Record<string, Record<string, unknown>>;
+type WasmFunctionExport = (...args: CModuleWASM.WasmFunctionArgument[]) => CModuleWASM.WasmFunctionResult;
+type WasmExportValue = WasmFunctionExport | Memory | Table | Global;
+type WasmExports = Record<string, WasmExportValue>;
+type WebAssemblyFacade = {
+    Module: typeof Module;
+    Instance: typeof Instance;
+    Memory: typeof Memory;
+    Table: typeof Table;
+    Global: typeof Global;
+    CompileError: typeof CompileError;
+    LinkError: typeof LinkError;
+    RuntimeError: typeof RuntimeError;
+    readonly [Symbol.toStringTag]: string;
+    validate(bufferSource: BufferSource): boolean;
+    compile(bufferSource: BufferSource): Promise<Module>;
+    instantiate(source: BufferSource | Module, importObject?: WasmImportObject): Promise<Instance | { module: Module; instance: Instance }>;
+    compileStreaming(source: Response | Promise<Response>): Promise<Module>;
+    instantiateStreaming(source: Response | Promise<Response>, importObject?: WasmImportObject): Promise<{ module: Module; instance: Instance }>;
+};
+type WasmErrorLike = {
+    message?: unknown;
+    name?: unknown;
+    code?: unknown;
+};
 
 function toArrayBuffer(source: BufferSource): ArrayBuffer {
     if (source instanceof ArrayBuffer) return source;
@@ -35,14 +62,20 @@ function toUint8Array(source: BufferSource): Uint8Array {
 function wrapWasmError<T>(fn: () => T): T {
     try {
         return fn();
-    } catch (e: any) {
-        const msg = e?.message || String(e);
-        const name = String(e?.name || e?.code || '');
+    } catch (e: unknown) {
+        const record = typeof e === 'object' && e !== null ? e as WasmErrorLike : undefined;
+        const msg = typeof record?.message === 'string' ? record.message : String(e);
+        const name = String(record?.name || record?.code || '');
         if (name.includes('Compile')) throw new CompileError(msg);
         if (name.includes('Link')) throw new LinkError(msg);
         if (name.includes('Runtime')) throw new RuntimeError(msg);
         throw e;
     }
+}
+
+function requireCustomSection(module: CModuleWASM.Module, sectionName: string): ArrayBuffer {
+    const section = wasm.moduleCustomSections(module, sectionName);
+    return section ?? new ArrayBuffer(0);
 }
 
 // Error Classes
@@ -90,15 +123,15 @@ class Module {
     }
 
     static exports(module: Module): WebAssembly.ModuleExportDescriptor[] {
-        return wasm.moduleExports(module._native) as any;
+        return wasm.moduleExports(module._native);
     }
 
     static imports(module: Module): WebAssembly.ModuleImportDescriptor[] {
-        return wasm.moduleImports(module._native) as any;
+        return wasm.moduleImports(module._native);
     }
 
     static customSections(module: Module, sectionName: string): ArrayBuffer[] {
-        return [wasm.moduleCustomSections(module._native, sectionName)!];
+        return [requireCustomSection(module._native, sectionName)];
     }
     
     get [Symbol.toStringTag]() {
@@ -121,24 +154,31 @@ class Memory {
         this._maxPages = descriptor.maximum;
     }
 
+    private localBuffer(): ArrayBuffer {
+        if (!this._buffer) throw new RuntimeError('WebAssembly.Memory buffer has been detached');
+        return this._buffer;
+    }
+
     get buffer(): ArrayBuffer {
-        if (this._instance) {
-            this._cachedBuffer = wasm.getMemoryBuffer(this._instance);
+        const instance = this._instance;
+        if (instance) {
+            this._cachedBuffer = wasm.getMemoryBuffer(instance);
             return this._cachedBuffer;
         }
-        return this._buffer!;
+        return this.localBuffer();
     }
 
     grow(delta: number): number {
-        if (this._instance) {
-            const result = wrapWasmError(() => wasm.growMemory(this._instance!, delta));
-            this._cachedBuffer = wasm.getMemoryBuffer(this._instance!);
+        const instance = this._instance;
+        if (instance) {
+            const result = wrapWasmError(() => wasm.growMemory(instance, delta));
+            this._cachedBuffer = wasm.getMemoryBuffer(instance);
             return result;
         }
-        const oldPages = this._buffer!.byteLength / 65536;
+        const oldBuffer = this.localBuffer();
+        const oldPages = oldBuffer.byteLength / 65536;
         const newPages = oldPages + delta;
         if (this._maxPages !== undefined && newPages > this._maxPages) return -1;
-        const oldBuffer = this._buffer!;
         const newBuffer = new ArrayBuffer(newPages * 65536);
         new Uint8Array(newBuffer).set(new Uint8Array(oldBuffer));
         engine.detachArrayBuffer(oldBuffer);
@@ -161,7 +201,7 @@ class Table {
     _instance: CModuleWASM.Instance | null;
     _name: string | null;
     _element: string;
-    _array: (number | null | unknown)[];
+    _array: CModuleWASM.WasmTableValue[];
     _maxSize: number | undefined;
 
     constructor(descriptor: { element: string; initial: number; maximum?: number }) {
@@ -175,17 +215,25 @@ class Table {
         this._array = new Array(descriptor.initial).fill(null);
     }
 
+    private nativeBinding(): { instance: CModuleWASM.Instance; name: string } | null {
+        if (!this._instance) return null;
+        if (!this._name) throw new RuntimeError('WebAssembly.Table native binding is missing its export name');
+        return { instance: this._instance, name: this._name };
+    }
+
     get length(): number {
-        if (this._instance) return wasm.tableSize(this._instance, this._name!);
+        const native = this.nativeBinding();
+        if (native) return wasm.tableSize(native.instance, native.name);
         return this._array.length;
     }
 
-    get(index: number): any {
-        if (this._instance) {
-            if (index >= wasm.tableSize(this._instance, this._name!)) {
+    get(index: number): CModuleWASM.WasmTableValue {
+        const native = this.nativeBinding();
+        if (native) {
+            if (index >= wasm.tableSize(native.instance, native.name)) {
                 throw new RangeError('index out of bounds');
             }
-            return wasm.tableGet(this._instance, this._name!, index);
+            return wasm.tableGet(native.instance, native.name, index);
         }
         if (index >= this._array.length) {
             throw new RangeError('index out of bounds');
@@ -193,12 +241,13 @@ class Table {
         return this._array[index];
     }
 
-    set(index: number, value: any): void {
-        if (this._instance) {
-            if (index >= wasm.tableSize(this._instance, this._name!)) {
+    set(index: number, value: CModuleWASM.WasmTableValue): void {
+        const native = this.nativeBinding();
+        if (native) {
+            if (index >= wasm.tableSize(native.instance, native.name)) {
                 throw new RangeError('index out of bounds');
             }
-            wasm.tableSet(this._instance, this._name!, index, value);
+            wasm.tableSet(native.instance, native.name, index, value);
             return;
         }
         if (index >= this._array.length) {
@@ -207,8 +256,9 @@ class Table {
         this._array[index] = value;
     }
 
-    grow(delta: number, init?: any): number {
-        if (this._instance) return wasm.tableGrow(this._instance, this._name!, delta);
+    grow(delta: number, init?: CModuleWASM.WasmTableValue): number {
+        const native = this.nativeBinding();
+        if (native) return wasm.tableGrow(native.instance, native.name, delta);
         const oldLength = this._array.length;
         const newLength = oldLength + delta;
         if (this._maxSize !== undefined && newLength > this._maxSize) return -1;
@@ -228,11 +278,11 @@ class Table {
 class Global {
     _instance: CModuleWASM.Instance | null;
     _name: string | null;
-    _value: CModuleWASM.WasmValue;
+    _value: CModuleWASM.WasmGlobalValue;
     _mutable: boolean;
     _type: string;
 
-    constructor(descriptor: { value: string; mutable: boolean }, initialValue: CModuleWASM.WasmValue) {
+    constructor(descriptor: { value: string; mutable: boolean }, initialValue: CModuleWASM.WasmGlobalValue) {
         if (!VALID_GLOBAL_TYPES.has(descriptor.value)) {
             throw new TypeError(`Invalid global type: '${descriptor.value}'`);
         }
@@ -244,22 +294,30 @@ class Global {
         this._value = initialValue;
     }
 
-    get value(): CModuleWASM.WasmValue {
-        if (this._instance) return wasm.getGlobal(this._instance, this._name!);
+    private nativeBinding(): { instance: CModuleWASM.Instance; name: string } | null {
+        if (!this._instance) return null;
+        if (!this._name) throw new RuntimeError('WebAssembly.Global native binding is missing its export name');
+        return { instance: this._instance, name: this._name };
+    }
+
+    get value(): CModuleWASM.WasmGlobalValue {
+        const native = this.nativeBinding();
+        if (native) return wasm.getGlobal(native.instance, native.name);
         return this._value;
     }
 
-    set value(newValue: CModuleWASM.WasmValue) {
+    set value(newValue: CModuleWASM.WasmGlobalValue) {
         if (!this._mutable) throw new TypeError('Global is immutable');
         validateGlobalValue(this._type, newValue);
-        if (this._instance) {
-            wasm.setGlobal(this._instance, this._name!, newValue);
+        const native = this.nativeBinding();
+        if (native) {
+            wasm.setGlobal(native.instance, native.name, newValue);
             return;
         }
         this._value = newValue;
     }
 
-    valueOf(): CModuleWASM.WasmValue {
+    valueOf(): CModuleWASM.WasmGlobalValue {
         return this.value;
     }
     
@@ -268,7 +326,7 @@ class Global {
     }
 }
 
-function validateGlobalValue(type: string, value: any): void {
+function validateGlobalValue(type: string, value: CModuleWASM.WasmGlobalValue): void {
     switch (type) {
         case 'i32':
             if (typeof value !== 'number' || !Number.isInteger(value)) {
@@ -293,9 +351,9 @@ function validateGlobalValue(type: string, value: any): void {
 
 class Instance {
     _instance: CModuleWASM.Instance;
-    _exports: Record<string, any>;
+    _exports: WasmExports;
 
-    constructor(module: Module, importObject?: Record<string, Record<string, any>>) {
+    constructor(module: Module, importObject?: WasmImportObject) {
         const nativeModule = module._native;
         if (importObject) {
             resolveImportObject(nativeModule, importObject);
@@ -305,7 +363,7 @@ class Instance {
         Object.freeze(this._exports);
     }
 
-    get exports(): Record<string, any> {
+    get exports(): WasmExports {
         return this._exports;
     }
     
@@ -318,7 +376,7 @@ class Instance {
 
 function resolveImportObject(
     nativeModule: CModuleWASM.Module,
-    importObject: Record<string, Record<string, any>>
+    importObject: WasmImportObject
 ): void {
     const imports = wasm.moduleImports(nativeModule);
     const functionDescs: CModuleWASM.ImportFunctionDescriptor[] = [];
@@ -352,14 +410,14 @@ function resolveImportObject(
                         `import object field '${imp.module}.${imp.name}' is not a Function`
                     );
                 }
-                functionDescs.push({ module: imp.module, name: imp.name, func: value });
+                functionDescs.push({ module: imp.module, name: imp.name, func: value as CModuleWASM.ImportFunctionDescriptor['func'] });
                 break;
             case 'global':
                 if (value instanceof Global) {
                     globalDescs.push({
                         module: imp.module,
                         name: imp.name,
-                        value: value._value,
+                        value: toGlobalImportValue(value._value),
                         type: value._type as CModuleWASM.GlobalImportDescriptor['type'],
                         mutable: value._mutable,
                     });
@@ -409,10 +467,15 @@ function resolveImportObject(
     }))));
 }
 
-function inferGlobalType(value: any): 'i32' | 'i64' | 'f32' | 'f64' {
+function inferGlobalType(value: unknown): 'i32' | 'i64' | 'f32' | 'f64' {
     if (typeof value === 'bigint') return 'i64';
-    if (Number.isInteger(value)) return 'i32';
+    if (typeof value === 'number' && Number.isInteger(value)) return 'i32';
     return 'f64';
+}
+
+function toGlobalImportValue(value: CModuleWASM.WasmGlobalValue): number | bigint {
+    if (typeof value === 'number' || typeof value === 'bigint') return value;
+    throw new LinkError('WebAssembly.Global import value must be numeric');
 }
 
 // Export Creation
@@ -420,19 +483,19 @@ function inferGlobalType(value: any): 'i32' | 'i64' | 'f32' | 'f64' {
 function createExports(
     instance: CModuleWASM.Instance,
     nativeModule: CModuleWASM.Module
-): Record<string, any> {
+): WasmExports {
     const exports = wasm.moduleExports(nativeModule);
-    const result: Record<string, any> = {};
+    const result: WasmExports = {};
 
     for (const exp of exports) {
         switch (exp.kind) {
             case 'function':
-                result[exp.name] = (...args: CModuleWASM.WasmValue[]) => {
+                result[exp.name] = (...args: CModuleWASM.WasmFunctionArgument[]) => {
                     return wrapWasmError(() => instance.callFunction(exp.name, ...args));
                 };
                 break;
             case 'memory': {
-                const mem = Object.create(Memory.prototype) as Memory;
+                const mem: Memory = Object.create(Memory.prototype);
                 mem._instance = instance;
                 mem._buffer = null;
                 mem._cachedBuffer = null;
@@ -442,7 +505,7 @@ function createExports(
             }
             case 'table': {
                 const info = wasm.getTableInfo(instance, exp.name);
-                const table = Object.create(Table.prototype) as Table;
+                const table: Table = Object.create(Table.prototype);
                 table._instance = instance;
                 table._name = exp.name;
                 table._element = info.element;
@@ -453,7 +516,7 @@ function createExports(
             }
             case 'global': {
                 const info = wasm.getGlobalInfo(instance, exp.name);
-                const global = Object.create(Global.prototype) as Global;
+                const global: Global = Object.create(Global.prototype);
                 global._instance = instance;
                 global._name = exp.name;
                 global._type = info.type;
@@ -471,7 +534,7 @@ function createExports(
 // WebAssembly Global Setup
 
 if (wasm) {
-    globalThis.WebAssembly = {
+    const webAssembly: WebAssemblyFacade = {
         Module,
         Instance,
         Memory,
@@ -493,7 +556,7 @@ if (wasm) {
 
         instantiate(
             source: BufferSource | Module,
-            importObject?: Record<string, Record<string, any>>
+            importObject?: WasmImportObject
         ): Promise<Instance | { module: Module; instance: Instance }> {
             return Promise.resolve().then(() => {
                 if (source instanceof Module) {
@@ -514,7 +577,7 @@ if (wasm) {
 
         async instantiateStreaming(
             source: Response | Promise<Response>,
-            importObject?: Record<string, Record<string, any>>
+            importObject?: WasmImportObject
         ): Promise<{ module: Module; instance: Instance }> {
             const response = await source;
             validateWasmMimeType(response);
@@ -523,7 +586,9 @@ if (wasm) {
             const instance = new Instance(module, importObject);
             return { module, instance };
         },
-    } as any;
+    };
+
+    Reflect.set(globalThis, 'WebAssembly', webAssembly);
 }
 
 function validateWasmMimeType(response: Response): void {

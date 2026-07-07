@@ -8,6 +8,8 @@ import { getMemoryTier } from "../utils/memory-tier";
 
 const zlib = import.meta.use('zlib');
 
+type ClosableHandle = { close?: () => void };
+
 const validateHighWaterMark = (value: number | undefined): number => {
     const hwm = Number(value);
     if (Number.isNaN(hwm) || hwm < 0) {
@@ -24,10 +26,27 @@ const extractSizeAlgorithm = <T>(strategy: QueuingStrategy<T> | undefined): (chu
     return strategy?.size ?? (() => 1);
 };
 
+function closeHandle(handle: ClosableHandle | null): void {
+    handle?.close?.();
+}
+
+function notifyEnqueueQuietly(callback: () => void): void {
+    try {
+        callback();
+    } catch {
+        // Backpressure callbacks are advisory; enqueue keeps its own state.
+    }
+}
+
+// Array.shift() cannot distinguish an empty queue from a valid undefined chunk.
+function shiftQueued<T>(queue: T[]): T {
+    return queue.shift() as T;
+}
+
 // ReadableStream State Machine
-class ReadableStreamController<R = any> implements globalThis.ReadableStreamDefaultController<R> {
+class ReadableStreamController<R = unknown> implements globalThis.ReadableStreamDefaultController<R> {
     #state: 'readable' | 'closed' | 'errored' = 'readable';
-    #source: UnderlyingSource<R>;
+    #source: UnderlyingSource<R> | null;
     #sizeAlgorithm: (chunk: R) => number;
     #highWaterMark: number;
     #queue: Array<{ chunk: R; size: number }> = [];
@@ -36,12 +55,13 @@ class ReadableStreamController<R = any> implements globalThis.ReadableStreamDefa
     #closeRequested = false;
     #pulling = false;
     #pullAgain = false;
-    #storedError: any = undefined;
+    #storedError: unknown = undefined;
+    #startPromise: Promise<void> | null = null;
     #pendingReads: Array<{
         resolve: (result: ReadableStreamReadResult<R>) => void;
-        reject: (reason: any) => void;
+        reject: (reason?: unknown) => void;
     }> = [];
-    #closedCallbacks: Array<{ resolve: () => void; reject: (e: any) => void }> = [];
+    #closedCallbacks: Array<{ resolve: () => void; reject: (reason?: unknown) => void }> = [];
     #backpressureBuffer: Array<{ chunk: R; size: number }> = [];
     #backpressureBufferSize = 0;
     #maxBackpressureSize: number;
@@ -70,7 +90,7 @@ class ReadableStreamController<R = any> implements globalThis.ReadableStreamDefa
 
         // If there's a pending read, fulfill it directly — no queuing needed.
         if (this.#pendingReads.length > 0) {
-            const read = this.#pendingReads.shift()!;
+            const read = shiftQueued(this.#pendingReads);
             read.resolve({ value: chunk, done: false });
             this.#callPullIfNeeded();
             return;
@@ -87,7 +107,9 @@ class ReadableStreamController<R = any> implements globalThis.ReadableStreamDefa
             }
             this.#backpressureBuffer.push({ chunk, size });
             this.#backpressureBufferSize += size;
-            if (this.#onEnqueue) try { this.#onEnqueue(); } catch {}
+            if (this.#onEnqueue) {
+                notifyEnqueueQuietly(this.#onEnqueue);
+            }
             return;
         }
 
@@ -108,7 +130,7 @@ class ReadableStreamController<R = any> implements globalThis.ReadableStreamDefa
         // We bypass the HWM limit here — the producer is done, so there is
         // no risk of unbounded growth; we just need every last chunk reachable.
         while (this.#backpressureBuffer.length > 0) {
-            const entry = this.#backpressureBuffer.shift()!;
+            const entry = shiftQueued(this.#backpressureBuffer);
             this.#queue.push(entry);
             this.#queueSize += entry.size;
         }
@@ -121,7 +143,7 @@ class ReadableStreamController<R = any> implements globalThis.ReadableStreamDefa
         }
     }
 
-    error(e: any): void {
+    error(e: unknown): void {
         if (this.#state !== 'readable') return;
 
         this.#state = 'errored';
@@ -148,14 +170,20 @@ class ReadableStreamController<R = any> implements globalThis.ReadableStreamDefa
     // Internal methods
     async #start(): Promise<void> {
         if (this.#started) return;
-        this.#started = true;
+        if (this.#startPromise) return this.#startPromise;
 
-        try {
-            await this.#source?.start?.(this);
-            this.#callPullIfNeeded();
-        } catch (error) {
-            this.error(error);
-        }
+        this.#startPromise = (async () => {
+            try {
+                await this.#source?.start?.(this);
+                this.#started = true;
+                this.#callPullIfNeeded();
+            } catch (error) {
+                this.error(error);
+            } finally {
+                this.#startPromise = null;
+            }
+        })();
+        return this.#startPromise;
     }
 
     #read(): void {
@@ -174,10 +202,11 @@ class ReadableStreamController<R = any> implements globalThis.ReadableStreamDefa
 
         // Try to dequeue
         if (this.#queue.length > 0) {
-            const entry = this.#queue.shift()!;
+            const read = this.#pendingReads.shift();
+            if (!read) return;
+            const entry = shiftQueued(this.#queue);
             this.#queueSize -= entry.size;
 
-            const read = this.#pendingReads.shift()!;
             read.resolve({ value: entry.chunk, done: false });
 
             // Drain backpressure buffer now that queue has room.
@@ -198,7 +227,7 @@ class ReadableStreamController<R = any> implements globalThis.ReadableStreamDefa
 
     #drainBuffer(): void {
         while (this.#backpressureBuffer.length > 0 && this.#queueSize < this.#highWaterMark) {
-            const entry = this.#backpressureBuffer.shift()!;
+            const entry = shiftQueued(this.#backpressureBuffer);
             this.#backpressureBufferSize -= entry.size;
             this.#queue.push(entry);
             this.#queueSize += entry.size;
@@ -234,10 +263,11 @@ class ReadableStreamController<R = any> implements globalThis.ReadableStreamDefa
         if (!this.#started) return false;
         if (this.#closeRequested) return false;
         if (this.#pendingReads.length === 0) return false;
-        return this.desiredSize! > 0;
+        const desiredSize = this.desiredSize;
+        return desiredSize !== null && desiredSize > 0;
     }
 
-    async #cancel(reason?: any): Promise<void> {
+    async #cancel(reason?: unknown): Promise<void> {
         if (this.#state === 'closed') return;
 
         this.#state = 'closed';
@@ -250,9 +280,9 @@ class ReadableStreamController<R = any> implements globalThis.ReadableStreamDefa
 
         // Save source for cancel callback, then release it.
         const source = this.#source;
-        this.#source = null as unknown as UnderlyingSource<R>;
+        this.#source = null;
 
-        await source.cancel?.(reason);
+        await source?.cancel?.(reason);
 
         for (const read of this.#pendingReads) {
             read.resolve({ value: undefined, done: true });
@@ -281,7 +311,7 @@ class ReadableStreamController<R = any> implements globalThis.ReadableStreamDefa
         // Break the closure chain: the source captures the producer's entire
         // scope (curl handle, headers, hooks, etc.).  Once the stream is done
         // the source will never be called again, so we can release it.
-        this.#source = null as unknown as UnderlyingSource<R>;
+        this.#source = null;
 
         // Resolve any pending reads with done
         for (const read of this.#pendingReads) {
@@ -303,12 +333,19 @@ class ReadableStreamController<R = any> implements globalThis.ReadableStreamDefa
 
     set _onEnqueueCallback(fn: (() => void) | null) { this.#onEnqueue = fn; }
 
-    _addPendingRead(resolve: any, reject: any) {
+    _addPendingRead(resolve: (result: ReadableStreamReadResult<R>) => void, reject: (reason?: unknown) => void) {
         this.#pendingReads.push({ resolve, reject });
         this.#read();
     }
 
-    _addClosedCallback(resolve: any, reject: any) {
+    _releasePendingReads(error: TypeError): void {
+        for (const read of this.#pendingReads) {
+            queueMicrotask(() => read.reject(error));
+        }
+        this.#pendingReads = [];
+    }
+
+    _addClosedCallback(resolve: () => void, reject: (reason?: unknown) => void) {
         if (this.#state === 'closed') {
             resolve();
         } else if (this.#state === 'errored') {
@@ -319,41 +356,47 @@ class ReadableStreamController<R = any> implements globalThis.ReadableStreamDefa
     }
 
     _start() { return this.#start(); }
-    _cancel(reason?: any) { return this.#cancel(reason); }
+    _cancel(reason?: unknown) { return this.#cancel(reason); }
 }
 
 // ReadableStream
-export class ReadableStream<R = any> implements globalThis.ReadableStream<R> {
+export class ReadableStream<R = unknown> implements globalThis.ReadableStream<R> {
     #controller: ReadableStreamController<R>;
     #reader: ReadableStreamDefaultReader<R> | null = null;
 
     static from<R>(iterable: AsyncIterable<R> | Iterable<R>): ReadableStream<R> {
+        const value: unknown = iterable;
+        if (value === null || (typeof value !== 'object' && typeof value !== 'function')) {
+            throw new TypeError("Failed to execute 'ReadableStream.from': Argument 1 can not be converted to async iterable.");
+        }
+
+        const getAsyncIterator = Reflect.get(value, Symbol.asyncIterator);
+        const getSyncIterator = Reflect.get(value, Symbol.iterator);
+        if (typeof getAsyncIterator !== 'function' && typeof getSyncIterator !== 'function') {
+            throw new TypeError("Failed to execute 'ReadableStream.from': Argument 1 can not be converted to async iterable.");
+        }
+
         let iterator: Iterator<R> | AsyncIterator<R>;
 
         return new ReadableStream({
             start() {
-                // @ts-ignore
-                if (iterable[Symbol.asyncIterator]) {
-                    // @ts-ignore
-                    iterator = iterable[Symbol.asyncIterator]();
-                    // @ts-ignore
-                } else if (iterable[Symbol.iterator]) {
-                    // @ts-ignore
-                    iterator = iterable[Symbol.iterator]();
-                } else {
-                    throw new TypeError('Object is not iterable');
+                if (typeof getAsyncIterator === 'function') {
+                    iterator = getAsyncIterator.call(value);
+                } else if (typeof getSyncIterator === 'function') {
+                    iterator = getSyncIterator.call(value);
                 }
             },
             async pull(c) {
+                const controller = c as ReadableStreamDefaultController<R>;
                 try {
                     const result = await iterator.next();
                     if (result.done) {
-                        c.close();
+                        controller.close();
                     } else {
-                        c.enqueue(result.value as any);
+                        controller.enqueue(result.value);
                     }
                 } catch (error) {
-                    c.error(error);
+                    controller.error(error);
                 }
             },
             cancel() {
@@ -367,6 +410,7 @@ export class ReadableStream<R = any> implements globalThis.ReadableStream<R> {
         strategy: QueuingStrategy<R> = {}
     ) {
         this.#controller = new ReadableStreamController(source, strategy);
+        void this.#controller._start();
     }
 
     get locked(): boolean {
@@ -385,7 +429,7 @@ export class ReadableStream<R = any> implements globalThis.ReadableStream<R> {
         return this.#reader as ReadableStreamReader<R>;
     }
 
-    async cancel(reason?: any): Promise<void> {
+    async cancel(reason?: unknown): Promise<void> {
         if (this.locked) {
             throw new TypeError('Stream is locked');
         }
@@ -396,8 +440,35 @@ export class ReadableStream<R = any> implements globalThis.ReadableStream<R> {
         transform: { writable: globalThis.WritableStream<R>; readable: globalThis.ReadableStream<T> },
         options?: { signal?: AbortSignal; preventClose?: boolean; preventAbort?: boolean; preventCancel?: boolean }
     ): globalThis.ReadableStream<T> {
-        this.pipeTo(transform.writable, options);
-        return transform.readable;
+        const pipePromise = this.pipeTo(transform.writable, options);
+        void pipePromise.catch(() => {});
+        let reader: globalThis.ReadableStreamDefaultReader<T>;
+
+        const source: UnderlyingSource<T> = {
+            start(controller) {
+                const defaultController = controller as ReadableStreamDefaultController<T>;
+                reader = transform.readable.getReader();
+                void (async () => {
+                    try {
+                        for (;;) {
+                            const result = await reader.read();
+                            if (result.done) {
+                                defaultController.close();
+                                return;
+                            }
+                            defaultController.enqueue(result.value as T);
+                        }
+                    } catch (error) {
+                        defaultController.error(error);
+                    }
+                })();
+            },
+            async cancel(reason) {
+                await reader.cancel(reason);
+                await pipePromise.catch(() => {});
+            },
+        };
+        return new ReadableStream<T>(source) as globalThis.ReadableStream<T>;
     }
 
     async pipeTo(
@@ -423,7 +494,9 @@ export class ReadableStream<R = any> implements globalThis.ReadableStream<R> {
 
         let aborted = false;
         const abortState: { removeAbortListener?: () => void } = {};
-        type AbortResult = { aborted: true; reason: any };
+        type AbortResult = { aborted: true; reason: unknown };
+        type DestinationClosedResult = { destinationClosed: true };
+        type DestinationErroredResult = { destinationErrored: true; reason: unknown };
         let abortPromise: Promise<AbortResult>;
         if (signal) {
             abortPromise = new Promise<AbortResult>((resolve) => {
@@ -437,19 +510,31 @@ export class ReadableStream<R = any> implements globalThis.ReadableStream<R> {
         } else {
             abortPromise = new Promise<AbortResult>(() => { });
         }
+        const destinationClosedPromise = writer.closed.then<DestinationClosedResult, DestinationErroredResult>(
+            () => ({ destinationClosed: true }),
+            (reason) => ({ destinationErrored: true, reason }),
+        );
 
         try {
             while (!aborted) {
-                const result = await Promise.race([reader.read(), abortPromise]);
+                const result = await Promise.race([reader.read(), abortPromise, destinationClosedPromise]);
                 if ('aborted' in result) throw result.reason;
+                if ('destinationErrored' in result) throw result.reason;
+                if ('destinationClosed' in result) throw new TypeError('Destination stream closed');
 
                 if (result.done) {
                     if (!preventClose) await writer.close();
                     break;
                 }
 
-                const writeResult = await Promise.race([writer.write(result.value).then(() => null), abortPromise]);
+                const writeResult = await Promise.race([
+                    writer.write(result.value).then(() => null),
+                    abortPromise,
+                    destinationClosedPromise,
+                ]);
                 if (writeResult && 'aborted' in writeResult) throw writeResult.reason;
+                if (writeResult && 'destinationErrored' in writeResult) throw writeResult.reason;
+                if (writeResult && 'destinationClosed' in writeResult) throw new TypeError('Destination stream closed');
             }
         } catch (error) {
             if (!preventAbort) await writer.abort(error);
@@ -469,44 +554,77 @@ export class ReadableStream<R = any> implements globalThis.ReadableStream<R> {
 
         const reader = this.getReader();
         const branches: [R[] | null, R[] | null] = [[], []];
+        const pending: [
+            ReadableStreamDefaultController<R> | null,
+            ReadableStreamDefaultController<R> | null,
+        ] = [null, null];
         let reading = false;
+        let done = false;
+        let error: unknown;
 
-        // @ts-ignore
-        const createBranch = (branchIndex: 0 | 1): globalThis.ReadableStream => new ReadableStream<R>({
-            async pull(controller) {
-                // If this branch has queued chunks, dequeue
-                if (branches[branchIndex] && branches[branchIndex]!.length > 0) {
-                    controller.enqueue(branches[branchIndex]!.shift() as any);
-                    return;
+        const flushBranch = (branchIndex: 0 | 1): void => {
+            const controller = pending[branchIndex];
+            if (!controller) return;
+            const branch = branches[branchIndex];
+            if (!branch) {
+                pending[branchIndex] = null;
+                return;
+            }
+            if (error !== undefined) {
+                pending[branchIndex] = null;
+                controller.error(error);
+                return;
+            }
+            if (branch.length > 0) {
+                pending[branchIndex] = null;
+                controller.enqueue(shiftQueued(branch));
+                return;
+            }
+            if (done) {
+                pending[branchIndex] = null;
+                controller.close();
+            }
+        };
+
+        const hasPendingLiveBranch = (): boolean =>
+            (pending[0] !== null && branches[0] !== null) ||
+            (pending[1] !== null && branches[1] !== null);
+
+        const pump = (): void => {
+            flushBranch(0);
+            flushBranch(1);
+            if (reading || done || error !== undefined || !hasPendingLiveBranch()) return;
+
+            reading = true;
+            reader.read().then(({ done: readDone, value }) => {
+                reading = false;
+                if (readDone) {
+                    done = true;
+                } else {
+                    if (branches[0]) branches[0].push(value);
+                    if (branches[1]) branches[1].push(value);
                 }
+                flushBranch(0);
+                flushBranch(1);
+                pump();
+            }, (err) => {
+                reading = false;
+                error = err;
+                flushBranch(0);
+                flushBranch(1);
+            });
+        };
 
-                // If already reading, wait
-                if (reading) return;
-
-                reading = true;
-                try {
-                    const { done, value } = await reader.read();
-                    if (done) {
-                        controller.close();
-                        return;
-                    }
-
-                    // Enqueue to both live branches
-                    const other = 1 - branchIndex as 0 | 1;
-                    if (branches[branchIndex]) {
-                        branches[branchIndex]!.push(value);
-                        controller.enqueue(branches[branchIndex]!.shift() as any);
-                    }
-                    if (branches[other]) {
-                        branches[other]!.push(value);
-                    }
-                } finally {
-                    reading = false;
-                }
+        const createBranch = (branchIndex: 0 | 1): globalThis.ReadableStream<R> => new ReadableStream<R>({
+            pull(controller) {
+                const defaultController = controller as ReadableStreamDefaultController<R>;
+                pending[branchIndex] = defaultController;
+                pump();
             },
             cancel(reason) {
                 // Clear this branch's buffer so the live branch stops pushing into it.
                 branches[branchIndex] = null;
+                pending[branchIndex] = null;
                 // If both branches are cancelled, cancel the underlying reader.
                 if (!branches[0] && !branches[1]) {
                     return reader.cancel(reason);
@@ -549,7 +667,7 @@ export class ReadableStream<R = any> implements globalThis.ReadableStream<R> {
                     throw error;
                 }
             },
-            async return(value?: any): Promise<IteratorResult<R>> {
+            async return(value?: R): Promise<IteratorResult<R>> {
                 if (!finished) {
                     finished = true;
                     try {
@@ -560,7 +678,7 @@ export class ReadableStream<R = any> implements globalThis.ReadableStream<R> {
                 }
                 return { value, done: true };
             },
-            async throw(error?: any): Promise<IteratorResult<R>> {
+            async throw(error?: unknown): Promise<IteratorResult<R>> {
                 if (!finished) {
                     finished = true;
                     try {
@@ -585,18 +703,19 @@ export class ReadableStream<R = any> implements globalThis.ReadableStream<R> {
 }
 
 // ReadableStreamDefaultReader
-class ReadableStreamDefaultReader<R = any> implements globalThis.ReadableStreamDefaultReader<R> {
+class ReadableStreamDefaultReader<R = unknown> implements globalThis.ReadableStreamDefaultReader<R> {
     #stream: ReadableStream<R> | null;
     #closedPromise: Promise<void>;
+    #closedReject: (reason?: unknown) => void;
 
     constructor(stream: ReadableStream<R>) {
         this.#stream = stream;
 
         const { promise, resolve, reject } = Promise.withResolvers<void>();
         this.#closedPromise = promise;
+        this.#closedReject = reject;
         void promise.catch(() => {});
 
-        // @ts-ignore
         stream._controller._addClosedCallback(resolve, reject);
     }
 
@@ -610,41 +729,41 @@ class ReadableStreamDefaultReader<R = any> implements globalThis.ReadableStreamD
         }
 
         const { promise, resolve, reject } = Promise.withResolvers<ReadableStreamReadResult<R>>();
-        // @ts-ignore
         this.#stream._controller._addPendingRead(resolve, reject);
         return promise;
     }
 
-    async cancel(reason?: any): Promise<void> {
+    async cancel(reason?: unknown): Promise<void> {
         if (!this.#stream) {
             throw new TypeError('Reader is released');
         }
-        // @ts-ignore
         await this.#stream._controller._cancel(reason);
     }
 
     releaseLock(): void {
         if (!this.#stream) return;
-        // @ts-ignore
+        const error = new TypeError('Reader was released');
+        this.#stream._controller._releasePendingReads(error);
+        this.#closedReject(error);
         this.#stream._releaseLock();
         this.#stream = null;
     }
 }
 
 // WritableStream State Machine
-class WritableStreamController implements globalThis.WritableStreamDefaultController {
+class WritableStreamController<W = unknown> implements globalThis.WritableStreamDefaultController {
     #state: 'writable' | 'closed' | 'erroring' | 'errored' = 'writable';
-    #sink: UnderlyingSink;
-    #sizeAlgorithm: (chunk: any) => number;
+    #sink: UnderlyingSink<W>;
+    #sizeAlgorithm: (chunk: W) => number;
     #highWaterMark: number;
     #queueSize = 0;
-    #storedError: any = undefined;
+    #storedError: unknown = undefined;
     #abortController = new AbortController();
-    #writeRequests: Array<{ resolve: () => void; reject: (e: any) => void }> = [];
-    #closedCallbacks: Array<{ resolve: () => void; reject: (e: any) => void }> = [];
-    #readyCallbacks: Array<{ resolve: () => void; reject: (e: any) => void }> = [];
+    #writeRequests: Array<{ resolve: () => void; reject: (reason?: unknown) => void }> = [];
+    #closedCallbacks: Array<{ resolve: () => void; reject: (reason?: unknown) => void }> = [];
+    #readyCallbacks: Array<{ resolve: () => void; reject: (reason?: unknown) => void }> = [];
 
-    constructor(sink: UnderlyingSink, strategy: QueuingStrategy) {
+    constructor(sink: UnderlyingSink<W>, strategy: QueuingStrategy<W>) {
         this.#sink = sink;
         this.#sizeAlgorithm = extractSizeAlgorithm(strategy);
         this.#highWaterMark = extractHighWaterMark(strategy, 1);
@@ -657,7 +776,7 @@ class WritableStreamController implements globalThis.WritableStreamDefaultContro
         return this.#abortController.signal;
     }
 
-    error(e: any): void {
+    error(e?: unknown): void {
         if (this.#state === 'closed' || this.#state === 'errored') return;
 
         this.#state = 'errored';
@@ -683,7 +802,7 @@ class WritableStreamController implements globalThis.WritableStreamDefaultContro
         return this.#highWaterMark - this.#queueSize;
     }
 
-    async #write(chunk: any): Promise<void> {
+    async #write(chunk: W): Promise<void> {
         if (this.#state !== 'writable') {
             throw new TypeError('Stream is not writable');
         }
@@ -713,7 +832,7 @@ class WritableStreamController implements globalThis.WritableStreamDefaultContro
         this.#closedCallbacks = [];
     }
 
-    async #abort(reason?: any): Promise<void> {
+    async #abort(reason?: unknown): Promise<void> {
         if (this.#state === 'closed') return;
 
         this.#abortController.abort(reason);
@@ -723,7 +842,7 @@ class WritableStreamController implements globalThis.WritableStreamDefaultContro
         await this.#sink.abort?.(reason);
 
         for (const cb of this.#closedCallbacks) {
-            queueMicrotask(() => cb.reject(reason));
+            cb.reject(reason);
         }
         this.#closedCallbacks = [];
     }
@@ -737,7 +856,7 @@ class WritableStreamController implements globalThis.WritableStreamDefaultContro
         }
     }
 
-    #addReadyCallback(resolve: any, reject: any): void {
+    #addReadyCallback(resolve: () => void, reject: (reason?: unknown) => void): void {
         if (this.#state === 'errored') {
             queueMicrotask(() => reject(this.#storedError));
         } else if (this.#getDesiredSize() > 0) {
@@ -747,7 +866,7 @@ class WritableStreamController implements globalThis.WritableStreamDefaultContro
         }
     }
 
-    #addClosedCallback(resolve: any, reject: any): void {
+    #addClosedCallback(resolve: () => void, reject: (reason?: unknown) => void): void {
         if (this.#state === 'closed') {
             resolve();
         } else if (this.#state === 'errored') {
@@ -759,18 +878,18 @@ class WritableStreamController implements globalThis.WritableStreamDefaultContro
 
     get _state() { return this.#state; }
     get _storedError() { return this.#storedError; }
-    _write(chunk: any) { return this.#write(chunk); }
+    _write(chunk: W) { return this.#write(chunk); }
     _close() { return this.#close(); }
-    _abort(reason?: any) { return this.#abort(reason); }
+    _abort(reason?: unknown) { return this.#abort(reason); }
     _getDesiredSize() { return this.#getDesiredSize(); }
-    _addReadyCallback(resolve: any, reject: any) { this.#addReadyCallback(resolve, reject); }
-    _addClosedCallback(resolve: any, reject: any) { this.#addClosedCallback(resolve, reject); }
+    _addReadyCallback(resolve: () => void, reject: (reason?: unknown) => void) { this.#addReadyCallback(resolve, reject); }
+    _addClosedCallback(resolve: () => void, reject: (reason?: unknown) => void) { this.#addClosedCallback(resolve, reject); }
 }
 
 // WritableStream
-export class WritableStream<W = any> implements globalThis.WritableStream<W> {
-    #controller: WritableStreamController;
-    #writer: WritableStreamDefaultWriter | null = null;
+export class WritableStream<W = unknown> implements globalThis.WritableStream<W> {
+    #controller: WritableStreamController<W>;
+    #writer: WritableStreamDefaultWriter<W> | null = null;
 
     constructor(sink: UnderlyingSink<W> = {}, strategy: QueuingStrategy<W> = {}) {
         this.#controller = new WritableStreamController(sink, strategy);
@@ -780,8 +899,7 @@ export class WritableStream<W = any> implements globalThis.WritableStream<W> {
         return this.#writer !== null;
     }
 
-    async abort(reason?: any): Promise<void> {
-        // @ts-ignore
+    async abort(reason?: unknown): Promise<void> {
         await this.#controller._abort(reason);
     }
 
@@ -789,11 +907,10 @@ export class WritableStream<W = any> implements globalThis.WritableStream<W> {
         if (this.locked) {
             throw new TypeError('Stream is locked');
         }
-        // @ts-ignore
         await this.#controller._close();
     }
 
-    getWriter(): WritableStreamDefaultWriter {
+    getWriter(): WritableStreamDefaultWriter<W> {
         if (this.locked) {
             throw new TypeError('Stream is already locked');
         }
@@ -806,24 +923,22 @@ export class WritableStream<W = any> implements globalThis.WritableStream<W> {
 }
 
 // WritableStreamDefaultWriter
-class WritableStreamDefaultWriter implements globalThis.WritableStreamDefaultWriter {
-    #stream: WritableStream | null;
+class WritableStreamDefaultWriter<W = unknown> implements globalThis.WritableStreamDefaultWriter<W> {
+    #stream: WritableStream<W> | null;
     #readyPromise: Promise<void>;
     #closedPromise: Promise<void>;
 
-    constructor(stream: WritableStream) {
+    constructor(stream: WritableStream<W>) {
         this.#stream = stream;
 
         const ready = Promise.withResolvers<void>();
         this.#readyPromise = ready.promise;
         void ready.promise.catch(() => {});
-        // @ts-ignore
         stream._controller._addReadyCallback(ready.resolve, ready.reject);
 
         const closed = Promise.withResolvers<void>();
         this.#closedPromise = closed.promise;
         void closed.promise.catch(() => {});
-        // @ts-ignore
         stream._controller._addClosedCallback(closed.resolve, closed.reject);
     }
 
@@ -833,9 +948,7 @@ class WritableStreamDefaultWriter implements globalThis.WritableStreamDefaultWri
 
     get desiredSize(): number | null {
         if (!this.#stream) throw new TypeError('Writer is released');
-        // @ts-ignore
         const state = this.#stream._controller._state;
-        // @ts-ignore
         return state === 'writable' ? this.#stream._controller._getDesiredSize() : null;
     }
 
@@ -843,77 +956,78 @@ class WritableStreamDefaultWriter implements globalThis.WritableStreamDefaultWri
         return this.#readyPromise;
     }
 
-    async abort(reason?: any): Promise<void> {
+    async abort(reason?: unknown): Promise<void> {
         if (!this.#stream) throw new TypeError('Writer is released');
-        // @ts-ignore
         await this.#stream._controller._abort(reason);
     }
 
     async close(): Promise<void> {
         if (!this.#stream) throw new TypeError('Writer is released');
-        // @ts-ignore
         await this.#stream._controller._close();
     }
 
     releaseLock(): void {
         if (!this.#stream) return;
-        // @ts-ignore
         this.#stream._releaseLock();
         this.#stream = null;
     }
 
-    async write(chunk: any): Promise<void> {
+    async write(chunk: W): Promise<void> {
         if (!this.#stream) throw new TypeError('Writer is released');
 
         await this.ready;
-        // @ts-ignore
         await this.#stream._controller._write(chunk);
 
         // Update ready promise
         const ready = Promise.withResolvers<void>();
         this.#readyPromise = ready.promise;
         void ready.promise.catch(() => {});
-        // @ts-ignore
         this.#stream._controller._addReadyCallback(ready.resolve, ready.reject);
     }
 }
 
 // TransformStream
-export class TransformStream<I = any, O = any> implements globalThis.TransformStream<I, O> {
-    // @ts-ignore
-    readonly readable: ReadableStream<O>;
-    readonly writable: WritableStream<I>;
+export class TransformStream<I = unknown, O = unknown> implements globalThis.TransformStream<I, O> {
+    readonly readable: globalThis.ReadableStream<O>;
+    readonly writable: globalThis.WritableStream<I>;
 
     constructor(
         transformer: Transformer<I, O> = {},
         writableStrategy: QueuingStrategy<I> = {},
         readableStrategy: QueuingStrategy<O> = {}
     ) {
-        let readableController: any;
-        let writableRef: WritableStream<I>;
+        let readableController: ReadableStreamDefaultController<O>;
+        let transformController: TransformStreamDefaultController<O>;
+        let writableRef: globalThis.WritableStream<I>;
 
         this.readable = new ReadableStream<O>({
             start(c) {
-                readableController = c;
-                return transformer.start?.(c as any);
+                readableController = c as ReadableStreamDefaultController<O>;
+                transformController = {
+                    get desiredSize() { return readableController.desiredSize; },
+                    enqueue(chunk?: O) { readableController.enqueue(chunk as O); },
+                    error(reason?: unknown) { readableController.error(reason); },
+                    terminate() { readableController.close(); },
+                };
+                return transformer.start?.(transformController);
             },
             cancel: async (reason) => {
                 await writableRef.abort(reason);
             }
-        }, readableStrategy);
+        }, readableStrategy) as globalThis.ReadableStream<O>;
 
         this.writable = new WritableStream<I>({
             write: async (chunk) => {
-                await transformer.transform?.(chunk, readableController);
+                await transformer.transform?.(chunk, transformController);
             },
             close: async () => {
-                await transformer.flush?.(readableController);
+                await transformer.flush?.(transformController);
                 readableController.close();
             },
             abort: async (reason) => {
                 readableController.error(reason);
             }
-        }, writableStrategy);
+        }, writableStrategy) as globalThis.WritableStream<I>;
 
         writableRef = this.writable;
     }
@@ -952,13 +1066,17 @@ export class TextEncoderStream implements globalThis.TextEncoderStream {
 
     constructor() {
         const encoder = new TextEncoder();
-        let controller: any;
+        let controller: ReadableStreamDefaultController<Uint8Array<ArrayBuffer>>;
+        let writableRef: globalThis.WritableStream<string>;
 
-        this.readable = new ReadableStream<Uint8Array>({
+        this.readable = new ReadableStream<Uint8Array<ArrayBuffer>>({
             start(c) {
-                controller = c;
+                controller = c as ReadableStreamDefaultController<Uint8Array<ArrayBuffer>>;
+            },
+            cancel(reason) {
+                return writableRef.abort(reason);
             }
-        }) as any;
+        }) as globalThis.ReadableStream<Uint8Array<ArrayBuffer>>;
 
         this.writable = new WritableStream<string>({
             write(chunk) {
@@ -971,7 +1089,8 @@ export class TextEncoderStream implements globalThis.TextEncoderStream {
             abort(reason) {
                 controller.error(reason);
             }
-        }) as any;
+        }) as globalThis.WritableStream<string>;
+        writableRef = this.writable;
     }
 }
 
@@ -984,23 +1103,27 @@ export class TextDecoderStream implements globalThis.TextDecoderStream {
     readonly writable: globalThis.WritableStream<AllowSharedBufferSource>;
 
     private decoder: TextDecoder;
-    private controller: any = null;
+    private controller: ReadableStreamDefaultController<string> | null = null;
 
     constructor(label?: string, options?: TextDecoderOptions) {
         this.decoder = new TextDecoder(label, options);
         this.encoding = this.decoder.encoding;
         this.fatal = this.decoder.fatal;
         this.ignoreBOM = this.decoder.ignoreBOM;
+        let writableRef: globalThis.WritableStream<AllowSharedBufferSource>;
 
         this.readable = new ReadableStream<string>({
             start: (c) => {
-                this.controller = c;
+                this.controller = c as ReadableStreamDefaultController<string>;
+            },
+            cancel(reason) {
+                return writableRef.abort(reason);
             }
-        }) as any;
+        }) as globalThis.ReadableStream<string>;
 
         this.writable = new WritableStream<AllowSharedBufferSource>({
             write: (chunk) => {
-                const decoded = this.decoder.decode(chunk as Uint8Array, { stream: true });
+                const decoded = this.decoder.decode(chunk, { stream: true });
                 if (decoded) {
                     this.controller?.enqueue(decoded);
                 }
@@ -1015,7 +1138,8 @@ export class TextDecoderStream implements globalThis.TextDecoderStream {
             abort: (reason) => {
                 this.controller?.error(reason);
             }
-        }) as any;
+        }) as globalThis.WritableStream<AllowSharedBufferSource>;
+        writableRef = this.writable;
     }
 }
 
@@ -1023,8 +1147,8 @@ export class CompressionStream implements globalThis.CompressionStream {
     readonly readable: globalThis.ReadableStream<Uint8Array<ArrayBuffer>>;
     readonly writable: globalThis.WritableStream<BufferSource>;
 
-    private handle: CModuleZLib.Deflate;
-    private controller: any = null;
+    private handle: CModuleZLib.Deflate | null;
+    private controller: ReadableStreamDefaultController<Uint8Array<ArrayBuffer>> | null = null;
 
     constructor(format: CompressionFormat) {
         if (format !== 'gzip' && format !== 'deflate' && format !== 'deflate-raw') {
@@ -1041,35 +1165,36 @@ export class CompressionStream implements globalThis.CompressionStream {
             throw new TypeError(`Unsupported compression format: ${format}`);
         }
 
-        this.readable = new ReadableStream<Uint8Array>({
+        this.readable = new ReadableStream<Uint8Array<ArrayBuffer>>({
             start: (c) => {
-                this.controller = c;
+                this.controller = c as ReadableStreamDefaultController<Uint8Array<ArrayBuffer>>;
             }
-        }) as any;
+        }) as globalThis.ReadableStream<Uint8Array<ArrayBuffer>>;
 
         this.writable = new WritableStream<BufferSource>({
             write: (chunk) => {
-                const input = chunk instanceof ArrayBuffer ? new Uint8Array(chunk) : chunk as Uint8Array;
-                const output = this.handle.deflate(input);
+                if (!this.handle) throw new TypeError('CompressionStream is closed');
+                const output = this.handle.deflate(chunk);
                 if (output && output.byteLength > 0) {
                     this.controller?.enqueue(new Uint8Array(output));
                 }
             },
             close: () => {
+                if (!this.handle) return;
                 const output = this.handle.finish();
                 if (output && output.byteLength > 0) {
                     this.controller?.enqueue(new Uint8Array(output));
                 }
                 this.controller?.close();
-                (this.handle as any)?.close?.();
-                (this as any).handle = null;
+                closeHandle(this.handle as ClosableHandle);
+                this.handle = null;
             },
             abort: (reason) => {
                 this.controller?.error(reason);
-                (this.handle as any)?.close?.();
-                (this as any).handle = null;
+                closeHandle(this.handle as ClosableHandle | null);
+                this.handle = null;
             }
-        }) as any;
+        }) as globalThis.WritableStream<BufferSource>;
     }
 }
 
@@ -1077,8 +1202,9 @@ export class DecompressionStream implements globalThis.DecompressionStream {
     readonly readable: globalThis.ReadableStream<Uint8Array<ArrayBuffer>>;
     readonly writable: globalThis.WritableStream<BufferSource>;
 
-    private handle: CModuleZLib.Inflate;
-    private controller: any = null;
+    private handle: CModuleZLib.Inflate | null;
+    private controller: ReadableStreamDefaultController<Uint8Array<ArrayBuffer>> | null = null;
+    private wroteInput = false;
 
     constructor(format: CompressionFormat) {
         if (format !== 'gzip' && format !== 'deflate' && format !== 'deflate-raw') {
@@ -1095,31 +1221,49 @@ export class DecompressionStream implements globalThis.DecompressionStream {
             throw new TypeError(`Unsupported decompression format: ${format}`);
         }
 
-        this.readable = new ReadableStream<Uint8Array>({
+        this.readable = new ReadableStream<Uint8Array<ArrayBuffer>>({
             start: (c) => {
-                this.controller = c;
+                this.controller = c as ReadableStreamDefaultController<Uint8Array<ArrayBuffer>>;
             }
-        }) as any;
+        }) as globalThis.ReadableStream<Uint8Array<ArrayBuffer>>;
 
         this.writable = new WritableStream<BufferSource>({
             write: (chunk) => {
-                const input = chunk instanceof ArrayBuffer ? new Uint8Array(chunk) : chunk as Uint8Array;
-                const output = this.handle.inflate(input);
+                if (!this.handle) throw new TypeError('DecompressionStream is closed');
+                if (chunk.byteLength > 0) this.wroteInput = true;
+                const output = this.handle.inflate(chunk);
                 if (output && output.byteLength > 0) {
                     this.controller?.enqueue(new Uint8Array(output));
                 }
             },
             close: () => {
-                this.controller?.close();
-                (this.handle as any)?.close?.();
-                (this as any).handle = null;
+                if (!this.handle) return;
+                try {
+                    if (!this.wroteInput) {
+                        throw new TypeError('corrupt gzip stream does not have a matching checksum');
+                    }
+                    this.controller?.close();
+                } catch (error) {
+                    if (error instanceof Error && error.message.includes('already finished')) {
+                        this.controller?.close();
+                        return;
+                    }
+                    const reason = error instanceof TypeError
+                        ? error
+                        : new TypeError(error instanceof Error ? error.message : String(error));
+                    this.controller?.error(reason);
+                    throw reason;
+                } finally {
+                    closeHandle(this.handle as ClosableHandle | null);
+                    this.handle = null;
+                }
             },
             abort: (reason) => {
                 this.controller?.error(reason);
-                (this.handle as any)?.close?.();
-                (this as any).handle = null;
+                closeHandle(this.handle as ClosableHandle | null);
+                this.handle = null;
             }
-        }) as any;
+        }) as globalThis.WritableStream<BufferSource>;
     }
 }
 

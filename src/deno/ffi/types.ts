@@ -3,7 +3,7 @@
  * Type definitions for Foreign Function Interface
  */
 
-const brand = Symbol('brand');
+export const brand = Symbol('brand');
 
 export type NativeNumberType =
     | 'u8' | 'i8'

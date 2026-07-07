@@ -4,7 +4,6 @@
  * singletons into Node-compatible Writable/Readable streams.
  */
 
-import type { Stream as StdioStream } from '../../deno/04_stdio';
 import { getTierLimits } from '../_internal/memory';
 import { Readable, Writable } from '../stream';
 
@@ -13,25 +12,35 @@ const streams = import.meta.use('streams');
 
 const { streamHighWaterMark: PROCESS_READ_STREAM_HWM } = getTierLimits();
 
-// deno/04_stdio injects stdin/stdout/stderr onto the streams module at runtime,
-// but CModuleStreams type does not declare them — use a minimal interface.
-interface StreamsWithStdio {
-    stdin: StdioStream;
-    stdout: StdioStream;
-    stderr: StdioStream;
-}
+type StdioStream = CModuleStreams.StdioStream;
 
-const { stdin: denoStdin, stdout: denoStdout, stderr: denoStderr } = streams as unknown as StreamsWithStdio;
+const { stdin: denoStdin, stdout: denoStdout, stderr: denoStderr } = streams;
+
+function readTtySize(stdio: StdioStream): { width: number; height: number } | undefined {
+    try {
+        return stdio.size;
+    } catch {
+        return undefined;
+    }
+}
 
 // Write stream (stdout / stderr)
 export class ProcessWriteStream extends Writable {
     #stdio: StdioStream;
+    #isTTYOverride: boolean | undefined;
+    #columnsOverride: number | undefined;
+    #rowsOverride: number | undefined;
 
     constructor(stdio: StdioStream) {
         super({
-            write: (chunk: any, encoding: string, callback: (error?: Error | null) => void) => {
-                const data = typeof chunk === 'string' ? engine.encodeString(chunk) : chunk;
-                stdio.write(data).then(() => callback(), callback);
+            write: (chunk: unknown, encoding: BufferEncoding, callback: (error?: Error | null) => void) => {
+                const data = typeof chunk === 'string' ? engine.encodeString(chunk) : chunk instanceof Uint8Array ? chunk : engine.encodeString(String(chunk));
+                try {
+                    stdio.writeSync(data);
+                    callback();
+                } catch (e) {
+                    callback(e instanceof Error ? e : new Error(String(e)));
+                }
             },
             final: (callback: (error?: Error | null) => void) => {
                 callback();
@@ -42,16 +51,28 @@ export class ProcessWriteStream extends Writable {
 
     get fd(): number { return this.#stdio.fd; }
 
-    get isTTY(): boolean { return this.#stdio.isTTY; }
+    get isTTY(): boolean { return this.#isTTYOverride ?? this.#stdio.isTTY; }
+
+    set isTTY(value: boolean) { this.#isTTYOverride = Boolean(value); }
 
     get columns(): number | undefined {
+        if (this.#columnsOverride !== undefined) return this.#columnsOverride;
         if (!this.#stdio.isTTY) return undefined;
-        try { return this.#stdio.size.width; } catch { return undefined; }
+        return readTtySize(this.#stdio)?.width;
+    }
+
+    set columns(value: number | undefined) {
+        this.#columnsOverride = value === undefined ? undefined : Number(value);
     }
 
     get rows(): number | undefined {
+        if (this.#rowsOverride !== undefined) return this.#rowsOverride;
         if (!this.#stdio.isTTY) return undefined;
-        try { return this.#stdio.size.height; } catch { return undefined; }
+        return readTtySize(this.#stdio)?.height;
+    }
+
+    set rows(value: number | undefined) {
+        this.#rowsOverride = value === undefined ? undefined : Number(value);
     }
 
     getColorDepth(env?: Record<string, string>): number {
@@ -109,6 +130,7 @@ export class ProcessWriteStream extends Writable {
 export class ProcessReadStream extends Readable {
     #stdio: StdioStream;
     #isRaw: boolean = false;
+    #isTTYOverride: boolean | undefined;
 
     constructor(stdio: StdioStream) {
         super({ highWaterMark: PROCESS_READ_STREAM_HWM });
@@ -119,20 +141,22 @@ export class ProcessReadStream extends Readable {
     async #doRead(size: number): Promise<void> {
         try {
             const buf = new Uint8Array(size);
-            const n = await this.#stdio.read(buf as Uint8Array<ArrayBuffer>);
+            const n = await this.#stdio.read(buf);
             if (n === null) {
                 this.push(null);
             } else {
                 this.push(buf.subarray(0, n));
             }
         } catch (e) {
-            this.destroy(e as any);
+            this.destroy(e instanceof Error ? e : new Error(String(e)));
         }
     }
 
     get fd(): number { return this.#stdio.fd; }
 
-    get isTTY(): boolean { return this.#stdio.isTTY; }
+    get isTTY(): boolean { return this.#isTTYOverride ?? this.#stdio.isTTY; }
+
+    set isTTY(value: boolean) { this.#isTTYOverride = Boolean(value); }
 
     get isRaw(): boolean { return this.#isRaw; }
 
@@ -152,6 +176,6 @@ const stdoutStream = new ProcessWriteStream(denoStdout);
 const stderrStream = new ProcessWriteStream(denoStderr);
 const stdinStream = new ProcessReadStream(denoStdin);
 
-export const stdout: NodeJS.WriteStream = stdoutStream as any;
-export const stderr: NodeJS.WriteStream = stderrStream as any;
-export const stdin: NodeJS.ReadStream = stdinStream as any;
+export const stdout: NodeJS.WriteStream = stdoutStream as NodeJS.WriteStream;
+export const stderr: NodeJS.WriteStream = stderrStream as NodeJS.WriteStream;
+export const stdin: NodeJS.ReadStream = stdinStream as NodeJS.ReadStream;

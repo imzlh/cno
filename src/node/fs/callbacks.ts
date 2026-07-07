@@ -2,15 +2,44 @@
  * Node.js fs module - callback-style API
  * All async operations support callback functions
  */
-import { toUint8Array, toNodeStat, toNodeDirentAsync, parseFlags, pathToString, splitPathOrFd, describeFd, removeRecursive, mkdirRecursive, modeToNumber, timeToNumber, readFileFromFdSync, randomHex, createAsyncDir, type PathLike, type TimeLike, type Mode } from './utils';
+import { toUint8Array, decodeBuffer, encodePathResult, toNodeStat, toNodeStatFs, toNodeDirentAsync, parseFlags, pathToString, splitPathOrFd, describeFd, removeRecursive, mkdirRecursive, modeToNumber, timeToNumber, readFileFromFdSync, randomHex, createAsyncDir, readDirEntries, validateOpendirOptions, validateFd, errorFromUnknown, assertCopyFileMode, makeAbortError, type PathLike, type TimeLike, type Mode } from './utils';
 import { toErrnoException } from '../_internal/errno';
 import { getTierLimits } from '../_internal/memory';
 
 const fs = import.meta.use('fs');
-const engine = import.meta.use('engine');
 const asfs = import.meta.use('asyncfs');
 
 type NoParamCallback = (err: NodeJS.ErrnoException | null) => void;
+type OpendirCallback = (err: NodeJS.ErrnoException | null, dir?: import('fs').Dir) => void;
+type FsOptionBag = {
+    encoding?: BufferEncoding | 'buffer' | null;
+    flag?: string | number;
+    mode?: Mode;
+    recursive?: boolean;
+    force?: boolean;
+    withFileTypes?: boolean;
+    bigint?: boolean;
+    signal?: AbortSignal;
+};
+
+function optionBag(value: unknown): FsOptionBag {
+    return value !== null && typeof value === 'object' ? value as FsOptionBag : {};
+}
+
+function numberOr(value: unknown, fallback: number): number {
+    return typeof value === 'number' ? value : fallback;
+}
+
+function assertCallback(callback: unknown): asserts callback is (...args: unknown[]) => void {
+    if (typeof callback !== 'function') {
+        throw new TypeError('The "callback" argument must be of type function');
+    }
+}
+
+function runFsCallback(callback: unknown, fn: () => void): void {
+    assertCallback(callback);
+    queueMicrotask(fn);
+}
 
 // File read/write - callback style
 
@@ -20,34 +49,85 @@ export function readFile(
     callback: (err: NodeJS.ErrnoException | null, data: string | Buffer) => void
 ): void;
 export function readFile(path: PathLike | number, callback: (err: NodeJS.ErrnoException | null, data: Buffer) => void): void;
-export function readFile(path: PathLike | number, options?: any, callback?: any): void {
+export function readFile(path: PathLike | number, options?: unknown, callback?: unknown): void {
     if (typeof options === 'function') {
         callback = options;
         options = {};
     }
 
-    const target = splitPathOrFd(path as PathLike | number);
-    const encoding = typeof options === 'string' ? options : options?.encoding;
+    const target = splitPathOrFd(path);
+    const option = optionBag(options);
+    const encoding = typeof options === 'string' ? options : option.encoding;
+    const flag = option.flag;
+    const signal = option.signal;
+    assertCallback(callback);
+    if (signal?.aborted) {
+        queueMicrotask(() => callback(makeAbortError(signal), Buffer.alloc(0)));
+        return;
+    }
     if ('fd' in target) {
-        try {
-            const out = readFileFromFdSync(fs.read, target.fd, getTierLimits().readBufSize);
-            const result = encoding ? engine.decodeString(out as Uint8Array<ArrayBuffer>) : Buffer.from(out);
+        queueMicrotask(() => {
+            if (signal?.aborted) {
+                callback(makeAbortError(signal), Buffer.alloc(0));
+                return;
+            }
+            let result: string | Buffer;
+            try {
+                const out = readFileFromFdSync(fs.read, target.fd, getTierLimits().readBufSize);
+                result = decodeBuffer(out, encoding);
+            } catch (err) {
+                callback(toErrnoException(err, 'readFile', describeFd(target.fd)));
+                return;
+            }
             callback(null, result);
-        } catch (err) {
-            callback(toErrnoException(err, 'readFile', describeFd(target.fd)));
-        }
+        });
         return;
     }
 
-    asfs.readFile(target.path).then(
+    const read = flag === undefined ? asfs.readFile(target.path) : readFileWithFlag(target.path, flag);
+    let settled = false;
+    let onAbort: (() => void) | undefined;
+    const cleanup = () => {
+        if (onAbort) signal?.removeEventListener('abort', onAbort);
+    };
+    const finish = (err: NodeJS.ErrnoException | null, result: string | Buffer) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        callback(err, result);
+    };
+    if (signal) {
+        onAbort = () => finish(makeAbortError(signal), Buffer.alloc(0));
+        signal.addEventListener('abort', onAbort, { once: true });
+    }
+    read.then(
         buffer => {
-            const result = encoding
-                ? engine.decodeString(buffer as Uint8Array<ArrayBuffer>)
-                : Buffer.from(buffer);
-            callback(null, result);
+            if (signal?.aborted) {
+                finish(makeAbortError(signal), Buffer.alloc(0));
+                return;
+            }
+            const result = decodeBuffer(toUint8Array(buffer), encoding);
+            finish(null, result);
         },
-        err => callback(toErrnoException(err, 'readFile', target.path))
+        err => finish(toErrnoException(err, 'readFile', target.path), Buffer.alloc(0))
     );
+}
+
+async function readFileWithFlag(path: string, flag: string | number): Promise<Uint8Array<ArrayBuffer>> {
+    const handle = await asfs.open(path, parseFlags(flag));
+    try {
+        const st = await handle.stat();
+        const buf = new Uint8Array(st.size);
+        let off = 0;
+        while (off < st.size) {
+            const n = await handle.read(buf.subarray(off));
+            if (n === 0) break;
+            off += n;
+        }
+        return buf;
+    } finally {
+        await handle.close();
+    }
 }
 
 export function writeFile(
@@ -61,26 +141,32 @@ export function writeFile(
     data: string | Uint8Array | ArrayBuffer,
     callback: NoParamCallback
 ): void;
-export function writeFile(path: PathLike | number, data: any, options?: any, callback?: any): void {
+export function writeFile(path: PathLike | number, data: string | Uint8Array | ArrayBuffer, options?: unknown, callback?: unknown): void {
     if (typeof options === 'function') {
         callback = options;
         options = {};
     }
 
-    const target = splitPathOrFd(path as PathLike | number);
-    const mode = modeToNumber(typeof options === 'object' ? options?.mode : undefined);
-    const flag = typeof options === 'object' ? parseFlags(options?.flag) : 'w';
-    const buffer = toUint8Array(data);
+    const target = splitPathOrFd(path);
+    const option = optionBag(options);
+    const mode = modeToNumber(option.mode);
+    const flag = option.flag !== undefined ? parseFlags(option.flag) : 'w';
+    const encoding = typeof options === 'string' ? options : option.encoding;
+    const buffer = toUint8Array(data, encoding);
+    assertCallback(callback);
     if ('fd' in target) {
-        try {
-            if (flag !== 'a') {
-                fs.ftruncate(target.fd, 0);
+        queueMicrotask(() => {
+            try {
+                if (flag !== 'a') {
+                    fs.ftruncate(target.fd, 0);
+                }
+                fs.write(target.fd, buffer);
+            } catch (err) {
+                callback(toErrnoException(err, 'writeFile', describeFd(target.fd)));
+                return;
             }
-            fs.write(target.fd, buffer);
             callback(null);
-        } catch (err) {
-            callback(toErrnoException(err, 'writeFile', describeFd(target.fd)));
-        }
+        });
         return;
     }
 
@@ -105,26 +191,33 @@ export function appendFile(
     data: string | Uint8Array | ArrayBuffer,
     callback: NoParamCallback
 ): void;
-export function appendFile(path: PathLike | number, data: any, options?: any, callback?: any): void {
+export function appendFile(path: PathLike | number, data: string | Uint8Array | ArrayBuffer, options?: unknown, callback?: unknown): void {
     if (typeof options === 'function') {
         callback = options;
         options = {};
     }
 
-    const target = splitPathOrFd(path as PathLike | number);
-    const mode = modeToNumber(typeof options === 'object' ? options?.mode : undefined);
-    const buffer = toUint8Array(data);
+    const target = splitPathOrFd(path);
+    const option = optionBag(options);
+    const mode = modeToNumber(option.mode);
+    const flag = option.flag !== undefined ? parseFlags(option.flag) : 'a';
+    const encoding = typeof options === 'string' ? options : option.encoding;
+    const buffer = toUint8Array(data, encoding);
+    assertCallback(callback);
     if ('fd' in target) {
-        try {
-            fs.write(target.fd, buffer);
+        queueMicrotask(() => {
+            try {
+                fs.write(target.fd, buffer);
+            } catch (err) {
+                callback(toErrnoException(err, 'appendFile', describeFd(target.fd)));
+                return;
+            }
             callback(null);
-        } catch (err) {
-            callback(toErrnoException(err, 'appendFile', describeFd(target.fd)));
-        }
+        });
         return;
     }
 
-    asfs.open(target.path, 'a', mode).then(
+    asfs.open(target.path, flag, mode).then(
         handle =>
             handle.write(buffer).then(
                 () => callback(null),
@@ -137,6 +230,7 @@ export function appendFile(path: PathLike | number, data: any, options?: any, ca
 // File status - callback style
 
 export function exists(path: PathLike, callback: (exists: boolean) => void): void {
+    assertCallback(callback);
     const pathStr = pathToString(path);
     asfs.stat(pathStr).then(
         () => callback(true),
@@ -144,21 +238,34 @@ export function exists(path: PathLike, callback: (exists: boolean) => void): voi
     );
 }
 
+Object.defineProperty(exists, Symbol.for('nodejs.util.promisify.custom'), {
+    value(path: PathLike): Promise<boolean> {
+        const pathStr = pathToString(path);
+        return asfs.stat(pathStr).then(
+            () => true,
+            () => false,
+        );
+    },
+    configurable: true,
+});
+
 export function stat(path: PathLike, callback: (err: NodeJS.ErrnoException | null, stats: import('fs').Stats) => void): void;
 export function stat(
     path: PathLike,
     options: { bigint?: boolean; throwIfNoEntry?: boolean },
     callback: (err: NodeJS.ErrnoException | null, stats: import('fs').Stats) => void
 ): void;
-export function stat(path: PathLike, options?: any, callback?: any): void {
+export function stat(path: PathLike, options?: unknown, callback?: unknown): void {
     if (typeof options === 'function') {
         callback = options;
         options = {};
     }
 
+    assertCallback(callback);
     const pathStr = pathToString(path);
+    const option = optionBag(options);
     asfs.stat(pathStr).then(
-        st => callback(null, toNodeStat(st)),
+        st => callback(null, toNodeStat(st, option)),
         err => callback(toErrnoException(err, 'stat', pathStr))
     );
 }
@@ -169,15 +276,17 @@ export function lstat(
     options: { bigint?: boolean; throwIfNoEntry?: boolean },
     callback: (err: NodeJS.ErrnoException | null, stats: import('fs').Stats) => void
 ): void;
-export function lstat(path: PathLike, options?: any, callback?: any): void {
+export function lstat(path: PathLike, options?: unknown, callback?: unknown): void {
     if (typeof options === 'function') {
         callback = options;
         options = {};
     }
 
+    assertCallback(callback);
     const pathStr = pathToString(path);
+    const option = optionBag(options);
     asfs.lstat(pathStr).then(
-        st => callback(null, toNodeStat(st)),
+        st => callback(null, toNodeStat(st, option)),
         err => callback(toErrnoException(err, 'lstat', pathStr))
     );
 }
@@ -188,27 +297,34 @@ export function fstat(
     options: { bigint?: boolean },
     callback: (err: NodeJS.ErrnoException | null, stats: import('fs').Stats) => void
 ): void;
-export function fstat(fd: number, options?: any, callback?: any): void {
+export function fstat(fd: number, options?: unknown, callback?: unknown): void {
     if (typeof options === 'function') {
         callback = options;
         options = {};
     }
-    try {
-        const st = fs.fstat(fd);
-        callback(null, toNodeStat(st));
-    } catch (err) {
-        callback(toErrnoException(err, 'fstat', describeFd(fd)));
-    }
+    assertCallback(callback);
+    const option = optionBag(options);
+    queueMicrotask(() => {
+        let st: CModuleFS.Stats;
+        try {
+            st = fs.fstat(fd);
+        } catch (err) {
+            callback(toErrnoException(err, 'fstat', describeFd(fd)));
+            return;
+        }
+        callback(null, toNodeStat(st, option));
+    });
 }
 
 export function access(path: PathLike, callback: NoParamCallback): void;
 export function access(path: PathLike, mode: number, callback: NoParamCallback): void;
-export function access(path: PathLike, mode?: any, callback?: any): void {
+export function access(path: PathLike, mode?: unknown, callback?: unknown): void {
     if (typeof mode === 'function') {
         callback = mode;
         mode = fs.F_OK;
     }
 
+    assertCallback(callback);
     const pathStr = pathToString(path);
     asfs.stat(pathStr).then(
         () => callback(null),
@@ -220,15 +336,17 @@ export function access(path: PathLike, mode?: any, callback?: any): void {
 
 export function mkdir(path: PathLike, callback: NoParamCallback): void;
 export function mkdir(path: PathLike, mode: Mode | { mode?: number; recursive?: boolean }, callback: NoParamCallback): void;
-export function mkdir(path: PathLike, options?: any, callback?: any): void {
+export function mkdir(path: PathLike, options?: unknown, callback?: unknown): void {
     if (typeof options === 'function') {
         callback = options;
         options = {};
     }
 
+    assertCallback(callback);
     const pathStr = pathToString(path);
-    const mode = modeToNumber(typeof options === 'object' ? options?.mode : options);
-    const recursive = typeof options === 'object' ? options?.recursive : false;
+    const option = optionBag(options);
+    const mode = modeToNumber(option.mode ?? (typeof options === 'string' || typeof options === 'number' ? options : undefined));
+    const recursive = option.recursive === true;
 
     if (recursive) {
         mkdirRecursive(pathStr, mode).then(() => callback(null), err => callback(toErrnoException(err, 'mkdir', pathStr)));
@@ -239,15 +357,17 @@ export function mkdir(path: PathLike, options?: any, callback?: any): void {
 
 export function rmdir(path: PathLike, callback: NoParamCallback): void;
 export function rmdir(path: PathLike, options: { recursive?: boolean; maxRetries?: number; retryDelay?: number }, callback: NoParamCallback): void;
-export function rmdir(path: PathLike, options?: any, callback?: any): void {
+export function rmdir(path: PathLike, options?: unknown, callback?: unknown): void {
     if (typeof options === 'function') {
         callback = options;
         options = {};
     }
 
+    assertCallback(callback);
     const pathStr = pathToString(path);
+    const option = optionBag(options);
 
-    if (options?.recursive) {
+    if (option.recursive) {
         removeRecursive(pathStr).then(() => callback(null), err => callback(toErrnoException(err, 'rmdir', pathStr)));
     } else {
         asfs.rmdir(pathStr).then(() => callback(null), err => callback(toErrnoException(err, 'rmdir', pathStr)));
@@ -256,18 +376,20 @@ export function rmdir(path: PathLike, options?: any, callback?: any): void {
 
 export function rm(path: PathLike, callback: NoParamCallback): void;
 export function rm(path: PathLike, options: { force?: boolean; recursive?: boolean; maxRetries?: number; retryDelay?: number }, callback: NoParamCallback): void;
-export function rm(path: PathLike, options?: any, callback?: any): void {
+export function rm(path: PathLike, options?: unknown, callback?: unknown): void {
     if (typeof options === 'function') {
         callback = options;
         options = {};
     }
 
+    assertCallback(callback);
     const pathStr = pathToString(path);
+    const option = optionBag(options);
 
     asfs.lstat(pathStr).then(
         stats => {
             if (stats.isDirectory) {
-                if (options?.recursive) {
+                if (option.recursive) {
                     removeRecursive(pathStr).then(() => callback(null), err => callback(toErrnoException(err, 'rm', pathStr)));
                 } else {
                     asfs.rmdir(pathStr).then(() => callback(null), err => callback(toErrnoException(err, 'rm', pathStr)));
@@ -277,7 +399,7 @@ export function rm(path: PathLike, options?: any, callback?: any): void {
             }
         },
         err => {
-            if (!options?.force) {
+            if (!option.force) {
                 callback(toErrnoException(err, 'rm', pathStr));
             } else {
                 callback(null);
@@ -295,32 +417,24 @@ export function readdir(
     options: { encoding?: BufferEncoding | 'buffer'; withFileTypes?: boolean; recursive?: boolean } | BufferEncoding,
     callback: (err: NodeJS.ErrnoException | null, files: string[] | import('fs').Dirent[]) => void
 ): void;
-export function readdir(path: PathLike, options?: any, callback?: any): void {
+export function readdir(path: PathLike, options?: unknown, callback?: unknown): void {
     if (typeof options === 'function') {
         callback = options;
         options = {};
     }
 
+    assertCallback(callback);
     const pathStr = pathToString(path);
-    const withFileTypes = typeof options === 'object' ? options?.withFileTypes : false;
+    const option = optionBag(options);
+    const withFileTypes = option.withFileTypes === true;
+    const recursive = option.recursive === true;
 
-    asfs.readDir(pathStr).then(
-        async dirHandle => {
-            const entries: any[] = [];
-            try {
-                for await (const entry of dirHandle) {
-                    if (withFileTypes) {
-                        entries.push(toNodeDirentAsync(entry));
-                    } else {
-                        entries.push(entry.name);
-                    }
-                }
-                callback(null, entries);
-            } catch (err) {
-                callback(toErrnoException(err, 'readdir', pathStr));
-            } finally {
-                await dirHandle.close();
-            }
+    readDirEntries(pathStr, recursive).then(
+        entries => {
+            callback(null, withFileTypes
+                ? entries.map(entry => toNodeDirentAsync(entry))
+                : entries.map(entry => encodePathResult(entry.name, typeof options === 'string' ? options : option))
+            );
         },
         err => callback(toErrnoException(err, 'readdir', pathStr))
     );
@@ -329,46 +443,58 @@ export function readdir(path: PathLike, options?: any, callback?: any): void {
 // File operations - callback style
 
 export function unlink(path: PathLike, callback: NoParamCallback): void {
+    assertCallback(callback);
     const pathStr = pathToString(path);
     asfs.unlink(pathStr).then(() => callback(null), err => callback(toErrnoException(err, 'unlink', pathStr)));
 }
 
 export function rename(oldPath: PathLike, newPath: PathLike, callback: NoParamCallback): void {
+    assertCallback(callback);
     const oldStr = pathToString(oldPath);
     const newStr = pathToString(newPath);
     asfs.rename(oldStr, newStr).then(
         () => callback(null),
-        err => callback(toErrnoException(err, 'rename', oldStr))
+        err => callback(toErrnoException(err, 'rename', oldStr, newStr))
     );
 }
 
 export function copyFile(src: PathLike, dest: PathLike, callback: NoParamCallback): void;
 export function copyFile(src: PathLike, dest: PathLike, mode: number, callback: NoParamCallback): void;
-export function copyFile(src: PathLike, dest: PathLike, mode?: any, callback?: any): void {
+export function copyFile(src: PathLike, dest: PathLike, mode?: unknown, callback?: unknown): void {
     if (typeof mode === 'function') {
         callback = mode;
         mode = 0;
     }
 
+    assertCallback(callback);
     const srcStr = pathToString(src);
-    asfs.copyFile(srcStr, pathToString(dest)).then(
+    const destStr = pathToString(dest);
+    try {
+        assertCopyFileMode(srcStr, destStr, mode);
+    } catch (err) {
+        queueMicrotask(() => callback(toErrnoException(err, 'copyFile', srcStr, destStr)));
+        return;
+    }
+    asfs.copyFile(srcStr, destStr).then(
         () => callback(null),
-        err => callback(toErrnoException(err, 'copyFile', srcStr))
+        err => callback(toErrnoException(err, 'copyFile', srcStr, destStr))
     );
 }
 
 export function truncate(path: PathLike, callback: NoParamCallback): void;
 export function truncate(path: PathLike, len: number, callback: NoParamCallback): void;
-export function truncate(path: PathLike, len?: any, callback?: any): void {
+export function truncate(path: PathLike, len?: unknown, callback?: unknown): void {
     if (typeof len === 'function') {
         callback = len;
         len = 0;
     }
 
+    assertCallback(callback);
     const pathStr = pathToString(path);
+    const size = numberOr(len, 0);
     asfs.open(pathStr, 'r+').then(
         handle => 
-            handle.truncate(len ?? 0).then(
+            handle.truncate(size).then(
                 () => callback(null),
                 err => callback(toErrnoException(err, 'truncate', pathStr))
             ).finally(() => handle.close()),
@@ -378,22 +504,27 @@ export function truncate(path: PathLike, len?: any, callback?: any): void {
 
 export function ftruncate(fd: number, callback: NoParamCallback): void;
 export function ftruncate(fd: number, len: number, callback: NoParamCallback): void;
-export function ftruncate(fd: number, len?: any, callback?: any): void {
+export function ftruncate(fd: number, len?: unknown, callback?: unknown): void {
     if (typeof len === 'function') {
         callback = len;
         len = 0;
     }
-    try {
-        fs.ftruncate(fd, len ?? 0);
+    const size = numberOr(len, 0);
+    runFsCallback(callback, () => {
+        try {
+            fs.ftruncate(fd, size);
+        } catch (err) {
+            callback(toErrnoException(err, 'ftruncate', describeFd(fd)));
+            return;
+        }
         callback(null);
-    } catch (err) {
-        callback(toErrnoException(err, 'ftruncate', describeFd(fd)));
-    }
+    });
 }
 
 // Link operations - callback style
 
 export function link(existingPath: PathLike, newPath: PathLike, callback: NoParamCallback): void {
+    assertCallback(callback);
     const existingStr = pathToString(existingPath);
     asfs.link(existingStr, pathToString(newPath)).then(
         () => callback(null),
@@ -403,13 +534,14 @@ export function link(existingPath: PathLike, newPath: PathLike, callback: NoPara
 
 export function symlink(target: PathLike, path: PathLike, callback: NoParamCallback): void;
 export function symlink(target: PathLike, path: PathLike, type: 'file' | 'dir' | 'junction', callback: NoParamCallback): void;
-export function symlink(target: PathLike, path: PathLike, type?: any, callback?: any): void {
+export function symlink(target: PathLike, path: PathLike, type?: 'file' | 'dir' | 'junction' | NoParamCallback, callback?: NoParamCallback): void {
     if (typeof type === 'function') {
         callback = type;
         type = 'file';
     }
 
-    const symlinkType = type === 'dir' ? asfs.SymlinkType.DIR : type === 'junction' ? asfs.SymlinkType.JUNCTION : 0 as any;
+    assertCallback(callback);
+    const symlinkType: CModuleAsyncFS.SymlinkType = type === 'dir' ? asfs.SymlinkType.DIR : type === 'junction' ? asfs.SymlinkType.JUNCTION : 0;
     asfs.symlink(pathToString(target), pathToString(path), symlinkType).then(
         () => callback(null),
         (err) => callback(toErrnoException(err, 'symlink', pathToString(path)))
@@ -425,12 +557,13 @@ export function readlink(
     options: { encoding?: BufferEncoding | 'buffer' } | BufferEncoding,
     callback: (err: NodeJS.ErrnoException | null, linkString: string | Buffer) => void
 ): void;
-export function readlink(path: PathLike, options?: any, callback?: any): void {
+export function readlink(path: PathLike, options?: unknown, callback?: unknown): void {
     if (typeof options === 'function') {
         callback = options;
         options = {};
     }
 
+    assertCallback(callback);
     asfs.readLink(pathToString(path)).then(
         result => callback(null, result),
         err => callback(toErrnoException(err, 'readlink', pathToString(path)))
@@ -446,29 +579,33 @@ export function realpath(
     options: { encoding?: BufferEncoding | 'buffer' } | BufferEncoding,
     callback: (err: NodeJS.ErrnoException | null, resolvedPath: string | Buffer) => void
 ): void;
-export function realpath(path: PathLike, options?: any, callback?: any): void {
+export function realpath(path: PathLike, options?: unknown, callback?: unknown): void {
     if (typeof options === 'function') {
         callback = options;
         options = {};
     }
 
+    assertCallback(callback);
     asfs.realPath(pathToString(path)).then(
         result => callback(null, result),
         err => callback(toErrnoException(err, 'realpath', pathToString(path)))
     );
 }
 
-export function mkdtemp(prefix: string, callback: (err: NodeJS.ErrnoException | null, folder: string) => void): void;
-export function mkdtemp(prefix: string, options: { encoding?: BufferEncoding | null } | BufferEncoding, callback: (err: NodeJS.ErrnoException | null, folder: string) => void): void;
-export function mkdtemp(prefix: string, options?: any, callback?: any): void {
+export function mkdtemp(prefix: string, callback: (err: NodeJS.ErrnoException | null, folder: string | Buffer) => void): void;
+export function mkdtemp(prefix: string, options: { encoding?: BufferEncoding | 'buffer' | null } | BufferEncoding, callback: (err: NodeJS.ErrnoException | null, folder: string | Buffer) => void): void;
+export function mkdtemp(prefix: string, options?: unknown, callback?: unknown): void {
     if (typeof options === 'function') {
         callback = options;
         options = {};
     }
 
+    assertCallback(callback);
     const dirPath = prefix + randomHex();
+    const option = optionBag(options);
+    const result = encodePathResult(dirPath, typeof options === 'string' ? options : option);
     asfs.mkdir(dirPath).then(
-        () => callback(null, dirPath),
+        () => callback(null, result),
         err => callback(toErrnoException(err, 'mkdtemp', dirPath), ''),
     );
 }
@@ -476,48 +613,62 @@ export function mkdtemp(prefix: string, options?: any, callback?: any): void {
 // Permission operations - callback style
 
 export function chmod(path: PathLike, mode: Mode, callback: NoParamCallback): void {
+    assertCallback(callback);
     const pathStr = pathToString(path);
-    asfs.chmod(pathStr, modeToNumber(mode)!).then(
+    asfs.chmod(pathStr, modeToNumber(mode)).then(
         () => callback(null),
         err => callback(toErrnoException(err, 'chmod', pathStr))
     );
 }
 
 export function fchmod(fd: number, mode: Mode, callback: NoParamCallback): void {
-    try {
-        fs.fchmod(fd, modeToNumber(mode)!);
+    const parsedMode = modeToNumber(mode);
+    runFsCallback(callback, () => {
+        try {
+            fs.fchmod(fd, parsedMode);
+        } catch (err) {
+            callback(toErrnoException(err, 'fchmod', describeFd(fd)));
+            return;
+        }
         callback(null);
-    } catch (err) {
-        callback(toErrnoException(err, 'fchmod', describeFd(fd)));
-    }
+    });
 }
 
 export function lchmod(path: PathLike, mode: Mode, callback: NoParamCallback): void {
     // lchmod: best-effort via chmod (C layer doesn't distinguish symlink chmod)
     const pathStr = pathToString(path);
-    try {
-        fs.chmod(pathStr, modeToNumber(mode)!);
+    const parsedMode = modeToNumber(mode);
+    runFsCallback(callback, () => {
+        try {
+            fs.chmod(pathStr, parsedMode);
+        } catch (err) {
+            callback(toErrnoException(err, 'lchmod', pathStr));
+            return;
+        }
         callback(null);
-    } catch (err) {
-        callback(toErrnoException(err, 'lchmod', pathStr));
-    }
+    });
 }
 
 export function chown(path: PathLike, uid: number, gid: number, callback: NoParamCallback): void {
+    assertCallback(callback);
     const pathStr = pathToString(path);
     asfs.chown(pathStr, uid, gid).then(() => callback(null), err => callback(toErrnoException(err, 'chown', pathStr)));
 }
 
 export function fchown(fd: number, uid: number, gid: number, callback: NoParamCallback): void {
-    try {
-        fs.fchown(fd, uid, gid);
+    runFsCallback(callback, () => {
+        try {
+            fs.fchown(fd, uid, gid);
+        } catch (err) {
+            callback(toErrnoException(err, 'fchown', describeFd(fd)));
+            return;
+        }
         callback(null);
-    } catch (err) {
-        callback(toErrnoException(err, 'fchown', describeFd(fd)));
-    }
+    });
 }
 
 export function lchown(path: PathLike, uid: number, gid: number, callback: NoParamCallback): void {
+    assertCallback(callback);
     const pathStr = pathToString(path);
     asfs.lchown(pathStr, uid, gid).then(() => callback(null), err => callback(toErrnoException(err, 'lchown', pathStr)));
 }
@@ -525,29 +676,36 @@ export function lchown(path: PathLike, uid: number, gid: number, callback: NoPar
 // Time operations - callback style
 
 export function utimes(path: PathLike, atime: TimeLike, mtime: TimeLike, callback: NoParamCallback): void {
+    assertCallback(callback);
     const pathStr = pathToString(path);
     asfs.utime(
         pathStr,
-        timeToNumber(atime) / 1000,
-        timeToNumber(mtime) / 1000
+        timeToNumber(atime),
+        timeToNumber(mtime)
     ).then(() => callback(null), err => callback(toErrnoException(err, 'utimes', pathStr)));
 }
 
 export function futimes(fd: number, atime: TimeLike, mtime: TimeLike, callback: NoParamCallback): void {
-    try {
-        fs.futimes(fd, timeToNumber(atime) / 1000, timeToNumber(mtime) / 1000);
+    const atimeSec = timeToNumber(atime) / 1000;
+    const mtimeSec = timeToNumber(mtime) / 1000;
+    runFsCallback(callback, () => {
+        try {
+            fs.futimes(fd, atimeSec, mtimeSec);
+        } catch (err) {
+            callback(toErrnoException(err, 'futimes', describeFd(fd)));
+            return;
+        }
         callback(null);
-    } catch (err) {
-        callback(toErrnoException(err, 'futimes', describeFd(fd)));
-    }
+    });
 }
 
 export function lutimes(path: PathLike, atime: TimeLike, mtime: TimeLike, callback: NoParamCallback): void {
+    assertCallback(callback);
     const pathStr = pathToString(path);
     asfs.lutime(
         pathStr,
-        timeToNumber(atime) / 1000,
-        timeToNumber(mtime) / 1000
+        timeToNumber(atime),
+        timeToNumber(mtime)
     ).then(() => callback(null), err => callback(toErrnoException(err, 'lutimes', pathStr)));
 }
 
@@ -556,7 +714,7 @@ export function lutimes(path: PathLike, atime: TimeLike, mtime: TimeLike, callba
 export function open(path: PathLike, callback: (err: NodeJS.ErrnoException | null, fd: number) => void): void;
 export function open(path: PathLike, flags: string | number, callback: (err: NodeJS.ErrnoException | null, fd: number) => void): void;
 export function open(path: PathLike, flags: string | number, mode: Mode, callback: (err: NodeJS.ErrnoException | null, fd: number) => void): void;
-export function open(path: PathLike, flags?: any, mode?: any, callback?: any): void {
+export function open(path: PathLike, flags?: unknown, mode?: unknown, callback?: unknown): void {
     if (typeof flags === 'function') {
         callback = flags;
         flags = 'r';
@@ -566,20 +724,33 @@ export function open(path: PathLike, flags?: any, mode?: any, callback?: any): v
         mode = 0o666;
     }
 
+    assertCallback(callback);
     const pathStr = pathToString(path);
-    asfs.open(pathStr, parseFlags(flags), modeToNumber(mode)).then(
-        handle => callback(null, handle.fileno()),
-        err => callback(toErrnoException(err, 'open', pathStr))
-    );
+    const openFlags = typeof flags === 'string' || typeof flags === 'number' ? flags : 'r';
+    const openMode = modeToNumber(typeof mode === 'string' || typeof mode === 'number' ? mode : 0o666);
+    Promise.resolve().then(() => {
+        let fd: number;
+        try {
+            fd = fs.open(pathStr, parseFlags(openFlags), openMode);
+        } catch (err) {
+            callback(toErrnoException(err, 'open', pathStr));
+            return;
+        }
+        callback(null, fd);
+    });
 }
 
-export function close(fd: number, callback: NoParamCallback): void {
-    try {
-        fs.close(fd);
+export function close(fd: number, callback: NoParamCallback = () => {}): void {
+    validateFd(fd);
+    runFsCallback(callback, () => {
+        try {
+            fs.close(fd);
+        } catch (err) {
+            callback(toErrnoException(err, 'close', describeFd(fd)));
+            return;
+        }
         callback(null);
-    } catch (err) {
-        callback(toErrnoException(err, 'close', describeFd(fd)));
-    }
+    });
 }
 
 export function read(
@@ -590,17 +761,20 @@ export function read(
     position: number | null,
     callback: (err: NodeJS.ErrnoException | null, bytesRead: number, buffer: Buffer | Uint8Array) => void
 ): void {
-    try {
+    runFsCallback(callback, () => {
         let bytesRead: number;
-        if (position !== null && position !== undefined) {
-            bytesRead = fs.pread(fd, buffer.subarray(offset, offset + length), position);
-        } else {
-            bytesRead = fs.read(fd, buffer.subarray(offset, offset + length));
+        try {
+            if (position !== null && position !== undefined) {
+                bytesRead = fs.pread(fd, buffer.subarray(offset, offset + length), position);
+            } else {
+                bytesRead = fs.read(fd, buffer.subarray(offset, offset + length));
+            }
+        } catch (err) {
+            callback(toErrnoException(err, 'read', describeFd(fd)), 0, buffer);
+            return;
         }
         callback(null, bytesRead, buffer);
-    } catch (err) {
-        callback(toErrnoException(err, 'read', describeFd(fd)), 0, buffer);
-    }
+    });
 }
 
 export function write(
@@ -616,7 +790,7 @@ export function write(
     buffer: Buffer | Uint8Array | string,
     callback: (err: NodeJS.ErrnoException | null, written: number, buffer: Buffer | Uint8Array | string) => void
 ): void;
-export function write(fd: number, buffer: any, offset?: any, length?: any, position?: any, callback?: any): void {
+export function write(fd: number, buffer: Buffer | Uint8Array | string, offset?: unknown, length?: unknown, position?: unknown, callback?: unknown): void {
     if (typeof offset === 'function') {
         callback = offset;
         offset = 0;
@@ -631,36 +805,48 @@ export function write(fd: number, buffer: any, offset?: any, length?: any, posit
         position = null;
     }
 
-    try {
-        const data = typeof buffer === 'string' ? toUint8Array(buffer) : buffer;
+    const data = typeof buffer === 'string' ? toUint8Array(buffer) : buffer;
+    const start = numberOr(offset, 0);
+    const count = numberOr(length, data.length - start);
+    const writePosition = typeof position === 'number' ? position : null;
+    runFsCallback(callback, () => {
         let written: number;
-        if (position !== null && position !== undefined) {
-            written = fs.pwrite(fd, data.subarray(offset, offset + length), position);
-        } else {
-            written = fs.write(fd, data.subarray(offset, offset + length));
+        try {
+            if (writePosition !== null) {
+                written = fs.pwrite(fd, data.subarray(start, start + count), writePosition);
+            } else {
+                written = fs.write(fd, data.subarray(start, start + count));
+            }
+        } catch (err) {
+            callback(toErrnoException(err, 'write', describeFd(fd)), 0, buffer);
+            return;
         }
         callback(null, written, buffer);
-    } catch (err) {
-        callback(toErrnoException(err, 'write', describeFd(fd)), 0, buffer);
-    }
+    });
 }
 
 export function fsync(fd: number, callback: NoParamCallback): void {
-    try {
-        fs.fsync(fd);
+    runFsCallback(callback, () => {
+        try {
+            fs.fsync(fd);
+        } catch (err) {
+            callback(toErrnoException(err, 'fsync', describeFd(fd)));
+            return;
+        }
         callback(null);
-    } catch (err) {
-        callback(toErrnoException(err, 'fsync', describeFd(fd)));
-    }
+    });
 }
 
 export function fdatasync(fd: number, callback: NoParamCallback): void {
-    try {
-        fs.fdatasync(fd);
+    runFsCallback(callback, () => {
+        try {
+            fs.fdatasync(fd);
+        } catch (err) {
+            callback(toErrnoException(err, 'fdatasync', describeFd(fd)));
+            return;
+        }
         callback(null);
-    } catch (err) {
-        callback(toErrnoException(err, 'fdatasync', describeFd(fd)));
-    }
+    });
 }
 
 // statfs - callback style
@@ -671,44 +857,44 @@ export function statfs(
     options: { bigint?: boolean },
     callback: (err: NodeJS.ErrnoException | null, stats: import('fs').StatsFs) => void
 ): void;
-export function statfs(path: PathLike, options?: any, callback?: any): void {
+export function statfs(path: PathLike, options?: unknown, callback?: unknown): void {
     if (typeof options === 'function') {
         callback = options;
         options = {};
     }
 
+    assertCallback(callback);
     const pathStr = pathToString(path);
+    const statOptions = optionBag(options);
     asfs.statFs(pathStr).then(
-        result => {
-            callback(null, {
-                type: result.type,
-                bsize: result.bsize,
-                blocks: result.blocks,
-                bfree: result.bfree,
-                bavail: result.bavail,
-                files: result.files,
-                ffree: result.ffree,
-            });
-        },
+        result => callback(null, toNodeStatFs(result, statOptions)),
         err => callback(toErrnoException(err, 'statfs', pathStr))
     );
 }
 
 // opendir - callback style
 
-export function opendir(path: PathLike, callback: (err: NodeJS.ErrnoException | null, dir: import('fs').Dir) => void): void;
+export function opendir(path: PathLike, callback: OpendirCallback): void;
 export function opendir(
     path: PathLike,
     options: { encoding?: BufferEncoding; bufferSize?: number },
-    callback: (err: NodeJS.ErrnoException | null, dir: import('fs').Dir) => void
+    callback: OpendirCallback
 ): void;
-export function opendir(path: PathLike, options?: any, callback?: any): void {
+export function opendir(path: PathLike, options?: unknown, callback?: unknown): void {
     if (typeof options === 'function') {
         callback = options;
         options = {};
     }
 
-    const pathStr = pathToString(path);
+    assertCallback(callback);
+    let pathStr: string;
+    try {
+        validateOpendirOptions(options);
+        pathStr = pathToString(path);
+    } catch (err) {
+        callback(errorFromUnknown(err));
+        return;
+    }
     asfs.readDir(pathStr).then(
         dirHandle => callback(null, createAsyncDir(pathStr, dirHandle)),
         err => callback(toErrnoException(err, 'opendir', pathStr))

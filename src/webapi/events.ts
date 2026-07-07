@@ -1,9 +1,11 @@
+const denoCustomInspect = Symbol.for('Deno.customInspect');
+
 export class Event implements globalThis.Event {
-    readonly type: string;
-    readonly bubbles: boolean = false;
-    readonly cancelable: boolean = false;
-    readonly composed: boolean = false;
-    readonly eventPhase: 0 = 0;             // NONE only
+    type: string;
+    bubbles: boolean = false;
+    cancelable: boolean = false;
+    composed: boolean = false;
+    eventPhase: number = 0;
     readonly isTrusted: boolean = false;
 
     // Legacy aliases required by TypeScript lib.dom.d.ts
@@ -16,14 +18,15 @@ export class Event implements globalThis.Event {
     timeStamp: number = performance.now();
 
     private _stopped = false;
+    private _immediateStopped = false;
     private _prevented = false;
 
     constructor(type: string, options?: EventInit, trust = false) {
-        this.type = type;
+        this.type = String(type);
         if (options) {
-            (this as any).bubbles = !!options.bubbles;
-            (this as any).cancelable = !!options.cancelable;
-            (this as any).composed = !!options.composed;
+            this.bubbles = !!options.bubbles;
+            this.cancelable = !!options.cancelable;
+            this.composed = !!options.composed;
         }
         this.isTrusted = trust;
     }
@@ -37,6 +40,7 @@ export class Event implements globalThis.Event {
     }
     stopImmediatePropagation(): void {
         this._stopped = true;
+        this._immediateStopped = true;
         this.cancelBubble = true;
     }
 
@@ -45,6 +49,9 @@ export class Event implements globalThis.Event {
     }
     get propagationStopped(): boolean {
         return this._stopped;
+    }
+    get immediatePropagationStopped(): boolean {
+        return this._immediateStopped;
     }
 
     static NONE = 0;
@@ -61,89 +68,158 @@ export class Event implements globalThis.Event {
     }
 
     initEvent(type: string, bubbles?: boolean, cancelable?: boolean): void {
-        (this as any).type = type;
-        (this as any).bubbles = !!bubbles;
-        (this as any).cancelable = !!cancelable;
+        this.type = type;
+        this.bubbles = !!bubbles;
+        this.cancelable = !!cancelable;
     }
     
     get [Symbol.toStringTag]() {
         return 'Event';
     }
+
+    [denoCustomInspect]() {
+        return inspectEvent(this);
+    }
 }
 
-interface ListenerEntry { listener: EventListenerOrEventListenerObject; once: boolean; signal?: AbortSignal; }
+interface ListenerEntry {
+    listener: EventListenerOrEventListenerObject;
+    once: boolean;
+    capture: boolean;
+    signal?: AbortSignal;
+}
+
+const captureOption = (options?: AddEventListenerOptions | boolean): boolean =>
+    typeof options === 'boolean' ? options : !!options?.capture;
+
+function callTrackingHook(name: string, ...args: unknown[]): void {
+    const hook = Reflect.get(globalThis, name);
+    if (typeof hook === 'function') Reflect.apply(hook, globalThis, args);
+}
 
 export class EventTarget implements globalThis.EventTarget {
     #listeners = new Map<string, ListenerEntry[]>();
 
+    static #receiver(receiver: EventTarget | typeof globalThis | null | undefined): EventTarget | null {
+        if (receiver === undefined || receiver === null || receiver === globalThis) return null;
+        if (!(receiver instanceof EventTarget)) throw new TypeError('Illegal invocation');
+        return receiver;
+    }
+
     addEventListener(
+        this: EventTarget | typeof globalThis | null | undefined,
         type: string,
         listener: EventListenerOrEventListenerObject | null,
         options?: AddEventListenerOptions | boolean
     ): void {
+        const target = EventTarget.#receiver(this);
+        if (!target) {
+            if (!listener) return;
+            return globalThis.addEventListener(type, listener, options);
+        }
+        const listeners = target.#listeners;
         if (!listener) return;
+        const eventType = String(type);
         const opts = typeof options === 'boolean' ? { capture: options } : options ?? {};
-        let bucket = this.#listeners.get(type);
-        if (!bucket) { bucket = []; this.#listeners.set(type, bucket); }
-        const entry: ListenerEntry = { listener, once: !!opts.once, signal: opts.signal };
+        if (opts.signal?.aborted) return;
+        let bucket = listeners.get(eventType);
+        if (!bucket) {
+            bucket = [];
+            listeners.set(eventType, bucket);
+        }
+        const capture = !!opts.capture;
+        if (bucket.some(e => e.listener === listener && e.capture === capture)) return;
+        const entry: ListenerEntry = { listener, once: !!opts.once, capture, signal: opts.signal };
         bucket.push(entry);
+        callTrackingHook('__cnoTrackEventTargetListener', target, eventType, listener, options);
         if (opts.signal) {
             opts.signal.addEventListener('abort', () => {
                 const idx = bucket.indexOf(entry);
-                if (idx !== -1) bucket.splice(idx, 1);
+                if (idx !== -1) {
+                    bucket.splice(idx, 1);
+                    callTrackingHook('__cnoUntrackEventTargetListener', target, eventType, listener, entry.capture);
+                }
             }, { once: true });
         }
     }
 
     removeEventListener(
+        this: EventTarget | typeof globalThis | null | undefined,
         type: string,
-        listener: EventListener | null,
+        listener: EventListenerOrEventListenerObject | null,
         options?: AddEventListenerOptions | boolean
     ): void {
+        const target = EventTarget.#receiver(this);
+        if (!target) {
+            if (!listener) return;
+            return globalThis.removeEventListener(type, listener, options);
+        }
+        const listeners = target.#listeners;
         if (!listener) return;
-        const bucket = this.#listeners.get(type);
+        const eventType = String(type);
+        const bucket = listeners.get(eventType);
         if (!bucket) return;
-        const idx = bucket.findIndex(e => e.listener === listener);
-        if (idx !== -1) bucket.splice(idx, 1);
+        const capture = captureOption(options);
+        const idx = bucket.findIndex(e => e.listener === listener && e.capture === capture);
+        if (idx !== -1) {
+            bucket.splice(idx, 1);
+            callTrackingHook('__cnoUntrackEventTargetListener', target, eventType, listener, options);
+        }
     }
 
-    dispatchEvent(event: globalThis.Event): boolean {
+    dispatchEvent(
+        this: EventTarget | typeof globalThis | null | undefined,
+        event: globalThis.Event
+    ): boolean {
+        const target = EventTarget.#receiver(this);
+        if (!target) return globalThis.dispatchEvent(event);
+        const listeners = target.#listeners;
         if (!(event instanceof Event)) throw new TypeError('Invalid event object');
 
-        // fill legacy aliases
-        event.target = this;
-        event.currentTarget = this;
-        event.srcElement = this;
+        event.target = target;
+        event.currentTarget = target;
+        event.srcElement = target;
 
-        const bucket = this.#listeners.get(event.type);
-        if (bucket) {
-            const snapshot = [...bucket];
-            for (const entry of snapshot) {
-                if (event.propagationStopped) break;
-                if (entry.once) {
+        const bucket = listeners.get(event.type);
+        event.eventPhase = Event.AT_TARGET;
+        try {
+            if (bucket) {
+                const snapshot = [...bucket];
+                for (const entry of snapshot) {
+                    if (event.immediatePropagationStopped) break;
                     const idx = bucket.indexOf(entry);
-                    if (idx !== -1) bucket.splice(idx, 1);
+                    if (idx === -1) continue;
+                    if (entry.once) {
+                        bucket.splice(idx, 1);
+                        callTrackingHook('__cnoUntrackEventTargetListener', target, event.type, entry.listener, entry.capture);
+                    }
+                    const fn = entry.listener;
+                    if (typeof fn === 'function') fn.call(this, event);
+                    else fn.handleEvent?.(event);
                 }
-                const fn = entry.listener;
-                if (typeof fn === 'function') fn.call(this, event);
-                else fn.handleEvent?.(event);
             }
+        } finally {
+            event.eventPhase = Event.NONE;
+            event.currentTarget = null;
         }
 
-        // cleanup
-        event.target = null;
-        event.currentTarget = null;
-        event.srcElement = null;
-
         return !event.defaultPrevented;
+    }
+
+    get [Symbol.toStringTag]() {
+        return 'EventTarget';
     }
 }
 
 export class CustomEvent extends Event implements globalThis.CustomEvent {
-    public readonly detail: any;
+    public readonly detail: unknown;
     constructor(type: string, eventInitDict?: CustomEventInit, trust?: boolean) {
         super(type, eventInitDict, trust);
         this.detail = eventInitDict?.detail;
+    }
+
+    get [Symbol.toStringTag]() {
+        return 'CustomEvent';
     }
 }
 
@@ -175,16 +251,24 @@ export class ErrorEvent extends Event implements globalThis.ErrorEvent {
         // Ensures `instanceof ErrorEvent` works correctly.
         Object.setPrototypeOf(this, ErrorEvent.prototype);
     }
+
+    get [Symbol.toStringTag]() {
+        return 'ErrorEvent';
+    }
 }
 
 export class PromiseRejectionEvent extends Event implements globalThis.PromiseRejectionEvent {
-    public readonly reason: any;
-    public readonly promise: Promise<any>;
+    public readonly reason: unknown;
+    public readonly promise: Promise<unknown>;
 
     constructor(type: string, init: PromiseRejectionEventInit, trust?: boolean) {
         super(type, init, trust);
         this.reason = init.reason;
         this.promise = init.promise;
+    }
+
+    get [Symbol.toStringTag]() {
+        return 'PromiseRejectionEvent';
     }
 }
 
@@ -193,16 +277,20 @@ export class CloseEvent extends Event implements globalThis.CloseEvent {
     public readonly reason: string;
     public readonly wasClean: boolean;
 
-    constructor(type: string, init: CloseEventInit, trust?: boolean) {
+    constructor(type: string, init: CloseEventInit = {}, trust?: boolean) {
         super(type, init, trust);
         this.code = init.code ?? 0;
         this.reason = init.reason ?? '';
-        this.wasClean = init.wasClean ?? true;
+        this.wasClean = init.wasClean ?? false;
+    }
+
+    get [Symbol.toStringTag]() {
+        return 'CloseEvent';
     }
 }
 
 export class MessageEvent extends Event implements globalThis.MessageEvent {
-    public readonly data: any;
+    public readonly data: unknown;
     public readonly origin: string;
     public readonly lastEventId: string;
     public readonly source = null;
@@ -213,12 +301,16 @@ export class MessageEvent extends Event implements globalThis.MessageEvent {
         throw new Error('legacy initMessageEvent deprecated');
     }
 
-    constructor(type: string, init: MessageEventInit, trust?: boolean) {
+    constructor(type: string, init: MessageEventInit = {}, trust?: boolean) {
         super(type, init, trust);
         this.data = init.data;
         this.origin = init.origin ?? '';
         this.lastEventId = init.lastEventId ?? '';
         this.ports = init.ports ?? [];
+    }
+
+    get [Symbol.toStringTag]() {
+        return 'MessageEvent';
     }
 }
 
@@ -230,6 +322,16 @@ export class DOMException extends Error {
 
         this.name = name;
         this.code = DOMException.getErrorCode(name);
+        let stackValue = this.stack;
+        Object.defineProperty(this, 'stack', {
+            configurable: true,
+            get() {
+                return stackValue;
+            },
+            set(value) {
+                stackValue = value;
+            },
+        });
         Object.setPrototypeOf(this, DOMException.prototype);
     }
 
@@ -291,7 +393,9 @@ export class DOMException extends Error {
     };
 
     private static getErrorCode(name: string): number {
-        return this.errorCodeMap[name] || 0;
+        return Object.prototype.hasOwnProperty.call(this.errorCodeMap, name)
+            ? this.errorCodeMap[name] ?? 0
+            : 0;
     }
 
     static create(name: string, message: string = ''): DOMException {
@@ -309,6 +413,14 @@ export class DOMException extends Error {
     static syntax(message?: string) { return DOMException.of('SyntaxError', message); }
     static typeMismatch(message?: string) { return DOMException.of('TypeMismatchError', message); }
     static invalidState(message?: string) { return DOMException.of('InvalidStateError', message); }
+
+    get [Symbol.toStringTag]() {
+        return 'DOMException';
+    }
+
+    [denoCustomInspect]() {
+        return inspectDOMException(this);
+    }
 }
 
 export class ProgressEvent<T extends EventTarget = EventTarget> extends Event implements globalThis.ProgressEvent<T> {
@@ -324,12 +436,18 @@ export class ProgressEvent<T extends EventTarget = EventTarget> extends Event im
         this.loaded = init.loaded ?? 0;
         this.total = init.total ?? 0;
     }
+
+    get [Symbol.toStringTag]() {
+        return 'ProgressEvent';
+    }
 }
 
 for (const [name, cls] of Object.entries({
     Event, EventTarget, CustomEvent, ErrorEvent, PromiseRejectionEvent,
     CloseEvent, MessageEvent, DOMException, ProgressEvent,
 })) Reflect.set(globalThis, name, cls);
+
+callTrackingHook('__cnoPatchEventTargetTracking');
 
 export const parseStackFrame = (
     line: string
@@ -353,7 +471,14 @@ export const parseStackFrame = (
     return { func, file, line: lineNum, col: colNum };
 };
 
-// FIXME: deno don't declared type StorageEvent
+interface StorageEventInit extends EventInit {
+    key?: string | null;
+    oldValue?: string | null;
+    newValue?: string | null;
+    url?: string;
+    storageArea?: Storage | null;
+}
+
 export class StorageEvent extends Event {
     readonly key: string | null;
     readonly oldValue: string | null;
@@ -361,7 +486,7 @@ export class StorageEvent extends Event {
     readonly url: string;
     readonly storageArea: Storage | null;
 
-    constructor(type: string, init?: /* StorageEventInit */ any, trust = false) {
+    constructor(type: string, init: StorageEventInit = {}, trust = false) {
         super(type, init, trust);
         this.key        = init?.key        ?? null;
         this.oldValue   = init?.oldValue   ?? null;
@@ -371,30 +496,114 @@ export class StorageEvent extends Event {
     }
 
     initStorageEvent(type: string, bubbles?: boolean, cancelable?: boolean, key?: string | null, oldValue?: string | null, newValue?: string | null, url?: string, storageArea?: Storage | null): void {
-        throw new Error('legacy initStorageEvent not implemented');
+        this.initEvent(type, bubbles, cancelable);
+        Object.defineProperties(this, {
+            key: { value: key ?? null, configurable: true },
+            oldValue: { value: oldValue ?? null, configurable: true },
+            newValue: { value: newValue ?? null, configurable: true },
+            url: { value: url ?? '', configurable: true },
+            storageArea: { value: storageArea ?? null, configurable: true },
+        });
     }
 }
 
 Reflect.set(globalThis, 'StorageEvent', StorageEvent);
 
-export function fromError(error: any): ErrorEvent {
+function inspectEvent(event: Event): string {
+    if (event === Event.prototype) {
+        return `Event {
+  bubbles: [Getter],
+  cancelable: [Getter],
+  composed: [Getter],
+  currentTarget: [Getter],
+  defaultPrevented: [Getter],
+  eventPhase: [Getter],
+  srcElement: [Getter/Setter],
+  target: [Getter],
+  returnValue: [Getter/Setter],
+  timeStamp: [Getter],
+  type: [Getter]
+}`;
+    }
+
+    const lines = [
+        `  bubbles: ${event.bubbles}`,
+        `  cancelable: ${event.cancelable}`,
+        `  composed: ${event.composed}`,
+        `  currentTarget: ${inspectSimple(event.currentTarget)}`,
+        `  defaultPrevented: ${event.defaultPrevented}`,
+        `  eventPhase: ${event.eventPhase}`,
+        `  srcElement: ${inspectSimple(event.srcElement)}`,
+        `  target: ${inspectSimple(event.target)}`,
+        `  returnValue: ${event.returnValue}`,
+        `  timeStamp: ${event.timeStamp}`,
+        `  type: ${JSON.stringify(event.type)}`,
+    ];
+
+    if (event instanceof ErrorEvent) {
+        lines.push(
+            `  message: ${JSON.stringify(event.message)}`,
+            `  filename: ${JSON.stringify(event.filename)}`,
+            `  lineno: ${event.lineno}`,
+            `  colno: ${event.colno}`,
+            `  error: ${inspectSimple(event.error === null ? undefined : event.error)}`,
+        );
+    } else if (event instanceof CloseEvent) {
+        lines.push(
+            `  wasClean: ${event.wasClean}`,
+            `  code: ${event.code}`,
+            `  reason: ${JSON.stringify(event.reason)}`,
+        );
+    } else if (event instanceof CustomEvent) {
+        lines.push(`  detail: ${inspectSimple(event.detail)}`);
+    } else if (event instanceof ProgressEvent) {
+        lines.push(
+            `  lengthComputable: ${event.lengthComputable}`,
+            `  loaded: ${event.loaded}`,
+            `  total: ${event.total}`,
+        );
+    }
+
+    return `${event[Symbol.toStringTag]} {\n${lines.join(',\n')}\n}`;
+}
+
+function inspectDOMException(exception: DOMException): string {
+    if (exception === DOMException.prototype) return 'DOMException { }';
+    return exception.stack ?? `${exception.name}: ${exception.message}`;
+}
+
+function inspectSimple(value: unknown): string {
+    if (value === null) return 'null';
+    if (value === undefined) return 'undefined';
+    if (typeof value === 'string') return JSON.stringify(value);
+    if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') {
+        return String(value);
+    }
+    return String(value);
+}
+
+export function fromError(error: unknown): ErrorEvent {
     if (!(error instanceof Error)) {
         return new ErrorEvent('error', {
             error,
-            message: String(error)
+            message: String(error),
+            cancelable: true,
         }, true);
     }
     const infoLine = error.stack?.split('\n')[0].trim();
     if (!infoLine) {
         return new ErrorEvent('error', {
             message: error.message,
+            error,
+            cancelable: true,
         }, true);
     }
     const match = parseStackFrame(infoLine);
     if (!match) {
         return new ErrorEvent('error', {
             message: error.message,
-            error
+            error,
+            cancelable: true,
         }, true);
     }
     return new ErrorEvent('error', {
@@ -403,5 +612,6 @@ export function fromError(error: any): ErrorEvent {
         lineno: match.line,
         colno: match.col,
         error,
+        cancelable: true,
     }, true);
 }

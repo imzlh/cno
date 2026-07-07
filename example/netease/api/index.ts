@@ -152,7 +152,7 @@ export const updateUserProfile = (data: Partial<IUserState>): Promise<ApiRespons
 // ==================== 歌曲相关 ====================
 
 // 获取歌曲详情
-export const getSongDetail = (ids: number | number[]): Promise<ApiResponse<{ songs: ISongDetail[]; privileges: any[] }>> => {
+export const getSongDetail = (ids: number | number[]): Promise<ApiResponse<{ songs: ISongDetail[]; privileges: unknown[] }>> => {
   const idStr = Array.isArray(ids) ? ids.join(',') : ids
   return get('/song/detail', { ids: idStr })
 }
@@ -402,7 +402,7 @@ export const subscribeAlbum = (id: number, t: 1 | 0): Promise<ApiResponse> => {
 // ==================== 排行榜相关 ====================
 
 // 获取所有榜单
-export const getToplist = (): Promise<ApiResponse<{ list: IPlaylist[]; artistToplist: any }>> => {
+export const getToplist = (): Promise<ApiResponse<{ list: IPlaylist[]; artistToplist: unknown }>> => {
   return get('/toplist')
 }
 

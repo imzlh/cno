@@ -1,5 +1,5 @@
 import type { Stream } from '../../deno/04_stdio';
-import { Readable, Writable } from '../stream';
+import { Readable, Writable, type ReadableOptions, type WritableOptions } from '../stream';
 import { getTierLimits } from '../_internal/memory';
 
 const os = import.meta.use('os');
@@ -8,7 +8,9 @@ const engine = import.meta.use('engine');
 const streams = import.meta.use('streams');
 const timers = import.meta.use('timers');
 
-const { stdin, stdout, stderr } = streams as any as Record<string, Stream>
+type StreamsWithStdio = typeof streams & { stdin: Stream; stdout: Stream; stderr: Stream };
+
+const { stdin, stdout, stderr } = streams as StreamsWithStdio;
 
 type Size = { width: number; height: number };
 type TTYRef = { stream: CModuleStreams.TTY; owned: boolean };
@@ -21,6 +23,18 @@ function validateFd(fd: number): void {
     if (!Number.isInteger(fd) || fd < 0) {
         throw new TypeError('The "fd" argument must be a non-negative integer');
     }
+}
+
+function asError(error: unknown): Error {
+    return error instanceof Error ? error : new Error(String(error));
+}
+
+function isAgainError(error: unknown): boolean {
+    if (!error || typeof error !== 'object') return false;
+    const code = Reflect.get(error, 'code');
+    if (code === 'EAGAIN' || code === 'EWOULDBLOCK') return true;
+    if (code === -11) return true;
+    return /EAGAIN|EWOULDBLOCK/.test(String(error));
 }
 
 function stdioStream(fd: number): Stream | null {
@@ -42,7 +56,11 @@ function openTTY(fd: number, readable: boolean): TTYRef {
 
 function envValue(env: Record<string, string> | undefined, key: string): string | undefined {
     if (env && key in env) return env[key];
-    try { return os.getenv(key); } catch { return undefined; }
+    try {
+        return os.getenv(key);
+    } catch {
+        return undefined;
+    }
 }
 
 function sameSize(a: Size | null, b: Size | null): boolean {
@@ -68,7 +86,11 @@ function ansiForMoveCursor(dx: number, dy: number): string {
 
 export function isatty(fd: number): boolean {
     if (!Number.isInteger(fd) || fd < 0) return false;
-    try { return os.guessHandle(fd) === 'tty'; } catch { return false; }
+    try {
+        return os.guessHandle(fd) === 'tty';
+    } catch {
+        return false;
+    }
 }
 
 export class ReadStream extends Readable {
@@ -77,12 +99,15 @@ export class ReadStream extends Readable {
     private handle: CModuleStreams.TTY;
     private owned = false;
     private closed = false;
+    private retryTimer = 0;
+    private readPending = false;
     readonly isTTY: boolean = true;
 
-    constructor(fd: number, options?: any) {
+    constructor(fd: number, options?: ReadableOptions) {
         validateFd(fd);
         super(options);
-        const ref = openTTY(fd, true)!;
+        const ref = openTTY(fd, true);
+        if (!ref) throw new Error(`Failed to open TTY fd ${fd}`);
         this.handle = ref.stream;
         this.owned = ref.owned;
         this.isTTY = os.guessHandle(fd) === 'tty';
@@ -115,14 +140,34 @@ export class ReadStream extends Readable {
     override destroy(error?: Error | null): this {
         if (this.closed) return this;
         this.closed = true;
+        if (this.retryTimer) {
+            timers.clearTimeout(this.retryTimer);
+            this.retryTimer = 0;
+        }
         if (this.owned) { this.handle.close(); }
         return super.destroy(error);
     }
 
+    private retryRead(): void {
+        if (this.closed || this.retryTimer) return;
+        this.retryTimer = timers.setTimeout(() => {
+            this.retryTimer = 0;
+            if (!this.closed) this._readAndResolve();
+        }, 1);
+    }
+
     private readFromFd(size: number): void {
+        if (this.readPending) return;
+        this.readPending = true;
+        this.readFromFdAsync(size);
+    }
+
+    private async readFromFdAsync(size: number): Promise<void> {
         try {
             const buf = new Uint8Array(size || READ_BUF_SIZE);
-            const n = this.handle.readSync(buf);
+            const n = await this.handle.read(buf);
+            this.readPending = false;
+            if (this.closed) return;
             if (!n) {
                 this.push(null);
                 return;
@@ -130,7 +175,12 @@ export class ReadStream extends Readable {
             this.bytesRead += n;
             this.push(buf.subarray(0, n));
         } catch (e) {
-            this.destroy(e as Error);
+            this.readPending = false;
+            if (isAgainError(e)) {
+                this.retryRead();
+                return;
+            }
+            this.destroy(asError(e));
         }
     }
 }
@@ -144,7 +194,7 @@ export class WriteStream extends Writable {
     private resizeTimer = 0;
     private closed = false;
 
-    constructor(fd: number, options?: any) {
+    constructor(fd: number, options?: WritableOptions) {
         validateFd(fd);
         super(options);
         this.fd = fd;
@@ -155,7 +205,7 @@ export class WriteStream extends Writable {
         this._write = this.writeToFd.bind(this);
     }
 
-    private writeToFd(chunk: any, _encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
+    private writeToFd(chunk: string | Uint8Array, _encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
         try {
             const data = typeof chunk === 'string' ? engine.encodeString(chunk) : chunk;
             const written = this.handle.writeSync(data);
@@ -163,11 +213,9 @@ export class WriteStream extends Writable {
             this.refreshSize();
             callback();
         } catch (e) {
-            callback(e as Error);
+            callback(asError(e));
         }
     }
-
-    get isTTY(): boolean { return isatty(this.fd); }
 
     get columns(): number | undefined { return this.refreshSize()?.width; }
 
@@ -257,43 +305,43 @@ export class WriteStream extends Writable {
         return super.destroy(error);
     }
 
-    override addListener(eventName: string | symbol, listener: (...args: any[]) => void): this {
+    override addListener(eventName: string | symbol, listener: (...args: unknown[]) => void): this {
         super.addListener(eventName, listener);
         this.updateResizePolling(eventName);
         return this;
     }
 
-    override on(eventName: string | symbol, listener: (...args: any[]) => void): this {
+    override on(eventName: string | symbol, listener: (...args: unknown[]) => void): this {
         super.on(eventName, listener);
         this.updateResizePolling(eventName);
         return this;
     }
 
-    override once(eventName: string | symbol, listener: (...args: any[]) => void): this {
+    override once(eventName: string | symbol, listener: (...args: unknown[]) => void): this {
         super.once(eventName, listener);
         this.updateResizePolling(eventName);
         return this;
     }
 
-    override prependListener(eventName: string | symbol, listener: (...args: any[]) => void): this {
+    override prependListener(eventName: string | symbol, listener: (...args: unknown[]) => void): this {
         super.prependListener(eventName, listener);
         this.updateResizePolling(eventName);
         return this;
     }
 
-    override prependOnceListener(eventName: string | symbol, listener: (...args: any[]) => void): this {
+    override prependOnceListener(eventName: string | symbol, listener: (...args: unknown[]) => void): this {
         super.prependOnceListener(eventName, listener);
         this.updateResizePolling(eventName);
         return this;
     }
 
-    override removeListener(eventName: string | symbol, listener: (...args: any[]) => void): this {
+    override removeListener(eventName: string | symbol, listener: (...args: unknown[]) => void): this {
         super.removeListener(eventName, listener);
         this.updateResizePolling(eventName);
         return this;
     }
 
-    override off(eventName: string | symbol, listener: (...args: any[]) => void): this {
+    override off(eventName: string | symbol, listener: (...args: unknown[]) => void): this {
         super.off(eventName, listener);
         this.updateResizePolling(eventName);
         return this;
@@ -342,3 +390,10 @@ export class WriteStream extends Writable {
         this.resizeTimer = 0;
     }
 }
+
+Object.defineProperty(WriteStream.prototype, 'isTTY', {
+    value: true,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+});

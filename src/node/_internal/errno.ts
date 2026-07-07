@@ -94,6 +94,8 @@ for (const [errnoValue, code] of Object.entries(errnoToString)) {
     stringToErrno[code] = Number(errnoValue);
 }
 
+type NodeErrnoError = NodeJS.ErrnoException & { dest?: string };
+
 /**
  * Convert C module errno error to Node.js ErrnoException
  * @param e - C module error (CModuleError.Error with negative .code errno)
@@ -104,38 +106,48 @@ for (const [errnoValue, code] of Object.entries(errnoToString)) {
 export function toErrnoException(
     e: unknown,
     syscall?: string,
-    path?: string
+    path?: string,
+    dest?: string,
 ): NodeJS.ErrnoException {
-    // If already ErrnoException (string .code), return directly
-    if (e instanceof Error && (e as CModuleError.Error).code && typeof (e as CModuleError.Error).code === 'string') {
-        return e as NodeJS.ErrnoException;
-    }
-
-    // Not CModuleError.Error (no numeric .code errno)
-    if (!(e instanceof Error) || typeof (e as CModuleError.Error).code !== 'number') {
-        const err = new Error((e as Error)?.message ?? String(e)) as NodeJS.ErrnoException;
+    if (!(e instanceof Error)) {
+        const err: NodeErrnoError = new Error(e instanceof Error ? e.message : String(e));
         err.code = 'UNKNOWN';
         err.errno = error.errno.UNKNOWN;
         if (syscall) err.syscall = syscall;
         if (path) err.path = path;
+        if (dest) err.dest = dest;
         return err;
     }
 
-    const cErr = e as CModuleError.Error & Error;
-    const errnoValue = cErr.code; // negative value, e.g. -4061
-    const codeStr = errnoToString[errnoValue] ?? `UNKNOWN(${errnoValue})`;
-    const message = cErr.message || error.strerror(errnoValue) || 'Unknown error';
+    const rawCode = Reflect.get(e, 'code');
+    if (typeof rawCode === 'string') return e;
 
-    const err = new Error(message) as NodeJS.ErrnoException;
+    // Not CModuleError.Error (no numeric .code errno)
+    if (typeof rawCode !== 'number') {
+        const err: NodeErrnoError = new Error(e.message);
+        err.code = 'UNKNOWN';
+        err.errno = error.errno.UNKNOWN;
+        if (syscall) err.syscall = syscall;
+        if (path) err.path = path;
+        if (dest) err.dest = dest;
+        return err;
+    }
+
+    const errnoValue = rawCode; // negative value, e.g. -4061
+    const codeStr = errnoToString[errnoValue] ?? `UNKNOWN(${errnoValue})`;
+    const message = e.message || error.strerror(errnoValue) || 'Unknown error';
+
+    const err: NodeErrnoError = new Error(message);
     err.name = 'ErrnoException';
     err.code = codeStr;
     err.errno = errnoValue;
     if (syscall) err.syscall = syscall;
     if (path) err.path = path;
+    if (dest) err.dest = dest;
 
     // Preserve original stack
-    if (cErr.stack) {
-        err.stack = cErr.stack;
+    if (e.stack) {
+        err.stack = e.stack;
     }
 
     return err;
@@ -149,11 +161,12 @@ export function normalizeErrnoError(
     e: unknown,
     syscall?: string,
     path?: string,
+    dest?: string,
 ): Error {
     if (e instanceof Error) {
-        const code = (e as CModuleError.Error).code;
+        const code = Reflect.get(e, 'code');
         if (typeof code === 'number' || typeof code === 'string') {
-            return toErrnoException(e, syscall, path);
+            return toErrnoException(e, syscall, path, dest);
         }
         return e;
     }
@@ -169,14 +182,13 @@ export function matchesErrnoCode(
 ): boolean {
     if (!(e instanceof Error)) return false;
 
-    const err = e as NodeJS.ErrnoException & CModuleError.Error;
-    const code = err.code;
+    const code = Reflect.get(e, 'code');
     if (typeof code === 'string' && codes.includes(code)) return true;
     if (typeof code === 'number') {
         return codes.some((name) => stringToErrno[name] === code);
     }
 
-    const message = String(err.message ?? '');
+    const message = String(e.message ?? '');
     return codes.some((name) => message.startsWith(`${name}:`) || message.includes(`${name}: `));
 }
 
@@ -186,10 +198,11 @@ export function matchesErrnoCode(
 export function wrapPromise<T>(
     promise: Promise<T>,
     syscall?: string,
-    path?: string
+    path?: string,
+    dest?: string,
 ): Promise<T> {
     return promise.catch((e: unknown) => {
-        throw toErrnoException(e, syscall, path);
+        throw toErrnoException(e, syscall, path, dest);
     });
 }
 
@@ -199,11 +212,12 @@ export function wrapPromise<T>(
 export function wrapSync<T>(
     fn: () => T,
     syscall?: string,
-    path?: string
+    path?: string,
+    dest?: string,
 ): T {
     try {
         return fn();
     } catch (e) {
-        throw toErrnoException(e, syscall, path);
+        throw toErrnoException(e, syscall, path, dest);
     }
 }

@@ -1,14 +1,32 @@
-# CNO Example
-这里有很多示例，展示了cno的功能，同时，除了`cnoterm`都能在deno上运行
+# CNO Examples
 
-## checkin、ssr2clash
-简单的签到脚本和ssr网址转换成clash配置小程序，展示了cno的基本功能
+This directory contains small programs used to exercise the `cno` runtime
+polyfill layer. Most examples are written as Deno-style TypeScript and should
+also be useful when checking compatibility against Deno, except examples that
+intentionally use CNO-specific APIs.
 
-## homepage
-hono应用，集成了简单的数据收集和文件服务器
+Run an example from the repository root with the staged binary:
 
-## snake
-进阶的终端程序，贪吃蛇游戏，展示了cno的高级IO功能
+```sh
+build/stage/cno run cno/example/<name>/index.ts
+```
 
-## cnoterm
-CNO特殊功能--内置的pty，用于在网页中运行终端程序
+Some examples use a different entry file; see the table below.
+
+## Examples
+
+| Directory | Entry | Purpose |
+| --- | --- | --- |
+| `homepage/` | `index.ts` | Small web app/static page example |
+| `snake/` | `index.ts` | Terminal I/O example using keyboard input |
+| `cnoterm/` | `index.ts` | CNO-specific pty-backed terminal-in-browser example |
+| `ssr2clash/` | `index.ts` or `main.ts` | Script-style URL/config conversion example |
+| `netease/` | `index.ts` or `main.ts` | Larger TypeScript example with shared local modules |
+
+## Notes
+
+- `cnoterm` depends on CNO-specific pty functionality and is not expected to be
+  portable to Deno unchanged.
+- The examples are not the canonical compatibility matrix. Use `tests/` for
+  behavioral checks.
+- `deno.json` in this directory is for example-local config and imports.

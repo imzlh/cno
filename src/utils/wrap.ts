@@ -2,11 +2,20 @@ import { errors } from "../deno/01_errors";
 
 const error = import.meta.use('error');
 
-export function wrapFSErr(e: CModuleError.Error): Error {
-    if (e instanceof Error && e.constructor?.name === 'DOMException') return e;
-    if (!(e instanceof Error) || !e.code) return e;
+function getErrorCode(e: Error): string | number | undefined {
+    if (!('code' in e)) return undefined;
+    const code = Reflect.get(e, 'code');
+    return typeof code === 'string' || typeof code === 'number' ? code : undefined;
+}
 
-    switch (e.code) {
+export function wrapFSErr(e: unknown): unknown {
+    if (e instanceof Error && e.constructor?.name === 'DOMException') return e;
+    if (!(e instanceof Error)) return e;
+
+    const code = getErrorCode(e);
+    if (code === undefined || typeof code === 'string') return e;
+
+    switch (code) {
         // ── File system ──────────────────────────────────────────────────────
         case error.errno.ENOENT: return new errors.NotFound(e.message);
         case error.errno.EEXIST: return new errors.AlreadyExists(e.message);
@@ -27,6 +36,7 @@ export function wrapFSErr(e: CModuleError.Error): Error {
         case error.errno.ENOSPC: return new errors.Busy(e.message);
         case error.errno.ENFILE: return new errors.Busy(e.message);
         case error.errno.EMFILE: return new errors.Busy(e.message);
+        case error.errno.ESRCH: return new errors.NotFound(e.message);
         case error.errno.EBUSY: return new errors.Busy(e.message);
         case error.errno.ENOBUFS: return new errors.Busy(e.message);
         // ── I/O ──────────────────────────────────────────────────────────────
@@ -64,29 +74,31 @@ export function wrapFSErr(e: CModuleError.Error): Error {
         // ── Socket ───────────────────────────────────────────────────────────
         case error.errno.EBADF: return new errors.BadResource(e.message);
         // ── Default ─────────────────────────────────────────────────────────
-        default: return new errors.NotSupported(error.strerror(e.code));
+        default: return new errors.NotSupported(error.strerror(code));
     }
 }
 
-function __rethrow(e: any, _stack: string) {
-    if (typeof e != "object") throw e;
+function __rethrow(e: unknown, _stack: string): never {
+    if (typeof e !== "object" || e === null) throw e;
     const stack = _stack.substring(_stack.indexOf('\n') + 1);
     Object.defineProperty(e, 'stack', { value: stack });
     throw e;
 }
 
-export function __wrap_fs_func(obj: Function) {
-    function wrappedFsFunc(this: any) {
-        const stack = new Error().stack!;
+export function __wrap_fs_func<This, Args extends unknown[], Return>(
+    obj: (this: This, ...args: Args) => Return
+): (this: This, ...args: Args) => Return {
+    function wrappedFsFunc(this: This, ...args: Args): Return {
+        const stack = new Error().stack ?? '';
         try {
-            const ret = obj.apply(this, arguments);
+            const ret = obj.apply(this, args);
             if (ret instanceof Promise) {
-                return ret.catch(e => __rethrow(wrapFSErr(e), stack));
+                return ret.catch(e => __rethrow(wrapFSErr(e), stack)) as Return;
             } else {
                 return ret;
             }
         } catch (e) {
-            return __rethrow(wrapFSErr(e as any), stack);
+            return __rethrow(wrapFSErr(e), stack);
         }
     }
     return wrappedFsFunc;
@@ -98,7 +110,7 @@ export function wrapFSns(fsFunc: Partial<typeof Deno>): Partial<typeof Deno> {
     for (const key in oldFs) {
         const obj = oldFs[key];
         if (typeof obj === "function") {
-            newFs[key] = __wrap_fs_func(obj);
+            newFs[key] = __wrap_fs_func(obj as (this: unknown, ...args: unknown[]) => unknown);
         } else {
             newFs[key] = obj;
         }
@@ -106,6 +118,9 @@ export function wrapFSns(fsFunc: Partial<typeof Deno>): Partial<typeof Deno> {
     return newFs;
 };
 
-export function wrapFsClassDec(target: Function, context: ClassMethodDecoratorContext<any, any>) {
+export function wrapFsClassDec<This, Args extends unknown[], Return>(
+    target: (this: This, ...args: Args) => Return,
+    context: ClassMethodDecoratorContext<This, (this: This, ...args: Args) => Return>
+): (this: This, ...args: Args) => Return {
     return __wrap_fs_func(target);
 }

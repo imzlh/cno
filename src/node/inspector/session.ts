@@ -4,7 +4,13 @@ import { InspectorProtocolClient, type ProtocolResponse } from './client'
 
 type PostCallback = (error: Error | null, result?: ProtocolResponse) => void
 
-export class Session extends EventEmitter {
+function createInspectorNotConnectedError(): NodeJS.ErrnoException {
+	return Object.assign(new Error('Session is not connected'), {
+		code: 'ERR_INSPECTOR_NOT_CONNECTED',
+	})
+}
+
+export class InspectorSessionBase extends EventEmitter {
 	protected readonly client = new InspectorProtocolClient()
 	protected connected = false
 
@@ -30,18 +36,6 @@ export class Session extends EventEmitter {
 		this.connected = false
 	}
 
-	post(method: string, callback?: PostCallback): void
-	post(method: string, params?: Record<string, unknown>, callback?: PostCallback): void
-	post(method: string, paramsOrCallback?: Record<string, unknown> | PostCallback, maybeCallback?: PostCallback): void {
-		const { params, callback } = normalizePostArgs(paramsOrCallback, maybeCallback)
-		const send = this.client.post(method, params)
-		if (!callback) {
-			void send.catch((error) => this.emit('error', error))
-			return
-		}
-		void send.then((result) => callback(null, result)).catch((error) => callback(error))
-	}
-
 	protected postAsync(method: string, params?: Record<string, unknown>): Promise<ProtocolResponse> {
 		if (!this.connected) this.connect()
 		return this.client.post(method, params)
@@ -51,6 +45,21 @@ export class Session extends EventEmitter {
 		this.connected = true
 		this.client.connect(waitForDebugger, false)
 		return Promise.resolve()
+	}
+}
+
+export class Session extends InspectorSessionBase {
+	post(method: string, callback?: PostCallback): void
+	post(method: string, params?: Record<string, unknown>, callback?: PostCallback): void
+	post(method: string, paramsOrCallback?: Record<string, unknown> | PostCallback, maybeCallback?: PostCallback): void {
+		if (!this.connected) throw createInspectorNotConnectedError()
+		const { params, callback } = normalizePostArgs(paramsOrCallback, maybeCallback)
+		const send = this.client.post(method, params)
+		if (!callback) {
+			void send.catch((error) => this.emit('error', error))
+			return
+		}
+		void send.then((result) => callback(null, result)).catch((error) => callback(error))
 	}
 }
 

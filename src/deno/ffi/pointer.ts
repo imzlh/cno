@@ -3,12 +3,15 @@
  * UnsafePointer and UnsafePointerView classes
  */
 
-import { PointerObject, PointerValue } from './types';
+import { brand, PointerObject, PointerValue } from './types';
+import { bytesToArrayBuffer } from '../../utils/bytes';
 const ffi = import.meta.use('ffi');
-const brand = Symbol('brand');
+
+type FfiBufferSource = ArrayBuffer | ArrayBufferView<ArrayBufferLike>;
+type PointerCarrier<T = unknown> = { pointer: PointerObject<T> };
 
 function createPointerObject<T = unknown>(addr: bigint): PointerObject<T> {
-    const obj = { [brand]: null as T };
+    const obj: PointerObject<T> = { [brand]: null as T };
     Object.setPrototypeOf(obj, null);
     Object.defineProperty(obj, brand, {
         value: addr,
@@ -16,11 +19,21 @@ function createPointerObject<T = unknown>(addr: bigint): PointerObject<T> {
         configurable: false,
         enumerable: false,
     });
-    return obj as unknown as PointerObject<T>;
+    return obj;
 }
 
 function getPointerAddress(ptr: PointerObject): bigint {
-    return (ptr as any)[brand] as bigint;
+    return Reflect.get(ptr, brand) as bigint;
+}
+
+function hasPointer(value: unknown): value is PointerCarrier {
+    return value !== null && typeof value === 'object' && Reflect.get(value, 'pointer') !== undefined;
+}
+
+function bufferSourceBytes(value: FfiBufferSource): Uint8Array {
+    if (value instanceof ArrayBuffer) return new Uint8Array(value);
+    if (value instanceof Uint8Array) return value;
+    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
 }
 
 export class UnsafePointer {
@@ -35,25 +48,15 @@ export class UnsafePointer {
         return getPointerAddress(a) === getPointerAddress(b);
     }
 
-    static of<T = unknown>(value: BufferSource | { pointer: PointerObject }): PointerValue<T> {
+    static of<T = unknown>(value: BufferSource | PointerCarrier): PointerValue<T> {
         if (value === null || value === undefined) return null;
         
-        if ('pointer' in value && value.pointer) {
+        if (hasPointer(value) && value.pointer) {
             return value.pointer as PointerValue<T>;
         }
+        if (!(value instanceof ArrayBuffer) && !ArrayBuffer.isView(value)) return null;
         
-        let buf: Uint8Array;
-        if (value instanceof ArrayBuffer) {
-            buf = new Uint8Array(value);
-        } else if (value instanceof Uint8Array) {
-            buf = value;
-        } else {
-            buf = new Uint8Array(
-                (value as ArrayBufferView).buffer,
-                (value as ArrayBufferView).byteOffset,
-                (value as ArrayBufferView).byteLength
-            );
-        }
+        const buf = bufferSourceBytes(value);
         
         const addr = ffi.getArrayBufPtr(buf);
         if (addr === 0n) return null;
@@ -157,7 +160,7 @@ export class UnsafePointerView {
 
     getArrayBuffer(byteLength: number, offset: number = 0): ArrayBuffer {
         const buf = this.readAt(offset, byteLength);
-        return buf.buffer.slice(buf.byteOffset, buf.byteOffset + byteLength) as ArrayBuffer;
+        return bytesToArrayBuffer(buf, byteLength);
     }
 
     static getArrayBuffer(
@@ -167,17 +170,11 @@ export class UnsafePointerView {
     ): ArrayBuffer {
         const addr = getPointerAddress(pointer);
         const buf = ffi.ptrToBuffer(addr + BigInt(offset), byteLength);
-        return buf.buffer.slice(buf.byteOffset, buf.byteOffset + byteLength) as ArrayBuffer;
+        return bytesToArrayBuffer(buf, byteLength);
     }
 
     copyInto(destination: BufferSource, offset: number = 0): void {
-        const destBuffer = destination instanceof ArrayBuffer
-            ? new Uint8Array(destination)
-            : new Uint8Array(
-                (destination as ArrayBufferView).buffer,
-                (destination as ArrayBufferView).byteOffset,
-                (destination as ArrayBufferView).byteLength
-            );
+        const destBuffer = bufferSourceBytes(destination);
         
         const src = this.readAt(offset, destBuffer.length);
         destBuffer.set(src);
@@ -189,17 +186,11 @@ export class UnsafePointerView {
         offset: number = 0
     ): void {
         const addr = getPointerAddress(pointer);
-        const destBuffer = destination instanceof ArrayBuffer
-            ? new Uint8Array(destination)
-            : new Uint8Array(
-                (destination as ArrayBufferView).buffer,
-                (destination as ArrayBufferView).byteOffset,
-                (destination as ArrayBufferView).byteLength
-            );
+        const destBuffer = bufferSourceBytes(destination);
         
         const src = ffi.ptrToBuffer(addr + BigInt(offset), destBuffer.length);
         destBuffer.set(src);
     }
 }
 
-export { getPointerAddress, createPointerObject };
+export { getPointerAddress, createPointerObject, bufferSourceBytes };

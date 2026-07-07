@@ -43,7 +43,7 @@ export const notEqual = notStrictEqual;
 export const deepEqual = deepStrictEqual;
 export const notDeepEqual = notDeepStrictEqual;
 
-const strict = Object.assign(assert, {
+const strictBase = Object.assign(assert, {
     AssertionError,
     CallTracker,
     ok,
@@ -64,9 +64,7 @@ const strict = Object.assign(assert, {
     doesNotMatch,
     ifError,
     partialDeepStrictEqual,
-    strict: null as unknown,
 });
-
-(strict as typeof strict & { strict: typeof strict }).strict = strict;
+const strict = Object.assign(strictBase, { strict: strictBase });
 
 export default strict;

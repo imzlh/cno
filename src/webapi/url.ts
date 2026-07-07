@@ -1,6 +1,8 @@
 // URL API Polyfill for QuickJS ng
 // 完整实现 URL 和 URLSearchParams，支持特殊路径格式
 
+import { Blob, blobBytesSymbol } from './formdata';
+
 // ==================== 工具函数 ====================
 
 const ALPHA = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
@@ -10,6 +12,9 @@ const USERINFO_ENCODE_SET = /[^\w.~!$&'()*+,;=:-]/g;
 const PATH_ENCODE_SET = /[^\w.~!$&'()*+,;=:@\/%-]/g;
 const QUERY_ENCODE_SET = /[^\w.~!$&'()*+,;=:@\/?%-]/g;
 const FRAGMENT_ENCODE_SET = /[^\w.~!$&'()*+,;=:@\/?%-]/g;
+const objectUrlStore = new Map<string, Blob>();
+let objectUrlCounter = 0;
+const denoCustomInspect = Symbol.for('Deno.customInspect');
 
 const isWindowsDriveLetter = (str: string): boolean => {
     return str.length === 2 &&
@@ -32,11 +37,56 @@ const percentEncode = (str: string, encodeSet: RegExp): string => {
     });
 };
 
+function createObjectUrlId(): string {
+    objectUrlCounter++;
+    return `blob:/cno-${Date.now().toString(36)}-${objectUrlCounter.toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
+export function resolveObjectURL(url: string | globalThis.URL): Blob | null {
+    try {
+        return objectUrlStore.get(new URL(String(url)).href) ?? null;
+    } catch {
+        return null;
+    }
+}
+
+export function resolveObjectURLBytes(url: string | globalThis.URL): { type: string; bytes: Uint8Array } | null {
+    const blob = resolveObjectURL(url);
+    if (!blob) return null;
+    return { type: blob.type, bytes: blob[blobBytesSymbol]() };
+}
+
 const percentDecode = (str: string): string => {
     return str.replace(/%([0-9A-Fa-f]{2})/g, (_, hex) => {
         return String.fromCharCode(parseInt(hex, 16));
     });
 };
+
+const formUrlEncode = (str: string): string => {
+    return encodeURIComponent(str)
+        .replace(/[!'()~]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`)
+        .replace(/%20/g, '+');
+};
+
+const formUrlDecode = (str: string): string => {
+    const normalized = str.replace(/\+/g, ' ').replace(/%(?![0-9A-Fa-f]{2})/g, '%25');
+    try {
+        return decodeURIComponent(normalized);
+    } catch {
+        return percentDecode(str.replace(/\+/g, ' '));
+    }
+};
+
+const isIterable = (value: unknown): value is Iterable<unknown> => {
+    if (value === null || value === undefined) return false;
+    const iterator = Reflect.get(Object(value), Symbol.iterator);
+    return typeof iterator === 'function';
+};
+
+function requireArguments(name: string, actual: number, required: number): void {
+    if (actual >= required) return;
+    throw new TypeError(`${name} requires at least ${required} argument${required === 1 ? '' : 's'}`);
+}
 
 const normalizeWindowsPath = (path: string): string => {
     // C:\aaa\bbb -> C:/aaa/bbb
@@ -103,9 +153,14 @@ class URLSearchParams implements URLSearchParams {
         } else if (init instanceof URLSearchParams) {
             this.#params = [...init.#params];
         } else if (typeof init === 'object') {
-            if (Symbol.iterator in init) {
-                for (const [key, value] of init as Iterable<[string, string]>) {
-                    this.#params.push([String(key), String(value)]);
+            if (isIterable(init)) {
+                for (const pair of init) {
+                    if (!isIterable(pair)) throw new TypeError('Each query pair must be iterable');
+                    const values = [...pair];
+                    if (values.length !== 2) {
+                        throw new TypeError('Each query pair must contain exactly two items');
+                    }
+                    this.#params.push([String(values[0]), String(values[1])]);
                 }
             } else {
                 for (const [key, value] of Object.entries(init)) {
@@ -126,10 +181,10 @@ class URLSearchParams implements URLSearchParams {
 
             const index = pair.indexOf('=');
             if (index === -1) {
-                this.#params.push([percentDecode(pair.replace(/\+/g, ' ')), '']);
+                this.#params.push([formUrlDecode(pair), '']);
             } else {
-                const key = percentDecode(pair.slice(0, index).replace(/\+/g, ' '));
-                const value = percentDecode(pair.slice(index + 1).replace(/\+/g, ' '));
+                const key = formUrlDecode(pair.slice(0, index));
+                const value = formUrlDecode(pair.slice(index + 1));
                 this.#params.push([key, value]);
             }
         }
@@ -140,11 +195,13 @@ class URLSearchParams implements URLSearchParams {
     }
 
     append(name: string, value: string): void {
+        requireArguments('URLSearchParams.append', arguments.length, 2);
         this.#params.push([String(name), String(value)]);
         this.#notifyUpdate();
     }
 
     delete(name: string, value?: string): void {
+        requireArguments('URLSearchParams.delete', arguments.length, 1);
         const nameStr = String(name);
 
         if (value !== undefined) {
@@ -160,12 +217,14 @@ class URLSearchParams implements URLSearchParams {
     }
 
     get(name: string): string | null {
+        requireArguments('URLSearchParams.get', arguments.length, 1);
         const nameStr = String(name);
         const entry = this.#params.find(([k]) => k === nameStr);
         return entry ? entry[1] : null;
     }
 
     getAll(name: string): string[] {
+        requireArguments('URLSearchParams.getAll', arguments.length, 1);
         const nameStr = String(name);
         return this.#params
             .filter(([k]) => k === nameStr)
@@ -173,6 +232,7 @@ class URLSearchParams implements URLSearchParams {
     }
 
     has(name: string, value?: string): boolean {
+        requireArguments('URLSearchParams.has', arguments.length, 1);
         const nameStr = String(name);
 
         if (value !== undefined) {
@@ -184,6 +244,7 @@ class URLSearchParams implements URLSearchParams {
     }
 
     set(name: string, value: string): void {
+        requireArguments('URLSearchParams.set', arguments.length, 2);
         const nameStr = String(name);
         const valueStr = String(value);
 
@@ -221,26 +282,42 @@ class URLSearchParams implements URLSearchParams {
     toString(): string {
         return this.#params
             .map(([key, value]) => {
-                const encodedKey = percentEncode(key, /[^\w.~-]/g).replace(/%20/g, '+');
-                const encodedValue = percentEncode(value, /[^\w.~-]/g).replace(/%20/g, '+');
+                const encodedKey = formUrlEncode(key);
+                const encodedValue = formUrlEncode(value);
                 return `${encodedKey}=${encodedValue}`;
             })
             .join('&');
     }
 
-    entries(): URLSearchParamsIterator<[string, string]> {
-        return this.#params[Symbol.iterator]();
+    *entries(): URLSearchParamsIterator<[string, string]> {
+        let index = 0;
+        while (index < this.#params.length) {
+            const [key, value] = this.#params[index];
+            index++;
+            yield [key, value];
+        }
     }
 
-    keys(): URLSearchParamsIterator<string> {
-        return this.#params.map(([k]) => k)[Symbol.iterator]();
+    *keys(): URLSearchParamsIterator<string> {
+        let index = 0;
+        while (index < this.#params.length) {
+            const [key] = this.#params[index];
+            index++;
+            yield key;
+        }
     }
 
-    values(): URLSearchParamsIterator<string> {
-        return this.#params.map(([, v]) => v)[Symbol.iterator]();
+    *values(): URLSearchParamsIterator<string> {
+        let index = 0;
+        while (index < this.#params.length) {
+            const [, value] = this.#params[index];
+            index++;
+            yield value;
+        }
     }
 
-    forEach(callback: (value: string, key: string, parent: this) => void, thisArg?: any): void {
+    forEach(callback: (value: string, key: string, parent: this) => void, thisArg?: unknown): void {
+        requireArguments('URLSearchParams.forEach', arguments.length, 1);
         for (const [key, value] of this.#params) {
             callback.call(thisArg, value, key, this);
         }
@@ -257,6 +334,11 @@ class URLSearchParams implements URLSearchParams {
 
     _setUpdateCallback(callback: () => void): void {
         this.#updateCallback = callback;
+    }
+
+    _replaceFromQuery(query: string): void {
+        this.#params = [];
+        this.#parseQuery(query);
     }
 
     _getParams(): Array<[string, string]> {
@@ -284,6 +366,7 @@ class URL implements globalThis.URL {
     #host = '';
     #port = '';
     #path: string[] = [];
+    #hasQuery = false;
     #query: string | null = null;
     #fragment = '';
     #searchParams: URLSearchParams;
@@ -309,6 +392,7 @@ class URL implements globalThis.URL {
         this.#searchParams = new URLSearchParams();
         this.#searchParams._setUpdateCallback(() => {
             this.#query = this.#searchParams.toString();
+            this.#hasQuery = this.#query !== '';
         });
 
         this.#parse(String(url), base);
@@ -343,6 +427,7 @@ class URL implements globalThis.URL {
         // 提取 query
         const queryIndex = input.indexOf('?');
         if (queryIndex !== -1) {
+            this.#hasQuery = true;
             this.#query = input.slice(queryIndex + 1);
             input = input.slice(0, queryIndex);
         }
@@ -393,10 +478,7 @@ class URL implements globalThis.URL {
 
         // 更新 searchParams
         if (this.#query !== null) {
-            this.#searchParams = new URLSearchParams(this.#query);
-            this.#searchParams._setUpdateCallback(() => {
-                this.#query = this.#searchParams.toString();
-            });
+            this.#searchParams._replaceFromQuery(this.#query);
         }
     }
 
@@ -462,13 +544,16 @@ class URL implements globalThis.URL {
             const portStr = authority.slice(1);
             if (portStr && /^\d+$/.test(portStr)) {
                 const port = parseInt(portStr, 10);
-                if (port <= 65535) {
-                    // 只在非默认端口时设置
-                    const defaultPort = SPECIAL_SCHEMES[this.#scheme];
-                    if (defaultPort !== port) {
-                        this.#port = String(port);
-                    }
+                if (port > 65535) {
+                    throw new TypeError('Invalid URL: invalid port');
                 }
+                // 只在非默认端口时设置
+                const defaultPort = SPECIAL_SCHEMES[this.#scheme];
+                if (defaultPort !== port) {
+                    this.#port = String(port);
+                }
+            } else if (portStr) {
+                throw new TypeError('Invalid URL: invalid port');
             }
         }
     }
@@ -515,7 +600,7 @@ class URL implements globalThis.URL {
     set href(value: string) {
         this.#scheme = ''; this.#host = ''; this.#port = '';
         this.#username = ''; this.#password = '';
-        this.#path = []; this.#query = ''; this.#fragment = '';
+        this.#path = []; this.#query = null; this.#hasQuery = false; this.#fragment = '';
         this.#parse(value);
     }
 
@@ -587,7 +672,11 @@ class URL implements globalThis.URL {
 
         if (str.startsWith('[')) {
             const endBracket = str.indexOf(']');
-            if (endBracket === -1) { this.#host = str.toLowerCase(); this.#port = ''; return; }
+            if (endBracket === -1) {
+                this.#host = str.toLowerCase();
+                this.#port = '';
+                return;
+            }
             hostPart = str.slice(0, endBracket + 1).toLowerCase();
             if (str[endBracket + 1] === ':') portStr = str.slice(endBracket + 2);
         } else {
@@ -672,18 +761,14 @@ class URL implements globalThis.URL {
         const str = String(value);
         if (!str) {
             this.#query = null;
-            this.#searchParams = new URLSearchParams();
-            this.#searchParams._setUpdateCallback(() => {
-                this.#query = this.#searchParams.toString();
-            });
+            this.#hasQuery = false;
+            this.#searchParams._replaceFromQuery('');
             return;
         }
 
         this.#query = str.startsWith('?') ? str.slice(1) : str;
-        this.#searchParams = new URLSearchParams(this.#query);
-        this.#searchParams._setUpdateCallback(() => {
-            this.#query = this.#searchParams.toString();
-        });
+        this.#hasQuery = true;
+        this.#searchParams._replaceFromQuery(this.#query);
     }
 
     get searchParams(): URLSearchParams {
@@ -731,9 +816,7 @@ class URL implements globalThis.URL {
 
         result += this.pathname;
 
-        if (this.#query !== null && this.#query !== '') {
-            result += '?' + this.#query;
-        }
+        if (this.#hasQuery) result += '?' + (this.#query ?? '');
 
         if (this.#fragment) {
             result += '#' + this.#fragment;
@@ -746,21 +829,47 @@ class URL implements globalThis.URL {
         return this.toString();
     }
 
-    static createObjectURL(blob: any): string {
-        throw new Error('createObjectURL is not implemented');
+    static createObjectURL(blob: Blob): string {
+        if (!(blob instanceof Blob)) {
+            throw new TypeError('URL.createObjectURL requires a Blob');
+        }
+        const url = new URL(createObjectUrlId()).href;
+        objectUrlStore.set(url, blob);
+        return url;
     }
 
     static revokeObjectURL(url: string): void {
-        throw new Error('revokeObjectURL is not implemented');
+        try {
+            objectUrlStore.delete(new URL(String(url)).href);
+        } catch {
+            // Browser-compatible no-op for invalid or unknown object URLs.
+        }
     }
     
     get [Symbol.toStringTag]() {
         return 'URL';
     }
+
+    [denoCustomInspect]() {
+        return `URL {
+  href: ${JSON.stringify(this.href)},
+  origin: ${JSON.stringify(this.origin)},
+  protocol: ${JSON.stringify(this.protocol)},
+  username: ${JSON.stringify(this.username)},
+  password: ${JSON.stringify(this.password)},
+  host: ${JSON.stringify(this.host)},
+  hostname: ${JSON.stringify(this.hostname)},
+  port: ${JSON.stringify(this.port)},
+  pathname: ${JSON.stringify(this.pathname)},
+  hash: ${JSON.stringify(this.hash)},
+  search: ${JSON.stringify(this.search)}
+}`;
+    }
 }
 
 Reflect.set(globalThis, 'URL', URL);
 Reflect.set(globalThis, 'URLSearchParams', URLSearchParams);
+Reflect.set(globalThis, '__cno_resolve_blob_url', resolveObjectURLBytes);
 
 export {
     URL as URL,

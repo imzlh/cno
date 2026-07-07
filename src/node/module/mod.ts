@@ -5,25 +5,34 @@
 
 import { fileURLToPath } from '../url';
 import path from '../path';
-const { dirname, join } = path;
+const { basename, dirname, isAbsolute: isAbsolutePath, join, resolve: resolvePath } = path;
+const os = import.meta.use('os');
 
 type CtsInternal = {
-    mkRequire: (parentPath: string, parentMod: any) => NodeJS.Require;
+    mkRequire: (parentPath: string, parentMod: unknown) => NodeJS.Require;
+    preloadModule?: (id: string, parentPath: string) => unknown;
     builtinModules: string[];
-    cache: Map<string, any>;
+    cache: Map<string, unknown>;
 } & {
     specToLocalPath?: (specPath: string) => string | null;
 };
 
 function getCtsInternal(): CtsInternal | undefined {
-    return (globalThis as any)[Symbol.for('cts.internal')] as CtsInternal | undefined;
+    return Reflect.get(globalThis, Symbol.for('cts.internal')) as CtsInternal | undefined;
 }
 
 function getBuiltinModules(): string[] {
     return getCtsInternal()?.builtinModules ?? [];
 }
 
-type RequireExtensionMap = Record<string, ((module: any, filename: string) => any) | undefined>;
+type RequireExtensionMap = Record<string, ((module: unknown, filename: string) => unknown) | undefined>;
+type CommonJSWrapper = (
+    exports: unknown,
+    require: NodeJS.Require,
+    module: Module,
+    filename: string,
+    dirname: string,
+) => unknown;
 
 function getExtensions(): RequireExtensionMap {
     const ctsInternal = getCtsInternal();
@@ -32,7 +41,7 @@ function getExtensions(): RequireExtensionMap {
 }
 
 export interface SourceMap {
-    payload: any;
+    payload: unknown;
     lineLengths: readonly number[];
 }
 
@@ -40,7 +49,16 @@ export interface SourceMap {
 const _pathsCache = new Map<string, string[]>();
 
 export function createRequire(filename: string | URL): NodeJS.Require {
-    const parentPath = filename instanceof URL ? fileURLToPath(filename) : filename;
+    let parentPath: string;
+    if (filename instanceof URL) {
+        parentPath = fileURLToPath(filename);
+    } else if (typeof filename === 'string' && filename.startsWith('file:')) {
+        parentPath = fileURLToPath(filename);
+    } else if (typeof filename === 'string' && isAbsolutePath(filename)) {
+        parentPath = filename;
+    } else {
+        throw new TypeError('The argument "filename" must be a file URL object, file URL string, or absolute path string');
+    }
     const ctsInternal = getCtsInternal();
     if (ctsInternal) return ctsInternal.mkRequire(parentPath, undefined);
     return require;
@@ -58,8 +76,28 @@ export function createRequireFromURL(url: string | URL): NodeJS.Require {
     return createRequire(fileURLToPath(url));
 }
 
+function requireFromCwd(): NodeJS.Require {
+    return createRequire(join(os.cwd, '__cno_module__.js'));
+}
+
+export function _preloadModules(requests: string[]): void {
+    const require = requireFromCwd();
+    const ctsInternal = getCtsInternal();
+    const parentPath = join(os.cwd, '__cno_require_preload__.js');
+    for (const request of requests) {
+        if (ctsInternal?.preloadModule) ctsInternal.preloadModule(request, parentPath);
+        else require(request);
+    }
+}
+
 export function runMain(): void {
-    // Handled by cts runtime
+    const processObject = Reflect.get(globalThis, 'process');
+    const argv = processObject && typeof processObject === 'object'
+        ? Reflect.get(processObject, 'argv')
+        : undefined;
+    const main = Array.isArray(argv) ? argv[1] : undefined;
+    if (typeof main !== 'string' || main.length === 0) return;
+    requireFromCwd()(isAbsolutePath(main) ? main : resolvePath(main));
 }
 
 export function wrap(code: string): string {
@@ -70,9 +108,10 @@ export function _nodeModulePaths(from: string): string[] {
     const hit = _pathsCache.get(from);
     if (hit) return hit;
     const out: string[] = [];
-    let d = from;
-    while (d !== '/' && d !== '' && !/^[a-zA-Z]:\\?$/.test(d)) {
-        out.push(join(d, 'node_modules'));
+    let d = isAbsolutePath(from) ? from : resolvePath(from);
+    while (d !== '') {
+        const candidate = basename(d) === 'node_modules' ? d : join(d, 'node_modules');
+        if (!out.includes(candidate)) out.push(candidate);
         const up = dirname(d);
         if (up === d) break;
         d = up;
@@ -86,7 +125,7 @@ export function _resolveFilename(request: string, parent?: { filename?: string }
     if (ctsInternal) {
         const parentPath = parent?.filename ?? '';
         const requireFn = ctsInternal.mkRequire(parentPath, undefined);
-        return (requireFn.resolve as any)(request, options);
+        return requireFn.resolve(request, options);
     }
     return request;
 }
@@ -95,7 +134,8 @@ export function _pathFilename(filename: string): string {
     return filename;
 }
 
-export const builtinModules: string[] = new Proxy([] as string[], {
+const builtinModulesTarget: string[] = [];
+export const builtinModules: string[] = new Proxy(builtinModulesTarget, {
     get: (_t, key) => Reflect.get(getBuiltinModules(), key),
     has: (_t, key) => key in getBuiltinModules(),
     ownKeys: () => Reflect.ownKeys(getBuiltinModules()),
@@ -105,19 +145,20 @@ export const builtinModules: string[] = new Proxy([] as string[], {
     },
 });
 
-export const _cache: Record<string, any> = new Proxy({} as Record<string, any>, {
-    has: (_t, key) => getCtsInternal()?.cache.has(key as string) ?? false,
-    get: (_t, key) => getCtsInternal()?.cache.get(key as string),
-    set: (_t, key, value) => { getCtsInternal()?.cache.set(key as string, value); return true; },
-    deleteProperty: (_t, key) => { getCtsInternal()?.cache.delete(key as string); return true; },
+const moduleCacheTarget: Record<string, unknown> = {};
+export const _cache: Record<string, unknown> = new Proxy(moduleCacheTarget, {
+    has: (_t, key) => typeof key === 'string' && (getCtsInternal()?.cache.has(key) ?? false),
+    get: (_t, key) => typeof key === 'string' ? getCtsInternal()?.cache.get(key) : undefined,
+    set: (_t, key, value) => { if (typeof key === 'string') getCtsInternal()?.cache.set(key, value); return true; },
+    deleteProperty: (_t, key) => { if (typeof key === 'string') getCtsInternal()?.cache.delete(key); return true; },
     ownKeys: () => {
         const ctsInternal = getCtsInternal();
         return ctsInternal ? [...ctsInternal.cache.keys()] : [];
     },
     getOwnPropertyDescriptor: (_t, key) => {
         const ctsInternal = getCtsInternal();
-        if (!ctsInternal?.cache.has(key as string)) return undefined;
-        return { value: ctsInternal.cache.get(key as string), writable: true, enumerable: true, configurable: true };
+        if (typeof key !== 'string' || !ctsInternal?.cache.has(key)) return undefined;
+        return { value: ctsInternal.cache.get(key), writable: true, enumerable: true, configurable: true };
     },
 });
 
@@ -138,6 +179,7 @@ export function findSourceMap(_path: string, _error?: Error): SourceMap | undefi
 export const globalPaths: string[] = [];
 
 export function isBuiltin(moduleName: string): boolean {
+    if (typeof moduleName !== 'string') return false;
     const bare = moduleName.startsWith('node:') ? moduleName.slice(5) : moduleName;
     return getBuiltinModules().includes(bare);
 }
@@ -148,7 +190,7 @@ export class Module {
     id: string;
     filename: string;
     loaded = false;
-    exports: any;
+    exports: unknown;
     parent: Module | null = null;
     children: Module[] = [];
     paths: string[];
@@ -166,20 +208,23 @@ export class Module {
         }
     }
 
-    require(id: string): any {
+    require(id: string): unknown {
         return createRequire(this.filename)(id);
     }
 
-    _compile(code: string, filename: string): any {
+    _compile(code: string, filename: string): void {
         const wrapper = Module.wrap(code);
-        const fn = (0, eval)(wrapper);
-        const require = createRequire(filename);
-        fn(this.exports, require, this, filename, dirname(filename));
+        const fn: unknown = (0, eval)(wrapper);
+        if (typeof fn !== 'function') {
+            throw new TypeError('Compiled CommonJS wrapper must be a function');
+        }
+        const require = createRequire(isAbsolutePath(filename) ? filename : resolvePath(filename));
+        (fn as CommonJSWrapper)(this.exports, require, this, filename, dirname(filename));
     }
 
     static wrap = wrap;
 
-    static _cache: Record<string, any> = {};
+    static _cache: Record<string, unknown> = {};
 
     static _nodeModulePaths = _nodeModulePaths;
 
@@ -189,14 +234,18 @@ export class Module {
 
     static createRequire = createRequire;
 
-    static register(_specifier: string, _options?: { parentURL?: string; data?: any; transferList?: any[] }): void {
+    static _preloadModules = _preloadModules;
+
+    static runMain = runMain;
+
+    static register(_specifier: string, _options?: { parentURL?: string; data?: unknown; transferList?: unknown[] }): void {
         // ESM loader hook registration — not yet implemented
     }
 }
 
 // Live cache proxy
 Object.defineProperty(Module, '_cache', {
-    get: () => getCtsInternal()?.cache ?? {},
+    get: () => _cache,
     enumerable: true,
     configurable: true,
 });
@@ -213,7 +262,7 @@ Object.defineProperty(Module, 'builtinModules', {
     configurable: true,
 });
 
-export const _compile = (content: string, filename: string): any => {
+export const _compile = (content: string, filename: string): unknown => {
     const mod = new Module(filename);
     mod._compile(content, filename);
     return mod.exports;

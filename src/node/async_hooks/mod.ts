@@ -14,27 +14,32 @@ export interface HookCallbacks {
     promiseResolve?(asyncId: AsyncId): void;
 }
 
+type StoreMap = Map<AsyncLocalStorage<unknown>, unknown>;
+type Thenable<T = unknown> = {
+    then(onFulfilled?: (value: T) => unknown, onRejected?: (reason: unknown) => unknown): unknown;
+};
+type TimerHandle = unknown;
+type AnyCallable = (...args: unknown[]) => unknown;
+
 interface AsyncState {
     id: AsyncId;
     type: string;
     triggerId: TriggerAsyncId;
     resource: object;
-    stores: Map<AsyncLocalStorage<any>, any>;
+    stores: StoreMap;
     settled: boolean;
 }
-
-const g = globalThis as any;
 
 let _nextId = 2;
 let _currentId: AsyncId = 1;
 let _currentTriggerId: TriggerAsyncId = 0;
-let _currentStores = new Map<AsyncLocalStorage<any>, any>();
+let _currentStores: StoreMap = new Map();
 let _patched = false;
-let _originalPromiseThen: Promise<any>['then'] | null = null;
+let _originalPromiseThen: Promise<unknown>['then'] | null = null;
 
 const _hooks: HookCallbacks[] = [];
-const _promiseStates = new WeakMap<object, AsyncState>();
-const _handleStates = new Map<any, AsyncState>();
+const _promiseStates = new WeakMap<Promise<unknown>, AsyncState>();
+const _handleStates = new Map<TimerHandle, AsyncState>();
 
 function emitInit(state: AsyncState): void {
     for (const hook of _hooks) {
@@ -66,7 +71,7 @@ function emitPromiseResolve(id: AsyncId): void {
     }
 }
 
-function snapshotStores(): Map<AsyncLocalStorage<any>, any> {
+function snapshotStores(): StoreMap {
     return new Map(_currentStores);
 }
 
@@ -97,7 +102,25 @@ function settleState(state: AsyncState): void {
     emitDestroy(state.id);
 }
 
-function runInState<T>(state: AsyncState, callback: (...args: any[]) => T, thisArg: any, args: any[]): T {
+function isThenable(value: unknown): value is Thenable {
+    return !!value && (typeof value === 'object' || typeof value === 'function')
+        && typeof Reflect.get(value, 'then') === 'function';
+}
+
+function isCallable(value: unknown): value is AnyCallable {
+    return typeof value === 'function';
+}
+
+function getGlobalFunction(name: string): AnyCallable | null {
+    const value = Reflect.get(globalThis, name);
+    return isCallable(value) ? value : null;
+}
+
+function setGlobalFunction(name: string, value: AnyCallable): void {
+    Reflect.set(globalThis, name, value);
+}
+
+function runInState<T>(state: AsyncState, callback: AnyCallable, thisArg: unknown, args: readonly unknown[]): T {
     const prevId = _currentId;
     const prevTriggerId = _currentTriggerId;
     const prevStores = _currentStores;
@@ -108,7 +131,7 @@ function runInState<T>(state: AsyncState, callback: (...args: any[]) => T, thisA
     emitBefore(state.id);
 
     try {
-        return callback.apply(thisArg, args);
+        return Reflect.apply(callback, thisArg, args) as T;
     } finally {
         emitAfter(state.id);
         _currentId = prevId;
@@ -117,20 +140,20 @@ function runInState<T>(state: AsyncState, callback: (...args: any[]) => T, thisA
     }
 }
 
-function snapshotStoresFrom(stores: Map<AsyncLocalStorage<any>, any>): Map<AsyncLocalStorage<any>, any> {
+function snapshotStoresFrom(stores: StoreMap): StoreMap {
     return new Map(stores);
 }
 
-function wrapCallback<T extends Function>(callback: T | undefined, state: AsyncState, finalize = false): T | undefined {
-    if (typeof callback !== 'function') return callback;
-    const wrapped = function(this: any, ...args: any[]) {
+function wrapCallback<T>(callback: T, state: AsyncState, finalize = false): T {
+    if (!isCallable(callback)) return callback;
+    const wrapped = function(this: unknown, ...args: unknown[]) {
         try {
-            return runInState(state, callback as any, this, args);
+            return runInState(state, callback, this, args);
         } finally {
             if (finalize) settleState(state);
         }
     };
-    return wrapped as any as T;
+    return wrapped as T;
 }
 
 function installAsyncPatches(): void {
@@ -139,12 +162,12 @@ function installAsyncPatches(): void {
 
     const originalThen = Promise.prototype.then;
     _originalPromiseThen = originalThen;
-    Promise.prototype.then = function(this: Promise<any>, onFulfilled?: any, onRejected?: any): Promise<any> {
-        const parentState = _promiseStates.get(this as object);
+    Promise.prototype.then = function(this: Promise<unknown>, onFulfilled?: unknown, onRejected?: unknown): Promise<unknown> {
+        const parentState = _promiseStates.get(this);
         const state = createState(
             'PROMISE',
             parentState?.id ?? _currentId,
-            this as object,
+            this,
             parentState ? snapshotStoresFrom(parentState.stores) : snapshotStores(),
         );
         const result = originalThen.call(
@@ -152,15 +175,15 @@ function installAsyncPatches(): void {
             wrapCallback(onFulfilled, state),
             wrapCallback(onRejected, state),
         );
-        state.resource = result as object;
-        _promiseStates.set(result as object, state);
+        state.resource = result;
+        _promiseStates.set(result, state);
         originalThen.call(
             result,
-            (value: any) => {
+            (value: unknown) => {
                 settleState(state);
                 return value;
             },
-            (error: any) => {
+            (error: unknown) => {
                 settleState(state);
                 throw error;
             },
@@ -168,25 +191,28 @@ function installAsyncPatches(): void {
         return result;
     };
 
-    if (typeof g.queueMicrotask === 'function') {
-        const originalQueueMicrotask = g.queueMicrotask.bind(g);
-        g.queueMicrotask = function(callback: Function): void {
+    const queueMicrotaskFn = getGlobalFunction('queueMicrotask');
+    if (queueMicrotaskFn) {
+        const originalQueueMicrotask = queueMicrotaskFn.bind(globalThis);
+        setGlobalFunction('queueMicrotask', function(callback: () => void): void {
             const state = createState('Microtask');
             originalQueueMicrotask(wrapCallback(callback, state, true));
-        };
+        });
     }
 
-    if (typeof g.setTimeout === 'function') {
-        const originalSetTimeout = g.setTimeout.bind(g);
-        const originalClearTimeout = typeof g.clearTimeout === 'function' ? g.clearTimeout.bind(g) : null;
+    const setTimeoutFn = getGlobalFunction('setTimeout');
+    if (setTimeoutFn) {
+        const originalSetTimeout = setTimeoutFn.bind(globalThis);
+        const clearTimeoutFn = getGlobalFunction('clearTimeout');
+        const originalClearTimeout = clearTimeoutFn ? clearTimeoutFn.bind(globalThis) : null;
 
-        g.setTimeout = function(callback: any, delay?: number, ...args: any[]) {
-            if (typeof callback !== 'function') {
+        setGlobalFunction('setTimeout', function(callback: unknown, delay?: number, ...args: unknown[]) {
+            if (!isCallable(callback)) {
                 return originalSetTimeout(callback, delay, ...args);
             }
             const state = createState('Timeout');
-            let handle: any;
-            const wrapped = function(this: any, ...innerArgs: any[]) {
+            let handle: TimerHandle;
+            const wrapped = function(this: unknown, ...innerArgs: unknown[]) {
                 try {
                     return runInState(state, callback, this, innerArgs);
                 } finally {
@@ -197,31 +223,33 @@ function installAsyncPatches(): void {
             handle = originalSetTimeout(wrapped, delay, ...args);
             _handleStates.set(handle, state);
             return handle;
-        };
+        });
 
         if (originalClearTimeout) {
-            g.clearTimeout = function(handle: any): void {
+            setGlobalFunction('clearTimeout', function(handle: TimerHandle): void {
                 const state = _handleStates.get(handle);
                 if (state) {
                     _handleStates.delete(handle);
                     settleState(state);
                 }
                 originalClearTimeout(handle);
-            };
+            });
         }
     }
 
-    if (typeof g.setImmediate === 'function') {
-        const originalSetImmediate = g.setImmediate.bind(g);
-        const originalClearImmediate = typeof g.clearImmediate === 'function' ? g.clearImmediate.bind(g) : null;
+    const setImmediateFn = getGlobalFunction('setImmediate');
+    if (setImmediateFn) {
+        const originalSetImmediate = setImmediateFn.bind(globalThis);
+        const clearImmediateFn = getGlobalFunction('clearImmediate');
+        const originalClearImmediate = clearImmediateFn ? clearImmediateFn.bind(globalThis) : null;
 
-        g.setImmediate = function(callback: any, ...args: any[]) {
-            if (typeof callback !== 'function') {
+        setGlobalFunction('setImmediate', function(callback: unknown, ...args: unknown[]) {
+            if (!isCallable(callback)) {
                 return originalSetImmediate(callback, ...args);
             }
             const state = createState('Immediate');
-            let handle: any;
-            const wrapped = function(this: any, ...innerArgs: any[]) {
+            let handle: TimerHandle;
+            const wrapped = function(this: unknown, ...innerArgs: unknown[]) {
                 try {
                     return runInState(state, callback, this, innerArgs);
                 } finally {
@@ -232,46 +260,48 @@ function installAsyncPatches(): void {
             handle = originalSetImmediate(wrapped, ...args);
             _handleStates.set(handle, state);
             return handle;
-        };
+        });
 
         if (originalClearImmediate) {
-            g.clearImmediate = function(handle: any): void {
+            setGlobalFunction('clearImmediate', function(handle: TimerHandle): void {
                 const state = _handleStates.get(handle);
                 if (state) {
                     _handleStates.delete(handle);
                     settleState(state);
                 }
                 originalClearImmediate(handle);
-            };
+            });
         }
     }
 
-    if (typeof g.setInterval === 'function') {
-        const originalSetInterval = g.setInterval.bind(g);
-        const originalClearInterval = typeof g.clearInterval === 'function' ? g.clearInterval.bind(g) : null;
+    const setIntervalFn = getGlobalFunction('setInterval');
+    if (setIntervalFn) {
+        const originalSetInterval = setIntervalFn.bind(globalThis);
+        const clearIntervalFn = getGlobalFunction('clearInterval');
+        const originalClearInterval = clearIntervalFn ? clearIntervalFn.bind(globalThis) : null;
 
-        g.setInterval = function(callback: any, delay?: number, ...args: any[]) {
-            if (typeof callback !== 'function') {
+        setGlobalFunction('setInterval', function(callback: unknown, delay?: number, ...args: unknown[]) {
+            if (!isCallable(callback)) {
                 return originalSetInterval(callback, delay, ...args);
             }
             const state = createState('Interval');
-            const wrapped = function(this: any, ...innerArgs: any[]) {
+            const wrapped = function(this: unknown, ...innerArgs: unknown[]) {
                 return runInState(state, callback, this, innerArgs);
             };
             const handle = originalSetInterval(wrapped, delay, ...args);
             _handleStates.set(handle, state);
             return handle;
-        };
+        });
 
         if (originalClearInterval) {
-            g.clearInterval = function(handle: any): void {
+            setGlobalFunction('clearInterval', function(handle: TimerHandle): void {
                 const state = _handleStates.get(handle);
                 if (state) {
                     _handleStates.delete(handle);
                     settleState(state);
                 }
                 originalClearInterval(handle);
-            };
+            });
         }
     }
 }
@@ -309,8 +339,25 @@ export class AsyncResource {
         this._asyncState = createState(type, triggerAsyncId ?? _currentId, this);
     }
 
-    runInAsyncScope<T>(callback: (...args: any[]) => T, thisArg?: any, ...args: any[]): T {
+    static bind<T extends AnyCallable>(fn: T, type?: string, thisArg?: unknown): T {
+        if (!isCallable(fn)) {
+            throw new TypeError(`The "fn" argument must be of type function. Received type ${typeof fn}`);
+        }
+        return new AsyncResource(type ?? fn.name).bind(fn, thisArg);
+    }
+
+    runInAsyncScope<T>(callback: (...args: unknown[]) => T, thisArg?: unknown, ...args: unknown[]): T {
         return runInState(this._asyncState, callback, thisArg, args);
+    }
+
+    bind<T extends AnyCallable>(fn: T, thisArg?: unknown): T {
+        if (!isCallable(fn)) {
+            throw new TypeError(`The "fn" argument must be of type function. Received type ${typeof fn}`);
+        }
+        const resource = this;
+        return function(this: unknown, ...args: unknown[]) {
+            return resource.runInAsyncScope(fn, thisArg === undefined ? this : thisArg, ...args);
+        } as T;
     }
 
     emitDestroy(): this {
@@ -333,7 +380,7 @@ export class AsyncLocalStorage<T = unknown> {
         _currentStores = snapshotStoresFrom(_currentStores);
         _currentStores.set(this, store);
         const result = callback();
-        if (result && typeof (result as any).then === 'function' && _originalPromiseThen) {
+        if (isThenable(result) && _originalPromiseThen) {
             return this._handleAsyncResult(result, prevStores);
         }
         _currentStores = prevStores;
@@ -345,31 +392,27 @@ export class AsyncLocalStorage<T = unknown> {
         _currentStores = snapshotStoresFrom(_currentStores);
         _currentStores.delete(this);
         const result = callback();
-        if (result && typeof (result as any).then === 'function' && _originalPromiseThen) {
+        if (isThenable(result) && _originalPromiseThen) {
             return this._handleAsyncResult(result, prevStores);
         }
         _currentStores = prevStores;
         return result;
     }
 
-    private _handleAsyncResult(result: unknown, prevStores: Map<AsyncLocalStorage<any>, any>): any {
-        const thenable: any = result;
-        let resolveOuter!: (value: any) => void;
-        let rejectOuter!: (reason: any) => void;
-        const outer = new Promise<any>((resolve, reject) => {
-            resolveOuter = resolve;
-            rejectOuter = reject;
-        });
+    private _handleAsyncResult(result: Thenable, prevStores: StoreMap): unknown {
+        const { promise: outer, resolve: resolveOuter, reject: rejectOuter } = Promise.withResolvers<unknown>();
         const outerState = createState('PROMISE', _currentId, outer, snapshotStoresFrom(prevStores));
         _promiseStates.set(outer, outerState);
-        _originalPromiseThen!.call(
-            thenable,
-            (value: any) => {
+        const originalPromiseThen = _originalPromiseThen;
+        if (!originalPromiseThen) return outer;
+        originalPromiseThen.call(
+            result,
+            (value: unknown) => {
                 _currentStores = prevStores;
                 settleState(outerState);
                 resolveOuter(value);
             },
-            (reason: any) => {
+            (reason: unknown) => {
                 _currentStores = prevStores;
                 settleState(outerState);
                 rejectOuter(reason);
@@ -396,17 +439,34 @@ export class AsyncLocalStorage<T = unknown> {
         this.disable();
     }
 
-    static snapshot<T extends (...args: any[]) => any>(fn?: T, _options?: { __proto__: null }): (...args: Parameters<T>) => ReturnType<T> {
+    static snapshot(): <R, A extends unknown[]>(fn: (...args: A) => R, ...args: A) => R;
+    static snapshot<T extends (...args: unknown[]) => unknown>(fn: T, _options?: { __proto__: null }): (...args: Parameters<T>) => ReturnType<T>;
+    static snapshot<T extends (...args: unknown[]) => unknown>(fn?: T, _options?: { __proto__: null }): (...args: unknown[]) => unknown {
         const stores = snapshotStores();
-        return ((...args: Parameters<T>) => {
+        return (...args: unknown[]) => {
             const prevStores = _currentStores;
             _currentStores = snapshotStoresFrom(stores);
             try {
-                return fn ? fn(...args) : undefined as any;
+                if (fn) return fn(...args);
+                const callback = args[0];
+                return isCallable(callback) ? callback(...args.slice(1)) : undefined;
             } finally {
                 _currentStores = prevStores;
             }
-        }) as (...args: Parameters<T>) => ReturnType<T>;
+        };
+    }
+
+    static bind<T extends (...args: unknown[]) => unknown>(fn: T): T {
+        const stores = snapshotStores();
+        return (function(this: unknown, ...args: Parameters<T>) {
+            const prevStores = _currentStores;
+            _currentStores = snapshotStoresFrom(stores);
+            try {
+                return fn.apply(this, args);
+            } finally {
+                _currentStores = prevStores;
+            }
+        }) as T;
     }
 }
 

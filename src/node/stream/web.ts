@@ -3,8 +3,16 @@ import * as nodeBuffer from '../buffer';
 
 const { Buffer } = nodeBuffer;
 
-function getGlobal(name: keyof typeof globalThis): any {
-    return (globalThis as any)[name];
+function getGlobal<K extends keyof typeof globalThis>(name: K): (typeof globalThis)[K] {
+    return Reflect.get(globalThis, name) as (typeof globalThis)[K];
+}
+
+interface AsyncIterableReadable {
+    [Symbol.asyncIterator](): AsyncIterator<unknown>;
+}
+
+function asError(error: unknown): Error {
+    return error instanceof Error ? error : new Error(String(error));
 }
 
 // Re-exports of Web Streams globals (for named imports)
@@ -29,7 +37,7 @@ export const DecompressionStream = getGlobal('DecompressionStream');
 // ── Readable.fromWeb(readableStream, options?) ────────────────────────────────
 // Converts a Web ReadableStream into a Node.js Readable
 
-export function readableFromWeb(webStream: ReadableStream, options?: { encoding?: string; highWaterMark?: number; objectMode?: boolean }): Readable {
+export function readableFromWeb(webStream: ReadableStream, options?: { encoding?: BufferEncoding; highWaterMark?: number; objectMode?: boolean }): Readable {
     const reader = webStream.getReader();
     const read = async (size: number) => {
         try {
@@ -38,12 +46,12 @@ export function readableFromWeb(webStream: ReadableStream, options?: { encoding?
                 readable.push(null);
             } else {
                 const chunk = options?.encoding && typeof value === 'string'
-                    ? Buffer.from(value, options.encoding as BufferEncoding)
+                    ? Buffer.from(value, options.encoding)
                     : value;
                 readable.push(chunk);
             }
         } catch (err) {
-            readable.destroy(err as Error);
+            readable.destroy(asError(err));
         }
     };
 
@@ -61,10 +69,11 @@ export function readableFromWeb(webStream: ReadableStream, options?: { encoding?
 
 export function readableToWeb(readable: Readable): ReadableStream {
     const RS = getGlobal('ReadableStream') as typeof globalThis.ReadableStream;
-    let iterator: AsyncIterator<any>;
+    let iterator: AsyncIterator<unknown>;
 
-    if (typeof (readable as any)[Symbol.asyncIterator] === 'function') {
-        iterator = (readable as any)[Symbol.asyncIterator]();
+    const getAsyncIterator = Reflect.get(readable, Symbol.asyncIterator);
+    if (typeof getAsyncIterator === 'function') {
+        iterator = getAsyncIterator.call(readable);
     } else {
         iterator = (async function* () {
             while (true) {
@@ -111,7 +120,7 @@ export function writableFromWeb(webStream: WritableStream, options?: { decodeStr
 
     const writable = new Writable({
         highWaterMark: options?.highWaterMark,
-        write(chunk: any, encoding: BufferEncoding, callback: (error?: Error | null) => void) {
+        write(chunk: unknown, encoding: BufferEncoding, callback: (error?: Error | null) => void) {
             const data = chunk instanceof Uint8Array ? chunk : (options?.decodeStrings !== false ? Buffer.from(String(chunk), encoding) : chunk);
             writer.write(data).then(() => callback(), callback);
         },
@@ -143,7 +152,7 @@ export function writableToWeb(writable: Writable): WritableStream {
                 writable.end(resolve);
             });
         },
-        abort(reason: any) {
+        abort(reason: unknown) {
             writable.destroy(reason instanceof Error ? reason : new Error(String(reason)));
         },
     });
@@ -176,7 +185,7 @@ export function duplexFromWeb(webDuplex: TransformStream | { readable: ReadableS
                 duplex.push(value);
             }
         } catch (err) {
-            duplex.destroy(err as Error);
+            duplex.destroy(asError(err));
         }
     };
 
@@ -184,7 +193,7 @@ export function duplexFromWeb(webDuplex: TransformStream | { readable: ReadableS
         allowHalfOpen: options?.allowHalfOpen,
         highWaterMark: options?.highWaterMark,
         read,
-        write(chunk: any, encoding: BufferEncoding, callback: (error?: Error | null) => void) {
+        write(chunk: unknown, encoding: BufferEncoding, callback: (error?: Error | null) => void) {
             writer.write(chunk).then(() => callback(), callback);
         },
         final(callback: (error?: Error | null) => void) {

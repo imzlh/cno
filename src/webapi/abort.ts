@@ -2,12 +2,27 @@ import { DOMException } from "./events";
 
 const { setTimeout, clearTimeout } = import.meta.use('timers');
 
+let allowAbortSignalConstruction = false;
+
+function createAbortSignal(): AbortSignal {
+    allowAbortSignalConstruction = true;
+    try {
+        return new AbortSignal();
+    } finally {
+        allowAbortSignalConstruction = false;
+    }
+}
+
 class AbortSignal extends EventTarget implements globalThis.AbortSignal {
     #aborted = false;
-    #reason: any = undefined;
-    #onabort: ((this: globalThis.AbortSignal, ev: Event) => any) | null = null;
+    #reason: unknown = undefined;
+    #onabort: ((this: globalThis.AbortSignal, ev: Event) => unknown) | null = null;
+    #onabortListener: ((ev: Event) => void) | null = null;
 
     constructor() {
+        if (!allowAbortSignalConstruction) {
+            throw new TypeError('Illegal constructor');
+        }
         super();
     }
 
@@ -15,23 +30,23 @@ class AbortSignal extends EventTarget implements globalThis.AbortSignal {
         return this.#aborted;
     }
 
-    get reason(): any {
+    get reason(): unknown {
         return this.#reason;
     }
 
-    get onabort(): ((this: globalThis.AbortSignal, ev: Event) => any) | null {
+    get onabort(): ((this: globalThis.AbortSignal, ev: Event) => unknown) | null {
         return this.#onabort;
     }
 
-    set onabort(handler: ((this: globalThis.AbortSignal, ev: Event) => any) | null) {
-        if (this.#onabort) {
-            // @ts-ignore
-            this.removeEventListener('abort', this.#onabort);
+    set onabort(handler: ((this: globalThis.AbortSignal, ev: Event) => unknown) | null) {
+        if (this.#onabortListener) {
+            this.removeEventListener('abort', this.#onabortListener);
+            this.#onabortListener = null;
         }
-        this.#onabort = handler;
-        if (handler) {
-            // @ts-ignore
-            this.addEventListener('abort', handler);
+        this.#onabort = typeof handler === 'function' ? handler : null;
+        if (this.#onabort) {
+            this.#onabortListener = (event) => this.#onabort?.call(this, event);
+            this.addEventListener('abort', this.#onabortListener);
         }
     }
 
@@ -41,14 +56,14 @@ class AbortSignal extends EventTarget implements globalThis.AbortSignal {
         }
     }
 
-    static abort(reason?: any): globalThis.AbortSignal {
-        const signal = new AbortSignal();
+    static abort(reason?: unknown): globalThis.AbortSignal {
+        const signal = createAbortSignal();
         signal._abort(reason ?? new DOMException('Signal aborted', 'AbortError'));
         return signal;
     }
 
     static timeout(milliseconds: number): globalThis.AbortSignal {
-        const signal = new AbortSignal();
+        const signal = createAbortSignal();
         const ms = Number(milliseconds);
 
         if (ms < 0 || !Number.isFinite(ms)) {
@@ -68,7 +83,7 @@ class AbortSignal extends EventTarget implements globalThis.AbortSignal {
             throw new TypeError('signals must be an array');
         }
 
-        const resultSignal = new AbortSignal();
+        const resultSignal = createAbortSignal();
 
         // If any signal is already aborted, abort immediately
         for (const signal of signals) {
@@ -102,7 +117,7 @@ class AbortSignal extends EventTarget implements globalThis.AbortSignal {
         return resultSignal;
     }
 
-    _abort(reason: any): void {
+    _abort(reason: unknown): void {
         if (this.#aborted) return;
 
         this.#aborted = true;
@@ -121,14 +136,14 @@ class AbortController implements globalThis.AbortController {
     #signal: AbortSignal;
 
     constructor() {
-        this.#signal = new AbortSignal();
+        this.#signal = createAbortSignal();
     }
 
     get signal(): AbortSignal {
         return this.#signal;
     }
 
-    abort(reason?: any): void {
+    abort(reason?: unknown): void {
         this.#signal._abort(reason ?? new DOMException('Aborted', 'AbortError'));
     }
 

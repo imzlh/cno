@@ -118,7 +118,7 @@ function encode(input: string): string {
                     output.push(String.fromCharCode(digitToBasic(t + qMinusT % baseMinusT, 0)));
                     q = Math.floor(qMinusT / baseMinusT);
                 }
-                output.push(String.fromCharCode(digitToBasic(q, handledCPCount === basicLength ? 1 : 0)));
+                output.push(String.fromCharCode(digitToBasic(q, 0)));
                 bias = adapt(delta, handledCPCountPlusOne, handledCPCount === basicLength);
                 delta = 0;
                 handledCPCount++;
@@ -132,7 +132,7 @@ function encode(input: string): string {
 function mapDomain(s: string, fn: (label: string) => string): string {
     const parts = s.split('@');
     let result = '';
-    if (parts.length > 1) { result = parts[0] + '@'; s = parts[1]!; }
+    if (parts.length > 1) { result = `${parts[0] ?? ''}@`; s = parts[1] ?? ''; }
     const labels = s.replace(REGEX_SEPARATORS, '.').split('.');
     return result + labels.map(fn).join('.');
 }

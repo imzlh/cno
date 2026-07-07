@@ -3,7 +3,11 @@
  * Based on W3C Web Cryptography API specification
  */
 
+import { DOMException } from "./events";
+
 const crypto = import.meta.use('crypto');
+const algo = import.meta.use('algorithm');
+const engine = import.meta.use('engine');
 
 // Type Definitions
 
@@ -40,6 +44,25 @@ interface HmacKeyAlgorithm extends KeyAlgorithm {
 
 type KeyType = 'public' | 'private' | 'secret';
 type KeyUsage = 'encrypt' | 'decrypt' | 'sign' | 'verify' | 'deriveKey' | 'deriveBits' | 'wrapKey' | 'unwrapKey';
+interface RuntimeSubtleCrypto {
+    digest(algorithm: HashAlgorithmIdentifier, data: BufferSource): Promise<ArrayBuffer>;
+    generateKey(algorithm: AlgorithmIdentifier, extractable: boolean, keyUsages: KeyUsage[]): Promise<CryptoKeyPair | CryptoKey>;
+    sign(algorithm: AlgorithmIdentifier, key: CryptoKey, data: BufferSource): Promise<ArrayBuffer>;
+    verify(algorithm: AlgorithmIdentifier, key: CryptoKey, signature: BufferSource, data: BufferSource): Promise<boolean>;
+    encrypt(algorithm: AlgorithmIdentifier, key: CryptoKey, data: BufferSource): Promise<ArrayBuffer>;
+    decrypt(algorithm: AlgorithmIdentifier, key: CryptoKey, data: BufferSource): Promise<ArrayBuffer>;
+    deriveKey(algorithm: AlgorithmIdentifier, baseKey: CryptoKey, derivedKeyAlgorithm: AlgorithmIdentifier, extractable: boolean, keyUsages: KeyUsage[]): Promise<CryptoKey>;
+    deriveBits(algorithm: AlgorithmIdentifier, baseKey: CryptoKey, length: number | null): Promise<ArrayBuffer>;
+    importKey(format: string, keyData: BufferSource | JsonWebKey, algorithm: AlgorithmIdentifier, extractable: boolean, keyUsages: KeyUsage[]): Promise<CryptoKey>;
+    exportKey(format: string, key: CryptoKey): Promise<ArrayBuffer | JsonWebKey>;
+    wrapKey(format: string, key: CryptoKey, wrappingKey: CryptoKey, wrapAlgorithm: AlgorithmIdentifier): Promise<ArrayBuffer>;
+    unwrapKey(format: string, wrappedKey: BufferSource, unwrappingKey: CryptoKey, unwrapAlgorithm: AlgorithmIdentifier, unwrappedKeyAlgorithm: AlgorithmIdentifier, extractable: boolean, keyUsages: KeyUsage[]): Promise<CryptoKey>;
+}
+
+type RuntimeCrypto = Omit<Crypto, 'subtle'> & {
+    subtle: RuntimeSubtleCrypto;
+    digest(algorithm: HashAlgorithmIdentifier, data: BufferSource): Promise<ArrayBuffer>;
+};
 
 interface CryptoKey {
     type: KeyType;
@@ -122,11 +145,48 @@ function toArrayBuffer(source: BufferSource): ArrayBuffer {
     throw new Error('Unsupported buffer source');
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+    return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function stringArrayField(value: unknown): string[] | undefined {
+    return Array.isArray(value) && value.every(item => typeof item === 'string') ? value : undefined;
+}
+
+function jsonWebKeyFromUnknown(value: unknown): JsonWebKey {
+    if (!isRecord(value)) throw new Error('Invalid JWK data');
+    const jwk: JsonWebKey = {};
+    for (const key of ['kty', 'k', 'alg', 'crv', 'x', 'y', 'd', 'n', 'e'] as const) {
+        const field = value[key];
+        if (typeof field === 'string') jwk[key] = field;
+    }
+    if (typeof value.ext === 'boolean') jwk.ext = value.ext;
+    const keyOps = stringArrayField(value.key_ops);
+    if (keyOps) jwk.key_ops = keyOps;
+    return jwk;
+}
+
+function exportKeyBytes(format: string, exportedKey: ArrayBuffer | JsonWebKey): BufferSource {
+    if (format === 'jwk') return engine.encodeString(JSON.stringify(exportedKey));
+    if (exportedKey instanceof ArrayBuffer) return exportedKey;
+    throw new Error(`Unsupported wrapped key export format: ${format}`);
+}
+
+function importKeyData(format: string, decryptedKey: ArrayBuffer): BufferSource | JsonWebKey {
+    if (format !== 'jwk') return decryptedKey;
+    return jsonWebKeyFromUnknown(JSON.parse(engine.decodeString(new Uint8Array(decryptedKey))));
+}
+
 function normalizeAlgorithm(algorithm: AlgorithmIdentifier): Algorithm {
     if (typeof algorithm === 'string') {
         return { name: algorithm.toUpperCase() };
     }
     return { ...algorithm, name: algorithm.name.toUpperCase() };
+}
+
+function algorithmLength(algorithm: Algorithm): number | undefined {
+    const value = (algorithm as Algorithm & { length?: unknown }).length;
+    return typeof value === 'number' ? value : undefined;
 }
 
 const HASH_FUNCTIONS: Record<string, (data: ArrayBuffer) => ArrayBuffer> = {
@@ -164,16 +224,147 @@ function getHashOutputLength(algorithm: HashAlgorithmIdentifier): number {
     return lengths[normalized] || 32;
 }
 
+function getHmacDefaultLength(algorithm: HashAlgorithmIdentifier): number {
+    const normalized = typeof algorithm === 'string' ? algorithm.toUpperCase() : normalizeAlgorithm(algorithm).name;
+    return normalized === 'SHA-384' || normalized === 'SHA-512' ? 1024 : 512;
+}
+
+function hmacJwkAlg(hash: HashAlgorithmIdentifier): string | undefined {
+    const normalized = typeof hash === 'string' ? hash.toUpperCase() : normalizeAlgorithm(hash).name;
+    if (normalized === 'SHA-1') return 'HS1';
+    if (normalized === 'SHA-256') return 'HS256';
+    if (normalized === 'SHA-384') return 'HS384';
+    if (normalized === 'SHA-512') return 'HS512';
+    return undefined;
+}
+
+function jwkHashAlg(alg: unknown): HashAlgorithmIdentifier | undefined {
+    if (alg === 'HS1') return 'SHA-1';
+    if (alg === 'HS256') return 'SHA-256';
+    if (alg === 'HS384') return 'SHA-384';
+    if (alg === 'HS512') return 'SHA-512';
+    return undefined;
+}
+
+function deriveKeyLength(algorithm: Algorithm): number {
+    const explicit = algorithmLength(algorithm);
+    if (explicit !== undefined) return explicit;
+    if (algorithm.name === 'HMAC') return getHmacDefaultLength((algorithm as HmacKeyGenParams).hash);
+    return 256;
+}
+
+function ecCurveBits(curve: string): number {
+    if (curve === 'P-256') return 256;
+    if (curve === 'P-384') return 384;
+    if (curve === 'P-521') return 521;
+    throw new Error(`Unsupported curve: ${curve}`);
+}
+
+function normalizeDeriveBitsLength(length: number | null, defaultLength: number | null): number {
+    if (length === null && defaultLength === null) {
+        throw new DOMException('Invalid length', 'OperationError');
+    }
+    const bits = length === null ? defaultLength : Number(length);
+    if (bits === null) {
+        throw new DOMException('Invalid length', 'OperationError');
+    }
+    if (!Number.isFinite(bits) || bits < 0 || Math.trunc(bits) !== bits || bits % 8 !== 0) {
+        throw new DOMException('Invalid length', 'OperationError');
+    }
+    return bits;
+}
+
+function normalizeGcmTagLength(length: number | undefined): number {
+    const bits = length ?? 128;
+    if (![32, 64, 96, 104, 112, 120, 128].includes(bits)) {
+        throw new DOMException('Invalid AES-GCM tag length', 'OperationError');
+    }
+    return bits / 8;
+}
+
+function invalidAccess(message: string): DOMException {
+    return new DOMException(message, 'InvalidAccessError');
+}
+
+function operationError(error: unknown, fallback: string): DOMException {
+    if (error instanceof DOMException) return error;
+    const message = error instanceof Error ? error.message : String(error);
+    return new DOMException(message || fallback, 'OperationError');
+}
+
+function runOperation<T>(operation: () => T, fallback: string): T {
+    try {
+        return operation();
+    } catch (error) {
+        throw operationError(error, fallback);
+    }
+}
+
+function pbkdf2Sha1(password: ArrayBuffer, salt: ArrayBuffer, iterations: number, keylen: number): ArrayBuffer {
+    if (iterations < 1 || keylen < 1) {
+        throw new DOMException('Invalid PBKDF2 parameters', 'OperationError');
+    }
+
+    const hashLen = 20;
+    const blocks = Math.ceil(keylen / hashLen);
+    const out = new Uint8Array(blocks * hashLen);
+    const saltBytes = new Uint8Array(salt);
+
+    for (let block = 1; block <= blocks; block++) {
+        const input = new Uint8Array(saltBytes.length + 4);
+        input.set(saltBytes);
+        input[input.length - 4] = (block >>> 24) & 0xff;
+        input[input.length - 3] = (block >>> 16) & 0xff;
+        input[input.length - 2] = (block >>> 8) & 0xff;
+        input[input.length - 1] = block & 0xff;
+
+        let u = new Uint8Array(crypto.hmacSha1(password, input));
+        const t = new Uint8Array(u);
+
+        for (let i = 1; i < iterations; i++) {
+            u = new Uint8Array(crypto.hmacSha1(password, u));
+            for (let j = 0; j < hashLen; j++) {
+                t[j] ^= u[j];
+            }
+        }
+
+        out.set(t, (block - 1) * hashLen);
+    }
+
+    return out.slice(0, keylen).buffer;
+}
+
 // CryptoKey Implementation
 
 class CryptoKeyImpl implements CryptoKey {
+    static #allowConstruct = false;
+
+    static _create(
+        type: KeyType,
+        extractable: boolean,
+        algorithm: KeyAlgorithm,
+        usages: KeyUsage[],
+        handle: ArrayBuffer
+    ): CryptoKeyImpl {
+        CryptoKeyImpl.#allowConstruct = true;
+        try {
+            return new CryptoKeyImpl(type, extractable, algorithm, usages, handle);
+        } finally {
+            CryptoKeyImpl.#allowConstruct = false;
+        }
+    }
+
     constructor(
         public type: KeyType,
         public extractable: boolean,
         public algorithm: KeyAlgorithm,
         public usages: KeyUsage[],
         public _handle: ArrayBuffer
-    ) { }
+    ) {
+        if (!CryptoKeyImpl.#allowConstruct) {
+            throw new TypeError('Illegal constructor');
+        }
+    }
     
     get [Symbol.toStringTag]() {
         return 'CryptoKey';
@@ -182,7 +373,7 @@ class CryptoKeyImpl implements CryptoKey {
 
 // SubtleCrypto Implementation
 
-class SubtleCrypto implements globalThis.SubtleCrypto {
+class SubtleCrypto implements RuntimeSubtleCrypto {
     /**
      * Generate cryptographic digest (hash)
      */
@@ -194,7 +385,6 @@ class SubtleCrypto implements globalThis.SubtleCrypto {
     /**
      * Generate a new key pair or secret key
      */
-    // @ts-ignore - overload
     async generateKey(
         algorithm: AlgorithmIdentifier,
         extractable: boolean,
@@ -216,9 +406,9 @@ class SubtleCrypto implements globalThis.SubtleCrypto {
             };
 
             return {
-                publicKey: new CryptoKeyImpl('public', true, algorithmObj,
+                publicKey: CryptoKeyImpl._create('public', true, algorithmObj,
                     keyUsages.filter(u => u === 'verify' || u === 'encrypt' || u === 'wrapKey'), keyPair.publicKey),
-                privateKey: new CryptoKeyImpl('private', extractable, algorithmObj,
+                privateKey: CryptoKeyImpl._create('private', extractable, algorithmObj,
                     keyUsages.filter(u => u === 'sign' || u === 'decrypt' || u === 'unwrapKey'), keyPair.privateKey),
             };
         }
@@ -239,14 +429,14 @@ class SubtleCrypto implements globalThis.SubtleCrypto {
                 namedCurve: curve,
             };
 
-            const publicUsages = alg.name === 'ECDSA' ? ['verify'] : [];
-            const privateUsages = alg.name === 'ECDSA' ? ['sign'] : ['deriveKey', 'deriveBits'];
+            const publicUsages: KeyUsage[] = alg.name === 'ECDSA' ? ['verify'] : [];
+            const privateUsages: KeyUsage[] = alg.name === 'ECDSA' ? ['sign'] : ['deriveKey', 'deriveBits'];
 
             return {
-                publicKey: new CryptoKeyImpl('public', true, algorithmObj,
-                    keyUsages.filter(u => publicUsages.includes(u)) as KeyUsage[], keyPair.publicKey),
-                privateKey: new CryptoKeyImpl('private', extractable, algorithmObj,
-                    keyUsages.filter(u => privateUsages.includes(u)) as KeyUsage[], keyPair.privateKey),
+                publicKey: CryptoKeyImpl._create('public', true, algorithmObj,
+                    keyUsages.filter(u => publicUsages.includes(u)), keyPair.publicKey),
+                privateKey: CryptoKeyImpl._create('private', extractable, algorithmObj,
+                    keyUsages.filter(u => privateUsages.includes(u)), keyPair.privateKey),
             };
         }
 
@@ -258,22 +448,24 @@ class SubtleCrypto implements globalThis.SubtleCrypto {
                 throw new Error(`Invalid AES key length: ${length}`);
             }
 
-            const keyData = crypto.randomBytes(length / 8);
+            const keyData = new ArrayBuffer(length / 8);
+            crypto.randomFill(keyData);
             const algorithmObj: AesKeyAlgorithm = {
                 name: alg.name,
                 length,
             };
 
-            return new CryptoKeyImpl('secret', extractable, algorithmObj, keyUsages, keyData);
+            return CryptoKeyImpl._create('secret', extractable, algorithmObj, keyUsages, keyData);
         }
 
         // HMAC
         if (alg.name === 'HMAC') {
             const params = algorithm as HmacKeyGenParams;
             const hashLength = getHashOutputLength(params.hash);
-            const length = params.length || hashLength * 8;
+            const length = params.length || getHmacDefaultLength(params.hash);
 
-            const keyData = crypto.randomBytes(length / 8);
+            const keyData = new ArrayBuffer(length / 8);
+            crypto.randomFill(keyData);
             const hashAlg = normalizeAlgorithm(params.hash);
             const algorithmObj: HmacKeyAlgorithm = {
                 name: 'HMAC',
@@ -281,7 +473,7 @@ class SubtleCrypto implements globalThis.SubtleCrypto {
                 length,
             };
 
-            return new CryptoKeyImpl('secret', extractable, algorithmObj, keyUsages, keyData);
+            return CryptoKeyImpl._create('secret', extractable, algorithmObj, keyUsages, keyData);
         }
 
         throw new Error(`Unsupported algorithm: ${alg.name}`);
@@ -292,7 +484,7 @@ class SubtleCrypto implements globalThis.SubtleCrypto {
      */
     async sign(algorithm: AlgorithmIdentifier, key: CryptoKey, data: BufferSource): Promise<ArrayBuffer> {
         if (!key.usages.includes('sign')) {
-            throw new Error('Key cannot be used for signing');
+            throw invalidAccess('Key cannot be used for signing');
         }
 
         const alg = normalizeAlgorithm(algorithm);
@@ -369,7 +561,7 @@ class SubtleCrypto implements globalThis.SubtleCrypto {
         data: BufferSource
     ): Promise<boolean> {
         if (!key.usages.includes('verify')) {
-            throw new Error('Key cannot be used for verification');
+            throw invalidAccess('Key cannot be used for verification');
         }
 
         const alg = normalizeAlgorithm(algorithm);
@@ -437,13 +629,9 @@ class SubtleCrypto implements globalThis.SubtleCrypto {
                 return false;
             }
 
-            let result = 0;
             const a = new Uint8Array(computedHmac);
             const b = new Uint8Array(signatureBuffer);
-            for (let i = 0; i < a.length; i++) {
-                result |= a[i] ^ b[i];
-            }
-            return result === 0;
+            return algo.bytesEqual(a, b);
         }
 
         throw new Error(`Unsupported verification algorithm: ${alg.name}`);
@@ -454,12 +642,13 @@ class SubtleCrypto implements globalThis.SubtleCrypto {
      */
     async encrypt(algorithm: AlgorithmIdentifier, key: CryptoKey, data: BufferSource): Promise<ArrayBuffer> {
         if (!key.usages.includes('encrypt')) {
-            throw new Error('Key cannot be used for encryption');
+            throw invalidAccess('Key cannot be used for encryption');
         }
+        return this.encryptData(algorithm, key as CryptoKeyImpl, toArrayBuffer(data));
+    }
 
+    private encryptData(algorithm: AlgorithmIdentifier, keyImpl: CryptoKeyImpl, dataBuffer: ArrayBuffer): ArrayBuffer {
         const alg = normalizeAlgorithm(algorithm);
-        const keyImpl = key as CryptoKeyImpl;
-        const dataBuffer = toArrayBuffer(data);
 
         // RSA-OAEP
         if (alg.name === 'RSA-OAEP') {
@@ -468,10 +657,10 @@ class SubtleCrypto implements globalThis.SubtleCrypto {
             const label = params.label ? toArrayBuffer(params.label) : undefined;
 
             if (keyAlg.hash.name === 'SHA-256') {
-                return crypto.rsaOaepSha256Encrypt(keyImpl._handle, dataBuffer, label);
+                return runOperation(() => crypto.rsaOaepSha256Encrypt(keyImpl._handle, dataBuffer, label), 'RSA-OAEP encryption failed');
             }
             if (keyAlg.hash.name === 'SHA-512') {
-                return crypto.rsaOaepSha512Encrypt(keyImpl._handle, dataBuffer, label);
+                return runOperation(() => crypto.rsaOaepSha512Encrypt(keyImpl._handle, dataBuffer, label), 'RSA-OAEP encryption failed');
             }
             throw new Error(`Unsupported hash for RSA-OAEP: ${keyAlg.hash.name}`);
         }
@@ -499,14 +688,13 @@ class SubtleCrypto implements globalThis.SubtleCrypto {
             const params = algorithm as AesGcmParams;
             const iv = toArrayBuffer(params.iv);
             const aad = params.additionalData ? toArrayBuffer(params.additionalData) : undefined;
+            const tagLength = normalizeGcmTagLength(params.tagLength);
 
-            const result = crypto.gcmEncrypt(keyImpl._handle, iv, dataBuffer, aad, params.tagLength);
+            const result = crypto.gcmEncrypt(keyImpl._handle, iv, dataBuffer, aad, tagLength);
             const ciphertext = new Uint8Array(result.ciphertext);
             const tag = new Uint8Array(result.tag);
-            const output = new Uint8Array(ciphertext.length + tag.length);
-            output.set(ciphertext, 0);
-            output.set(tag, ciphertext.length);
-            return output.buffer;
+            const output = algo.bytesConcat([ciphertext, tag]);
+            return toArrayBuffer(output);
         }
 
         throw new Error(`Unsupported encryption algorithm: ${alg.name}`);
@@ -517,12 +705,13 @@ class SubtleCrypto implements globalThis.SubtleCrypto {
      */
     async decrypt(algorithm: AlgorithmIdentifier, key: CryptoKey, data: BufferSource): Promise<ArrayBuffer> {
         if (!key.usages.includes('decrypt')) {
-            throw new Error('Key cannot be used for decryption');
+            throw invalidAccess('Key cannot be used for decryption');
         }
+        return this.decryptData(algorithm, key as CryptoKeyImpl, toArrayBuffer(data));
+    }
 
+    private decryptData(algorithm: AlgorithmIdentifier, keyImpl: CryptoKeyImpl, dataBuffer: ArrayBuffer): ArrayBuffer {
         const alg = normalizeAlgorithm(algorithm);
-        const keyImpl = key as CryptoKeyImpl;
-        const dataBuffer = toArrayBuffer(data);
 
         // RSA-OAEP
         if (alg.name === 'RSA-OAEP') {
@@ -531,10 +720,10 @@ class SubtleCrypto implements globalThis.SubtleCrypto {
             const label = params.label ? toArrayBuffer(params.label) : undefined;
 
             if (keyAlg.hash.name === 'SHA-256') {
-                return crypto.rsaOaepSha256Decrypt(keyImpl._handle, dataBuffer, label);
+                return runOperation(() => crypto.rsaOaepSha256Decrypt(keyImpl._handle, dataBuffer, label), 'RSA-OAEP decryption failed');
             }
             if (keyAlg.hash.name === 'SHA-512') {
-                return crypto.rsaOaepSha512Decrypt(keyImpl._handle, dataBuffer, label);
+                return runOperation(() => crypto.rsaOaepSha512Decrypt(keyImpl._handle, dataBuffer, label), 'RSA-OAEP decryption failed');
             }
             throw new Error(`Unsupported hash for RSA-OAEP: ${keyAlg.hash.name}`);
         }
@@ -565,7 +754,7 @@ class SubtleCrypto implements globalThis.SubtleCrypto {
             const aad = params.additionalData ? toArrayBuffer(params.additionalData) : undefined;
 
             const ciphertextWithTag = dataBuffer;
-            const tagLength = params.tagLength ?? 16;
+            const tagLength = normalizeGcmTagLength(params.tagLength);
             const ciphertext = ciphertextWithTag.slice(0, ciphertextWithTag.byteLength - tagLength);
             const tag = ciphertextWithTag.slice(ciphertextWithTag.byteLength - tagLength);
 
@@ -594,11 +783,7 @@ class SubtleCrypto implements globalThis.SubtleCrypto {
         }
 
         const derivedAlg = normalizeAlgorithm(derivedKeyAlgorithm);
-        let length = 256;
-
-        if ('length' in derivedAlg && typeof (derivedAlg as any).length === 'number') {
-            length = (derivedAlg as any).length;
-        }
+        const length = deriveKeyLength(derivedAlg);
 
         const bits = await this.deriveBits(algorithm, baseKey, length);
         return this.importKey('raw', bits, derivedKeyAlgorithm, extractable, keyUsages);
@@ -607,7 +792,7 @@ class SubtleCrypto implements globalThis.SubtleCrypto {
     /**
      * Derive bits from base key
      */
-    async deriveBits(algorithm: AlgorithmIdentifier, baseKey: CryptoKey, length: number): Promise<ArrayBuffer> {
+    async deriveBits(algorithm: AlgorithmIdentifier, baseKey: CryptoKey, length: number | null): Promise<ArrayBuffer> {
         if (!baseKey.usages.includes('deriveBits') && !baseKey.usages.includes('deriveKey')) {
             throw new Error('Key cannot be used for derivation');
         }
@@ -620,6 +805,7 @@ class SubtleCrypto implements globalThis.SubtleCrypto {
             const params = algorithm as EcdhKeyDeriveParams;
             const keyAlg = keyImpl.algorithm as EcKeyAlgorithm;
             const publicKeyImpl = params.public as CryptoKeyImpl;
+            const bits = normalizeDeriveBitsLength(length, ecCurveBits(keyAlg.namedCurve));
 
             let sharedSecret: ArrayBuffer;
             if (keyAlg.namedCurve === 'P-256') {
@@ -632,23 +818,27 @@ class SubtleCrypto implements globalThis.SubtleCrypto {
                 throw new Error(`Unsupported curve for ECDH: ${keyAlg.namedCurve}`);
             }
 
-            // Return requested number of bits
-            const bytes = length / 8;
+            if (bits > sharedSecret.byteLength * 8) {
+                throw new DOMException('Invalid length', 'OperationError');
+            }
+            const bytes = bits / 8;
             return sharedSecret.slice(0, bytes);
         }
 
         // HKDF
         if (alg.name === 'HKDF') {
             const params = algorithm as HkdfParams;
+            if (length === null) throw new DOMException('Invalid length', 'OperationError');
+            const bits = normalizeDeriveBitsLength(length, length);
             const salt = toArrayBuffer(params.salt);
             const info = toArrayBuffer(params.info);
             const hashAlg = normalizeAlgorithm(params.hash);
 
             if (hashAlg.name === 'SHA-256') {
-                return crypto.hkdfSha256(keyImpl._handle, length / 8, salt, info);
+                return crypto.hkdfSha256(keyImpl._handle, bits / 8, salt, info);
             }
             if (hashAlg.name === 'SHA-512') {
-                return crypto.hkdfSha512(keyImpl._handle, length / 8, salt, info);
+                return crypto.hkdfSha512(keyImpl._handle, bits / 8, salt, info);
             }
             throw new Error(`Unsupported hash for HKDF: ${hashAlg.name}`);
         }
@@ -656,14 +846,19 @@ class SubtleCrypto implements globalThis.SubtleCrypto {
         // PBKDF2
         if (alg.name === 'PBKDF2') {
             const params = algorithm as Pbkdf2Params;
+            if (length === null) throw new DOMException('Invalid length', 'OperationError');
+            const bits = normalizeDeriveBitsLength(length, length);
             const salt = toArrayBuffer(params.salt);
             const hashAlg = normalizeAlgorithm(params.hash);
 
+            if (hashAlg.name === 'SHA-1') {
+                return pbkdf2Sha1(keyImpl._handle, salt, params.iterations, bits / 8);
+            }
             if (hashAlg.name === 'SHA-256') {
-                return crypto.pbkdf2Sha256(keyImpl._handle, salt, params.iterations, length / 8);
+                return crypto.pbkdf2Sha256(keyImpl._handle, salt, params.iterations, bits / 8);
             }
             if (hashAlg.name === 'SHA-512') {
-                return crypto.pbkdf2Sha512(keyImpl._handle, salt, params.iterations, length / 8);
+                return crypto.pbkdf2Sha512(keyImpl._handle, salt, params.iterations, bits / 8);
             }
             throw new Error(`Unsupported hash for PBKDF2: ${hashAlg.name}`);
         }
@@ -695,7 +890,7 @@ class SubtleCrypto implements globalThis.SubtleCrypto {
                     hash: { name: hashAlg.name },
                     length: keyBuffer.byteLength * 8,
                 };
-                return new CryptoKeyImpl('secret', extractable, algorithmObj, keyUsages, keyBuffer);
+                return CryptoKeyImpl._create('secret', extractable, algorithmObj, keyUsages, keyBuffer);
             }
 
             // AES
@@ -708,15 +903,34 @@ class SubtleCrypto implements globalThis.SubtleCrypto {
                     name: alg.name,
                     length,
                 };
-                return new CryptoKeyImpl('secret', extractable, algorithmObj, keyUsages, keyBuffer);
+                return CryptoKeyImpl._create('secret', extractable, algorithmObj, keyUsages, keyBuffer);
             }
 
             // PBKDF2 / HKDF (password material)
             if (alg.name === 'PBKDF2' || alg.name === 'HKDF') {
-                return new CryptoKeyImpl('secret', false, { name: alg.name }, keyUsages, keyBuffer);
+                return CryptoKeyImpl._create('secret', false, { name: alg.name }, keyUsages, keyBuffer);
             }
 
             throw new Error(`Cannot import raw key for algorithm: ${alg.name}`);
+        }
+
+        if (format === 'jwk') {
+            const jwk = keyData as JsonWebKey;
+            if (alg.name === 'HMAC') {
+                if (jwk.kty !== 'oct' || typeof jwk.k !== 'string') {
+                    throw new DOMException('Invalid HMAC JWK', 'DataError');
+                }
+                const params = algorithm as HmacKeyGenParams;
+                const hashAlg = normalizeAlgorithm(params.hash ?? jwkHashAlg(jwk.alg));
+                const keyBuffer = toArrayBuffer(algo.base64DecodeLoose(jwk.k));
+                const algorithmObj: HmacKeyAlgorithm = {
+                    name: 'HMAC',
+                    hash: { name: hashAlg.name },
+                    length: keyBuffer.byteLength * 8,
+                };
+                return CryptoKeyImpl._create('secret', extractable && jwk.ext !== false, algorithmObj, keyUsages, keyBuffer);
+            }
+            throw new Error(`Cannot import JWK key for algorithm: ${alg.name}`);
         }
 
         if (format === 'spki' || format === 'pkcs8') {
@@ -734,7 +948,7 @@ class SubtleCrypto implements globalThis.SubtleCrypto {
                 };
 
                 const type: KeyType = format === 'spki' ? 'public' : 'private';
-                return new CryptoKeyImpl(type, extractable, algorithmObj, keyUsages, keyBuffer);
+                return CryptoKeyImpl._create(type, extractable, algorithmObj, keyUsages, keyBuffer);
             }
 
             if (alg.name === 'ECDSA' || alg.name === 'ECDH') {
@@ -745,7 +959,7 @@ class SubtleCrypto implements globalThis.SubtleCrypto {
                 };
 
                 const type: KeyType = format === 'spki' ? 'public' : 'private';
-                return new CryptoKeyImpl(type, extractable, algorithmObj, keyUsages, keyBuffer);
+                return CryptoKeyImpl._create(type, extractable, algorithmObj, keyUsages, keyBuffer);
             }
         }
 
@@ -755,10 +969,9 @@ class SubtleCrypto implements globalThis.SubtleCrypto {
     /**
      * Export key to external format
      */
-    // @ts-ignore - overload
     async exportKey(format: string, key: CryptoKey): Promise<ArrayBuffer | JsonWebKey> {
         if (!key.extractable) {
-            throw new Error('Key is not extractable');
+            throw new DOMException('Key is not extractable', 'InvalidAccessError');
         }
 
         const keyImpl = key as CryptoKeyImpl;
@@ -768,6 +981,24 @@ class SubtleCrypto implements globalThis.SubtleCrypto {
                 throw new Error('Can only export secret keys as raw');
             }
             return keyImpl._handle;
+        }
+
+        if (format === 'jwk') {
+            if (key.type !== 'secret') {
+                throw new Error('Can only export secret keys as JWK');
+            }
+            const keyAlg = keyImpl.algorithm;
+            if (keyAlg.name === 'HMAC') {
+                const hmacAlg = keyAlg as HmacKeyAlgorithm;
+                return {
+                    kty: 'oct',
+                    k: algo.base64UrlEncode(new Uint8Array(keyImpl._handle)),
+                    alg: hmacJwkAlg(hmacAlg.hash),
+                    ext: key.extractable,
+                    key_ops: [...key.usages],
+                };
+            }
+            throw new Error(`Unsupported JWK export algorithm: ${keyAlg.name}`);
         }
 
         if (format === 'spki' && key.type === 'public') {
@@ -797,7 +1028,7 @@ class SubtleCrypto implements globalThis.SubtleCrypto {
         const exportedKey = await this.exportKey(format, key);
 
         // Encrypt the exported key data using the wrapping key
-        return this.encrypt(wrapAlgorithm, wrappingKey, new Uint8Array(exportedKey as ArrayBuffer));
+        return this.encryptData(wrapAlgorithm, wrappingKey as CryptoKeyImpl, toArrayBuffer(exportKeyBytes(format, exportedKey)));
     }
 
     /**
@@ -817,17 +1048,18 @@ class SubtleCrypto implements globalThis.SubtleCrypto {
         }
 
         // Decrypt the wrapped key using the unwrapping key
-        const decryptedKey = await this.decrypt(unwrapAlgorithm, unwrappingKey, wrappedKey);
+        const decryptedKey = this.decryptData(unwrapAlgorithm, unwrappingKey as CryptoKeyImpl, toArrayBuffer(wrappedKey));
 
         // Import the decrypted key data
-        return this.importKey(format, decryptedKey, unwrappedKeyAlgorithm, extractable, keyUsages);
+        return this.importKey(format, importKeyData(format, decryptedKey), unwrappedKeyAlgorithm, extractable, keyUsages);
     }
 }
 
 export const subtle = new SubtleCrypto();
 
-const webCrypto: Crypto = {
-    // @ts-ignore
+Reflect.set(globalThis, 'CryptoKey', CryptoKeyImpl);
+
+const webCrypto: RuntimeCrypto = {
     subtle,
 
     digest(algorithm: HashAlgorithmIdentifier, data: BufferSource): Promise<ArrayBuffer> {
@@ -835,23 +1067,18 @@ const webCrypto: Crypto = {
     },
 
     getRandomValues<T extends ArrayBufferView>(buffer: T): T {
-        if (buffer.byteLength > 65536) {
-            throw new RangeError('getRandomValues: Request exceeds maximum size of 65536 bytes');
+        if (!ArrayBuffer.isView(buffer) || buffer instanceof DataView || buffer instanceof Float32Array || buffer instanceof Float64Array) {
+            throw new DOMException('The provided ArrayBufferView is not an integer typed array', 'TypeMismatchError');
         }
-        const bytes = crypto.randomBytes(buffer.byteLength);
-        new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength).set(new Uint8Array(bytes));
+        if (buffer.byteLength > 65536) {
+            throw new DOMException('The ArrayBufferView byte length exceeds the number of bytes of entropy available via this API', 'QuotaExceededError');
+        }
+        crypto.randomFill(buffer);
         return buffer;
     },
 
     randomUUID() {
-        const data = crypto.randomBytes(16);
-        const dv = new DataView(data);
-        // version 4
-        dv.setUint8(6, (dv.getUint8(6) & 0x0f) | 0x40);
-        // variant 10
-        dv.setUint8(8, (dv.getUint8(8) & 0x3f) | 0x80);
-        const hex = crypto.hexEncode(data);
-        return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+        return crypto.randomUUID();
     },
 };
 

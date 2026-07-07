@@ -4,11 +4,29 @@
  * Type definitions reference: @types/node/os.d.ts
  */
 
+import { Buffer } from '../buffer';
+
 const os = import.meta.use('os');
 const sig = import.meta.use('signals');
 const err = import.meta.use('error');
 
 const uname = os.uname();
+
+interface PriorityNativeOS {
+    getPriority?: (pid: number) => number;
+    setPriority?: (pid: number, priority: number) => void;
+}
+
+type NetworkInterfaceWithCidr = CModuleOS.NetworkInterface & {
+    cidr?: string | null;
+};
+
+type SignalConstants = { [key in NodeJS.Signals]: number };
+
+const priorityOS: PriorityNativeOS = os;
+const errnoConstants: Record<string, number> = Object.fromEntries(
+    Object.entries(err.errno).filter(([k]) => k !== 'OK' && k !== 'UNKNOWN')
+);
 export interface CpuInfo {
     model: string;
     speed: number;
@@ -58,11 +76,9 @@ export const constants = {
     // not per-thread) — fall back to an empty map instead of crashing on import.
     signals: Object.fromEntries(
         Object.entries(sig?.signals ?? {}).map(([k, v]) => [k, v])
-    ) as { [key in NodeJS.Signals]: number },
+    ) as SignalConstants,
 
-    errno: Object.fromEntries(
-        Object.entries(err.errno).filter(([k]) => k !== 'OK' && k !== 'UNKNOWN')
-    ) as any,
+    errno: errnoConstants,
 
     dlopen: {
         RTLD_LAZY: 1,
@@ -131,7 +147,7 @@ export function totalmem(): number {
  * Returns an array of CPU information
  */
 export function cpus(): CpuInfo[] {
-    return os.cpuInfo().map((cpu: any) => ({
+    return os.cpuInfo().map(cpu => ({
         ...cpu,
         times: cpu.times ?? { user: 0, nice: 0, sys: 0, idle: 0, irq: 0 },
     }));
@@ -162,19 +178,31 @@ export function release(): string {
  * Returns network interface information
  */
 export function networkInterfaces(): NodeJS.Dict<NetworkInterfaceInfo[]> {
-    const interfaces = os.networkInterfaces();
+    let interfaces: NetworkInterfaceWithCidr[];
+    try {
+        interfaces = os.networkInterfaces();
+    } catch {
+        return {
+            lo: [{
+                family: 'IPv4',
+                address: '127.0.0.1',
+                netmask: '255.0.0.0',
+                mac: '00:00:00:00:00:00',
+                internal: true,
+                cidr: '127.0.0.1/8',
+            }],
+        };
+    }
     const result: NodeJS.Dict<NetworkInterfaceInfo[]> = {};
 
     for (const iface of interfaces) {
-        if (!result[iface.name]) {
-            result[iface.name] = [];
-        }
+        const entries = result[iface.name] ??= [];
 
         const isIPv6 = iface.address.includes(':');
-        const cidr = (iface as any).cidr ?? `${iface.address}/${isIPv6 ? 128 : 32}`;
+        const cidr = iface.cidr ?? `${iface.address}/${isIPv6 ? 128 : 32}`;
 
         if (isIPv6) {
-            result[iface.name]!.push({
+            entries.push({
                 family: 'IPv6',
                 address: iface.address,
                 netmask: iface.netmask,
@@ -184,7 +212,7 @@ export function networkInterfaces(): NodeJS.Dict<NetworkInterfaceInfo[]> {
                 scopeid: iface.scopeId ?? 0,
             });
         } else {
-            result[iface.name]!.push({
+            entries.push({
                 family: 'IPv4',
                 address: iface.address,
                 netmask: iface.netmask,
@@ -212,14 +240,22 @@ export interface UserInfoOptions {
 /**
  * Returns information about the current effective user
  */
-export function userInfo(options?: UserInfoOptions): UserInfo<string> {
+function encodeUserInfoValue(value: string, options?: UserInfoOptions): string | Buffer {
+    return options?.encoding === 'buffer' ? Buffer.from(value) : value;
+}
+
+export function userInfo(options?: UserInfoOptions): UserInfo<string>;
+export function userInfo(options: { encoding: 'buffer' }): UserInfo<Buffer>;
+export function userInfo(options?: UserInfoOptions): UserInfo<string | Buffer> {
     const info = os.userInfo;
+    const shell = info.shell;
+    const home = info.homeDir ?? os.homeDir;
     return {
-        username: info.userName,
+        username: encodeUserInfoValue(info.userName, options),
         uid: info.userId,
         gid: info.groupId,
-        shell: info.shell,
-        homedir: info.homeDir ?? os.homeDir,
+        shell: shell === null ? null : encodeUserInfoValue(shell, options),
+        homedir: encodeUserInfoValue(home, options),
     };
 }
 
@@ -317,9 +353,28 @@ export function endianness(): 'BE' | 'LE' {
     return new Uint8Array(buffer)[0] === 1 ? 'LE' : 'BE';
 }
 
+function validateInt32(value: number, name: string): void {
+    if (!Number.isInteger(value)) {
+        throw new RangeError(`The value of "${name}" is out of range. It must be an integer.`);
+    }
+    if (value < -2147483648 || value > 2147483647) {
+        throw new RangeError(`The value of "${name}" is out of range. It must be >= -2147483648 && <= 2147483647.`);
+    }
+}
+
+function validatePriority(priority: number): void {
+    if (!Number.isInteger(priority)) {
+        throw new RangeError('The value of "priority" is out of range. It must be an integer.');
+    }
+    if (priority < -20 || priority > 19) {
+        throw new RangeError('The value of "priority" is out of range. It must be >= -20 && <= 19.');
+    }
+}
+
 export function getPriority(pid?: number): number {
+    validateInt32(pid ?? 0, 'pid');
     try {
-        return (os as any).getPriority?.(pid ?? 0) ?? 0;
+        return priorityOS.getPriority?.(pid ?? 0) ?? 0;
     } catch {
         throw new RangeError(`getPriority ${pid} is not a valid pid`);
     }
@@ -330,9 +385,22 @@ export function setPriority(pid: number, priority: number): void;
 export function setPriority(pidOrPriority: number, priority?: number): void {
     const pid = priority !== undefined ? pidOrPriority : 0;
     const prio = priority ?? pidOrPriority;
+    validateInt32(pid, 'pid');
+    validatePriority(prio);
     try {
-        (os as any).setPriority?.(pid, prio);
+        priorityOS.setPriority?.(pid, prio);
     } catch {
         throw new RangeError(`setPriority ${prio} is out of range`);
     }
 }
+
+function installPrimitiveCoercion(fn: () => string, getValue: () => string): void {
+    Object.defineProperties(fn, {
+        toString: { value: getValue, configurable: true },
+        [Symbol.toPrimitive]: { value: getValue, configurable: true },
+    });
+}
+
+installPrimitiveCoercion(arch, arch);
+installPrimitiveCoercion(endianness, endianness);
+installPrimitiveCoercion(platform, platform);

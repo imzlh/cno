@@ -3,7 +3,9 @@
  * Provides the Console class and the global console instance
  */
 
-const nativeConsole = import.meta.use('console') as Record<string, any>;
+import process from '../process';
+
+const nativeConsole = import.meta.use('console');
 
 export interface ConsoleOptions {
     stdout: NodeJS.WritableStream;
@@ -35,6 +37,8 @@ const styleMap: Record<string, string> = {
     bgYellow: `${ESC}43m`, bgBlue: `${ESC}44m`, bgMagenta: `${ESC}45m`,
     bgCyan: `${ESC}46m`, bgWhite: `${ESC}47m`,
 };
+
+const objectTag = (value: unknown): string => Object.prototype.toString.call(value);
 
 function cssToAnsi(css: string): string {
     const codes: string[] = [];
@@ -70,6 +74,28 @@ function cssToAnsi(css: string): string {
     return codes.join('');
 }
 
+function iteratorToArray(iterator: unknown): unknown[] {
+    if (!iterator || (typeof iterator !== 'object' && typeof iterator !== 'function')) return [];
+    const next = Reflect.get(iterator, 'next');
+    if (typeof next !== 'function') return [];
+    const out: unknown[] = [];
+    while (true) {
+        const step = Reflect.apply(next, iterator, []);
+        if (!step || typeof step !== 'object') break;
+        if (Reflect.get(step, 'done') === true) break;
+        out.push(Reflect.get(step, 'value'));
+    }
+    return out;
+}
+
+function stringifyJsonValue(value: unknown): string {
+    try {
+        return JSON.stringify(value);
+    } catch {
+        return String(value);
+    }
+}
+
 function formatValue(val: unknown, depth = 0): string {
     if (depth > 2) {
         if (typeof val === 'object' && val !== null) {
@@ -85,9 +111,20 @@ function formatValue(val: unknown, depth = 0): string {
     if (typeof val === 'number' || typeof val === 'boolean' || typeof val === 'bigint') return String(val);
     if (typeof val === 'symbol') return val.toString();
     if (typeof val === 'function') return `[Function: ${val.name || 'anonymous'}]`;
-    if (val instanceof Date) return val.toISOString();
-    if (val instanceof RegExp) return val.toString();
-    if (val instanceof Error) return `${val.name}: ${val.message}`;
+    const tag = objectTag(val);
+    if (tag === '[object Date]') {
+        const getTime = Reflect.get(Object(val), 'getTime');
+        const timeValue = typeof getTime === 'function'
+            ? Reflect.apply(getTime, val, [])
+            : NaN;
+        const time = typeof timeValue === 'number' ? timeValue : NaN;
+        return Number.isNaN(time) ? 'Invalid Date' : new Date(time).toISOString();
+    }
+    if (tag === '[object RegExp]') return String(val);
+    if (tag === '[object Error]' || val instanceof Error) {
+        const error = Object(val);
+        return `${String(Reflect.get(error, 'name') || 'Error')}: ${String(Reflect.get(error, 'message') || '')}`;
+    }
     if (val instanceof Promise) return 'Promise { <pending> }';
 
     if (Array.isArray(val)) {
@@ -96,22 +133,35 @@ function formatValue(val: unknown, depth = 0): string {
         return val.length > 5 ? `[${items}, ... ${val.length - 5} more items]` : `[${items}]`;
     }
 
-    if (val instanceof Map) {
-        const entries = Array.from(val.entries()).slice(0, 3)
-            .map(([k, v]) => `${formatValue(k, depth + 1)} => ${formatValue(v, depth + 1)}`).join(', ');
-        return `Map(${val.size}) {${entries}${val.size > 3 ? ', ...' : ''}}`;
+    if (tag === '[object Map]') {
+        const map = Object(val);
+        const getEntries = Reflect.get(map, 'entries');
+        const mapEntries = typeof getEntries === 'function' ? iteratorToArray(Reflect.apply(getEntries, map, [])) : [];
+        const entries = mapEntries.slice(0, 3)
+            .map((entry) => {
+                if (!Array.isArray(entry)) return formatValue(entry, depth + 1);
+                return `${formatValue(entry[0], depth + 1)} => ${formatValue(entry[1], depth + 1)}`;
+            }).join(', ');
+        const sizeValue = Reflect.get(map, 'size');
+        const size = typeof sizeValue === 'number' ? sizeValue : mapEntries.length;
+        return `Map(${size}) {${entries}${size > 3 ? ', ...' : ''}}`;
     }
 
-    if (val instanceof Set) {
-        const items = Array.from(val).slice(0, 3).map(v => formatValue(v, depth + 1)).join(', ');
-        return `Set(${val.size}) {${items}${val.size > 3 ? ', ...' : ''}}`;
+    if (tag === '[object Set]') {
+        const set = Object(val);
+        const getValues = Reflect.get(set, 'values');
+        const values = typeof getValues === 'function' ? iteratorToArray(Reflect.apply(getValues, set, [])) : [];
+        const items = values.slice(0, 3).map(v => formatValue(v, depth + 1)).join(', ');
+        const sizeValue = Reflect.get(set, 'size');
+        const size = typeof sizeValue === 'number' ? sizeValue : values.length;
+        return `Set(${size}) {${items}${size > 3 ? ', ...' : ''}}`;
     }
 
     if (typeof val === 'object') {
         try {
             const keys = Object.keys(val);
             if (keys.length === 0) return '{}';
-            const entries = keys.slice(0, 3).map(k => `${k}: ${formatValue((val as Record<string, unknown>)[k], depth + 1)}`).join(', ');
+            const entries = keys.slice(0, 3).map(k => `${k}: ${formatValue(Reflect.get(val, k), depth + 1)}`).join(', ');
             return keys.length > 3 ? `{${entries}, ...}` : `{${entries}}`;
         } catch {
             return '[Object]';
@@ -170,7 +220,7 @@ function applyFormat(format: string, args: unknown[]): { text: string; consumed:
                         i += 2;
                         continue;
                     case 'j':
-                        try { result += JSON.stringify(arg); } catch { result += String(arg); }
+                        result += stringifyJsonValue(arg);
                         i += 2;
                         continue;
                     case 'o':
@@ -224,6 +274,14 @@ function buildOutput(args: unknown[]): string {
 
 function formatOutput(...args: unknown[]): string {
     return String(nativeConsole.format.apply(nativeConsole, args));
+}
+
+function emitConsoleWarning(message: string): void {
+    try {
+        process.emitWarning(message);
+        return;
+    } catch {}
+    if (typeof nativeConsole.warn === 'function') nativeConsole.warn(message);
 }
 
 export class Console {
@@ -310,13 +368,17 @@ export class Console {
     }
 
     time(label = 'default'): void {
+        if (this._timers.has(label)) {
+            emitConsoleWarning(`Label '${label}' already exists for console.time()`);
+            return;
+        }
         this._timers.set(label, performance.now());
     }
 
     timeLog(label = 'default', ...args: unknown[]): void {
         const start = this._timers.get(label);
         if (start === undefined) {
-            this.warn(`Timer '${label}' does not exist`);
+            emitConsoleWarning(`No such label '${label}' for console.timeLog()`);
             return;
         }
         const ms = performance.now() - start;
@@ -327,7 +389,7 @@ export class Console {
     timeEnd(label = 'default'): void {
         const start = this._timers.get(label);
         if (start === undefined) {
-            this.warn(`Timer '${label}' does not exist`);
+            emitConsoleWarning(`No such label '${label}' for console.timeEnd()`);
             return;
         }
         const ms = performance.now() - start;
@@ -342,6 +404,10 @@ export class Console {
     }
 
     countReset(label = 'default'): void {
+        if (!this._counters.has(label)) {
+            emitConsoleWarning(`Count for '${label}' does not exist`);
+            return;
+        }
         this._counters.delete(label);
     }
 
@@ -406,7 +472,7 @@ function buildTable(data: unknown, columns?: string[]): string[] {
                 const key = cols[i].key;
                 let val: string;
                 if (item && typeof item === 'object' && !Array.isArray(item)) {
-                    val = formatValue((item as Record<string, unknown>)[key]);
+                    val = formatValue(Reflect.get(item, key));
                 } else if (cols.length === 2 && cols[1].key === 'Value') {
                     val = formatValue(item);
                 } else {
@@ -446,7 +512,7 @@ function getTableColumns(data: unknown, columns?: string[]): TableColumn[] {
             if (item && typeof item === 'object' && !Array.isArray(item)) {
                 for (const key of Object.keys(item)) {
                     if (columns && !columns.includes(key)) continue;
-                    const val = formatValue((item as Record<string, unknown>)[key]);
+                    const val = formatValue(Reflect.get(item, key));
                     cols.set(key, Math.max(cols.get(key) || key.length, val.length, key.length));
                 }
             } else {
@@ -502,11 +568,11 @@ type ConsoleMethod =
 
 function forward(name: ConsoleMethod) {
     return (...args: unknown[]) => {
-        const fn = nativeConsole[name];
+        const fn = Reflect.get(nativeConsole, name);
         if (typeof fn === 'function') {
             return fn.apply(nativeConsole, args);
         }
-        const fallback = (globalThis.console as Record<string, any> | undefined)?.[name];
+        const fallback = globalThis.console ? Reflect.get(globalThis.console, name) : undefined;
         if (typeof fallback === 'function') {
             return fallback.apply(globalThis.console, args);
         }
@@ -540,5 +606,5 @@ export const groupEnd = forward('groupEnd');
 export const profile = forward('profile');
 export const profileEnd = forward('profileEnd');
 
-export const context = nativeConsole.context;
-export const createTask = nativeConsole.createTask;
+export const context = Reflect.get(nativeConsole, 'context');
+export const createTask = Reflect.get(nativeConsole, 'createTask');

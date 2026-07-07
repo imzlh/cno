@@ -5,19 +5,22 @@
 
 import type { Stream } from '../../deno/04_stdio';
 import { EventEmitter } from '../events';
+import { arrayBufferBackedBytes } from '../_internal/buffer';
 
 const streams = import.meta.use('streams');
 const engine = import.meta.use('engine');
 const text = import.meta.use('text');
 
-const { stdin, stdout } = streams as any as Record<string, Stream>;
+type StreamsWithStdio = typeof streams & { stdin: Stream; stdout: Stream };
+
+const { stdin, stdout } = streams as StreamsWithStdio;
 
 type OutputTarget = NodeJS.WritableStream | Stream;
 
 function isCnoStream(value: unknown): value is Stream {
     return !!value && typeof value === 'object'
-        && typeof (value as { write?: unknown }).write === 'function'
-        && typeof (value as { writeSync?: unknown }).writeSync === 'function';
+        && typeof Reflect.get(value, 'write') === 'function'
+        && typeof Reflect.get(value, 'writeSync') === 'function';
 }
 
 async function writeTarget(target: OutputTarget, data: string): Promise<void> {
@@ -114,7 +117,7 @@ export interface Interface extends EventEmitter {
     _readBuf: Uint8Array;
     _lineBuf: string[];
     _reading: boolean;
-    _decoder: any;
+    _decoder: CModuleText.Decoder;
     _outputQueue: Promise<void>;
     _detachInput?: () => void;
 
@@ -141,6 +144,7 @@ export interface Interface extends EventEmitter {
     resume(): this;
     write(data: string | Buffer, key?: { ctrl?: boolean; meta?: boolean; shift?: boolean; name: string }): void;
     getPrompt(): string;
+    [Symbol.asyncIterator](): AsyncIterableIterator<string>;
 
     readonly cursorPos: { rows: number; cols: number };
     readonly history: string[];
@@ -154,7 +158,7 @@ export interface InterfaceConstructor {
     prototype: Interface;
 }
 
-function initInterface(self: any, options: ReadLineOptions | NodeJS.ReadableStream): void {
+function initInterface(self: Interface, options: ReadLineOptions | NodeJS.ReadableStream): void {
     EventEmitter.call(self);
 
     self._prompt = '';
@@ -196,12 +200,12 @@ function initInterface(self: any, options: ReadLineOptions | NodeJS.ReadableStre
         else opts.signal.addEventListener('abort', () => self.close(), { once: true });
     }
 
-    if (opts.prompt) self._displayPrompt();
+    if (opts.prompt && self._terminal) self._displayPrompt();
     if (!self._paused) self._startRead();
 }
 
-export const Interface: InterfaceConstructor = function Interface(this: any, options: ReadLineOptions | NodeJS.ReadableStream) {
-    const target = this && (typeof this === 'object' || typeof this === 'function')
+export const Interface: InterfaceConstructor = function Interface(this: Interface | undefined, options: ReadLineOptions | NodeJS.ReadableStream) {
+    const target: Interface = this && (typeof this === 'object' || typeof this === 'function')
         ? this
         : Object.create(Interface.prototype);
     initInterface(target, options);
@@ -224,7 +228,6 @@ Interface.prototype._scheduleWrite = function _scheduleWrite(this: Interface, da
 };
 
 Interface.prototype._displayPrompt = function _displayPrompt(this: Interface): void {
-    if (!this._terminal) return;
     this._scheduleWrite(this._prompt);
 };
 
@@ -243,7 +246,7 @@ Interface.prototype._startRead = function _startRead(this: Interface): void {
         const onData = (chunk: string | Uint8Array) => {
             const textChunk = typeof chunk === 'string'
                 ? chunk
-                : this._decoder.decode(chunk as Uint8Array<ArrayBuffer>);
+                : this._decoder.decode(arrayBufferBackedBytes(chunk));
             this._processInput(textChunk);
         };
         const onEnd = () => {
@@ -399,7 +402,9 @@ Interface.prototype._tabComplete = function _tabComplete(this: Interface): void 
     try {
         const [completions] = this._completer(this._line);
         if (completions.length === 1) {
-            this._line = completions[0]!;
+            const completion = completions[0];
+            if (completion === undefined) return;
+            this._line = completion;
             this._cursorPos = this._line.length;
             this._refreshLine();
         } else if (completions.length > 1) {
@@ -491,23 +496,109 @@ Interface.prototype.close = function close(this: Interface): void {
 };
 
 Interface.prototype.pause = function pause(this: Interface): Interface {
+    if (this._closed || this._paused) return this;
     this._paused = true;
+    this._input.pause?.();
+    this.emit('pause');
     return this;
 };
 
 Interface.prototype.resume = function resume(this: Interface): Interface {
+    if (this._closed) return this;
+    const wasPaused = this._paused;
     this._paused = false;
+    this._input.resume?.();
+    if (wasPaused) this.emit('resume');
     if (!this._reading && !this._closed) this._startRead();
     return this;
 };
 
 Interface.prototype.write = function write(this: Interface, data: string | Buffer, _key?: { ctrl?: boolean; meta?: boolean; shift?: boolean; name: string }): void {
     if (this._closed) return;
-    const str = typeof data === 'string' ? data : new TextDecoder().decode(data as Uint8Array);
+    const str = typeof data === 'string' ? data : engine.decodeString(arrayBufferBackedBytes(data));
+    if (this._terminal && str.length > 0 && !/[\r\n\t\x00-\x1f\x7f]/.test(str)) {
+        const before = this._line.slice(0, this._cursorPos);
+        const after = this._line.slice(this._cursorPos);
+        this._line = before + str + after;
+        this._cursorPos += str.length;
+        this._scheduleWrite(str);
+        return;
+    }
     this._processInput(str);
 };
 
 Interface.prototype.getPrompt = function getPrompt(this: Interface): string { return this._prompt; };
+
+Interface.prototype[Symbol.asyncIterator] = function asyncIterator(this: Interface): AsyncIterableIterator<string> {
+    const rl = this;
+    const lines: string[] = [];
+    const waiters: Array<{
+        resolve: (value: IteratorResult<string>) => void;
+        reject: (reason?: unknown) => void;
+    }> = [];
+    let closed = rl.closed;
+    let error: unknown;
+
+    const cleanup = (): void => {
+        rl.off('line', onLine);
+        rl.off('close', onClose);
+        rl.off('error', onError);
+    };
+    const settle = (): void => {
+        while (waiters.length > 0) {
+            const waiter = waiters.shift();
+            if (!waiter) continue;
+            if (error) waiter.reject(error);
+            else if (lines.length > 0) waiter.resolve({ value: lines.shift()!, done: false });
+            else waiter.resolve({ value: undefined as never, done: true });
+        }
+    };
+    const onLine = (line: string): void => {
+        if (waiters.length > 0) waiters.shift()!.resolve({ value: line, done: false });
+        else lines.push(line);
+    };
+    const onClose = (): void => {
+        closed = true;
+        cleanup();
+        settle();
+    };
+    const onError = (err: unknown): void => {
+        error = err;
+        closed = true;
+        cleanup();
+        settle();
+    };
+
+    rl.on('line', onLine);
+    rl.once('close', onClose);
+    rl.once('error', onError);
+
+    return {
+        [Symbol.asyncIterator]() {
+            return this;
+        },
+        next(): Promise<IteratorResult<string>> {
+            if (error) return Promise.reject(error);
+            if (lines.length > 0) return Promise.resolve({ value: lines.shift()!, done: false });
+            if (closed) return Promise.resolve({ value: undefined as never, done: true });
+            return new Promise<IteratorResult<string>>((resolve, reject) => {
+                waiters.push({ resolve, reject });
+            });
+        },
+        return(): Promise<IteratorResult<string>> {
+            closed = true;
+            cleanup();
+            rl.close();
+            return Promise.resolve({ value: undefined as never, done: true });
+        },
+        throw(err?: unknown): Promise<IteratorResult<string>> {
+            error = err;
+            closed = true;
+            cleanup();
+            return Promise.reject(err);
+        },
+    };
+};
 
 Object.defineProperty(Interface.prototype, 'cursorPos', {
     get(this: Interface): { rows: number; cols: number } {
@@ -561,9 +652,11 @@ export function clearScreenDown(stream: NodeJS.WritableStream, callback?: () => 
     stream.write('\x1b[0J', () => callback?.());
 }
 
-export function cursorTo(stream: NodeJS.WritableStream, x: number, y?: number, callback?: () => void): void {
-    const seq = y !== undefined ? `\x1b[${y + 1};${x + 1}H` : `\x1b[${x + 1}G`;
-    stream.write(seq, () => callback?.());
+export function cursorTo(stream: NodeJS.WritableStream, x: number, y?: number | (() => void), callback?: () => void): void {
+    const cb = typeof y === 'function' ? y : callback;
+    const row = typeof y === 'number' ? y : undefined;
+    const seq = row !== undefined ? `\x1b[${row + 1};${x + 1}H` : `\x1b[${x + 1}G`;
+    stream.write(seq, () => cb?.());
 }
 
 export function moveCursor(stream: NodeJS.WritableStream, dx: number, dy: number, callback?: () => void): void {

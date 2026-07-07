@@ -21,6 +21,8 @@ interface CallbackInternal {
     closure: CModuleFFI.FfiClosure;
     refCount: number;
     closed: boolean;
+    definition: UnsafeCallbackDefinition;
+    callback: UnsafeCallbackFunction;
 }
 
 const callbackRegistry = new Map<PointerObject, CallbackInternal>();
@@ -58,6 +60,8 @@ export class UnsafeCallback<
             closure,
             refCount: 0,
             closed: false,
+            definition,
+            callback,
         };
         
         callbackRegistry.set(this.pointer, this.internal);
@@ -109,7 +113,7 @@ export class UnsafeCallback<
         if (!cif) {
             const retType = this.toFfiType(result);
             const argTypes = parameters.map(p => this.toFfiType(p));
-            cif = new ffi.FfiCif(retType, argTypes);
+            cif = new ffi.FfiCif(retType, ...argTypes);
             UnsafeCallback.cifCache.set(cacheKey, cif);
         }
         return cif;
@@ -121,10 +125,8 @@ export class UnsafeCallback<
             : `struct(${type.struct.map(member => this.typeCacheKey(member)).join(',')})`;
     }
 
-    private toFfiType(
- type: NativeType | 'void'
-    ): CModuleFFI.FfiType {
-        if (type === 'void') return ffi.FfiType.type_void;
+    private toFfiType(type: NativeType | 'void'): CModuleFFI.FfiType {
+        if (type === 'void') return ffi.type_void;
         if (typeof type !== 'string') {
             if ('struct' in type) {
                 const memberTypes = type.struct.map(t => this.toFfiType(t));
@@ -132,7 +134,7 @@ export class UnsafeCallback<
             }
         }
         
-        const typeMap: Record<string, keyof typeof ffi.FfiType> = {
+        const typeMap: Record<Extract<NativeType, string>, keyof typeof ffi> = {
             'u8': 'type_uint8',
             'i8': 'type_sint8',
             'u16': 'type_uint16',
@@ -151,22 +153,23 @@ export class UnsafeCallback<
             'isize': 'type_ssize',
         };
         
-        const propName = typeMap[type as string];
+        const propName = typeMap[type];
         if (!propName) {
             throw new TypeError(`Unknown type: ${type}`);
         }
         
-        return ffi.FfiType[propName] as CModuleFFI.FfiType;
+        return ffi[propName] as CModuleFFI.FfiType;
     }
 
     private wrapCallback(
         callback: UnsafeCallbackFunction,
         definition: UnsafeCallbackDefinition
-    ): (...args: Uint8Array[]) => Uint8Array {
-        return (...args: Uint8Array[]): Uint8Array => {
+    ): (...args: ArrayBuffer[]) => Uint8Array {
+        return (...args: ArrayBuffer[]): Uint8Array => {
             try {
-                const convertedArgs = this.convertArgs(args, definition.parameters);
-                const result = callback.apply(null, convertedArgs as any[]);
+                const buffers = args.map(arg => new Uint8Array(arg));
+                const convertedArgs = this.convertArgs(buffers, definition.parameters);
+                const result = Reflect.apply(callback, null, convertedArgs);
                 return this.convertResult(result, definition.result);
             } catch (err) {
                 console.error('UnsafeCallback error:', err);
@@ -220,15 +223,15 @@ export class UnsafeCallback<
             switch (type) {
                 case 'u8':
                 case 'i8':
-                    view.setUint8(0, result as number);
+                    view.setUint8(0, Number(result));
                     break;
                 case 'u16':
                 case 'i16':
-                    view.setUint16(0, result as number, true);
+                    view.setUint16(0, Number(result), true);
                     break;
                 case 'u32':
                 case 'i32':
-                    view.setUint32(0, result as number, true);
+                    view.setUint32(0, Number(result), true);
                     break;
                 case 'u64':
                 case 'usize':
@@ -239,10 +242,10 @@ export class UnsafeCallback<
                     view.setBigInt64(0, result as bigint, true);
                     break;
                 case 'f32':
-                    view.setFloat32(0, result as number, true);
+                    view.setFloat32(0, Number(result), true);
                     break;
                 case 'f64':
-                    view.setFloat64(0, result as number, true);
+                    view.setFloat64(0, Number(result), true);
                     break;
                 case 'bool':
                     view.setUint8(0, result ? 1 : 0);
@@ -261,4 +264,14 @@ export class UnsafeCallback<
         
         return new Uint8Array(buf);
     }
+}
+
+export function callRegisteredCallback(pointer: PointerValue, args: readonly unknown[]): { found: boolean; value?: unknown } {
+    if (pointer === null) return { found: false };
+    const internal = callbackRegistry.get(pointer);
+    if (!internal || internal.closed) return { found: false };
+    return {
+        found: true,
+        value: internal.callback(...args as []),
+    };
 }

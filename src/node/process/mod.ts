@@ -4,10 +4,11 @@
  */
 
 import { EventEmitter } from '../events';
-import { IPCChannel } from '../ipc_channel';
+import { IPCChannel, type IPCSerialization } from '../ipc_channel';
 import { stdout, stderr, stdin } from './streams';
 import { hrtime, memoryUsage, cpuUsage, resourceUsage } from './metrics';
 import { normalizeErrnoError } from '../_internal/errno';
+import { loadEnvFile as loadDotenvFile } from '../_internal/envfile';
 
 const os = import.meta.use('os');
 const engine = import.meta.use('engine');
@@ -15,13 +16,27 @@ const sig = import.meta.use('signals');
 const proc = import.meta.use('process');
 const streams = import.meta.use('streams');
 const console = import.meta.use('console');
+const errMod = import.meta.use('error');
+
+interface CnoProcessArgs {
+    nodeArgv(): string[];
+    nodeArgv0(): string;
+    nodeExecArgv(): string[];
+}
+
+type ProcessOsModule = typeof os & {
+    __cno_args: CnoProcessArgs;
+    umask?: (mask?: number) => number;
+    getgroups?: () => number[];
+};
+
+const processOs = os as ProcessOsModule;
 
 // argv shapes come from cno/src/utils/args via the os shared namespace — node
 // modules must not import across the node/ boundary (AGENT.md). Read once here;
 // cno-cli sets argv before any user code runs, so the snapshot is stable and
 // stays mutable like Node's real process.argv.
-// @ts-ignore - ns
-const cno_args = os.__cno_args;
+const cno_args = processOs.__cno_args;
 
 // Re-export streams and metrics under their original names
 export { stdout, stderr, stdin };
@@ -37,31 +52,71 @@ function safeGetEnv(env: string): string | undefined {
     }
 }
 
+function unsetEnvQuietly(name: string): void {
+    try {
+        os.unsetenv(name);
+    } catch {
+        // Best-effort cleanup for inherited child-process bootstrap variables.
+    }
+}
+
+function readUmask(): number {
+    try {
+        return processOs.umask?.() ?? 0o022;
+    } catch {
+        return 0o022;
+    }
+}
+
+function writeUmask(mask: number): void {
+    try {
+        processOs.umask?.(mask);
+    } catch {
+        // Some hosts do not expose a writable umask.
+    }
+}
+
+function processGroups(): number[] {
+    try {
+        return processOs.getgroups?.() ?? [];
+    } catch {
+        return [];
+    }
+}
+
+function normalizeSignal(signal?: string | number): CModuleProcess.Signal | number | undefined {
+    if (signal === undefined || typeof signal === 'number') return signal;
+    const signals = sig?.signals;
+    if (!signals) return signal as CModuleProcess.Signal;
+    if (typeof signals[signal] === 'number') return signal as CModuleProcess.Signal;
+    return signal as CModuleProcess.Signal;
+}
+
 // Signal handling
 
-const signalMap: Map<NodeJS.Signals, Map<() => void, CModuleSignals.SignalHandler>> = new Map();
+const signalMap: Map<string, Map<() => void, CModuleSignals.SignalHandler>> = new Map();
 
 // Signals that are not supported on this platform
 const UNSUPPORTED_SIGNALS = new Set(['SIGBREAK', 'SIGIOT', 'SIGPOLL', 'SIGSTKFLT', 'SIGUNUSED', 'SIGLOST', 'SIGINFO']);
 
-function throwIfUnsupportedSignal(signalName: NodeJS.Signals): void {
+function throwIfUnsupportedSignal(signalName: string): void {
     if (UNSUPPORTED_SIGNALS.has(signalName))
         throw new Error('The requested signal is not supported.');
 }
 
-function addSignalListener(signalName: NodeJS.Signals, listener: () => void): void {
+function addSignalListener(signalName: string, listener: () => void): void {
     throwIfUnsupportedSignal(signalName);
     if (!sig) throw new Error('signal handling is unavailable outside the main thread');
-    const sigint = (sig.signals as any)[signalName];
+    const sigint = sig.signals[signalName];
     if (typeof sigint !== 'number') {
         throw new Error(`Invalid signal: ${signalName}`);
     }
 
-    if (!signalMap.has(signalName)) {
-        signalMap.set(signalName, new Map());
+    let map = signalMap.get(signalName);
+    if (!map) {
+        map = new Map();
+        signalMap.set(signalName, map);
     }
-
-    const map = signalMap.get(signalName)!;
     if (map.has(listener)) {
         return;
     }
@@ -70,10 +125,10 @@ function addSignalListener(signalName: NodeJS.Signals, listener: () => void): vo
     map.set(listener, ret);
 }
 
-function removeSignalListener(signalName: NodeJS.Signals, listener: () => void): void {
+function removeSignalListener(signalName: string, listener: () => void): void {
     throwIfUnsupportedSignal(signalName);
     if (!sig) throw new Error('signal handling is unavailable outside the main thread');
-    const sigint = (sig.signals as any)[signalName];
+    const sigint = sig.signals[signalName];
     if (typeof sigint !== 'number') {
         throw new Error(`Invalid signal: ${signalName}`);
     }
@@ -88,10 +143,25 @@ function removeSignalListener(signalName: NodeJS.Signals, listener: () => void):
     }
 }
 
+function shouldRefIpcForProcessEvent(event: string | symbol): boolean {
+    return event === 'message' || event === 'disconnect';
+}
+
+function hasIpcRefListener(emitter: EventEmitter): boolean {
+    return emitter.listenerCount('message') > 0 || emitter.listenerCount('disconnect') > 0;
+}
+
+function syncIpcRef(emitter: EventEmitter): void {
+    if (!_ipcChannel) return;
+    if (hasIpcRefListener(emitter)) _ipcChannel.ref();
+    else _ipcChannel.unref();
+}
+
 // Environment variables
 
-const envProxy = new Proxy({} as NodeJS.ProcessEnv, {
-    get(target, key: string | symbol, receiver: any): any {
+const envTarget: NodeJS.ProcessEnv = {};
+const envProxy = new Proxy(envTarget, {
+    get(target, key: string | symbol, receiver: unknown): unknown {
         if (typeof key !== 'string') {
             return Reflect.get(target, key, receiver);
         }
@@ -99,11 +169,11 @@ const envProxy = new Proxy({} as NodeJS.ProcessEnv, {
         if (value !== undefined) return value;
         return Reflect.get(target, key, receiver);
     },
-    set(target, key: string | symbol, value: string, receiver: any): boolean {
+    set(target, key: string | symbol, value: unknown, receiver: unknown): boolean {
         if (typeof key !== 'string') {
             return Reflect.set(target, key, value, receiver);
         }
-        os.setenv(key, value);
+        os.setenv(key, String(value));
         return true;
     },
     has(target, key: string | symbol): boolean {
@@ -134,57 +204,164 @@ const envProxy = new Proxy({} as NodeJS.ProcessEnv, {
 
 // Process EventEmitter
 
+type ProcessListener = (...args: unknown[]) => void;
+type SendCallback = (error: Error | null) => void;
+
 class ProcessEventEmitter extends EventEmitter {
-    override emit(event: string | Symbol, ...args: any[]): boolean {
+    override emit(event: string | symbol, ...args: unknown[]): boolean {
+        let emitted: boolean;
         if (typeof event == 'string' && (event.startsWith('SIG') || event.startsWith('sig'))) {
-            return super.emit(event, ...args);
+            emitted = super.emit(event, ...args);
+        } else {
+            emitted = super.emit(event.toString(), ...args);
         }
-        return super.emit(event.toString(), ...args);
+        if (shouldRefIpcForProcessEvent(event)) syncIpcRef(this);
+        return emitted;
     }
 
-    override on(event: string | symbol, listener: any): this {
+    override on(event: string | symbol, listener: ProcessListener): this {
         if (typeof event === 'string' && (event.startsWith('SIG') || event.startsWith('sig'))) {
-            addSignalListener(event as NodeJS.Signals, listener);
+            addSignalListener(event, listener);
         }
-        return super.on(event, listener);
+        const result = super.on(event, listener);
+        if (shouldRefIpcForProcessEvent(event)) syncIpcRef(this);
+        return result;
     }
 
-    override once(event: string | symbol, listener: any): this {
+    override once(event: string | symbol, listener: ProcessListener): this {
         if (typeof event === 'string' && (event.startsWith('SIG') || event.startsWith('sig'))) {
             // Register with the native signal system using a wrapper that cleans
             // itself up AND removes the super.once listener to avoid double-fire.
             const onceListener = () => {
-                removeSignalListener(event as NodeJS.Signals, onceListener);
+                removeSignalListener(event, onceListener);
                 // Remove the super.once wrapper so it doesn't fire again
                 super.off(event, wrappedListener);
                 listener();
             };
             const wrappedListener = onceListener;
-            addSignalListener(event as NodeJS.Signals, onceListener);
+            addSignalListener(event, onceListener);
             // Register with super.once only so EventEmitter tracks the listener,
             // but we intercept via onceListener above and remove it before it fires.
             return super.once(event, wrappedListener);
         }
-        return super.once(event, listener);
+        const result = super.once(event, listener);
+        if (shouldRefIpcForProcessEvent(event)) syncIpcRef(this);
+        return result;
     }
 
-    override off(event: string | symbol, listener: any): this {
+    override prependListener(event: string | symbol, listener: ProcessListener): this {
+        const result = super.prependListener(event, listener);
+        if (shouldRefIpcForProcessEvent(event)) syncIpcRef(this);
+        return result;
+    }
+
+    override prependOnceListener(event: string | symbol, listener: ProcessListener): this {
+        const result = super.prependOnceListener(event, listener);
+        if (shouldRefIpcForProcessEvent(event)) syncIpcRef(this);
+        return result;
+    }
+
+    override off(event: string | symbol, listener: ProcessListener): this {
         if (typeof event === 'string' && (event.startsWith('SIG') || event.startsWith('sig'))) {
-            removeSignalListener(event as NodeJS.Signals, listener);
+            removeSignalListener(event, listener);
         }
-        return super.off(event, listener);
+        const result = super.off(event, listener);
+        if (shouldRefIpcForProcessEvent(event)) syncIpcRef(this);
+        return result;
+    }
+
+    override removeAllListeners(event?: string | symbol): this {
+        const result = super.removeAllListeners(event);
+        if (
+            event === undefined ||
+            shouldRefIpcForProcessEvent(event)
+        ) {
+            syncIpcRef(this);
+        }
+        return result;
     }
 }
 
 const processEE = new ProcessEventEmitter();
+type NextTickCallback = (...args: unknown[]) => void;
+const nextTickQueue: Array<{ callback: NextTickCallback; args: unknown[] }> = [];
+let nextTickScheduled = false;
+
+function drainNextTickQueue(): void {
+    nextTickScheduled = false;
+    while (nextTickQueue.length > 0) {
+        const batch = nextTickQueue.splice(0);
+        for (const { callback, args } of batch) {
+            try {
+                callback(...args);
+            } catch (error) {
+                handleUncaughtException(error);
+            }
+        }
+    }
+}
+
+function handleUncaughtException(error: unknown): void {
+    processEE.emit('uncaughtExceptionMonitor', error, 'uncaughtException');
+    if (processEE.listenerCount('uncaughtException') > 0) {
+        processEE.emit('uncaughtException', error, 'uncaughtException');
+        return;
+    }
+    throw error;
+}
+
+function scheduleNextTickDrain(): void {
+    if (nextTickScheduled) return;
+    nextTickScheduled = true;
+    queueMicrotask(drainNextTickQueue);
+}
+
+type ProcessWarningOptions = string | { type?: string; code?: string; detail?: string };
+type ProcessWarning = Error & { code?: string; detail?: string };
+type MutableErrnoError = Error & { code?: string; errno?: number };
+
+function normalizeExitCodeValue(value: unknown): number | undefined {
+    if (value === undefined) return undefined;
+    const n = typeof value === 'string' ? Number(value) : value;
+    if (typeof n !== 'number' || !Number.isInteger(n)) {
+        throw new TypeError('The "code" argument must be an integer');
+    }
+    return n;
+}
+
+function createProcessWarning(
+    warning: string | Error,
+    options?: ProcessWarningOptions,
+): ProcessWarning {
+    const detailOptions = typeof options === 'string' ? { type: options } : options ?? {};
+    const out: ProcessWarning = warning instanceof Error ? warning : new Error(String(warning));
+    out.name = detailOptions.type ?? (out.name === 'Error' ? 'Warning' : out.name);
+    if (detailOptions.code !== undefined) out.code = detailOptions.code;
+    if (detailOptions.detail !== undefined) out.detail = detailOptions.detail;
+    return out;
+}
 
 // Process object
 
 const uname = os.uname();
 
-export const argv: string[] = cno_args.nodeArgv();
-export const argv0: string = cno_args.nodeArgv0();
-export const execArgv: string[] = cno_args.nodeExecArgv();
+export const argv: string[] = [];
+export let argv0: string = '';
+export const execArgv: string[] = [];
+
+function replaceArray(target: string[], values: string[]): void {
+    target.length = 0;
+    for (const value of values) target.push(value);
+}
+
+function refreshProcessArgs(): void {
+    replaceArray(argv, cno_args.nodeArgv());
+    replaceArray(execArgv, cno_args.nodeExecArgv());
+    argv0 = cno_args.nodeArgv0();
+}
+
+refreshProcessArgs();
+Reflect.set(os, '__cno_process_args_refresh', refreshProcessArgs);
 
 export const pid: number = os.pid;
 export const ppid: number = os.ppid;
@@ -237,11 +414,15 @@ export function cwd(): string {
 }
 
 export function chdir(directory: string): void {
-    os.chdir(directory);
+    try {
+        os.chdir(directory);
+    } catch (e) {
+        throw normalizeErrnoError(e, 'chdir', directory);
+    }
 }
 
 export function exit(code?: number): never {
-    const exitCode_ = code ?? exitCode ?? 0;
+    const exitCode_ = normalizeExitCodeValue(code) ?? exitCode ?? 0;
     _exiting = true;
     processEE.emit('exit', exitCode_);
     os.exit(exitCode_);
@@ -256,20 +437,33 @@ export const execPath: string = os.exePath;
 export let title: string = 'node';
 
 export const version: string = 'v24.1.0';
-export const versions: NodeJS.ProcessVersions = {
+type CnoProcessVersions = NodeJS.ProcessVersions & {
+    deno: string;
+    typescript: string;
+};
+
+const llhttpVersion = engine.versions.llhttp ?? '9.2.1';
+
+export const versions: CnoProcessVersions = {
     node: '24.1.0',
     v8: engine.versions.quickjs,
     modules: '127',
-    http_parser: engine.versions.llhttp ?? '9.2.1',
+    http_parser: llhttpVersion,
+    llhttp: llhttpVersion,
     uv: engine.versions.uv,
     zlib: engine.versions.zlib,
+    brotli: '1.1.0',
     ares: '1.34.4',
     openssl: engine.versions.openssl,
     napi: '9',
+    cldr: '46.0',
     icu: '76.1',
+    tz: '2025b',
     unicode: '16.0',
     nghttp2: '1.62.1',
     acorn: '8.14.0',
+    deno: engine.versions.core,
+    typescript: '5.9.2',
 };
 
 export const config: NodeJS.ProcessConfig = {
@@ -322,15 +516,22 @@ export function uptime(): number {
     return os.uptime();
 }
 
-export const on = processEE.on.bind(processEE) as any;
-export const off = processEE.off.bind(processEE) as any;
-export const once = processEE.once.bind(processEE) as any;
-export const emit = processEE.emit.bind(processEE) as any;
-export const addListener = processEE.on.bind(processEE) as any;
-export const removeListener = processEE.off.bind(processEE) as any;
-export const removeAllListeners = processEE.removeAllListeners.bind(processEE) as any;
-export const prependListener = processEE.prependListener.bind(processEE) as any;
-export const prependOnceListener = processEE.prependOnceListener.bind(processEE) as any;
+export const on = (event: string | symbol, listener: ProcessListener): ProcessEventEmitter =>
+    processEE.on(event, listener);
+export const off = (event: string | symbol, listener: ProcessListener): ProcessEventEmitter =>
+    processEE.off(event, listener);
+export const once = (event: string | symbol, listener: ProcessListener): ProcessEventEmitter =>
+    processEE.once(event, listener);
+export const emit = (event: string | symbol, ...args: unknown[]): boolean =>
+    processEE.emit(event, ...args);
+export const addListener = on;
+export const removeListener = off;
+export const removeAllListeners = (event?: string | symbol): ProcessEventEmitter =>
+    processEE.removeAllListeners(event);
+export const prependListener = (event: string | symbol, listener: ProcessListener): ProcessEventEmitter =>
+    processEE.prependListener(event, listener);
+export const prependOnceListener = (event: string | symbol, listener: ProcessListener): ProcessEventEmitter =>
+    processEE.prependOnceListener(event, listener);
 
 export function listenerCount(event: string | symbol): number {
     return processEE.listenerCount(event);
@@ -340,11 +541,11 @@ export function eventNames(): (string | symbol)[] {
     return processEE.eventNames();
 }
 
-export function listeners(event: string | symbol): Function[] {
+export function listeners(event: string | symbol): ProcessListener[] {
     return processEE.listeners(event);
 }
 
-export function rawListeners(event: string | symbol): Function[] {
+export function rawListeners(event: string | symbol): ProcessListener[] {
     return processEE.rawListeners(event);
 }
 
@@ -354,7 +555,7 @@ export function getMaxListeners(): number {
 
 export function setMaxListeners(n: number): typeof process {
     processEE.setMaxListeners(n);
-    return process;
+    return processDefault as typeof process;
 }
 
 export const permission: NodeJS.ProcessPermission = {
@@ -374,8 +575,10 @@ export const report: NodeJS.ProcessReport = {
     writeReport: () => '',
 };
 
-export function emitWarning(warning: string | Error, options?: any): void {
-    console.warn(warning);
+export function emitWarning(warning: string | Error, options?: ProcessWarningOptions): void {
+    const normalized = createProcessWarning(warning, options);
+    console.warn(normalized.message);
+    nextTick(() => processEE.emit('warning', normalized));
 }
 
 export function getuid(): number {
@@ -409,30 +612,33 @@ export function setegid(): void { unsupported('setegid'); }
 export function setgroups(): void { unsupported('setgroups'); }
 
 export function umask(mask?: number | string): number {
-    const readMask = () => { try { return (os as any).umask?.() ?? 0o022; } catch { return 0o022; } };
-    const prev = readMask();
+    const prev = readUmask();
     if (mask !== undefined) {
-        try { (os as any).umask?.(typeof mask === 'string' ? parseInt(mask, 8) : mask); } catch {}
+        writeUmask(typeof mask === 'string' ? parseInt(mask, 8) : mask);
     }
     return prev;
 }
 
-export function nextTick(callback: Function, ...args: any[]): void {
-    queueMicrotask(() => callback(...args));
+export function nextTick(callback: NextTickCallback, ...args: unknown[]): void {
+    if (typeof callback !== 'function') {
+        throw new TypeError('The "callback" argument must be of type Function');
+    }
+    nextTickQueue.push({ callback, args });
+    scheduleNextTickDrain();
 }
 
 export let connected: boolean = false;
 
-export let channel: any = null;
+export let channel: IPCChannel | null = null;
 
 export function kill(pid: number, signal?: string | number): boolean {
     try {
-        proc.kill(pid, signal as any);
+        proc.kill(pid, normalizeSignal(signal));
     } catch (e) {
-        const err = normalizeErrnoError(e, 'kill');
-        if ((err as NodeJS.ErrnoException).code === 'UNKNOWN(-3)') {
-            (err as NodeJS.ErrnoException).code = 'ESRCH';
-            (err as NodeJS.ErrnoException).errno = -4043;
+        const err: MutableErrnoError = normalizeErrnoError(e, 'kill');
+        if (err.code === 'UNKNOWN(-3)') {
+            err.code = 'ESRCH';
+            err.errno = -4043;
         }
         throw err;
     }
@@ -464,13 +670,23 @@ export function getActiveResourcesInfo(): string[] {
 
 export function getBuiltinModule(id: string): NodeJS.Module | undefined {
     try {
-        return require(id);
+        return require(id) as NodeJS.Module;
     } catch {
         return undefined;
     }
 }
 
-export const allowedNodeEnvironmentFlags: Set<string> = new Set([
+class AllowedNodeEnvironmentFlags extends Set<string> {
+    override has(value: string): boolean {
+        if (super.has(value)) return true;
+        if (typeof value !== 'string') return false;
+        const eq = value.indexOf('=');
+        if (eq === -1) return false;
+        return super.has(value.slice(0, eq));
+    }
+}
+
+export const allowedNodeEnvironmentFlags: Set<string> = new AllowedNodeEnvironmentFlags([
     '--require', '-r', '--import', '--loader', '--inspect', '--inspect-brk',
     '--inspect-port', '--abort-on-uncaught-exception', '--no-deprecation',
     '--trace-deprecation', '--throw-deprecation', '--enable-source-maps',
@@ -478,17 +694,20 @@ export const allowedNodeEnvironmentFlags: Set<string> = new Set([
 
 export const throwDeprecation: boolean = false;
 export const traceDeprecation: boolean = false;
-export const noDeprecation: boolean | undefined = undefined;
+export let noDeprecation: boolean | undefined = undefined;
 
-export function ref(maybeRefable: any): void { }
+export function ref(maybeRefable: unknown): void { }
 
-export function unref(maybeRefable: any): void { }
+export function unref(maybeRefable: unknown): void { }
 
-export function loadEnvFile(path?: any): void {
-    unsupported('process.loadEnvFile');
+export function loadEnvFile(path?: string | URL): void {
+    const loaded = loadDotenvFile(path ?? '.env');
+    if (loaded === null) {
+        throw new Error(`Failed to load env file: ${path === undefined ? '.env' : String(path)}`);
+    }
 }
 
-export const sourceMapsEnabled: boolean = false;
+export const sourceMapsEnabled: boolean = true;
 
 export function setSourceMapsEnabled(value: boolean): void { }
 
@@ -496,7 +715,48 @@ export const domain: null = null;
 
 export const moduleLoadList: string[] = [];
 
-export function binding(id: string): any {
+type UvBinding = {
+    errname(code: number): string;
+    getErrorMessage(code: number): string;
+    getErrorMap(): Map<number, [string, string]>;
+    getCodeMap(): Map<string, number>;
+};
+
+let uvBinding: UvBinding | undefined;
+
+function createUvBinding(): UvBinding {
+    const errorMap = new Map<number, [string, string]>();
+    const codeMap = new Map<string, number>();
+    for (const [name, code] of Object.entries(errMod.errno)) {
+        if (name === 'OK' || name === 'UNKNOWN') continue;
+        if (typeof code !== 'number') continue;
+        const errno = code;
+        const message = errMod.strerror(errno).replace(new RegExp(`^${name}:\\s*`), '');
+        errorMap.set(errno, [name, message]);
+        codeMap.set(name, errno);
+    }
+
+    return {
+        errname(code: number): string {
+            return errorMap.get(code)?.[0] ?? `Unknown system error ${code}`;
+        },
+        getErrorMessage(code: number): string {
+            return errorMap.get(code)?.[1] ?? `Unknown system error ${code}`;
+        },
+        getErrorMap(): Map<number, [string, string]> {
+            return new Map(errorMap);
+        },
+        getCodeMap(): Map<string, number> {
+            return new Map(codeMap);
+        },
+    };
+}
+
+export function binding(id: string): UvBinding {
+    if (id === 'uv') {
+        uvBinding ??= createUvBinding();
+        return uvBinding;
+    }
     throw new Error(`process.binding('${id}') is not supported`);
 }
 
@@ -509,12 +769,12 @@ export function _getActiveRequests(): object[] {
 }
 
 export function openStdin(): typeof stdin {
-    stdin.resume();
+    stdin.resume?.();
     return stdin;
 }
 
 export function getgroups(): number[] {
-    try { return (os as any).getgroups?.() ?? []; } catch { return []; }
+    return processGroups();
 }
 
 export function initgroups(): void { unsupported('initgroups'); }
@@ -541,6 +801,168 @@ export function hasUncaughtExceptionCaptureCallback(): boolean {
 
 export const traceProcessWarnings: boolean = false;
 
+function Process(this: object): void { }
+
+const PROCESS_DEFAULT_SINGLETON = Symbol.for('cno.node.process.default');
+
+function getExistingProcessDefault(): NodeJS.Process & Record<string, unknown> | null {
+    const existing = Reflect.get(globalThis, PROCESS_DEFAULT_SINGLETON);
+    if (existing && (typeof existing === 'object' || typeof existing === 'function')) {
+        return existing as NodeJS.Process & Record<string, unknown>;
+    }
+    return null;
+}
+
+const existingProcessDefault = getExistingProcessDefault();
+
+const processDefault = existingProcessDefault ?? {
+    stdout,
+    stderr,
+    stdin,
+    env,
+    argv,
+    get argv0() { return argv0; },
+    execArgv,
+    pid,
+    ppid,
+    platform,
+    arch,
+    version,
+    versions,
+    config,
+    release,
+    features,
+    permission,
+    report,
+    on,
+    off,
+    once,
+    emit,
+    addListener,
+    removeListener,
+    removeAllListeners,
+    prependListener,
+    prependOnceListener,
+    listenerCount,
+    eventNames,
+    listeners,
+    rawListeners,
+    getMaxListeners,
+    setMaxListeners,
+    cwd,
+    chdir,
+    exit,
+    uptime,
+    hrtime,
+    memoryUsage,
+    cpuUsage,
+    resourceUsage,
+    emitWarning,
+    getuid,
+    getgid,
+    geteuid,
+    getegid,
+    setuid,
+    setgid,
+    seteuid,
+    setegid,
+    setgroups,
+    umask,
+    nextTick,
+    kill,
+    abort,
+    debugPort,
+    dlopen,
+    finalization,
+    getActiveResourcesInfo,
+    getBuiltinModule,
+    allowedNodeEnvironmentFlags,
+    ref,
+    unref,
+    loadEnvFile,
+    setSourceMapsEnabled,
+    domain,
+    moduleLoadList,
+    binding,
+    _getActiveHandles,
+    _getActiveRequests,
+    openStdin,
+    getgroups,
+    initgroups,
+    threadCpuUsage,
+    constrainedMemory,
+    availableMemory,
+    setUncaughtExceptionCaptureCallback,
+    hasUncaughtExceptionCaptureCallback,
+    traceDeprecation,
+    throwDeprecation,
+	traceProcessWarnings,
+	constructor: Process,
+} as NodeJS.Process & Record<string, unknown>;
+
+if (existingProcessDefault) Reflect.set(processDefault, 'versions', versions);
+
+if (!existingProcessDefault) Object.defineProperties(processDefault, {
+    exitCode: {
+        enumerable: true,
+        configurable: true,
+        get: () => exitCode,
+        set: (value: unknown) => { exitCode = normalizeExitCodeValue(value); },
+    },
+    _exiting: {
+        enumerable: true,
+        configurable: true,
+        get: () => _exiting,
+        set: (value: unknown) => { _exiting = Boolean(value); },
+    },
+    execPath: {
+        enumerable: true,
+        configurable: true,
+        writable: true,
+        value: execPath,
+    },
+    title: {
+        enumerable: true,
+        configurable: true,
+        get: () => title,
+        set: (value: unknown) => { title = String(value); },
+    },
+    mainModule: {
+        enumerable: true,
+        configurable: true,
+        writable: true,
+        value: mainModule,
+    },
+    connected: {
+        enumerable: true,
+        configurable: true,
+        get: () => connected,
+        set: (value: unknown) => { connected = Boolean(value); },
+    },
+    channel: {
+        enumerable: true,
+        configurable: true,
+        get: () => channel,
+        set: (value: unknown) => { channel = value as IPCChannel | null; },
+    },
+    noDeprecation: {
+        enumerable: true,
+        configurable: true,
+        get: () => noDeprecation,
+        set: (value: unknown) => { noDeprecation = value === undefined ? undefined : Boolean(value); },
+    },
+    sourceMapsEnabled: {
+        enumerable: true,
+        configurable: true,
+        writable: true,
+        value: sourceMapsEnabled,
+    },
+});
+
+if (!existingProcessDefault) Reflect.set(globalThis, PROCESS_DEFAULT_SINGLETON, processDefault);
+
+export default processDefault;
+
 // IPC Channel support (for child_process)
 
 let _ipcChannel: IPCChannel | null = null;
@@ -548,58 +970,94 @@ let _ipcChannel: IPCChannel | null = null;
 /**
  * Set up IPC channel for child process (called by child_process module)
  */
-export function _setupIPC(pipe: any): void {
-    _ipcChannel = new IPCChannel(pipe);
+export function _setupIPC(pipe: CModuleStreams.Pipe, serialization: IPCSerialization = 'json'): IPCChannel {
+    if (existingProcessDefault) {
+        const setup = Reflect.get(processDefault, '_setupIPC');
+        if (typeof setup === 'function' && setup !== _setupIPC) {
+            return Reflect.apply(setup, processDefault, [pipe, serialization]) as IPCChannel;
+        }
+    }
+
+    _ipcChannel = new IPCChannel(pipe, serialization);
     connected = true;
     channel = _ipcChannel;
 
     _ipcChannel.on('message', (msg) => {
-        process.emit('message', msg);
+        processDefault.emit('message', msg);
     });
 
     _ipcChannel.on('error', (err: Error) => {
-        process.emit('error', err);
+        processDefault.emit('error', err);
     });
 
     _ipcChannel.on('close', () => {
         connected = false;
         channel = null;
-        process.emit('disconnect');
+        processDefault.emit('disconnect');
     });
+
+    return _ipcChannel;
 }
 
 /**
  * Send a message to the parent process
  */
-export function send(message: any, callback?: (error: Error | null) => void): boolean {
+export function send(message: unknown, sendHandleOrCallback?: unknown, optionsOrCallback?: unknown, callback?: SendCallback): boolean {
+    if (existingProcessDefault) {
+        const activeSend = Reflect.get(processDefault, 'send');
+        if (typeof activeSend === 'function' && activeSend !== send) {
+            return Boolean(Reflect.apply(activeSend, processDefault, [
+                message,
+                sendHandleOrCallback,
+                optionsOrCallback,
+                callback,
+            ]));
+        }
+    }
+
+    const cb = typeof sendHandleOrCallback === 'function'
+        ? sendHandleOrCallback as SendCallback
+        : typeof optionsOrCallback === 'function'
+            ? optionsOrCallback as SendCallback
+            : callback;
+
     if (!_ipcChannel || !_ipcChannel.connected) {
-        const err = new Error('IPC channel is not established') as NodeJS.ErrnoException;
-        err.code = 'ERR_IPC_CHANNEL_CLOSED';
-        if (callback) { callback(err); return false; }
+        const err = Object.assign(new Error('IPC channel is not established'), {
+            code: 'ERR_IPC_CHANNEL_CLOSED',
+        });
+        if (cb) {
+            queueMicrotask(() => cb(err));
+            return false;
+        }
         return false;
     }
 
-    try {
-        // Node sends user messages verbatim (no wrapper) so that the peer —
-        // including a real node process — receives exactly what was sent.
-        _ipcChannel.send(message);
-        if (callback) callback(null);
-        return true;
-    } catch (err) {
-        if (callback) callback(err as Error);
-        return false;
-    }
+    // Node sends user messages verbatim (no wrapper) so that the peer —
+    // including a real node process — receives exactly what was sent.
+    _ipcChannel.send(message);
+    if (cb) queueMicrotask(() => cb(null));
+    return true;
 }
 
 /**
  * Disconnect the IPC channel
  */
 export function disconnect(): void {
+    if (existingProcessDefault) {
+        const activeDisconnect = Reflect.get(processDefault, 'disconnect');
+        if (typeof activeDisconnect === 'function' && activeDisconnect !== disconnect) {
+            Reflect.apply(activeDisconnect, processDefault, []);
+            return;
+        }
+    }
+
     if (_ipcChannel) {
         _ipcChannel.close();
         _ipcChannel = null;
     }
 }
+
+if (!existingProcessDefault) Object.assign(processDefault, { _setupIPC, send, disconnect });
 
 // ============================================================================
 // Child-side IPC bootstrap
@@ -612,16 +1070,20 @@ export function disconnect(): void {
 // No-op for normally launched processes (NODE_CHANNEL_FD unset).
 // ============================================================================
 (function bootstrapChildIPC() {
+    if (existingProcessDefault) return;
     const fdStr = safeGetEnv('NODE_CHANNEL_FD');
     if (!fdStr) return;
     const fd = parseInt(fdStr, 10);
     if (!Number.isInteger(fd) || fd < 0) return;
     try {
-        const pipe = new (streams as any).Pipe();
+        const serialization = safeGetEnv('CNO_IPC_SERIALIZATION') === 'advanced' ? 'advanced' : 'json';
+        const pipe = new streams.Pipe();
         pipe.open(fd);
-        _setupIPC(pipe);
+        const ipcChannel = _setupIPC(pipe, serialization);
+        ipcChannel.unref();
         // Prevent grandchildren from wrongly inheriting this channel fd.
-        try { os.unsetenv('NODE_CHANNEL_FD'); } catch { /* ignore */ }
+        unsetEnvQuietly('NODE_CHANNEL_FD');
+        unsetEnvQuietly('CNO_IPC_SERIALIZATION');
     } catch {
         // IPC bootstrap failed; the child simply has no usable channel.
     }

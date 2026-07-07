@@ -13,13 +13,16 @@ const os = import.meta.use('os');
 function pipeToReadable(pipe: CModuleStreams.Pipe): ReadableStream<Uint8Array> {
     return new ReadableStream({
         pull: async (controller) => {
-            try {
-                const buf = malloc(controller);
-                const n = await pipe.read(buf);
-                if (n === null) { controller.close(); return; }
-                controller.enqueue(buf.subarray(0, n));
-            } catch (e) {
-                controller.error(wrapFSErr(e as any));
+	            try {
+	                const buf = malloc(controller);
+	                const n = await pipe.read(buf);
+	                if (n === null) {
+	                    controller.close();
+	                    return;
+	                }
+	                controller.enqueue(buf.subarray(0, n));
+	            } catch (e) {
+                controller.error(wrapFSErr(e));
             }
         }
     });
@@ -64,18 +67,19 @@ class PtyProcess implements CNO.PtyPipe {
         } else {
             this.#proc = process.spawn([opts.name ?? osShell], spawnOpts);
         }
-        this.#readable = pipeToReadable(this.#proc.readable!);
-        this.#writable = pipeToWritable(this.#proc.writable!);
+        if (!this.#proc.readable || !this.#proc.writable) throw new Error('pty process pipes were not created');
+        this.#readable = pipeToReadable(this.#proc.readable);
+        this.#writable = pipeToWritable(this.#proc.writable);
     }
 
     get pid(): number { return this.#proc.pid; }
     get readable(): ReadableStream<Uint8Array> { return this.#readable; }
-    get writable(): WritableStream<Uint8Array> { return this.#writable!; }
+    get writable(): WritableStream<Uint8Array> { return this.#writable; }
 
     kill(signal: CNO.Signal = 'SIGINT') { this.#proc.kill(signal); }
     resize(cols: number, rows: number) { this.#proc.resize(cols, rows); }
-    getwinsize(): CNO.WinSize { return this.#proc.size; }
-    wait(): Promise<CNO.ExitInfo> { return this.#proc.wait().then(res => ({
+    getwinsize(): CNO.WinSize { return this.#proc.getwinsize; }
+    wait(): Promise<CNO.ExitInfo> { return Promise.resolve(this.#proc.waitSync()).then(res => ({
         exitStatus: res.exit_status,
         termSignal: res.term_signal
     })); }

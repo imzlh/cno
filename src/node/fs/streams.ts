@@ -1,11 +1,9 @@
 import { Readable, Writable } from '../stream';
-import buffer from '../buffer';
-import { modeToNumber, parseFlags, pathToString, type Mode, type PathLike } from './utils';
+import { arrayBufferBackedBytes } from '../_internal/buffer';
+import { decodeBuffer, modeToNumber, parseFlags, pathToString, toUint8Array, type Mode, type PathLike } from './utils';
 
 const fs = import.meta.use('fs');
 const asfs = import.meta.use('asyncfs');
-
-const { Buffer } = buffer;
 
 type FsChunk = string | Uint8Array | ArrayBuffer;
 
@@ -32,14 +30,26 @@ export interface WriteStreamOptions {
     highWaterMark?: number;
 }
 
-function chunkToBytes(chunk: FsChunk, encoding?: BufferEncoding): Uint8Array {
-    if (typeof chunk === 'string') return Buffer.from(chunk, encoding ?? 'utf8');
+function chunkToBytes(chunk: FsChunk, encoding?: BufferEncoding): Uint8Array<ArrayBuffer> {
+    if (typeof chunk === 'string') return toUint8Array(chunk, encoding ?? 'utf8');
     if (chunk instanceof ArrayBuffer) return new Uint8Array(chunk);
-    return chunk;
+    return arrayBufferBackedBytes(chunk);
 }
 
-function maybeDecode(chunk: Uint8Array, encoding?: BufferEncoding | null): Uint8Array | string {
-    return encoding ? Buffer.from(chunk).toString(encoding) : chunk;
+function maybeDecode(chunk: Uint8Array<ArrayBuffer>, encoding?: BufferEncoding | null): Uint8Array | string {
+    return encoding ? decodeBuffer(chunk, encoding) : chunk;
+}
+
+function asError(error: unknown): Error {
+    return error instanceof Error ? error : new Error(String(error));
+}
+
+function closeHandleQuietly(handle: CModuleAsyncFS.FileHandle): void {
+    try {
+        handle.close();
+    } catch {
+        // The stream has already closed; this close is best-effort cleanup.
+    }
 }
 
 export class ReadStream extends Readable {
@@ -114,7 +124,7 @@ export class ReadStream extends Readable {
         void asfs.open(pathStr, parseFlags(this.flags), modeToNumber(this.mode)).then(
             (handle: CModuleAsyncFS.FileHandle) => {
                 if (this.closed) {
-                    try { handle.close(); } catch {}
+                    closeHandleQuietly(handle);
                     return;
                 }
                 this.handle = handle;
@@ -130,7 +140,7 @@ export class ReadStream extends Readable {
             },
             (err: unknown) => {
                 this.opening = false;
-                this.destroy(err as Error);
+                this.destroy(asError(err));
             },
         );
     }
@@ -158,12 +168,12 @@ export class ReadStream extends Readable {
             },
             (err) => {
                 this.reading = false;
-                this.destroy(err as Error);
+                this.destroy(asError(err));
             },
         );
     }
 
-    private async readChunk(size: number): Promise<Uint8Array | null | undefined> {
+    private async readChunk(size: number): Promise<Uint8Array<ArrayBuffer> | null | undefined> {
         if (this.handle) {
             const remaining = this.end !== undefined && this.position !== null
                 ? this.end - this.position + 1
@@ -259,11 +269,11 @@ export class WriteStream extends Writable {
         return super.destroy(error);
     }
 
-    override _write(chunk: any, encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
+    override _write(chunk: FsChunk, encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
         const bytes = chunkToBytes(chunk, encoding);
         this.writeChunk(bytes).then(
             () => callback(),
-            (err) => callback(err as Error),
+            (err) => callback(asError(err)),
         );
     }
 
@@ -272,7 +282,7 @@ export class WriteStream extends Writable {
             if (this.autoClose) this.destroy();
             callback();
         } catch (err) {
-            callback(err as Error);
+            callback(asError(err));
         }
     }
 
@@ -283,7 +293,7 @@ export class WriteStream extends Writable {
         void asfs.open(pathStr, parseFlags(this.flags), modeToNumber(this.mode)).then(
             (handle: CModuleAsyncFS.FileHandle) => {
                 if (this.closed) {
-                    try { handle.close(); } catch {}
+                    closeHandleQuietly(handle);
                     return;
                 }
                 this.handle = handle;
@@ -295,20 +305,20 @@ export class WriteStream extends Writable {
             },
             (err: unknown) => {
                 this.opening = false;
-                this.destroy(err as Error);
+                this.destroy(asError(err));
             },
         );
     }
 
-    private async writeChunk(chunk: Uint8Array): Promise<void> {
+    private async writeChunk(chunk: Uint8Array<ArrayBuffer>): Promise<void> {
         if (this.handle) {
             let offset = 0;
             while (offset < chunk.length) {
                 const part = offset === 0 ? chunk : chunk.subarray(offset);
                 // native write() treats explicit null as offset 0, not "current offset" — omit the arg instead
                 const written = this.position === null
-                    ? await this.handle.write(part as Uint8Array<ArrayBuffer>)
-                    : await this.handle.write(part as Uint8Array<ArrayBuffer>, this.position + offset);
+                    ? await this.handle.write(part)
+                    : await this.handle.write(part, this.position + offset);
                 if (written <= 0) throw new Error('write returned no bytes');
                 offset += written;
                 this.bytesWritten += written;

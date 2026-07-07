@@ -53,8 +53,6 @@ memoryUsage.rss = function (): number {
 
 // cpuUsage
 
-let lastCpuUsage = { user: 0, system: 0 };
-
 export function cpuUsage(previousValue?: NodeJS.CpuUsage): NodeJS.CpuUsage {
     const cpus = os.cpuInfo();
     if (cpus.length === 0) return { user: 0, system: 0 };
@@ -69,24 +67,36 @@ export function cpuUsage(previousValue?: NodeJS.CpuUsage): NodeJS.CpuUsage {
     }
 
     const current = {
-        user: (totalUser + totalNice) * 1e6,  // ms → μs
-        system: totalSys * 1e6,
+        user: (totalUser + totalNice) * 1000,
+        system: totalSys * 1000,
     };
 
     if (previousValue) {
+        validateCpuUsage(previousValue);
         return {
-            user: current.user - (previousValue.user || 0),
-            system: current.system - (previousValue.system || 0),
+            user: Math.max(0, current.user - previousValue.user),
+            system: Math.max(0, current.system - previousValue.system),
         };
     }
 
-    // First call: return delta since last call, or zero if first ever
-    const result = {
-        user: current.user - lastCpuUsage.user,
-        system: current.system - lastCpuUsage.system,
-    };
-    lastCpuUsage = { user: current.user, system: current.system };
-    return result;
+    return current;
+}
+
+function validateCpuUsage(value: NodeJS.CpuUsage): void {
+    if (value === null || typeof value !== 'object') {
+        throw new TypeError('The "previousValue" argument must be an object');
+    }
+    validateCpuUsageNumber(value.user, 'user');
+    validateCpuUsageNumber(value.system, 'system');
+}
+
+function validateCpuUsageNumber(value: unknown, key: 'user' | 'system'): void {
+    if (typeof value !== 'number') {
+        throw new TypeError(`The "previousValue.${key}" property must be a number`);
+    }
+    if (!Number.isFinite(value) || value < 0) {
+        throw new RangeError(`The "previousValue.${key}" property must be a non-negative finite number`);
+    }
 }
 
 // resourceUsage

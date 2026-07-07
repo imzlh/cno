@@ -96,13 +96,13 @@ function detect(): void {
 /** The detected memory tier. */
 export function getMemoryTier(): MemoryTier {
     if (_tier === null) detect();
-    return _tier!;
+    return _tier ?? 'normal';
 }
 
 /** Buffer limits for the detected tier. */
 export function getTierLimits(): TierLimits {
     if (_limits === null) detect();
-    return _limits!;
+    return _limits ?? TIER_NORMAL;
 }
 
 /**

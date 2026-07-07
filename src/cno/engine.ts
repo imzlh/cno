@@ -5,23 +5,25 @@
 const engine = import.meta.use('engine');
 
 const cnoEngine = {
-    serialize(obj: any): Uint8Array {
+    serialize(obj: unknown): Uint8Array {
         return engine.serialize(obj);
     },
 
-    deserialize<T = any>(buf: Uint8Array<ArrayBuffer>): T {
+    deserialize<T = unknown>(buf: Uint8Array<ArrayBuffer>): T {
         return engine.deserialize(buf);
     },
 
-    async evalModule(code: string, importMeta?: Record<string, any>): Promise<any> {
+    async evalModule(code: string, importMeta?: Record<string, unknown>): Promise<unknown> {
         const meta = importMeta ?? { url: '', main: false };
-        const mod = new engine.Module(code, meta.url || '<eval>');
+        const url = typeof meta.url === 'string' ? meta.url : '';
+        const mod = new engine.Module(code, url || '<eval>');
         return mod.eval();
     },
 
-    compileModule(code: string, importMeta?: Record<string, any>): Uint8Array {
+    compileModule(code: string, importMeta?: Record<string, unknown>): Uint8Array {
         const meta = importMeta ?? { url: '', main: false };
-        const mod = new engine.Module(code, meta.url || '<compile>');
+        const url = typeof meta.url === 'string' ? meta.url : '';
+        const mod = new engine.Module(code, url || '<compile>');
         return new Uint8Array(mod.dump(engine.DUMP_BYTECODE));
     },
 
@@ -42,7 +44,7 @@ const cnoEngine = {
     },
 
     get versions(): CNO.engine.EngineVersions {
-        return engine.versions;
+        return Object.assign({ curl: '', expat: '' }, engine.versions);
     },
 
     get gc(): CNO.engine.GarbageCollector {

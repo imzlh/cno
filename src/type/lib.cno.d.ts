@@ -47,10 +47,10 @@ declare namespace CNO {
     /* ================================================================ */
 
     export namespace engine {
-        function serialize(obj: any): Uint8Array;
-        function deserialize<T = any>(buf: Uint8Array<ArrayBuffer>): T;
-        function evalModule(code: string, importMeta?: Record<string, any>): Promise<any>;
-        function compileModule(code: string, importMeta?: Record<string, any>): Uint8Array;
+        function serialize(obj: unknown): Uint8Array;
+        function deserialize<T = unknown>(buf: Uint8Array<ArrayBuffer>): T;
+        function evalModule(code: string, importMeta?: Record<string, unknown>): Promise<unknown>;
+        function compileModule(code: string, importMeta?: Record<string, unknown>): Uint8Array;
         function encodeString(str: string): Uint8Array;
         function decodeString(buf: Uint8Array | ArrayBuffer): string;
         function setMemoryLimit(limit: number): void;
@@ -66,7 +66,7 @@ declare namespace CNO {
             openssl: string;
             expat: string;
             core: string;
-            llhttp?: string;
+            llhttp: string;
             wasm3?: string;
             mimalloc?: number;
         }
@@ -157,6 +157,11 @@ declare namespace CNO {
     }
 
     export namespace compress {
+        const NO_COMPRESSION: number;
+        const BEST_SPEED: number;
+        const BEST_COMPRESSION: number;
+        const DEFAULT_COMPRESSION: number;
+
         function deflate(data: Uint8Array | ArrayBuffer, level?: number): ArrayBuffer;
         function inflate(data: Uint8Array | ArrayBuffer): ArrayBuffer;
         function gzip(data: Uint8Array | ArrayBuffer, level?: number): ArrayBuffer;
@@ -182,7 +187,8 @@ declare namespace CNO {
 
     export namespace ssl {
         function createSelfSignedCert(options?: { commonName?: string; days?: number }): SelfSignedCertResult;
-        function loadPEM(data: string, type?: string): { subject?: string; type?: string; bits?: number } | null;
+        function loadPEM(data: string, type?: "certificate" | "key"): { subject?: string; type?: string; bits?: number } | null;
+        const version: string;
     }
 
     /* ================================================================ */
@@ -294,7 +300,7 @@ declare namespace CNO {
         function toWebRequest(msg: HttpRequestMessage, base?: string | URL): Request;
         function toWebResponse(msg: HttpResponseMessage): Response;
         function fromWebRequest(req: Request): HttpRequestMessage;
-        function fromWebResponse(res: Response): HttpResponseMessage;
+        function fromWebResponse(res: Response): Promise<HttpResponseMessage>;
 
         // Utilities
         function strerr(errno: number): string;

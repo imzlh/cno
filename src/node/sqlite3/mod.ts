@@ -13,10 +13,12 @@ const engine = import.meta.use('engine');
 
 type Sqlite3Handle = CModuleSQLite3.Sqlite3Handle;
 type Sqlite3Stmt = CModuleSQLite3.Sqlite3Stmt;
-type BindParams = any[] | Record<string, any>;
-type Callback = (...args: any[]) => void;
-type RowCallback = (err: Error | null, row?: any) => void;
-type CompleteCallback = (err: Error | null, count?: number) => void;
+type SqliteRow = Record<string, unknown> | unknown[];
+type BindParams = unknown[] | Record<string, unknown>;
+type Callback = (...args: unknown[]) => void;
+type RowCallback = (err: unknown, row?: SqliteRow) => void;
+type CompleteCallback = (err: unknown, count?: number) => void;
+type QueryMethod = 'run' | 'get' | 'all' | 'each' | 'map';
 
 export type { Sqlite3Handle, Sqlite3Stmt };
 
@@ -57,11 +59,11 @@ function defer(fn: () => void): void {
     queueMicrotask(fn);
 }
 
-function call(callback: Callback | undefined, self: any, args: any[]): void {
-    if (callback) defer(() => callback.apply(self, args));
+function call(callback: Callback | undefined, self: unknown, args: unknown[]): void {
+    if (callback) defer(() => Reflect.apply(callback, self, args));
 }
 
-function emitOrThrow(target: EventEmitter, callback: Callback | undefined, self: any, err: unknown): void {
+function emitOrThrow(target: EventEmitter, callback: Callback | undefined, self: unknown, err: unknown): void {
     if (callback) {
         call(callback, self, [err]);
         return;
@@ -69,11 +71,11 @@ function emitOrThrow(target: EventEmitter, callback: Callback | undefined, self:
     target.emit('error', err instanceof Error ? err : new Error(String(err)));
 }
 
-function isBindObject(value: any): boolean {
+function isBindObject(value: unknown): value is Record<string, unknown> {
     return value !== null && typeof value === 'object' && !Array.isArray(value) && !(value instanceof Uint8Array);
 }
 
-function splitArgs(args: any[]): { params?: BindParams; callback?: Callback } {
+function splitArgs(args: unknown[]): { params?: BindParams; callback?: Callback } {
     const values = args.slice();
     let callback: Callback | undefined;
     if (typeof values[values.length - 1] === 'function') {
@@ -88,7 +90,7 @@ function splitArgs(args: any[]): { params?: BindParams; callback?: Callback } {
     return { params: values, callback };
 }
 
-function splitEachArgs(args: any[]): { params?: BindParams; rowCallback?: RowCallback; completeCallback?: CompleteCallback } {
+function splitEachArgs(args: unknown[]): { params?: BindParams; rowCallback?: RowCallback; completeCallback?: CompleteCallback } {
     const values = args.slice();
     let completeCallback: CompleteCallback | undefined;
     let rowCallback: RowCallback | undefined;
@@ -105,7 +107,7 @@ function splitEachArgs(args: any[]): { params?: BindParams; rowCallback?: RowCal
 
 function normalizeBindParams(sql: string, params?: BindParams): BindParams | undefined {
     if (params === undefined || !isBindObject(params)) return params;
-    const normalized: Record<string, any> = {};
+    const normalized: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(params)) {
         if (/^[:@$]/.test(key)) {
             normalized[key] = value;
@@ -137,13 +139,13 @@ function runStmt(stmt: Sqlite3Stmt, params?: BindParams, sql = ''): void {
     else stmt.run(params);
 }
 
-function allStmt(stmt: Sqlite3Stmt, params?: BindParams, sql = ''): any[] {
+function allStmt(stmt: Sqlite3Stmt, params?: BindParams, sql = ''): SqliteRow[] {
     params = normalizeBindParams(sql, params);
     return params === undefined ? stmt.all() : stmt.all(params);
 }
 
-function mapRows(rows: any[]): Record<string, any> {
-    const result: Record<string, any> = {};
+function mapRows(rows: SqliteRow[]): Record<string, unknown> {
+    const result: Record<string, unknown> = {};
     for (const row of rows) {
         const keys = Object.keys(row);
         if (keys.length === 0) continue;
@@ -162,12 +164,12 @@ export class Statement extends EventEmitter {
     changes = 0;
     private stmt: Sqlite3Stmt | null;
 
-    constructor(private readonly db: Database, stmt: Sqlite3Stmt, readonly sql = '') {
+    constructor(private readonly db: Database, stmt: Sqlite3Stmt | null, readonly sql = '', private readonly prepareError?: unknown) {
         super();
         this.stmt = stmt;
     }
 
-    bind(...args: any[]): this {
+    bind(...args: unknown[]): this {
         const { params, callback } = splitArgs(args);
         try {
             bindStmt(this.getStmt(), params, this.sql);
@@ -202,7 +204,7 @@ export class Statement extends EventEmitter {
         return this;
     }
 
-    run(...args: any[]): this {
+    run(...args: unknown[]): this {
         const { params, callback } = splitArgs(args);
         this.db.trace(this.sql);
         const started = Date.now();
@@ -218,7 +220,7 @@ export class Statement extends EventEmitter {
         return this;
     }
 
-    get(...args: any[]): this {
+    get(...args: unknown[]): this {
         const { params, callback } = splitArgs(args);
         this.db.trace(this.sql);
         const started = Date.now();
@@ -232,7 +234,7 @@ export class Statement extends EventEmitter {
         return this;
     }
 
-    all(...args: any[]): this {
+    all(...args: unknown[]): this {
         const { params, callback } = splitArgs(args);
         this.db.trace(this.sql);
         const started = Date.now();
@@ -246,7 +248,7 @@ export class Statement extends EventEmitter {
         return this;
     }
 
-    each(...args: any[]): this {
+    each(...args: unknown[]): this {
         const { params, rowCallback, completeCallback } = splitEachArgs(args);
         this.db.trace(this.sql);
         const started = Date.now();
@@ -263,7 +265,7 @@ export class Statement extends EventEmitter {
         return this;
     }
 
-    map(...args: any[]): this {
+    map(...args: unknown[]): this {
         const { params, callback } = splitArgs(args);
         this.db.trace(this.sql);
         const started = Date.now();
@@ -286,6 +288,9 @@ export class Statement extends EventEmitter {
     }
 
     private getStmt(): Sqlite3Stmt {
+        if (this.prepareError) {
+            throw this.prepareError;
+        }
         if (!this.stmt) throw new Error('Statement has been finalized');
         return this.stmt;
     }
@@ -323,7 +328,7 @@ export class Database extends EventEmitter {
         return this;
     }
 
-    configure(option: string, value: any): this {
+    configure(option: string, value: unknown): this {
         switch (option) {
             case 'trace':
                 this.traceCallback = typeof value === 'function' ? value : null;
@@ -339,26 +344,26 @@ export class Database extends EventEmitter {
         }
     }
 
-    run(sql: string, ...args: any[]): this {
+    run(sql: string, ...args: unknown[]): this {
         return this._query('run', sql, args);
     }
 
-    get(sql: string, ...args: any[]): this {
+    get(sql: string, ...args: unknown[]): this {
         return this._query('get', sql, args);
     }
 
-    all(sql: string, ...args: any[]): this {
+    all(sql: string, ...args: unknown[]): this {
         return this._query('all', sql, args);
     }
 
-    each(sql: string, ...args: any[]): this {
+    each(sql: string, ...args: unknown[]): this {
         const statement = this.prepare(sql);
         const values = args.slice();
         let wrapped = false;
         if (typeof values[values.length - 1] === 'function' && typeof values[values.length - 2] === 'function') {
             const completeCallback = values.pop() as CompleteCallback;
-            values.push(function(this: any, ...cbArgs: any[]) {
-                try { completeCallback.apply(this, cbArgs as any); }
+            values.push(function(this: unknown, ...cbArgs: unknown[]) {
+                try { Reflect.apply(completeCallback, this, cbArgs); }
                 finally { statement.finalize(); }
             });
             wrapped = true;
@@ -386,7 +391,7 @@ export class Database extends EventEmitter {
         return this;
     }
 
-    prepare(sql: string, ...args: any[]): Statement {
+    prepare(sql: string, ...args: unknown[]): Statement {
         const { params, callback } = splitArgs(args);
         try {
             const statement = new Statement(this, this.getHandle().prepare(sql), sql);
@@ -396,13 +401,13 @@ export class Database extends EventEmitter {
         } catch (err) {
             if (callback) {
                 call(callback, this, [err]);
-                return null as any;
+                return new Statement(this, null, sql, err);
             }
             throw err;
         }
     }
 
-    map(sql: string, ...args: any[]): this {
+    map(sql: string, ...args: unknown[]): this {
         return this._query('map', sql, args);
     }
 
@@ -466,18 +471,19 @@ export class Database extends EventEmitter {
         return this.handle;
     }
 
-    private _query(method: string, sql: string, args: any[]): this {
+    private _query(method: QueryMethod, sql: string, args: unknown[]): this {
         const statement = this.prepare(sql);
         const values = args.slice();
         const callback = typeof values[values.length - 1] === 'function' ? values.pop() : undefined;
         try {
+            const query = statement[method] as (...queryArgs: unknown[]) => Statement;
             if (callback) {
-                (statement as any)[method](...values, function(this: any, ...cbArgs: any[]) {
-                    try { callback.apply(this, cbArgs); }
+                query.call(statement, ...values, function(this: unknown, ...cbArgs: unknown[]) {
+                    try { Reflect.apply(callback, this, cbArgs); }
                     finally { statement.finalize(); }
                 });
             } else {
-                (statement as any)[method](...values);
+                query.call(statement, ...values);
                 statement.finalize();
             }
         } catch (err) {
@@ -498,10 +504,9 @@ export class Backup extends EventEmitter {
 const cachedDbs = new Map<string, Database>();
 const CACHED_DB_LIMIT = 32;
 
-function CachedDatabase(this: any, filename: string, mode?: number | Callback, callback?: Callback): Database {
+function CachedDatabase(this: unknown, filename: string, mode?: number | Callback, callback?: Callback): Database {
     if (!(this instanceof CachedDatabase)) {
-        // @ts-ignore - CachedDatabase is a legacy-JS compatible constructor
-        return new CachedDatabase(filename, mode, callback);
+        return Reflect.construct(CachedDatabase, [filename, mode, callback]) as Database;
     }
     const hit = cachedDbs.get(filename);
     if (hit) {
@@ -510,8 +515,8 @@ function CachedDatabase(this: any, filename: string, mode?: number | Callback, c
     }
     // Evict oldest entry if at capacity
     if (cachedDbs.size >= CACHED_DB_LIMIT) {
-        const oldest = cachedDbs.keys().next().value!;
-        cachedDbs.delete(oldest);
+        const oldest = cachedDbs.keys().next().value;
+        if (oldest !== undefined) cachedDbs.delete(oldest);
     }
     const db = new Database(filename, mode, callback);
     cachedDbs.set(filename, db);
@@ -519,7 +524,7 @@ function CachedDatabase(this: any, filename: string, mode?: number | Callback, c
 }
 
 export const cached = {
-    Database: CachedDatabase as unknown as typeof Database,
+    Database: CachedDatabase as typeof Database,
 };
 
 export const sqlite3 = {

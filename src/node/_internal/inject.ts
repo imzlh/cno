@@ -1,4 +1,6 @@
 import { createServer } from "@cnojs/http/server";
+import processDefault from '../process';
+import { Buffer } from '../buffer';
 
 const http = import.meta.use('http');
 
@@ -7,30 +9,23 @@ export interface IOpaque {
 }
 
 // http.__cno for node:http/server
-Reflect.set(http, '__cno', {
+const httpInternals: IOpaque = {
     createServer
-} as IOpaque);
+};
+Reflect.set(http, '__cno', httpInternals);
 
 // global process inject
-let proc_cache: any;
-let buffer_cache: any;
-
 Object.defineProperties(globalThis, {
     process: {
-        get() {
-            if (!proc_cache) {
-                proc_cache = Reflect.get(globalThis, 'require')('process');
-            }
-
-            return proc_cache;
-        },
+        value: processDefault,
+        writable: true,
+        configurable: true,
+        enumerable: true,
     },
     Buffer: {
-        get() {
-            if (!buffer_cache) {
-                buffer_cache = Reflect.get(globalThis, 'require')('buffer').Buffer;
-            }
-            return buffer_cache;
-        },
+        value: Buffer,
+        writable: true,
+        configurable: true,
+        enumerable: true,
     },
 });

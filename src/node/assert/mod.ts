@@ -5,9 +5,12 @@
 const console = import.meta.use('console');
 import { deepEqual as _deepEqual } from '../_internal/deep-equal';
 
+type PropertyRecord = Record<PropertyKey, unknown>;
+
 // Internal helpers to reduce boilerplate
-function msg(m?: string | Error): string | undefined {
-    return typeof m === 'string' ? m : m?.message;
+function msg(m?: unknown): string | undefined {
+    if (typeof m === 'string') return m;
+    return m instanceof Error ? m.message : undefined;
 }
 
 function checkArgs(min: number, actual: number): void {
@@ -44,10 +47,11 @@ function inspectForAssertion(value: unknown, seen = new WeakSet<object>()): stri
     }
 
     try {
+        const record = value as PropertyRecord;
         const keys = Reflect.ownKeys(value);
         const entries = keys.map(key => {
             const label = typeof key === 'symbol' ? `[${key.toString()}]` : String(key);
-            return `${label}: ${inspectForAssertion((value as any)[key], seen)}`;
+            return `${label}: ${inspectForAssertion(record[key], seen)}`;
         });
         const prefix = Object.getPrototypeOf(value) === null ? '[Object: null prototype] ' : '';
         return `${prefix}{ ${entries.join(', ')} }`;
@@ -57,13 +61,14 @@ function inspectForAssertion(value: unknown, seen = new WeakSet<object>()): stri
 }
 
 export type AssertPredicate = RegExp | (new () => object) | ((thrown: unknown) => boolean) | object | Error;
+type AssertCallable = (...args: unknown[]) => unknown;
 
 export interface AssertionErrorOptions {
     message?: string;
     actual?: unknown;
     expected?: unknown;
     operator?: string;
-    stackStartFn?: Function;
+    stackStartFn?: AssertCallable;
     diff?: 'simple' | 'full';
     generatedMessage?: boolean;
 }
@@ -94,7 +99,7 @@ export class AssertionError extends Error {
     }
 }
 
-function innerOk(fn: Function, argLen: number, value: unknown, message?: string | Error): void {
+function innerOk(fn: AssertCallable, argLen: number, value: unknown, message?: string | Error): void {
     if (argLen === 0) {
         throw new AssertionError({
             message: 'No value argument passed to `assert.ok()`',
@@ -121,7 +126,7 @@ export function fail(actual: unknown, expected: unknown, message?: string | Erro
 export function fail(actual?: unknown, expected?: unknown, message?: string | Error, operator?: string): never {
     const m = arguments.length === 1 ? actual : message;
     throw new AssertionError({
-        message: msg(m as string | Error),
+        message: msg(m),
         actual: arguments.length > 1 ? actual : undefined,
         expected: arguments.length > 1 ? expected : undefined,
         operator: operator || 'fail',
@@ -233,9 +238,24 @@ export function notDeepStrictEqual(actual: unknown, expected: unknown, message?:
     }
 }
 
+function expectedErrorKeys(error: object): string[] {
+    const keys = Object.keys(error);
+    if (error instanceof Error) {
+        for (const key of ['name', 'message']) {
+            if (!keys.includes(key)) keys.unshift(key);
+        }
+    }
+    return keys;
+}
+
+function hasProperty(value: object | Function | undefined, key: string): boolean {
+    return value !== undefined && key in value;
+}
+
 function _checkError(err: unknown, error: AssertPredicate, message?: string | Error): void {
     if (typeof error === 'function') {
-        if (error === Error || error.prototype instanceof Error) {
+        const prototype = Reflect.get(error, 'prototype');
+        if (error === Error || (prototype && prototype instanceof Error)) {
             if (!(err instanceof error)) {
                 throw new AssertionError({
                     actual: err,
@@ -246,7 +266,7 @@ function _checkError(err: unknown, error: AssertPredicate, message?: string | Er
                 });
             }
         } else {
-            if (!(error as (thrown: unknown) => boolean)(err)) {
+            if ((error as (thrown: unknown) => boolean)(err) !== true) {
                 throw new AssertionError({
                     actual: err,
                     expected: error,
@@ -257,15 +277,6 @@ function _checkError(err: unknown, error: AssertPredicate, message?: string | Er
             }
         }
     } else if (error instanceof RegExp) {
-        if (typeof err !== 'object' || err === null) {
-            throw new AssertionError({
-                actual: err,
-                expected: error,
-                message: msg(message),
-                operator: 'throws',
-                generatedMessage: !message
-            });
-        }
         const str = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
         if (!error.test(str)) {
             throw new AssertionError({
@@ -277,10 +288,23 @@ function _checkError(err: unknown, error: AssertPredicate, message?: string | Er
             });
         }
     } else if (typeof error === 'object' && error !== null) {
-        const keys = Object.keys(error);
+        const keys = expectedErrorKeys(error);
+        const actualRecord = (typeof err === 'object' || typeof err === 'function') && err !== null
+            ? err as PropertyRecord
+            : undefined;
+        const expectedRecord = error as PropertyRecord;
         for (const key of keys) {
-            const actualValue = (err as any)[key];
-            const expectedValue = (error as any)[key];
+            if (!hasProperty(actualRecord, key)) {
+                throw new AssertionError({
+                    actual: err,
+                    expected: error,
+                    message: msg(message),
+                    operator: 'throws',
+                    generatedMessage: !message
+                });
+            }
+            const actualValue = actualRecord?.[key];
+            const expectedValue = expectedRecord[key];
             if (expectedValue instanceof RegExp) {
                 if (typeof actualValue !== 'string' || !expectedValue.test(actualValue)) {
                     throw new AssertionError({
@@ -304,6 +328,25 @@ function _checkError(err: unknown, error: AssertPredicate, message?: string | Er
     }
 }
 
+function matchesError(err: unknown, error: AssertPredicate): boolean {
+    try {
+        _checkError(err, error);
+        return true;
+    } catch (caught) {
+        if (caught instanceof AssertionError) return false;
+        throw caught;
+    }
+}
+
+function hasErrorMatcher(error: AssertPredicate | string | Error | undefined): error is AssertPredicate {
+    return error !== undefined && typeof error !== 'string';
+}
+
+function isPromiseLike(value: unknown): value is Promise<unknown> {
+    if ((typeof value !== 'object' && typeof value !== 'function') || value === null) return false;
+    return typeof Reflect.get(value, 'then') === 'function';
+}
+
 export function throws(block: () => unknown, message?: string | Error): void;
 export function throws(block: () => unknown, error: AssertPredicate, message?: string | Error): void;
 export function throws(block: () => unknown, error?: AssertPredicate | string | Error, message?: string | Error): void {
@@ -325,15 +368,15 @@ export function throws(block: () => unknown, error?: AssertPredicate | string | 
     }
 
     if (!threw) {
-        const m = typeof error === 'string' || error instanceof Error ? error : message;
+        const m = typeof error === 'string' ? error : message;
         throw new AssertionError({
-            message: msg(m as string | Error) || 'Missing expected exception',
+            message: msg(m) || 'Missing expected exception',
             operator: 'throws',
             generatedMessage: !m
         });
     }
 
-    if (error !== undefined && typeof error !== 'string' && !(error instanceof Error)) {
+    if (hasErrorMatcher(error)) {
         _checkError(err, error, message);
     }
 }
@@ -348,15 +391,18 @@ export function doesNotThrow(block: () => unknown, error?: AssertPredicate | str
         });
     }
 
-    const m = (typeof error === 'string' || error instanceof Error) ? error : message;
+    const m = typeof error === 'string' ? error : message;
 
     try {
         block();
     } catch (err: unknown) {
+        if (hasErrorMatcher(error) && !matchesError(err, error)) {
+            throw err;
+        }
         throw new AssertionError({
             actual: err,
             expected: undefined,
-            message: msg(m as string | Error) || 'Got unwanted exception',
+            message: msg(m) || 'Got unwanted exception',
             operator: 'doesNotThrow',
             generatedMessage: !m
         });
@@ -380,16 +426,12 @@ export async function rejects(block: (() => Promise<unknown>) | Promise<unknown>
     let promise: Promise<unknown>;
 
     if (typeof block === 'function') {
-        try {
-            promise = block();
-        } catch (err) {
-            throw new AssertionError({
-                message: 'The "block" argument must return a Promise',
-                generatedMessage: true
-            });
-        }
+        promise = block();
     } else {
         promise = block;
+    }
+    if (!isPromiseLike(promise)) {
+        throw new TypeError('Expected instance of Promise to be returned from the "promiseFn" function');
     }
 
     let err: unknown;
@@ -403,15 +445,15 @@ export async function rejects(block: (() => Promise<unknown>) | Promise<unknown>
     }
 
     if (!threw) {
-        const m = typeof error === 'string' || error instanceof Error ? error : message;
+        const m = typeof error === 'string' ? error : message;
         throw new AssertionError({
-            message: msg(m as string | Error) || 'Missing expected rejection',
+            message: msg(m) || 'Missing expected rejection',
             operator: 'rejects',
             generatedMessage: !m
         });
     }
 
-    if (error !== undefined && typeof error !== 'string' && !(error instanceof Error)) {
+    if (hasErrorMatcher(error)) {
         _checkError(err, error, message);
     }
 }
@@ -420,28 +462,27 @@ export function doesNotReject(block: (() => Promise<unknown>) | Promise<unknown>
 export function doesNotReject(block: (() => Promise<unknown>) | Promise<unknown>, error: AssertPredicate, message?: string | Error): Promise<void>;
 export async function doesNotReject(block: (() => Promise<unknown>) | Promise<unknown>, error?: AssertPredicate | string | Error, message?: string | Error): Promise<void> {
     let promise: Promise<unknown>;
-    const m = (typeof error === 'string' || error instanceof Error) ? error : message;
+    const m = typeof error === 'string' ? error : message;
 
     if (typeof block === 'function') {
-        try {
-            promise = block();
-        } catch (err) {
-            throw new AssertionError({
-                message: 'The "block" argument must return a Promise',
-                generatedMessage: true
-            });
-        }
+        promise = block();
     } else {
         promise = block;
+    }
+    if (!isPromiseLike(promise)) {
+        throw new TypeError('Expected instance of Promise to be returned from the "promiseFn" function');
     }
 
     try {
         await promise;
     } catch (err: unknown) {
+        if (hasErrorMatcher(error) && !matchesError(err, error)) {
+            throw err;
+        }
         throw new AssertionError({
             actual: err,
             expected: undefined,
-            message: msg(m as string | Error) || 'Got unwanted rejection',
+            message: msg(m) || 'Got unwanted rejection',
             operator: 'doesNotReject',
             generatedMessage: !m
         });
@@ -529,14 +570,16 @@ export function partialDeepStrictEqual(actual: unknown, expected: unknown, messa
 
         if (typeof a !== 'object' || a === null) return false;
 
-        for (const key of Object.keys(e as object)) {
+        const actualRecord = a as PropertyRecord;
+        const expectedRecord = e as PropertyRecord;
+        for (const key of Object.keys(e)) {
             if (!Object.prototype.hasOwnProperty.call(a, key)) return false;
-            if (!compare((a as any)[key], (e as any)[key])) return false;
+            if (!compare(actualRecord[key], expectedRecord[key])) return false;
         }
 
-        for (const sym of Object.getOwnPropertySymbols(e as object)) {
+        for (const sym of Object.getOwnPropertySymbols(e)) {
             if (!Object.prototype.hasOwnProperty.call(a, sym)) return false;
-            if (!compare((a as any)[sym], (e as any)[sym])) return false;
+            if (!compare(actualRecord[sym], expectedRecord[sym])) return false;
         }
 
         return true;
@@ -553,20 +596,12 @@ export function partialDeepStrictEqual(actual: unknown, expected: unknown, messa
     }
 }
 
-export function assert(cond: any, message = 'Assertion failed'): asserts cond {
-    if (!cond) {
-        throw new AssertionError({
-            actual: cond,
-            expected: true,
-            message: typeof message === 'string' ? message : (message as any)?.message,
-            operator: '==',
-            generatedMessage: !message
-        });
-    }
+export function assert(cond: unknown, message?: string | Error): asserts cond {
+    innerOk(assert, arguments.length, cond, message);
 }
 
 interface CallExpectation {
-    callback: Function;
+    callback: AssertCallable;
     atLeast: number;
     calls: number;
 }
@@ -574,12 +609,12 @@ interface CallExpectation {
 export class CallTracker {
     #expectations: CallExpectation[] = [];
 
-    calls(fn?: Function, num: number = 1) {
+    calls(fn?: AssertCallable, num: number = 1) {
         const exp: CallExpectation = { callback: fn ?? (() => {}), atLeast: num, calls: 0 };
         this.#expectations.push(exp);
         const wrapper = Object.assign(function (this: unknown, ...args: unknown[]) {
             exp.calls++;
-            return exp.callback.apply(this, args);
+            return Reflect.apply(exp.callback, this, args);
         }, { callback: exp.callback, atLeast: exp.atLeast });
         return wrapper;
     }
@@ -631,11 +666,10 @@ assert.partialDeepStrictEqual = partialDeepStrictEqual;
 // assert.strict — strict mode sub-namespace where equal/notEqual/deepEqual/notDeepEqual
 // use their strict counterparts. Created as a separate object so assert.equal
 // (loose equality) is unaffected.
-function strictAssert(condition: any, message?: string | Error): asserts condition {
-    if(false === condition)
-        throw message instanceof Error ? message : new Error(String(message));
+function strictAssert(condition: unknown, message?: string | Error): asserts condition {
+    innerOk(strictAssert, arguments.length, condition, message);
 }
-export const strict: any = Object.assign(strictAssert, {
+export const strict = Object.assign(strictAssert, {
     ok, fail,
     equal: strictEqual, notEqual: notStrictEqual,
     strictEqual, notStrictEqual,

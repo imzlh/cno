@@ -8,7 +8,6 @@ import { getMemoryTier } from '../../utils/memory-tier';
 import { toPosixPath } from '../../utils/path';
 
 import {
-    KvKeyPart,
     RawKey,
     InternalEntry,
     serializeValue,
@@ -20,6 +19,7 @@ import {
     serializeKey,
     rawKeyToCursor,
 } from './types';
+import { KvU64, MAX_U64, isKvU64 } from './u64';
 
 const { setInterval, clearInterval } = import.meta.use('timers');
 
@@ -44,6 +44,53 @@ const DELETE_PREFIX_SQL = `DELETE FROM kv_entries WHERE key >= ? AND key < ?`;
 const LIST_SQL = `SELECT key, value, versionstamp, expire_at FROM kv_entries WHERE key >= ? AND key < ? AND (expire_at IS NULL OR expire_at > ?) ORDER BY key ASC LIMIT ?`;
 const LIST_REVERSE_SQL = `SELECT key, value, versionstamp, expire_at FROM kv_entries WHERE key >= ? AND key < ? AND (expire_at IS NULL OR expire_at > ?) ORDER BY key DESC LIMIT ?`;
 const SQLITE_CACHE_SIZE_KIB = getMemoryTier() === 'low' ? -512 : getMemoryTier() === 'normal' ? -4096 : -16384;
+
+type AtomicDbOperation =
+    | { type: 'check'; key: RawKey; versionstamp: string | null }
+    | { type: 'set'; key: RawKey; value: Uint8Array; expireIn?: number }
+    | { type: 'delete'; key: RawKey }
+    | { type: 'sum' | 'max' | 'min'; key: RawKey; operand: bigint };
+
+function isLegacyKeyRow(row: CModuleSQLite3.SqliteRow): row is CModuleSQLite3.SqliteRow & { key: string } {
+    return typeof row.key === 'string';
+}
+
+function rollbackQuietly(db: CModuleSQLite3.Sqlite3Handle): void {
+    try {
+        db.exec('ROLLBACK');
+    } catch {
+        // Keep the original transaction failure as the actionable error.
+    }
+}
+
+function readBlob(row: CModuleSQLite3.SqliteRow, column: string): Uint8Array<ArrayBuffer> {
+    const value = row[column];
+    if (value instanceof Uint8Array) {
+        const out = new Uint8Array(value.byteLength);
+        out.set(value);
+        return out;
+    }
+    throw new TypeError(`Expected blob column: ${column}`);
+}
+
+function readString(row: CModuleSQLite3.SqliteRow, column: string): string {
+    const value = row[column];
+    if (typeof value === 'string') return value;
+    throw new TypeError(`Expected text column: ${column}`);
+}
+
+function readNullableNumber(row: CModuleSQLite3.SqliteRow, column: string): number | null {
+    const value = row[column];
+    if (value === null) return null;
+    if (typeof value === 'number') return value;
+    throw new TypeError(`Expected integer column: ${column}`);
+}
+
+function readNumber(row: CModuleSQLite3.SqliteRow, column: string): number {
+    const value = row[column];
+    if (typeof value === 'number') return value;
+    throw new TypeError(`Expected number column: ${column}`);
+}
 
 export class KvDatabase {
     private db: CModuleSQLite3.Sqlite3Handle | null = null;
@@ -158,7 +205,7 @@ export class KvDatabase {
             const rows = stmt.all();
             stmt.finalize();
 
-            const legacyRows = rows.filter((row: any) => typeof row.key === 'string');
+            const legacyRows = rows.filter(isLegacyKeyRow);
             if (!legacyRows.length) return;
 
             db.exec('BEGIN IMMEDIATE');
@@ -174,7 +221,7 @@ export class KvDatabase {
                 ins.finalize();
                 db.exec('COMMIT');
             } catch (error) {
-                try { db.exec('ROLLBACK'); } catch {}
+                rollbackQuietly(db);
                 throw error;
             }
         } catch {
@@ -197,19 +244,18 @@ export class KvDatabase {
         if (rows.length === 0) return null;
 
         const row = rows[0];
-        const expireAt = row.expire_at;
+        const expireAt = readNullableNumber(row, 'expire_at');
         if (expireAt !== null && expireAt < Date.now()) return null;
 
         return {
-            key: new Uint8Array(row.key),
-            value: new Uint8Array(row.value),
-            versionstamp: row.versionstamp,
+            key: readBlob(row, 'key'),
+            value: readBlob(row, 'value'),
+            versionstamp: readString(row, 'versionstamp'),
             expireAt,
         };
     }
 
-    set(rawKey: RawKey, value: Uint8Array, expireIn?: number): string {
-        const versionstamp = generateVersionstamp();
+    set(rawKey: RawKey, value: Uint8Array, expireIn?: number, versionstamp = generateVersionstamp()): string {
         const expireAt = expireIn ? Date.now() + expireIn : null;
 
         const stmt = this.getStmt(SET_SQL);
@@ -224,16 +270,17 @@ export class KvDatabase {
     }
 
     deletePrefix(prefix: RawKey): number {
+        const db = this.getDb();
         const endKey = getEndKeyForPrefix(prefix);
         const stmt = this.getStmt(DELETE_PREFIX_SQL);
-        const result = stmt.run([prefix, endKey]);
-        return result.changes || 0;
+        stmt.run([prefix, endKey]);
+        return db.changes();
     }
 
     count(startKey: RawKey, endKey: RawKey): number {
         const stmt = this.getStmt(COUNT_SQL);
         const rows = stmt.all([startKey, endKey]);
-        return rows[0]?.count || 0;
+        return rows[0] ? readNumber(rows[0], 'count') : 0;
     }
 
     list(
@@ -248,8 +295,8 @@ export class KvDatabase {
 
         if (options.cursor) {
             const cursorKey = cursorToRawKey(options.cursor);
-            rows = rows.filter((row: any) => {
-                const key = new Uint8Array(row.key);
+            rows = rows.filter((row) => {
+                const key = readBlob(row, 'key');
                 return options.reverse
                     ? compareRawKeys(key, cursorKey) < 0
                     : compareRawKeys(key, cursorKey) > 0;
@@ -258,28 +305,21 @@ export class KvDatabase {
 
         let nextCursor: RawKey | null = null;
         if (rows.length > limit) {
-            nextCursor = new Uint8Array(rows[limit - 1].key);
+            nextCursor = readBlob(rows[limit - 1], 'key');
             rows = rows.slice(0, limit);
         }
 
-        const entries = rows.map((row: any) => ({
-            key: new Uint8Array(row.key),
-            value: new Uint8Array(row.value),
-            versionstamp: row.versionstamp,
-            expireAt: row.expire_at,
+        const entries = rows.map((row) => ({
+            key: readBlob(row, 'key'),
+            value: readBlob(row, 'value'),
+            versionstamp: readString(row, 'versionstamp'),
+            expireAt: readNullableNumber(row, 'expire_at'),
         }));
 
         return { entries, cursor: nextCursor };
     }
 
-    atomic(operations: Array<{
-        type: 'check' | 'set' | 'delete' | 'sum' | 'max' | 'min';
-        key: RawKey;
-        versionstamp?: string | null;
-        value?: Uint8Array;
-        expireIn?: number;
-        operand?: KvKeyPart;
-    }>): { success: boolean; versionstamp?: string } {
+    atomic(operations: AtomicDbOperation[], commitVersionstamp?: string): { success: boolean; versionstamp?: string } {
         const db = this.getDb();
         const setStmt = this.getStmt(SET_SQL);
         const deleteStmt = this.getStmt(DELETE_SQL);
@@ -288,6 +328,7 @@ export class KvDatabase {
 
         try {
             let finalVersionstamp = '';
+            const mutationVersionstamp = commitVersionstamp ?? generateVersionstamp();
 
             for (const op of operations) {
                 switch (op.type) {
@@ -301,59 +342,70 @@ export class KvDatabase {
                         break;
                     }
                     case 'set': {
-                        const versionstamp = generateVersionstamp();
                         const expireAt = op.expireIn ? Date.now() + op.expireIn : null;
-                        setStmt.run([op.key, op.value!, versionstamp, expireAt]);
-                        finalVersionstamp = versionstamp;
+                        setStmt.run([op.key, op.value, mutationVersionstamp, expireAt]);
+                        finalVersionstamp = mutationVersionstamp;
                         break;
                     }
                     case 'delete': {
                         deleteStmt.run([op.key]);
+                        finalVersionstamp = mutationVersionstamp;
                         break;
                     }
                     case 'sum': {
+                        if (typeof op.operand !== 'bigint') {
+                            throw new TypeError("Failed to perform 'sum' mutation on a non-U64 operand");
+                        }
                         const current = this._getInternal(op.key);
-                        let currentValue: number | bigint = 0;
+                        let currentValue = 0n;
                         if (current) {
                             const val = deserializeValue(current.value);
-                            if (typeof val === 'number') currentValue = val;
-                            else if (typeof val === 'bigint') currentValue = val;
+                            if (!isKvU64(val)) {
+                                throw new TypeError("Failed to perform 'sum' mutation on a non-U64 value in the database");
+                            }
+                            currentValue = val.value;
                         }
-                        const operand = op.operand as number | bigint;
-                        const newValue = (typeof currentValue === 'bigint' || typeof operand === 'bigint')
-                            ? BigInt(currentValue) + BigInt(operand)
-                            : currentValue + operand;
-                        const versionstamp = generateVersionstamp();
-                        setStmt.run([op.key, serializeValue(newValue), versionstamp, null]);
-                        finalVersionstamp = versionstamp;
+                        const newValue = (currentValue + op.operand) & MAX_U64;
+                        setStmt.run([op.key, serializeValue(new KvU64(newValue)), mutationVersionstamp, null]);
+                        finalVersionstamp = mutationVersionstamp;
                         break;
                     }
                     case 'max': {
+                        if (typeof op.operand !== 'bigint') {
+                            throw new TypeError("Failed to perform 'max' mutation on a non-U64 operand");
+                        }
                         const current = this._getInternal(op.key);
-                        let currentValue: number | bigint = op.operand as number | bigint;
+                        let currentValue = op.operand;
                         if (current) {
                             const val = deserializeValue(current.value);
-                            if ((typeof val === 'number' || typeof val === 'bigint') && BigInt(val) > BigInt(currentValue)) {
-                                currentValue = val as number | bigint;
+                            if (!isKvU64(val)) {
+                                throw new TypeError("Failed to perform 'max' mutation on a non-U64 value in the database");
+                            }
+                            if (val.value > currentValue) {
+                                currentValue = val.value;
                             }
                         }
-                        const versionstamp = generateVersionstamp();
-                        setStmt.run([op.key, serializeValue(currentValue), versionstamp, null]);
-                        finalVersionstamp = versionstamp;
+                        setStmt.run([op.key, serializeValue(new KvU64(currentValue)), mutationVersionstamp, null]);
+                        finalVersionstamp = mutationVersionstamp;
                         break;
                     }
                     case 'min': {
+                        if (typeof op.operand !== 'bigint') {
+                            throw new TypeError("Failed to perform 'min' mutation on a non-U64 operand");
+                        }
                         const current = this._getInternal(op.key);
-                        let currentValue: number | bigint = op.operand as number | bigint;
+                        let currentValue = op.operand;
                         if (current) {
                             const val = deserializeValue(current.value);
-                            if ((typeof val === 'number' || typeof val === 'bigint') && BigInt(val) < BigInt(currentValue)) {
-                                currentValue = val as number | bigint;
+                            if (!isKvU64(val)) {
+                                throw new TypeError("Failed to perform 'min' mutation on a non-U64 value in the database");
+                            }
+                            if (val.value < currentValue) {
+                                currentValue = val.value;
                             }
                         }
-                        const versionstamp = generateVersionstamp();
-                        setStmt.run([op.key, serializeValue(currentValue), versionstamp, null]);
-                        finalVersionstamp = versionstamp;
+                        setStmt.run([op.key, serializeValue(new KvU64(currentValue)), mutationVersionstamp, null]);
+                        finalVersionstamp = mutationVersionstamp;
                         break;
                     }
                 }
@@ -365,11 +417,7 @@ export class KvDatabase {
                 versionstamp: finalVersionstamp || '00000000000000000000'
             };
         } catch (err) {
-            try {
-                db.exec('ROLLBACK');
-            } catch {
-                // Ignore rollback errors
-            }
+            rollbackQuietly(db);
             throw err;
         }
     }

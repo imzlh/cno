@@ -1,51 +1,147 @@
-import { Headers } from "headers-polyfill";
-import { version } from "../../../package.json";
+import { Headers } from "../headers";
+import pkg from "../../../package.json";
 import { getFetchHook, getUserAgentOverride, getExtraHTTPHeaders, getFetchInterceptHook, captureUserNetworkCallFrames, getCurlInitHook, type NetworkCallFrame } from "../../utils/network-hooks";
 import { type HttpClient } from "../../deno/07_http";
 import { Request } from "./request";
 import { Response } from "./response";
 import { abortError, asyncfs, attachCurlDebugTrace, buildConnectionInfo, compressionAcceptEncoding, curlMod, engine, getCurlPool, isCurlTimeoutError, isNullBodyStatus, maxPendingBodyBytes, os, parseHeaders, prepareRequestBody, rawHeadersToHeaders, streamHighWaterMark, throwIfAborted, timeoutError, toCurlBody, truncateHookPostData } from "./helpers";
+import { isLocalFetchProtocol, loadLocalProtocol } from "./protocols";
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
+type CurlProxyType = NonNullable<Parameters<CModuleCURL.CURL['setProxy']>[1]>;
+type RequestInput = ConstructorParameters<typeof Request>[0];
+type FetchStreamController = ReadableStreamDefaultController<Uint8Array> & {
+    _backpressured?: boolean;
+    _onEnqueueCallback?: (() => void) | null;
+};
+type BodyTerminal = { type: 'close' } | { type: 'error'; error: unknown };
+
+const CURL_PROXY_TYPES = new Set<string>(['http', 'https', 'socks4', 'socks4a', 'socks5', 'socks5h']);
+const { version } = pkg as { version: string };
 
 let _fetchIdCounter = 0;
 function newRequestId(): string { return `fetch-${++_fetchIdCounter}`; }
+
+function emitFetchHookQuietly(callback: () => void): void {
+    try {
+        callback();
+    } catch {
+        // Network hooks are debug observers; failures must not change fetch().
+    }
+}
+
+function isCurlProxyType(value: string): value is CurlProxyType {
+    return CURL_PROXY_TYPES.has(value);
+}
+
+function getCurlProxyType(protocol: string): CurlProxyType {
+    const value = protocol.endsWith(':') ? protocol.slice(0, -1) : protocol;
+    if (isCurlProxyType(value)) return value;
+    throw new Error(`Unsupported proxy protocol: ${protocol}`);
+}
+
+function getEffectiveUrl(curl: CModuleCURL.CURL, fallback: string): string {
+    const value = curl.getInfo(curlMod.CURLINFO_EFFECTIVE_URL);
+    return typeof value === 'string' && value.length > 0 ? value : fallback;
+}
+
+async function closeFileQuietly(file: CModuleAsyncFS.FileHandle): Promise<void> {
+    try {
+        await file.close();
+    } catch {
+        // Preserve the original body/temp-file error.
+    }
+}
+
+function unlinkTempFileQuietly(path: string): void {
+    asyncfs.unlink(path).catch(() => {
+        // Temp-file cleanup is best-effort after curl has consumed it.
+    });
+}
+
+function abortCurlQuietly(curl: CModuleCURL.CURL): void {
+    try {
+        curl.abort();
+    } catch {
+        // Abort is best-effort once the request has been short-circuited.
+    }
+}
+
+function pauseCurlRecvQuietly(curl: CModuleCURL.CURL): boolean {
+    try {
+        curl.pauseRecv();
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+function resumeCurlRecvQuietly(curl: CModuleCURL.CURL): boolean {
+    try {
+        curl.resumeRecv();
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+function readFinalUrl(curl: CModuleCURL.CURL, fallback: string): string {
+    try {
+        return getEffectiveUrl(curl, fallback);
+    } catch {
+        return fallback;
+    }
+}
+
+function toRequestInput(input: unknown): RequestInput {
+    if (input instanceof URL || input instanceof Request || typeof input === 'string') return input;
+    return String(input);
+}
 
 /** Write a PEM string to a temp file and return its path. */
 async function writeTempPem(name: string, pem: string) {
     const path = `${os.tmpDir}/ca-${name}-${Math.random().toString(36).slice(2, 8)}.pem`;
     const f = await asyncfs.open(path, 'w');
-    await f.write(engine.encodeString(pem));
-    f.close();
+    try {
+        await f.write(engine.encodeString(pem));
+    } catch (err) {
+        await closeFileQuietly(f);
+        await asyncfs.unlink(path).catch(() => {});
+        throw err;
+    }
+    await f.close();
     return path;
 }
 
 /** Apply Deno.HttpClient proxy + mTLS settings to a curl handle. Returns temp PEM paths to delete after use. */
-async function applyClientToCurl(curl: CModuleCURL.CURL, client: HttpClient): Promise<string[]> {
+async function applyClientToCurl(curl: CModuleCURL.CURL, client: HttpClient, url: URL): Promise<string[]> {
     const tempFiles: string[] = [];
-    const proxyUrl = client.getProxyUrl();
-    if (proxyUrl) {
-        if (!['http', 'https', 'socks4', 'socks4a', 'socks5', 'socks5h'].includes(proxyUrl.protocol))
-            throw new Error(`Unsupported proxy protocol: ${proxyUrl.protocol}`);
-        curl.setProxy(proxyUrl.href, proxyUrl.protocol as any);
-    }
-    // mTLS: HttpClient stores PEM strings; curl needs file paths.
-    const opts = client.options;
-    if (opts.caCerts?.length) {
-        const caPem = opts.caCerts.join('\n');
-        const p = await writeTempPem('ca', caPem);
-        tempFiles.push(p);
-        curl.setCABundle(p);
-    }
-    if (opts.cert) {
-        const p = await writeTempPem('cert', opts.cert);
-        tempFiles.push(p);
-        curl.setOpt(curlMod.CURLOPT_SSLCERT, p);
-    }
-    if (opts.key) {
-        const p = await writeTempPem('key', opts.key);
-        tempFiles.push(p);
-        curl.setOpt(curlMod.CURLOPT_SSLKEY, p);
+    try {
+        const proxyUrl = client.shouldUseProxy(url) ? client.getProxyUrl() : null;
+        if (proxyUrl) {
+            curl.setProxy(proxyUrl.href, getCurlProxyType(proxyUrl.protocol));
+        }
+        // mTLS: HttpClient stores PEM strings; curl needs file paths.
+        const opts = client.options;
+        if (opts.caCerts?.length) {
+            const caPem = opts.caCerts.join('\n');
+            const p = await writeTempPem('ca', caPem);
+            tempFiles.push(p);
+            curl.setCABundle(p);
+        }
+        if (opts.cert) {
+            const p = await writeTempPem('cert', opts.cert);
+            tempFiles.push(p);
+            curl.setOpt(curlMod.CURLOPT_SSLCERT, p);
+        }
+        if (opts.key) {
+            const p = await writeTempPem('key', opts.key);
+            tempFiles.push(p);
+            curl.setOpt(curlMod.CURLOPT_SSLKEY, p);
+        }
+    } catch (err) {
+        for (const p of tempFiles) unlinkTempFileQuietly(p);
+        throw err;
     }
     return tempFiles;
 }
@@ -68,6 +164,15 @@ const inFlightFetchFrames = new Set<Promise<unknown>>();
 // ----------------------------------------------------------------------------
 export async function performFetch(request: Request, url: URL): Promise<Response> {
     throwIfAborted(request.signal);
+    const localResponse = await loadLocalProtocol(url, request.url);
+    if (localResponse) {
+        const response = new Response(localResponse.body, {
+            status: localResponse.status,
+            headers: localResponse.headers,
+        });
+        Object.defineProperty(response, 'url', { value: localResponse.url });
+        return response;
+    }
     const preparedBody = await prepareRequestBody(request);
     const body = preparedBody.kind === 'buffer' ? preparedBody.body : null;
     throwIfAborted(request.signal);
@@ -81,8 +186,19 @@ export async function performFetch(request: Request, url: URL): Promise<Response
     let tempPemFiles: string[] = [];
     let tempBodyFile: string | null = preparedBody.kind === 'file' ? preparedBody.path : null;
     if (client) {
-        tempPemFiles = await applyClientToCurl(curl, client);
+        tempPemFiles = await applyClientToCurl(curl, client, url);
     }
+    const cleanupTempFiles = () => {
+        for (const p of tempPemFiles) unlinkTempFileQuietly(p);
+        tempPemFiles.length = 0;
+        if (tempBodyFile) {
+            unlinkTempFileQuietly(tempBodyFile);
+            tempBodyFile = null;
+        }
+    };
+    const abortCurl = () => {
+        abortCurlQuietly(curl);
+    };
     const netHook = getFetchHook();
     const curlTrace = netHook ? attachCurlDebugTrace(curl) : undefined;
     const interceptHook = getFetchInterceptHook();
@@ -162,10 +278,11 @@ export async function performFetch(request: Request, url: URL): Promise<Response
             const err = abortError(request.signal);
             headersDone.reject(err);
             errorBody(err);
-            try { curl.abort(); } catch {}
+            abortCurl();
         };
         if (request.signal.aborted) {
-            curl.abort();
+            abortCurl();
+            cleanupTempFiles();
             throw abortError(request.signal);
         }
         request.signal.addEventListener('abort', abortHandler, { once: true });
@@ -178,12 +295,12 @@ export async function performFetch(request: Request, url: URL): Promise<Response
         }
     };
 
-    // Resolve as soon as headers arrive; stream body via ReadableStream.
+    // Resolve immediately when headers arrive; stream body via ReadableStream.
     const headersDone = Promise.withResolvers<{ status: number; headers: string }>();
     inFlightFetchFrames.add(headersDone.promise);
-    let streamController: ReadableStreamDefaultController<Uint8Array> | null = null;
+    let streamController: FetchStreamController | null = null;
     let bodyCanceled = false;
-    let bodyTerminal: { type: 'close' } | { type: 'error'; error: any } | null = null;
+    let bodyTerminal: BodyTerminal | null = null;
     const pendingBodyChunks: Uint8Array[] = [];
     let pendingBodySize = 0;
 
@@ -191,18 +308,16 @@ export async function performFetch(request: Request, url: URL): Promise<Response
 
     const pauseCurlRecv = () => {
         if (curlRecvPaused || bodyCanceled || bodyTerminal) return;
-        try {
-            curl.pauseRecv();
+        if (pauseCurlRecvQuietly(curl)) {
             curlRecvPaused = true;
-        } catch {}
+        }
     };
 
     const resumeCurlRecv = () => {
         if (!curlRecvPaused || bodyCanceled || bodyTerminal) return;
-        try {
-            curl.resumeRecv();
+        if (resumeCurlRecvQuietly(curl)) {
             curlRecvPaused = false;
-        } catch {}
+        }
     };
 
     const shiftPendingBodyChunk = (): Uint8Array | undefined => {
@@ -214,7 +329,7 @@ export async function performFetch(request: Request, url: URL): Promise<Response
     const shouldPauseCurlRecv = (): boolean => {
         if (bodyCanceled || bodyTerminal) return false;
         if (!streamController) return pendingBodySize >= maxPendingBodyBytes;
-        return pendingBodySize >= maxPendingBodyBytes || !!(streamController as any)._backpressured;
+        return pendingBodySize >= maxPendingBodyBytes || !!streamController._backpressured;
     };
 
     const syncCurlBackpressure = () => {
@@ -225,7 +340,7 @@ export async function performFetch(request: Request, url: URL): Promise<Response
     const flushPendingBodyChunks = () => {
         if (!streamController) return;
         while (pendingBodyChunks.length > 0) {
-            if ((streamController as any)._backpressured) break;
+            if (streamController._backpressured) break;
             const chunk = shiftPendingBodyChunk();
             if (!chunk) break;
             try {
@@ -240,7 +355,7 @@ export async function performFetch(request: Request, url: URL): Promise<Response
 
     const enqueueBodyChunk = (chunk: Uint8Array): void => {
         if (bodyCanceled || bodyTerminal) return;
-        if (!streamController || (streamController as any)._backpressured) {
+        if (!streamController || streamController._backpressured) {
             pendingBodyChunks.push(chunk);
             pendingBodySize += chunk.byteLength;
             syncCurlBackpressure();
@@ -267,7 +382,7 @@ export async function performFetch(request: Request, url: URL): Promise<Response
         bodyTerminal = { type: 'close' };
     };
 
-    const errorBody = (error: any) => {
+    const errorBody = (error: unknown) => {
         if (bodyCanceled || bodyTerminal) return;
         resumeCurlRecv();
         if (!streamController) {
@@ -279,8 +394,9 @@ export async function performFetch(request: Request, url: URL): Promise<Response
     };
 
     const startBody = (controller: ReadableStreamDefaultController<Uint8Array>) => {
-        streamController = controller;
-        (controller as any)._onEnqueueCallback = syncCurlBackpressure;
+        const fetchController = controller as FetchStreamController;
+        streamController = fetchController;
+        fetchController._onEnqueueCallback = syncCurlBackpressure;
         flushPendingBodyChunks();
         if (bodyTerminal?.type === 'close') controller.close();
         else if (bodyTerminal?.type === 'error') controller.error(bodyTerminal.error);
@@ -312,14 +428,14 @@ export async function performFetch(request: Request, url: URL): Promise<Response
         if (netHook) {
             const hdrs: Record<string, string> = {};
             for (const [k, v] of parseHeaders(headers)) hdrs[k] = v;
-            try {
+            emitFetchHookQuietly(() => {
                 netHook.onResponse?.({
                     requestId, url: url.href, status, headers: hdrs,
                     requestHeaders: objHeaders,
                     resourceType: 'Fetch',
                     connection: buildConnectionInfo(curl, reqStartTime, curlTrace), timestamp: ts()
                 });
-            } catch {}
+            });
         }
 
         headersDone.resolve({ status, headers });
@@ -333,7 +449,9 @@ export async function performFetch(request: Request, url: URL): Promise<Response
         if (!waitingForFinalHeaders && netHook) {
             const hookBytes = new Uint8Array(chunkBytes.byteLength);
             hookBytes.set(chunkBytes);
-            try { netHook.onData?.({ requestId, data: hookBytes, timestamp: ts() }); } catch {}
+            emitFetchHookQuietly(() => {
+                netHook.onData?.({ requestId, data: hookBytes, timestamp: ts() });
+            });
         }
         enqueueBodyChunk(chunkBytes);
         return false;
@@ -350,14 +468,18 @@ export async function performFetch(request: Request, url: URL): Promise<Response
         if (result) {
             if (result.action === 'fulfill') {
                 removeAbortHandler();
-                try { curl.abort(); } catch {}
+                abortCurl();
+                inFlightFetchFrames.delete(headersDone.promise);
+                cleanupTempFiles();
                 const resHeaders = new Headers();
                 for (const [k, v] of result.responseHeaders) resHeaders.set(k, v);
                 return new Response(result.body, { status: result.responseCode, headers: resHeaders });
             }
             if (result.action === 'fail') {
                 removeAbortHandler();
-                try { curl.abort(); } catch {}
+                abortCurl();
+                inFlightFetchFrames.delete(headersDone.promise);
+                cleanupTempFiles();
                 throw new TypeError(`Request blocked: ${result.reason}`);
             }
             // action === 'continue': apply modifications to the already-configured curl handle
@@ -370,12 +492,14 @@ export async function performFetch(request: Request, url: URL): Promise<Response
 
     // call hook
     const reqStartTime = Date.now() / 1000;  // absolute start for timing delta calc
-    if (netHook) try {
-        netHook.onRequest?.({
-            requestId, url: url.href, method: request.method,
-            headers: objHeaders, postData: truncateHookPostData(body ?? null), callFrames: reqCallFrames, resourceType: 'Fetch', timestamp: reqStartTime
+    if (netHook) {
+        emitFetchHookQuietly(() => {
+            netHook.onRequest?.({
+                requestId, url: url.href, method: request.method,
+                headers: objHeaders, postData: truncateHookPostData(body ?? null), callFrames: reqCallFrames, resourceType: 'Fetch', timestamp: reqStartTime
+            });
         });
-    } catch {}
+    }
 
     // perform() runs in background; we await headers independently
     const performPromise = curl.perform().then(
@@ -383,7 +507,9 @@ export async function performFetch(request: Request, url: URL): Promise<Response
             closeBody();
             if (netHook) {
                 const conn = buildConnectionInfo(curl, reqStartTime, curlTrace);
-                try { netHook.onFinished?.({ requestId, success: true, connection: conn, timestamp: ts() }); } catch {}
+                emitFetchHookQuietly(() => {
+                    netHook.onFinished?.({ requestId, success: true, connection: conn, timestamp: ts() });
+                });
             }
         },
         (err: Error) => {
@@ -392,14 +518,15 @@ export async function performFetch(request: Request, url: URL): Promise<Response
             errorBody(fetchErr);
             if (netHook) {
                 const conn = buildConnectionInfo(curl, reqStartTime, curlTrace);
-                try { netHook.onFinished?.({ requestId, success: false, errorText: fetchErr.message, connection: conn, timestamp: ts() }); } catch {}
+                emitFetchHookQuietly(() => {
+                    netHook.onFinished?.({ requestId, success: false, errorText: fetchErr.message, connection: conn, timestamp: ts() });
+                });
             }
         }
     ).finally(() => {
         inFlightFetchFrames.delete(headersDone.promise);
         removeAbortHandler();
-        for (const p of tempPemFiles) asyncfs.unlink(p).catch(() => {});
-        if (tempBodyFile) asyncfs.unlink(tempBodyFile).catch(() => {});
+        cleanupTempFiles();
         curlRecvPaused = false;
         // Keep pre-read body chunks alive until a reader attaches. Clearing them
         // here races with lazy consumers like response.text()/json().
@@ -418,7 +545,7 @@ export async function performFetch(request: Request, url: URL): Promise<Response
         const isRedirect = status >= 300 && status < 400;
 
         if (request.redirect === 'error' && isRedirect) {
-            curl.abort();
+            abortCurl();
             throw new TypeError(`Request redirect mode is "error" but received redirect ${status}`);
         }
 
@@ -434,18 +561,17 @@ export async function performFetch(request: Request, url: URL): Promise<Response
                 bodyCanceled = true;
                 pendingBodyChunks.length = 0;
                 pendingBodySize = 0;
-                try { curl.abort(); } catch {}
+                abortCurl();
             }
         }, new ByteLengthQueuingStrategy({ highWaterMark: streamHighWaterMark }));
 
         const result = new Response(bodyStream, { status, headers: responseHeaders });
-        let finalUrl = url.href;
-        try { finalUrl = curl.getInfo(curlMod.CURLINFO_EFFECTIVE_URL) as string || url.href; } catch {}
+        const finalUrl = readFinalUrl(curl, url.href);
         Object.defineProperty(result, 'url', { value: finalUrl });
         Object.defineProperty(result, 'redirected', { value: didRedirect || isRedirect || finalUrl !== url.href });
         return result;
     } catch (err) {
-        curl.abort();
+        abortCurl();
         // drain so perform() settles and we don't leak the handle
         await performPromise.catch(() => {});
         if (request.signal?.aborted) throw abortError(request.signal);
@@ -454,17 +580,17 @@ export async function performFetch(request: Request, url: URL): Promise<Response
     }
 }
 
-export async function fetchAsync(input: any, init?: any, initiatorCallFrames?: NetworkCallFrame[]): Promise<Response> {
+export async function fetchAsync(input: unknown, init?: RequestInit, initiatorCallFrames?: NetworkCallFrame[]): Promise<Response> {
     if (input instanceof URL) input = input.href;
-    const request = new Request(input, init);
+    const request = new Request(toRequestInput(input), init);
     request.setInitiatorCallFrames(initiatorCallFrames);
     throwIfAborted(request.signal);
     const url = new URL(request.url);
-    if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new TypeError(`Unsupported protocol: ${url.protocol}`);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:' && !isLocalFetchProtocol(url.protocol)) throw new TypeError(`Unsupported protocol: ${url.protocol}`);
     return performFetch(request, url);
 }
 
-export function fetch(input: any, init?: any): Promise<Response> {
+export function fetch(input: unknown, init?: RequestInit): Promise<Response> {
     const initiatorCallFrames = getFetchHook() ? captureUserNetworkCallFrames() : undefined;
     return fetchAsync(input, init, initiatorCallFrames);
 }

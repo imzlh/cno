@@ -1,177 +1,182 @@
 // Copyright 2018-2025 the Deno authors. MIT license.
 
-class BadResource extends Error {
-    constructor(msg: string) {
+type DenoErrorOptions = { cause?: unknown };
+
+function applyErrorOptions(error: Error, options?: DenoErrorOptions): void {
+    if (options === undefined || options === null) return;
+    if (!Object.prototype.hasOwnProperty.call(options, 'cause')) return;
+    Object.defineProperty(error, 'cause', {
+        value: options.cause,
+        writable: true,
+        configurable: true,
+    });
+}
+
+class DenoError extends Error {
+    constructor(name: string, msg = '', options?: DenoErrorOptions) {
         super(msg);
-        this.name = "BadResource";
+        this.name = name;
+        applyErrorOptions(this, options);
     }
 }
 
-class Interrupted extends Error {
-    constructor(msg: string) {
-        super(msg);
-        this.name = "Interrupted";
+class BadResource extends DenoError {
+    constructor(msg = '', options?: DenoErrorOptions) {
+        super("BadResource", msg, options);
     }
 }
 
-class NotCapable extends Error {
-    constructor(msg: string) {
-        super(msg);
-        this.name = "NotCapable";
+class Interrupted extends DenoError {
+    constructor(msg = '', options?: DenoErrorOptions) {
+        super("Interrupted", msg, options);
     }
 }
 
-class NotFound extends Error {
-    constructor(msg: string) {
-        super(msg);
-        this.name = "NotFound";
+class NotCapable extends DenoError {
+    constructor(msg = '', options?: DenoErrorOptions) {
+        super("NotCapable", msg, options);
     }
 }
 
-class ConnectionRefused extends Error {
-    constructor(msg: string) {
-        super(msg);
-        this.name = "ConnectionRefused";
+class NotFound extends DenoError {
+    code = "ENOENT";
+
+    constructor(msg = '', options?: DenoErrorOptions) {
+        super("NotFound", msg, options);
     }
 }
 
-class ConnectionReset extends Error {
-    constructor(msg: string) {
-        super(msg);
-        this.name = "ConnectionReset";
+class ConnectionRefused extends DenoError {
+    constructor(msg = '', options?: DenoErrorOptions) {
+        super("ConnectionRefused", msg, options);
     }
 }
 
-class ConnectionAborted extends Error {
-    constructor(msg: string) {
-        super(msg);
-        this.name = "ConnectionAborted";
+class ConnectionReset extends DenoError {
+    constructor(msg = '', options?: DenoErrorOptions) {
+        super("ConnectionReset", msg, options);
     }
 }
 
-class NotConnected extends Error {
-    constructor(msg: string) {
-        super(msg);
-        this.name = "NotConnected";
+class ConnectionAborted extends DenoError {
+    constructor(msg = '', options?: DenoErrorOptions) {
+        super("ConnectionAborted", msg, options);
     }
 }
 
-class AddrInUse extends Error {
-    constructor(msg: string) {
-        super(msg);
-        this.name = "AddrInUse";
+class NotConnected extends DenoError {
+    constructor(msg = '', options?: DenoErrorOptions) {
+        super("NotConnected", msg, options);
     }
 }
 
-class AddrNotAvailable extends Error {
-    constructor(msg: string) {
-        super(msg);
-        this.name = "AddrNotAvailable";
+class AddrInUse extends DenoError {
+    constructor(msg = '', options?: DenoErrorOptions) {
+        super("AddrInUse", msg, options);
     }
 }
 
-class BrokenPipe extends Error {
-    constructor(msg: string) {
-        super(msg);
-        this.name = "BrokenPipe";
+class AddrNotAvailable extends DenoError {
+    constructor(msg = '', options?: DenoErrorOptions) {
+        super("AddrNotAvailable", msg, options);
     }
 }
 
-class AlreadyExists extends Error {
-    constructor(msg: string) {
-        super(msg);
-        this.name = "AlreadyExists";
+class BrokenPipe extends DenoError {
+    constructor(msg = '', options?: DenoErrorOptions) {
+        super("BrokenPipe", msg, options);
     }
 }
 
-class InvalidData extends Error {
-    constructor(msg: string) {
-        super(msg);
-        this.name = "InvalidData";
+class AlreadyExists extends DenoError {
+    code = "EEXIST";
+
+    constructor(msg = '', options?: DenoErrorOptions) {
+        super("AlreadyExists", msg, options);
     }
 }
 
-class TimedOut extends Error {
-    constructor(msg: string) {
-        super(msg);
-        this.name = "TimedOut";
+class InvalidData extends DenoError {
+    constructor(msg = '', options?: DenoErrorOptions) {
+        super("InvalidData", msg, options);
     }
 }
 
-class WriteZero extends Error {
-    constructor(msg: string) {
-        super(msg);
-        this.name = "WriteZero";
+class TimedOut extends DenoError {
+    constructor(msg = '', options?: DenoErrorOptions) {
+        super("TimedOut", msg, options);
     }
 }
 
-class WouldBlock extends Error {
-    constructor(msg: string) {
-        super(msg);
-        this.name = "WouldBlock";
+class WriteZero extends DenoError {
+    constructor(msg = '', options?: DenoErrorOptions) {
+        super("WriteZero", msg, options);
     }
 }
 
-class UnexpectedEof extends Error {
-    constructor(msg: string) {
-        super(msg);
-        this.name = "UnexpectedEof";
+class WouldBlock extends DenoError {
+    constructor(msg = '', options?: DenoErrorOptions) {
+        super("WouldBlock", msg, options);
     }
 }
 
-class Http extends Error {
-    constructor(msg: string) {
-        super(msg);
-        this.name = "Http";
+class UnexpectedEof extends DenoError {
+    constructor(msg = '', options?: DenoErrorOptions) {
+        super("UnexpectedEof", msg, options);
     }
 }
 
-class Busy extends Error {
-    constructor(msg: string) {
-        super(msg);
-        this.name = "Busy";
+class Http extends DenoError {
+    constructor(msg = '', options?: DenoErrorOptions) {
+        super("Http", msg, options);
     }
 }
 
-class PermissionDenied extends Error {
-    constructor(msg: string) {
-        super(msg);
-        this.name = "PermissionDenied";
+class Busy extends DenoError {
+    constructor(msg = '', options?: DenoErrorOptions) {
+        super("Busy", msg, options);
     }
 }
 
-class NotSupported extends Error {
-    constructor(msg: string) {
-        super(msg);
-        this.name = "NotSupported";
+class PermissionDenied extends DenoError {
+    code = "EACCES";
+
+    constructor(msg = '', options?: DenoErrorOptions) {
+        super("PermissionDenied", msg, options);
     }
 }
 
-class FilesystemLoop extends Error {
-    constructor(msg: string) {
-        super(msg);
-        this.name = "FilesystemLoop";
+class NotSupported extends DenoError {
+    constructor(msg = '', options?: DenoErrorOptions) {
+        super("NotSupported", msg, options);
     }
 }
 
-class IsADirectory extends Error {
-    constructor(msg: string) {
-        super(msg);
-        this.name = "IsADirectory";
+class FilesystemLoop extends DenoError {
+    constructor(msg = '', options?: DenoErrorOptions) {
+        super("FilesystemLoop", msg, options);
     }
 }
 
-class NetworkUnreachable extends Error {
-    constructor(msg: string) {
-        super(msg);
-        this.name = "NetworkUnreachable";
+class IsADirectory extends DenoError {
+    code = "EISDIR";
+
+    constructor(msg = '', options?: DenoErrorOptions) {
+        super("IsADirectory", msg, options);
     }
 }
 
-class NotADirectory extends Error {
-    constructor(msg: string) {
-        super(msg);
-        this.name = "NotADirectory";
+class NetworkUnreachable extends DenoError {
+    constructor(msg = '', options?: DenoErrorOptions) {
+        super("NetworkUnreachable", msg, options);
+    }
+}
+
+class NotADirectory extends DenoError {
+    code = "ENOTDIR";
+
+    constructor(msg = '', options?: DenoErrorOptions) {
+        super("NotADirectory", msg, options);
     }
 }
 

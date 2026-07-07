@@ -2,10 +2,82 @@ const ssl = import.meta.use('ssl');
 const streams = import.meta.use('streams');
 const engine = import.meta.use('engine');
 const os = import.meta.use('os');
+const crypto = import.meta.use('crypto');
 
 import { wrapFsClassDec as wrap } from '../utils/wrap';
 import { dnsCache } from '@cnojs/http/dns-cache';
+import type { DnsAddressType } from '@cnojs/http/dns-cache';
 import type { FetchConnectionInfo } from '../utils/network-hooks';
+
+const preferIPv4 = (addrs: DnsAddressType[]): DnsAddressType =>
+    addrs.find(addr => addr.family === 4) ?? addrs[0];
+
+function safeGetEnv(name: string): string | null {
+    try {
+        return os.getenv(name) ?? null;
+    } catch {
+        return null;
+    }
+}
+
+function normalizeNoProxyHost(host: string): string {
+    return host.trim().toLowerCase().replace(/^\[(.*)\]$/, '$1');
+}
+
+function splitNoProxyHostPort(entry: string): { host: string; port: string | null } {
+    const trimmed = entry.trim();
+    if (!trimmed) return { host: '', port: null };
+    try {
+        const url = new URL(trimmed.includes('://') ? trimmed : `http://${trimmed}`);
+        return {
+            host: normalizeNoProxyHost(url.hostname),
+            port: url.port || null,
+        };
+    } catch {
+        const index = trimmed.lastIndexOf(':');
+        if (index > 0 && trimmed.indexOf(':') === index) {
+            return {
+                host: normalizeNoProxyHost(trimmed.slice(0, index)),
+                port: trimmed.slice(index + 1) || null,
+            };
+        }
+        return { host: normalizeNoProxyHost(trimmed), port: null };
+    }
+}
+
+function noProxyMatches(url: URL, noProxy: string | null): boolean {
+    if (!noProxy) return false;
+    const host = normalizeNoProxyHost(url.hostname);
+    const port = url.port || (url.protocol === 'https:' ? '443' : url.protocol === 'http:' ? '80' : '');
+
+    for (const rawEntry of noProxy.split(',')) {
+        const entry = rawEntry.trim().toLowerCase();
+        if (!entry) continue;
+        if (entry === '*') return true;
+
+        const { host: ruleHost, port: rulePort } = splitNoProxyHostPort(entry);
+        if (!ruleHost) continue;
+        if (rulePort && rulePort !== port) continue;
+
+        if (ruleHost.startsWith('*.')) {
+            const suffix = ruleHost.slice(1);
+            if (host.endsWith(suffix)) return true;
+            continue;
+        }
+        if (ruleHost.startsWith('.')) {
+            const bare = ruleHost.slice(1);
+            if (host === bare || host.endsWith(ruleHost)) return true;
+            continue;
+        }
+        if (host === ruleHost) return true;
+    }
+    return false;
+}
+
+function hostForUrl(hostname: string): string {
+    if (hostname.startsWith('[') && hostname.endsWith(']')) return hostname;
+    return hostname.includes(':') ? `[${hostname}]` : hostname;
+}
 
 /**
  * HTTP proxy connection - CONNECT tunnel
@@ -21,7 +93,7 @@ async function connectHttpProxy(
     if (!addrs || !addrs.length) {
         throw new Error(`DNS resolution failed for proxy ${proxyUrl.hostname}`);
     }
-    const addr = addrs.find((a: any) => a.family === 4) || addrs[0];
+    const addr = preferIPv4(addrs);
     
     const socket = new streams.TCP();
     await socket.connect({ 
@@ -79,12 +151,12 @@ export interface HttpClientOptions {
  * HTTP Client for custom TLS and proxy configuration
  */
 export class HttpClient {
-    public readonly options: HttpClientOptions;
-    private sslContext: CModuleSSL.Context | null = null;
-    private closed = false;
+    #options: HttpClientOptions;
+    #sslContext: CModuleSSL.Context | null = null;
+    #closed = false;
 
     constructor(options: HttpClientOptions = {}) {
-        this.options = {
+        this.#options = {
             poolIdleTimeout: 30000,
             http2: false,
             ...options
@@ -92,8 +164,12 @@ export class HttpClient {
 
         // Build SSL context if custom certs provided
         if (options.caCerts || options.cert || options.key) {
-            this.sslContext = this.createSSLContext();
+            this.#sslContext = this.createSSLContext();
         }
+    }
+
+    get options(): HttpClientOptions {
+        return this.#options;
     }
 
     private createSSLContext(): CModuleSSL.Context {
@@ -126,7 +202,7 @@ export class HttpClient {
      * Get SSL context for connections
      */
     getSSLContext(): CModuleSSL.Context | null {
-        return this.sslContext;
+        return this.#sslContext;
     }
 
     /**
@@ -134,8 +210,8 @@ export class HttpClient {
      */
     shouldUseProxy(url: URL): boolean {
         if (!this.options.proxy) return false;
-        // TODO: Support NO_PROXY environment variable
-        return true;
+        const noProxy = safeGetEnv('NO_PROXY') ?? safeGetEnv('no_proxy');
+        return !noProxyMatches(url, noProxy);
     }
 
     /**
@@ -152,9 +228,7 @@ export class HttpClient {
     getProxyAuth(): string | null {
         if (!this.options.proxy?.basicAuth) return null;
         const { username, password } = this.options.proxy.basicAuth;
-        const creds = engine.encodeString(`${username}:${password}`);
-        const base64 = btoa(String.fromCharCode(...creds));
-        return `Basic ${base64}`;
+        return `Basic ${crypto.base64Encode(engine.encodeString(`${username}:${password}`))}`;
     }
 
     /**
@@ -162,11 +236,12 @@ export class HttpClient {
      */
     @wrap
     async connect(hostname: string, port: number, isSecure: boolean): Promise<CModuleStreams.TCP> {
-        if (this.closed) {
+        if (this.#closed) {
             throw new Error('HttpClient is closed');
         }
 
-        const proxyUrl = this.getProxyUrl();
+        const targetUrl = new URL(`${isSecure ? 'https' : 'http'}://${hostForUrl(hostname)}:${port}/`);
+        const proxyUrl = this.shouldUseProxy(targetUrl) ? this.getProxyUrl() : null;
         
         if (proxyUrl && !isSecure) {
             // HTTP through proxy - connect to proxy server
@@ -174,7 +249,7 @@ export class HttpClient {
             if (!addrs || !addrs.length) {
                 throw new Error(`DNS resolution failed for proxy ${proxyUrl.hostname}`);
             }
-            const addr = addrs.find((a: any) => a.family === 4) || addrs[0];
+            const addr = preferIPv4(addrs);
             
             const socket = new streams.TCP();
             await socket.connect({
@@ -192,7 +267,7 @@ export class HttpClient {
             if (!addrs || !addrs.length) {
                 throw new Error(`DNS resolution failed for ${hostname}`);
             }
-            const addr = addrs.find((a: any) => a.family === 4) || addrs[0];
+            const addr = preferIPv4(addrs);
             
             const socket = new streams.TCP();
             await socket.connect({ ip: addr.ip, port });
@@ -201,7 +276,7 @@ export class HttpClient {
     }
 
     close(): void {
-        this.closed = true;
+        this.#closed = true;
         // Note: SSL context cleanup is handled by GC
     }
 
@@ -232,11 +307,11 @@ export function getRequestClient(request: Request): HttpClient | undefined {
 /**
  * Create HTTP client (Deno API)
  */
-function createHttpClient(options: HttpClientOptions): HttpClient {
+function createHttpClient(options: HttpClientOptions = {}): HttpClient {
     return new HttpClient(options);
 }
 
 Object.assign(Deno, {
     createHttpClient,
     HttpClient
-} as Partial<typeof Deno>);
+});

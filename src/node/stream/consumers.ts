@@ -1,8 +1,10 @@
 import * as nodeBuffer from '../buffer';
 
+const engine = import.meta.use('engine');
 const { Blob, Buffer } = nodeBuffer;
 
-type Consumable = ReadableStream | NodeJS.ReadableStream | AsyncIterable<any>;
+type Consumable = ReadableStream | NodeJS.ReadableStream | AsyncIterable<unknown>;
+type NodeReadableListener = (...args: unknown[]) => void;
 
 function isReadableStream(value: unknown): value is ReadableStream {
     return !!value && typeof (value as ReadableStream).getReader === 'function';
@@ -12,7 +14,7 @@ function isNodeReadableStream(value: unknown): value is NodeJS.ReadableStream {
     return !!value && typeof (value as NodeJS.ReadableStream).on === 'function';
 }
 
-async function* readableStreamToAsyncIterable(stream: ReadableStream): AsyncIterableIterator<any> {
+async function* readableStreamToAsyncIterable(stream: ReadableStream): AsyncIterableIterator<unknown> {
     const reader = stream.getReader();
     try {
         while (true) {
@@ -25,15 +27,17 @@ async function* readableStreamToAsyncIterable(stream: ReadableStream): AsyncIter
     }
 }
 
-function toAsyncIterable(stream: Consumable): AsyncIterable<any> {
+function toAsyncIterable(stream: Consumable): AsyncIterable<unknown> {
     if (isReadableStream(stream)) return readableStreamToAsyncIterable(stream);
-    if (stream && typeof (stream as AsyncIterable<any>)[Symbol.asyncIterator] === 'function') {
-        return stream as AsyncIterable<any>;
-    }
+    if (isAsyncIterable(stream)) return stream;
     throw new TypeError('The "stream" argument must be a stream or async iterable');
 }
 
-async function chunkToBuffer(chunk: any): Promise<Uint8Array> {
+function isAsyncIterable(value: Consumable): value is AsyncIterable<unknown> {
+    return typeof Reflect.get(value, Symbol.asyncIterator) === 'function';
+}
+
+async function chunkToBuffer(chunk: unknown): Promise<Uint8Array> {
     if (typeof chunk === 'string') return Buffer.from(chunk);
     if (chunk instanceof Uint8Array) return chunk;
     if (chunk instanceof ArrayBuffer) return new Uint8Array(chunk);
@@ -48,34 +52,44 @@ async function readAll(stream: Consumable): Promise<InstanceType<typeof Buffer>>
             const chunks: Uint8Array[] = [];
             const readable = stream as NodeJS.ReadableStream & {
                 resume?: () => void;
-                off?: (event: string, listener: (...args: any[]) => void) => void;
-                removeListener?: (event: string, listener: (...args: any[]) => void) => void;
+                off?: (event: string, listener: NodeReadableListener) => void;
+                removeListener?: (event: string, listener: NodeReadableListener) => void;
             };
+            let pending = Promise.resolve();
+            let settled = false;
             const cleanup = () => {
                 off('data', onData);
                 off('end', onEnd);
                 off('error', onError);
             };
-            const off = (event: string, listener: (...args: any[]) => void) => {
+            const fail = (err: unknown) => {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                reject(err);
+            };
+            const off = (event: string, listener: NodeReadableListener) => {
                 if (typeof readable.off === 'function') readable.off(event, listener);
                 else readable.removeListener?.(event, listener);
             };
-            const onData = (chunk: any) => {
-                void chunkToBuffer(chunk).then(
-                    (buffer) => chunks.push(buffer),
-                    (err) => {
-                        cleanup();
-                        reject(err);
-                    },
-                );
+            const onData = (chunk: unknown) => {
+                pending = pending.then(async () => {
+                    chunks.push(await chunkToBuffer(chunk));
+                }, async () => {
+                    chunks.push(await chunkToBuffer(chunk));
+                });
+                pending.catch(fail);
             };
             const onEnd = () => {
                 cleanup();
-                resolve(Buffer.concat(chunks));
+                pending.then(() => {
+                    if (settled) return;
+                    settled = true;
+                    resolve(Buffer.concat(chunks));
+                }, fail);
             };
             const onError = (err: unknown) => {
-                cleanup();
-                reject(err);
+                fail(err);
             };
             readable.on('data', onData);
             readable.on('end', onEnd);
@@ -101,7 +115,7 @@ export async function arrayBuffer(stream: Consumable): Promise<ArrayBuffer> {
 }
 
 export async function text(stream: Consumable): Promise<string> {
-    return (await readAll(stream)).toString('utf8');
+    return engine.decodeString(await readAll(stream));
 }
 
 export async function json(stream: Consumable): Promise<unknown> {

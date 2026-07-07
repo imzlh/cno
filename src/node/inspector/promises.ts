@@ -1,10 +1,10 @@
-import { Session as CallbackSession } from './session'
+import { InspectorSessionBase } from './session'
 import { open, close, url, waitForDebugger, console } from './mod'
+import type { ProtocolResponse } from './client'
 
-export class Session extends CallbackSession {
-	// @ts-expect-error - Promise-based override of callback-based base.post()
-	async post(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>> {
-		return await this.postAsync(method, params) as Record<string, unknown>
+export class Session extends InspectorSessionBase {
+	async post(method: string, params?: Record<string, unknown>): Promise<ProtocolResponse> {
+		return await this.postAsync(method, params)
 	}
 }
 

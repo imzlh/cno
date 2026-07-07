@@ -156,22 +156,22 @@ export interface ISongDetail {
   pst?: number;
   t?: number;
   rt?: string;
-  crbt?: any;
+  crbt?: unknown;
   cf?: string;
-  rtUrl?: any;
-  rtUrls?: any[];
+  rtUrl?: unknown;
+  rtUrls?: unknown[];
   djId?: number;
   s_id?: number;
   resourceState?: boolean;
-  tagPicList?: any;
-  songJumpInfo?: any;
-  entertainmentTags?: any;
-  awardTags?: any;
-  displayTags?: any[];
-  markTags?: any[];
-  noCopyrightRcmd?: any;
-  rurl?: any;
-  a?: any;
+  tagPicList?: unknown;
+  songJumpInfo?: unknown;
+  entertainmentTags?: unknown;
+  awardTags?: unknown;
+  displayTags?: unknown[];
+  markTags?: unknown[];
+  noCopyrightRcmd?: unknown;
+  rurl?: unknown;
+  a?: unknown;
 }
 
 export interface IQualitySection {
@@ -190,7 +190,7 @@ export interface ISong2 extends IQualitySection {
   duration: number;
   starred: boolean;
   artists: IArtist[];
-  rtUrls?: any[];
+  rtUrls?: unknown[];
   popularity: number;
   playedNum: number;
   hearTime: number;
@@ -569,7 +569,7 @@ export interface ApiResponse<T = undefined> {
   code: number
   data: T
   message?: string
-  [key: string]: any
+  [key: string]: unknown
 }
 
 // 音质等级类型

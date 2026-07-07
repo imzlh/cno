@@ -1,22 +1,58 @@
 import { Stream, Readable, Writable, PassThrough, Transform } from './mod';
 
+type PipelineStreamArg = Stream | ((source: Readable) => Stream);
+type PipelineOptions = { signal?: AbortSignal };
+type WebClosedController = {
+    _addClosedCallback(resolve: () => void, reject: (reason?: unknown) => void): void;
+};
+
+function isPipelineOptions(value: unknown): value is PipelineOptions {
+    return typeof value === 'object'
+        && value !== null
+        && 'signal' in value
+        && Reflect.get(value, 'signal') instanceof AbortSignal;
+}
+
+function webClosedController(value: unknown): WebClosedController | null {
+    if (
+        !(value instanceof globalThis.ReadableStream) &&
+        !(value instanceof globalThis.WritableStream)
+    ) return null;
+    const controller = Reflect.get(value, '_controller');
+    if (!controller || (typeof controller !== 'object' && typeof controller !== 'function')) return null;
+    const addClosedCallback = Reflect.get(controller, '_addClosedCallback');
+    return typeof addClosedCallback === 'function'
+        ? { _addClosedCallback: (resolve, reject) => addClosedCallback.call(controller, resolve, reject) }
+        : null;
+}
+
+function isReadableLike(value: unknown): value is Readable {
+    return value instanceof Readable
+        || !!value && typeof value === 'object' && '_readableState' in value;
+}
+
+function isWritableLike(value: unknown): value is Writable {
+    return value instanceof Writable
+        || !!value && typeof value === 'object' && '_writableState' in value;
+}
+
 /**
  * Stream.pipeline — connects streams and returns a Promise that resolves when
  * the pipeline finishes or rejects on the first error. Properly handles
  * transform functions, destroys all streams on error, and supports AbortSignal.
  */
 export async function pipeline(
-    ...streams: (Stream | ((source: Readable) => Stream) | { signal?: AbortSignal })[]
+    ...streams: (PipelineStreamArg | PipelineOptions)[]
 ): Promise<void> {
     // Extract the optional signal from the last arg
     let signal: AbortSignal | undefined;
     const args = streams.map(s => {
-        if (s && typeof s === 'object' && 'signal' in s && (s as any).signal instanceof AbortSignal) {
-            signal = (s as any).signal;
+        if (isPipelineOptions(s)) {
+            signal = s.signal;
             return null;
         }
         return s;
-    }).filter(Boolean) as (Stream | ((source: Readable) => Stream))[];
+    }).filter((s): s is PipelineStreamArg => s !== null);
 
     if (args.length < 2) {
         throw new TypeError('pipeline requires at least two streams');
@@ -55,15 +91,18 @@ export async function pipeline(
         cleanup.push(() => { src.removeListener('error', onSrcError); dst.removeListener('error', onDstError); });
     }
 
-    // Handle AbortSignal
+    const abortError = () => new Error('The operation was aborted');
+    if (signal?.aborted) {
+        const err = abortError();
+        destroyAll(err);
+        throw err;
+    }
+
     if (signal) {
-        if (signal.aborted) {
-            destroyAll(new Error('The operation was aborted'));
-        } else {
-            const onAbort = () => { destroyAll(new Error('The operation was aborted')); };
-            signal.addEventListener('abort', onAbort, { once: true });
-            cleanup.push(() => signal!.removeEventListener('abort', onAbort));
-        }
+        const abortSignal = signal;
+        const onAbort = () => { destroyAll(abortError()); };
+        abortSignal.addEventListener('abort', onAbort, { once: true });
+        cleanup.push(() => abortSignal.removeEventListener('abort', onAbort));
     }
 
     return new Promise<void>((resolve, reject) => {
@@ -99,7 +138,7 @@ export async function pipeline(
  * readable/writable options.
  */
 export async function finished(
-    stream: Stream,
+    stream: Stream | globalThis.ReadableStream | globalThis.WritableStream,
     options?: { error?: boolean; readable?: boolean; writable?: boolean; signal?: AbortSignal }
 ): Promise<void> {
     const { readable = true, writable = true, signal } = options ?? {};
@@ -113,7 +152,7 @@ export async function finished(
             listeners.length = 0;
         };
 
-        const done = (err?: Error) => {
+        const done = (err?: unknown) => {
             if (settled) return;
             settled = true;
             cleanup();
@@ -121,26 +160,53 @@ export async function finished(
             else resolve();
         };
 
-        const on = (emitter: Stream, event: string, handler: (...args: any[]) => void) => {
+        const on = (emitter: Stream, event: string, handler: (...args: unknown[]) => void) => {
             emitter.on(event, handler);
             listeners.push(() => emitter.removeListener(event, handler));
         };
 
         // AbortSignal
         if (signal) {
-            if (signal.aborted) { done(new Error('The operation was aborted')); return; }
+            const abortSignal = signal;
+            if (abortSignal.aborted) {
+                done(new Error('The operation was aborted'));
+                return;
+            }
             const onAbort = () => done(new Error('The operation was aborted'));
-            signal.addEventListener('abort', onAbort, { once: true });
-            listeners.push(() => signal!.removeEventListener('abort', onAbort));
+            abortSignal.addEventListener('abort', onAbort, { once: true });
+            listeners.push(() => abortSignal.removeEventListener('abort', onAbort));
         }
 
-        if (readable && stream instanceof Readable) {
-            on(stream, 'end', () => done());
-            on(stream, 'error', (err: Error) => done(err));
+        if (
+            (readable && stream instanceof globalThis.ReadableStream) ||
+            (writable && stream instanceof globalThis.WritableStream)
+        ) {
+            const controller = webClosedController(stream);
+            if (controller) {
+                controller._addClosedCallback(() => done(), done);
+                return;
+            }
         }
-        if (writable && stream instanceof Writable) {
+
+        if (readable && isReadableLike(stream)) {
+            if (stream.readableEnded || stream._readableState?.endEmitted || stream._readableState?.ended) {
+                done();
+                return;
+            }
+            on(stream, 'end', () => done());
+            on(stream, 'error', (...args: unknown[]) => done(args[0]));
+        }
+        if (writable && isWritableLike(stream)) {
+            if (stream.writableFinished || stream._writableState?.finished) {
+                done();
+                return;
+            }
             on(stream, 'finish', () => done());
-            on(stream, 'error', (err: Error) => done(err));
+            on(stream, 'error', (...args: unknown[]) => done(args[0]));
+        }
+
+        if (!isReadableLike(stream) && !isWritableLike(stream)) {
+            done(new TypeError('The "stream" argument must be a stream'));
         }
     });
 }

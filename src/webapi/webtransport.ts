@@ -68,7 +68,7 @@ export class WebTransportSendStream {
     get writer(): WritableStreamDefaultWriter<Uint8Array> {
         const self = this;
         const ws = new WritableStream({
-            write(chunk: any) {
+            write(chunk: BufferSource) {
                 const data = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
                 self.write(data);
             },
@@ -107,7 +107,8 @@ export class WebTransportReceiveStream {
 
     read(): Promise<{ done: false; value: Uint8Array } | { done: true; value: undefined }> {
         if (this._queue.length > 0) {
-            return Promise.resolve({ done: false, value: this._queue.shift()! });
+            const value = this._queue.shift();
+            if (value !== undefined) return Promise.resolve({ done: false, value });
         }
         if (this._closed) {
             return Promise.resolve({ done: true, value: undefined });
@@ -182,7 +183,7 @@ export class WebTransportDatagramDuplexStream {
     get maxDatagramSize(): number { return 1200; }
 
     writable: WritableStream = new WritableStream({
-        write: (chunk: any) => {
+        write: (chunk: BufferSource) => {
             const data = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
             this._conn.sendDatagram(data);
         },
@@ -293,7 +294,7 @@ export class WebTransport {
     private _streamCtrl: IncomingStreamController | null = null;
     private _datagrams: WebTransportDatagramDuplexStream | null = null;
     private _readyResolve: ((value: void) => void) | null = null;
-    private _readyReject: ((reason: any) => void) | null = null;
+    private _readyReject: ((reason: unknown) => void) | null = null;
     private _closedResolve: ((value: WebTransportCloseInfo) => void) | null = null;
     private _drainingResolve: ((value: void) => void) | null = null;
     private _state: 'connecting' | 'connected' | 'draining' | 'closed' = 'connecting';

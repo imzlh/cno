@@ -24,16 +24,20 @@
 import { Kv } from './core';
 import { KvListIterator } from './iterator';
 import { AtomicOperation } from './atomic';
+import { KvU64 } from './u64';
 const console = import.meta.use('console');
 
-export { Kv, KvListIterator, AtomicOperation };
+export { Kv, KvListIterator, AtomicOperation, KvU64 };
 export * from './types';
+export * from './u64';
 
 const DEFAULT_KV_PATH = '.deno/kv.db.cnodb';
 
 function normalizeKvPath(path?: string): string {
     if (path === undefined) return DEFAULT_KV_PATH;
-    if (path === '' || path === ':memory:') return path;
+    if (path === '') throw new TypeError('Filename cannot be empty');
+    if (path === ':memory:') return path;
+    if (path.startsWith(':')) throw new TypeError("Filename cannot start with ':' unless prefixed with './'");
     if (path.endsWith('.cnodb')) return path;
     return `${path}.cnodb`;
 }
@@ -76,9 +80,11 @@ export class KvClosedError extends KvError {
 async function openKv(path?: string): Promise<Deno.Kv> {
     const kv = new Kv(normalizeKvPath(path));
     await kv.open();
-    return kv as unknown as Deno.Kv;
+    return kv;
 }
 
 Object.assign(Deno, {
     openKv,
+    KvU64,
+    AtomicOperation,
 });

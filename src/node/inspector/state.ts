@@ -9,8 +9,17 @@ export interface InspectorBridge {
 	isActive(): boolean
 }
 
+function isInspectorBridge(value: unknown): value is InspectorBridge {
+	if (!value || typeof value !== 'object') return false
+	return typeof Reflect.get(value, 'open') === 'function'
+		&& typeof Reflect.get(value, 'close') === 'function'
+		&& typeof Reflect.get(value, 'url') === 'function'
+		&& typeof Reflect.get(value, 'waitForConnection') === 'function'
+		&& typeof Reflect.get(value, 'waitForDebugger') === 'function'
+		&& typeof Reflect.get(value, 'isActive') === 'function'
+}
+
 export function getInspectorBridge(): InspectorBridge | null {
-	const value = (globalThis as Record<PropertyKey, unknown>)[INSPECTOR_BRIDGE]
-	if (!value || typeof value !== 'object') return null
-	return value as InspectorBridge
+	const value = Reflect.get(globalThis, INSPECTOR_BRIDGE)
+	return isInspectorBridge(value) ? value : null
 }

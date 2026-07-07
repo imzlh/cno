@@ -1,43 +1,42 @@
-// node:path polyfill — wraps Deno @std/path with Node.js compatibility
-// Adds: sep, delimiter (lowercase aliases), posix/win32 namespace objects
+import { posixPathApi, win32PathApi } from './_shared';
 
-// @ts-ignore - deno-styled jsr import
-export * from "jsr:@std/path"
+const posixCompat = posixPathApi;
+const win32Compat = win32PathApi;
+const platformPath = process.platform === 'win32' ? win32Compat : posixCompat;
 
-// @ts-ignore
-import * as stdPath from "jsr:@std/path"
-// @ts-ignore - posix sub-module (exports map: ./posix → posix/mod.ts)
-import * as posixNs from "jsr:@std/path/posix"
-// @ts-ignore - windows sub-module (exports map: ./windows → windows/mod.ts)
-import * as win32Ns from "jsr:@std/path/windows"
+export const sep = platformPath.sep;
+export const delimiter = platformPath.delimiter;
+export const _makeLong = platformPath._makeLong;
+export const basename = platformPath.basename;
+export const dirname = platformPath.dirname;
+export const extname = platformPath.extname;
+export const format = platformPath.format;
+export const isAbsolute = platformPath.isAbsolute;
+export const join = platformPath.join;
+export const normalize = platformPath.normalize;
+export const parse = platformPath.parse;
+export const relative = platformPath.relative;
+export const resolve = platformPath.resolve;
+export const toNamespacedPath = platformPath.toNamespacedPath;
 
-// Node.js lowercase aliases. Keep these explicit; third-party code often
-// concatenates with path.sep, so an upstream constant rename becomes visible
-// as paths like "D:undefinedproject".
-export const sep = process.platform === 'win32' ? '\\' : '/'
-export const delimiter = process.platform === 'win32' ? ';' : ':'
+export const posix = posixCompat;
+export const win32 = win32Compat;
 
-const posixCompat = {
-    ...posixNs,
-    sep: '/',
-    delimiter: ':',
-}
-
-const win32Compat = {
-    ...win32Ns,
-    sep: '\\',
-    delimiter: ';',
-}
-
-// Platform-specific namespace objects (Node.js path.posix / path.win32)
-export const posix = posixCompat
-export const win32 = win32Compat
-
-// Default export: everything in one object
 export default {
-    ...stdPath,
-    sep,
+    basename,
     delimiter,
+    dirname,
+    extname,
+    format,
+    isAbsolute,
+    join,
+    normalize,
+    parse,
     posix: posixCompat,
+    relative,
+    resolve,
+    sep,
+    toNamespacedPath,
     win32: win32Compat,
+    _makeLong,
 } as typeof import('node:path');

@@ -1,4 +1,6 @@
 const console = import.meta.use('console');
+const testRuntime = Deno as typeof Deno & { __startTest(): void };
+
 console.log('Start scan and running deno tests');
 console.log('Behavior is same as: cargo run --bin deno -- test --allow-all --location=http://js-unit-tests/foo/bar .');
 
@@ -13,5 +15,4 @@ for (const file of flist) {
 }
 
 console.log('Now, starting all tests.');
-// @ts-ignore - cno private function
-Deno.__startTest();
+testRuntime.__startTest();

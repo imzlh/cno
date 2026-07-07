@@ -17,12 +17,36 @@ interface ProtocolMessage {
 	method?: string
 	params?: Record<string, unknown>
 	result?: ProtocolResponse
-	error?: { code?: number; message?: string }
+	error?: { code?: number; message?: string; data?: unknown }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function parseProtocolMessage(raw: string): ProtocolMessage | null {
+	const value: unknown = JSON.parse(raw)
+	if (!isRecord(value)) return null
+
+	const message: ProtocolMessage = {}
+	if (typeof value.id === 'number') message.id = value.id
+	if (typeof value.method === 'string') message.method = value.method
+	if (isRecord(value.params)) message.params = value.params
+	if (isRecord(value.result)) message.result = value.result
+	if (isRecord(value.error)) {
+		const error: ProtocolMessage['error'] = {}
+		if (typeof value.error.code === 'number') error.code = value.error.code
+		if (typeof value.error.message === 'string') error.message = value.error.message
+		if ('data' in value.error) error.data = value.error.data
+		message.error = error
+	}
+	return message
 }
 
 export class InspectorProtocolClient extends EventEmitter {
 	private ws: WebSocket | null = null
 	private connectPromise: Promise<void> | null = null
+	private mode: 'bridge' | 'local' = 'bridge'
 	private nextId = 1
 	private pending = new Map<number, PendingRequest>()
 
@@ -36,12 +60,15 @@ export class InspectorProtocolClient extends EventEmitter {
 			this.ws?.close()
 		} catch {}
 		this.ws = null
+		this.mode = 'bridge'
 		this.connectPromise = null
 		this.failPending(new Error('Inspector session disconnected'))
 	}
 
 	post(method: string, params?: Record<string, unknown>): Promise<ProtocolResponse> {
-		return this.ensureConnected(false).then(() => new Promise<ProtocolResponse>((resolve, reject) => {
+		return this.ensureConnected(false).then(() => {
+			if (this.mode === 'local') return this.postLocal(method, params)
+			return new Promise<ProtocolResponse>((resolve, reject) => {
 			const ws = this.ws
 			if (!ws || ws.readyState !== WebSocket.OPEN) {
 				reject(new Error('Inspector session is not connected'))
@@ -55,15 +82,20 @@ export class InspectorProtocolClient extends EventEmitter {
 				this.pending.delete(id)
 				reject(asError(error))
 			}
-		}))
+			})
+		})
 	}
 
 	private ensureConnected(waitForDebugger: boolean): Promise<void> {
+		if (this.mode === 'local') return Promise.resolve()
 		if (this.ws && this.ws.readyState === WebSocket.OPEN) return Promise.resolve()
 		if (this.connectPromise) return this.connectPromise
 
 		const bridge = getInspectorBridge()
-		if (!bridge) throw new Error('Inspector bridge is not available in this runtime')
+		if (!bridge) {
+			this.mode = 'local'
+			return Promise.resolve()
+		}
 
 		this.connectPromise = (async () => {
 			const wsUrl = await bridge.open({ wait: waitForDebugger })
@@ -90,6 +122,25 @@ export class InspectorProtocolClient extends EventEmitter {
 		return this.connectPromise
 	}
 
+	private postLocal(method: string, params?: Record<string, unknown>): Promise<ProtocolResponse> {
+		switch (method) {
+			case 'Runtime.enable':
+				return Promise.resolve({})
+			case 'Runtime.evaluate': {
+				const expression = typeof params?.expression === 'string' ? params.expression : ''
+				const value = globalThis.eval(expression)
+				return Promise.resolve({
+					result: {
+						type: value === null ? 'object' : typeof value,
+						value,
+					},
+				})
+			}
+			default:
+				throw protocolError({ code: -32601, message: `Unknown CDP method: ${method}` })
+		}
+	}
+
 	private installSocket(ws: WebSocket): void {
 		ws.onmessage = (event): void => {
 			let raw = event.data
@@ -98,7 +149,9 @@ export class InspectorProtocolClient extends EventEmitter {
 
 			let message: ProtocolMessage
 			try {
-				message = JSON.parse(raw) as ProtocolMessage
+				const parsed = parseProtocolMessage(raw)
+				if (!parsed) return
+				message = parsed
 			} catch {
 				return
 			}
@@ -107,8 +160,8 @@ export class InspectorProtocolClient extends EventEmitter {
 				const pending = this.pending.get(message.id)
 				if (!pending) return
 				this.pending.delete(message.id)
-				if (message.error) pending.reject(new Error(message.error.message || 'Inspector protocol error'))
-				else pending.resolve((message.result ?? {}) as ProtocolResponse)
+				if (message.error) pending.reject(protocolError(message.error))
+				else pending.resolve(message.result ?? {})
 				return
 			}
 
@@ -137,4 +190,13 @@ export class InspectorProtocolClient extends EventEmitter {
 
 function asError(error: unknown): Error {
 	return error instanceof Error ? error : new Error(String(error))
+}
+
+type ProtocolError = Error & { code?: number; data?: unknown }
+
+function protocolError(payload: { code?: number; message?: string; data?: unknown }): Error {
+	const error: ProtocolError = new Error(payload.message || 'Inspector protocol error')
+	if (payload.code !== undefined) error.code = payload.code
+	if (payload.data !== undefined) error.data = payload.data
+	return error
 }

@@ -3,6 +3,12 @@
  */
 
 const fs = import.meta.use('fs');
+const os = import.meta.use('os');
+
+const sysname = os.uname().sysname;
+const isWindows = sysname === 'Windows_NT';
+const isDarwin = sysname === 'Darwin';
+const isLinux = sysname === 'Linux';
 
 export const constants = {
     // File open flags
@@ -13,6 +19,10 @@ export const constants = {
     O_EXCL: fs.OPEN_EXCL,
     O_TRUNC: fs.OPEN_TRUNC,
     O_APPEND: fs.OPEN_APPEND,
+    O_DIRECT: isLinux ? 0o40000 : undefined,
+    O_NOATIME: isLinux ? 0o1000000 : undefined,
+    O_SYMLINK: isDarwin ? 0x200000 : undefined,
+    UV_FS_O_FILEMAP: isWindows ? 0x20000000 : 0,
 
     // File types
     S_IFMT: fs.S_IFMT,
@@ -48,6 +58,11 @@ export const constants = {
     R_OK: fs.R_OK,
     W_OK: fs.W_OK,
     X_OK: fs.X_OK,
+
+    // copyFile mode flags
+    COPYFILE_EXCL: 1,
+    COPYFILE_FICLONE: 2,
+    COPYFILE_FICLONE_FORCE: 4,
 };
 
 // Export individual constants (Node.js compatible)
@@ -59,6 +74,10 @@ export const {
     O_EXCL,
     O_TRUNC,
     O_APPEND,
+    O_DIRECT,
+    O_NOATIME,
+    O_SYMLINK,
+    UV_FS_O_FILEMAP,
     S_IFMT,
     S_IFREG,
     S_IFDIR,
@@ -82,4 +101,7 @@ export const {
     R_OK,
     W_OK,
     X_OK,
+    COPYFILE_EXCL,
+    COPYFILE_FICLONE,
+    COPYFILE_FICLONE_FORCE,
 } = constants;

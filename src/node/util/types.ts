@@ -1,3 +1,9 @@
+const objectToString = (value: unknown): string => Object.prototype.toString.call(value);
+
+function toStringTag(value: object): unknown {
+    return Reflect.get(value, Symbol.toStringTag);
+}
+
 export function isAnyArrayBuffer(value: unknown): value is ArrayBuffer {
     return value instanceof ArrayBuffer || value instanceof SharedArrayBuffer;
 }
@@ -7,14 +13,16 @@ export function isArrayBuffer(value: unknown): value is ArrayBuffer {
 }
 
 export function isArgumentsObject(value: unknown): value is IArguments {
-    return value !== null && typeof value === 'object' && 'callee' in value;
+    return objectToString(value) === '[object Arguments]';
 }
 
 export function isArrayBufferView(value: unknown): value is ArrayBufferView {
     return ArrayBuffer.isView(value);
 }
 
-export function isAsyncFunction(value: unknown): value is Function {
+type AsyncCallable = (...args: unknown[]) => Promise<unknown>;
+
+export function isAsyncFunction(value: unknown): value is AsyncCallable {
     return typeof value === 'function' && value.constructor.name === 'AsyncFunction';
 }
 
@@ -31,7 +39,13 @@ export function isBooleanObject(value: unknown): value is Boolean {
 }
 
 export function isBoxedPrimitive(value: unknown): value is Boolean | String | Number | Symbol | BigInt {
-    return value instanceof Boolean || value instanceof String || value instanceof Number || value instanceof Object && (typeof (value as any).valueOf() === 'symbol' || typeof (value as any).valueOf() === 'bigint');
+    if (value === null || typeof value !== 'object') return false;
+    const tag = objectToString(value);
+    return tag === '[object Boolean]'
+        || tag === '[object Number]'
+        || tag === '[object String]'
+        || tag === '[object Symbol]'
+        || tag === '[object BigInt]';
 }
 
 export function isDataView(value: unknown): value is DataView {
@@ -55,7 +69,7 @@ export function isGeneratorFunction(value: unknown): value is GeneratorFunction 
 }
 
 export function isGeneratorObject(value: unknown): value is Generator {
-    return value !== null && typeof value === 'object' && typeof (value as any).next === 'function';
+    return objectToString(value) === '[object Generator]';
 }
 
 export function isInt8Array(value: unknown): value is Int8Array {
@@ -75,11 +89,11 @@ export function isMap(value: unknown): value is Map<unknown, unknown> {
 }
 
 export function isMapIterator(value: unknown): boolean {
-    return value !== null && typeof value === 'object' && typeof (value as any).next === 'function';
+    return objectToString(value) === '[object Map Iterator]';
 }
 
 export function isModuleNamespaceObject(value: unknown): boolean {
-    return value !== null && typeof value === 'object' && (value as any)[Symbol.toStringTag] === 'Module';
+    return value !== null && typeof value === 'object' && toStringTag(value) === 'Module';
 }
 
 export function isNativeError(value: unknown): value is Error {
@@ -107,7 +121,7 @@ export function isSet(value: unknown): value is Set<unknown> {
 }
 
 export function isSetIterator(value: unknown): boolean {
-    return value !== null && typeof value === 'object' && typeof (value as any).next === 'function';
+    return objectToString(value) === '[object Set Iterator]';
 }
 
 export function isSharedArrayBuffer(value: unknown): value is SharedArrayBuffer {
@@ -118,8 +132,9 @@ export function isStringObject(value: unknown): value is String {
     return value instanceof String;
 }
 
-export function isSymbolObject(value: unknown): value is Object {
-    return typeof value === 'object' && value !== null && typeof (value as any).valueOf() === 'symbol';
+export function isSymbolObject(value: unknown): value is object {
+    if (value === null || typeof value !== 'object') return false;
+    return objectToString(value) === '[object Symbol]';
 }
 
 export function isTypedArray(value: unknown): value is NodeJS.TypedArray {
@@ -152,10 +167,10 @@ export function isWeakSet(value: unknown): value is WeakSet<object> {
 
 export function isKeyObject(value: unknown): boolean {
     return value !== null && typeof value === 'object'
-        && (value as any)[Symbol.toStringTag] === 'KeyObject';
+        && toStringTag(value) === 'KeyObject';
 }
 
 export function isCryptoKey(value: unknown): boolean {
     return value !== null && typeof value === 'object'
-        && (value as any)[Symbol.toStringTag] === 'CryptoKey';
+        && toStringTag(value) === 'CryptoKey';
 }

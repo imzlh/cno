@@ -5,7 +5,7 @@
  */
 
 import { HttpRequestBuilder, HttpResponseParser } from "@cnojs/http/h1";
-import { Headers } from "headers-polyfill";
+import { Headers } from "../webapi/headers";
 import { type ISocket, TcpSocket } from "@cnojs/http/socket";
 import { dnsCache } from "@cnojs/http/dns-cache";
 
@@ -83,30 +83,36 @@ export function readHeaders(socket: IHttpSocket, parser: HttpResponseParser): Pr
     let settled = false;
     let head: HttpResponseHead | null = null;
     return new Promise<HttpResponseHead>((resolve, reject) => {
+        const settle = (fn: 'resolve' | 'reject', value: HttpResponseHead | unknown) => {
+            if (settled) return;
+            settled = true;
+            if (fn === 'resolve') resolve(value as HttpResponseHead);
+            else reject(value);
+        };
+
         parser.onHeadersComplete = (status, headers) => {
             head = { status, headers };
         };
         parser.onError = (err) => {
-            if (!settled) { settled = true; reject(err); }
+            settle('reject', err);
         };
         socket.onReadable(data => {
             if (!data) {
                 socket.close();
-                if (!settled) { settled = true; reject(new Error('Connection closed while reading headers')); }
+                settle('reject', new Error('Connection closed while reading headers'));
                 return;
             }
-            const result = parser.feed(data) as any;
+            const result = parser.feed(data);
             if (head && !settled) {
-                settled = true;
                 socket.stopReading();
-                const consumed = Number(result?.nread ?? result?.offset ?? result?.consumed ?? data.byteLength);
+                const consumed = Number(result?.bytesConsumed ?? data.byteLength);
                 if (Number.isFinite(consumed) && consumed >= 0 && consumed < data.byteLength) {
                     head.leftover = data.subarray(consumed);
                 }
-                resolve(head);
+                settle('resolve', head);
             }
         }, err => {
-            if (!settled) { settled = true; reject(err); }
+            settle('reject', err);
         });
     });
 }

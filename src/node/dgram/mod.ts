@@ -26,7 +26,11 @@ function _getFd(handle: CModuleUDP.UDP): number {
 function _getSocket(handle: CModuleUDP.UDP): CModuleSocket.PosixSocket | null {
     const fd = _getFd(handle);
     if (fd < 0) return null;
-    try { return sock.socket_from_fd(fd); } catch { return null; }
+    try {
+        return sock.socket_from_fd(fd);
+    } catch {
+        return null;
+    }
 }
 
 // Type definitions
@@ -58,7 +62,7 @@ export interface SocketOptions {
     ipv6Only?: boolean;
     recvBufferSize?: number;
     sendBufferSize?: number;
-    lookup?: (hostname: string, options: any, callback: (err: Error | null, address: string, family: number) => void) => void;
+    lookup?: (hostname: string, options: { family?: 4 | 6 }, callback: (err: Error | null, address: string, family: number) => void) => void;
     signal?: AbortSignal;
 }
 
@@ -81,6 +85,50 @@ function flattenPrototype(target: object): void {
     }
 }
 
+function validateSocketType(type: unknown): asserts type is 'udp4' | 'udp6' {
+    if (type !== 'udp4' && type !== 'udp6') {
+        throw Object.assign(
+            new TypeError('Bad socket type specified. Valid types are: udp4, udp6'),
+            { code: 'ERR_SOCKET_BAD_TYPE' },
+        );
+    }
+}
+
+function makeError(message: string, code: string): Error & { code: string } {
+    return Object.assign(new Error(message), { code });
+}
+
+function asError(error: unknown): Error {
+    return error instanceof Error ? error : new Error(String(error));
+}
+
+function validateTTL(ttl: unknown): number {
+    if (typeof ttl !== 'number') {
+        throw new TypeError('The "ttl" argument must be of type number');
+    }
+    if (ttl <= 0 || ttl > 255) {
+        throw makeError('setTTL EINVAL', 'EINVAL');
+    }
+    return ttl;
+}
+
+function validateSendPort(port: unknown): number {
+    const value = typeof port === 'string' && port.trim() !== '' ? Number(port) : port;
+    if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0 || value >= 65536) {
+        throw Object.assign(
+            new RangeError(`Port should be > 0 and < 65536. Received ${String(port)}.`),
+            { code: 'ERR_SOCKET_BAD_PORT' },
+        );
+    }
+    return value;
+}
+
+function validateAddress(address: unknown): asserts address is string {
+    if (typeof address !== 'string') {
+        throw new TypeError(`The "address" argument must be of type string. Received type ${typeof address}`);
+    }
+}
+
 export interface Socket extends EventEmitter {
     readonly isIPv6: boolean;
     _handle: CModuleUDP.UDP | null;
@@ -99,16 +147,20 @@ export interface Socket extends EventEmitter {
     bind(options: BindOptions, callback?: () => void): this;
     _doBind(portOrOptions?: number | BindOptions, addressOrCallback?: string | (() => void), callback?: () => void): Promise<void>;
     _startRecv(): Promise<void>;
-    send(msg: string | Uint8Array | Array<string | Uint8Array>, port: number, address?: string, callback?: (error: Error | null, bytes?: number) => void): this;
-    send(msg: string | Uint8Array | Array<string | Uint8Array>, port: number, address: string, callback: (error: Error | null, bytes?: number) => void): this;
-    _doSend(msg: string | Uint8Array | Array<string | Uint8Array>, port: number, addressOrCallback?: string | ((error: Error | null, bytes?: number) => void), callback?: (error: Error | null, bytes?: number) => void): Promise<void>;
-    connect(port: number, address?: string, callback?: () => void): Promise<this>;
-    disconnect(): Promise<this>;
+    send(msg: string | Uint8Array | Array<string | Uint8Array>, offset: number, length: number, port: number, address?: string, callback?: (error: Error | null, bytes?: number) => void): void;
+    send(msg: string | Uint8Array | Array<string | Uint8Array>, offset: number, length: number, callback?: (error: Error | null, bytes?: number) => void): void;
+    send(msg: string | Uint8Array | Array<string | Uint8Array>, port: number, address?: string, callback?: (error: Error | null, bytes?: number) => void): void;
+    send(msg: string | Uint8Array | Array<string | Uint8Array>, port: number, address: string, callback: (error: Error | null, bytes?: number) => void): void;
+    send(msg: string | Uint8Array | Array<string | Uint8Array>, callback?: (error: Error | null, bytes?: number) => void): void;
+    _doSend(request: SendRequest): Promise<void>;
+    connect(port: number, address?: string, callback?: () => void): void;
+    _doConnect(port: number, address?: string, callback?: () => void): Promise<void>;
+    disconnect(): void;
     address(): AddressInfo | null;
     remoteAddress(): AddressInfo | null;
-    setBroadcast(flag: boolean): this;
-    setTTL(ttl: number): this;
-    setMulticastTTL(ttl: number): this;
+    setBroadcast(flag: boolean): void;
+    setTTL(ttl: number): number;
+    setMulticastTTL(ttl: number): number;
     setMulticastInterface(multicastInterface?: string): this;
     setMulticastLoopback(flag: boolean): this;
     addMembership(multicastAddress: string, multicastInterface?: string): void;
@@ -131,7 +183,8 @@ export interface SocketConstructor {
     prototype: Socket;
 }
 
-function initSocket(self: any, type: 'udp4' | 'udp6', reuseAddr?: boolean, ipv6Only?: boolean): void {
+function initSocket(self: Socket, type: 'udp4' | 'udp6', reuseAddr?: boolean, ipv6Only?: boolean): void {
+    validateSocketType(type);
     EventEmitter.call(self);
     self._handle = null;
     self._bound = false;
@@ -147,8 +200,8 @@ function initSocket(self: any, type: 'udp4' | 'udp6', reuseAddr?: boolean, ipv6O
     self.isIPv6 = type === 'udp6';
 }
 
-export const Socket: SocketConstructor = function Socket(this: any, type: 'udp4' | 'udp6', reuseAddr?: boolean, ipv6Only?: boolean) {
-    const target = this && (typeof this === 'object' || typeof this === 'function')
+export const Socket: SocketConstructor = function Socket(this: unknown, type: 'udp4' | 'udp6', reuseAddr?: boolean, ipv6Only?: boolean) {
+    const target: Socket = this && (typeof this === 'object' || typeof this === 'function')
         ? this
         : Object.create(Socket.prototype);
     initSocket(target, type, reuseAddr, ipv6Only);
@@ -197,13 +250,16 @@ Socket.prototype._doBind = async function _doBind(this: Socket, portOrOptions?: 
         if (!this._handle) {
             await this._init();
         }
+        const handle = this._handle;
+        if (!handle) throw new Error('UDP handle is not initialized');
 
-        const flags = this._ipv6Only ? udp.UDP_IPV6ONLY : 0;
+        const flags = (this._ipv6Only ? udp.UDP_IPV6ONLY : 0) |
+            (this._reuseAddr ? udp.UDP_REUSEADDR : 0);
 
-        this._handle!.bind({ ip: address, port }, flags);
+        handle.bind({ ip: address, port }, flags);
         this._bound = true;
 
-        const sockname = this._handle!.getsockname();
+        const sockname = handle.getsockname();
         this._address = {
             address: sockname.ip ?? address,
             family: this._type === 'udp6' ? 'IPv6' : 'IPv4',
@@ -246,120 +302,203 @@ Socket.prototype._startRecv = async function _startRecv(this: Socket): Promise<v
     }
 };
 
-Socket.prototype.send = function send(this: Socket, msg: string | Uint8Array | Array<string | Uint8Array>, port: number, addressOrCallback?: string | ((error: Error | null, bytes?: number) => void), callback?: (error: Error | null, bytes?: number) => void): Socket {
-    // Asynchronously send
-    this._doSend(msg, port, addressOrCallback, callback);
-    return this;
+Socket.prototype.send = function send(this: Socket, msg: string | Uint8Array | Array<string | Uint8Array>, port: number, addressOrCallback?: string | ((error: Error | null, bytes?: number) => void), callback?: (error: Error | null, bytes?: number) => void): void {
+    const args: unknown[] = Array.prototype.slice.call(arguments, 1);
+    this._doSend(normalizeSendArgs(this, msg, args));
 };
 
-Socket.prototype._doSend = async function _doSend(this: Socket, msg: string | Uint8Array | Array<string | Uint8Array>, port: number, addressOrCallback?: string | ((error: Error | null, bytes?: number) => void), callback?: (error: Error | null, bytes?: number) => void): Promise<void> {
-    let address: string;
-    let cb: ((error: Error | null, bytes?: number) => void) | undefined;
+interface SendRequest {
+    data: Uint8Array;
+    port?: number;
+    address?: string;
+    connected?: boolean;
+    callback?: (error: Error | null, bytes?: number) => void;
+}
 
-    if (typeof addressOrCallback === 'string') {
-        address = addressOrCallback;
-        cb = callback;
-    } else {
-        address = this._remoteAddress?.address ?? '127.0.0.1';
-        cb = addressOrCallback;
-    }
-
+function normalizeSendArgs(
+    socket: Socket,
+    msg: string | Uint8Array | Array<string | Uint8Array>,
+    args: unknown[],
+): SendRequest {
+    let address = socket._remoteAddress?.address ?? '127.0.0.1';
+    let callback: ((error: Error | null, bytes?: number) => void) | undefined;
     let data: Uint8Array;
+    let port: number;
+
     if (typeof msg === 'string') {
         data = engine.encodeString(msg);
     } else if (Array.isArray(msg)) {
-        const buffers = msg.map(m => typeof m === 'string' ? engine.encodeString(m) : m);
-        // @ts-ignore - Buffer.concat returns Buffer which is Uint8Array
+        const buffers = msg.map((item) => typeof item === 'string' ? engine.encodeString(item) : item);
         data = Buffer.concat(buffers);
     } else {
         data = msg;
     }
 
+    if (
+        typeof args[0] === 'number' &&
+        typeof args[1] === 'number' &&
+        typeof args[2] === 'number'
+    ) {
+        const offset = args[0];
+        const length = args[1];
+        port = args[2];
+        if (typeof args[3] === 'string') {
+            address = args[3];
+            if (typeof args[4] === 'function') callback = args[4];
+        } else if (typeof args[3] === 'function') {
+            callback = args[3];
+        } else if (args[3] !== undefined) {
+            validateAddress(args[3]);
+        } else {
+            callback = undefined;
+        }
+        data = data.subarray(offset, offset + length);
+        port = validateSendPort(port);
+        validateAddress(address);
+        return { data, port, address, callback };
+    }
+
+    if (
+        socket._remoteAddress &&
+        typeof args[0] === 'number' &&
+        typeof args[1] === 'number' &&
+        typeof args[2] !== 'number'
+    ) {
+        data = data.subarray(args[0], args[0] + args[1]);
+        return { data, connected: true, callback: typeof args[2] === 'function' ? args[2] : undefined };
+    }
+
+    if (socket._remoteAddress && (args[0] === undefined || typeof args[0] === 'function')) {
+        return { data, connected: true, callback: typeof args[0] === 'function' ? args[0] : undefined };
+    }
+
+    port = args[0];
+    if (typeof args[1] === 'string') {
+        address = args[1];
+        if (typeof args[2] === 'function') callback = args[2];
+    } else if (typeof args[1] === 'function') {
+        callback = args[1];
+    } else if (args[1] !== undefined) {
+        validateAddress(args[1]);
+    } else {
+        callback = undefined;
+    }
+
+    port = validateSendPort(port);
+    validateAddress(address);
+    return { data, port, address, callback };
+}
+
+Socket.prototype._doSend = async function _doSend(this: Socket, request: SendRequest): Promise<void> {
+    const { data, port, address, callback, connected } = request;
+
     try {
         if (!this._handle) {
             await this._init();
         }
+        const handle = this._handle;
+        if (!handle) throw new Error('UDP handle is not initialized');
 
-        const bytes = await this._handle!.send(data, { ip: address, port });
-        cb?.(null, bytes);
+        const target = connected
+            ? undefined
+            : address !== undefined && port !== undefined
+            ? { ip: address, port }
+            : undefined;
+        if (!connected && !target) throw new TypeError('Address and port are required');
+        const bytes = await handle.send(data, target);
+        callback?.(null, bytes);
         this.emit('send', bytes);
     } catch (err) {
-        if (cb) {
-            cb(err as Error);
+        if (callback) {
+            callback(asError(err));
         } else if (this.listenerCount('error') > 0) {
             this.emit('error', err);
         }
     }
 };
 
-Socket.prototype.connect = async function connect(this: Socket, port: number, address?: string, callback?: () => void): Promise<Socket> {
-    if (!this._handle) {
-        await this._init();
-    }
-
-    const addr = address ?? '127.0.0.1';
-
-    this._handle!.connect({ ip: addr, port });
-    this._connected = true;
-
-    const peername = this._handle!.getpeername();
-    this._remoteAddress = {
-        address: peername.ip ?? addr,
-        family: this._type === 'udp6' ? 'IPv6' : 'IPv4',
-        port: peername.port ?? port,
-    };
-
-    this.emit('connect');
-    callback?.();
-
-    return this;
+Socket.prototype.connect = function connect(this: Socket, port: number, address?: string, callback?: () => void): void {
+    this._doConnect(port, address, callback);
 };
 
-Socket.prototype.disconnect = async function disconnect(this: Socket): Promise<Socket> {
+Socket.prototype._doConnect = async function _doConnect(this: Socket, port: number, address?: string, callback?: () => void): Promise<void> {
+    try {
+        if (!this._handle) {
+            await this._init();
+        }
+        const handle = this._handle;
+        if (!handle) throw new Error('UDP handle is not initialized');
+
+        const addr = address ?? '127.0.0.1';
+
+        handle.connect({ ip: addr, port });
+        this._connected = true;
+
+        const peername = handle.getpeername();
+        this._remoteAddress = {
+            address: peername.ip ?? addr,
+            family: this._type === 'udp6' ? 'IPv6' : 'IPv4',
+            port: peername.port ?? port,
+        };
+
+        this.emit('connect');
+        callback?.();
+    } catch (err) {
+        this.emit('error', err);
+    }
+};
+
+Socket.prototype.disconnect = function disconnect(this: Socket): void {
+    if (!this._connected) {
+        throw makeError('Not connected', 'ERR_SOCKET_DGRAM_NOT_CONNECTED');
+    }
+    this._handle?.disconnect();
     this._connected = false;
     this._remoteAddress = null;
-    return this;
 };
 
 Socket.prototype.address = function address(this: Socket): AddressInfo | null {
+    if (!this._bound || !this._address) throw makeError('getsockname EBADF', 'EBADF');
     return this._address;
 };
 
 Socket.prototype.remoteAddress = function remoteAddress(this: Socket): AddressInfo | null {
+    if (!this._connected || !this._remoteAddress) throw makeError('Not connected', 'ERR_SOCKET_DGRAM_NOT_CONNECTED');
     return this._remoteAddress;
 };
 
-Socket.prototype.setBroadcast = function setBroadcast(this: Socket, flag: boolean): Socket {
-    if (!this._handle) return this;
+Socket.prototype.setBroadcast = function setBroadcast(this: Socket, flag: boolean): void {
+    if (!this._handle) return;
     try {
         const s = _getSocket(this._handle);
-        if (!s) return this;
+        if (!s) return;
         const val = new Uint8Array(4); new DataView(val.buffer).setUint32(0, flag ? 1 : 0, true);
         s.setopt(sock.defines.SOL_SOCKET, sock.defines.SO_BROADCAST, val);
     } catch { /* best-effort */ }
-    return this;
 };
 
-Socket.prototype.setTTL = function setTTL(this: Socket, ttl: number): Socket {
-    if (!this._handle) return this;
+Socket.prototype.setTTL = function setTTL(this: Socket, ttl: number): number {
+    ttl = validateTTL(ttl);
+    if (!this._handle) return ttl;
     try {
         const s = _getSocket(this._handle);
-        if (!s) return this;
+        if (!s) return ttl;
         const val = new Uint8Array(4); new DataView(val.buffer).setUint32(0, ttl, true);
         s.setopt(sock.defines.IPPROTO_IP, 2, val);
     } catch { /* best-effort */ }
-    return this;
+    return ttl;
 };
 
-Socket.prototype.setMulticastTTL = function setMulticastTTL(this: Socket, ttl: number): Socket {
-    if (!this._handle) return this;
+Socket.prototype.setMulticastTTL = function setMulticastTTL(this: Socket, ttl: number): number {
+    ttl = validateTTL(ttl);
+    if (!this._handle) return ttl;
     try {
         const s = _getSocket(this._handle);
-        if (!s) return this;
+        if (!s) return ttl;
         const val = new Uint8Array(4); new DataView(val.buffer).setUint32(0, ttl, true);
         s.setopt(sock.defines.IPPROTO_IP, 10, val);
     } catch { /* best-effort */ }
-    return this;
+    return ttl;
 };
 
 Socket.prototype.setMulticastInterface = function setMulticastInterface(this: Socket, multicastInterface?: string): Socket {
@@ -504,7 +643,7 @@ Socket.prototype.unref = function unref(this: Socket): Socket {
 };
 
 Socket.prototype.close = function close(this: Socket, callback?: () => void): Socket {
-    this._doClose(callback);
+    this._doClose(typeof callback === 'function' ? callback : undefined);
     return this;
 };
 
@@ -537,6 +676,7 @@ export function createSocket(typeOrOptions: 'udp4' | 'udp6' | SocketOptions, cal
     let signal: AbortSignal | undefined;
 
     if (typeof typeOrOptions === 'object') {
+        if (typeOrOptions === null) validateSocketType(undefined);
         type = typeOrOptions.type;
         reuseAddr = typeOrOptions.reuseAddr ?? false;
         ipv6Only = typeOrOptions.ipv6Only ?? false;
@@ -544,6 +684,7 @@ export function createSocket(typeOrOptions: 'udp4' | 'udp6' | SocketOptions, cal
     } else {
         type = typeOrOptions;
     }
+    validateSocketType(type);
 
     const socket = new Socket(type, reuseAddr, ipv6Only);
 

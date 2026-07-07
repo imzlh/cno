@@ -75,7 +75,7 @@ export class FSWatcher extends EventEmitter<WatchEvents> {
         this.watcher = watcher;
     }
 
-    emitChange(eventType: string, filename: string): void {
+    emitChange(eventType: string, filename: string | null): void {
         if (this.closed) return;
         this.emit('change', eventType, this.toFilename(filename));
     }
@@ -111,7 +111,7 @@ export class FSWatcher extends EventEmitter<WatchEvents> {
         return this;
     }
 
-    private toFilename(filename: string): string | Buffer | null {
+    private toFilename(filename: string | null): string | Buffer | null {
         if (!filename) return null;
         return this.options.encoding === 'buffer' ? Buffer.from(filename) : filename;
     }
@@ -128,9 +128,9 @@ export function watch(
 
     const pathStr = pathToString(path);
     try {
-        const nativeWatcher = fswatch.watch(pathStr, (filename: string, eventType: CModuleFSWatch.FsEvent) => {
+        const nativeWatcher = fswatch.watch(pathStr, (filename, eventType) => {
             watcher.emitChange(eventType, filename);
-        });
+        }, !!options.recursive);
         watcher.attach(nativeWatcher);
     } catch (err) {
         watcher.emitError(err);
