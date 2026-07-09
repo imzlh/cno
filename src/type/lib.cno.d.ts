@@ -43,45 +43,6 @@ declare namespace CNO {
     export function openpty(options?: OpenptyOptions): Promise<PtyPipe>;
 
     /* ================================================================ */
-    /*  Engine  (JS engine internals, no Deno equivalent)               */
-    /* ================================================================ */
-
-    export namespace engine {
-        function serialize(obj: unknown): Uint8Array;
-        function deserialize<T = unknown>(buf: Uint8Array<ArrayBuffer>): T;
-        function evalModule(code: string, importMeta?: Record<string, unknown>): Promise<unknown>;
-        function compileModule(code: string, importMeta?: Record<string, unknown>): Uint8Array;
-        function encodeString(str: string): Uint8Array;
-        function decodeString(buf: Uint8Array | ArrayBuffer): string;
-        function setMemoryLimit(limit: number): void;
-        function setMaxStackSize(size: number): void;
-
-        export interface EngineVersions {
-            quickjs: string;
-            tjs: string;
-            uv: string;
-            curl: string;
-            sqlite3: string;
-            zlib: string;
-            openssl: string;
-            expat: string;
-            core: string;
-            llhttp: string;
-            wasm3?: string;
-            mimalloc?: number;
-        }
-
-        export interface GarbageCollector {
-            run(): void;
-            setThreshold(threshold: number): void;
-            getThreshold(): number;
-        }
-
-        export const versions: EngineVersions;
-        export const gc: GarbageCollector;
-    }
-
-    /* ================================================================ */
     /*  Process                                                         */
     /* ================================================================ */
 
@@ -137,58 +98,6 @@ declare namespace CNO {
         function spawn(args: string | string[], options?: SpawnOptions): ChildProcess;
         function kill(pid: number, signal?: Signal | number): void;
         function signal(sigNum: number, handler: () => void): { close(): void };
-    }
-
-    /* ================================================================ */
-    /*  Compress  (no Deno/Web API equivalent)                          */
-    /* ================================================================ */
-
-    export interface DeflateStream {
-        deflate(data: Uint8Array | ArrayBuffer, flush?: number): ArrayBuffer;
-        flush(flush?: number): ArrayBuffer;
-        finish(data?: Uint8Array | ArrayBuffer): ArrayBuffer;
-        reset(): void;
-    }
-
-    export interface InflateStream {
-        inflate(data: Uint8Array | ArrayBuffer): ArrayBuffer;
-        flush(): ArrayBuffer;
-        reset(): void;
-    }
-
-    export namespace compress {
-        const NO_COMPRESSION: number;
-        const BEST_SPEED: number;
-        const BEST_COMPRESSION: number;
-        const DEFAULT_COMPRESSION: number;
-
-        function deflate(data: Uint8Array | ArrayBuffer, level?: number): ArrayBuffer;
-        function inflate(data: Uint8Array | ArrayBuffer): ArrayBuffer;
-        function gzip(data: Uint8Array | ArrayBuffer, level?: number): ArrayBuffer;
-        function gunzip(data: Uint8Array | ArrayBuffer): ArrayBuffer;
-
-        function createDeflate(level?: number): DeflateStream;
-        function createGzip(level?: number): DeflateStream;
-        function createInflate(): InflateStream;
-        function createGunzip(): InflateStream;
-
-        function crc32(data: Uint8Array | ArrayBuffer, crc?: number): number;
-        function adler32(data: Uint8Array | ArrayBuffer, adler?: number): number;
-    }
-
-    /* ================================================================ */
-    /*  SSL  (self-signed cert, no Deno equivalent)                     */
-    /* ================================================================ */
-
-    export interface SelfSignedCertResult {
-        cert: string;
-        key: string;
-    }
-
-    export namespace ssl {
-        function createSelfSignedCert(options?: { commonName?: string; days?: number }): SelfSignedCertResult;
-        function loadPEM(data: string, type?: "certificate" | "key"): { subject?: string; type?: string; bits?: number } | null;
-        const version: string;
     }
 
     /* ================================================================ */

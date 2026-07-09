@@ -1,8 +1,3 @@
-/**
- * CNO llhttp lib — High-level HTTP/1.x parser + formatter
- * Wraps CModuleHTTP with structured streaming, formatting, and Web API interop
- */
-
 const http = import.meta.use('http');
 const engine = import.meta.use('engine');
 const algorithm = import.meta.use('algorithm');

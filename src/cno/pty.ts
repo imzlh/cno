@@ -1,8 +1,3 @@
-/**
- * CNO pty lib
- * @copyright 2025 iz
- */
-
 import { malloc } from "../utils/malloc";
 import { osShell } from "../utils/platform";
 import { wrapFSErr } from "../utils/wrap";

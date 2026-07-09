@@ -5,8 +5,5 @@ Object.defineProperty(globalThis, 'CNO', {
     value: {}
 });
 
-await import('./engine');
-await import('./compress');
-await import('./ssl');
 await import('./llhttp');
 await import('./pty');
