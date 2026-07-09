@@ -53,7 +53,7 @@ export class WASI {
     private _stderr: number;
 
     private _memory: DataView | null = null;
-    private _memBuf: ArrayBuffer | null = null;
+    private _memBuf: ArrayBuffer | SharedArrayBuffer | null = null;
     private _started = false;
     public wasiImport: Record<string, WasiBinding>;
 
@@ -81,7 +81,7 @@ export class WASI {
         return this._memory;
     }
 
-    private _memoryBuffer(): ArrayBuffer {
+    private _memoryBuffer(): SharedArrayBuffer | ArrayBuffer {
         this._refresh();
         if (!this._memBuf) throw createWasiError('ERR_WASI_MEMORY_NOT_SET', 'WASI memory has not been bound');
         return this._memBuf;

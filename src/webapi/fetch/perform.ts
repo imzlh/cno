@@ -204,7 +204,7 @@ export async function performFetch(request: Request, url: URL): Promise<Response
     const interceptHook = getFetchInterceptHook();
     const requestId = (netHook || interceptHook) ? newRequestId() : '';
     const ts = () => Date.now() / 1000;
-    const reqCallFrames = netHook ? request.getInitiatorCallFrames() : undefined;
+    const reqCallFrames = (netHook || interceptHook) ? request.getInitiatorCallFrames() : undefined;
 
     // Build final headers: request headers + extra CDP headers + UA override
     const finalHeaders = new Headers(request.headers);
@@ -463,7 +463,8 @@ export async function performFetch(request: Request, url: URL): Promise<Response
     if (interceptHook?.onRequest) {
         const result = await interceptHook.onRequest({
             requestId, url: url.href, method: request.method,
-            headers: objHeaders, postData: truncateHookPostData(body ?? null), resourceType: 'Fetch',
+            headers: objHeaders, postData: truncateHookPostData(body ?? null),
+            callFrames: reqCallFrames, resourceType: 'Fetch',
         });
         if (result) {
             if (result.action === 'fulfill') {
@@ -591,6 +592,6 @@ export async function fetchAsync(input: unknown, init?: RequestInit, initiatorCa
 }
 
 export function fetch(input: unknown, init?: RequestInit): Promise<Response> {
-    const initiatorCallFrames = getFetchHook() ? captureUserNetworkCallFrames() : undefined;
+    const initiatorCallFrames = (getFetchHook() || getFetchInterceptHook()) ? captureUserNetworkCallFrames() : undefined;
     return fetchAsync(input, init, initiatorCallFrames);
 }

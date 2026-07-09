@@ -294,6 +294,7 @@ export interface FetchInterceptInfo {
     method: string;
     headers: Record<string, string>;
     postData?: Uint8Array | null;  // raw request body bytes
+    callFrames?: NetworkCallFrame[];
     resourceType?: string;         // "Fetch", "XHR", "Document", etc.
 }
 

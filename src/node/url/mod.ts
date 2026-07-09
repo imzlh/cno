@@ -1,90 +1,14 @@
 /**
  * Node.js url module compatibility.
  *
- * WHATWG URL objects come from the runtime web API polyfill. This module keeps
- * Node's legacy url.parse/format/resolve helpers and the file URL helpers
- * separate so Node semantics do not depend on quirks in that polyfill.
+ * URL and URLSearchParams are the web API polyfill (webapi/url.ts), already on
+ * globalThis. Node's legacy url.parse/format/resolve and the file URL helpers
+ * are built on top of them here.
  */
 
-const NativeURL = globalThis.URL;
-const URLSearchParams = globalThis.URLSearchParams;
-const nativePathnameGetter = Object.getOwnPropertyDescriptor(NativeURL.prototype, 'pathname')?.get;
-const nativeSearchGetter = Object.getOwnPropertyDescriptor(NativeURL.prototype, 'search')?.get;
-const nativeProtocolGetter = Object.getOwnPropertyDescriptor(NativeURL.prototype, 'protocol')?.get;
-const nativeUsernameGetter = Object.getOwnPropertyDescriptor(NativeURL.prototype, 'username')?.get;
-const nativePasswordGetter = Object.getOwnPropertyDescriptor(NativeURL.prototype, 'password')?.get;
-const nativeHostGetter = Object.getOwnPropertyDescriptor(NativeURL.prototype, 'host')?.get;
-const nativeHashGetter = Object.getOwnPropertyDescriptor(NativeURL.prototype, 'hash')?.get;
+import type { URL as WebURL } from '../../webapi/url';
 
-interface PatchedUrl extends globalThis.URL {
-    __nodeUrlPatched?: true;
-}
-
-function encodeUrlSpaces(value: string): string {
-    return value.replace(/ /g, '%20');
-}
-
-function computeUrlHref(url: globalThis.URL): string {
-    const protocol = nativeProtocolGetter?.call(url) ?? '';
-    const username = nativeUsernameGetter?.call(url) ?? '';
-    const password = nativePasswordGetter?.call(url) ?? '';
-    const host = nativeHostGetter?.call(url) ?? '';
-    const hash = nativeHashGetter?.call(url) ?? '';
-    const auth = username ? `${username}${password ? `:${password}` : ''}@` : '';
-    return `${protocol}//${auth}${host}${encodeUrlSpaces(nativePathnameGetter?.call(url) ?? '')}${encodeUrlSpaces(nativeSearchGetter?.call(url) ?? '')}${hash}`;
-}
-
-function patchUrlInstance<T extends globalThis.URL>(url: T): T {
-    if ((url as PatchedUrl).__nodeUrlPatched) return url;
-    Object.defineProperties(url, {
-        __nodeUrlPatched: { value: true, configurable: true },
-        pathname: {
-            configurable: true,
-            enumerable: true,
-            get() {
-                return encodeUrlSpaces(nativePathnameGetter?.call(url) ?? '');
-            },
-        },
-        search: {
-            configurable: true,
-            enumerable: true,
-            get() {
-                return encodeUrlSpaces(nativeSearchGetter?.call(url) ?? '');
-            },
-        },
-        href: {
-            configurable: true,
-            enumerable: true,
-            get() {
-                return computeUrlHref(url);
-            },
-        },
-        toString: {
-            configurable: true,
-            value() {
-                return computeUrlHref(this as globalThis.URL);
-            },
-        },
-        toJSON: {
-            configurable: true,
-            value() {
-                return computeUrlHref(this as globalThis.URL);
-            },
-        },
-    });
-    return url;
-}
-
-export const URL = function URL(this: unknown, input: string | globalThis.URL, base?: string | globalThis.URL) {
-    return patchUrlInstance(new NativeURL(input, base));
-} as typeof globalThis.URL;
-
-Object.setPrototypeOf(URL, NativeURL);
-URL.prototype = NativeURL.prototype;
-Reflect.set(globalThis, 'URL', URL);
-
-export { URLSearchParams };
-
+export const URLSearchParams = globalThis.URLSearchParams;
 type ParsedQuery = Record<string, string | string[]>;
 
 export interface UrlWithStringQuery {
@@ -226,6 +150,13 @@ function splitHost(host: string): { host: string; hostname: string; port: string
 function findHostEnd(rest: string): number {
     const slash = rest.search(/[/?#]/);
     return slash === -1 ? rest.length : slash;
+}
+
+export class URL extends globalThis.URL {
+    constructor(input: string | URL, base?: string | URL) { 
+        super(input, base);
+        (this as unknown as WebURL).enableNodeCompact();
+    }    
 }
 
 export function parse(urlStr: string, parseQueryString = false, slashesDenoteHost = false): UrlWithStringQuery | UrlWithParsedQuery {

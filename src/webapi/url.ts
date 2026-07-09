@@ -1,16 +1,12 @@
 // URL API Polyfill for QuickJS ng
-// 完整实现 URL 和 URLSearchParams，支持特殊路径格式
+// Full implementation of URL and URLSearchParams, supports special path formats
 
 import { Blob, blobBytesSymbol } from './formdata';
 
-// ==================== 工具函数 ====================
+// ==================== Utility Functions ====================
 
-const ALPHA = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
-const DIGIT = '0123456789';
-const SCHEME_CHARS = ALPHA + DIGIT + '+-.';
 const USERINFO_ENCODE_SET = /[^\w.~!$&'()*+,;=:-]/g;
 const PATH_ENCODE_SET = /[^\w.~!$&'()*+,;=:@\/%-]/g;
-const QUERY_ENCODE_SET = /[^\w.~!$&'()*+,;=:@\/?%-]/g;
 const FRAGMENT_ENCODE_SET = /[^\w.~!$&'()*+,;=:@\/?%-]/g;
 const objectUrlStore = new Map<string, Blob>();
 let objectUrlCounter = 0;
@@ -22,13 +18,7 @@ const isWindowsDriveLetter = (str: string): boolean => {
         (str[1] === ':' || str[1] === '|');
 };
 
-const isNormalizedWindowsPath = (str: string): boolean => {
-    return /^[a-zA-Z]:[\/\\]/.test(str);
-};
 
-const isAbsolutePath = (str: string): boolean => {
-    return str.startsWith('/') || isNormalizedWindowsPath(str);
-};
 
 const percentEncode = (str: string, encodeSet: RegExp): string => {
     return str.replace(encodeSet, (char) => {
@@ -95,12 +85,12 @@ const normalizeWindowsPath = (path: string): string => {
 
     path = path.replace(/\\/g, '/');
 
-    // 移除开头的斜杠（如果后面是盘符）
+    // Remove leading slash (if followed by a drive letter)
     if (path.startsWith('/') && isWindowsDriveLetter(path.slice(1, 3))) {
         path = path.slice(1);
     }
 
-    // 处理 C| 格式
+    // Handle C| format
     if (isWindowsDriveLetter(path.slice(0, 2)) && path[1] === '|') {
         path = path[0] + ':' + path.slice(2);
     }
@@ -108,34 +98,6 @@ const normalizeWindowsPath = (path: string): string => {
     return path;
 };
 
-const normalizePath = (path: string): string => {
-    // 规范化路径，处理 . 和 ..
-    const parts = path.split('/');
-    const result: string[] = [];
-
-    for (const part of parts) {
-        if (part === '.' || part === '') {
-            continue;
-        }
-        if (part === '..') {
-            if (result.length > 0 && result[result.length - 1] !== '..') {
-                result.pop();
-            } else if (!path.startsWith('/')) {
-                result.push('..');
-            }
-        } else {
-            result.push(part);
-        }
-    }
-
-    const normalized = result.join('/');
-
-    if (path.startsWith('/')) {
-        return '/' + normalized;
-    }
-
-    return normalized || '.';
-};
 
 // ==================== URLSearchParams ====================
 
@@ -249,7 +211,7 @@ class URLSearchParams implements URLSearchParams {
         const valueStr = String(value);
 
         let found = false;
-        this.#params = this.#params.filter(([k, v]) => {
+        this.#params = this.#params.filter(([k]) => {
             if (k === nameStr) {
                 if (!found) {
                     found = true;
@@ -370,6 +332,7 @@ class URL implements globalThis.URL {
     #query: string | null = null;
     #fragment = '';
     #searchParams: URLSearchParams;
+    #nodeCompact = false;
 
     static parse(url: string, base?: string | globalThis.URL): URL | null {
         try {
@@ -398,13 +361,21 @@ class URL implements globalThis.URL {
         this.#parse(String(url), base);
     }
 
+    private encodeSpaces(str: string) {
+        return this.#nodeCompact ? str.replace(' ', '%20') : str;
+    }
+
+    enableNodeCompact() {
+        this.#nodeCompact = true;
+    }
+
     #parse(input: string, base?: string | globalThis.URL): void {
         input = String(input).trim();
 
-        // 标准 URL 解析
+        // Standard URL parsing
         const baseUrl = base ? (typeof base === 'string' ? new URL(base) : base as URL) : null;
 
-        // 处理特殊格式（仅当无 base URL 时）
+        // Handle special formats (only when there is no base URL)
         if (!baseUrl) {
             if (this.#isWindowsPath(input)) {
                 this.#parseWindowsPath(input);
@@ -417,14 +388,14 @@ class URL implements globalThis.URL {
             }
         }
 
-        // 提取 fragment
+        // Extract fragment
         const fragmentIndex = input.indexOf('#');
         if (fragmentIndex !== -1) {
             this.#fragment = input.slice(fragmentIndex + 1);
             input = input.slice(0, fragmentIndex);
         }
 
-        // 提取 query
+        // Extract query
         const queryIndex = input.indexOf('?');
         if (queryIndex !== -1) {
             this.#hasQuery = true;
@@ -432,7 +403,7 @@ class URL implements globalThis.URL {
             input = input.slice(0, queryIndex);
         }
 
-        // 解析 scheme
+        // Parse scheme
         const schemeMatch = input.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):/);
         if (schemeMatch) {
             this.#scheme = schemeMatch[1].toLowerCase();
@@ -446,10 +417,10 @@ class URL implements globalThis.URL {
             throw new TypeError('Invalid URL: no scheme');
         }
 
-        // 特殊 scheme 处理
+        // Special scheme handling
         const isSpecial = this.#scheme in SPECIAL_SCHEMES;
 
-        // 解析 authority
+        // Parse authority
         if (input.startsWith('//')) {
             input = input.slice(2);
 
@@ -471,12 +442,12 @@ class URL implements globalThis.URL {
             }
         }
 
-        // 解析 path
+        // Parse path
         if (input) {
             this.#parsePath(input, isSpecial);
         }
 
-        // 更新 searchParams
+        // Update searchParams
         if (this.#query !== null) {
             this.#searchParams._replaceFromQuery(this.#query);
         }
@@ -496,7 +467,7 @@ class URL implements globalThis.URL {
 
         // C:/aaa/bbb -> /C:/aaa/bbb
         this.#path = path.split('/').filter(p => p);
-        this.#path.unshift(''); // 添加前导空元素以生成 /C:/aaa
+        this.#path.unshift(''); // prepend empty element to generate /C:/aaa
     }
 
     #parseUnixPath(path: string): void {
@@ -505,7 +476,7 @@ class URL implements globalThis.URL {
     }
 
     #parseAuthority(authority: string): void {
-        // 提取 userinfo
+        // Extract userinfo
         const atIndex = authority.lastIndexOf('@');
         if (atIndex !== -1) {
             const userinfo = authority.slice(0, atIndex);
@@ -520,7 +491,7 @@ class URL implements globalThis.URL {
             }
         }
 
-        // 提取 host 和 port
+        // Extract host and port
         if (authority.startsWith('[')) {
             // IPv6
             const endBracket = authority.indexOf(']');
@@ -539,7 +510,7 @@ class URL implements globalThis.URL {
             }
         }
 
-        // 提取 port
+        // Extract port
         if (authority.startsWith(':')) {
             const portStr = authority.slice(1);
             if (portStr && /^\d+$/.test(portStr)) {
@@ -547,7 +518,7 @@ class URL implements globalThis.URL {
                 if (port > 65535) {
                     throw new TypeError('Invalid URL: invalid port');
                 }
-                // 只在非默认端口时设置
+                // Only set when non-default port
                 const defaultPort = SPECIAL_SCHEMES[this.#scheme];
                 if (defaultPort !== port) {
                     this.#port = String(port);
@@ -735,7 +706,7 @@ class URL implements globalThis.URL {
     get pathname(): string {
         if (this.#scheme === 'file') {
             if (this.#path.length === 0) return '/';
-            return '/' + this.#path.join('/');
+            return this.encodeSpaces('/' + this.#path.join('/'));
         }
 
         if (this.#path.length === 0) return '/';
@@ -754,7 +725,7 @@ class URL implements globalThis.URL {
 
     get search(): string {
         if (this.#query === null || this.#query === '') return '';
-        return '?' + this.#query;
+        return '?' + this.encodeSpaces(this.#query);
     }
 
     set search(value: string) {
@@ -792,7 +763,7 @@ class URL implements globalThis.URL {
         );
     }
 
-    // ==================== 方法 ====================
+    // ==================== Methods ====================
 
     toString(): string {
         let result = this.#scheme + ':';
@@ -816,7 +787,7 @@ class URL implements globalThis.URL {
 
         result += this.pathname;
 
-        if (this.#hasQuery) result += '?' + (this.#query ?? '');
+        if (this.#hasQuery) result += '?' + this.encodeSpaces(this.#query ?? '');
 
         if (this.#fragment) {
             result += '#' + this.#fragment;
@@ -869,7 +840,6 @@ class URL implements globalThis.URL {
 
 Reflect.set(globalThis, 'URL', URL);
 Reflect.set(globalThis, 'URLSearchParams', URLSearchParams);
-Reflect.set(globalThis, '__cno_resolve_blob_url', resolveObjectURLBytes);
 
 export {
     URL as URL,

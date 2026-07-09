@@ -474,6 +474,7 @@ Reflect.set(globalThis, 'clearImmediate', function(id: Immediate | number | unde
 });
 
 globalThis.structuredClone = function(v, opt){
+    // @ts-ignore - never clone AbortSignal
     return structuredCloneWithTransfer(v, opt, messagePortTransferHooks);
 }
 
