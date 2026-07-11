@@ -118,7 +118,7 @@ function innerOk(fn: AssertCallable, argLen: number, value: unknown, message?: s
 }
 
 export function ok(value: unknown, message?: string | Error): asserts value {
-    innerOk(ok, arguments.length, value, message);
+    innerOk(ok as AssertCallable, arguments.length, value, message);
 }
 
 export function fail(message?: string | Error): never;
@@ -370,9 +370,11 @@ export function throws(block: () => unknown, error?: AssertPredicate | string | 
     if (!threw) {
         const m = typeof error === 'string' ? error : message;
         throw new AssertionError({
-            message: msg(m) || 'Missing expected exception',
+            message: msg(m) || 'Expexception was not thrown.',
             operator: 'throws',
-            generatedMessage: !m
+            generatedMessage: !m,
+            actual: undefined,
+            expected: error
         });
     }
 
@@ -597,7 +599,7 @@ export function partialDeepStrictEqual(actual: unknown, expected: unknown, messa
 }
 
 export function assert(cond: unknown, message?: string | Error): asserts cond {
-    innerOk(assert, arguments.length, cond, message);
+    innerOk(assert as AssertCallable, arguments.length, cond, message);
 }
 
 interface CallExpectation {
@@ -667,7 +669,7 @@ assert.partialDeepStrictEqual = partialDeepStrictEqual;
 // use their strict counterparts. Created as a separate object so assert.equal
 // (loose equality) is unaffected.
 function strictAssert(condition: unknown, message?: string | Error): asserts condition {
-    innerOk(strictAssert, arguments.length, condition, message);
+    innerOk(strictAssert as AssertCallable, arguments.length, condition, message);
 }
 export const strict = Object.assign(strictAssert, {
     ok, fail,
@@ -679,5 +681,6 @@ export const strict = Object.assign(strictAssert, {
     match, doesNotMatch, ifError,
     AssertionError, CallTracker, partialDeepStrictEqual,
 });
+// @ts-ignore
 strict.strict = strict;
 assert.strict = strict;

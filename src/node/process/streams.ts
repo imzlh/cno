@@ -30,6 +30,7 @@ export class ProcessWriteStream extends Writable {
     #isTTYOverride: boolean | undefined;
     #columnsOverride: number | undefined;
     #rowsOverride: number | undefined;
+    #bytesWritten = 0;
 
     constructor(stdio: StdioStream) {
         super({
@@ -37,6 +38,7 @@ export class ProcessWriteStream extends Writable {
                 const data = typeof chunk === 'string' ? engine.encodeString(chunk) : chunk instanceof Uint8Array ? chunk : engine.encodeString(String(chunk));
                 try {
                     stdio.writeSync(data);
+                    this.#bytesWritten += data.length;
                     callback();
                 } catch (e) {
                     callback(e instanceof Error ? e : new Error(String(e)));
@@ -55,20 +57,20 @@ export class ProcessWriteStream extends Writable {
 
     set isTTY(value: boolean) { this.#isTTYOverride = Boolean(value); }
 
-    get columns(): number | undefined {
+    get columns(): number {
         if (this.#columnsOverride !== undefined) return this.#columnsOverride;
-        if (!this.#stdio.isTTY) return undefined;
-        return readTtySize(this.#stdio)?.width;
+        if (!this.#stdio.isTTY) return undefined as unknown as number;
+        return readTtySize(this.#stdio)?.width as unknown as number;
     }
 
     set columns(value: number | undefined) {
         this.#columnsOverride = value === undefined ? undefined : Number(value);
     }
 
-    get rows(): number | undefined {
+    get rows(): number {
         if (this.#rowsOverride !== undefined) return this.#rowsOverride;
-        if (!this.#stdio.isTTY) return undefined;
-        return readTtySize(this.#stdio)?.height;
+        if (!this.#stdio.isTTY) return undefined as unknown as number;
+        return readTtySize(this.#stdio)?.height as unknown as number;
     }
 
     set rows(value: number | undefined) {
@@ -89,14 +91,17 @@ export class ProcessWriteStream extends Writable {
         return 4;
     }
 
-    hasColors(depth?: number, env?: Record<string, string>): boolean {
-        if (depth === undefined) return this.isTTY;
-        return this.getColorDepth(env) >= depth;
+    hasColors(countOrEnv?: number | object, env?: object): boolean {
+        const count = typeof countOrEnv === 'number' ? countOrEnv : 16;
+        const environment = (typeof countOrEnv === 'object' ? countOrEnv : env) as Record<string, string> | undefined;
+        return this.getColorDepth(environment) >= count;
     }
 
     writeSync(data: Uint8Array | string): number {
         const d = typeof data === 'string' ? engine.encodeString(data) : data;
-        return this.#stdio.writeSync(d);
+        const n = this.#stdio.writeSync(d);
+        this.#bytesWritten += n;
+        return n;
     }
 
     clearLine(dir: number, callback?: () => void): boolean {
@@ -105,9 +110,11 @@ export class ProcessWriteStream extends Writable {
         return true;
     }
 
-    cursorTo(x: number, y?: number, callback?: () => void): boolean {
+    cursorTo(x: number, yOrCallback?: number | (() => void), callback?: () => void): boolean {
+        const y = typeof yOrCallback === 'number' ? yOrCallback : undefined;
+        const cb = typeof yOrCallback === 'function' ? yOrCallback : callback;
         const code = y !== undefined ? `\x1b[${y + 1};${x + 1}H` : `\x1b[${x + 1}G`;
-        this.write(code, () => callback?.());
+        this.write(code, () => cb?.());
         return true;
     }
 
@@ -124,6 +131,55 @@ export class ProcessWriteStream extends Writable {
     getWindowSize(): [number, number] {
         return [this.columns ?? 80, this.rows ?? 24];
     }
+
+    clearScreenDown(callback?: () => void): boolean {
+        this.write('\x1b[0J', () => callback?.());
+        return true;
+    }
+
+    destroySoon(): void { this.destroy(); }
+
+    connect(..._args: unknown[]): this { return this; }
+
+    setEncoding(_encoding?: BufferEncoding): this { return this; }
+
+    pause(): this { return this; }
+
+    resume(): this { return this; }
+
+    resetAndDestroy(): this { this.destroy(); return this; }
+
+    setTimeout(_timeout: number, _callback?: () => void): this { return this; }
+
+    setNoDelay(_noDelay?: boolean): this { return this; }
+
+    setKeepAlive(_enable?: boolean, _initialDelay?: number): this { return this; }
+
+    getTypeOfService(): number { return 0; }
+
+    setTypeOfService(_tos: number): this { return this; }
+
+    address(): Record<string, never> { return {}; }
+
+    unref(): this { return this; }
+
+    ref(): this { return this; }
+
+    get bytesWritten(): number { return this.#bytesWritten; }
+
+    readonly bytesRead = 0;
+    readonly autoSelectFamilyAttemptedAddresses: string[] = [];
+    readonly bufferSize = 0;
+    readonly connecting = false;
+    readonly pending = false;
+    readonly localAddress: string | undefined = undefined;
+    readonly localPort: number | undefined = undefined;
+    readonly localFamily: string | undefined = undefined;
+    readonly readyState = 'writeOnly' as const;
+    readonly remoteAddress: string | undefined = undefined;
+    readonly remoteFamily: string | undefined = undefined;
+    readonly remotePort: number | undefined = undefined;
+    readonly timeout: number | undefined = undefined;
 }
 
 // Read stream (stdin)
@@ -131,6 +187,7 @@ export class ProcessReadStream extends Readable {
     #stdio: StdioStream;
     #isRaw: boolean = false;
     #isTTYOverride: boolean | undefined;
+    #bytesRead = 0;
 
     constructor(stdio: StdioStream) {
         super({ highWaterMark: PROCESS_READ_STREAM_HWM });
@@ -145,6 +202,7 @@ export class ProcessReadStream extends Readable {
             if (n === null) {
                 this.push(null);
             } else {
+                this.#bytesRead += n;
                 this.push(buf.subarray(0, n));
             }
         } catch (e) {
@@ -167,8 +225,48 @@ export class ProcessReadStream extends Readable {
     }
 
     readSync(buf: Uint8Array<ArrayBuffer>): number | null {
-        return this.#stdio.readSync(buf);
+        const n = this.#stdio.readSync(buf);
+        if (n !== null) this.#bytesRead += n;
+        return n;
     }
+
+    destroySoon(): void { this.destroy(); }
+
+    connect(..._args: unknown[]): this { return this; }
+
+    resetAndDestroy(): this { this.destroy(); return this; }
+
+    setTimeout(_timeout: number, _callback?: () => void): this { return this; }
+
+    setNoDelay(_noDelay?: boolean): this { return this; }
+
+    setKeepAlive(_enable?: boolean, _initialDelay?: number): this { return this; }
+
+    getTypeOfService(): number { return 0; }
+
+    setTypeOfService(_tos: number): this { return this; }
+
+    address(): Record<string, never> { return {}; }
+
+    unref(): this { return this; }
+
+    ref(): this { return this; }
+
+    get bytesRead(): number { return this.#bytesRead; }
+
+    readonly bytesWritten = 0;
+    readonly autoSelectFamilyAttemptedAddresses: string[] = [];
+    readonly bufferSize = 0;
+    readonly connecting = false;
+    readonly pending = false;
+    readonly localAddress: string | undefined = undefined;
+    readonly localPort: number | undefined = undefined;
+    readonly localFamily: string | undefined = undefined;
+    readonly readyState = 'readOnly' as const;
+    readonly remoteAddress: string | undefined = undefined;
+    readonly remoteFamily: string | undefined = undefined;
+    readonly remotePort: number | undefined = undefined;
+    readonly timeout: number | undefined = undefined;
 }
 
 // Standard stream instances
@@ -176,6 +274,7 @@ const stdoutStream = new ProcessWriteStream(denoStdout);
 const stderrStream = new ProcessWriteStream(denoStderr);
 const stdinStream = new ProcessReadStream(denoStdin);
 
-export const stdout: NodeJS.WriteStream = stdoutStream as NodeJS.WriteStream;
-export const stderr: NodeJS.WriteStream = stderrStream as NodeJS.WriteStream;
-export const stdin: NodeJS.ReadStream = stdinStream as NodeJS.ReadStream;
+// Bridges the remaining Duplex generic surface (map/filter/write/cork/etc.) that stdio never exercises.
+export const stdout: NodeJS.WriteStream = stdoutStream as unknown as NodeJS.WriteStream;
+export const stderr: NodeJS.WriteStream = stderrStream as unknown as NodeJS.WriteStream;
+export const stdin: NodeJS.ReadStream = stdinStream as unknown as NodeJS.ReadStream;

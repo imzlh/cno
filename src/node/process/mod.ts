@@ -898,7 +898,7 @@ const processDefault = existingProcessDefault ?? {
     throwDeprecation,
 	traceProcessWarnings,
 	constructor: Process,
-} as NodeJS.Process & Record<string, unknown>;
+} as unknown as NodeJS.Process;
 
 if (existingProcessDefault) Reflect.set(processDefault, 'versions', versions);
 

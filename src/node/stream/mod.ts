@@ -865,7 +865,7 @@ Writable.prototype.write = function write(
 
     if (!state.objectMode && state.decodeStrings && typeof chunk === 'string') {
         chunk = Buffer.from(chunk, writeEncoding ?? state.defaultEncoding);
-        writeEncoding = 'buffer';
+        writeEncoding = 'binary';
     }
 
     state.buffer.push({ chunk, encoding: writeEncoding ?? 'utf8', callback: callback ?? (() => {}) });
