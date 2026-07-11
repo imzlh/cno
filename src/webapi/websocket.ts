@@ -8,7 +8,7 @@ import { HttpResponseParser } from "@cnojs/http/h1";
 import { type ISocket } from "@cnojs/http/socket";
 import { Headers } from "./headers";
 import { assert } from "../utils/assert";
-import { buildRequest, connectTcp, readHeaders } from "../utils/http";
+import { buildRequest, connectHttp, readHeaders } from "../utils/http";
 import { bytesToArrayBuffer, concatChunks, toOwnedBytes } from "../utils/bytes";
 import { getTierLimits } from '../utils/memory-tier';
 import { captureUserNetworkCallFrames, getWebSocketHook, type NetworkCallFrame, type NetworkSource, type WSFrameInfo } from '../utils/network-hooks';
@@ -416,9 +416,10 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
                 this._initiatorCallFrames = captureWebSocketCallFrames();
             }
 
-            this.connection = await connectTcp(url);
+            const connection = await connectHttp(url);
+            this.connection = connection.socket;
 
-            await this.sendHandshake(url);
+            await this.sendHandshake(url, connection.requestTarget, connection.proxyAuthorization);
             await this.receiveHandshake();
 
             this._readyState = WebSocketReadyState.OPEN;
@@ -429,7 +430,7 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
         } catch (err) { this._readyState = WebSocketReadyState.CLOSED; this.emitError(toError(err)); }
     }
 
-    private async sendHandshake(url: URL): Promise<void> {
+    private async sendHandshake(url: URL, requestTarget?: string, proxyAuthorization?: string): Promise<void> {
         assert(this.connection, "Connection is not established");
         this._wsKey = this.generateWebSocketKey();
         const headers = new Headers({
@@ -437,6 +438,7 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
             'Sec-WebSocket-Version': '13', 'Sec-WebSocket-Key': this._wsKey
         });
         if (this.protocol) headers.set('Sec-WebSocket-Protocol', this.protocol);
+        if (proxyAuthorization) headers.set('Proxy-Authorization', proxyAuthorization);
         if (this._netRequestId) {
             const wsHook = getWebSocketHook();
             if (wsHook) {
@@ -452,7 +454,7 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
                 });
             }
         }
-        await this.connection.write(buildRequest({ method: 'GET', url, headers }));
+        await this.connection.write(buildRequest({ method: 'GET', url, headers, requestTarget }));
     }
 
     private async receiveHandshake(): Promise<void> {

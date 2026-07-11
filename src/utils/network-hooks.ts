@@ -5,6 +5,8 @@
  * never invoked until a setter registers them.
  */
 
+import type { TcpSocket } from '@cnojs/http/socket';
+
 const debug = import.meta.use('debug');
 const HOOK_OFFSET = 2;
 
@@ -21,6 +23,26 @@ export function getExtraHTTPHeaders(): Record<string, string> { return _extraHTT
 // ---- CurlInit hook (applied to every CURL handle before perform) -----------
 
 export { type CurlInitHook, setCurlInitHook, getCurlInitHook } from '../../../cts/src/utils/curl';
+
+// ---- Raw connection hook (SSE/WebSocket and similar long-lived clients) ---
+
+export interface RawConnection {
+    socket: TcpSocket;
+    requestTarget?: string;
+    proxyAuthorization?: string;
+}
+
+export type RawConnectionHook = (url: URL) => Promise<RawConnection>;
+
+let rawConnectionHook: RawConnectionHook | null = null;
+
+export function setRawConnectionHook(hook: RawConnectionHook | null): void {
+    rawConnectionHook = hook;
+}
+
+export function getRawConnectionHook(): RawConnectionHook | null {
+    return rawConnectionHook;
+}
 
 // ---- Fetch hooks -----------------------------------------------------------
 

@@ -7,7 +7,7 @@
 
 import { Headers } from "./headers";
 import { HttpResponseParser } from "@cnojs/http/h1";
-import { connectTcp, buildRequest, readHeaders, type IHttpSocket } from "../utils/http";
+import { connectHttp, buildRequest, readHeaders, type IHttpSocket } from "../utils/http";
 import { MessageEvent } from "./events";
 
 const engine = import.meta.use('engine');
@@ -60,7 +60,8 @@ export class EventSource extends EventTarget {
         try {
             const url = new URL(this.url);
 
-            this.connection = await connectTcp(url);
+            const connection = await connectHttp(url);
+            this.connection = connection.socket;
             if (this.readyState === EventSourceReadyState.CLOSED) {
                 this.closeConnection();
                 return;
@@ -70,8 +71,9 @@ export class EventSource extends EventTarget {
             headers.set('accept', 'text/event-stream');
             headers.set('cache-control', 'no-cache');
             if (this.lastEventId) headers.set('last-event-id', this.lastEventId);
+            if (connection.proxyAuthorization) headers.set('proxy-authorization', connection.proxyAuthorization);
 
-            await this.connection.write(buildRequest({ method: 'GET', url, headers }));
+            await this.connection.write(buildRequest({ method: 'GET', url, headers, requestTarget: connection.requestTarget }));
 
             this.parser = new HttpResponseParser();
             const { status, headers: resHeaders, leftover } = await readHeaders(this.connection, this.parser);

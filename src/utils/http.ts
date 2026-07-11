@@ -8,6 +8,7 @@ import { HttpRequestBuilder, HttpResponseParser } from "@cnojs/http/h1";
 import { Headers } from "../webapi/headers";
 import { type ISocket, TcpSocket } from "@cnojs/http/socket";
 import { dnsCache } from "@cnojs/http/dns-cache";
+import { getRawConnectionHook, type RawConnection } from './network-hooks';
 
 const streams = import.meta.use('streams');
 const ssl = import.meta.use('ssl');
@@ -16,6 +17,13 @@ type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
 /** Socket subset required for HTTP request/response exchange. */
 export type IHttpSocket = Pick<ISocket, 'onReadable' | 'stopReading' | 'write' | 'close'>;
+
+export async function openTcp(hostname: string, port: number): Promise<TcpSocket> {
+    const ips = await dnsCache.resolve(hostname);
+    const tcp = new streams.TCP();
+    for (const ip of ips) try { await tcp.connect({ ip: ip.ip, port }); return new TcpSocket(tcp); } catch { }
+    throw new Error('Connection failed');
+}
 
 /** Result of reading HTTP response headers. */
 export interface HttpResponseHead {
@@ -29,21 +37,10 @@ export interface HttpResponseHead {
  * Resolves DNS via cache, tries each IP until one connects, then performs
  * TLS handshake if the URL scheme is https: or wss:.
  */
-export async function connectTcp(url: URL): Promise<TcpSocket> {
+export async function connectDirectTcp(url: URL): Promise<TcpSocket> {
     const isSecure = url.protocol === 'https:' || url.protocol === 'wss:';
     const port = url.port ? parseInt(url.port) : (isSecure ? 443 : 80);
-
-    let connected = false;
-    const iplist = await dnsCache.resolve(url.hostname);
-    const tcp = new streams.TCP();
-    for (const ip of iplist) try {
-        await tcp.connect({ ip: ip.ip, port });
-        connected = true;
-        break;
-    } catch { }
-    if (!connected) throw new Error('Connection failed');
-
-    const socket = new TcpSocket(tcp);
+    const socket = await openTcp(url.hostname, port);
     if (isSecure) {
         const ctx = new ssl.Context({
             alpn: ['http/1.1'],
@@ -54,6 +51,15 @@ export async function connectTcp(url: URL): Promise<TcpSocket> {
     return socket;
 }
 
+export async function connectHttp(url: URL): Promise<RawConnection> {
+    const hook = getRawConnectionHook();
+    return hook ? hook(url) : { socket: await connectDirectTcp(url) };
+}
+
+export async function connectTcp(url: URL): Promise<TcpSocket> {
+    return (await connectHttp(url)).socket;
+}
+
 /**
  * Build raw HTTP/1.1 request bytes from method, URL, and headers.
  */
@@ -61,12 +67,13 @@ export function buildRequest(opts: {
     method: string;
     url: URL;
     headers: Headers;
+    requestTarget?: string;
 }): Uint8Array {
     const rawHeaders: Array<[string, string]> = [];
     opts.headers.forEach((v, k) => rawHeaders.push([k, v]));
     return new HttpRequestBuilder({
         method: opts.method,
-        path: opts.url.pathname + opts.url.search,
+        path: opts.requestTarget ?? opts.url.pathname + opts.url.search,
         host: opts.url.host,
         headers: rawHeaders
     }).build();
