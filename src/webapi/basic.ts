@@ -41,20 +41,63 @@ function stripInternalErrorProxyFrames(stack: string): string {
     return lines.join('\n');
 }
 
+/** Drop our lazy stack so native capture can write frames again. */
+function clearLazyErrorStack(error: object): void {
+    const own = Object.getOwnPropertyDescriptor(error, 'stack');
+    if (own && typeof own.get === 'function' && own.configurable) {
+        try { delete (error as { stack?: unknown }).stack; } catch { /* */ }
+    }
+}
+
+/** V8 `prepareStackTrace` may return CallSite[] — never coerce that to string. */
+function readErrorStackRaw(error: object): { kind: 'string'; raw: string; enumerable: boolean } | { kind: 'skip' } {
+    const own = Object.getOwnPropertyDescriptor(error, 'stack');
+    if (own && 'value' in own && own.value !== undefined) {
+        if (typeof own.value !== 'string') return { kind: 'skip' };
+        return { kind: 'string', raw: own.value, enumerable: own.enumerable ?? false };
+    }
+    if (own && typeof own.get === 'function') {
+        try {
+            const value = own.get.call(error);
+            if (typeof value !== 'string') return { kind: 'skip' };
+            let raw = value;
+            const nl = raw.indexOf('\n');
+            if (nl >= 0 && !raw.startsWith('    at ') && !raw.startsWith('at ')) {
+                raw = raw.slice(nl + 1);
+            }
+            return { kind: 'string', raw, enumerable: own.enumerable ?? false };
+        } catch {
+            return { kind: 'skip' };
+        }
+    }
+    try {
+        const value = (error as { stack?: unknown }).stack;
+        if (value === undefined || value === null) {
+            return { kind: 'string', raw: '', enumerable: false };
+        }
+        if (typeof value !== 'string') return { kind: 'skip' };
+        return { kind: 'string', raw: value, enumerable: false };
+    } catch {
+        return { kind: 'skip' };
+    }
+}
+
 function installLazyErrorStack<T>(error: T): T {
     if (!error || (typeof error !== 'object' && typeof error !== 'function')) return error;
-    const descriptor = Object.getOwnPropertyDescriptor(error, 'stack');
-    if (!descriptor || typeof descriptor.value !== 'string') return error;
 
-    const frames = stripInternalErrorProxyFrames(descriptor.value);
+    // Leave non-string stacks alone (depd / CallSite arrays from prepareStackTrace).
+    const read = readErrorStackRaw(error as object);
+    if (read.kind === 'skip') return error;
+
+    const frames = stripInternalErrorProxyFrames(read.raw);
     let customStack: unknown;
     let hasCustomStack = false;
     Object.defineProperty(error, 'stack', {
         configurable: true,
-        enumerable: descriptor.enumerable,
+        enumerable: read.enumerable,
         get() {
             if (hasCustomStack) return customStack;
-            const header = formatErrorStackHeader(this instanceof Error ? this : error);
+            const header = formatErrorStackHeader(this instanceof Error ? this : error as object);
             return frames ? `${header}\n${frames}` : header;
         },
         set(value) {
@@ -83,6 +126,8 @@ const ErrorProxy = new Proxy(NativeError, {
 
 Object.defineProperty(ErrorProxy, 'captureStackTrace', {
     value(target: object, constructorOpt?: (...args: never[]) => unknown) {
+        // Remove lazy getter first so native write is not swallowed by our setter.
+        clearLazyErrorStack(target);
         nativeCaptureStackTrace?.(target, constructorOpt ?? ErrorProxy.captureStackTrace);
         installLazyErrorStack(target);
     },
@@ -487,12 +532,14 @@ globalThis.queueMicrotask = function(callback: () => void) {
 
 globalThis.reportError = function(e) {
     const error = e instanceof Error ? e : new Error(String(e));
+    // cancelable so listeners (and Deno.test harness) can preventDefault
     const event = new ErrorEvent('error', {
         message: error.message,
         error: error,
         filename: '',
         lineno: 0,
-        colno: 0
+        colno: 0,
+        cancelable: true,
     });
     globalThis.dispatchEvent(event);
 }

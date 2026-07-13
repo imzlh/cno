@@ -562,17 +562,337 @@ export const permission: NodeJS.ProcessPermission = {
     has: () => true,
 };
 
-export const report: NodeJS.ProcessReport = {
+// process.report — diagnostic dump (Node-shaped; approximate heap/libuv fields)
+
+let reportSeq = 0;
+
+// glibc version for report.header (empty on musl/non-linux). Used by packages
+// like rollup that branch optional natives via !glibcVersionRuntime.
+let cachedGlibcRuntime: string | undefined;
+function glibcVersionRuntime(): string {
+    if (cachedGlibcRuntime !== undefined) return cachedGlibcRuntime;
+    if (platform !== 'linux') {
+        cachedGlibcRuntime = '';
+        return cachedGlibcRuntime;
+    }
+    try {
+        const r = proc.spawnSync(['ldd', '--version'], { stdout: 'pipe', stderr: 'pipe' });
+        const raw = r.stdout ?? r.stderr;
+        const text = raw ? engine.decodeString(raw) : '';
+        const m = text.match(/GLIBC\s+([0-9.]+)/i) || text.match(/\b([0-9]+\.[0-9]+(?:\.[0-9]+)?)\b/);
+        cachedGlibcRuntime = m?.[1] ?? '';
+    } catch {
+        cachedGlibcRuntime = '';
+    }
+    return cachedGlibcRuntime;
+}
+
+function pad2(n: number): string {
+    return n < 10 ? `0${n}` : String(n);
+}
+
+function formatReportStamp(d: Date): { file: string; dumpEventTime: string; dumpEventTimeStamp: string } {
+    const y = d.getFullYear();
+    const mo = pad2(d.getMonth() + 1);
+    const day = pad2(d.getDate());
+    const h = pad2(d.getHours());
+    const mi = pad2(d.getMinutes());
+    const s = pad2(d.getSeconds());
+    return {
+        file: `${y}${mo}${day}.${h}${mi}${s}`,
+        dumpEventTime: d.toString(),
+        dumpEventTimeStamp: String(d.getTime()),
+    };
+}
+
+function joinReportPath(dir: string, name: string): string {
+    if (!dir) return name;
+    const sep = platform === 'win32' ? '\\' : '/';
+    const base = dir.endsWith('/') || dir.endsWith('\\') ? dir.slice(0, -1) : dir;
+    return `${base}${sep}${name}`;
+}
+
+function isAbsoluteReportPath(p: string): boolean {
+    if (platform === 'win32') return /^[A-Za-z]:[\\/]/.test(p) || p.startsWith('\\\\');
+    return p.startsWith('/');
+}
+
+function collectEnvForReport(): Record<string, string> {
+    const out: Record<string, string> = Object.create(null);
+    for (const key of os.envKeys()) {
+        try {
+            const v = os.getenv(key);
+            if (v !== undefined) out[key] = v;
+        } catch {
+            // skip unset/missing
+        }
+    }
+    return out;
+}
+
+function buildJavascriptStack(err?: Error): {
+    message: string;
+    stack: string[];
+    errorProperties: Record<string, unknown>;
+} {
+    const error = err ?? new Error('JavaScript Callstack');
+    if (!err) error.name = 'Error';
+    const message = err
+        ? `${error.name}: ${error.message}`
+        : `Error: JavaScript Callstack`;
+    const raw = error.stack ?? '';
+    const lines = raw.split('\n').slice(1).map((l) => l.trim()).filter(Boolean);
+    return { message, stack: lines, errorProperties: {} };
+}
+
+function buildJavascriptHeap(): Record<string, unknown> {
+    const mem = memoryUsage();
+    const free = os.memoryUsage()['os.free'] ?? 0;
+    return {
+        totalMemory: mem.heapTotal,
+        executableMemory: 0,
+        totalCommittedMemory: mem.heapTotal,
+        availableMemory: free,
+        totalGlobalHandlesMemory: 0,
+        usedGlobalHandlesMemory: 0,
+        usedMemory: mem.heapUsed,
+        memoryLimit: 0,
+        mallocedMemory: 0,
+        externalMemory: mem.external,
+        peakMallocedMemory: 0,
+        nativeContextCount: 1,
+        detachedContextCount: 0,
+        doesZapGarbage: 0,
+        heapSpaces: {
+            new_space: {
+                memorySize: mem.heapUsed,
+                committedMemory: mem.heapUsed,
+                capacity: mem.heapTotal,
+                used: mem.heapUsed,
+                available: Math.max(0, mem.heapTotal - mem.heapUsed),
+            },
+        },
+    };
+}
+
+function buildResourceUsageSection(): Record<string, unknown> {
+    const ru = resourceUsage();
+    const mem = os.memoryUsage();
+    const free = mem['os.free'] ?? 0;
+    const total = mem['os.total'] ?? 0;
+    const rss = mem['os.rss'] ?? 0;
+    const userCpuSeconds = ru.userCPUTime / 1e6;
+    const kernelCpuSeconds = ru.systemCPUTime / 1e6;
+    const cpuConsumptionPercent = (userCpuSeconds + kernelCpuSeconds) * 100;
+    return {
+        free_memory: free,
+        total_memory: total,
+        rss,
+        constrained_memory: constrainedMemory(),
+        available_memory: availableMemory(),
+        userCpuSeconds,
+        kernelCpuSeconds,
+        cpuConsumptionPercent,
+        userCpuConsumptionPercent: userCpuSeconds * 100,
+        kernelCpuConsumptionPercent: kernelCpuSeconds * 100,
+        maxRss: ru.maxRSS,
+        pageFaults: {
+            IORequired: ru.majorPageFault,
+            IONotRequired: ru.minorPageFault,
+        },
+        fsActivity: {
+            reads: ru.fsRead,
+            writes: ru.fsWrite,
+        },
+    };
+}
+
+function buildLibuvHandles(): Array<Record<string, unknown>> {
+    // Approximate: expose stdio as pipe handles (full libuv walk needs native support).
+    return [
+        { type: 'tty', is_active: true, is_referenced: true, address: 'stdin' },
+        { type: 'tty', is_active: true, is_referenced: true, address: 'stdout' },
+        { type: 'tty', is_active: true, is_referenced: true, address: 'stderr' },
+    ];
+}
+
+function buildProcessReport(err?: Error, filename: string | null = null): Record<string, unknown> {
+    const now = new Date();
+    const stamp = formatReportStamp(now);
+    const u = os.uname();
+    let cpus: unknown[] = [];
+    try {
+        cpus = os.cpuInfo().map((cpu) => ({
+            model: cpu.model,
+            speed: cpu.speed,
+            user: cpu.times?.user ?? 0,
+            nice: cpu.times?.nice ?? 0,
+            sys: cpu.times?.sys ?? 0,
+            idle: cpu.times?.idle ?? 0,
+            irq: cpu.times?.irq ?? 0,
+        }));
+    } catch {
+        cpus = [];
+    }
+
+    let networkInterfaces: unknown[] = [];
+    try {
+        networkInterfaces = os.networkInterfaces().map((iface) => ({
+            name: iface.name,
+            internal: iface.internal,
+            mac: iface.mac,
+            address: iface.address,
+            netmask: iface.netmask,
+            family: iface.scopeId ? 6 : 4,
+        }));
+    } catch {
+        networkInterfaces = [];
+    }
+
+    const ru = resourceUsage();
+    const userCpuSeconds = ru.userCPUTime / 1e6;
+    const kernelCpuSeconds = ru.systemCPUTime / 1e6;
+
+    return {
+        header: {
+            reportVersion: 5,
+            event: err ? 'Exception' : 'JavaScript API',
+            trigger: err ? 'Exception' : 'GetReport',
+            filename,
+            dumpEventTime: stamp.dumpEventTime,
+            dumpEventTimeStamp: stamp.dumpEventTimeStamp,
+            processId: pid,
+            threadId: 0,
+            cwd: os.cwd,
+            commandLine: [...argv],
+            nodejsVersion: version,
+            glibcVersionRuntime: glibcVersionRuntime(),
+            glibcVersionCompiler: '',
+            wordSize: 64,
+            arch,
+            platform,
+            componentVersions: { ...versions },
+            release: { name: 'node', headersUrl: '', sourceUrl: '', libUrl: '' },
+            osName: u.sysname,
+            osRelease: u.release,
+            osVersion: u.version,
+            osMachine: u.machine,
+            cpus,
+            networkInterfaces,
+            host: os.hostName,
+        },
+        javascriptStack: buildJavascriptStack(err),
+        javascriptHeap: buildJavascriptHeap(),
+        nativeStack: [] as unknown[],
+        resourceUsage: buildResourceUsageSection(),
+        uvthreadResourceUsage: {
+            userCpuSeconds,
+            kernelCpuSeconds,
+            cpuConsumptionPercent: (userCpuSeconds + kernelCpuSeconds) * 100,
+            userCpuConsumptionPercent: userCpuSeconds * 100,
+            kernelCpuConsumptionPercent: kernelCpuSeconds * 100,
+            fsActivity: { reads: ru.fsRead, writes: ru.fsWrite },
+        },
+        libuv: buildLibuvHandles(),
+        workers: [] as unknown[],
+        environmentVariables: reportState.excludeEnv ? {} : collectEnvForReport(),
+        userLimits: {
+            core_file_size_blocks: { soft: '', hard: '' },
+            data_seg_size_bytes: { soft: '', hard: '' },
+            file_size_blocks: { soft: '', hard: '' },
+            max_locked_memory_bytes: { soft: '', hard: '' },
+            max_memory_size_bytes: { soft: '', hard: '' },
+            open_files: { soft: '', hard: '' },
+            stack_size_bytes: { soft: '', hard: '' },
+            cpu_time_seconds: { soft: '', hard: '' },
+            max_user_processes: { soft: '', hard: '' },
+            virtual_memory_bytes: { soft: '', hard: '' },
+        },
+        sharedObjects: [] as string[],
+    };
+}
+
+function resolveReportFilename(file?: string): { path: string; name: string } {
+    const configuredDir = reportState.directory || '';
+    const configuredName = reportState.filename || '';
+
+    if (file && typeof file === 'string' && file.length > 0) {
+        if (isAbsoluteReportPath(file)) {
+            const parts = file.replace(/\\/g, '/').split('/');
+            return { path: file, name: parts[parts.length - 1] || file };
+        }
+        return { path: joinReportPath(configuredDir || os.cwd, file), name: file };
+    }
+
+    if (configuredName) {
+        return {
+            path: joinReportPath(configuredDir || os.cwd, configuredName),
+            name: configuredName,
+        };
+    }
+
+    reportSeq += 1;
+    const stamp = formatReportStamp(new Date());
+    const name = `report.${stamp.file}.${pid}.0.${String(reportSeq).padStart(3, '0')}.json`;
+    return { path: joinReportPath(configuredDir || os.cwd, name), name };
+}
+
+const reportState = {
     compact: false,
     directory: '',
     filename: '',
-    getReport: () => ({}),
     reportOnFatalError: false,
     reportOnSignal: false,
     reportOnUncaughtException: false,
     excludeEnv: false,
-    signal: 'SIGUSR2',
-    writeReport: () => '',
+    signal: 'SIGUSR2' as NodeJS.Signals,
+};
+
+export const report: NodeJS.ProcessReport = {
+    get compact() { return reportState.compact; },
+    set compact(v: boolean) { reportState.compact = Boolean(v); },
+    get directory() { return reportState.directory; },
+    set directory(v: string) { reportState.directory = String(v ?? ''); },
+    get filename() { return reportState.filename; },
+    set filename(v: string) { reportState.filename = String(v ?? ''); },
+    get reportOnFatalError() { return reportState.reportOnFatalError; },
+    set reportOnFatalError(v: boolean) { reportState.reportOnFatalError = Boolean(v); },
+    get reportOnSignal() { return reportState.reportOnSignal; },
+    set reportOnSignal(v: boolean) { reportState.reportOnSignal = Boolean(v); },
+    get reportOnUncaughtException() { return reportState.reportOnUncaughtException; },
+    set reportOnUncaughtException(v: boolean) { reportState.reportOnUncaughtException = Boolean(v); },
+    get excludeEnv() { return reportState.excludeEnv; },
+    set excludeEnv(v: boolean) { reportState.excludeEnv = Boolean(v); },
+    get signal() { return reportState.signal; },
+    set signal(v: NodeJS.Signals) { reportState.signal = v; },
+    getReport(err?: Error): object {
+        return buildProcessReport(err instanceof Error ? err : undefined, null);
+    },
+    writeReport(file?: string | Error, err?: Error): string {
+        let filenameArg: string | undefined;
+        let errorArg: Error | undefined = err;
+        if (typeof file === 'string') filenameArg = file;
+        else if (file instanceof Error) errorArg = file;
+
+        const resolved = resolveReportFilename(filenameArg);
+        const payload = buildProcessReport(errorArg, resolved.name);
+        const json = reportState.compact
+            ? JSON.stringify(payload)
+            : `${JSON.stringify(payload, null, 2)}\n`;
+        try {
+            const fs = import.meta.use('fs');
+            fs.writeFile(resolved.path, engine.encodeString(json));
+        } catch (e) {
+            throw normalizeErrnoError(e, 'write', resolved.path);
+        }
+        try {
+            console.error(`Writing Node.js report to file: ${resolved.path}`);
+            console.error('Node.js report completed');
+        } catch {
+            // console may be redirected
+        }
+        return resolved.path;
+    },
 };
 
 export function emitWarning(warning: string | Error, options?: ProcessWarningOptions): void {
@@ -900,7 +1220,12 @@ const processDefault = existingProcessDefault ?? {
 	constructor: Process,
 } as unknown as NodeJS.Process;
 
-if (existingProcessDefault) Reflect.set(processDefault, 'versions', versions);
+// Re-evaluation (e.g. after `cno setup` refreshes cache) reuses the singleton
+// but must pick up newly filled surfaces like report.
+if (existingProcessDefault) {
+    Reflect.set(processDefault, 'versions', versions);
+    Reflect.set(processDefault, 'report', report);
+}
 
 if (!existingProcessDefault) Object.defineProperties(processDefault, {
     exitCode: {

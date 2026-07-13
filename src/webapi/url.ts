@@ -332,7 +332,6 @@ class URL implements globalThis.URL {
     #query: string | null = null;
     #fragment = '';
     #searchParams: URLSearchParams;
-    #nodeCompact = false;
 
     static parse(url: string, base?: string | globalThis.URL): URL | null {
         try {
@@ -362,11 +361,7 @@ class URL implements globalThis.URL {
     }
 
     private encodeSpaces(str: string) {
-        return this.#nodeCompact ? str.replace(' ', '%20') : str;
-    }
-
-    enableNodeCompact() {
-        this.#nodeCompact = true;
+        return str.replaceAll(' ', '%20');
     }
 
     #parse(input: string, base?: string | globalThis.URL): void {

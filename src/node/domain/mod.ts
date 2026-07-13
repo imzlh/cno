@@ -3,9 +3,38 @@ import { EventEmitter } from '../events';
 type AnyFn = (...args: unknown[]) => unknown;
 type DomainEmitter = EventEmitter & { domain?: Domain | null };
 
+// Active domain stack (Node: enter pushes, exit pops this domain and above).
+const stack: Domain[] = [];
+
+export let active: Domain | null = null;
+
+function setActive(domain: Domain | null): void {
+    active = domain;
+    try {
+        const proc = Reflect.get(globalThis, 'process') as { domain?: Domain | null } | undefined;
+        if (proc && (typeof proc === 'object' || typeof proc === 'function')) {
+            proc.domain = domain;
+        }
+    } catch {
+        // process may be unavailable during early bootstrap
+    }
+}
+
 export class Domain extends EventEmitter {
     members: DomainEmitter[] = [];
     #errorHandlers = new WeakMap<DomainEmitter, (error: unknown) => void>();
+
+    enter(): void {
+        stack.push(this);
+        setActive(this);
+    }
+
+    exit(): void {
+        const index = stack.lastIndexOf(this);
+        if (index === -1) return;
+        stack.length = index;
+        setActive(stack[index - 1] ?? null);
+    }
 
     add(emitter: DomainEmitter): void {
         if (!emitter || typeof emitter.on !== 'function') {
@@ -34,11 +63,14 @@ export class Domain extends EventEmitter {
     }
 
     run<T>(fn: (...args: unknown[]) => T, ...args: unknown[]): T | undefined {
+        this.enter();
         try {
             return fn(...args);
         } catch (error) {
             this.emit('error', error);
             return undefined;
+        } finally {
+            this.exit();
         }
     }
 
@@ -71,6 +103,8 @@ export class Domain extends EventEmitter {
     }
 
     destroy(): void {
+        // Drop this domain (and anything entered above it) from the stack.
+        this.exit();
         for (const emitter of [...this.members]) this.remove(emitter);
         this.removeAllListeners();
     }
@@ -81,4 +115,3 @@ export function create(): Domain {
 }
 
 export const createDomain = create;
-export const active: Domain | null = null;

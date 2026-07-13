@@ -16,11 +16,12 @@ Object.defineProperties(globalThis, {
         enumerable: true,
         configurable: false,
     },
+    // Deno main thread: globalThis.window is undefined (not an alias of globalThis).
     window: {
-        value: globalThis,
-        writable: false,
+        value: undefined,
+        writable: true,
         enumerable: true,
-        configurable: false,
+        configurable: true,
     },
     name: {
         value: '',
@@ -64,11 +65,34 @@ Reflect.set(globalThis, 'addEventListener', globalEvent.addEventListener.bind(gl
 Reflect.set(globalThis,'removeEventListener', globalEvent.removeEventListener.bind(globalEvent));
 Reflect.set(globalThis, 'dispatchEvent', globalEvent.dispatchEvent.bind(globalEvent));
 
+// onload / onunload property bridges (specs/test/load_unload, specs/run/_078_unload)
+function defineGlobalHandler(prop: string, type: string): void {
+    let handler: ((ev: globalThis.Event) => void) | null = null;
+    const wrapper = (ev: globalThis.Event) => { if (handler) handler.call(globalThis, ev); };
+    Object.defineProperty(globalThis, prop, {
+        get() { return handler; },
+        set(fn: unknown) {
+            // @ts-ignore - event
+            if (handler) globalEvent.removeEventListener(type, wrapper);
+            handler = typeof fn === 'function' ? fn as (ev: Event) => void : null;
+            // @ts-ignore - event
+            if (handler) globalEvent.addEventListener(type, wrapper);
+        },
+        enumerable: true,
+        configurable: true,
+    });
+}
+defineGlobalHandler('onload', 'load');
+defineGlobalHandler('onunload', 'unload');
+defineGlobalHandler('onbeforeunload', 'beforeunload');
+
 // bridge cjs event
 onEvent((eventName, eventData) => {
     let event;
     switch (eventName) {
         case EventType.EXIT:
+            // Process exit: fire unload then exit (Deno order approximates).
+            globalEvent.dispatchEvent(new Event('unload'));
             event = new Event('exit');
             break;
         case EventType.JOB_EXCEPTION:

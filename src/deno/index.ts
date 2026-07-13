@@ -663,8 +663,26 @@ function createBenchFunction(): BenchFunction {
 }
 
 export async function startTest(contextName = '<core>', test = true, bench = true, options: StartTestOptions = {}) {
+    // reportError / uncaught errors during a test fail the suite (specs/test/report_error).
+    // Listeners may preventDefault on cancelable ErrorEvents (reportError is cancelable).
+    let suiteUncaught: Error | null = null;
+    const onSuiteError = (ev: Event) => {
+        if (!(ev instanceof ErrorEvent)) return;
+        if (suiteUncaught) return;
+        const err = ev.error instanceof Error ? ev.error : new Error(String(ev.message || 'Uncaught error'));
+        // Defer so same-turn preventDefault from user listeners still wins.
+        queueMicrotask(() => {
+            if (ev.defaultPrevented) return;
+            if (!suiteUncaught) suiteUncaught = err;
+        });
+    };
     if (test) {
-        // Run beforeAll hooks
+        try { globalThis.addEventListener('error', onSuiteError); } catch { /* */ }
+    }
+
+    try {
+    if (test) {
+        // Run beforeAll hooks (registration order)
         for (const hook of beforeAllHooks) {
             await runTestHook(hook, 'beforeAll hook', 'beforeAll hook failed');
         }
@@ -673,7 +691,7 @@ export async function startTest(contextName = '<core>', test = true, bench = tru
         let stopTests = options.failFast === true && failedTests.length > 0;
 
         for (const testItem of testRegistry) {
-            if (stopTests) break;
+            if (stopTests || suiteUncaught) break;
             if (hasOnly && !testItem.only) continue;
             if (!filterMatches(testItem.name, options.filter)) continue;
             if ((testItem as TestDefinitionWithNoRun).noRun) continue;
@@ -687,11 +705,11 @@ export async function startTest(contextName = '<core>', test = true, bench = tru
             const totalRuns = repeats + 1;
 
             for (let run = 0; run < totalRuns; run++) {
-                if (stopTests) break;
+                if (stopTests || suiteUncaught) break;
                 const runLabel = totalRuns > 1 ? `${testItem.name} (${run + 1}/${totalRuns})` : testItem.name;
                 const failureCountBefore = failedTests.length;
 
-                // beforeEach hooks
+                // beforeEach hooks (registration order)
                 for (const hook of beforeEachHooks) {
                     await runTestHook(
                         hook,
@@ -720,6 +738,8 @@ export async function startTest(contextName = '<core>', test = true, bench = tru
                         } else {
                             await testItem.fn(stepCtx);
                         }
+                        // Drain reportError microtask before sanitizers (preventDefault race).
+                        await Promise.resolve();
                         success = true;
                         break;
                     } catch (e) {
@@ -729,6 +749,23 @@ export async function startTest(contextName = '<core>', test = true, bench = tru
                         }
                     }
                 }
+                // Drain once more after attempts (uncaught may queue after throw path).
+                await Promise.resolve();
+
+                // specs/test/exit_code*: non-zero Deno.exitCode fails a clean test and resets;
+                // if the test already threw, keep the sticky code for later tests.
+                if (denoExitCode !== 0) {
+                    if (success) {
+                        success = false;
+                        lastError = new Error(`Test case finished with exit code set to ${denoExitCode}`);
+                        setDenoExitCode(0);
+                    }
+                }
+
+                if (suiteUncaught && success) {
+                    success = false;
+                    lastError = suiteUncaught;
+                }
 
                 if (success) {
                     console.info(`  ok ${runLabel}`);
@@ -737,8 +774,8 @@ export async function startTest(contextName = '<core>', test = true, bench = tru
                     failedTests.push({ ...testItem, name: runLabel, error: toError(lastError) });
                 }
 
-                // afterEach hooks
-                for (const hook of afterEachHooks) {
+                // afterEach hooks run LIFO (Deno/Jest style)
+                for (const hook of [...afterEachHooks].reverse()) {
                     await runTestHook(
                         hook,
                         `afterEach hook for ${runLabel}`,
@@ -750,12 +787,32 @@ export async function startTest(contextName = '<core>', test = true, bench = tru
                     stopTests = true;
                     break;
                 }
+                if (suiteUncaught) {
+                    stopTests = true;
+                    break;
+                }
             }
         }
 
-        // Run afterAll hooks
-        for (const hook of afterAllHooks) {
+        // afterAll hooks run LIFO
+        for (const hook of [...afterAllHooks].reverse()) {
             await runTestHook(hook, 'afterAll hook', 'afterAll hook failed');
+        }
+
+        // only option fails the overall run even when selected tests pass
+        if (hasOnly) {
+            failedTests.push({
+                name: 'only option',
+                fn: () => {},
+                error: new Error('Test failed because the "only" option was used'),
+            });
+        }
+        if (suiteUncaught && !failedTests.some(t => t.error === suiteUncaught)) {
+            failedTests.push({
+                name: `${contextName} (uncaught error)`,
+                fn: () => {},
+                error: suiteUncaught,
+            });
         }
     }
 
@@ -783,6 +840,11 @@ export async function startTest(contextName = '<core>', test = true, bench = tru
         return failedTests.length === 0;
     } else {
         return true;
+    }
+    } finally {
+        if (test) {
+            try { globalThis.removeEventListener('error', onSuiteError); } catch { /* */ }
+        }
     }
 }
 

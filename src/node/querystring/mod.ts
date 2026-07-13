@@ -1,5 +1,5 @@
 /**
- * Node.js querystring module (stub)
+ * Node.js querystring module
  * URL query string parsing and stringifying
  */
 
@@ -180,10 +180,30 @@ export function stringify(obj: Record<string, unknown>, sep = '&', eq = '=', opt
     return pairs.join(sep);
 }
 
+// Node qsEscape: encodeURIComponent alphabet, leave !'()* unescaped (RFC 2396).
+// Iterate code points (not UTF-16 units) so surrogate pairs encode as UTF-8.
+const QS_UNESCAPED = /[A-Za-z0-9\-_.!~*'()]/;
+
 export function escape(str: string): string {
-    return encodeURIComponent(str);
+    const input = typeof str === 'string' ? str : String(str);
+    let out = '';
+    for (const ch of input) {
+        const code = ch.codePointAt(0)!;
+        if (code < 0x80 && QS_UNESCAPED.test(ch)) {
+            out += ch;
+            continue;
+        }
+        if (code < 0x80) {
+            out += `%${code.toString(16).toUpperCase().padStart(2, '0')}`;
+            continue;
+        }
+        // Full code point (incl. emoji surrogate pairs) → UTF-8 percent sequences.
+        out += encodeURIComponent(ch);
+    }
+    return out;
 }
 
 export function unescape(str: string): string {
-    return decodePart(str, decodeURIComponent);
+    const input = typeof str === 'string' ? str : String(str);
+    return decodePart(input, decodeURIComponent);
 }

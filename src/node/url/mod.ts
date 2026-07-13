@@ -1,12 +1,10 @@
 /**
  * Node.js url module compatibility.
  *
- * URL and URLSearchParams are the web API polyfill (webapi/url.ts), already on
- * globalThis. Node's legacy url.parse/format/resolve and the file URL helpers
- * are built on top of them here.
+ * URL and URLSearchParams come from the runtime (webapi polyfill on globalThis).
+ * Legacy parse/format/resolve and file-URL helpers are built on top of them.
+ * Do not subclass globalThis.URL — QuickJS rejects super() with "not a function".
  */
-
-import type { URL as WebURL } from '../../webapi/url';
 
 export const URLSearchParams = globalThis.URLSearchParams;
 type ParsedQuery = Record<string, string | string[]>;
@@ -152,12 +150,9 @@ function findHostEnd(rest: string): number {
     return slash === -1 ? rest.length : slash;
 }
 
-export class URL extends globalThis.URL {
-    constructor(input: string | URL, base?: string | URL) { 
-        super(input, base);
-        (this as unknown as WebURL).enableNodeCompact();
-    }    
-}
+// Re-export the runtime URL. Subclassing globalThis.URL breaks on QuickJS
+// (super() → "not a function"), which killed fileURLToPath / createRequire.
+export const URL = globalThis.URL;
 
 export function parse(urlStr: string, parseQueryString = false, slashesDenoteHost = false): UrlWithStringQuery | UrlWithParsedQuery {
     if (typeof urlStr !== 'string') {
@@ -292,8 +287,9 @@ export function format(url: string | URL | UrlObject, options?: {
     if (typeof url === 'string') {
         return formatWhatwgUrl(new URL(url), options);
     }
-    if (url instanceof URL) {
-        return formatWhatwgUrl(url, options);
+    // Prefer WHATWG URL instances over legacy UrlObject duck-types.
+    if (url instanceof globalThis.URL) {
+        return formatWhatwgUrl(url as URL, options);
     }
 
     const protocol = normalizeProtocol(url.protocol);
@@ -560,7 +556,14 @@ export function domainToUnicode(domain: string): string {
 }
 
 function isUrl(value: unknown): value is URL {
-    return value instanceof URL;
+    if (value instanceof globalThis.URL) return true;
+    // Duck-type URL-like (e.g. cross-realm / partial mocks).
+    if (value !== null && typeof value === 'object') {
+        const href = Reflect.get(value, 'href');
+        const protocol = Reflect.get(value, 'protocol');
+        return typeof href === 'string' && typeof protocol === 'string';
+    }
+    return false;
 }
 
 function assertFileUrl(value: URL): void {

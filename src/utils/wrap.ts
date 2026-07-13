@@ -81,7 +81,7 @@ export function wrapFSErr(e: unknown): unknown {
 function __rethrow(e: unknown, _stack: string): never {
     if (typeof e !== "object" || e === null) throw e;
     const stack = _stack.substring(_stack.indexOf('\n') + 1);
-    Object.defineProperty(e, 'stack', { value: stack });
+    Reflect.set(e, 'stack', stack);
     throw e;
 }
 

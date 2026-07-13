@@ -194,6 +194,7 @@ export class EventTarget implements globalThis.EventTarget {
                         callTrackingHook('__cnoUntrackEventTargetListener', target, event.type, entry.listener, entry.capture);
                     }
                     const fn = entry.listener;
+                    // @ts-ignore
                     if (typeof fn === 'function') fn.call(this, event);
                     else fn.handleEvent?.(event);
                 }
