@@ -155,11 +155,9 @@ export function writeFile(path: PathLike | number, data: string | Uint8Array | A
     const buffer = toUint8Array(data, encoding);
     assertCallback(callback);
     if ('fd' in target) {
+        // Node: write from current offset; do not ftruncate the fd.
         queueMicrotask(() => {
             try {
-                if (flag !== 'a') {
-                    fs.ftruncate(target.fd, 0);
-                }
                 fs.write(target.fd, buffer);
             } catch (err) {
                 callback(toErrnoException(err, 'writeFile', describeFd(target.fd)));
@@ -326,10 +324,16 @@ export function access(path: PathLike, mode?: unknown, callback?: unknown): void
 
     assertCallback(callback);
     const pathStr = pathToString(path);
-    asfs.stat(pathStr).then(
-        () => callback(null),
-        err => callback(toErrnoException(err, 'access', pathStr))
-    );
+    const accessMode = typeof mode === 'number' ? mode : fs.F_OK;
+    // Mode-aware: use sync fs.access (asyncfs has no access).
+    queueMicrotask(() => {
+        try {
+            fs.access(pathStr, accessMode);
+            callback(null);
+        } catch (err) {
+            callback(toErrnoException(err, 'access', pathStr));
+        }
+    });
 }
 
 // Directory operations - callback style
@@ -349,7 +353,11 @@ export function mkdir(path: PathLike, options?: unknown, callback?: unknown): vo
     const recursive = option.recursive === true;
 
     if (recursive) {
-        mkdirRecursive(pathStr, mode).then(() => callback(null), err => callback(toErrnoException(err, 'mkdir', pathStr)));
+        // Node callback mkdir recursive: (err, path?) — first created path.
+        mkdirRecursive(pathStr, mode).then(
+            first => callback(null, first),
+            err => callback(toErrnoException(err, 'mkdir', pathStr)),
+        );
     } else {
         asfs.mkdir(pathStr, mode).then(() => callback(null), err => callback(toErrnoException(err, 'mkdir', pathStr)));
     }
@@ -388,7 +396,8 @@ export function rm(path: PathLike, options?: unknown, callback?: unknown): void 
 
     asfs.lstat(pathStr).then(
         stats => {
-            if (stats.isDirectory) {
+            // Symlink-to-dir is not a directory for rm — always unlink the link.
+            if (stats.isDirectory && !stats.isSymbolicLink) {
                 if (option.recursive) {
                     removeRecursive(pathStr).then(() => callback(null), err => callback(toErrnoException(err, 'rm', pathStr)));
                 } else {
@@ -432,8 +441,8 @@ export function readdir(path: PathLike, options?: unknown, callback?: unknown): 
     readDirEntries(pathStr, recursive).then(
         entries => {
             callback(null, withFileTypes
-                ? entries.map(entry => toNodeDirentAsync(entry))
-                : entries.map(entry => encodePathResult(entry.name, typeof options === 'string' ? options : option))
+                ? entries.map(entry => toNodeDirentAsync(entry, entry.parentPath))
+                : entries.map(entry => encodePathResult(entry.relativePath, typeof options === 'string' ? options : option))
             );
         },
         err => callback(toErrnoException(err, 'readdir', pathStr))
@@ -586,9 +595,11 @@ export function realpath(path: PathLike, options?: unknown, callback?: unknown):
     }
 
     assertCallback(callback);
-    asfs.realPath(pathToString(path)).then(
-        result => callback(null, result),
-        err => callback(toErrnoException(err, 'realpath', pathToString(path)))
+    const pathStr = pathToString(path);
+    const encodingOpt = typeof options === 'string' ? options : optionBag(options);
+    asfs.realPath(pathStr).then(
+        result => callback(null, encodePathResult(result, encodingOpt)),
+        err => callback(toErrnoException(err, 'realpath', pathStr))
     );
 }
 
@@ -635,11 +646,20 @@ export function fchmod(fd: number, mode: Mode, callback: NoParamCallback): void 
 }
 
 export function lchmod(path: PathLike, mode: Mode, callback: NoParamCallback): void {
-    // lchmod: best-effort via chmod (C layer doesn't distinguish symlink chmod)
+    // Linux has no lchmod; Node throws ENOSYS on symlinks.
     const pathStr = pathToString(path);
     const parsedMode = modeToNumber(mode);
     runFsCallback(callback, () => {
         try {
+            const st = fs.lstat(pathStr);
+            if (st.isSymbolicLink) {
+                const err = new Error(`ENOSYS: function not implemented, lchmod '${pathStr}'`) as NodeJS.ErrnoException;
+                err.code = 'ENOSYS';
+                err.syscall = 'lchmod';
+                err.path = pathStr;
+                callback(err);
+                return;
+            }
             fs.chmod(pathStr, parsedMode);
         } catch (err) {
             callback(toErrnoException(err, 'lchmod', pathStr));

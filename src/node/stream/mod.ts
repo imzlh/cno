@@ -898,8 +898,14 @@ Writable.prototype._writeBuffered = function _writeBuffered(this: Writable): voi
         this.writableLength = state.buffer.length;
 
         if (err) {
-            this.emit('error', err);
+            // Callback first: emit('error') with no listener throws on EE and
+            // would otherwise swallow the write callback forever.
             callback(err);
+            try {
+                this.emit('error', err);
+            } catch {
+                // No listener / listener threw — fault already delivered to cb.
+            }
             return;
         }
 
@@ -1589,6 +1595,10 @@ export function isErrored(stream: unknown): boolean {
 
 export function isReadable(stream: unknown): boolean {
     return isReadableLike(stream) && stream.readable === true && !stream.readableEnded && !stream.destroyed;
+}
+
+export function isWritable(stream: unknown): boolean {
+    return isWritableLike(stream) && stream.writable === true && !stream.writableEnded && !stream.destroyed;
 }
 
 export function compose(...streams: Array<Duplex | Readable | Writable>): Duplex {

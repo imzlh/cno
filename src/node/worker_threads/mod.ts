@@ -13,6 +13,7 @@ import {
 } from '../_internal/structured-clone';
 
 const wk = import.meta.use('worker');
+const error = import.meta.use('error');
 
 const INTERNAL_KEYS = new Set([
     '__cts_entry',
@@ -98,11 +99,9 @@ function errorFromWorkerPayload(payload: WorkerErrorPayload): Error {
     return error;
 }
 
-function isPipeEof(error: unknown): boolean {
-    if (!error || typeof error !== 'object') return false;
-    const code = Reflect.get(error, 'code');
-    const message = Reflect.get(error, 'message');
-    return code === -4095 || (typeof message === 'string' && message.includes('EOF'));
+function isPipeEof(err: unknown): boolean {
+    if (!(err instanceof Error)) return false;
+    return Reflect.get(err, 'code') === error.errno.EOF;
 }
 
 function isMessagePort(value: unknown): value is MessagePort {

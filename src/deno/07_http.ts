@@ -3,6 +3,7 @@ const streams = import.meta.use('streams');
 const engine = import.meta.use('engine');
 const os = import.meta.use('os');
 const crypto = import.meta.use('crypto');
+const error = import.meta.use('error');
 
 import { wrapFsClassDec as wrap } from '../utils/wrap';
 import { dnsCache } from '@cnojs/http/dns-cache';
@@ -117,7 +118,7 @@ async function connectHttpProxy(
     const n = await socket.read(buf);
     if (n === 0) {
         socket.close();
-        throw new Error('Proxy CONNECT failed: EOF');
+        throw error.Error(error.errno.EOF);
     }
 
     const response = engine.decodeString(buf.subarray(0, n));

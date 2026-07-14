@@ -1,11 +1,24 @@
+/**
+ * llhttp method enum order — index equals Parser.state.method.
+ * Do not use for http.METHODS (public list is alphabetical).
+ */
+export const LLHTTP_METHODS = [
+    'DELETE', 'GET', 'HEAD', 'POST', 'PUT', 'CONNECT',
+    'OPTIONS', 'TRACE', 'COPY', 'LOCK', 'MKCOL', 'MOVE',
+    'PROPFIND', 'PROPPATCH', 'SEARCH', 'UNLOCK', 'BIND',
+    'REBIND', 'UNBIND', 'ACL', 'REPORT', 'MKACTIVITY',
+    'CHECKOUT', 'MERGE', 'M-SEARCH', 'NOTIFY', 'SUBSCRIBE',
+    'UNSUBSCRIBE', 'PATCH', 'PURGE', 'MKCALENDAR', 'LINK', 'UNLINK',
+    'SOURCE',
+] as const;
+
+// Node public surface: alphabetical, includes QUERY (Node 19+).
 export const METHODS = [
-    "DELETE", "GET", "HEAD", "POST", "PUT", "CONNECT",
-    "OPTIONS", "TRACE", "COPY", "LOCK", "MKCOL", "MOVE",
-    "PROPFIND", "PROPPATCH", "SEARCH", "UNLOCK", "BIND",
-    "REBIND", "UNBIND", "ACL", "REPORT", "MKACTIVITY",
-    "CHECKOUT", "MERGE", "M-SEARCH", "NOTIFY", "SUBSCRIBE",
-    "UNSUBSCRIBE", "PATCH", "PURGE", "MKCALENDAR", "LINK", "UNLINK",
-    "SOURCE"
+    'ACL', 'BIND', 'CHECKOUT', 'CONNECT', 'COPY', 'DELETE', 'GET', 'HEAD',
+    'LINK', 'LOCK', 'M-SEARCH', 'MERGE', 'MKACTIVITY', 'MKCALENDAR', 'MKCOL',
+    'MOVE', 'NOTIFY', 'OPTIONS', 'PATCH', 'POST', 'PROPFIND', 'PROPPATCH',
+    'PURGE', 'PUT', 'QUERY', 'REBIND', 'REPORT', 'SEARCH', 'SOURCE',
+    'SUBSCRIBE', 'TRACE', 'UNBIND', 'UNLINK', 'UNLOCK', 'UNSUBSCRIBE',
 ] as const;
 
 export const STATUS_CODES: Record<number, string> = {

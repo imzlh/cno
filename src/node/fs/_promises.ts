@@ -13,7 +13,6 @@ const { readBufSize: READ_BUF_SIZE } = getTierLimits();
 
 const asfs = import.meta.use('asyncfs');
 const fs = import.meta.use('fs');
-const os = import.meta.use('os');
 
 // Helper: wrap asyncfs calls, auto-convert errno to ErrnoException
 function w<T>(promise: Promise<T>, syscall: string, path: string, dest?: string): Promise<T> {
@@ -84,7 +83,7 @@ export async function writeFile(path: PathLike | number, data: string | Uint8Arr
     const encoding = typeof options === 'string' ? options : typeof options === 'object' ? options?.encoding : undefined;
     const buffer = toUint8Array(data, encoding);
     if ('fd' in target) {
-        fs.ftruncate(target.fd, 0);
+        // Node: write from current offset; do not ftruncate the fd.
         fs.write(target.fd, buffer);
         return;
     }
@@ -118,9 +117,15 @@ export async function appendFile(path: PathLike | number, data: string | Uint8Ar
 
 // File status
 
-export async function access(path: PathLike): Promise<void> {
+export async function access(path: PathLike, mode?: number): Promise<void> {
+    // asyncfs has no access(); bridge sync fs.access (mode-aware) via microtask.
     const pathStr = pathToString(path);
-    await w(asfs.stat(pathStr), 'stat', pathStr);
+    const m = mode ?? fs.F_OK;
+    try {
+        fs.access(pathStr, m);
+    } catch (e) {
+        throw normalizeErrnoError(e, 'access', pathStr);
+    }
 }
 
 export async function stat(path: PathLike, options?: { bigint?: boolean }): Promise<import('fs').Stats> {
@@ -143,8 +148,8 @@ export async function mkdir(path: PathLike, options?: { mode?: number; recursive
     const recursive = typeof options === 'object' ? options?.recursive : false;
 
     if (recursive) {
-        await mkdirRecursive(pathStr, mode);
-        return pathStr;
+        // Node returns the first created directory, or undefined if all existed.
+        return await w(mkdirRecursive(pathStr, mode), 'mkdir', pathStr);
     }
 
     await w(asfs.mkdir(pathStr, mode), 'mkdir', pathStr);
@@ -167,7 +172,8 @@ export async function rm(path: PathLike, options?: { force?: boolean; recursive?
     try {
         const stats = await w(asfs.lstat(pathStr), 'lstat', pathStr);
 
-        if (stats.isDirectory) {
+        // Symlink-to-dir is not a directory for rm — always unlink the link.
+        if (stats.isDirectory && !stats.isSymbolicLink) {
             if (options?.recursive) {
                 await removeRecursive(pathStr);
             } else {
@@ -191,9 +197,9 @@ export async function readdir(path: PathLike, options?: { encoding?: BufferEncod
     try {
         const entries = await readDirEntries(pathStr, recursive);
         if (withFileTypes) {
-            return entries.map(entry => toNodeDirentAsync(entry));
+            return entries.map(entry => toNodeDirentAsync(entry, entry.parentPath));
         }
-        return entries.map(entry => encodePathResult(entry.name, options));
+        return entries.map(entry => encodePathResult(entry.relativePath, options));
     } catch (err) {
         throw normalizeErrnoError(err, 'readdir', pathStr);
     }
@@ -257,18 +263,15 @@ export async function readlink(path: PathLike): Promise<string | Uint8Array> {
     return result;
 }
 
-export async function realpath(_path: PathLike): Promise<string> {
-    const pathStr = pathToString(_path);
-    if (path.isAbsolute(pathStr)) {
-        return path.normalize(pathStr);
-    } else {
-        return path.join(os.cwd, pathStr);
-    }
+export async function realpath(pathLike: PathLike, options?: { encoding?: BufferEncoding | 'buffer' } | BufferEncoding): Promise<string | Buffer> {
+    const pathStr = pathToString(pathLike);
+    const resolved = await w(asfs.realPath(pathStr), 'realpath', pathStr);
+    return encodePathResult(resolved, options);
 }
 
-Reflect.set(realpath, 'native', function (path: PathLike) {
-    const pathStr = pathToString(path);
-    return w(asfs.realPath(pathStr), 'realpath', pathStr);
+Reflect.set(realpath, 'native', function (pathLike: PathLike, options?: { encoding?: BufferEncoding | 'buffer' } | BufferEncoding) {
+    const pathStr = pathToString(pathLike);
+    return w(asfs.realPath(pathStr), 'realpath', pathStr).then(resolved => encodePathResult(resolved, options));
 });
 
 // Permission operations
@@ -321,7 +324,16 @@ export async function open(path: PathLike, flags?: string | number, mode?: Mode)
 // Missing exports
 
 export async function lchmod(path: PathLike, mode: Mode): Promise<void> {
-    // lchmod is typically not supported, simplified implementation
+    // Linux has no lchmod; Node throws ENOSYS on symlinks.
+    const pathStr = pathToString(path);
+    const st = await w(asfs.lstat(pathStr), 'lstat', pathStr);
+    if (st.isSymbolicLink) {
+        const err = new Error(`ENOSYS: function not implemented, lchmod '${pathStr}'`) as NodeJS.ErrnoException;
+        err.code = 'ENOSYS';
+        err.syscall = 'lchmod';
+        err.path = pathStr;
+        throw err;
+    }
     await chmod(path, mode);
 }
 

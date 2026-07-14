@@ -5,7 +5,7 @@ const dns = import.meta.use('dns');
 const os = import.meta.use('os');
 
 import { Readable, Writable } from '../stream';
-import { Socket, Server as NetServer, AddressInfo } from '../net';
+import { Socket, Server as NetServer, AddressInfo, type HttpOwnedTransport } from '../net';
 import type { HttpRequest, HttpResponse, Server as HttpServer } from '@cnojs/http/server';
 import {
     buildNodeServerUrl,
@@ -17,7 +17,7 @@ import {
     normalizeHeaderRecord,
     toUint8Array,
 } from '../_internal/network-debug';
-import { normalizeErrnoError } from '../_internal/errno';
+import { isTransportDisconnectError, normalizeErrnoError } from '../_internal/errno';
 import { viewToUint8Array } from '../_internal/buffer';
 import { ServerResponseAdapter } from '../_internal/server-response-adapter';
 import { dispatchServerRequest } from '../_internal/server-request-runtime';
@@ -92,16 +92,29 @@ function normalizeEndArgs(
     return { chunk };
 }
 
-function createAttachedSocketQuietly(tcp: CModuleStreams.TCP | undefined): Socket | null {
+function createAttachedSocketQuietly(
+    tcp: CModuleStreams.TCP | undefined,
+    owned?: HttpOwnedTransport,
+): Socket | null {
     if (!tcp) return null;
     try {
-        return createAttachedSocket(tcp);
+        return createAttachedSocket(tcp, owned);
     } catch {
         return null;
     }
 }
 
-export function createAttachedSocket(tcp: CModuleStreams.TCP): Socket {
+/**
+ * Node view of a connection. When `owned` is set, HTTP core owns all I/O —
+ * the Socket is address/destroy metadata only (no dual-write on the TCP).
+ * Without `owned` (e.g. clientError display), destroy may close the handle.
+ */
+export function createAttachedSocket(
+    tcp: CModuleStreams.TCP,
+    owned?: HttpOwnedTransport,
+): Socket {
+    if (owned) return Socket.fromHttpOwned(tcp, owned);
+
     const socket = new Socket();
     const localInfo = tcp.sockname;
     const remoteInfo = tcp.peername;
@@ -279,7 +292,8 @@ function initOutgoingMessage(self: OutgoingMessageImpl): void {
     self.sendDate = true;
     self.finished = false;
     self.chunkedEncoding = false;
-    self.shouldKeepAlive = false;
+    // Node OutgoingMessage defaults shouldKeepAlive true (client flips off without keepAlive).
+    self.shouldKeepAlive = true;
     self.useChunkedEncodingByDefault = true;
 
     self._headers = {};
@@ -430,12 +444,18 @@ export interface ServerResponseImplConstructor {
 function initServerResponse(self: ServerResponseImpl): void {
     OutgoingMessageImpl.call(self);
     self.statusCode = 200;
-    self.statusMessage = 'OK';
+    // Node starts with undefined; empty means "fill from STATUS_CODES on send".
+    self.statusMessage = '';
     self.strictContentLength = false;
     self.req = null;
 
     self._ended = false;
     self._bodyLength = 0;
+}
+
+function statusMessageFor(code: number, explicit?: string): string {
+    if (explicit) return explicit;
+    return STATUS_CODES[code] ?? 'unknown';
 }
 
 export const ServerResponseImpl: ServerResponseImplConstructor = function ServerResponseImpl(this: ServerResponseImpl | undefined) {
@@ -468,9 +488,10 @@ ServerResponseImpl.prototype.writeHead = function writeHead(
 
     this.statusCode = statusCode;
     if (typeof statusMessageOrHeaders === 'string') {
-        this.statusMessage = statusMessageOrHeaders;
-    } else if (statusMessageOrHeaders !== undefined) {
-        headers = statusMessageOrHeaders;
+        this.statusMessage = statusMessageOrHeaders || statusMessageFor(statusCode);
+    } else {
+        this.statusMessage = statusMessageFor(statusCode, this.statusMessage);
+        if (statusMessageOrHeaders !== undefined) headers = statusMessageOrHeaders;
     }
 
     if (headers) {
@@ -598,6 +619,9 @@ class NodeResponseAdapter extends ServerResponseAdapter<ServerResponseImpl> {
             finish: async () => {
                 await coreResponse.end();
             },
+            abort: () => {
+                try { coreResponse.close(); } catch { /* already closed */ }
+            },
         }, serveHook, {
             isBodyForbiddenStatus,
             createHeadersSentError,
@@ -688,6 +712,8 @@ export class ServerImpl extends NetServer implements Server {
     private _options: ServerOptions;
     private _requestListener: RequestListener;
     private _httpConnections: Set<Socket> = new Set();
+    /** One Node facade per native TCP (keep-alive reuses it). */
+    private _httpSocketByTcp = new WeakMap<object, Socket>();
 
     constructor(options: ServerOptions | RequestListener, requestListener?: RequestListener) {
         super();
@@ -715,7 +741,7 @@ export class ServerImpl extends NetServer implements Server {
     }
 
     closeAllConnections(): void {
-        for (const socket of this._httpConnections) {
+        for (const socket of [...this._httpConnections]) {
             socket.destroy();
         }
         this._httpConnections.clear();
@@ -724,6 +750,33 @@ export class ServerImpl extends NetServer implements Server {
     closeIdleConnections(): void {
         // Core does not expose idle-only sockets yet. Do not stop the listener:
         // Node's closeIdleConnections() never closes the server itself.
+    }
+
+    private trackHttpSocket(socket: Socket): void {
+        if (this._httpConnections.has(socket)) return;
+        this._httpConnections.add(socket);
+        socket.once('close', () => {
+            this._httpConnections.delete(socket);
+        });
+    }
+
+    /**
+     * Facade for a core-owned TCP. Reused across keep-alive requests on the
+     * same handle; destroy closes the HTTP connection via the current res.
+     */
+    private socketForCoreRequest(tcp: CModuleStreams.TCP, res: HttpResponse): Socket {
+        const closeOwned = () => {
+            try { res.close(); } catch { /* already closed */ }
+        };
+        const existing = this._httpSocketByTcp.get(tcp);
+        if (existing && !existing.destroyed) {
+            existing._httpOwned = { close: closeOwned };
+            return existing;
+        }
+        const socket = createAttachedSocket(tcp, { close: closeOwned });
+        this._httpSocketByTcp.set(tcp, socket);
+        this.trackHttpSocket(socket);
+        return socket;
     }
 
     private async _handleNativeRequest(
@@ -739,7 +792,10 @@ export class ServerImpl extends NetServer implements Server {
         const requestHeaders = headerEntriesToRecord(req.headers);
         const requestUrl = buildNodeServerUrl('http:', req.url, requestHeaders, host);
         const rawTcp = Reflect.get(req, '__cnoTcp') ?? Reflect.get(res, '__cnoTcp');
-        const nodeSocket = rawTcp ? createAttachedSocket(rawTcp) : null;
+        // Core owns wire I/O; Node socket is addresses + destroy → res.close only.
+        const nodeSocket = typeof rawTcp === 'object' && rawTcp !== null
+            ? this.socketForCoreRequest(rawTcp as CModuleStreams.TCP, res)
+            : null;
         const { incoming, response } = createServerRequestObjects(nodeSocket);
         applyCoreServerRequest(incoming, req);
         if (incoming.method === 'CONNECT') {
@@ -759,11 +815,6 @@ export class ServerImpl extends NetServer implements Server {
 
         pumpIncomingRequestBody(incoming, req.body);
 
-        // NOTE: do NOT call response.setTcp(rawTcp) here. All response bytes
-        // must flow through the adapter -> coreResponse (@cnojs/http), which
-        // owns the socket. Giving ServerResponseImpl the raw TCP handle too
-        // creates two independent writers for one socket, which interleaves
-        // header/body/terminator writes and hangs the client mid-response.
         const adapter = new NodeResponseAdapter(response, res, serveHook, requestId, requestUrl, incoming.method === 'HEAD');
         await dispatchServerRequest({
             listener: this._requestListener,
@@ -778,13 +829,20 @@ export class ServerImpl extends NetServer implements Server {
             headers: requestHeaders,
             postData: req.body instanceof Uint8Array ? req.body : undefined,
             callFrames: requestCallFrames,
-            onError: (err) => this.emit('error', err),
+            // Peer abort is not a server fault; never promote it to server 'error'.
+            onError: (err) => {
+                if (isTransportDisconnectError(err)) return;
+                this.emit('error', err);
+            },
         });
     }
 
     private _handleNativeRequestError(err: Error, tcpSock: { socket?: CModuleStreams.TCP } | undefined): void {
+        if (isTransportDisconnectError(err)) return;
+        // H1 marks parse faults with this prefix (structured kind pending).
+        // clientError is the Node-compatible surface for bad request lines.
         const message = String(err.message ?? err);
-        if (/^Parse error:/.test(message)) {
+        if (message.startsWith('Parse error:')) {
             const clientSocket = createAttachedSocketQuietly(tcpSock?.socket);
             this.emit('clientError', err, clientSocket);
             return;

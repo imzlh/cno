@@ -6,10 +6,17 @@ import {
     normalizeHeaderRecord,
     toUint8Array,
 } from './network-debug';
+import { isTransportDisconnectError } from './errno';
 import type { OutgoingHttpHeaders } from '../http/types';
+import { STATUS_CODES } from '../http/constants';
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 type HeaderInput = OutgoingHttpHeaders | readonly string[];
+
+function reasonPhrase(code: number, explicit?: string): string {
+    if (explicit) return explicit;
+    return STATUS_CODES[code] ?? 'unknown';
+}
 
 function encodeStringForEncoding(encoding?: string): (value: string) => Uint8Array {
     if (!encoding) return engine.encodeString;
@@ -22,6 +29,7 @@ export interface ResponseAdapterTarget {
     statusMessage: string;
     sendDate: boolean;
     chunkedEncoding: boolean;
+    shouldKeepAlive?: boolean;
     writableEnded: boolean;
     writableFinished: boolean;
     finished: boolean;
@@ -29,8 +37,10 @@ export interface ResponseAdapterTarget {
     headersSent: boolean;
     hasHeader(name: string): boolean;
     setHeader(name: string, value: OutgoingHttpHeaders[string]): unknown;
+    getHeader?(name: string): OutgoingHttpHeaders[string] | undefined;
     getHeaders(): OutgoingHttpHeaders;
     emit(event: string | symbol, ...args: unknown[]): boolean;
+    listenerCount?(event: string | symbol): number;
 }
 
 export interface ResponseAdapterServeHook {
@@ -74,6 +84,9 @@ interface ResponseAdapterHelpers {
     createWriteAfterEndError(): Error & { code: string };
 }
 
+/** open → finished | aborted (peer gone) | failed (real fault) */
+type ResponseTerminal = 'open' | 'finished' | 'aborted' | 'failed';
+
 function emitServeFinishedQuietly(
     serveHook: ResponseAdapterServeHook | null | undefined,
     payload: Parameters<NonNullable<ResponseAdapterServeHook['onFinished']>>[0]
@@ -83,6 +96,28 @@ function emitServeFinishedQuietly(
     } catch {
         // Debug hooks must not affect the HTTP response lifecycle.
     }
+}
+
+function emitResponseErrorQuietly(response: ResponseAdapterTarget, error: Error): void {
+    // Peer disconnect is terminal for the response stream, not a server fault.
+    // Only surface 'error' when the app opted in with a listener — matching Node
+    // (unhandled 'error' would throw and poison the request loop).
+    const count = typeof response.listenerCount === 'function'
+        ? response.listenerCount('error')
+        : 0;
+    if (count <= 0) return;
+    try {
+        response.emit('error', error);
+    } catch {
+        // Listener threw; response is already terminal.
+    }
+}
+
+function disconnectError(message: string): Error & { code: string; syscall: string } {
+    return Object.assign(new Error(message), {
+        code: 'ECONNRESET',
+        syscall: 'write',
+    });
 }
 
 export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
@@ -95,9 +130,8 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
     private readonly suppressBody: boolean;
     private queue: Promise<void> = Promise.resolve();
     private headWritten = false;
-    private closed = false;
-    private failed = false;
-    private finished = false;
+    private terminal: ResponseTerminal = 'open';
+    private terminalError: Error | null = null;
     private pendingBytes = 0;
     private needDrain = false;
 
@@ -118,39 +152,61 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
         this.requestUrl = requestUrl;
         this.suppressBody = suppressBody;
         this.transport.closeSource?.once('close', () => {
-            if (this.response.writableEnded && !this.failed) {
-                return;
-            }
-            this.closed = true;
-            if (!this.finished && !this.failed) {
-                this.fail(Object.assign(new Error('socket closed before response finished'), {
-                    code: 'ECONNRESET',
-                    syscall: 'write',
-                }));
-            }
+            if (this.terminal !== 'open') return;
+            // Peer closed while we still owed bytes — normal HTTP abort path.
+            this.enterAborted(disconnectError('socket closed before response finished'));
         });
     }
 
-    private enqueue<T>(op: () => Promise<T>): Promise<T> {
-        const next = this.queue.then(async () => {
-            if (this.closed || this.failed) {
-                throw Object.assign(new Error('socket closed before response write completed'), {
-                    code: 'ECONNRESET',
-                    syscall: 'write',
-                });
+    /** True when the peer left or a write fault already ended the stream. */
+    get isClosed(): boolean {
+        return this.terminal !== 'open' && this.terminal !== 'finished';
+    }
+
+    get isFinished(): boolean {
+        return this.terminal === 'finished';
+    }
+
+    get isAborted(): boolean {
+        return this.terminal === 'aborted';
+    }
+
+    get lastError(): Error | null {
+        return this.terminalError;
+    }
+
+    private normalize(err: unknown): Error {
+        return this.transport.normalizeError?.(err)
+            ?? (err instanceof Error ? err : new Error(String(err)));
+    }
+
+    private closedWriteError(): Error {
+        return this.terminalError ?? disconnectError('socket closed before response write completed');
+    }
+
+    /**
+     * Serialize transport ops on a single queue. Faults never leave as bare
+     * rejections: onOk/onErr run inside the chain so QuickJS cannot report
+     * unhandled rejection between schedule and caller attach.
+     */
+    private enqueue(
+        op: () => Promise<void>,
+        onOk?: () => void,
+        onErr?: (err: unknown) => void,
+    ): void {
+        const run = async () => {
+            if (this.terminal !== 'open') {
+                onErr?.(this.closedWriteError());
+                return;
             }
-            return op();
-        }, async () => {
-            if (this.closed || this.failed) {
-                throw Object.assign(new Error('socket closed before response write completed'), {
-                    code: 'ECONNRESET',
-                    syscall: 'write',
-                });
+            try {
+                await op();
+                onOk?.();
+            } catch (err) {
+                onErr?.(err);
             }
-            return op();
-        });
-        this.queue = next.then(() => undefined, () => undefined);
-        return next;
+        };
+        this.queue = this.queue.then(run, run);
     }
 
     private shouldSuppressBody(): boolean {
@@ -183,6 +239,15 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
             this.response.chunkedEncoding = true;
             this.response.setHeader('Transfer-Encoding', 'chunked');
         }
+
+        // Node: Keep-Alive: timeout=5 when the connection will stay open.
+        const resConn = String(this.response.getHeader?.('connection') ?? '').toLowerCase();
+        const req = (this.response as { req?: { headers?: Record<string, unknown> } }).req;
+        const reqConn = String(req?.headers?.['connection'] ?? '').toLowerCase();
+        const closing = resConn === 'close' || reqConn === 'close';
+        if (!closing && this.response.shouldKeepAlive !== false && !this.response.hasHeader('keep-alive')) {
+            this.response.setHeader('Keep-Alive', 'timeout=5');
+        }
     }
 
     private collectHeaders(): Array<[string, string]> {
@@ -197,25 +262,88 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
         return allHeaders;
     }
 
-    private fail(err: unknown, callback?: (err?: Error | null) => void): void {
-        const error = this.transport.normalizeError?.(err) ?? (err instanceof Error ? err : new Error(String(err)));
-        if (this.failed) {
-            callback?.(error);
-            return;
-        }
-        this.closed = true;
-        this.failed = true;
+    private markWritableEnded(): void {
         if (!this.response.writableEnded) this.response.writableEnded = true;
-        this.abortTransportQuietly(error);
-        this.response.emit('close');
+    }
+
+    /**
+     * Drop the Node socket facade after transport teardown so closeSource and
+     * connection tracking see a real 'close' (HTTP-owned sockets never read EOF).
+     */
+    private closeSocketFacade(): void {
+        const src = this.transport.closeSource;
+        if (!src || typeof src !== 'object') return;
+        const destroy = Reflect.get(src, 'destroy');
+        if (typeof destroy !== 'function') return;
+        const destroyed = Reflect.get(src, 'destroyed');
+        if (destroyed === true) return;
+        try {
+            destroy.call(src);
+        } catch {
+            // Facade may already be torn down with the transport.
+        }
+    }
+
+    /** Client/peer gone — end the stream without treating it as a server error. */
+    private enterAborted(err: Error): void {
+        if (this.terminal !== 'open') return;
+        this.terminal = 'aborted';
+        this.terminalError = err;
+        this.markWritableEnded();
+        this.abortTransportQuietly(err);
+        this.closeSocketFacade();
         emitServeFinishedQuietly(this.serveHook, {
             requestId: this.requestId,
             timestamp: nodeTs(),
             success: false,
-            errorText: String(error.message ?? error),
+            errorText: String(err.message ?? err),
         });
-        this.response.emit('error', error);
-        callback?.(error);
+        // close first so waiters can treat peer-gone as normal end-of-stream.
+        this.response.emit('close');
+        // Optional: apps that listen get the disconnect; no listener ⇒ silent.
+        emitResponseErrorQuietly(this.response, err);
+    }
+
+    /** Real write/protocol fault. */
+    private enterFailed(err: Error, callback?: (err?: Error | null) => void): void {
+        if (this.terminal !== 'open') {
+            callback?.(err);
+            return;
+        }
+        this.terminal = 'failed';
+        this.terminalError = err;
+        this.markWritableEnded();
+        this.abortTransportQuietly(err);
+        this.closeSocketFacade();
+        emitServeFinishedQuietly(this.serveHook, {
+            requestId: this.requestId,
+            timestamp: nodeTs(),
+            success: false,
+            errorText: String(err.message ?? err),
+        });
+        // Always emit error for real faults — request runtime attaches a listener
+        // for the request lifetime, so this is never an unhandled EE throw.
+        try {
+            this.response.emit('error', err);
+        } catch {
+            // No listener / listener threw; still close the stream.
+        }
+        this.response.emit('close');
+        callback?.(err);
+    }
+
+    private fail(err: unknown, callback?: (err?: Error | null) => void): void {
+        const error = this.normalize(err);
+        if (this.terminal !== 'open') {
+            callback?.(error);
+            return;
+        }
+        if (isTransportDisconnectError(error)) {
+            this.enterAborted(error);
+            callback?.(error);
+            return;
+        }
+        this.enterFailed(error, callback);
     }
 
     private abortTransportQuietly(error: Error): void {
@@ -245,13 +373,16 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
 
         this.response.statusCode = statusCode;
         if (typeof statusMessageOrHeaders === 'string') {
-            this.response.statusMessage = statusMessageOrHeaders;
-        }
-
-        if (typeof statusMessageOrHeaders === 'object' && statusMessageOrHeaders !== null) {
-            this.normalizeHeadersInput(statusMessageOrHeaders);
-        } else {
+            // Empty string is not a real phrase — fill from STATUS_CODES like Node.
+            this.response.statusMessage = statusMessageOrHeaders || reasonPhrase(statusCode);
             this.normalizeHeadersInput(headers);
+        } else {
+            this.response.statusMessage = reasonPhrase(statusCode, this.response.statusMessage);
+            if (statusMessageOrHeaders !== undefined && statusMessageOrHeaders !== null) {
+                this.normalizeHeadersInput(statusMessageOrHeaders);
+            } else {
+                this.normalizeHeadersInput(headers);
+            }
         }
 
         this.ensureImplicitHeaders();
@@ -271,8 +402,11 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
             });
         } catch {}
 
-        this.enqueue(() => this.transport.writeHead(this.response, outHeaders))
-            .catch((err) => this.fail(err));
+        this.enqueue(
+            () => this.transport.writeHead(this.response, outHeaders),
+            undefined,
+            (err) => this.fail(err),
+        );
 
         return this.response;
     }
@@ -280,7 +414,8 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
     flushHeaders(): void {
         if (this.response.headersSent) return;
         this.ensureImplicitHeaders();
-        this.writeHead(this.response.statusCode, this.response.statusMessage);
+        // Pass only statusCode so STATUS_CODES fills an empty statusMessage.
+        this.writeHead(this.response.statusCode);
     }
 
     write(
@@ -293,12 +428,12 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
         if (this.response.writableEnded) {
             const err = this.helpers.createWriteAfterEndError();
             callback?.(err);
-            queueMicrotask(() => this.response.emit('error', err));
+            if (!callback) queueMicrotask(() => emitResponseErrorQuietly(this.response, err));
             return false;
         }
         if (!this.response.headersSent) {
             this.ensureImplicitHeaders();
-            this.writeHead(this.response.statusCode, this.response.statusMessage);
+            this.writeHead(this.response.statusCode);
         }
 
         try {
@@ -309,16 +444,20 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
                 return true;
             }
             this.pendingBytes += data.byteLength;
-            this.enqueue(async () => {
-                try { this.serveHook?.onData?.({ requestId: this.requestId, timestamp: nodeTs(), data }); } catch {}
-                await this.transport.writeBody(this.response, data);
-            }).then(() => {
-                this.settleWrite(data.byteLength);
-                callback?.();
-            }, (err) => {
-                this.settleWrite(data.byteLength);
-                this.fail(err, callback);
-            });
+            this.enqueue(
+                async () => {
+                    try { this.serveHook?.onData?.({ requestId: this.requestId, timestamp: nodeTs(), data }); } catch {}
+                    await this.transport.writeBody(this.response, data);
+                },
+                () => {
+                    this.settleWrite(data.byteLength);
+                    callback?.();
+                },
+                (err) => {
+                    this.settleWrite(data.byteLength);
+                    this.fail(err, callback);
+                },
+            );
         } catch (err) {
             this.fail(err, callback);
         }
@@ -354,7 +493,8 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
             ) {
                 this.response.setHeader('Content-Length', '0');
             }
-            this.writeHead(this.response.statusCode, this.response.statusMessage);
+            // Only statusCode — empty statusMessage is filled from STATUS_CODES.
+            this.writeHead(this.response.statusCode);
         } else if (chunk !== undefined && !this.response.headersSent) {
             const encoding = typeof encodingOrCb === 'string' ? encodingOrCb : undefined;
             const encodeString = encodeStringForEncoding(encoding);
@@ -366,38 +506,62 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
             ) {
                 this.response.setHeader('Content-Length', String(data.byteLength));
             }
-            this.writeHead(this.response.statusCode, this.response.statusMessage);
+            this.writeHead(this.response.statusCode);
             chunk = data;
         }
 
-        this.enqueue(async () => {
-            if (chunk !== undefined && !this.shouldSuppressBody()) {
-                const encoding = typeof encodingOrCb === 'string' ? encodingOrCb : undefined;
-                const encodeString = encodeStringForEncoding(encoding);
-                const data = chunk instanceof Uint8Array ? chunk : toUint8Array(chunk, encodeString);
-                try { this.serveHook?.onData?.({ requestId: this.requestId, timestamp: nodeTs(), data }); } catch {}
-                await this.transport.writeBody(this.response, data);
-            }
-            await this.transport.finish(this.response);
-        }).then(() => {
-            this.finished = true;
-            this.response.finished = true;
-            this.response.writableFinished = true;
-            emitServeFinishedQuietly(this.serveHook, { requestId: this.requestId, timestamp: nodeTs(), success: true });
-            this.response.emit('finish');
-            callback?.();
-        }, (err) => {
-            this.fail(err, callback as ((err?: Error | null) => void) | undefined);
-        });
+        this.enqueue(
+            async () => {
+                if (chunk !== undefined && !this.shouldSuppressBody()) {
+                    const encoding = typeof encodingOrCb === 'string' ? encodingOrCb : undefined;
+                    const encodeString = encodeStringForEncoding(encoding);
+                    const data = chunk instanceof Uint8Array ? chunk : toUint8Array(chunk, encodeString);
+                    try { this.serveHook?.onData?.({ requestId: this.requestId, timestamp: nodeTs(), data }); } catch {}
+                    await this.transport.writeBody(this.response, data);
+                }
+                await this.transport.finish(this.response);
+            },
+            () => {
+                if (this.terminal !== 'open') {
+                    // Peer aborted while finishing — callback still runs; no finish event.
+                    callback?.();
+                    return;
+                }
+                this.terminal = 'finished';
+                this.response.finished = true;
+                this.response.writableFinished = true;
+                emitServeFinishedQuietly(this.serveHook, { requestId: this.requestId, timestamp: nodeTs(), success: true });
+                this.response.emit('finish');
+                callback?.();
+            },
+            (err) => {
+                this.fail(err, callback as ((err?: Error | null) => void) | undefined);
+            },
+        );
 
         return this.response;
     }
 
     abort(err: unknown): void {
-        this.enqueue(async () => {
-            const error = this.transport.normalizeError?.(err) ?? (err instanceof Error ? err : new Error(String(err)));
-            this.abortTransportQuietly(error);
-            this.fail(error);
-        }).catch((error) => this.fail(error));
+        const error = this.normalize(err);
+        if (this.terminal !== 'open') return;
+        // Peer already gone — tear down now; no bytes left to flush.
+        if (isTransportDisconnectError(error)) {
+            this.enterAborted(error);
+            return;
+        }
+        // App/protocol fault: finish in-flight writes (e.g. writeHead) first so
+        // partial headers reach the client, then destroy the transport.
+        this.enqueue(
+            async () => {
+                if (this.terminal !== 'open') return;
+                this.enterFailed(error);
+            },
+            undefined,
+            (queueErr) => {
+                if (this.terminal !== 'open') return;
+                this.enterFailed(this.normalize(queueErr));
+            },
+        );
     }
 }

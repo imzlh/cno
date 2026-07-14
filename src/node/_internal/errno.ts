@@ -9,90 +9,28 @@
 
 const error = import.meta.use('error');
 
-// errno value -> Node.js error code string mapping
-// Only includes constants actually defined in CModuleError.errno
-const errnoToString: Record<number, string> = {
-    [error.errno.EACCES]:       'EACCES',
-    [error.errno.EADDRINUSE]:   'EADDRINUSE',
-    [error.errno.EADDRNOTAVAIL]:'EADDRNOTAVAIL',
-    [error.errno.EAFNOSUPPORT]: 'EAFNOSUPPORT',
-    [error.errno.EAGAIN]:       'EAGAIN',
-    [error.errno.EALREADY]:     'EALREADY',
-    [error.errno.EBADF]:        'EBADF',
-    [error.errno.EBUSY]:        'EBUSY',
-    [error.errno.ECANCELED]:    'ECANCELED',
-    [error.errno.ECONNABORTED]: 'ECONNABORTED',
-    [error.errno.ECONNREFUSED]: 'ECONNREFUSED',
-    [error.errno.ECONNRESET]:   'ECONNRESET',
-    [error.errno.EDESTADDRREQ]: 'EDESTADDRREQ',
-    [error.errno.EEXIST]:       'EEXIST',
-    [error.errno.EFAULT]:       'EFAULT',
-    [error.errno.EFBIG]:        'EFBIG',
-    [error.errno.EHOSTDOWN]:    'EHOSTDOWN',
-    [error.errno.EHOSTUNREACH]: 'EHOSTUNREACH',
-    [error.errno.EILSEQ]:       'EILSEQ',
-    [error.errno.EINTR]:        'EINTR',
-    [error.errno.EINVAL]:       'EINVAL',
-    [error.errno.EIO]:          'EIO',
-    [error.errno.EISCONN]:      'EISCONN',
-    [error.errno.EISDIR]:       'EISDIR',
-    [error.errno.ELOOP]:        'ELOOP',
-    [error.errno.EMFILE]:       'EMFILE',
-    [error.errno.EMSGSIZE]:     'EMSGSIZE',
-    [error.errno.ENAMETOOLONG]: 'ENAMETOOLONG',
-    [error.errno.ENETDOWN]:     'ENETDOWN',
-    [error.errno.ENETRESET]:    'ENETRESET',
-    [error.errno.ENETUNREACH]:  'ENETUNREACH',
-    [error.errno.ENFILE]:       'ENFILE',
-    [error.errno.ENOBUFS]:      'ENOBUFS',
-    [error.errno.ENODEV]:       'ENODEV',
-    [error.errno.ENOENT]:       'ENOENT',
-    [error.errno.ENOKEY]:       'ENOKEY',
-    [error.errno.ENOMEM]:       'ENOMEM',
-    [error.errno.ENOPROTOOPT]:  'ENOPROTOOPT',
-    [error.errno.ENOSPC]:       'ENOSPC',
-    [error.errno.ENOSYS]:       'ENOSYS',
-    [error.errno.ENOTCONN]:     'ENOTCONN',
-    [error.errno.ENOTDIR]:      'ENOTDIR',
-    [error.errno.ENOTEMPTY]:    'ENOTEMPTY',
-    [error.errno.ENOTSOCK]:     'ENOTSOCK',
-    [error.errno.ENOTSUP]:      'ENOTSUP',
-    // EOPNOTSUPP === ENOTSUP (-4051), already mapped above
-    [error.errno.EPROTO]:       'EPROTO',
-    [error.errno.EPROTONOSUPPORT]: 'EPROTONOSUPPORT',
-    [error.errno.EPROTOTYPE]:   'EPROTOTYPE',
-    [error.errno.ERANGE]:       'ERANGE',
-    [error.errno.EREMOTEIO]:    'EREMOTEIO',
-    [error.errno.EROFS]:        'EROFS',
-    [error.errno.ESHUTDOWN]:    'ESHUTDOWN',
-    [error.errno.ESPIPE]:       'ESPIPE',
-    [error.errno.ETIMEDOUT]:    'ETIMEDOUT',
-    [error.errno.ETXTBSY]:      'ETXTBSY',
-    [error.errno.EXDEV]:        'EXDEV',
-    [error.errno.EKEYEXPIRED]:  'EKEYEXPIRED',
-    [error.errno.EKEYREVOKED]:  'EKEYREVOKED',
-    [error.errno.EKEYREJECTED]: 'EKEYREJECTED',
-    [error.errno.EOWNERDEAD]:   'EOWNERDEAD',
-    [error.errno.ENOTRECOVERABLE]: 'ENOTRECOVERABLE',
-    [error.errno.ERFKILL]:      'ERFKILL',
-    [error.errno.EHWPOISON]:    'EHWPOISON',
-    [error.errno.EBADMSG]:      'EBADMSG',
-    [error.errno.EIDRM]:        'EIDRM',
-    [error.errno.EMULTIHOP]:    'EMULTIHOP',
-    [error.errno.ENODATA]:      'ENODATA',
-    [error.errno.ENOLINK]:      'ENOLINK',
-    [error.errno.ENOMSG]:       'ENOMSG',
-    [error.errno.ENOSR]:        'ENOSR',
-    [error.errno.ENOSTR]:       'ENOSTR',
-    [error.errno.EOF]:          'EOF',
-    [error.errno.EOVERFLOW]:    'EOVERFLOW',
-    [error.errno.E2BIG]:        'E2BIG',
-};
-
+// Built from runtime UV table — never hand-maintain (platform-local values drift).
+const errnoToString: Record<number, string> = {};
 const stringToErrno: Record<string, number> = {};
-for (const [errnoValue, code] of Object.entries(errnoToString)) {
-    stringToErrno[code] = Number(errnoValue);
+for (const name of Object.keys(error.errno) as Array<keyof typeof error.errno>) {
+    const v = error.errno[name];
+    if (typeof v !== 'number' || name === 'OK') continue;
+    // First name wins if two labels share a value (e.g. EOPNOTSUPP === ENOTSUP).
+    if (errnoToString[v] === undefined) errnoToString[v] = name;
+    stringToErrno[name] = v;
 }
+
+/** Peer/socket gone — normal for HTTP when the client aborts mid-response. */
+const DISCONNECT_CODES = new Set([
+    'EPIPE',
+    'ECONNRESET',
+    'ECONNABORTED',
+    'EBADF',
+    'ECANCELED',
+    'ESHUTDOWN',
+    'ENOTCONN',
+    'EOF',
+]);
 
 type NodeErrnoError = NodeJS.ErrnoException & { dest?: string };
 
@@ -133,8 +71,8 @@ export function toErrnoException(
         return err;
     }
 
-    const errnoValue = rawCode; // negative value, e.g. -4061
-    const codeStr = errnoToString[errnoValue] ?? `UNKNOWN(${errnoValue})`;
+    const errnoValue = rawCode;
+    const codeStr = errnoToString[errnoValue] ?? 'UNKNOWN';
     const message = e.message || error.strerror(errnoValue) || 'Unknown error';
 
     const err: NodeErrnoError = new Error(message);
@@ -174,7 +112,7 @@ export function normalizeErrnoError(
 }
 
 /**
- * Match both raw numeric circu errno values and Node-style string codes.
+ * Match raw UV errno numbers and Node string codes only — never message text.
  */
 export function matchesErrnoCode(
     e: unknown,
@@ -183,13 +121,27 @@ export function matchesErrnoCode(
     if (!(e instanceof Error)) return false;
 
     const code = Reflect.get(e, 'code');
-    if (typeof code === 'string' && codes.includes(code)) return true;
+    if (typeof code === 'string') return codes.includes(code);
     if (typeof code === 'number') {
         return codes.some((name) => stringToErrno[name] === code);
     }
+    return false;
+}
 
-    const message = String(e.message ?? '');
-    return codes.some((name) => message.startsWith(`${name}:`) || message.includes(`${name}: `));
+/**
+ * Peer/socket gone. Structured `.code` only (UV number or Node string).
+ * Synthetic adapter errors must set code (e.g. ECONNRESET), not rely on message.
+ */
+export function isTransportDisconnectError(e: unknown): boolean {
+    if (!(e instanceof Error)) return false;
+
+    const code = Reflect.get(e, 'code');
+    if (typeof code === 'string') return DISCONNECT_CODES.has(code);
+    if (typeof code === 'number') {
+        const name = errnoToString[code];
+        return !!name && DISCONNECT_CODES.has(name);
+    }
+    return false;
 }
 
 /**

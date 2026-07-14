@@ -49,6 +49,7 @@ export function wrapFSErr(e: unknown): unknown {
         case error.errno.ENOSYS: return new errors.NotSupported(e.message);
         // ── Pipes / streams ──────────────────────────────────────────────────
         case error.errno.EPIPE: return new errors.BrokenPipe(e.message);
+        case error.errno.EOF: return new errors.UnexpectedEof(e.message);
         // ── Network: connection ──────────────────────────────────────────────
         case error.errno.ECONNRESET: return new errors.ConnectionReset(e.message);
         case error.errno.ECONNABORTED: return new errors.ConnectionAborted(e.message);
@@ -57,6 +58,8 @@ export function wrapFSErr(e: unknown): unknown {
         case error.errno.ESHUTDOWN: return new errors.NotConnected(e.message);
         case error.errno.EISCONN: return new errors.InvalidData(e.message);
         case error.errno.ETIMEDOUT: return new errors.TimedOut(e.message);
+        // Pending UV ops cancelled when the peer/local side closes the handle.
+        case error.errno.ECANCELED: return new errors.Interrupted(e.message);
         // ── Network: addresses ───────────────────────────────────────────────
         case error.errno.EADDRINUSE: return new errors.AddrInUse(e.message);
         case error.errno.EADDRNOTAVAIL: return new errors.AddrNotAvailable(e.message);

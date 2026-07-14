@@ -4,10 +4,11 @@
  */
 
 import { Server, createServer, type HttpRequest, type HttpResponse } from '@cnojs/http/server';
+import { TcpSocket } from '@cnojs/http/socket';
 import { assert } from '../utils/assert';
 import { createWebSocketFromConnection } from "../webapi/websocket";
 import { getResponseInitiatorCallFrames, setResponseInitiatorCallFrames } from '../webapi/fetch';
-import { wrapFsClassDec as wrap, wrapFSns } from "../utils/wrap";
+import { wrapFsClassDec as wrap, wrapFSErr, wrapFSns } from "../utils/wrap";
 import { errors } from './01_errors';
 import { getServeHook, captureUserNetworkCallFrames, type NetworkCallFrame } from '../utils/network-hooks';
 import { getTierLimits } from '../utils/memory-tier';
@@ -31,7 +32,31 @@ interface WebSocketResponse extends Response {
     [kWebSocket]?: (conn: ISocket) => void;
 }
 
-class ServeResponseWriteError extends Error { }
+/** Non-disconnect write fault after headers/body started — outer loop must not run onError/500. */
+class ServeResponseWriteError extends Error {
+    override cause?: unknown;
+    constructor(message: string, cause?: unknown) {
+        super(message);
+        this.cause = cause;
+    }
+}
+
+function isDenoTransportGone(err: unknown): boolean {
+    return err instanceof errors.ConnectionReset
+        || err instanceof errors.BrokenPipe
+        || err instanceof errors.UnexpectedEof
+        || err instanceof errors.NotConnected
+        || err instanceof errors.ConnectionAborted
+        || err instanceof errors.BadResource
+        || err instanceof errors.Interrupted;
+}
+
+function isServePeerDisconnect(err: unknown): boolean {
+    // Prefer structured UV/Node codes before wrap remapping (ECANCELED etc.).
+    if (TcpSocket.isDisconnectError(err)) return true;
+    if (isDenoTransportGone(err)) return true;
+    return isDenoTransportGone(wrapFSErr(err));
+}
 
 type IWSMeta = {
     source: 'serve';
@@ -260,13 +285,22 @@ class ResponseAdapter {
                 // the producer keeps downloading after the client has gone away.
                 await cancelReaderQuietly(reader, err);
                 this.coreRes.close();
-                throw new ServeResponseWriteError(message);
+                // Keep structured UV/Deno code for peer-gone; do not strip to message-only.
+                if (isServePeerDisconnect(err)) throw err;
+                throw new ServeResponseWriteError(message, err);
             } finally {
                 reader.releaseLock();
             }
         }
 
-        await this.coreRes.end();
+        try {
+            await this.coreRes.end();
+        } catch (err) {
+            this.emitFinished(false, errorMessage(err));
+            this.coreRes.close();
+            if (isServePeerDisconnect(err)) throw err;
+            throw new ServeResponseWriteError(errorMessage(err), err);
+        }
         this.emitFinished(true);
     }
 
@@ -470,7 +504,9 @@ function serve(
             } catch (error) {
                 if (error instanceof ServeResponseWriteError) {
                     // The adapter already reported loadingFailed and closed the connection.
-                } else if (!(error instanceof errors.ConnectionReset)) {
+                } else if (isServePeerDisconnect(error)) {
+                    // Peer left mid-response. Adapter already closed + onFinished; never onError/500.
+                } else {
                     // Give user code the same error-recovery hook Deno.serve exposes.
                     try {
                         if (serveHook && requestId && !requestReported) {
@@ -502,10 +538,6 @@ function serve(
                     } catch {
                         // Keep the connection failure isolated from the accept loop.
                     }
-                } else if (serveHook && requestId) {
-                    emitServeHookQuietly(() => {
-                        serveHook.onFinished?.({ requestId, success: false, errorText: errorMessage(error), timestamp: serveTs() });
-                    });
                 }
             }
         },

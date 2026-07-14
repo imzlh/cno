@@ -4,6 +4,7 @@ import { wrapFSErr } from "../utils/wrap";
 
 const process = import.meta.use('process');
 const os = import.meta.use('os');
+const error = import.meta.use('error');
 
 function pipeToReadable(pipe: CModuleStreams.Pipe): ReadableStream<Uint8Array> {
     return new ReadableStream({
@@ -27,7 +28,7 @@ function pipeToWritable(pipe: CModuleStreams.Pipe): WritableStream<Uint8Array> {
     return new WritableStream({
         write: async (data) => {
             const n = await pipe.write(data);
-            if (n === null) throw new Error('EOF');
+            if (n === null) throw error.Error(error.errno.EOF);
         }
     });
 }

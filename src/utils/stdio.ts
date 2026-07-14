@@ -15,6 +15,7 @@ const os = import.meta.use('os');
 const pipe = import.meta.use('streams');
 const asyncfs = import.meta.use('asyncfs');
 const sfs = import.meta.use('fs');
+const error = import.meta.use('error');
 
 type AnyStream = CModuleStreams.Pipe | CModuleStreams.TTY | FileStdio | NullStdio;
 
@@ -308,7 +309,7 @@ export class Stream {
             write: async (chunk, control) => {
                 try {
                     lock(this.fd);
-                    if (!await this.write(chunk)) control.error(new Error('EOF'));
+                    if (!await this.write(chunk)) control.error(error.Error(error.errno.EOF));
                 } catch (e) {
                     control.error(e);
                 } finally {

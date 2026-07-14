@@ -318,7 +318,6 @@ function scheduleNextTickDrain(): void {
 
 type ProcessWarningOptions = string | { type?: string; code?: string; detail?: string };
 type ProcessWarning = Error & { code?: string; detail?: string };
-type MutableErrnoError = Error & { code?: string; errno?: number };
 
 function normalizeExitCodeValue(value: unknown): number | undefined {
     if (value === undefined) return undefined;
@@ -955,12 +954,7 @@ export function kill(pid: number, signal?: string | number): boolean {
     try {
         proc.kill(pid, normalizeSignal(signal));
     } catch (e) {
-        const err: MutableErrnoError = normalizeErrnoError(e, 'kill');
-        if (err.code === 'UNKNOWN(-3)') {
-            err.code = 'ESRCH';
-            err.errno = -4043;
-        }
-        throw err;
+        throw normalizeErrnoError(e, 'kill');
     }
     return true;
 }

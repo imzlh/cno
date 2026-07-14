@@ -2,6 +2,7 @@ import type { NetworkCallFrame, ServeHook } from '../../utils/network-hooks';
 import type { OutgoingHttpHeaders } from '../http/types';
 
 import { nodeTs } from './network-debug';
+import { isTransportDisconnectError } from './errno';
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 type HeaderInput = OutgoingHttpHeaders | readonly string[];
@@ -13,6 +14,9 @@ export interface RuntimeAdapter<TResponse> {
     write: TResponse['write'];
     end: TResponse['end'];
     abort?(err: unknown): void;
+    readonly isAborted?: boolean;
+    readonly isFinished?: boolean;
+    readonly lastError?: Error | null;
 }
 
 interface RuntimeResponse {
@@ -50,27 +54,58 @@ export interface RunServerRequestContext<TIncoming, TResponse extends RuntimeRes
 export interface DispatchServerRequestContext<TIncoming, TResponse extends RuntimeResponse>
     extends Omit<RunServerRequestContext<TIncoming, TResponse>, 'request'>, RuntimeRequestMeta {}
 
-function observeServerResponse(response: RuntimeResponse): { observed: Promise<void>; getError: () => unknown } {
+/**
+ * Watch response terminal events. Disconnect is a normal end-of-stream, not a
+ * request failure — settle the waiter without rejecting.
+ */
+function observeServerResponse(response: RuntimeResponse): {
+    observed: Promise<void>;
+    getError: () => unknown;
+    wasDisconnect: () => boolean;
+} {
     let responseDoneError: unknown;
+    let disconnect = false;
+    let settled = false;
     const responseDone = new Promise<void>((resolve, reject) => {
         const cleanup = () => {
             response.off('finish', onFinish);
             response.off('error', onError);
+            response.off('close', onClose);
         };
-        const onFinish = () => {
+        const settleOk = (asDisconnect: boolean) => {
+            if (settled) return;
+            settled = true;
+            if (asDisconnect) disconnect = true;
             cleanup();
             resolve();
         };
+        const settleErr = (err: unknown) => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            reject(err);
+        };
+        const onFinish = () => settleOk(false);
         const onError = (err: unknown) => {
             const code = typeof err === 'object' && err !== null && 'code' in err ? err.code : undefined;
             if (code === 'ERR_STREAM_WRITE_AFTER_END' && response.writableEnded) {
                 return;
             }
-            cleanup();
-            reject(err);
+            // Disconnect may arrive as 'error' after 'close' or alone — never fail the request.
+            if (isTransportDisconnectError(err)) {
+                settleOk(true);
+                return;
+            }
+            settleErr(err);
+        };
+        // Peer close without finish (client abort mid-body). Real faults emit error first.
+        const onClose = () => {
+            if (response.writableFinished) return;
+            settleOk(true);
         };
         response.on('finish', onFinish);
         response.on('error', onError);
+        response.on('close', onClose);
     });
     const observed = responseDone.catch((err) => {
         responseDoneError = err;
@@ -78,6 +113,7 @@ function observeServerResponse(response: RuntimeResponse): { observed: Promise<v
     return {
         observed,
         getError: () => responseDoneError,
+        wasDisconnect: () => disconnect,
     };
 }
 
@@ -135,17 +171,34 @@ export async function runServerRequest<TIncoming, TResponse extends RuntimeRespo
 
     try {
         await ctx.listener(ctx.incoming, ctx.response);
+        if (ctx.adapter.isAborted || responseDone.wasDisconnect()) {
+            // Client left; request completed from the server's point of view.
+            return;
+        }
         if (!ctx.response.writableFinished) {
             await responseDone.observed;
+            if (ctx.adapter.isAborted || responseDone.wasDisconnect()) return;
             const err = responseDone.getError();
-            if (err !== undefined) throw err;
+            if (err !== undefined) {
+                if (isTransportDisconnectError(err)) return;
+                throw err;
+            }
         }
     } catch (err) {
-        emitServeFailure(ctx.serveHook, ctx.request, err);
+        // Listener threw, or a non-disconnect response fault.
+        if (isTransportDisconnectError(err) || ctx.adapter.isAborted) {
+            abortAdapterQuietly(ctx.adapter, err);
+            return;
+        }
         if (!ctx.response.headersSent) {
+            // No response terminal yet — report failure here, then try a 500.
+            emitServeFailure(ctx.serveHook, ctx.request, err);
             writeInternalServerErrorQuietly(ctx.response);
         } else if (!ctx.response.writableFinished) {
+            // abort → enterFailed owns the single onFinished for this request.
             abortAdapterQuietly(ctx.adapter, err);
+        } else {
+            emitServeFailure(ctx.serveHook, ctx.request, err);
         }
         ctx.onError(err);
     }

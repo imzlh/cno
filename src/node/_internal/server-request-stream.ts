@@ -1,3 +1,5 @@
+import { isTransportDisconnectError } from './errno';
+
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
 export interface IncomingRequestStreamTarget {
@@ -18,8 +20,20 @@ export function completeIncomingRequest(target: IncomingRequestStreamTarget): vo
     target.push(null);
 }
 
+/**
+ * Peer left mid-body: mark aborted and end the readable without destroy(err).
+ * destroy(err) would emit 'error'; with no listener that becomes an unhandled
+ * rejection — disconnect is normal end-of-stream, not a request fault.
+ */
 export function failIncomingRequest(target: IncomingRequestStreamTarget, err: unknown): void {
     target.aborted = true;
+    if (isTransportDisconnectError(err)) {
+        if (!target.complete) {
+            try { completeIncomingRequest(target); } catch { /* already ended */ }
+        }
+        try { target.destroy(); } catch { /* already destroyed */ }
+        return;
+    }
     target.destroy(err instanceof Error ? err : new Error(String(err)));
 }
 

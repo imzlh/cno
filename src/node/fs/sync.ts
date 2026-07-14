@@ -10,8 +10,8 @@ import path from '../path';
 const { dirname, join } = path;
 const { readBufSize: READ_BUF_SIZE } = getTierLimits();
 
-const os = import.meta.use('os');
 const fs = import.meta.use('fs');
+const asfs = import.meta.use('asyncfs');
 const engine = import.meta.use('engine');
 
 // File read/write
@@ -42,8 +42,8 @@ export function writeFileSync(path: PathLike | number, data: string | Uint8Array
     const encoding = typeof options === 'string' ? options : typeof options === 'object' ? options?.encoding : undefined;
     const buffer = toUint8Array(data, encoding);
     if ('fd' in target) {
+        // Node: write from current offset; do not ftruncate(0) the fd.
         wrapSync(() => {
-            fs.ftruncate(target.fd, 0);
             fs.write(target.fd, buffer);
         }, 'writeFileSync', describeFd(target.fd));
         return;
@@ -125,8 +125,8 @@ export function mkdirSync(path: PathLike, options?: { mode?: number; recursive?:
     const recursive = typeof options === 'object' ? options?.recursive : false;
 
     if (recursive) {
-        mkdirRecursiveSync(pathStr, mode);
-        return pathStr;
+        // Node returns the first created directory, or undefined if all existed.
+        return wrapSync(() => mkdirRecursiveSync(pathStr, mode), 'mkdirSync', pathStr);
     }
 
     wrapSync(() => fs.mkdir(pathStr, mode), 'mkdirSync', pathStr);
@@ -149,7 +149,8 @@ export function rmSync(path: PathLike, options?: { force?: boolean; recursive?: 
     try {
         const stats = wrapSync(() => fs.lstat(pathStr), 'rmSync', pathStr);
 
-        if (stats.isDirectory) {
+        // Symlink-to-dir is not a directory for rm — always unlink the link.
+        if (stats.isDirectory && !stats.isSymbolicLink) {
             if (options?.recursive) {
                 removeRecursiveSync(pathStr);
             } else {
@@ -172,12 +173,11 @@ export function readdirSync(path: PathLike, options?: { encoding?: BufferEncodin
     const entries = wrapSync(() => readDirEntriesSync(pathStr, recursive), 'readdirSync', pathStr);
 
     if (withFileTypes) {
-        return entries.map(entry => {
-            return toNodeDirent(entry.name, entry);
-        });
+        return entries.map(entry => toNodeDirent(entry.name, entry, entry.parentPath));
     }
 
-    return entries.map(entry => encodePathResult(entry.name, options));
+    // recursive string names are root-relative paths (e.g. "sub/f").
+    return entries.map(entry => encodePathResult(entry.relativePath, options));
 }
 
 export function opendirSync(path: PathLike, options?: { encoding?: BufferEncoding; bufferSize?: number }): import('fs').Dir {
@@ -236,18 +236,17 @@ export function readlinkSync(path: PathLike, options?: { encoding?: BufferEncodi
     return result;
 }
 
-export function realpathSync(_path: PathLike, options?: { encoding?: BufferEncoding | 'buffer' } | BufferEncoding): string {
-    const pathStr = pathToString(_path);
-    if (path.isAbsolute(pathStr)) {
-        return path.normalize(pathStr);
-    } else {
-        return path.join(os.cwd, pathStr);
-    }
+export function realpathSync(pathLike: PathLike, options?: { encoding?: BufferEncoding | 'buffer' } | BufferEncoding): string | Buffer {
+    const pathStr = pathToString(pathLike);
+    // Resolve symlinks (was normalize-only — diverged from Node for links).
+    const resolved = wrapSync(() => fs.realpath(pathStr), 'realpathSync', pathStr);
+    return encodePathResult(resolved, options);
 }
 
-Reflect.set(realpathSync, 'native', function (path: PathLike, options?: { encoding?: BufferEncoding | 'buffer' } | BufferEncoding) {
-    const pathStr = pathToString(path);
-    return wrapSync(() => fs.realpath(pathStr), 'realpathSync', pathStr);
+Reflect.set(realpathSync, 'native', function (pathLike: PathLike, options?: { encoding?: BufferEncoding | 'buffer' } | BufferEncoding) {
+    const pathStr = pathToString(pathLike);
+    const resolved = wrapSync(() => fs.realpath(pathStr), 'realpathSync', pathStr);
+    return encodePathResult(resolved, options);
 });
 
 // Permission operations
@@ -262,9 +261,20 @@ export function fchmodSync(fd: number, mode: Mode): void {
 }
 
 export function lchmodSync(path: PathLike, mode: Mode): void {
-    // lchmod is macOS-only; best-effort via chmod
+    // No O_NOFOLLOW open on all hosts — open via lstat guard then fchmod.
     const pathStr = pathToString(path);
-    wrapSync(() => fs.chmod(pathStr, modeToNumber(mode)), 'lchmodSync', pathStr);
+    wrapSync(() => {
+        const st = fs.lstat(pathStr);
+        if (st.isSymbolicLink) {
+            // Linux lchmod is unsupported; Node throws ENOSYS — match when link.
+            const err = new Error(`ENOSYS: function not implemented, lchmod '${pathStr}'`) as NodeJS.ErrnoException;
+            err.code = 'ENOSYS';
+            err.syscall = 'lchmod';
+            err.path = pathStr;
+            throw err;
+        }
+        fs.chmod(pathStr, modeToNumber(mode));
+    }, 'lchmodSync', pathStr);
 }
 
 export function chownSync(path: PathLike, uid: number, gid: number): void {
@@ -277,9 +287,9 @@ export function fchownSync(fd: number, uid: number, gid: number): void {
 }
 
 export function lchownSync(path: PathLike, uid: number, gid: number): void {
-    // C layer doesn't have sync lchown; best-effort via chown (follows symlink)
+    // Sync C layer has no lchown; bridge asyncfs via waitIO.
     const pathStr = pathToString(path);
-    wrapSync(() => fs.chown(pathStr, uid, gid), 'lchownSync', pathStr);
+    wrapSync(() => engine.waitIO(asfs.lchown(pathStr, uid, gid)), 'lchownSync', pathStr);
 }
 
 // Time operations
@@ -290,9 +300,13 @@ export function utimesSync(path: PathLike, atime: TimeLike, mtime: TimeLike): vo
 }
 
 export function lutimesSync(path: PathLike, atime: TimeLike, mtime: TimeLike): void {
-    // C layer doesn't have sync lutimes; best-effort via utimes (follows symlink)
+    // Sync C layer has no lutimes; bridge asyncfs via waitIO.
     const pathStr = pathToString(path);
-    wrapSync(() => fs.utimes(pathStr, timeToNumber(atime) / 1000, timeToNumber(mtime) / 1000), 'lutimesSync', pathStr);
+    wrapSync(
+        () => engine.waitIO(asfs.lutime(pathStr, timeToNumber(atime), timeToNumber(mtime))),
+        'lutimesSync',
+        pathStr,
+    );
 }
 
 export function futimesSync(fd: number, atime: TimeLike, mtime: TimeLike): void {

@@ -244,22 +244,158 @@ function formatImpl(pathObject: FormatInputPathObject, sep: '/' | '\\'): string 
     return `${dir}${sep}${base}`;
 }
 
-function resolveImpl(paths: string[], windows: boolean): string {
-    const sep = windows ? '\\' : '/';
-    const cwd = normalizeSlashes(getCwd(), windows);
-    const parts = paths.length > 0 ? [...paths] : [''];
-    parts.unshift(cwd);
+function isWinDeviceRoot(ch: string): boolean {
+    const c = ch.charCodeAt(0);
+    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+}
 
-    let resolved = '';
-    for (let i = parts.length - 1; i >= 0; i--) {
-        const part = assertString(parts[i] ?? '', i === 0 ? 'path' : `paths[${i - 1}]`);
-        if (!part) continue;
-        const normalized = normalizeSlashes(part, windows);
-        resolved = resolved ? `${normalized}${sep}${resolved}` : normalized;
-        if (splitRoot(normalized, windows).absolute) break;
+function win32DriveCwd(device: string): string {
+    // Node: process.env['=C:'] is the per-drive cwd; else process.cwd().
+    const proc = Reflect.get(globalThis, 'process');
+    const env = (proc && typeof proc === 'object') ? Reflect.get(proc, 'env') : undefined;
+    let path: string | undefined;
+    if (env && typeof env === 'object') {
+        const fromEnv = Reflect.get(env, `=${device}`);
+        if (typeof fromEnv === 'string' && fromEnv.length > 0) path = fromEnv;
+    }
+    if (path === undefined) path = getCwd();
+    // If cwd is not on this drive (and looks like `X:\...`), use drive root.
+    if (
+        path.length >= 3
+        && path.slice(0, 2).toLowerCase() !== device.toLowerCase()
+        && (path.charAt(2) === '\\' || path.charAt(2) === '/')
+    ) {
+        return `${device}\\`;
+    }
+    return path;
+}
+
+/** Parse one win32 path segment the way Node's path.win32.resolve does. */
+function parseWin32ResolvePart(path: string): { device: string; isAbsolute: boolean; tail: string } {
+    const normalized = normalizeSlashes(path, true);
+    const len = normalized.length;
+    let rootEnd = 0;
+    let device = '';
+    let isAbsolute = false;
+    if (len === 0) return { device, isAbsolute, tail: '' };
+
+    const code0 = normalized.charAt(0);
+    if (len === 1) {
+        if (code0 === '\\') {
+            rootEnd = 1;
+            isAbsolute = true;
+        }
+    } else if (code0 === '\\') {
+        isAbsolute = true;
+        if (normalized.charAt(1) === '\\') {
+            // UNC or device namespace
+            let j = 2;
+            while (j < len && normalized.charAt(j) !== '\\') j++;
+            if (j < len && j !== 2) {
+                const firstPart = normalized.slice(2, j);
+                let last = j;
+                while (j < len && normalized.charAt(j) === '\\') j++;
+                if (j < len && j !== last) {
+                    last = j;
+                    while (j < len && normalized.charAt(j) !== '\\') j++;
+                    if (j === len || j !== last) {
+                        if (firstPart !== '.' && firstPart !== '?') {
+                            device = `\\\\${firstPart}\\${normalized.slice(last, j)}`;
+                            rootEnd = j;
+                        } else {
+                            device = `\\\\${firstPart}`;
+                            rootEnd = 4;
+                        }
+                    }
+                }
+            }
+        } else {
+            rootEnd = 1;
+        }
+    } else if (isWinDeviceRoot(code0) && normalized.charAt(1) === ':') {
+        device = normalized.slice(0, 2);
+        rootEnd = 2;
+        if (len > 2 && normalized.charAt(2) === '\\') {
+            isAbsolute = true;
+            rootEnd = 3;
+        }
     }
 
-    return normalizeImpl(resolved, windows);
+    return { device, isAbsolute, tail: normalized.slice(rootEnd) };
+}
+
+function resolveImpl(paths: string[], windows: boolean): string {
+    if (!windows) {
+        const sep = '/';
+        const cwd = normalizeSlashes(getCwd(), false);
+        const parts = paths.length > 0 ? [...paths] : [''];
+        parts.unshift(cwd);
+
+        let resolved = '';
+        for (let i = parts.length - 1; i >= 0; i--) {
+            const part = assertString(parts[i] ?? '', i === 0 ? 'path' : `paths[${i - 1}]`);
+            if (!part) continue;
+            const normalized = normalizeSlashes(part, false);
+            resolved = resolved ? `${normalized}${sep}${resolved}` : normalized;
+            if (splitRoot(normalized, false).absolute) break;
+        }
+        return normalizeImpl(resolved, false);
+    }
+
+    // Node path.win32.resolve — right-to-left device + absolute tail.
+    let resolvedDevice = '';
+    let resolvedTail = '';
+    let resolvedAbsolute = false;
+
+    for (let i = paths.length - 1; i >= -1; i--) {
+        let path: string;
+        if (i >= 0) {
+            path = assertString(paths[i] ?? '', `paths[${i}]`);
+            if (!path) continue;
+        } else if (!resolvedDevice) {
+            path = getCwd();
+        } else {
+            path = win32DriveCwd(resolvedDevice);
+        }
+
+        const { device, isAbsolute, tail } = parseWin32ResolvePart(path);
+
+        if (device) {
+            if (resolvedDevice) {
+                if (device.toLowerCase() !== resolvedDevice.toLowerCase()) continue;
+            } else {
+                resolvedDevice = device;
+            }
+        }
+
+        if (resolvedAbsolute) {
+            if (resolvedDevice) break;
+        } else {
+            resolvedTail = resolvedTail ? `${tail}\\${resolvedTail}` : tail;
+            resolvedAbsolute = isAbsolute;
+            if (isAbsolute && resolvedDevice) break;
+        }
+    }
+
+    // Normalize only the tail segments (never run full path normalize — a
+    // leading `\\` would be misread as UNC).
+    const segments: string[] = [];
+    for (const segment of splitSegments(resolvedTail, true)) {
+        if (!segment || segment === '.') continue;
+        if (segment === '..') {
+            if (segments.length > 0 && segments.at(-1) !== '..') {
+                segments.pop();
+                continue;
+            }
+            if (!resolvedAbsolute) segments.push('..');
+            continue;
+        }
+        segments.push(segment);
+    }
+    const normalizedTail = segments.join('\\');
+
+    if (resolvedAbsolute) return `${resolvedDevice}\\${normalizedTail}`;
+    return `${resolvedDevice}${normalizedTail}` || '.';
 }
 
 function relativeImpl(from: string, to: string, windows: boolean): string {

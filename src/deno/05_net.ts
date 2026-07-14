@@ -9,6 +9,7 @@ const dns = import.meta.use('dns');
 const udp = import.meta.use('udp');
 const windows = import.meta.use('win32');
 const timers = import.meta.use('timers');
+const error = import.meta.use('error');
 
 import { dnsCache } from '@cnojs/http/dns-cache';
 
@@ -351,7 +352,7 @@ class TlsConn implements Deno.TlsConn {
         if (data === null) {
             this.$eof = true;
             this.pauseEncryptedRead();
-            if (!this.$handshakeDone) this.$handshakeReject(new Error('TLS failed to handshake: EOF'));
+            if (!this.$handshakeDone) this.$handshakeReject(error.Error(error.errno.EOF));
             this.wakeWaiters();
             if (this.$closing) this.finishClose();
             return;

@@ -24,10 +24,15 @@ export const constants = {
     O_SYMLINK: isDarwin ? 0x200000 : undefined,
     UV_FS_O_FILEMAP: isWindows ? 0x20000000 : 0,
 
-    // File types
-    S_IFMT: fs.S_IFMT,
-    S_IFREG: fs.S_IFREG,
-    S_IFDIR: fs.S_IFDIR,
+    // File types (POSIX values; host may only export a subset on CModuleFS)
+    S_IFMT: fs.S_IFMT ?? 0o170000,
+    S_IFREG: fs.S_IFREG ?? 0o100000,
+    S_IFDIR: fs.S_IFDIR ?? 0o040000,
+    S_IFCHR: 0o020000,
+    S_IFBLK: 0o060000,
+    S_IFIFO: 0o010000,
+    S_IFLNK: 0o120000,
+    S_IFSOCK: 0o140000,
 
     // Permission bits - user
     S_IRWXU: fs.S_IRWXU,
@@ -81,6 +86,11 @@ export const {
     S_IFMT,
     S_IFREG,
     S_IFDIR,
+    S_IFCHR,
+    S_IFBLK,
+    S_IFIFO,
+    S_IFLNK,
+    S_IFSOCK,
     S_IRWXU,
     S_IRUSR,
     S_IWUSR,

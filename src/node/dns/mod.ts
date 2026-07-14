@@ -173,6 +173,12 @@ export function lookup(hostname: string, options?: unknown, callback?: unknown):
     );
 }
 
+// util.promisify(dns.lookup) → { address, family } (not just address string)
+Object.defineProperty(lookup, Symbol.for('nodejs.util.promisify.customArgs'), {
+    value: ['address', 'family'],
+    enumerable: false,
+});
+
 export function lookupSync(hostname: string, options?: LookupOptions | number): string | Array<{ address: string; family: number }> {
     const { family, all } = normalizeLookupOptions(options);
 

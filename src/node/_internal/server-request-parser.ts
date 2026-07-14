@@ -5,8 +5,8 @@ import {
     appendIncomingHeader,
     applyIncomingRequestLine,
     type IncomingMessageImpl,
-    METHODS as HTTP_METHODS,
 } from '../http/server';
+import { LLHTTP_METHODS } from '../http/constants';
 import {
     buildNodeServerUrl,
     captureNodeNetworkCallFrames,
@@ -86,7 +86,7 @@ export function createServerRequestParser(options: ServerRequestParserOptions): 
         const currentIncoming = getIncoming();
         applyIncomingRequestLine(
             currentIncoming,
-            HTTP_METHODS[parser.state.method] || 'GET',
+            LLHTTP_METHODS[parser.state.method] || 'GET',
             currentIncoming.url || '/',
             `${parser.state.httpMajor}.${parser.state.httpMinor}`,
         );

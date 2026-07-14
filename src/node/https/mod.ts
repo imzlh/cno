@@ -30,6 +30,7 @@ import {
     normalizeRequestOptions,
     setRequestTimeout,
     writeRequest,
+    formatClientRequestHeader,
 } from '../_internal/http-client';
 import {
     createServerRequestObjects,
@@ -50,10 +51,15 @@ import {
     nodeTs,
 } from '../_internal/network-debug';
 import { ServerResponseAdapter } from '../_internal/server-response-adapter';
+import { isTransportDisconnectError, normalizeErrnoError } from '../_internal/errno';
 import { dispatchServerRequest } from '../_internal/server-request-runtime';
 import { createServerRequestParser, type ParsedServerRequest } from '../_internal/server-request-parser';
-
-const engine = import.meta.use('engine');
+import {
+    encodeResponseHead,
+    encodeChunkedFrame,
+    encodeChunkedTrailer,
+    shouldCloseAfterResponse,
+} from '@cnojs/http/h1-frame';
 
 function flattenPrototype(target: object): void {
     const parent = Object.getPrototypeOf(target);
@@ -91,12 +97,8 @@ function endTlsSocket(socket: TLSSocket): Promise<void> {
 }
 
 function shouldCloseServerConnection(incoming: IncomingMessageImpl): boolean {
-    const connection = String(incoming.headers['connection'] ?? '').toLowerCase();
-    if (connection.split(',').some((token) => token.trim() === 'close')) return true;
-    if (incoming.httpVersionMajor === 1 && incoming.httpVersionMinor === 0) {
-        return !connection.split(',').some((token) => token.trim() === 'keep-alive');
-    }
-    return false;
+    const ver = `${incoming.httpVersionMajor}.${incoming.httpVersionMinor}`;
+    return shouldCloseAfterResponse(ver, String(incoming.headers['connection'] ?? ''));
 }
 
 class TlsResponseAdapter extends ServerResponseAdapter<ServerResponseImpl> {
@@ -111,6 +113,8 @@ class TlsResponseAdapter extends ServerResponseAdapter<ServerResponseImpl> {
         responseTurn: Promise<void> = Promise.resolve(),
         releaseResponseTurn?: () => void,
     ) {
+        // Turn is released only from finish/abort — never from normalizeError
+        // (normalize runs on every fault and must stay pure).
         let turnReleased = false;
         const releaseTurn = () => {
             if (turnReleased) return;
@@ -121,17 +125,18 @@ class TlsResponseAdapter extends ServerResponseAdapter<ServerResponseImpl> {
             closeSource: socket,
             writeHead: async (res, headers) => {
                 await responseTurn;
-                const lines = [`HTTP/1.1 ${res.statusCode} ${res.statusMessage}`];
-                for (const [key, value] of headers) lines.push(`${key}: ${value}`);
-                lines.push('', '');
-                await writeTlsChunk(socket, engine.encodeString(lines.join('\r\n')));
+                const ver = `${res.req?.httpVersionMajor ?? 1}.${res.req?.httpVersionMinor ?? 1}`;
+                await writeTlsChunk(socket, encodeResponseHead(
+                    ver,
+                    res.statusCode,
+                    res.statusMessage || 'OK',
+                    headers,
+                ));
             },
             writeBody: async (res, data) => {
                 await responseTurn;
                 if (res.chunkedEncoding) {
-                    await writeTlsChunk(socket, engine.encodeString(`${data.byteLength.toString(16)}\r\n`));
-                    await writeTlsChunk(socket, data);
-                    await writeTlsChunk(socket, engine.encodeString('\r\n'));
+                    await writeTlsChunk(socket, encodeChunkedFrame(data));
                     return;
                 }
                 await writeTlsChunk(socket, data);
@@ -140,7 +145,7 @@ class TlsResponseAdapter extends ServerResponseAdapter<ServerResponseImpl> {
                 await responseTurn;
                 try {
                     if (res.chunkedEncoding) {
-                        await writeTlsChunk(socket, engine.encodeString('0\r\n\r\n'));
+                        await writeTlsChunk(socket, encodeChunkedTrailer());
                     }
                     if (closeAfterResponse) {
                         await endTlsSocket(socket);
@@ -149,14 +154,11 @@ class TlsResponseAdapter extends ServerResponseAdapter<ServerResponseImpl> {
                     releaseTurn();
                 }
             },
-            abort: (_res, err) => {
+            abort: () => {
                 releaseTurn();
-                socket.destroy();
+                try { socket.destroy(); } catch { /* already closed */ }
             },
-            normalizeError: (err) => {
-                releaseTurn();
-                return err instanceof Error ? err : new Error(String(err));
-            },
+            normalizeError: (err) => normalizeErrnoError(err),
         }, serveHook, {
             isBodyForbiddenStatus,
             createHeadersSentError,
@@ -165,6 +167,14 @@ class TlsResponseAdapter extends ServerResponseAdapter<ServerResponseImpl> {
 
         if (closeAfterResponse && !response.hasHeader('connection')) {
             response.setHeader('Connection', 'close');
+        } else if (!closeAfterResponse) {
+            if (!response.hasHeader('connection')) {
+                response.setHeader('Connection', 'keep-alive');
+            }
+            // Match node:http Keep-Alive: timeout=<sec> (default 5s).
+            if (!response.hasHeader('keep-alive')) {
+                response.setHeader('Keep-Alive', 'timeout=5');
+            }
         }
     }
 }
@@ -252,6 +262,7 @@ function dispatchHttpsServerRequest(
         responseTurn,
         releaseResponseTurn,
     );
+    // runServerRequest never rejects disconnects; only surface real faults.
     return dispatchServerRequest({
         listener,
         incoming,
@@ -265,8 +276,11 @@ function dispatchHttpsServerRequest(
         headers: meta.requestHeaders,
         postData: meta.postData,
         callFrames: meta.requestCallFrames,
-        onError: (err) => self.emit('error', err),
-    }).catch((err) => self.emit('error', err));
+        onError: (err) => {
+            if (isTransportDisconnectError(err)) return;
+            self.emit('error', err);
+        },
+    });
 }
 
 function handleHttpsServerConnection(self: Server, tlsSocket: TLSSocket): void {
@@ -451,7 +465,12 @@ export class Agent extends HttpAgent {
     }
 }
 
-export const globalAgent = new Agent();
+// Match node:http globalAgent (keepAlive on, 5s free-socket idle).
+export const globalAgent = new Agent({
+    keepAlive: true,
+    scheduling: 'lifo',
+    timeout: 5000,
+});
 
 // HTTPS Client Request
 
@@ -487,6 +506,7 @@ interface HttpsClientRequest extends OutgoingMessageImpl, ClientRequestState<TLS
     _streamErrored: boolean;
     _transport: TLSSocket | null;
     _transportCleanup: (() => void) | null;
+    _userConnectionHeader: boolean;
     _connect(): Promise<void>;
     _implicitHeader(): void;
 }
@@ -499,7 +519,8 @@ interface HttpsClientRequestConstructor {
 
 const HTTPS_CLIENT_HOOKS: ClientHooks<HttpsClientRequest> = {
     defaultPort: 443,
-    defaultUserAgent: 'Node.js/https',
+    // Node https client: Host only by default (no User-Agent).
+    defaultUserAgent: '',
     requestIdPrefix: 'https-fetch',
     waitForSecureConnect: true,
     connect: (request) => connectSecureTransport(request, 443),
@@ -537,7 +558,14 @@ function initHttpsClientRequest(self: HttpsClientRequest, url: string | URL | Re
         }
     }
 
+    self._userConnectionHeader = self.hasHeader('connection');
     applyRequestCommonOptions(self);
+    const agentKeepAlive = !!(
+        self.agent &&
+        typeof self.agent === 'object' &&
+        self.agent.options?.keepAlive
+    );
+    self.shouldKeepAlive = agentKeepAlive;
 }
 
 const HttpsClientRequest: HttpsClientRequestConstructor = function HttpsClientRequest(
@@ -569,7 +597,7 @@ HttpsClientRequest.prototype.onSocket = function onSocket(this: HttpsClientReque
 };
 
 HttpsClientRequest.prototype._implicitHeader = function _implicitHeader(this: HttpsClientRequest): void {
-    this._header = `${this.method} ${this.path} HTTP/1.1\r\n${this._formatHeaders()}\r\n`;
+    this._header = formatClientRequestHeader(this);
 };
 
 HttpsClientRequest.prototype.write = function write(this: HttpsClientRequest, chunk: unknown, encodingOrCb?: BufferEncoding | ((err?: Error) => void), cb?: (err?: Error) => void): boolean {

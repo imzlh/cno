@@ -312,64 +312,109 @@ export function toNodeStatFs(stat: StatFsInput, options?: StatFsOptions): import
     return new StatFs(stat, options?.bigint === true) as import('fs').StatsFs;
 }
 
-// Dirent conversion
+// Dirent conversion — parentPath is the directory containing `name` (Node 20.12+).
+
+/**
+ * Dir walk entry. `name` is the leaf basename (Dirent.name).
+ * `relativePath` is relative to the readdir root (string readdir names).
+ * `parentPath` is the absolute directory containing the leaf.
+ */
+export interface DirEntryWithParent {
+    name: string;
+    relativePath: string;
+    parentPath: string;
+    isFile: boolean;
+    isDirectory: boolean;
+    isSymbolicLink: boolean;
+    isBlockDevice?: boolean;
+    isCharacterDevice?: boolean;
+    isFIFO?: boolean;
+    isSocket?: boolean;
+}
 
 export function toNodeDirent(
     name: string,
-    stat: Pick<CModuleFS.Stats, 'isFile' | 'isDirectory' | 'isSymbolicLink'>
-        | Pick<CModuleFS.DirEnt, 'isFile' | 'isDirectory' | 'isSymbolicLink'>
+    stat: Pick<CModuleFS.Stats, 'isFile' | 'isDirectory' | 'isSymbolicLink' | 'isBlockDevice' | 'isCharacterDevice' | 'isFIFO' | 'isSocket'>
+        | Pick<CModuleFS.DirEnt, 'isFile' | 'isDirectory' | 'isSymbolicLink' | 'isBlockDevice' | 'isCharacterDevice' | 'isFIFO' | 'isSocket'>
+        | DirEntryWithParent,
+    parentPath: string,
 ): import('fs').Dirent {
     return {
         name,
         isFile: () => stat.isFile,
         isDirectory: () => stat.isDirectory,
-        isBlockDevice: () => false,
-        isCharacterDevice: () => false,
+        isBlockDevice: () => !!stat.isBlockDevice,
+        isCharacterDevice: () => !!stat.isCharacterDevice,
         isSymbolicLink: () => stat.isSymbolicLink,
-        isFIFO: () => false,
-        isSocket: () => false,
-        parentPath: dirname(name)
+        isFIFO: () => !!stat.isFIFO,
+        isSocket: () => !!stat.isSocket,
+        parentPath,
     };
 }
 
-export function toNodeDirentAsync(ent: CModuleAsyncFS.DirEnt): import('fs').Dirent {
+export function toNodeDirentAsync(
+    ent: CModuleAsyncFS.DirEnt | DirEntryWithParent,
+    parentPath: string,
+): import('fs').Dirent {
     return {
         name: ent.name,
         isFile: () => ent.isFile,
         isDirectory: () => ent.isDirectory,
-        isBlockDevice: () => ent.isBlockDevice,
-        isCharacterDevice: () => ent.isCharacterDevice,
+        isBlockDevice: () => !!ent.isBlockDevice,
+        isCharacterDevice: () => !!ent.isCharacterDevice,
         isSymbolicLink: () => ent.isSymbolicLink,
-        isFIFO: () => ent.isFIFO,
-        isSocket: () => ent.isSocket,
-        parentPath: dirname(ent.name)
+        isFIFO: () => !!ent.isFIFO,
+        isSocket: () => !!ent.isSocket,
+        parentPath,
     };
 }
 
-export function readDirEntriesSync(pathStr: string, recursive = false, prefix = ''): CModuleFS.DirEnt[] {
-    const entries = fs.readdir(pathStr, true);
-    if (!recursive) return entries;
-
-    const out: CModuleFS.DirEnt[] = [];
+export function readDirEntriesSync(pathStr: string, recursive = false, prefix = ''): DirEntryWithParent[] {
+    const absDir = prefix ? join(pathStr, prefix) : pathStr;
+    const entries = fs.readdir(absDir, true);
+    const out: DirEntryWithParent[] = [];
     for (const entry of entries) {
-        const relName = prefix ? join(prefix, entry.name) : entry.name;
-        out.push(relName === entry.name ? entry : { ...entry, name: relName });
-        if (entry.isDirectory && !entry.isSymbolicLink) {
-            out.push(...readDirEntriesSync(join(pathStr, entry.name), true, relName));
+        const relativePath = prefix ? join(prefix, entry.name) : entry.name;
+        out.push({
+            name: entry.name,
+            relativePath,
+            parentPath: absDir,
+            isFile: entry.isFile,
+            isDirectory: entry.isDirectory,
+            isSymbolicLink: entry.isSymbolicLink,
+            isBlockDevice: entry.isBlockDevice,
+            isCharacterDevice: entry.isCharacterDevice,
+            isFIFO: entry.isFIFO,
+            isSocket: entry.isSocket,
+        });
+        if (recursive && entry.isDirectory && !entry.isSymbolicLink) {
+            out.push(...readDirEntriesSync(pathStr, true, relativePath));
         }
     }
     return out;
 }
 
-export async function readDirEntries(pathStr: string, recursive = false, prefix = ''): Promise<CModuleAsyncFS.DirEnt[]> {
-    const dirHandle = await asfs.readDir(pathStr);
-    const entries: CModuleAsyncFS.DirEnt[] = [];
+export async function readDirEntries(pathStr: string, recursive = false, prefix = ''): Promise<DirEntryWithParent[]> {
+    const absDir = prefix ? join(pathStr, prefix) : pathStr;
+    const dirHandle = await asfs.readDir(absDir);
+    const entries: DirEntryWithParent[] = [];
     try {
         for await (const entry of dirHandle) {
-            const relName = prefix ? join(prefix, entry.name) : entry.name;
-            entries.push(relName === entry.name ? entry : { ...entry, name: relName });
+            const relativePath = prefix ? join(prefix, entry.name) : entry.name;
+            entries.push({
+                name: entry.name,
+                relativePath,
+                parentPath: absDir,
+                isFile: entry.isFile,
+                isDirectory: entry.isDirectory,
+                isSymbolicLink: entry.isSymbolicLink,
+                isBlockDevice: entry.isBlockDevice,
+                isCharacterDevice: entry.isCharacterDevice,
+                isFIFO: entry.isFIFO,
+                isSocket: entry.isSocket,
+            });
             if (recursive && entry.isDirectory && !entry.isSymbolicLink) {
-                entries.push(...await readDirEntries(join(pathStr, entry.name), true, relName));
+                entries.push(...await readDirEntries(pathStr, true, relativePath));
             }
         }
     } finally {
@@ -411,7 +456,7 @@ export class Dir {
         if (this.closed || this.index >= this.entries.length) return null;
         const entry = this.entries[this.index++];
         if (entry === undefined) return null;
-        return toNodeDirent(entry.name, entry);
+        return toNodeDirent(entry.name, entry, this.path);
     }
 
     close(callback: (err: NodeJS.ErrnoException | null) => void): void;
@@ -501,12 +546,12 @@ export function describeFd(fd: number): string {
     return `fd:${fd}`;
 }
 
-// Recursive deletion
+// Recursive deletion — use lstat so symlink-to-dir unlinks the link only.
 
 export function removeRecursiveSync(targetPath: string): void {
-    const stats = fs.stat(targetPath);
+    const stats = fs.lstat(targetPath);
 
-    if (stats.isDirectory) {
+    if (stats.isDirectory && !stats.isSymbolicLink) {
         const items = fs.readdir(targetPath);
         for (const item of items) {
             removeRecursiveSync(join(targetPath, item));
@@ -518,9 +563,9 @@ export function removeRecursiveSync(targetPath: string): void {
 }
 
 export async function removeRecursive(targetPath: string): Promise<void> {
-    const stats = await asfs.stat(targetPath);
+    const stats = await asfs.lstat(targetPath);
 
-    if (stats.isDirectory) {
+    if (stats.isDirectory && !stats.isSymbolicLink) {
         const dirHandle = await asfs.readDir(targetPath);
         try {
             for await (const entry of dirHandle) {
@@ -567,33 +612,79 @@ function appendPathPart(base: string, part: string): string {
     return base.endsWith('/') ? `${base}${part}` : `${base}/${part}`;
 }
 
-export function mkdirRecursiveSync(pathStr: string, mode?: number): void {
-    const { root, parts } = splitMkdirPath(pathStr);
-    let current = root;
+function enotdirError(current: string): NodeJS.ErrnoException {
+    const err = new Error(`ENOTDIR: not a directory, mkdir '${current}'`) as NodeJS.ErrnoException;
+    err.code = 'ENOTDIR';
+    err.syscall = 'mkdir';
+    err.path = current;
+    return err;
+}
 
-    for (const part of parts) {
-        current = appendPathPart(current, part);
-        if (!fs.exists(current)) {
-            fs.mkdir(current, mode);
-        }
+/** True when path exists as a directory after a failed mkdir (race / already there). */
+function isExistingDirSync(current: string): boolean {
+    try {
+        return fs.stat(current).isDirectory;
+    } catch {
+        return false;
     }
 }
 
-export async function mkdirRecursive(pathStr: string, mode?: number): Promise<void> {
+async function isExistingDir(current: string): Promise<boolean> {
+    try {
+        return (await asfs.stat(current)).isDirectory;
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * Create path recursively. Returns the first directory actually created
+ * (Node.js mkdir recursive), or undefined when every segment already existed.
+ */
+export function mkdirRecursiveSync(pathStr: string, mode?: number): string | undefined {
     const { root, parts } = splitMkdirPath(pathStr);
     let current = root;
+    let firstCreated: string | undefined;
+
+    for (const part of parts) {
+        current = appendPathPart(current, part);
+        if (fs.exists(current)) {
+            if (!fs.stat(current).isDirectory) throw enotdirError(current);
+            continue;
+        }
+        try {
+            fs.mkdir(current, mode);
+            if (firstCreated === undefined) firstCreated = current;
+        } catch (e) {
+            // Concurrent create: ok only if the path is now a directory.
+            if (!isExistingDirSync(current)) throw e;
+        }
+    }
+    return firstCreated;
+}
+
+export async function mkdirRecursive(pathStr: string, mode?: number): Promise<string | undefined> {
+    const { root, parts } = splitMkdirPath(pathStr);
+    let current = root;
+    let firstCreated: string | undefined;
 
     for (const part of parts) {
         current = appendPathPart(current, part);
         try {
             const stat = await asfs.stat(current);
-            if (!stat.isDirectory) {
-                throw new Error(`Not a directory: ${current}`);
-            }
-        } catch {
+            if (!stat.isDirectory) throw enotdirError(current);
+            continue;
+        } catch (e) {
+            if (e instanceof Error && Reflect.get(e, 'code') === 'ENOTDIR') throw e;
+        }
+        try {
             await asfs.mkdir(current, mode);
+            if (firstCreated === undefined) firstCreated = current;
+        } catch (e) {
+            if (!(await isExistingDir(current))) throw e;
         }
     }
+    return firstCreated;
 }
 
 export function createFileHandle(fd: number, handle: CModuleAsyncFS.FileHandle) {
@@ -723,7 +814,7 @@ export function createAsyncDir(
             if (closed) return null;
             const result = await dirHandle.next();
             if (result.done) return null;
-            return toNodeDirentAsync(result.value);
+            return toNodeDirentAsync(result.value, pathStr);
         },
 
         readSync(): import('fs').Dirent | null {

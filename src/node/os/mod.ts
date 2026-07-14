@@ -24,8 +24,11 @@ type NetworkInterfaceWithCidr = CModuleOS.NetworkInterface & {
 type SignalConstants = { [key in NodeJS.Signals]: number };
 
 const priorityOS: PriorityNativeOS = os;
+// Node exposes positive platform errno in os.constants.errno; UV stores negatives.
 const errnoConstants: Record<string, number> = Object.fromEntries(
-    Object.entries(err.errno).filter(([k]) => k !== 'OK' && k !== 'UNKNOWN')
+    Object.entries(err.errno)
+        .filter(([k, v]) => k !== 'OK' && k !== 'UNKNOWN' && typeof v === 'number')
+        .map(([k, v]) => [k, Math.abs(v as number)])
 );
 export interface CpuInfo {
     model: string;

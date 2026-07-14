@@ -20,6 +20,7 @@ import {
     releaseRequestTransport,
     setRequestTimeout,
     writeRequest,
+    formatClientRequestHeader,
 } from '../_internal/http-client';
 import { EventEmitter } from '../events';
 import { Socket } from '../net';
@@ -47,7 +48,7 @@ export interface ClientRequest extends OutgoingMessageImpl {
     host: string;
     protocol: string;
     reusedSocket: boolean;
-    maxHeadersCount: number;
+    maxHeadersCount: number | null;
     method: string;
     path: string;
     abort(): void;
@@ -112,8 +113,8 @@ export interface ClientRequestImplConstructor {
 
 const HTTP_CLIENT_HOOKS: ClientHooks<ClientRequestImpl> = {
     defaultPort: 80,
-    defaultUserAgent: 'Node.js/http',
-    defaultAcceptEncoding: 'identity',
+    // Node client sends Host only by default (no User-Agent / Accept-Encoding).
+    defaultUserAgent: '',
     requestIdPrefix: 'http-fetch',
     connect: (request) => connectPlainTransport(request, 80),
     onTransportAssigned: (request, transport) => {
@@ -126,7 +127,8 @@ function initClientRequest(self: ClientRequestImpl, url: string | URL | ClientRe
     initClientRequestState(self, cb);
 
     self.reusedSocket = false;
-    self.maxHeadersCount = 2000;
+    // Node ClientRequest.maxHeadersCount defaults to null (unlimited until set).
+    self.maxHeadersCount = null;
     self._tcp = null;
     self._socketAssigned = false;
     self._response = null;
@@ -155,14 +157,14 @@ function initClientRequest(self: ClientRequestImpl, url: string | URL | ClientRe
 
     self._userConnectionHeader = self.hasHeader('connection');
     applyRequestCommonOptions(self);
-    if (
-        !self._userConnectionHeader &&
+    // Node: keepAlive agent → shouldKeepAlive true (Connection added at serialize).
+    // agent:false / keepAlive off → shouldKeepAlive false.
+    const agentKeepAlive = !!(
         self.agent &&
         typeof self.agent === 'object' &&
         self.agent.options.keepAlive
-    ) {
-        self.setHeader('Connection', 'keep-alive');
-    }
+    );
+    self.shouldKeepAlive = agentKeepAlive;
 }
 
 export const ClientRequestImpl: ClientRequestImplConstructor = function ClientRequestImpl(this: ClientRequestImpl | undefined, url: string | URL | ClientRequestArgs, cb?: (res: IncomingMessageImpl) => void) {
@@ -232,7 +234,7 @@ ClientRequestImpl.prototype.onSocket = function onSocket(this: ClientRequestImpl
 };
 
 ClientRequestImpl.prototype._implicitHeader = function _implicitHeader(this: ClientRequestImpl): void {
-    this._header = `${this.method} ${this.path} HTTP/1.1\r\n${this._formatHeaders()}\r\n`;
+    this._header = formatClientRequestHeader(this);
 };
 
 ClientRequestImpl.prototype.setNoDelay = function setNoDelay(this: ClientRequestImpl, noDelay?: boolean): void {
@@ -262,11 +264,15 @@ flattenPrototype(ClientRequestImpl.prototype);
 export interface AgentOptions {
     keepAlive?: boolean;
     keepAliveMsecs?: number;
+    /** Free-socket idle timeout (ms). Node globalAgent defaults to 5000. */
+    timeout?: number;
+    /** freeSockets reuse order: lifo (Node default) or fifo. */
+    scheduling?: 'lifo' | 'fifo';
+    noDelay?: boolean;
+    path?: string | null;
     maxSockets?: number;
     maxTotalSockets?: number;
     maxFreeSockets?: number;
-    scheduling?: 'lifo' | 'fifo';
-    timeout?: number;
 }
 
 type AgentSocketTable = Record<string, Socket[]>;
@@ -304,10 +310,13 @@ export class Agent extends EventEmitter {
     sockets: AgentSocketTable = newAgentTable<Socket>();
     freeSockets: AgentSocketTable = newAgentTable<Socket>();
     requests: AgentRequestTable = newAgentTable<ClientRequestImpl>();
+    private _freeTimers = new WeakMap<Socket, ReturnType<typeof setTimeout>>();
 
     constructor(options?: AgentOptions) {
         super();
-        this.options = options || {};
+        // Node Agent merges options onto a null-prototype object; keepAlive stays off
+        // unless the caller (or globalAgent) sets it.
+        this.options = Object.assign(Object.create(null), options || {}) as AgentOptions;
         if (options?.maxSockets !== undefined) this.maxSockets = options.maxSockets;
         if (options?.maxFreeSockets !== undefined) this.maxFreeSockets = options.maxFreeSockets;
         if (options?.maxTotalSockets !== undefined) this.maxTotalSockets = options.maxTotalSockets;
@@ -349,9 +358,11 @@ export class Agent extends EventEmitter {
         const name = this.getName(options);
         const sockets = getSocketList(this.sockets, name);
         const freeSockets = getSocketList(this.freeSockets, name);
+        const lifo = (this.options.scheduling ?? 'lifo') === 'lifo';
 
         while (freeSockets.length > 0) {
-            const socket = freeSockets.shift()!;
+            const socket = lifo ? freeSockets.pop()! : freeSockets.shift()!;
+            this._clearFreeTimer(socket);
             if (!isReusableSocket(socket)) {
                 socket.destroy();
                 continue;
@@ -425,9 +436,38 @@ export class Agent extends EventEmitter {
         this.keepSocketAlive(socket);
         socket.unref();
         freeSockets.push(socket);
+        this._armFreeTimer(socket, options);
+    }
+
+    private _clearFreeTimer(socket: Socket): void {
+        const t = this._freeTimers.get(socket);
+        if (t !== undefined) {
+            clearTimeout(t);
+            this._freeTimers.delete(socket);
+        }
+    }
+
+    private _armFreeTimer(socket: Socket, options: ClientRequestArgs): void {
+        this._clearFreeTimer(socket);
+        const idle = this.options.timeout;
+        if (idle === undefined || idle <= 0) return;
+        const timer = setTimeout(() => {
+            this._freeTimers.delete(socket);
+            // Drop idle free socket (Node Agent free-socket timeout).
+            const name = this.getName(options);
+            const free = this.freeSockets[name];
+            if (free) {
+                const i = free.indexOf(socket);
+                if (i !== -1) free.splice(i, 1);
+                deleteEmptyList(this.freeSockets, name);
+            }
+            if (isReusableSocket(socket) || !socket._destroyed) socket.destroy();
+        }, idle);
+        this._freeTimers.set(socket, timer);
     }
 
     removeSocket(socket: Socket, options: ClientRequestArgs): void {
+        this._clearFreeTimer(socket);
         const name = this.getName(options);
         const sockets = this.sockets[name];
         if (sockets) {
@@ -462,7 +502,12 @@ export class Agent extends EventEmitter {
     }
 }
 
-export const globalAgent = new Agent();
+// Node 19+: globalAgent keepAlive defaults on; free sockets idle out after 5s.
+export const globalAgent = new Agent({
+    keepAlive: true,
+    scheduling: 'lifo',
+    timeout: 5000,
+});
 
 export function request(url: string | URL, options: ClientRequestArgs, callback?: (res: IncomingMessageImpl) => void): ClientRequestImpl;
 export function request(options: ClientRequestArgs | string | URL, callback?: (res: IncomingMessageImpl) => void): ClientRequestImpl;

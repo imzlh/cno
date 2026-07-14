@@ -180,10 +180,21 @@ export interface UpgradeHandle {
     isClosed(): boolean;
 }
 
+/**
+ * TCP handle still owned by @cnojs/http (H1 read/write). Node Socket is only a
+ * metadata / destroy facade — never startRead/write on the raw handle.
+ */
+export interface HttpOwnedTransport {
+    /** Tear down the core HTTP connection (idempotent). */
+    close(): void;
+}
+
 export interface Socket extends Duplex {
     _tcp: CModuleStreams.TCP | null;
     _stream: CModuleStreams.Pipe | null;
     _upgradeHandle: UpgradeHandle | null;
+    /** When set, I/O is owned by HTTP core; Socket must not touch `_tcp`. */
+    _httpOwned: HttpOwnedTransport | null;
     _connecting: boolean;
     _destroyed: boolean;
     _readable: boolean;
@@ -241,6 +252,14 @@ export interface SocketConstructor {
     /** Build a Socket backed by a core @cnojs/http upgrade handle (WebSocket
      *  upgrade path). Reads replay any buffered upgradeLeftover bytes first. */
     fromUpgradeHandle(handle: UpgradeHandle): Socket;
+    /**
+     * Facade over a TCP still owned by @cnojs/http. Address metadata only;
+     * destroy() closes the HTTP connection, never dual-writes the handle.
+     */
+    fromHttpOwned(
+        tcp: CModuleStreams.TCP,
+        owned: HttpOwnedTransport,
+    ): Socket;
 }
 
 type NativeReadResult = Uint8Array<ArrayBuffer> | null | undefined;
@@ -252,6 +271,7 @@ function initSocket(self: Socket, options?: SocketConstructorOpts): void {
     self._tcp = null;
     self._stream = null;
     self._upgradeHandle = null;
+    self._httpOwned = null;
     self._connecting = false;
     self._destroyed = false;
     self._readable = true;
@@ -306,6 +326,35 @@ Socket.fromUpgradeHandle = function fromUpgradeHandle(handle: UpgradeHandle): So
     const socket = new Socket();
     socket._upgradeHandle = handle;
     socket.readyState = 'open';
+    return socket;
+};
+
+Socket.fromHttpOwned = function fromHttpOwned(
+    tcp: CModuleStreams.TCP,
+    owned: HttpOwnedTransport,
+): Socket {
+    const socket = new Socket();
+    const localInfo = tcp.sockname;
+    const remoteInfo = tcp.peername;
+
+    // Keep the handle for address()/ref only — never assign for stream I/O.
+    socket._httpOwned = owned;
+    socket.readyState = 'open';
+    socket.localAddress = localInfo.ip;
+    socket.localPort = localInfo.port;
+    socket.remoteAddress = remoteInfo.ip;
+    socket.remotePort = remoteInfo.port;
+    socket.remoteFamily = `IPv${remoteInfo.family}`;
+    socket._address = {
+        address: localInfo.ip,
+        family: `IPv${localInfo.family}`,
+        port: localInfo.port,
+    };
+    socket._remoteAddress = {
+        address: remoteInfo.ip,
+        family: `IPv${remoteInfo.family}`,
+        port: remoteInfo.port,
+    };
     return socket;
 };
 
@@ -491,18 +540,22 @@ Socket.prototype.resume = function resume(this: Socket): Socket {
     if (state.readableListening && this.listenerCount('data') === 0) {
         this.emit('resume');
         this._read(state.highWaterMark);
-        if (this._tcp) this._startTcpRead();
-        if (this._upgradeHandle) this._startUpgradeRead();
-        if (this._stream) this._startPipeRead();
+        if (!this._httpOwned) {
+            if (this._tcp) this._startTcpRead();
+            if (this._upgradeHandle) this._startUpgradeRead();
+            if (this._stream) this._startPipeRead();
+        }
         return this;
     }
     if (!state.flowing) {
         state.flowing = true;
         this.emit('resume');
     }
-    if (this._tcp) this._startTcpRead();
-    if (this._upgradeHandle) this._startUpgradeRead();
-    if (this._stream) this._startPipeRead();
+    if (!this._httpOwned) {
+        if (this._tcp) this._startTcpRead();
+        if (this._upgradeHandle) this._startUpgradeRead();
+        if (this._stream) this._startPipeRead();
+    }
     queueMicrotask(() => this._duplexReadAndResolve());
     return this;
 };
@@ -619,6 +672,8 @@ Socket.prototype._startUpgradeRead = function _startUpgradeRead(this: Socket): v
 /** Duplex _read — called when consumer wants data */
 Socket.prototype._read = function _read(this: Socket, size: number): void {
     if (this._destroyed) return;
+    // HTTP-owned sockets never pump the raw TCP — core owns the read loop.
+    if (this._httpOwned) return;
     if (this._upgradeHandle) {
         this._startUpgradeRead();
     } else if (this._tcp) {
@@ -668,6 +723,15 @@ Socket.prototype._write = function _write(this: Socket, chunk: string | Uint8Arr
 
     const buffer = typeof chunk === 'string' ? engine.encodeString(chunk) : chunk;
 
+    // Core owns the wire; app must not dual-write the same TCP as H1.
+    if (this._httpOwned) {
+        callback(Object.assign(new Error('Socket is owned by the HTTP server'), {
+            code: 'ERR_SOCKET_HTTP_SERVER',
+            syscall: 'write',
+        }));
+        return;
+    }
+
     if (this._upgradeHandle) {
         this._upgradeHandle.write(buffer).then(() => {
             this.bytesWritten += buffer.byteLength;
@@ -696,6 +760,12 @@ Socket.prototype._write = function _write(this: Socket, chunk: string | Uint8Arr
 
 Socket.prototype._final = function _final(this: Socket, callback: (error?: Error | null) => void): void {
     if (this._destroyed) {
+        callback();
+        return;
+    }
+
+    // HTTP core owns half-close / end; facade does not shutdown the handle.
+    if (this._httpOwned) {
         callback();
         return;
     }
@@ -787,7 +857,11 @@ Socket.prototype.destroy = function destroy(this: Socket, error?: Error): Socket
         this._timeoutId = null;
     }
 
-    if (this._tcp) {
+    if (this._httpOwned) {
+        // Ask core to drop the connection; do not closeTcp on a borrowed handle.
+        try { this._httpOwned.close(); } catch { /* already closed */ }
+        this._httpOwned = null;
+    } else if (this._tcp) {
         closeTcpQuietly(this._tcp);
         this._tcp = null;
     }
@@ -1260,6 +1334,54 @@ export class BlockList {
 
     get rules(): string[] {
         return this.#rules.map((rule) => rule.rule);
+    }
+}
+
+// SocketAddress (Node 15+)
+
+export interface SocketAddressInit {
+    address?: string;
+    port?: number;
+    family?: 'ipv4' | 'ipv6' | 4 | 6;
+    flowlabel?: number;
+}
+
+export class SocketAddress {
+    readonly address: string;
+    readonly port: number;
+    readonly family: 'ipv4' | 'ipv6';
+    readonly flowlabel: number;
+
+    constructor(options?: SocketAddressInit) {
+        const opts = options ?? {};
+        let family: 'ipv4' | 'ipv6' = 'ipv4';
+        if (opts.family === 6 || opts.family === 'ipv6') family = 'ipv6';
+        else if (opts.family === 4 || opts.family === 'ipv4') family = 'ipv4';
+
+        const address = opts.address ?? (family === 'ipv6' ? '::' : '127.0.0.1');
+        if (family === 'ipv4' && !isIPv4(address)) {
+            // Infer family from address when default/unspecified family.
+            if (isIPv6(address)) family = 'ipv6';
+            else throw new TypeError('Invalid socket address');
+        }
+        if (family === 'ipv6' && !isIPv6(address) && !isIPv4(address)) {
+            throw new TypeError('Invalid socket address');
+        }
+        if (family === 'ipv4' && isIPv6(address)) family = 'ipv6';
+
+        const port = opts.port ?? 0;
+        if (!Number.isInteger(port) || port < 0 || port > 65535) {
+            throw new RangeError('Port should be >= 0 and < 65536');
+        }
+        const flowlabel = opts.flowlabel ?? 0;
+        if (!Number.isInteger(flowlabel) || flowlabel < 0 || flowlabel > 0xfffff) {
+            throw new RangeError('flowlabel should be >= 0 and < 1048576');
+        }
+
+        this.address = address;
+        this.port = port;
+        this.family = family;
+        this.flowlabel = flowlabel;
     }
 }
 

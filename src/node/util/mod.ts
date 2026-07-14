@@ -509,6 +509,8 @@ export interface PromisifyInterface {
     __promisify__: AnyCallable;
 }
 
+const kCustomPromisifyArgs = Symbol.for('nodejs.util.promisify.customArgs');
+
 export function promisify<T>(fn: AnyCallable): (...args: unknown[]) => Promise<T> {
     const customSymbol = Symbol.for('nodejs.util.promisify.custom');
 
@@ -526,14 +528,25 @@ export function promisify<T>(fn: AnyCallable): (...args: unknown[]) => Promise<T
         return legacyCustom as (...args: unknown[]) => Promise<T>;
     }
 
+    // Multi-value callbacks (e.g. dns.lookup → { address, family })
+    const argumentNames = Reflect.get(fn, kCustomPromisifyArgs) as string[] | undefined;
+
     const promisified = function(this: unknown, ...args: unknown[]) {
         return new Promise<T>((resolve, reject) => {
-            Reflect.apply(fn, this, [...args, (err: Error | null, result: T) => {
+            Reflect.apply(fn, this, [...args, (err: Error | null, ...values: unknown[]) => {
                 if (err) {
                     reject(err);
-                } else {
-                    resolve(result);
+                    return;
                 }
+                if (argumentNames !== undefined && values.length > 1) {
+                    const obj: Record<string, unknown> = {};
+                    for (let i = 0; i < argumentNames.length; i++) {
+                        obj[argumentNames[i]!] = values[i];
+                    }
+                    resolve(obj as T);
+                    return;
+                }
+                resolve(values[0] as T);
             }]);
         });
     };
@@ -550,6 +563,8 @@ export function promisify<T>(fn: AnyCallable): (...args: unknown[]) => Promise<T
 }
 
 promisify.custom = Symbol.for('nodejs.util.promisify.custom');
+// Node documents this as util.promisify.customPromisifyArgs (legacy name on Symbol.for).
+Reflect.set(promisify, 'customPromisifyArgs', kCustomPromisifyArgs);
 
 // TextEncoder / TextDecoder
 

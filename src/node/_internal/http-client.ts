@@ -22,6 +22,11 @@ import {
     normalizeHeaderRecord,
     setupResponseParser,
 } from './network-debug';
+import {
+    encodeChunkedFrame,
+    encodeChunkedTrailer,
+    formatRequestHead,
+} from '@cnojs/http/h1-frame';
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
@@ -449,14 +454,13 @@ function applyConnectedRequestOptions<TRequest extends ClientRequestState>(reque
     if (request._options.auth && !request.hasHeader('authorization')) {
         request.setHeader('Authorization', `Basic ${btoa(request._options.auth)}`);
     }
-    if (setDefaultHeaders && !request.hasHeader('user-agent')) {
+    // Node does not inject User-Agent / Accept-Encoding / Connection: close.
+    // Connection: keep-alive is set by ClientRequest when agent.keepAlive is on.
+    if (hooks.defaultUserAgent && setDefaultHeaders && !request.hasHeader('user-agent')) {
         request.setHeader('User-Agent', hooks.defaultUserAgent);
     }
     if (hooks.defaultAcceptEncoding && setDefaultHeaders && !request.hasHeader('accept-encoding')) {
         request.setHeader('Accept-Encoding', hooks.defaultAcceptEncoding);
-    }
-    if (setDefaultHeaders && !request.hasHeader('connection')) {
-        request.setHeader('Connection', 'close');
     }
 }
 
@@ -530,10 +534,6 @@ export async function sendRequestLine<TRequest extends ClientRequestState>(reque
     if (!transport) return;
     const fetchHook = getNodeFetchHook();
 
-    let requestLine = `${request.method} ${request.path} HTTP/1.1\r\n`;
-    requestLine += request._formatHeaders();
-    requestLine += '\r\n';
-
     try {
         fetchHook?.onRequest?.({
             requestId: request._requestId,
@@ -547,8 +547,30 @@ export async function sendRequestLine<TRequest extends ClientRequestState>(reque
         });
     } catch {}
 
-    await writeToTransport(transport, engine.encodeString(requestLine));
+    // Same pure head framing as HttpRequestBuilder / HTTPS implicit header.
+    await writeToTransport(
+        transport,
+        engine.encodeString(formatClientRequestHeader(request)),
+    );
     request.headersSent = true;
+}
+
+/** Node `_header` string: request-line + formatted headers + blank line. */
+export function formatClientRequestHeader<TRequest extends ClientRequestState>(request: TRequest): string {
+    // Node injects Connection on the wire without exposing it via getHeader().
+    let extra = '';
+    if (!request.hasHeader('connection')) {
+        const agent = (request as TRequest & { agent?: unknown; shouldKeepAlive?: boolean }).agent;
+        const keepAlive = !!(
+            agent &&
+            typeof agent === 'object' &&
+            (agent as { options?: { keepAlive?: boolean } }).options?.keepAlive
+        );
+        const flag = (request as TRequest & { shouldKeepAlive?: boolean }).shouldKeepAlive;
+        const useKeepAlive = flag !== undefined ? flag : keepAlive;
+        extra = `Connection: ${useKeepAlive ? 'keep-alive' : 'close'}\r\n`;
+    }
+    return formatRequestHead(request.method, request.path, '1.1', request._formatHeaders() + extra);
 }
 
 export function markRequestFinished<TRequest extends ClientRequestState>(request: TRequest): void {
@@ -571,11 +593,9 @@ export async function doBufferedRequest<TRequest extends ClientRequestState>(req
         if (request.hasHeader('transfer-encoding') && String(request.getHeader('transfer-encoding')).toLowerCase().includes('chunked')) {
             await sendRequestLine(request);
             if (bodyLength > 0) {
-                await writeToTransport(request._transport, engine.encodeString(`${bodyLength.toString(16)}\r\n`));
-                await writeToTransport(request._transport, requestBody);
-                await writeToTransport(request._transport, engine.encodeString('\r\n'));
+                await writeToTransport(request._transport, encodeChunkedFrame(requestBody));
             }
-            await writeToTransport(request._transport, engine.encodeString('0\r\n\r\n'));
+            await writeToTransport(request._transport, encodeChunkedTrailer());
             request._bodySent = true;
             markRequestFinished(request);
             readResponse(request);
@@ -626,9 +646,7 @@ export async function streamChunk<TRequest extends ClientRequestState>(request: 
 
     if (!request._transport) return;
     if (request._chunkedEncoding) {
-        await writeToTransport(request._transport, engine.encodeString(`${data.byteLength.toString(16)}\r\n`));
-        await writeToTransport(request._transport, data);
-        await writeToTransport(request._transport, engine.encodeString('\r\n'));
+        await writeToTransport(request._transport, encodeChunkedFrame(data));
         return;
     }
     await writeToTransport(request._transport, data);
@@ -646,7 +664,7 @@ export async function finishStreaming<TRequest extends ClientRequestState>(reque
         await sendRequestLine(request);
     }
     if (request._transport && request._chunkedEncoding) {
-        await writeToTransport(request._transport, engine.encodeString('0\r\n\r\n'));
+        await writeToTransport(request._transport, encodeChunkedTrailer());
     }
     request._bodySent = true;
     markRequestFinished(request);
