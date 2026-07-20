@@ -33,7 +33,10 @@ export function wrapFSErr(e: unknown): unknown {
         case error.errno.EILSEQ: return new errors.InvalidData(e.message);
         // ── Resource / memory ────────────────────────────────────────────────
         case error.errno.ENOMEM: return new errors.Busy(e.message);
-        case error.errno.ENOSPC: return new errors.Busy(e.message);
+        case error.errno.ENOSPC:
+            Reflect.set(e, 'name', 'Error');
+            Reflect.set(e, 'code', 'ENOSPC');
+            return e;
         case error.errno.ENFILE: return new errors.Busy(e.message);
         case error.errno.EMFILE: return new errors.Busy(e.message);
         case error.errno.ESRCH: return new errors.NotFound(e.message);

@@ -16,6 +16,7 @@ export interface KeyExportOptions {
 export interface KeyObject {
     readonly type: 'private' | 'public' | 'secret';
     readonly asymmetricKeyType?: 'rsa' | 'ec';
+    readonly asymmetricKeyDetails?: { namedCurve?: string; modulusLength?: number };
     readonly symmetricKeySize?: number;
     export(options?: KeyExportOptions): Uint8Array | string | SecretJwk;
     readonly [Symbol.toStringTag]: 'KeyObject';
@@ -28,34 +29,39 @@ export interface KeyWithOptions {
     dsaEncoding?: 'der' | 'ieee-p1363';
 }
 
-export interface Hash {
+import type { Transform, TransformOptions } from '../stream';
+
+export interface Hash extends Transform {
     update(input: BinaryInput, encoding?: string): Hash;
     digest(encoding?: string): Uint8Array | string;
+    copy(options?: TransformOptions): Hash;
 }
 
-export interface Hmac {
+export interface Hmac extends Transform {
     update(input: BinaryInput, encoding?: string): Hmac;
     digest(encoding?: string): Uint8Array | string;
 }
 
-export interface Cipheriv {
+export interface Cipheriv extends Transform {
     update(data: BinaryInput, inputEncoding?: string, outputEncoding?: string): Uint8Array | string;
     final(outputEncoding?: string): Uint8Array | string;
+    setAutoPadding(autoPadding?: boolean): this;
 }
 
-export interface Decipheriv {
+export interface Decipheriv extends Transform {
     update(data: BinaryInput, inputEncoding?: string, outputEncoding?: string): Uint8Array | string;
     final(outputEncoding?: string): Uint8Array | string;
+    setAutoPadding(autoPadding?: boolean): this;
 }
 
-export interface CipherGCM {
+export interface CipherGCM extends Cipheriv {
     setAAD(aad: ArrayBuffer | Uint8Array): CipherGCM;
     update(data: BinaryInput, inputEncoding?: string, outputEncoding?: string): Uint8Array | string;
     final(outputEncoding?: string): Uint8Array | string;
     getAuthTag(): Uint8Array;
 }
 
-export interface DecipherGCM {
+export interface DecipherGCM extends Decipheriv {
     setAAD(aad: ArrayBuffer | Uint8Array): DecipherGCM;
     setAuthTag(tag: ArrayBuffer | Uint8Array): DecipherGCM;
     update(data: BinaryInput, inputEncoding?: string, outputEncoding?: string): Uint8Array | string;

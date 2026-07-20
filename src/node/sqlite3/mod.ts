@@ -155,10 +155,6 @@ function mapRows(rows: SqliteRow[]): Record<string, unknown> {
     return result;
 }
 
-function notImplemented(name: string): Error {
-    return new Error(`sqlite3.${name} is not implemented by this runtime`);
-}
-
 export class Statement extends EventEmitter {
     lastID = 0;
     changes = 0;
@@ -444,6 +440,50 @@ export class Database extends EventEmitter {
         return this.getHandle();
     }
 
+    /** Create a node-sqlite3-style backup; data moves when Backup.step() runs. */
+    backup(filename: string, callback?: Callback): Backup;
+    backup(
+        filename: string,
+        destName: string,
+        sourceName: string,
+        filenameIsDest: boolean,
+        callback?: Callback,
+    ): Backup;
+    backup(filename: string, ...args: unknown[]): Backup {
+        const values = args.slice();
+        const callback = typeof values[values.length - 1] === 'function'
+            ? values.pop() as Callback
+            : undefined;
+
+        let destName = 'main';
+        let sourceName = 'main';
+        let filenameIsDest = true;
+        if (values.length !== 0) {
+            if (values.length !== 3
+                || typeof values[0] !== 'string'
+                || typeof values[1] !== 'string'
+                || typeof values[2] !== 'boolean') {
+                throw new TypeError(
+                    'backup(filename, destName, sourceName, filenameIsDest[, callback]) expected',
+                );
+            }
+            destName = values[0];
+            sourceName = values[1];
+            filenameIsDest = values[2];
+        }
+
+        if (typeof filename !== 'string' || filename.length === 0) {
+            const err = new TypeError('The "filename" argument must be a non-empty string');
+            if (!callback) throw err;
+            const failed = new Backup(this, filename, destName, sourceName, filenameIsDest, err);
+            failed.initialize(callback);
+            return failed;
+        }
+        const backup = new Backup(this, filename, destName, sourceName, filenameIsDest);
+        backup.initialize(callback);
+        return backup;
+    }
+
     inTransaction(): boolean {
         return this.getHandle().inTransaction();
     }
@@ -494,10 +534,124 @@ export class Database extends EventEmitter {
     }
 }
 
+/** node-sqlite3-compatible Backup backed by the native full-copy primitive. */
 export class Backup extends EventEmitter {
-    constructor() {
+    completed = false;
+    failed = false;
+    idle = true;
+    remaining = 0;
+    pageCount = 0;
+    retryErrors = [5, 6];
+    private error: unknown = null;
+    private initialized = false;
+    private finished = false;
+    private completionNotified = false;
+
+    constructor(
+        private readonly db: Database,
+        readonly filename: string,
+        readonly destName = 'main',
+        readonly sourceName = 'main',
+        readonly filenameIsDest = true,
+        initError?: unknown,
+    ) {
         super();
-        throw notImplemented('Backup');
+        if (initError !== undefined) {
+            this.failed = true;
+            this.error = initError;
+        }
+        if (!filenameIsDest && initError === undefined) {
+            this.failed = true;
+            this.error = new Error(
+                'Restoring a file into an existing database is not supported by this runtime',
+            );
+        }
+        this.initialized = true;
+    }
+
+    /** Notify the optional Database#backup initialization callback. */
+    initialize(callback?: Callback): this {
+        if (!callback) return this;
+        call(callback, this, [this.error ?? null]);
+        return this;
+    }
+
+    /** Copy all pages. The native binding does not expose partial stepping. */
+    step(pages?: number | Callback, callback?: Callback): this {
+        const count = typeof pages === 'number' ? pages : -1;
+        const cb = typeof pages === 'function' ? pages : callback;
+        if (!Number.isInteger(count) || count === 0) {
+            return this.fail(new RangeError('Backup.step() pages must be a non-zero integer'), cb, false);
+        }
+        if (this.finished) {
+            return this.fail(new Error('Backup has already been finished'), cb, false);
+        }
+        if (!this.initialized) {
+            return this.fail(new Error('Backup has not been initialized'), cb);
+        }
+        if (this.failed) {
+            return this.fail(this.error ?? new Error('Backup failed'), cb, false);
+        }
+        if (this.completed) {
+            call(cb, this, [null]);
+            return this;
+        }
+
+        this.idle = false;
+        try {
+            if (!this.filenameIsDest) {
+                throw new Error(
+                    'Restoring a file into an existing database is not supported by this runtime',
+                );
+            }
+            this.pageCount = this.db.raw().backupTo(this.filename, this.sourceName, this.destName);
+            this.remaining = 0;
+            this.completed = true;
+            this.idle = true;
+            call(cb, this, [null]);
+            if (!this.completionNotified) {
+                this.completionNotified = true;
+                defer(() => this.emit('completed', this.pageCount));
+            }
+        } catch (err) {
+            return this.fail(err, cb);
+        }
+        return this;
+    }
+
+    /** Backward-compatible alias for callers that used the previous shim. */
+    run(callback?: Callback): this {
+        return this.step(-1, callback);
+    }
+
+    finish(callback?: Callback): this {
+        if (this.failed) {
+            this.finished = true;
+            this.idle = true;
+            emitOrThrow(this, callback, this, this.error ?? new Error('Backup failed'));
+            return this;
+        }
+        if (this.finished) {
+            call(callback, this, [null]);
+            return this;
+        }
+        this.finished = true;
+        this.idle = true;
+        call(callback, this, [null]);
+        return this;
+    }
+
+    private fail(err: unknown, callback?: Callback, remember = true): this {
+        this.idle = true;
+        if (remember) {
+            this.failed = true;
+            this.error = err;
+        }
+        emitOrThrow(this, callback, this, err);
+        if (remember) {
+            defer(() => this.emit('failed', err instanceof Error ? err : new Error(String(err))));
+        }
+        return this;
     }
 }
 

@@ -69,6 +69,14 @@ function unsupported(name: string): never {
     throw new Error(`node:sqlite ${name} is not implemented by this runtime`);
 }
 
+function optionalBoolean(options: Record<string, unknown>, name: string): boolean {
+    const value = options[name];
+    if (value !== undefined && typeof value !== 'boolean') {
+        throw new TypeError(`The "options.${name}" argument must be of type boolean`);
+    }
+    return value === true;
+}
+
 function normalizeLocation(location: DatabaseLocation): string {
     if (typeof location === 'string') return location;
     if (location instanceof URL) {
@@ -314,12 +322,87 @@ export class DatabaseSync {
         return new StatementSync(this, this.raw().prepare(sql), sql);
     }
 
-    function(): void {
-        unsupported('DatabaseSync.function');
+    /**
+     * Register a scalar SQL function (Node DatabaseSync.function).
+     * function(name, fn) | function(name, options, fn)
+     */
+    function(
+        name: string,
+        optionsOrFn?: Record<string, unknown> | ((...args: unknown[]) => unknown),
+        maybeFn?: (...args: unknown[]) => unknown,
+    ): void {
+        if (typeof name !== 'string' || name.length === 0) {
+            throw new TypeError('The "name" argument must be a non-empty string');
+        }
+        let options: Record<string, unknown> = {};
+        let fn: (...args: unknown[]) => unknown;
+        if (typeof optionsOrFn === 'function') {
+            fn = optionsOrFn;
+        } else if (typeof maybeFn === 'function') {
+            if (optionsOrFn === null || typeof optionsOrFn !== 'object') {
+                throw new TypeError('The "options" argument must be an object');
+            }
+            options = optionsOrFn;
+            fn = maybeFn;
+        } else {
+            throw new TypeError('The "function" argument must be of type function');
+        }
+
+        const deterministic = optionalBoolean(options, 'deterministic');
+        const directOnly = optionalBoolean(options, 'directOnly');
+        const varargs = optionalBoolean(options, 'varargs');
+        const useBigIntArguments = optionalBoolean(options, 'useBigIntArguments');
+        const nArg = varargs ? -1 : (typeof fn.length === 'number' ? fn.length : 0);
+        const nativeOpts: { deterministic?: boolean; directOnly?: boolean; useBigIntArguments?: boolean } = {};
+        if (deterministic) nativeOpts.deterministic = true;
+        if (directOnly) nativeOpts.directOnly = true;
+        if (useBigIntArguments) nativeOpts.useBigIntArguments = true;
+
+        this.raw().createFunction(name, nArg, fn, nativeOpts);
     }
 
-    aggregate(): void {
-        unsupported('DatabaseSync.aggregate');
+    /**
+     * Register an aggregate SQL function (Node DatabaseSync.aggregate).
+     * aggregate(name, options) with options.start + options.step required.
+     */
+    aggregate(name: string, options: Record<string, unknown>): void {
+        if (typeof name !== 'string' || name.length === 0) {
+            throw new TypeError('The "name" argument must be a non-empty string');
+        }
+        if (options === undefined || options === null || typeof options !== 'object') {
+            throw new TypeError('The "options" argument must be an object');
+        }
+        if (options.start === undefined) {
+            throw new TypeError('The "options.start" argument must be a function or a primitive value');
+        }
+        if (typeof options.step !== 'function') {
+            throw new TypeError('The "options.step" argument must be a function');
+        }
+        if (options.inverse !== undefined && typeof options.inverse !== 'function') {
+            throw new TypeError('The "options.inverse" argument must be a function');
+        }
+
+        const directOnly = optionalBoolean(options, 'directOnly');
+        const varargs = optionalBoolean(options, 'varargs');
+        const useBigIntArguments = optionalBoolean(options, 'useBigIntArguments');
+        let nArg = -1;
+        if (!varargs) {
+            // Node infers arity from step.length minus the accumulator argument.
+            const stepLen = typeof (options.step as Function).length === 'number'
+                ? (options.step as Function).length
+                : 1;
+            nArg = Math.max(0, stepLen - 1);
+        }
+
+        this.raw().createAggregate(name, nArg, {
+            start: options.start,
+            step: options.step as (...args: unknown[]) => unknown,
+            result: typeof options.result === 'function' ? options.result : undefined,
+            inverse: options.inverse as ((...args: unknown[]) => unknown) | undefined,
+            deterministic: !!options.deterministic,
+            directOnly,
+            useBigIntArguments,
+        });
     }
 
     createSession(): void {
@@ -353,8 +436,35 @@ export class Session {
     }
 }
 
-export function backup(): never {
-    unsupported('backup');
+export interface BackupOptions {
+    source?: string;
+    target?: string;
+}
+
+/**
+ * Online backup of an open DatabaseSync to a destination path (Node node:sqlite.backup).
+ * Resolves with the total page count of the source database.
+ */
+export function backup(
+    sourceDb: DatabaseSync,
+    path: string | URL | Uint8Array,
+    options: BackupOptions = {},
+): Promise<number> {
+    if (!(sourceDb instanceof DatabaseSync) && !(sourceDb && typeof (sourceDb as DatabaseSync).raw === 'function')) {
+        return Promise.reject(new TypeError('The "sourceDb" argument must be a DatabaseSync'));
+    }
+    if (path === undefined || path === null) {
+        return Promise.reject(new TypeError('The "path" argument must be a string, Buffer, or file: URL'));
+    }
+    const destPath = normalizeLocation(path as DatabaseLocation);
+    const sourceName = options.source ?? 'main';
+    const destName = options.target ?? 'main';
+    try {
+        const pages = sourceDb.raw().backupTo(destPath, sourceName, destName);
+        return Promise.resolve(pages);
+    } catch (e) {
+        return Promise.reject(e);
+    }
 }
 
 export const constants = {

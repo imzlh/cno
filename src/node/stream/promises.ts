@@ -141,7 +141,7 @@ export async function finished(
     stream: Stream | globalThis.ReadableStream | globalThis.WritableStream,
     options?: { error?: boolean; readable?: boolean; writable?: boolean; signal?: AbortSignal }
 ): Promise<void> {
-    const { readable = true, writable = true, signal } = options ?? {};
+    const { error: reportErrors = true, readable = true, writable = true, signal } = options ?? {};
 
     return new Promise<void>((resolve, reject) => {
         let settled = false;
@@ -156,7 +156,7 @@ export async function finished(
             if (settled) return;
             settled = true;
             cleanup();
-            if (err) reject(err);
+            if (err !== undefined) reject(err);
             else resolve();
         };
 
@@ -169,10 +169,18 @@ export async function finished(
         if (signal) {
             const abortSignal = signal;
             if (abortSignal.aborted) {
-                done(new Error('The operation was aborted'));
+                done(Object.assign(new Error('The operation was aborted'), {
+                    name: 'AbortError',
+                    code: 'ABORT_ERR',
+                    cause: abortSignal.reason,
+                }));
                 return;
             }
-            const onAbort = () => done(new Error('The operation was aborted'));
+            const onAbort = () => done(Object.assign(new Error('The operation was aborted'), {
+                name: 'AbortError',
+                code: 'ABORT_ERR',
+                cause: abortSignal.reason,
+            }));
             abortSignal.addEventListener('abort', onAbort, { once: true });
             listeners.push(() => abortSignal.removeEventListener('abort', onAbort));
         }
@@ -183,30 +191,42 @@ export async function finished(
         ) {
             const controller = webClosedController(stream);
             if (controller) {
-                controller._addClosedCallback(() => done(), done);
+                controller._addClosedCallback(() => done(), (reason) => done(reportErrors ? reason : undefined));
                 return;
             }
         }
 
-        if (readable && isReadableLike(stream)) {
-            if (stream.readableEnded || stream._readableState?.endEmitted || stream._readableState?.ended) {
-                done();
-                return;
-            }
-            on(stream, 'end', () => done());
-            on(stream, 'error', (...args: unknown[]) => done(args[0]));
-        }
-        if (writable && isWritableLike(stream)) {
-            if (stream.writableFinished || stream._writableState?.finished) {
-                done();
-                return;
-            }
-            on(stream, 'finish', () => done());
-            on(stream, 'error', (...args: unknown[]) => done(args[0]));
-        }
-
-        if (!isReadableLike(stream) && !isWritableLike(stream)) {
+        const nodeReadable = readable && isReadableLike(stream);
+        const nodeWritable = writable && isWritableLike(stream);
+        if (!nodeReadable && !nodeWritable) {
             done(new TypeError('The "stream" argument must be a stream'));
+            return;
         }
+
+        let readableDone = !nodeReadable || !!stream.readableEnded || !!stream._readableState?.endEmitted;
+        let writableDone = !nodeWritable || !!stream.writableFinished || !!stream._writableState?.finished;
+
+        const maybeDone = () => {
+            if (readableDone && writableDone) done();
+        };
+        const onClose = () => {
+            if (readableDone && writableDone) done();
+            else if (reportErrors) {
+                done(Object.assign(new Error('Premature close'), { code: 'ERR_STREAM_PREMATURE_CLOSE' }));
+            } else {
+                done();
+            }
+        };
+
+        if (nodeReadable) on(stream, 'end', () => { readableDone = true; maybeDone(); });
+        if (nodeWritable) on(stream, 'finish', () => { writableDone = true; maybeDone(); });
+        on(stream, 'close', onClose);
+        if (reportErrors) on(stream, 'error', (...args: unknown[]) => done(args[0]));
+
+        if (Reflect.get(stream as object, 'errored') != null && reportErrors) {
+            done(Reflect.get(stream as object, 'errored'));
+            return;
+        }
+        maybeDone();
     });
 }

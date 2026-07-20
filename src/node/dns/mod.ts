@@ -1,30 +1,42 @@
 /**
  * Node.js dns module
- * Based on CModuleDNS implementation
  */
 
 const dns = import.meta.use('dns');
 const os = import.meta.use('os');
 const timers = import.meta.use('timers');
-import { toErrnoException } from '../_internal/errno';
+
 import {
     type DefaultResultOrder,
+    type NodeAnyRecord,
+    type NodeCaaRecord,
+    type NodeMxRecord,
+    type NodeNaptrRecord,
+    type NodeSoaRecord,
+    type NodeSrvRecord,
+    type ResolverOptions,
     type Rrtype,
-    abortQueryQuietly,
-    typeMap,
-    expandIPv6,
+    ResolverQuery,
+    createDnsError,
+    getAddressFamily,
+    getDefaultLookupOrder,
+    getDefaultServers,
     isAddressAnswer,
-    isTxtAnswer,
+    normalizeLookupError,
     normalizeLookupOptions,
-    normalizeServers,
-    shapeAnswers,
+    normalizeLookupServiceError,
+    normalizeLookupServicePort,
+    orderLookupAddresses,
+    queryDns,
     reverseName,
-    validateDefaultResultOrder,
+    shapeAnswers,
+    setDefaultLookupOrder,
+    setDefaultServers,
+    validateHostname,
+    validateLookupServiceAddress,
     validateRrtype,
 } from './_internal';
 import * as promises from './promises';
-
-// Constants
 
 export const NODATA = 'ENODATA';
 export const FORMERR = 'EFORMERR';
@@ -54,8 +66,6 @@ export const V4MAPPED = 8;
 export const ALL = 16;
 export const ADDRCONFIG = 32;
 
-// Resolution options
-
 export interface ResolveOptions {
     ttl?: boolean;
 }
@@ -65,6 +75,7 @@ export interface LookupOptions {
     hints?: number;
     all?: boolean;
     verbatim?: boolean;
+    order?: DefaultResultOrder;
 }
 
 export interface LookupOneOptions extends LookupOptions {
@@ -75,59 +86,20 @@ export interface LookupAllOptions extends LookupOptions {
     all: true;
 }
 
-// Resolution record types
-
-export interface MxRecord {
-    priority: number;
-    exchange: string;
-}
-
-export interface NaptrRecord {
-    flags: string;
-    service: string;
-    regexp: string;
-    replacement: string;
-    order: number;
-    preference: number;
-}
-
-export interface SoaRecord {
-    nsname: string;
-    hostmaster: string;
-    serial: number;
-    refresh: number;
-    retry: number;
-    expire: number;
-    minttl: number;
-}
-
-export interface SrvRecord {
-    priority: number;
-    weight: number;
-    port: number;
-    name: string;
-}
+export type MxRecord = NodeMxRecord;
+export type NaptrRecord = NodeNaptrRecord;
+export type SoaRecord = NodeSoaRecord;
+export type SrvRecord = NodeSrvRecord;
+export type AnyRecord = NodeAnyRecord;
+export type CaaRecord = NodeCaaRecord;
 
 export interface TxtRecord {
     [index: number]: string;
 }
 
-export type AnyRecord = CModuleDNS.DNSAnswer;
-
-export interface CaaRecord {
-    critical: boolean;
-    issue?: string;
-    issuewild?: string;
-    iodef?: string;
-}
-
-const DNS_QUERY_TIMEOUT_MS = 2000;
-
-function query(hostname: string, type: number): Promise<CModuleDNS.DNSAnswer[]> {
-    const req = dns.query(hostname, type);
-    const id = timers.setTimeout(() => abortQueryQuietly(req), DNS_QUERY_TIMEOUT_MS);
-    return req.finally(() => timers.clearTimeout(id));
-}
+type ResolveResult = ReturnType<typeof shapeAnswers>;
+type DnsCallback = (error: NodeJS.ErrnoException | null, result: ResolveResult) => void;
+type QuerySource = (hostname: string, rrtype: Rrtype) => Promise<CModuleDNS.DNSAnswer[]>;
 
 function assertCallback(callback: unknown): asserts callback is (...args: unknown[]) => void {
     if (typeof callback !== 'function') {
@@ -136,126 +108,174 @@ function assertCallback(callback: unknown): asserts callback is (...args: unknow
 }
 
 function wantsTtl(options: unknown): boolean {
-    if (typeof options !== 'object' || options === null) return false;
-    return Reflect.get(options, 'ttl') === true;
+    return typeof options === 'object' && options !== null && Boolean(Reflect.get(options, 'ttl'));
 }
 
-// lookup - basic name resolution
+function globalQuery(hostname: string, rrtype: Rrtype): Promise<CModuleDNS.DNSAnswer[]> {
+    return queryDns(hostname, rrtype, getDefaultServers());
+}
+
+function completeResolve(
+    hostname: string,
+    rrtype: Rrtype,
+    callback: DnsCallback,
+    query: QuerySource,
+): void {
+    query(hostname, rrtype).then(
+        answers => {
+            const result = shapeAnswers(rrtype, answers);
+            if (rrtype === 'SOA' && result === null) {
+                callback(createDnsError(NODATA, 'querySoa', hostname), null);
+            } else {
+                callback(null, result);
+            }
+        },
+        error => callback(error, null),
+    );
+}
+
+function resolveTyped(hostname: unknown, rrtype: Rrtype, callback: unknown, query: QuerySource): void {
+    validateHostname(hostname);
+    assertCallback(callback);
+    completeResolve(hostname, rrtype, callback, query);
+}
+
+function resolveAddress(
+    hostname: unknown,
+    rrtype: 'A' | 'AAAA',
+    options: unknown,
+    callback: unknown,
+    query: QuerySource,
+): void {
+    validateHostname(hostname);
+    assertCallback(callback);
+    query(hostname, rrtype).then(
+        answers => {
+            const addressType = rrtype === 'A' ? dns.A : dns.AAAA;
+            const addresses = answers.filter(isAddressAnswer).filter(answer => answer.type === addressType);
+            callback(null, wantsTtl(options)
+                ? addresses.map(answer => ({ address: answer.address, ttl: answer.ttl }))
+                : addresses.map(answer => answer.address));
+        },
+        error => callback(error, null),
+    );
+}
 
 export function lookup(hostname: string, callback: (err: NodeJS.ErrnoException | null, address: string, family: number) => void): void;
 export function lookup(hostname: string, family: number, callback: (err: NodeJS.ErrnoException | null, address: string, family: number) => void): void;
 export function lookup(hostname: string, options: LookupOneOptions, callback: (err: NodeJS.ErrnoException | null, address: string, family: number) => void): void;
 export function lookup(hostname: string, options: LookupAllOptions, callback: (err: NodeJS.ErrnoException | null, addresses: Array<{ address: string; family: number }>) => void): void;
 export function lookup(hostname: string, options: LookupOptions, callback: (err: NodeJS.ErrnoException | null, address: string | Array<{ address: string; family: number }>, family: number) => void): void;
-export function lookup(hostname: string, options?: unknown, callback?: unknown): void {
+export function lookup(hostname: unknown, options?: unknown, callback?: unknown): void {
     if (typeof options === 'function') {
         callback = options;
-        options = {};
+        options = undefined;
+    }
+    if (hostname && typeof hostname !== 'string') {
+        throw new TypeError(`The "hostname" argument must be of type string. Received ${String(hostname)}`);
+    }
+    if (typeof hostname === 'string' && hostname.includes('\0')) {
+        throw new TypeError('The "hostname" argument must be a string without null bytes');
+    }
+    assertCallback(callback);
+    const normalized = normalizeLookupOptions(options, getDefaultLookupOrder(), true);
+
+    if (!hostname) {
+        timers.setTimeout(() => {
+            if (normalized.all) callback(null, []);
+            else callback(null, null, normalized.family === 6 ? 6 : 4);
+        }, 0);
+        return;
+    }
+    if (typeof hostname !== 'string') {
+        throw new TypeError(`The "hostname" argument must be of type string. Received ${String(hostname)}`);
+    }
+    const matchedFamily = getAddressFamily(hostname);
+    if (matchedFamily !== 0) {
+        timers.setTimeout(() => {
+            const result = { address: hostname, family: matchedFamily };
+            if (normalized.all) callback(null, [result]);
+            else callback(null, result.address, result.family);
+        }, 0);
+        return;
     }
 
-    const { family, all } = normalizeLookupOptions(options);
-    assertCallback(callback);
-
-    dns.resolve(hostname, { family: family === 0 ? os.AF_UNSPEC : family === 4 ? os.AF_INET : os.AF_INET6 }).then(
+    dns.resolve(hostname, {
+        family: normalized.family === 0 ? os.AF_UNSPEC : normalized.family === 4 ? os.AF_INET : os.AF_INET6,
+        hints: normalized.hints,
+    }).then(
         addresses => {
-            if (all) {
-                callback(null, addresses.map(a => ({ address: a.ip, family: a.family })));
-            } else {
-                const addr = addresses[0];
-                if (addr) {
-                    callback(null, addr.ip, addr.family);
-                } else {
-                    callback(toErrnoException(new Error(`ENOTFOUND ${hostname}`), 'lookup', hostname), '', 0);
-                }
+            const ordered = orderLookupAddresses(addresses, normalized.order);
+            if (normalized.all) {
+                callback(null, ordered.map(address => ({ address: address.ip, family: address.family })));
+                return;
             }
+            const address = ordered[0];
+            if (!address) callback(createDnsError(NOTFOUND, 'getaddrinfo', hostname));
+            else callback(null, address.ip, address.family);
         },
-        err => callback(toErrnoException(err, 'lookup', hostname))
+        error => callback(normalizeLookupError(error, hostname)),
     );
 }
 
-// util.promisify(dns.lookup) → { address, family } (not just address string)
 Object.defineProperty(lookup, Symbol.for('nodejs.util.promisify.customArgs'), {
     value: ['address', 'family'],
     enumerable: false,
 });
 
 export function lookupSync(hostname: string, options?: LookupOptions | number): string | Array<{ address: string; family: number }> {
-    const { family, all } = normalizeLookupOptions(options);
-
-    let addresses: CModuleStreams.AddressInfo[];
+    if (typeof hostname !== 'string') {
+        throw new TypeError(`The "hostname" argument must be of type string. Received ${String(hostname)}`);
+    }
+    const normalized = normalizeLookupOptions(options, getDefaultLookupOrder(), true);
+    const matchedFamily = getAddressFamily(hostname);
+    if (matchedFamily !== 0) {
+        if (normalized.all) return [{ address: hostname, family: matchedFamily }];
+        return hostname;
+    }
+    let addresses: CModuleDNS.ResolvedAddress[];
     try {
-        addresses = dns.resolveSync(hostname, { family: family === 0 ? os.AF_UNSPEC : family === 4 ? os.AF_INET : os.AF_INET6 });
-    } catch (err) {
-        throw toErrnoException(err, 'lookup', hostname);
+        addresses = dns.resolveSync(hostname, {
+            family: normalized.family === 0 ? os.AF_UNSPEC : normalized.family === 4 ? os.AF_INET : os.AF_INET6,
+            hints: normalized.hints,
+        });
+    } catch (error) {
+        throw normalizeLookupError(error, hostname);
     }
-
-    if (all) {
-        return addresses.map(a => ({ address: a.ip, family: a.family }));
-    }
-
-    return addresses[0]?.ip ?? '';
+    const ordered = orderLookupAddresses(addresses, normalized.order);
+    if (normalized.all) return ordered.map(address => ({ address: address.ip, family: address.family }));
+    const address = ordered[0];
+    if (!address) throw createDnsError(NOTFOUND, 'getaddrinfo', hostname);
+    return address.ip;
 }
 
-// resolve - resolve specific record types
-
 export function resolve(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
-export function resolve(hostname: string, rrtype: 'A', callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
-export function resolve(hostname: string, rrtype: 'AAAA', callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
+export function resolve(hostname: string, rrtype: 'A' | 'AAAA' | 'CNAME' | 'NS' | 'PTR', callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
 export function resolve(hostname: string, rrtype: 'ANY', callback: (err: NodeJS.ErrnoException | null, addresses: AnyRecord[]) => void): void;
 export function resolve(hostname: string, rrtype: 'CAA', callback: (err: NodeJS.ErrnoException | null, addresses: CaaRecord[]) => void): void;
-export function resolve(hostname: string, rrtype: 'CNAME', callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
 export function resolve(hostname: string, rrtype: 'MX', callback: (err: NodeJS.ErrnoException | null, addresses: MxRecord[]) => void): void;
 export function resolve(hostname: string, rrtype: 'NAPTR', callback: (err: NodeJS.ErrnoException | null, addresses: NaptrRecord[]) => void): void;
-export function resolve(hostname: string, rrtype: 'NS', callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
-export function resolve(hostname: string, rrtype: 'PTR', callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
 export function resolve(hostname: string, rrtype: 'SOA', callback: (err: NodeJS.ErrnoException | null, addresses: SoaRecord) => void): void;
 export function resolve(hostname: string, rrtype: 'SRV', callback: (err: NodeJS.ErrnoException | null, addresses: SrvRecord[]) => void): void;
-export function resolve(hostname: string, rrtype: 'TXT', callback: (err: NodeJS.ErrnoException | null, addresses: TxtRecord[]) => void): void;
+export function resolve(hostname: string, rrtype: 'TXT', callback: (err: NodeJS.ErrnoException | null, addresses: string[][]) => void): void;
 export function resolve(hostname: string, rrtype?: unknown, callback?: unknown): void {
     if (typeof rrtype === 'function') {
         callback = rrtype;
         rrtype = 'A';
     }
-
-    const normalizedRrtype: Rrtype = validateRrtype(rrtype);
-    assertCallback(callback);
-    const queryType = typeMap[normalizedRrtype];
-
-    query(hostname, queryType).then(
-        answers => {
-            const result = shapeAnswers(normalizedRrtype, answers);
-            if (normalizedRrtype === 'SOA' && !result) {
-                callback(toErrnoException(new Error('ENODATA'), 'query', hostname), null);
-            } else {
-                callback(null, result);
-            }
-        },
-        err => callback(toErrnoException(err, 'resolve', hostname))
-    );
+    if (rrtype === undefined) rrtype = 'A';
+    const normalizedRrtype = validateRrtype(rrtype);
+    resolveTyped(hostname, normalizedRrtype, callback, globalQuery);
 }
-
-// resolve4 / resolve6
 
 export function resolve4(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
 export function resolve4(hostname: string, options: { ttl: true }, callback: (err: NodeJS.ErrnoException | null, addresses: Array<{ address: string; ttl: number }>) => void): void;
 export function resolve4(hostname: string, options?: unknown, callback?: unknown): void {
     if (typeof options === 'function') {
         callback = options;
-        options = {};
+        options = undefined;
     }
-    assertCallback(callback);
-
-    query(hostname, dns.A).then(
-        answers => {
-            const addresses = answers.filter(isAddressAnswer);
-            if (wantsTtl(options)) {
-                callback(null, addresses.map(a => ({ address: a.address, ttl: a.ttl })));
-            } else {
-                callback(null, addresses.map(a => a.address));
-            }
-        },
-        err => callback(toErrnoException(err, 'resolve4', hostname))
-    );
+    resolveAddress(hostname, 'A', options, callback, globalQuery);
 }
 
 export function resolve6(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
@@ -263,131 +283,199 @@ export function resolve6(hostname: string, options: { ttl: true }, callback: (er
 export function resolve6(hostname: string, options?: unknown, callback?: unknown): void {
     if (typeof options === 'function') {
         callback = options;
-        options = {};
+        options = undefined;
     }
-    assertCallback(callback);
-
-    query(hostname, dns.AAAA).then(
-        answers => {
-            const addresses = answers.filter(isAddressAnswer);
-            if (wantsTtl(options)) {
-                callback(null, addresses.map(a => ({ address: a.address, ttl: a.ttl })));
-            } else {
-                callback(null, addresses.map(a => a.address));
-            }
-        },
-        err => callback(toErrnoException(err, 'resolve6', hostname))
-    );
+    resolveAddress(hostname, 'AAAA', options, callback, globalQuery);
 }
 
-// resolveCname / resolveMx / resolveNs / resolveTxt / resolveSrv / resolvePtr / resolveSoa
+export function resolveAny(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: AnyRecord[]) => void): void {
+    resolveTyped(hostname, 'ANY', callback, globalQuery);
+}
+
+export function resolveCaa(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: CaaRecord[]) => void): void {
+    resolveTyped(hostname, 'CAA', callback, globalQuery);
+}
 
 export function resolveCname(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void {
-    resolve(hostname, 'CNAME', callback);
+    resolveTyped(hostname, 'CNAME', callback, globalQuery);
 }
 
 export function resolveMx(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: MxRecord[]) => void): void {
-    resolve(hostname, 'MX', callback);
-}
-
-export function resolveNs(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void {
-    resolve(hostname, 'NS', callback);
-}
-
-export function resolveTxt(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[][]) => void): void;
-export function resolveTxt(hostname: string, callback: unknown): void {
-    assertCallback(callback);
-    query(hostname, dns.TXT).then(
-        answers => callback(null, answers.filter(isTxtAnswer).map(a => [a.txt])),
-        err => callback(toErrnoException(err, 'resolveTxt', hostname), null)
-    );
-}
-
-export function resolveSrv(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: SrvRecord[]) => void): void {
-    resolve(hostname, 'SRV', callback);
-}
-
-export function resolvePtr(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void {
-    resolve(hostname, 'PTR', callback);
-}
-
-export function resolveSoa(hostname: string, callback: (err: NodeJS.ErrnoException | null, address: SoaRecord) => void): void {
-    resolve(hostname, 'SOA', callback);
+    resolveTyped(hostname, 'MX', callback, globalQuery);
 }
 
 export function resolveNaptr(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: NaptrRecord[]) => void): void {
-    resolve(hostname, 'NAPTR', callback);
+    resolveTyped(hostname, 'NAPTR', callback, globalQuery);
 }
 
-// reverse
+export function resolveNs(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void {
+    resolveTyped(hostname, 'NS', callback, globalQuery);
+}
+
+export function resolvePtr(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void {
+    resolveTyped(hostname, 'PTR', callback, globalQuery);
+}
+
+export function resolveSoa(hostname: string, callback: (err: NodeJS.ErrnoException | null, address: SoaRecord) => void): void {
+    resolveTyped(hostname, 'SOA', callback, globalQuery);
+}
+
+export function resolveSrv(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: SrvRecord[]) => void): void {
+    resolveTyped(hostname, 'SRV', callback, globalQuery);
+}
+
+export function resolveTxt(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[][]) => void): void {
+    resolveTyped(hostname, 'TXT', callback, globalQuery);
+}
 
 export function reverse(ip: string, callback: (err: NodeJS.ErrnoException | null, hostnames: string[]) => void): void {
     assertCallback(callback);
     if (ip === '127.0.0.1' || ip === '::1') {
-        callback(null, ['localhost']);
+        timers.setTimeout(() => callback(null, ['localhost']), 0);
         return;
     }
-    resolve(reverseName(ip), 'PTR', (err, hostnames) => {
-        callback(err, hostnames);
-    });
+    const hostname = reverseName(ip);
+    resolveTyped(hostname, 'PTR', callback, globalQuery);
 }
 
-// setServers / getServers
-
-let _dnsServers: string[] = [];
-
 export function setServers(servers: string[]): void {
-    _dnsServers = normalizeServers(servers);
+    setDefaultServers(servers);
 }
 
 export function getServers(): string[] {
-    return _dnsServers.length > 0 ? [..._dnsServers] : ['8.8.8.8', '8.8.4.4'];
+    return getDefaultServers();
 }
 
-let _defaultResultOrder: DefaultResultOrder = 'verbatim';
-
 export function setDefaultResultOrder(order: DefaultResultOrder): void {
-    validateDefaultResultOrder(order);
-    _defaultResultOrder = order;
+    setDefaultLookupOrder(order);
 }
 
 export function getDefaultResultOrder(): DefaultResultOrder {
-    return _defaultResultOrder;
+    return getDefaultLookupOrder();
 }
 
-export function lookupService(address: string, port: number, callback: (err: NodeJS.ErrnoException | null, hostname: string, service: string) => void): void {
-    if (arguments.length < 3) {
-        throw new TypeError('The "address", "port", and "callback" arguments must be specified');
+export function lookupService(address: string, port: number, callback: (err: NodeJS.ErrnoException | null, hostname: string, service: string) => void): void;
+export function lookupService(address: string, port: number, callback: unknown): void {
+    if (arguments.length !== 3) {
+        const error: NodeJS.ErrnoException = new TypeError('The "address", "port", and "callback" arguments must be specified');
+        error.code = 'ERR_MISSING_ARGS';
+        throw error;
     }
+    validateLookupServiceAddress(address);
+    const normalizedPort = normalizeLookupServicePort(port);
     assertCallback(callback);
-    if (address === '10.0.0.0') {
-        callback(createLookupServiceNotFound(address), '', '');
-        return;
+    let request: Promise<{ hostname: string; service: string }>;
+    try {
+        request = dns.lookupService(address, normalizedPort);
+    } catch (error) {
+        throw normalizeLookupServiceError(error, address);
     }
-    const hostname = address === '127.0.0.1' || address === '::1' ? 'localhost' : address;
-    const service = port === 80 ? 'http' : String(port);
-    callback(null, hostname, service);
-}
-
-function createLookupServiceNotFound(address: string): NodeJS.ErrnoException {
-    const err: NodeJS.ErrnoException = new Error(`getnameinfo ENOTFOUND ${address}`);
-    err.code = 'ENOTFOUND';
-    err.syscall = 'getnameinfo';
-    return err;
+    request.then(
+        result => callback(null, result.hostname, result.service),
+        error => callback(normalizeLookupServiceError(error, address)),
+    );
 }
 
 export class Resolver {
-    private _servers = getServers();
+    private readonly resolver: ResolverQuery;
+
+    constructor(options?: ResolverOptions) {
+        this.resolver = new ResolverQuery(getDefaultServers(), options);
+    }
+
+    cancel(): void {
+        this.resolver.cancel();
+    }
 
     getServers(): string[] {
-        return [...this._servers];
+        return this.resolver.getServers();
     }
 
     setServers(servers: string[]): void {
-        this._servers = normalizeServers(servers);
+        this.resolver.setServers(servers);
+    }
+
+    private query = (hostname: string, rrtype: Rrtype): Promise<CModuleDNS.DNSAnswer[]> => this.resolver.query(hostname, rrtype);
+
+    resolve(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
+    resolve(hostname: string, rrtype: string, callback: (err: NodeJS.ErrnoException | null, addresses: ResolveResult) => void): void;
+    resolve(hostname: string, rrtype?: unknown, callback?: unknown): void {
+        if (typeof rrtype === 'function') {
+            callback = rrtype;
+            rrtype = 'A';
+        }
+        if (rrtype === undefined) rrtype = 'A';
+        resolveTyped(hostname, validateRrtype(rrtype), callback, this.query);
+    }
+
+    resolve4(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
+    resolve4(hostname: string, options: ResolveOptions, callback: (err: NodeJS.ErrnoException | null, addresses: string[] | Array<{ address: string; ttl: number }>) => void): void;
+    resolve4(hostname: string, options?: unknown, callback?: unknown): void {
+        if (typeof options === 'function') {
+            callback = options;
+            options = undefined;
+        }
+        resolveAddress(hostname, 'A', options, callback, this.query);
+    }
+
+    resolve6(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void;
+    resolve6(hostname: string, options: ResolveOptions, callback: (err: NodeJS.ErrnoException | null, addresses: string[] | Array<{ address: string; ttl: number }>) => void): void;
+    resolve6(hostname: string, options?: unknown, callback?: unknown): void {
+        if (typeof options === 'function') {
+            callback = options;
+            options = undefined;
+        }
+        resolveAddress(hostname, 'AAAA', options, callback, this.query);
+    }
+
+    resolveAny(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: AnyRecord[]) => void): void {
+        resolveTyped(hostname, 'ANY', callback, this.query);
+    }
+
+    resolveCaa(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: CaaRecord[]) => void): void {
+        resolveTyped(hostname, 'CAA', callback, this.query);
+    }
+
+    resolveCname(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void {
+        resolveTyped(hostname, 'CNAME', callback, this.query);
+    }
+
+    resolveMx(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: MxRecord[]) => void): void {
+        resolveTyped(hostname, 'MX', callback, this.query);
+    }
+
+    resolveNaptr(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: NaptrRecord[]) => void): void {
+        resolveTyped(hostname, 'NAPTR', callback, this.query);
+    }
+
+    resolveNs(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void {
+        resolveTyped(hostname, 'NS', callback, this.query);
+    }
+
+    resolvePtr(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[]) => void): void {
+        resolveTyped(hostname, 'PTR', callback, this.query);
+    }
+
+    resolveSoa(hostname: string, callback: (err: NodeJS.ErrnoException | null, address: SoaRecord) => void): void {
+        resolveTyped(hostname, 'SOA', callback, this.query);
+    }
+
+    resolveSrv(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: SrvRecord[]) => void): void {
+        resolveTyped(hostname, 'SRV', callback, this.query);
+    }
+
+    resolveTxt(hostname: string, callback: (err: NodeJS.ErrnoException | null, addresses: string[][]) => void): void {
+        resolveTyped(hostname, 'TXT', callback, this.query);
+    }
+
+    reverse(ip: string, callback: (err: NodeJS.ErrnoException | null, hostnames: string[]) => void): void {
+        assertCallback(callback);
+        if (ip === '127.0.0.1' || ip === '::1') {
+            timers.setTimeout(() => callback(null, ['localhost']), 0);
+            return;
+        }
+        resolveTyped(reverseName(ip), 'PTR', callback, this.query);
     }
 }
-
-// promises API
 
 export { promises };

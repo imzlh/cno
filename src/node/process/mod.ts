@@ -17,6 +17,7 @@ const proc = import.meta.use('process');
 const streams = import.meta.use('streams');
 const console = import.meta.use('console');
 const errMod = import.meta.use('error');
+const napi = import.meta.use('nodeapi');
 
 interface CnoProcessArgs {
     nodeArgv(): string[];
@@ -968,8 +969,28 @@ export const mainModule: NodeJS.Module | undefined = undefined;
 
 export const debugPort: number = 5858;
 
-export function dlopen(module: object, filename: string, flags?: number): void {
-    unsupported('process.dlopen');
+/**
+ * Load a Node-API `.node` into `module.exports` (same loader as CJS require).
+ * Legacy V8/NAN addons fail closed inside nodeapi.
+ */
+export function dlopen(module: { exports?: unknown }, filename: string, _flags?: number): void {
+    if (module === null || typeof module !== 'object') {
+        throw new TypeError('The "module" argument must be of type object');
+    }
+    if (typeof filename !== 'string' || filename.length === 0) {
+        throw new TypeError('The "filename" argument must be a non-empty string');
+    }
+    if (!napi || typeof napi.dlopen !== 'function') {
+        throw new Error('Node-API native addons are unavailable in this runtime context');
+    }
+    try {
+        module.exports = napi.dlopen(filename);
+    } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        const err = new Error(`Error loading shared library ${filename}: ${msg}`);
+        Reflect.set(err, 'code', 'ERR_DLOPEN_FAILED');
+        throw err;
+    }
 }
 
 export const finalization = {

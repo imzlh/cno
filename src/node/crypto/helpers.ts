@@ -6,7 +6,7 @@ const engine = import.meta.use('engine');
 const crypto = import.meta.use('crypto');
 const algorithm = import.meta.use('algorithm');
 import { Buffer } from '../buffer';
-import type { BinaryInput, Cipheriv, Decipheriv, Hmac, KeyInput, KeyWithOptions } from './types';
+import type { BinaryInput, KeyInput, KeyWithOptions } from './types';
 import { concatChunks as concatBuffers } from '../_internal/buffer';
 export { concatBuffers };
 
@@ -226,10 +226,15 @@ export function p1363ToDer(signature: BinaryInput): ArrayBuffer {
     return out.buffer;
 }
 
+export type BufferedCipher = {
+    update(data: BinaryInput, inputEncoding?: string, outputEncoding?: string): Uint8Array | string;
+    final(outputEncoding?: string): Uint8Array | string;
+};
+
 export function createBufferedCipher(
     transform: (data: Uint8Array) => ArrayBuffer,
     blockSize = 16,
-): Cipheriv {
+): BufferedCipher {
     const chunks: Uint8Array[] = [];
     let outChunks: Uint8Array[] = [];
     return {
@@ -258,7 +263,7 @@ export function createBufferedCipher(
 export const createBufferedDecipher = createBufferedCipher as (
     transform: (data: Uint8Array) => ArrayBuffer,
     blockSize?: number,
-) => Decipheriv;
+) => BufferedCipher;
 
 export function isGcmAlgorithm(algorithm: string): boolean {
     const a = algorithm.toLowerCase();
@@ -313,7 +318,12 @@ export function isSupportedHmacAlgorithm(algorithm: string): boolean {
     }
 }
 
-export function createOneShotHmac(algorithm: string, key: Uint8Array): Hmac {
+export type BufferedHmac = {
+    update(input: BinaryInput, encoding?: string): BufferedHmac;
+    digest(encoding?: string): Uint8Array | string;
+};
+
+export function createOneShotHmac(algorithm: string, key: Uint8Array): BufferedHmac {
     const chunks: Uint8Array[] = [];
     return {
         update(input: BinaryInput, encoding?: string) {

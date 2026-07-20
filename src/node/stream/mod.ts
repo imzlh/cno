@@ -14,18 +14,28 @@ export interface StreamOptions {
 
 export interface ReadableOptions extends StreamOptions {
     read?: (size: number) => void;
+    readableObjectMode?: boolean;
+    readableHighWaterMark?: number;
 }
 
 export interface WritableOptions extends StreamOptions {
+    decodeStrings?: boolean;
+    defaultEncoding?: BufferEncoding;
     write?: (chunk: unknown, encoding: BufferEncoding, callback: (error?: Error | null) => void) => void;
     writev?: (chunks: Array<{ chunk: unknown; encoding: BufferEncoding }>, callback: (error?: Error | null) => void) => void;
     final?: (callback: (error?: Error | null) => void) => void;
+    writableObjectMode?: boolean;
+    writableHighWaterMark?: number;
 }
 
 export interface DuplexOptions extends ReadableOptions, WritableOptions {
     allowHalfOpen?: boolean;
     readable?: boolean;
     writable?: boolean;
+    readableObjectMode?: boolean;
+    writableObjectMode?: boolean;
+    readableHighWaterMark?: number;
+    writableHighWaterMark?: number;
 }
 
 export interface TransformOptions extends DuplexOptions {
@@ -38,17 +48,21 @@ export interface PipeOptions {
 }
 
 function isAsyncIterable(value: Iterable<unknown> | AsyncIterable<unknown>): value is AsyncIterable<unknown> {
-    return typeof Reflect.get(value, Symbol.asyncIterator) === 'function';
+    return value !== null && value !== undefined
+        && typeof Reflect.get(value, Symbol.asyncIterator) === 'function';
 }
 
 function isIterable(value: Iterable<unknown> | AsyncIterable<unknown>): value is Iterable<unknown> {
-    return typeof Reflect.get(value, Symbol.iterator) === 'function';
+    return value !== null && value !== undefined
+        && typeof Reflect.get(value, Symbol.iterator) === 'function';
 }
 
 function normalizeChunk(chunk: unknown, objectMode: boolean, encoding: BufferEncoding | undefined, defaultEncoding: BufferEncoding): unknown {
     if (objectMode || chunk === null) return chunk;
     if (typeof chunk === 'string') return Buffer.from(chunk, encoding || defaultEncoding);
-    if (chunk instanceof Uint8Array && !(chunk instanceof Buffer)) return Buffer.from(chunk);
+    if (ArrayBuffer.isView(chunk) && !(chunk instanceof Buffer)) {
+        return Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+    }
     return chunk;
 }
 
@@ -56,6 +70,25 @@ function createWriteAfterEndError(): Error & { code: string } {
     return Object.assign(new Error('write after end'), {
         code: 'ERR_STREAM_WRITE_AFTER_END',
     });
+}
+
+function createNullWriteError(): TypeError & { code: string } {
+    return Object.assign(new TypeError('May not write null values to stream'), {
+        code: 'ERR_STREAM_NULL_VALUES',
+    });
+}
+
+function createInvalidChunkError(chunk: unknown): TypeError & { code: string } {
+    const constructor = chunk !== null && (typeof chunk === 'object' || typeof chunk === 'function')
+        ? Reflect.get(chunk, 'constructor')
+        : undefined;
+    const received = chunk === undefined
+        ? 'undefined'
+        : `an instance of ${typeof constructor === 'function' ? constructor.name : typeof chunk}`;
+    return Object.assign(new TypeError(
+        'The "chunk" argument must be of type string or an instance of Buffer, TypedArray, or DataView. ' +
+        `Received ${received}`,
+    ), { code: 'ERR_INVALID_ARG_TYPE' });
 }
 
 function asError(error: unknown): Error {
@@ -125,8 +158,14 @@ function decoderBytes(chunk: unknown): Buffer | null {
     return null;
 }
 
+function bufferFromView(chunk: unknown): Buffer {
+    if (!ArrayBuffer.isView(chunk)) return Buffer.alloc(0);
+    return Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+}
+
 export interface Stream extends EventEmitter {
     destroyed: boolean;
+    errored: Error | null;
     _pipedDestinations: Writable[];
     pipe<T extends Writable>(destination: T, options?: PipeOptions): T;
     destroy(error?: Error | null): this;
@@ -141,6 +180,7 @@ export interface StreamConstructor {
 function initStream(self: Stream): void {
     EventEmitter.call(self);
     if (typeof self.destroyed !== 'boolean') self.destroyed = false;
+    self.errored = null;
     if (!Array.isArray(self._pipedDestinations)) self._pipedDestinations = [];
 }
 
@@ -229,6 +269,7 @@ Stream.prototype.destroy = function destroy(this: Stream, error?: Error | null):
     if (this.destroyed) return this;
     this.destroyed = true;
     if (error) {
+        this.errored = error;
         this.emit('error', error);
     }
     this.emit('close');
@@ -263,7 +304,112 @@ type ReadableState = {
     decoder: StringDecoder | null;
     encoding: BufferEncoding | null;
     disturbed: boolean;
+    emitClose: boolean;
+    autoDestroy: boolean;
 };
+
+type ReadableTarget = {
+    _readableState: ReadableState;
+    readableLength: number;
+    readableDidRead: boolean;
+    _read(size: number): void;
+    _emitReadableEndIfNeeded(): void;
+    emit(event: string, ...args: unknown[]): boolean;
+};
+
+function readableChunkLength(state: ReadableState, chunk: unknown): number {
+    if (state.objectMode) return 1;
+    if (typeof chunk === 'string') return chunk.length;
+    if (ArrayBuffer.isView(chunk)) return chunk.byteLength;
+    return 0;
+}
+
+function updateReadableLength(stream: { _readableState: ReadableState; readableLength: number }): number {
+    const state = stream._readableState;
+    let length = 0;
+    for (const chunk of state.buffer) length += readableChunkLength(state, chunk);
+    stream.readableLength = length;
+    return stream.readableLength;
+}
+
+function requestReadableData(target: ReadableTarget, size: number): void {
+    const state = target._readableState;
+    if (state.destroyed || state.ended || state.reading) return;
+    state.reading = true;
+    try {
+        target._read(size);
+    } catch (err) {
+        state.reading = false;
+        target.emit('error', err);
+    }
+}
+
+function joinReadableChunks(chunks: unknown[], stringMode: boolean): unknown {
+    if (chunks.length === 1) return chunks[0];
+    if (stringMode) return chunks.join('');
+    return Buffer.concat(chunks.map(bufferFromView));
+}
+
+function consumeReadableData(state: ReadableState, size: number): unknown {
+    if (state.objectMode) return state.buffer.shift();
+
+    const chunks: unknown[] = [];
+    let remaining = size;
+    while (remaining > 0 && state.buffer.length > 0) {
+        const chunk = state.buffer[0];
+        const length = readableChunkLength(state, chunk);
+        if (length <= remaining) {
+            chunks.push(state.buffer.shift());
+            remaining -= length;
+            continue;
+        }
+        if (typeof chunk === 'string') {
+            chunks.push(chunk.slice(0, remaining));
+            state.buffer[0] = chunk.slice(remaining);
+        } else {
+            const bytes = bufferFromView(chunk);
+            chunks.push(bytes.subarray(0, remaining));
+            state.buffer[0] = bytes.subarray(remaining);
+        }
+        remaining = 0;
+    }
+    return joinReadableChunks(chunks, typeof chunks[0] === 'string');
+}
+
+function readReadableData(target: ReadableTarget, n?: number): unknown {
+    const state = target._readableState;
+    const numeric = n === null ? NaN : Number(n);
+    const requested = n === undefined || Number.isNaN(numeric) || !Number.isFinite(numeric)
+        ? undefined
+        : Math.floor(numeric);
+    requestReadableData(target, Math.max(state.highWaterMark, requested ?? 0));
+
+    const available = updateReadableLength(target);
+    if (requested !== undefined && requested <= 0) return null;
+    if (available === 0) {
+        if (state.ended) target._emitReadableEndIfNeeded();
+        else state.needReadable = true;
+        return null;
+    }
+
+    let size = requested ?? available;
+    if (size > available) {
+        if (!state.ended) {
+            state.needReadable = true;
+            return null;
+        }
+        size = available;
+    }
+    if (state.objectMode) size = 1;
+
+    const chunk = consumeReadableData(state, size);
+    state.disturbed = true;
+    target.readableDidRead = true;
+    updateReadableLength(target);
+    emitDataAfterRead(target as Readable | Duplex, chunk);
+    target._emitReadableEndIfNeeded();
+    return chunk;
+}
 
 function scheduleReadableFlow(target: { _readableState: ReadableState }, resume: () => void): void {
     const state = target._readableState;
@@ -279,13 +425,7 @@ function scheduleReadableFlow(target: { _readableState: ReadableState }, resume:
 function invokeReadableRead(target: { _readableState: ReadableState; _read(size: number): void; emit(event: string, error: unknown): void }): void {
     const state = target._readableState;
     if (state.destroyed || (!state.flowing && !state.readableListening) || state.ended || state.reading) return;
-    state.reading = true;
-    try {
-        target._read(state.highWaterMark);
-    } catch (err) {
-        state.reading = false;
-        target.emit('error', err);
-    }
+    requestReadableData(target as ReadableTarget, state.highWaterMark);
 }
 
 function emitDataAfterRead(stream: Readable | Duplex, chunk: unknown): void {
@@ -306,13 +446,13 @@ function unshiftReadableChunk(stream: Readable | Duplex, chunk: unknown, encodin
     const bytes = decoderBytes(chunk);
     if (state.decoder && bytes) {
         const decoded = state.decoder.write(bytes);
-        if (decoded.length === 0) return state.buffer.length < state.highWaterMark;
+        if (decoded.length === 0) return updateReadableLength(stream) < state.highWaterMark;
         chunk = decoded;
     }
     state.buffer.unshift(chunk);
-    stream.readableLength = state.buffer.length;
+    updateReadableLength(stream);
     if (!state.flowing || state.readableListening) stream.emit('readable');
-    return state.buffer.length < state.highWaterMark;
+    return stream.readableLength < state.highWaterMark;
 }
 
 export interface Readable extends Stream {
@@ -357,7 +497,7 @@ function initReadable(self: Readable, options?: ReadableOptions): void {
     self.readableObjectMode = options?.objectMode ?? false;
     self.readableHighWaterMark = options?.highWaterMark ?? defaultHighWaterMark(self.readableObjectMode);
     self.readableLength = 0;
-    self.readableEncoding = null;
+    self.readableEncoding = options?.encoding ?? null;
     self.readableAborted = false;
     self.readableDidRead = false;
     self._readableState = {
@@ -378,8 +518,10 @@ function initReadable(self: Readable, options?: ReadableOptions): void {
         defaultEncoding: 'utf8',
         awaitDrain: 0,
         readingMore: false,
-        decoder: null,
+        decoder: options?.encoding ? new StringDecoder(options.encoding) : null,
         disturbed: false,
+        emitClose: options?.emitClose ?? true,
+        autoDestroy: options?.autoDestroy ?? true,
     };
 
     if (options?.read) {
@@ -445,7 +587,9 @@ Readable.prototype._emitReadableEndIfNeeded = function _emitReadableEndIfNeeded(
     if (!state.ended || state.endEmitted || state.buffer.length > 0) return;
     state.endEmitted = true;
     this.readableEnded = true;
+    this.readable = false;
     this.emit('end');
+    maybeAutoDestroy(this);
 };
 
 Readable.from = function from(iterable: Iterable<unknown> | AsyncIterable<unknown>, options?: ReadableOptions): Readable {
@@ -481,6 +625,11 @@ Readable.from = function from(iterable: Iterable<unknown> | AsyncIterable<unknow
                 ended = true;
                 readable.push(null);
             } else {
+                if (value === null) {
+                    ended = true;
+                    readable.destroy(createNullWriteError());
+                    return;
+                }
                 readable.push(value);
             }
         } catch (err) {
@@ -494,26 +643,7 @@ Readable.from = function from(iterable: Iterable<unknown> | AsyncIterable<unknow
 };
 
 Readable.prototype.read = function read(this: Readable, n?: number): unknown {
-    const state = this._readableState;
-
-    if (state.buffer.length === 0) {
-        if (state.ended) {
-            this._emitReadableEndIfNeeded();
-            return null;
-        }
-        state.needReadable = true;
-        return null;
-    }
-
-    const chunk = state.buffer.shift();
-    state.disturbed = true;
-    this.readableDidRead = true;
-    this.readableLength = state.buffer.length;
-    emitDataAfterRead(this, chunk);
-
-    this._emitReadableEndIfNeeded();
-
-    return chunk;
+    return readReadableData(this, n);
 };
 
 Readable.prototype.setEncoding = function setEncoding(this: Readable, enc: BufferEncoding): Readable {
@@ -531,8 +661,12 @@ Readable.prototype.setEncoding = function setEncoding(this: Readable, enc: Buffe
             decoded.push(chunk);
         }
     }
+    if (state.ended) {
+        const trailing = state.decoder.end();
+        if (trailing.length > 0) decoded.push(trailing);
+    }
     state.buffer = decoded;
-    this.readableLength = state.buffer.length;
+    updateReadableLength(this);
     return this;
 };
 
@@ -572,7 +706,7 @@ Readable.prototype._readAndResolve = function _readAndResolve(this: Readable): v
         let chunk = state.buffer.shift();
         state.disturbed = true;
         this.readableDidRead = true;
-        this.readableLength = state.buffer.length;
+        updateReadableLength(this);
         this.emit('data', chunk);
     }
 
@@ -626,30 +760,37 @@ Readable.prototype.push = function push(this: Readable, chunk: unknown, encoding
     if (state.destroyed) return false;
     state.reading = false;
 
-    if (chunk === null) {
+    let decodedTrailing = false;
+    const ending = chunk === null;
+    if (ending) {
+        state.ended = true;
         if (state.decoder) {
             const trailing = state.decoder.end();
-            state.decoder = null;
             if (trailing) {
                 chunk = trailing;
+                decodedTrailing = true;
             } else {
-                state.ended = true;
                 if (state.flowing) this._emitReadableEndIfNeeded();
                 return false;
             }
         } else {
-            state.ended = true;
             if (!state.flowing && state.readableListening) this.emit('readable');
             if (state.flowing) this._emitReadableEndIfNeeded();
             return false;
         }
     }
 
-    chunk = normalizeChunk(chunk, state.objectMode, encoding, state.defaultEncoding);
+    if (!state.objectMode && chunk === undefined) return true;
+    if (!state.objectMode && typeof chunk !== 'string' && !ArrayBuffer.isView(chunk)) {
+        this.destroy(createInvalidChunkError(chunk));
+        return false;
+    }
+
+    if (!decodedTrailing) chunk = normalizeChunk(chunk, state.objectMode, encoding, state.defaultEncoding);
     const bytes = decoderBytes(chunk);
-    if (state.decoder && bytes) {
+    if (!decodedTrailing && state.decoder && bytes) {
         const decoded = state.decoder.write(bytes);
-        if (decoded.length === 0) return state.buffer.length < state.highWaterMark;
+        if (decoded.length === 0) return updateReadableLength(this) < state.highWaterMark;
         chunk = decoded;
     }
 
@@ -658,14 +799,14 @@ Readable.prototype.push = function push(this: Readable, chunk: unknown, encoding
         this.readableDidRead = true;
         this.emit('data', chunk);
         if (!state.destroyed) scheduleReadableFlow(this, () => this._readAndResolve());
-        return state.buffer.length < state.highWaterMark;
+        return ending ? false : this.readableLength < state.highWaterMark;
     }
 
     state.buffer.push(chunk);
-    this.readableLength = state.buffer.length;
+    updateReadableLength(this);
     this.emit('readable');
 
-    return state.buffer.length < state.highWaterMark;
+    return ending ? false : this.readableLength < state.highWaterMark;
 };
 
 Readable.prototype._read = function _read(this: Readable, size: number): void {
@@ -677,12 +818,15 @@ Readable.prototype.destroy = function destroy(this: Readable, error?: Error | nu
     if (state.destroyed) return this;
     state.destroyed = true;
     this.destroyed = true;
+    this.readableAborted = !this.readableEnded;
+    if (error) this.errored = error;
+    this.readable = false;
     state.buffer.length = 0;
     this.readableLength = 0;
     if (error) {
         this.emit('error', error);
     }
-    this.emit('close');
+    if (state.emitClose) this.emit('close');
     return this;
 };
 
@@ -754,6 +898,7 @@ type WritableState = {
     corked: number;
     ended: boolean;
     finished: boolean;
+    finishScheduled: boolean;
     finalCalled: boolean;
     decodeStrings: boolean;
     defaultEncoding: BufferEncoding;
@@ -761,7 +906,57 @@ type WritableState = {
     awaitDrain: number;
     emitClose: boolean;
     autoDestroy: boolean;
+    afterWriteCallbacks: Array<() => void>;
+    afterWriteScheduled: boolean;
+    pendingDrain: boolean;
 };
+
+function maybeAutoDestroy(stream: Stream): void {
+    if (stream.destroyed) return;
+    const readable = isReadableLike(stream) ? stream : undefined;
+    const writable = isWritableLike(stream) ? stream : undefined;
+    const autoDestroy = writable?._writableState.autoDestroy ?? readable?._readableState.autoDestroy ?? false;
+    if (!autoDestroy) return;
+    if (readable && !readable.readableEnded) return;
+    if (writable && !writable.writableFinished) return;
+    queueMicrotask(() => {
+        if (!stream.destroyed) stream.destroy();
+    });
+}
+
+function writableChunkLength(state: WritableState, chunk: unknown, encoding: BufferEncoding): number {
+    if (state.objectMode) return 1;
+    if (typeof chunk === 'string') return Buffer.byteLength(chunk, encoding);
+    if (ArrayBuffer.isView(chunk)) return chunk.byteLength;
+    return 0;
+}
+
+function updateWritableLength(stream: Writable): number {
+    const state = stream._writableState;
+    stream.writableLength = state.buffer.reduce(
+        (total, entry) => total + writableChunkLength(state, entry.chunk, entry.encoding),
+        0,
+    );
+    return stream.writableLength;
+}
+
+function queueSynchronousWriteCallbacks(stream: Writable, callbacks: Array<() => void>): void {
+    const state = stream._writableState;
+    state.afterWriteCallbacks.push(...callbacks);
+    if (state.afterWriteScheduled) return;
+    state.afterWriteScheduled = true;
+    queueMicrotask(() => {
+        state.afterWriteScheduled = false;
+        if (state.pendingDrain) {
+            state.pendingDrain = false;
+            state.awaitDrain = 0;
+            stream.writableNeedDrain = false;
+            stream.emit('drain');
+        }
+        const pending = state.afterWriteCallbacks.splice(0);
+        for (const callback of pending) callback();
+    });
+}
 
 export interface Writable extends Stream {
     writable: boolean;
@@ -771,6 +966,8 @@ export interface Writable extends Stream {
     writableLength: number;
     writableObjectMode: boolean;
     writableCorked: number;
+    writableNeedDrain: boolean;
+    writableAborted: boolean;
     _writableState: WritableState;
     _write(chunk: unknown, encoding: BufferEncoding, callback: (error?: Error | null) => void): void;
     _writev?(chunks: Array<{ chunk: unknown; encoding: BufferEncoding }>, callback: (error?: Error | null) => void): void;
@@ -790,15 +987,19 @@ export interface WritableConstructor {
     prototype: Writable;
 }
 
-function initWritable(self: Writable, options?: WritableOptions): void {
+function initWritable(self: Writable, options?: WritableOptions | DuplexOptions): void {
     Stream.call(self);
     self.writable = true;
     self.writableEnded = false;
     self.writableFinished = false;
-    self.writableObjectMode = options?.objectMode ?? false;
-    self.writableHighWaterMark = options?.highWaterMark ?? defaultHighWaterMark(self.writableObjectMode);
+    self.writableObjectMode = !!(options?.objectMode || options?.writableObjectMode);
+    self.writableHighWaterMark = options?.highWaterMark
+        ?? options?.writableHighWaterMark
+        ?? defaultHighWaterMark(self.writableObjectMode);
     self.writableLength = 0;
     self.writableCorked = 0;
+    self.writableNeedDrain = false;
+    self.writableAborted = false;
     self._writableState = {
         objectMode: self.writableObjectMode,
         highWaterMark: self.writableHighWaterMark,
@@ -807,13 +1008,17 @@ function initWritable(self: Writable, options?: WritableOptions): void {
         corked: 0,
         ended: false,
         finished: false,
+        finishScheduled: false,
         finalCalled: false,
-        decodeStrings: true,
-        defaultEncoding: 'utf8',
+        decodeStrings: options?.decodeStrings ?? true,
+        defaultEncoding: options?.defaultEncoding ?? 'utf8',
         destroyed: false,
         awaitDrain: 0,
         emitClose: options?.emitClose ?? true,
-        autoDestroy: options?.autoDestroy ?? false,
+        autoDestroy: options?.autoDestroy ?? true,
+        afterWriteCallbacks: [],
+        afterWriteScheduled: false,
+        pendingDrain: false,
     };
 
     if (options?.write) {
@@ -859,26 +1064,33 @@ Writable.prototype.write = function write(
         return false;
     }
 
-    if (chunk === null && !state.objectMode) {
-        throw new TypeError('May not write null values to stream');
+    if (chunk === null) throw createNullWriteError();
+    if (!state.objectMode && typeof chunk !== 'string' && !ArrayBuffer.isView(chunk)) {
+        throw createInvalidChunkError(chunk);
     }
 
     if (!state.objectMode && state.decodeStrings && typeof chunk === 'string') {
         chunk = Buffer.from(chunk, writeEncoding ?? state.defaultEncoding);
         writeEncoding = 'binary';
+    } else if (!state.objectMode && ArrayBuffer.isView(chunk) && !(chunk instanceof Buffer)) {
+        chunk = Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+        writeEncoding = 'binary';
     }
 
     state.buffer.push({ chunk, encoding: writeEncoding ?? 'utf8', callback: callback ?? (() => {}) });
-    this.writableLength = state.buffer.length;
+    updateWritableLength(this);
 
     if (!state.writing && state.corked === 0) {
         this._writeBuffered();
     }
 
-    const ok = state.buffer.length < state.highWaterMark;
+    const ok = this.writableLength < state.highWaterMark;
     // 'drain' only fires (in _writeBuffered below) if this is armed — else
     // a paused pipe() source waits forever for a 'drain' that never comes.
-    if (!ok) state.awaitDrain = 1;
+    if (!ok) {
+        state.awaitDrain = 1;
+        this.writableNeedDrain = true;
+    }
     return ok;
 };
 
@@ -887,45 +1099,63 @@ Writable.prototype._writeBuffered = function _writeBuffered(this: Writable): voi
     if (state.writing || state.buffer.length === 0 || state.corked > 0) return;
 
     state.writing = true;
-    const { chunk, encoding, callback } = state.buffer[0];
+    const useWritev = state.buffer.length > 1 && typeof this._writev === 'function';
+    const count = useWritev ? state.buffer.length : 1;
+    const entries = state.buffer.slice(0, count);
 
     let called = false;
+    let synchronous = true;
     const onWrite = (err?: Error | null) => {
         if (called) return;
         called = true;
         state.writing = false;
-        state.buffer.shift();
-        this.writableLength = state.buffer.length;
+        state.buffer.splice(0, count);
+        updateWritableLength(this);
 
         if (err) {
-            // Callback first: emit('error') with no listener throws on EE and
-            // would otherwise swallow the write callback forever.
-            callback(err);
-            try {
-                this.emit('error', err);
-            } catch {
-                // No listener / listener threw — fault already delivered to cb.
-            }
+            const failedEntries = entries.concat(state.buffer.splice(0));
+            updateWritableLength(this);
+            this.errored = err;
+            this.writableAborted = true;
+            this.writable = false;
+            const callbacks = failedEntries.map((entry) => () => entry.callback(err));
+            if (synchronous) queueSynchronousWriteCallbacks(this, callbacks);
+            else for (const callback of callbacks) callback();
+            queueMicrotask(() => this.emit('error', err));
             return;
         }
 
-        callback();
+        const callbacks = entries.map((entry) => () => entry.callback());
+        if (synchronous) queueSynchronousWriteCallbacks(this, callbacks);
 
         if (state.buffer.length > 0) {
             this._writeBuffered();
         } else if (state.ended && !state.finished) {
             this._doFinal();
         } else if (state.awaitDrain > 0) {
-            state.awaitDrain = 0;
-            this.emit('drain');
+            if (synchronous) {
+                state.pendingDrain = true;
+            } else {
+                state.awaitDrain = 0;
+                this.writableNeedDrain = false;
+                this.emit('drain');
+            }
         }
+
+        if (!synchronous) for (const callback of callbacks) callback();
     };
 
     try {
-        this._write(chunk, encoding, onWrite);
+        if (useWritev) {
+            this._writev!(entries.map(({ chunk, encoding }) => ({ chunk, encoding })), onWrite);
+        } else {
+            const entry = entries[0];
+            this._write(entry.chunk, entry.encoding, onWrite);
+        }
     } catch (err) {
         onWrite(asError(err));
     }
+    synchronous = false;
 };
 
 Writable.prototype._doFinal = function _doFinal(this: Writable): void {
@@ -934,13 +1164,17 @@ Writable.prototype._doFinal = function _doFinal(this: Writable): void {
     state.finalCalled = true;
 
     const finish = () => {
-        if (state.finished) return;
-        state.finished = true;
-        this.writableFinished = true;
-        this.emit('finish');
-        if (state.autoDestroy) {
-            this.destroy();
-        }
+        if (state.finished || state.finishScheduled) return;
+        state.finishScheduled = true;
+        queueMicrotask(() => {
+            state.finishScheduled = false;
+            if (state.finished) return;
+            state.finished = true;
+            this.writableFinished = true;
+            this.writable = false;
+            this.emit('finish');
+            maybeAutoDestroy(this);
+        });
     };
 
     if (this._final) {
@@ -1035,7 +1269,10 @@ Writable.prototype.destroy = function destroy(this: Writable, error?: Error | nu
     if (state.destroyed) return this;
     state.destroyed = true;
     this.destroyed = true;
+    this.writableAborted = !this.writableFinished;
+    this.writable = false;
     if (error) {
+        this.errored = error;
         this.emit('error', error);
     }
     if (state.emitClose) this.emit('close');
@@ -1051,6 +1288,7 @@ Object.defineProperty(Writable.prototype, 'constructor', {
 flattenPrototype(Writable.prototype);
 
 export interface Duplex extends Writable {
+    allowHalfOpen: boolean;
     readable: boolean;
     readableEnded: boolean;
     readableFlowing: boolean | null;
@@ -1086,12 +1324,16 @@ export interface DuplexConstructor {
 function initDuplex(self: Duplex, options?: DuplexOptions): void {
     Writable.call(self, options);
     self.readable = options?.readable ?? true;
+    self.writable = options?.writable ?? true;
+    self.allowHalfOpen = options?.allowHalfOpen ?? true;
     self.readableEnded = false;
     self.readableFlowing = null;
-    self.readableObjectMode = options?.objectMode ?? false;
-    self.readableHighWaterMark = options?.highWaterMark ?? defaultHighWaterMark(self.readableObjectMode);
+    self.readableObjectMode = !!(options?.objectMode || options?.readableObjectMode);
+    self.readableHighWaterMark = options?.highWaterMark
+        ?? options?.readableHighWaterMark
+        ?? defaultHighWaterMark(self.readableObjectMode);
     self.readableLength = 0;
-    self.readableEncoding = null;
+    self.readableEncoding = options?.encoding ?? null;
     self.readableAborted = false;
     self.readableDidRead = false;
     self._readableState = {
@@ -1112,9 +1354,23 @@ function initDuplex(self: Duplex, options?: DuplexOptions): void {
         defaultEncoding: 'utf8',
         awaitDrain: 0,
         readingMore: false,
-        decoder: null,
+        decoder: options?.encoding ? new StringDecoder(options.encoding) : null,
         disturbed: false,
+        emitClose: options?.emitClose ?? true,
+        autoDestroy: options?.autoDestroy ?? true,
     };
+
+    if (options?.readable === false) {
+        self.readableEnded = true;
+        self._readableState.ended = true;
+        self._readableState.endEmitted = true;
+    }
+    if (options?.writable === false) {
+        self.writableEnded = true;
+        self.writableFinished = true;
+        self._writableState.ended = true;
+        self._writableState.finished = true;
+    }
 
     if (options?.read) {
         self._read = options.read;
@@ -1134,24 +1390,7 @@ Duplex.prototype = Object.create(Writable.prototype);
 
 Duplex.prototype.read = function read(this: Duplex, n?: number): unknown {
     if (!this.readable) return null;
-    const state = this._readableState;
-
-    if (state.buffer.length === 0) {
-        if (state.ended) {
-            this._emitReadableEndIfNeeded();
-            return null;
-        }
-        state.needReadable = true;
-        return null;
-    }
-
-    const chunk = state.buffer.shift();
-    state.disturbed = true;
-    this.readableDidRead = true;
-    this.readableLength = state.buffer.length;
-    emitDataAfterRead(this, chunk);
-    this._emitReadableEndIfNeeded();
-    return chunk;
+    return readReadableData(this, n);
 };
 
 Duplex.prototype.setEncoding = function setEncoding(this: Duplex, enc: BufferEncoding): Duplex {
@@ -1169,8 +1408,12 @@ Duplex.prototype.setEncoding = function setEncoding(this: Duplex, enc: BufferEnc
             decoded.push(chunk);
         }
     }
+    if (state.ended) {
+        const trailing = state.decoder.end();
+        if (trailing.length > 0) decoded.push(trailing);
+    }
     state.buffer = decoded;
-    this.readableLength = state.buffer.length;
+    updateReadableLength(this);
     return this;
 };
 
@@ -1250,7 +1493,10 @@ Duplex.prototype._emitReadableEndIfNeeded = function _emitReadableEndIfNeeded(th
     if (!state.ended || state.endEmitted || state.buffer.length > 0) return;
     state.endEmitted = true;
     this.readableEnded = true;
+    this.readable = false;
     this.emit('end');
+    if (!this.allowHalfOpen && !this.writableEnded) queueMicrotask(() => this.end());
+    maybeAutoDestroy(this);
 };
 
 Duplex.prototype._duplexReadAndResolve = function _duplexReadAndResolve(this: Duplex): void {
@@ -1261,7 +1507,7 @@ Duplex.prototype._duplexReadAndResolve = function _duplexReadAndResolve(this: Du
         let chunk = state.buffer.shift();
         state.disturbed = true;
         this.readableDidRead = true;
-        this.readableLength = state.buffer.length;
+        updateReadableLength(this);
         this.emit('data', chunk);
     }
 
@@ -1302,30 +1548,37 @@ Duplex.prototype.push = function push(this: Duplex, chunk: unknown, encoding?: B
     if (state.destroyed) return false;
     state.reading = false;
 
-    if (chunk === null) {
+    let decodedTrailing = false;
+    const ending = chunk === null;
+    if (ending) {
+        state.ended = true;
         if (state.decoder) {
             const trailing = state.decoder.end();
-            state.decoder = null;
             if (trailing) {
                 chunk = trailing;
+                decodedTrailing = true;
             } else {
-                state.ended = true;
                 if (state.flowing) this._emitReadableEndIfNeeded();
                 return false;
             }
         } else {
-            state.ended = true;
             if (!state.flowing && state.readableListening) this.emit('readable');
             if (state.flowing) this._emitReadableEndIfNeeded();
             return false;
         }
     }
 
-    chunk = normalizeChunk(chunk, state.objectMode, encoding, state.defaultEncoding);
+    if (!state.objectMode && chunk === undefined) return true;
+    if (!state.objectMode && typeof chunk !== 'string' && !ArrayBuffer.isView(chunk)) {
+        this.destroy(createInvalidChunkError(chunk));
+        return false;
+    }
+
+    if (!decodedTrailing) chunk = normalizeChunk(chunk, state.objectMode, encoding, state.defaultEncoding);
     const bytes = decoderBytes(chunk);
-    if (state.decoder && bytes) {
+    if (!decodedTrailing && state.decoder && bytes) {
         const decoded = state.decoder.write(bytes);
-        if (decoded.length === 0) return state.buffer.length < state.highWaterMark;
+        if (decoded.length === 0) return updateReadableLength(this) < state.highWaterMark;
         chunk = decoded;
     }
 
@@ -1337,9 +1590,9 @@ Duplex.prototype.push = function push(this: Duplex, chunk: unknown, encoding?: B
     } else {
         state.buffer.push(chunk);
     }
-    this.readableLength = state.buffer.length;
+    updateReadableLength(this);
     if (!state.flowing) this.emit('readable');
-    return state.buffer.length < state.highWaterMark;
+    return ending ? false : this.readableLength < state.highWaterMark;
 };
 
 Duplex.prototype._read = function _read(this: Duplex, size: number): void {
@@ -1422,6 +1675,8 @@ Duplex.prototype.toArray = function toArray(this: Duplex): Promise<unknown[]> {
 Duplex.prototype.destroy = function destroy(this: Duplex, error?: Error | null): Duplex {
     if (this.destroyed) return this;
     this.destroyed = true;
+    this.readableAborted = !this.readableEnded;
+    this.writableAborted = !this.writableFinished;
     this.readable = false;
     this.writable = false;
     const state = this._readableState;
@@ -1429,9 +1684,10 @@ Duplex.prototype.destroy = function destroy(this: Duplex, error?: Error | null):
     state.buffer.length = 0;
     this.readableLength = 0;
     if (error) {
+        this.errored = error;
         this.emit('error', error);
     }
-    this.emit('close');
+    if (this._writableState.emitClose) this.emit('close');
     return this;
 };
 
@@ -1583,22 +1839,162 @@ export function isDisturbed(stream: unknown): boolean {
     if (isReadableLike(stream)) {
         return !!stream._readableState.disturbed || stream.readableEnded || stream.readableAborted || stream.destroyed;
     }
-    if (isWritableLike(stream)) return stream.writableEnded || stream.writableFinished || stream.destroyed;
     return false;
 }
 
 export function isErrored(stream: unknown): boolean {
-    if (isReadableLike(stream)) return !stream.readable;
-    if (isWritableLike(stream)) return !stream.writable;
+    if (isReadableLike(stream) || isWritableLike(stream) || stream instanceof Stream) {
+        return Reflect.get(stream, 'errored') != null;
+    }
+    const controller = stream && (typeof stream === 'object' || typeof stream === 'function')
+        ? Reflect.get(stream as object, '_controller')
+        : undefined;
+    if (controller && typeof controller === 'object') return Reflect.get(controller, '_state') === 'errored';
     return false;
 }
 
-export function isReadable(stream: unknown): boolean {
-    return isReadableLike(stream) && stream.readable === true && !stream.readableEnded && !stream.destroyed;
+export function isDestroyed(stream: unknown): boolean | null {
+    if (!stream || (typeof stream !== 'object' && typeof stream !== 'function')) return null;
+    if (isReadableLike(stream)) return !!stream._readableState.destroyed;
+    if (isWritableLike(stream)) return !!stream._writableState.destroyed;
+    if (stream instanceof Stream) return !!stream.destroyed;
+    return null;
 }
 
-export function isWritable(stream: unknown): boolean {
-    return isWritableLike(stream) && stream.writable === true && !stream.writableEnded && !stream.destroyed;
+export function isReadable(stream: unknown): boolean | null {
+    if (isReadableLike(stream)) {
+        return stream.readable === true && !stream.readableEnded && !stream.destroyed;
+    }
+    const controller = stream && (typeof stream === 'object' || typeof stream === 'function')
+        ? Reflect.get(stream as object, '_controller')
+        : undefined;
+    if (controller && typeof controller === 'object' && typeof Reflect.get(stream as object, 'getReader') === 'function') {
+        return Reflect.get(controller, '_state') === 'readable';
+    }
+    return null;
+}
+
+export function isWritable(stream: unknown): boolean | null {
+    if (isWritableLike(stream)) {
+        return stream.writable === true && !stream.writableEnded && !stream.destroyed;
+    }
+    const controller = stream && (typeof stream === 'object' || typeof stream === 'function')
+        ? Reflect.get(stream as object, '_controller')
+        : undefined;
+    if (controller && typeof controller === 'object' && typeof Reflect.get(stream as object, 'getWriter') === 'function') {
+        return Reflect.get(controller, '_state') === 'writable';
+    }
+    return null;
+}
+
+function createAbortError(reason?: unknown): Error & { code: string; cause?: unknown } {
+    const error: Error & { code: string; cause?: unknown } = Object.assign(new Error('The operation was aborted'), {
+        name: 'AbortError',
+        code: 'ABORT_ERR',
+    });
+    if (reason !== undefined) error.cause = reason;
+    return error;
+}
+
+function createStreamDestroyedError(): Error & { code: string } {
+    return Object.assign(new Error('Cannot call write after a stream was destroyed'), {
+        code: 'ERR_STREAM_DESTROYED',
+    });
+}
+
+export function destroy(stream: unknown, error?: Error | null): void {
+    if (stream === null || stream === undefined) return;
+    const destroyMethod = Reflect.get(Object(stream), 'destroy');
+    const reason = error ?? createAbortError();
+    if (typeof destroyMethod === 'function') {
+        destroyMethod.call(stream, reason);
+        return;
+    }
+    const emit = Reflect.get(Object(stream), 'emit');
+    if (typeof emit === 'function') {
+        queueMicrotask(() => {
+            emit.call(stream, 'error', reason);
+            emit.call(stream, 'close');
+        });
+    }
+}
+
+export function duplexPair(options: DuplexOptions = {}): [Duplex, Duplex] {
+    const pendingWrites = new WeakMap<Duplex, Array<(error?: Error | null) => void>>();
+    let first: Duplex;
+    let second: Duplex;
+
+    const createEndpoint = (peer: () => Duplex): Duplex => new Duplex({
+        ...options,
+        autoDestroy: false,
+        read() {
+            const writer = peer();
+            const callbacks = pendingWrites.get(writer);
+            const callback = callbacks?.shift();
+            if (!callback) return;
+            if (callbacks && callbacks.length === 0) pendingWrites.delete(writer);
+            callback();
+        },
+        write(chunk, _encoding, callback) {
+            const target = peer();
+            if (target.destroyed) {
+                callback(createStreamDestroyedError());
+                return;
+            }
+            if (target.push(chunk)) callback();
+            else {
+                const callbacks = pendingWrites.get(this as Duplex) ?? [];
+                callbacks.push(callback);
+                pendingWrites.set(this as Duplex, callbacks);
+            }
+        },
+        final(callback) {
+            const target = peer();
+            if (!target.destroyed) target.push(null);
+            callback();
+        },
+    });
+
+    first = createEndpoint(() => second);
+    second = createEndpoint(() => first);
+
+    const closeIfComplete = () => {
+        const complete = first.readableEnded && first.writableFinished
+            && second.readableEnded && second.writableFinished;
+        if (!complete) return;
+        if (!first.destroyed) first.destroy();
+        if (!second.destroyed) second.destroy();
+    };
+    first.on('end', closeIfComplete);
+    first.on('finish', closeIfComplete);
+    second.on('end', closeIfComplete);
+    second.on('finish', closeIfComplete);
+
+    const firstDestroy = first.destroy;
+    const secondDestroy = second.destroy;
+    const abortPendingWrites = () => {
+        for (const endpoint of [first, second]) {
+            const callbacks = pendingWrites.get(endpoint);
+            if (!callbacks) continue;
+            pendingWrites.delete(endpoint);
+        }
+    };
+    first.destroy = function destroyFirst(error?: Error | null): Duplex {
+        const completed = first.readableEnded && first.writableFinished;
+        const result = firstDestroy.call(first, error);
+        if (!completed) abortPendingWrites();
+        if (!completed && !second.destroyed) secondDestroy.call(second);
+        return result;
+    };
+    second.destroy = function destroySecond(error?: Error | null): Duplex {
+        const completed = second.readableEnded && second.writableFinished;
+        const result = secondDestroy.call(second, error);
+        if (!completed) abortPendingWrites();
+        if (!completed && !first.destroyed) firstDestroy.call(first);
+        return result;
+    };
+
+    return [first, second];
 }
 
 export function compose(...streams: Array<Duplex | Readable | Writable>): Duplex {
@@ -1668,10 +2064,10 @@ export function ReadableFrom(iterable: Iterable<unknown> | AsyncIterable<unknown
 
 export function addAbortSignal(signal: AbortSignal, stream: Stream): Stream {
     if (signal.aborted) {
-        stream.destroy(new Error('aborted'));
+        stream.destroy(createAbortError(signal.reason));
     } else {
         signal.addEventListener('abort', () => {
-            stream.destroy(new Error('aborted'));
+            stream.destroy(createAbortError(signal.reason));
         });
     }
     return stream;

@@ -34,6 +34,26 @@ function requestInitMethod(init: RequestInit | undefined, fallback: string): str
         : fallback;
 }
 
+function bodyContentType(body: unknown): string | undefined {
+    if (body === null || body === undefined) return undefined;
+    if (body instanceof URLSearchParams) return 'application/x-www-form-urlencoded;charset=UTF-8';
+    if (body instanceof Blob) return body.type || undefined;
+    if (body instanceof FormData || isReadableStreamLike(body) || isBodyIterable(body)) return undefined;
+    if (ArrayBuffer.isView(body) || body instanceof ArrayBuffer) return undefined;
+    return 'text/plain;charset=UTF-8';
+}
+
+function followSignal(source: AbortSignal | null | undefined): AbortSignal {
+    const controller = new AbortController();
+    if (!source) return controller.signal;
+    if (source.aborted) {
+        controller.abort(source.reason);
+    } else {
+        source.addEventListener('abort', () => controller.abort(source.reason), { once: true });
+    }
+    return controller.signal;
+}
+
 export class Request implements globalThis.Request {
     public readonly url: string;
     public readonly method: string;
@@ -72,8 +92,8 @@ export class Request implements globalThis.Request {
             this.method = requestInitMethod(init, input.method);
             // init.headers fully replaces input.headers per spec
             this.headers = init?.headers !== undefined ? new Headers(init.headers) : new Headers(input.headers);
-            if (!init?.body && input.body && !input.bodyUsed) {
-                if (input._bodyBuffer) {
+            if ((init?.body === undefined || init?.body === null) && input.body && !input.bodyUsed) {
+                if (input._bodyBuffer !== null) {
                     this._bodyBuffer = input._bodyBuffer;
                     this._bodySource = input._bodyBuffer;
                 } else {
@@ -100,7 +120,9 @@ export class Request implements globalThis.Request {
         this.redirect = init?.redirect || base?.redirect || 'follow';
         this.referrer = init?.referrer || base?.referrer || 'about:client';
         this.referrerPolicy = init?.referrerPolicy || base?.referrerPolicy || '';
-        this.signal = init?.signal ?? base?.signal ?? new AbortController().signal;
+        this.signal = followSignal(init?.signal ?? base?.signal);
+        const inferredType = bodyContentType(this._bodySource);
+        if (inferredType && !this.headers.has('content-type')) this.headers.set('content-type', inferredType);
         if (this._bodyBuffer == null) {
             const directBody = serializeBody(this._bodySource);
             if (directBody !== null) this._bodyBuffer = directBody;
@@ -108,7 +130,7 @@ export class Request implements globalThis.Request {
         if (this._bodySource instanceof FormData) {
             this._formDataBoundary = ensureFormDataContentType(this.headers);
         }
-        this.body = this._bodySource ? this.trackBodyStream(this.createBodyStream()) : null;
+        this.body = this._bodySource !== null ? this.trackBodyStream(this.createBodyStream()) : null;
         if (['GET', 'HEAD'].includes(this.method) && this.body) throw new TypeError(`Request with ${this.method} method cannot have body`);
     }
 
@@ -226,6 +248,7 @@ export class Request implements globalThis.Request {
             while (true) {
                 const { done, value } = await reader.read();
                 if (done) break;
+                if (!(value instanceof Uint8Array)) throw new TypeError('Request body stream chunks must be Uint8Array values');
                 chunks.push(value);
             }
         } finally {
@@ -246,7 +269,7 @@ export class Request implements globalThis.Request {
         if (!b) return new Uint8Array(0);
         return b;
     }
-    async blob(): Promise<Blob> { return new Blob([await this.arrayBuffer()], { type: this.headers.get('content-type') || 'application/octet-stream' }); }
+    async blob(): Promise<Blob> { return new Blob([await this.arrayBuffer()], { type: this.headers.get('content-type') || '' }); }
     async formData(): Promise<FormData> {
         if (this._bodySource instanceof FormData) return this._bodySource;
         const buf = await this.getBodyBuffer();

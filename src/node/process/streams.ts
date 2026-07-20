@@ -31,6 +31,7 @@ export class ProcessWriteStream extends Writable {
     #columnsOverride: number | undefined;
     #rowsOverride: number | undefined;
     #bytesWritten = 0;
+    closed = false;
 
     constructor(stdio: StdioStream) {
         super({
@@ -56,6 +57,19 @@ export class ProcessWriteStream extends Writable {
     get isTTY(): boolean { return this.#isTTYOverride ?? this.#stdio.isTTY; }
 
     set isTTY(value: boolean) { this.#isTTYOverride = Boolean(value); }
+
+    override write(
+        chunk: unknown,
+        encoding?: BufferEncoding | ((error?: Error | null) => void),
+        callback?: (error?: Error | null) => void
+    ): boolean {
+        this.#stdio.writeSync(new Uint8Array(0));
+        return super.write(chunk, encoding, callback);
+    }
+
+    override destroy(_error?: Error | null): this {
+        return this;
+    }
 
     get columns(): number {
         if (this.#columnsOverride !== undefined) return this.#columnsOverride;
@@ -188,6 +202,7 @@ export class ProcessReadStream extends Readable {
     #isRaw: boolean = false;
     #isTTYOverride: boolean | undefined;
     #bytesRead = 0;
+    closed = false;
 
     constructor(stdio: StdioStream) {
         super({ highWaterMark: PROCESS_READ_STREAM_HWM });
@@ -222,6 +237,13 @@ export class ProcessReadStream extends Readable {
         this.#stdio.setRaw(mode);
         this.#isRaw = mode;
         return this;
+    }
+
+    override destroy(error?: Error | null): this {
+        if (this.destroyed) return this;
+        this.readable = false;
+        this.closed = true;
+        return super.destroy(error) as this;
     }
 
     readSync(buf: Uint8Array<ArrayBuffer>): number | null {

@@ -12,7 +12,7 @@ import { buildRequest, connectHttp, readHeaders } from "../utils/http";
 import { bytesToArrayBuffer, concatChunks, toOwnedBytes } from "../utils/bytes";
 import { getTierLimits } from '../utils/memory-tier';
 import { captureUserNetworkCallFrames, getWebSocketHook, type NetworkCallFrame, type NetworkSource, type WSFrameInfo } from '../utils/network-hooks';
-import { CloseEvent, ErrorEvent, MessageEvent } from "./events";
+import { CloseEvent, DOMException, ErrorEvent, MessageEvent } from "./events";
 
 const engine = import.meta.use('engine');
 const algo = import.meta.use('algorithm');
@@ -96,9 +96,12 @@ function normalizeClientWebSocketUrl(input: string | URL): string {
 
 function validateProtocols(protocols?: string | string[]): string[] {
     if (protocols === undefined) return [];
-    const list = Array.isArray(protocols) ? protocols : [protocols];
+    const list = (Array.isArray(protocols) ? protocols : [protocols]).map((protocol) => String(protocol));
     const seen = new Set<string>();
     for (const protocol of list) {
+        if (!/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(protocol)) {
+            throw new DOMException('Invalid Sec-WebSocket-Protocol value', 'SyntaxError');
+        }
         if (seen.has(protocol)) {
             throw new DOMException(`The subprotocol '${protocol}' is duplicated`, 'SyntaxError');
         }
@@ -308,9 +311,14 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
     readonly CLOSED = WebSocketReadyState.CLOSED;
 
     public url: string;
-    public readonly protocol: string = '';
-    public readonly extensions: string = '';
-    public binaryType: 'blob' | 'arraybuffer' = 'blob';
+    public protocol: string = '';
+    public extensions: string = '';
+    private _binaryType: 'blob' | 'arraybuffer' = 'blob';
+
+    public get binaryType(): 'blob' | 'arraybuffer' { return this._binaryType; }
+    public set binaryType(value: 'blob' | 'arraybuffer') {
+        if (value === 'blob' || value === 'arraybuffer') this._binaryType = value;
+    }
 
     private _readyState: WebSocketReadyState = WebSocketReadyState.CONNECTING;
     private connection: IWSSocket | null = null;
@@ -335,6 +343,7 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
     private _netRequestId: string = '';
     private _serverMeta?: ServerWebSocketMeta;
     private _serverHandshakeEmitted = false;
+    private requestedProtocols: string[] = [];
 
     public onopen: ((this: globalThis.WebSocket, ev: globalThis.Event) => unknown) | null = null;
     public onmessage: ((this: globalThis.WebSocket, ev: globalThis.MessageEvent) => unknown) | null = null;
@@ -370,7 +379,7 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
                     ? protocolsOrIsServer
                     : undefined
             );
-            if (protocols.length > 0) this.protocol = protocols[0] ?? '';
+            this.requestedProtocols = protocols;
             this.connectClient();
         } else {
             const syncServerMeta = serverMeta && typeof (serverMeta as Promise<ServerWebSocketMeta | undefined>).then !== 'function'
@@ -437,7 +446,9 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
             'Upgrade': 'websocket', 'Connection': 'Upgrade',
             'Sec-WebSocket-Version': '13', 'Sec-WebSocket-Key': this._wsKey
         });
-        if (this.protocol) headers.set('Sec-WebSocket-Protocol', this.protocol);
+        if (this.requestedProtocols.length > 0) {
+            headers.set('Sec-WebSocket-Protocol', this.requestedProtocols.join(', '));
+        }
         if (proxyAuthorization) headers.set('Proxy-Authorization', proxyAuthorization);
         if (this._netRequestId) {
             const wsHook = getWebSocketHook();
@@ -469,6 +480,13 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
         const accept = headers.find(([n]) => n === 'sec-websocket-accept')?.[1];
         if (!accept) throw new Error('Missing Sec-WebSocket-Accept header');
         if (accept !== this.computeAcceptKey(this._wsKey)) throw new Error('Invalid Sec-WebSocket-Accept header');
+
+        const negotiated = headers.find(([n]) => n === 'sec-websocket-protocol')?.[1]?.trim() ?? '';
+        if (negotiated && !this.requestedProtocols.includes(negotiated)) {
+            throw new Error('Server selected an unsupported WebSocket subprotocol');
+        }
+        this.protocol = negotiated;
+        this.extensions = headers.find(([n]) => n === 'sec-websocket-extensions')?.[1]?.trim() ?? '';
 
         if (this._netRequestId) {
             const wsHook = getWebSocketHook();
@@ -629,7 +647,10 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
     }
 
     public send(data: string | ArrayBuffer | ArrayBufferView | Blob): void {
-        if (this._readyState !== WebSocketReadyState.OPEN) throw new Error('WebSocket is not open');
+        if (this._readyState === WebSocketReadyState.CONNECTING) {
+            throw new DOMException('Sent before connected.', 'InvalidStateError');
+        }
+        if (this._readyState !== WebSocketReadyState.OPEN) return;
         if (typeof data === 'string') {
             this.sendFrame(OpCode.TEXT, engine.encodeString(data)).catch(() => { this.close(WebSocketCloseCode.ABNORMAL, 'Send failed'); });
         } else if (data instanceof Blob) {

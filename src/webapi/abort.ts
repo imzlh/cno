@@ -58,7 +58,7 @@ class AbortSignal extends EventTarget implements globalThis.AbortSignal {
 
     static abort(reason?: unknown): globalThis.AbortSignal {
         const signal = createAbortSignal();
-        signal._abort(reason ?? new DOMException('Signal aborted', 'AbortError'));
+        signal._abort(reason === undefined ? new DOMException('Signal aborted', 'AbortError') : reason);
         return signal;
     }
 
@@ -144,7 +144,7 @@ class AbortController implements globalThis.AbortController {
     }
 
     abort(reason?: unknown): void {
-        this.#signal._abort(reason ?? new DOMException('Aborted', 'AbortError'));
+        this.#signal._abort(reason === undefined ? new DOMException('Aborted', 'AbortError') : reason);
     }
 
     [Symbol.toStringTag] = 'AbortController';

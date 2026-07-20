@@ -1,4 +1,5 @@
 const os = import.meta.use('os');
+import { matchGlobPattern } from '../_internal/glob-match';
 
 type FormatInputPathObject = {
     root?: string;
@@ -31,6 +32,7 @@ type PathApi = {
     relative(from: string, to: string): string;
     resolve(...paths: string[]): string;
     toNamespacedPath(path: string): string;
+    matchesGlob(path: string, pattern: string): boolean;
     posix?: PathApi;
     win32?: PathApi;
 };
@@ -43,9 +45,15 @@ type RootInfo = {
 
 function assertString(value: unknown, name: string): string {
     if (typeof value !== 'string') {
-        throw new TypeError(`The "${name}" argument must be of type string`);
+        throw Object.assign(new TypeError(`The "${name}" argument must be of type string`), {
+            code: 'ERR_INVALID_ARG_TYPE',
+        });
     }
     return value;
+}
+
+function matchGlob(path: string, pattern: string, windows: boolean): boolean {
+    return matchGlobPattern(path, pattern, windows);
 }
 
 function assertPathObject(value: unknown): FormatInputPathObject {
@@ -490,6 +498,11 @@ function createPathApi(windows: boolean): PathApi {
         },
         toNamespacedPath(path) {
             return toNamespacedPathImpl(path, windows);
+        },
+        matchesGlob(path, pattern) {
+            assertString(path, 'path');
+            assertString(pattern, 'pattern');
+            return matchGlob(path, pattern, windows);
         },
     };
 }

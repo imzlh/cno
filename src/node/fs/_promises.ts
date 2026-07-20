@@ -3,12 +3,13 @@
  */
 
 
-import { normalizeErrnoError, wrapPromise } from '../_internal/errno';
+import { matchesErrnoCode, normalizeErrnoError, wrapPromise } from '../_internal/errno';
 import { getTierLimits } from '../_internal/memory';
-import path from '../path';
-import { createAsyncDir, createFileHandle, decodeBuffer, encodePathResult, mkdirRecursive, modeToNumber, parseFlags, pathToString, randomHex, readDirEntries, readFileFromFdSync, removeRecursive, splitPathOrFd, timeToNumber, toNodeDirentAsync, toNodeStat, toNodeStatFs, toUint8Array, validateOpendirOptions, assertCopyFileMode, makeAbortError, type Mode, type PathLike, type TimeLike } from './utils';
+import { resolve } from '../path';
+import { copyPath, validateCopyOptions, type CopyOptions } from './copy';
+import { globPaths, type GlobOptions, type GlobResult } from './glob';
+import { createAsyncDir, createFileHandle, decodeBuffer, encodePathResult, mkdirRecursive, modeToNumber, parseFlags, pathToString, randomHex, readDirEntries, readFileFromFdSync, removeRecursive, splitPathOrFd, timeToNumber, toNodeDirentAsync, toNodeStat, toNodeStatFs, toUint8Array, validateOpendirOptions, validateReaddirOptions, assertCopyFileMode, makeAbortError, rmIsDirectoryError, type Mode, type PathLike, type TimeLike } from './utils';
 
-const { dirname, join } = path;
 const { readBufSize: READ_BUF_SIZE } = getTierLimits();
 
 const asfs = import.meta.use('asyncfs');
@@ -168,28 +169,25 @@ export async function rmdir(path: PathLike, options?: { recursive?: boolean; max
 
 export async function rm(path: PathLike, options?: { force?: boolean; recursive?: boolean; maxRetries?: number; retryDelay?: number }): Promise<void> {
     const pathStr = pathToString(path);
-
+    let stats: CModuleAsyncFS.StatResult;
     try {
-        const stats = await w(asfs.lstat(pathStr), 'lstat', pathStr);
-
-        // Symlink-to-dir is not a directory for rm — always unlink the link.
-        if (stats.isDirectory && !stats.isSymbolicLink) {
-            if (options?.recursive) {
-                await removeRecursive(pathStr);
-            } else {
-                await w(asfs.rmdir(pathStr), 'rmdir', pathStr);
-            }
-        } else {
-            await w(asfs.unlink(pathStr), 'unlink', pathStr);
-        }
+        stats = await w(asfs.lstat(pathStr), 'lstat', pathStr);
     } catch (err) {
-        if (!options?.force) {
-            throw err;
-        }
+        if (options?.force && Reflect.get(err, 'code') === 'ENOENT') return;
+        throw err;
+    }
+
+    // Symlink-to-dir is not a directory for rm — always unlink the link.
+    if (stats.isDirectory && !stats.isSymbolicLink) {
+        if (!options?.recursive) throw rmIsDirectoryError(pathStr);
+        await w(removeRecursive(pathStr), 'rm', pathStr);
+    } else {
+        await w(asfs.unlink(pathStr), 'rm', pathStr);
     }
 }
 
-export async function readdir(path: PathLike, options?: { encoding?: BufferEncoding | 'buffer'; withFileTypes?: boolean; recursive?: boolean } | BufferEncoding): Promise<Array<string | Buffer> | import('fs').Dirent[]> {
+export async function readdir(path: PathLike, options?: { encoding?: BufferEncoding | 'buffer'; withFileTypes?: boolean; recursive?: boolean } | BufferEncoding): Promise<Array<string | Buffer> | import('fs').Dirent<string | Buffer>[]> {
+    validateReaddirOptions(options);
     const pathStr = pathToString(path);
     const withFileTypes = typeof options === 'object' ? options?.withFileTypes : false;
     const recursive = typeof options === 'object' ? options?.recursive === true : false;
@@ -197,7 +195,13 @@ export async function readdir(path: PathLike, options?: { encoding?: BufferEncod
     try {
         const entries = await readDirEntries(pathStr, recursive);
         if (withFileTypes) {
-            return entries.map(entry => toNodeDirentAsync(entry, entry.parentPath));
+            return entries.map(entry => {
+                const dirent = toNodeDirentAsync(entry, entry.parentPath, encodePathResult(entry.name, options));
+                if (path instanceof Uint8Array) {
+                    Reflect.set(dirent, 'parentPath', encodePathResult(entry.parentPath, 'buffer'));
+                }
+                return dirent;
+            });
         }
         return entries.map(entry => encodePathResult(entry.relativePath, options));
     } catch (err) {
@@ -344,15 +348,26 @@ export async function mkdtemp(prefix: string, options?: { encoding?: BufferEncod
     return result;
 }
 
-export async function mkdtempDisposable(prefix: string, options?: { encoding?: BufferEncoding | 'buffer' | null } | BufferEncoding): Promise<{ path: string | Buffer; cleanup: () => Promise<void> }> {
+export async function mkdtempDisposable(prefix: string, options?: { encoding?: BufferEncoding | 'buffer' | null } | BufferEncoding): Promise<{
+    path: string | Buffer;
+    remove: () => Promise<void>;
+    [Symbol.asyncDispose]: () => Promise<void>;
+}> {
     const dirPath = prefix + randomHex();
     const result = encodePathResult(dirPath, options);
     await w(asfs.mkdir(dirPath), 'mkdir', dirPath);
+    const fullPath = resolve(dirPath);
+    const remove = async () => {
+        try {
+            await removeRecursive(fullPath);
+        } catch (error) {
+            if (!matchesErrnoCode(error, 'ENOENT')) throw normalizeErrnoError(error, 'rm', fullPath);
+        }
+    };
     return {
         path: result,
-        async cleanup() {
-            await removeRecursive(dirPath);
-        },
+        remove,
+        [Symbol.asyncDispose]() { return remove(); },
     };
 }
 
@@ -424,134 +439,18 @@ export function watch(path: PathLike, options?: { persistent?: boolean; recursiv
     } as AsyncIterableIterator<{ eventType: string; filename: string | null }>;
 }
 
-export async function cp(source: PathLike, destination: PathLike, opts?: { force?: boolean; recursive?: boolean; preserveTimestamps?: boolean; filter?: (src: string, dest: string) => boolean | Promise<boolean> }): Promise<void> {
-    const srcStr = pathToString(source);
-    const destStr = pathToString(destination);
-    
-    try {
-        const stats = await w(asfs.lstat(srcStr), 'cp', srcStr);
-        if (opts?.filter) {
-            const shouldCopy = await opts.filter(srcStr, destStr);
-            if (!shouldCopy) return;
-        }
-
-        if (stats.isDirectory) {
-            await w(asfs.mkdir(destStr), 'cp', destStr);
-            const dir = await w(asfs.readDir(srcStr), 'cp', srcStr);
-            try {
-                for await (const entry of dir) {
-                    const srcPath = join(srcStr, entry.name);
-                    const destPath = join(destStr, entry.name);
-
-                    await cp(srcPath, destPath, opts);
-                }
-            } finally {
-                await dir.close();
-            }
-        } else {
-            const parent = dirname(destStr);
-            if (parent && parent !== destStr) {
-                await mkdirRecursive(parent);
-            }
-            await w(asfs.copyFile(srcStr, destStr), 'cp', srcStr);
-        }
-    } catch (err) {
-        if (!opts?.force) {
-            throw err;
-        }
-    }
+export async function cp(source: PathLike, destination: PathLike, options?: CopyOptions): Promise<void> {
+    const resolvedOptions = validateCopyOptions(options);
+    const sourcePath = pathToString(source);
+    const destinationPath = pathToString(destination);
+    await copyPath(sourcePath, destinationPath, resolvedOptions);
 }
 
-function globToRegex(pattern: string): RegExp {
-    const sep = '[/\\\\]';
-    const notSep = '[^/\\\\]';
-    let regex = '';
-    let i = 0;
-    while (i < pattern.length) {
-        const c = pattern[i];
-        if (c === '*') {
-            if (pattern[i + 1] === '*') {
-                if (pattern[i + 2] === '/' || pattern[i + 2] === '\\') {
-                    regex += `(?:.*${sep})?`;
-                    i += 3;
-                } else {
-                    regex += '.*';
-                    i += 2;
-                }
-            } else {
-                regex += notSep + '*';
-                i++;
-            }
-        } else if (c === '?') {
-            regex += notSep;
-            i++;
-        } else if (c === '[') {
-            const j = pattern.indexOf(']', i);
-            if (j === -1) {
-                regex += '\\[';
-                i++;
-            } else {
-                regex += pattern.slice(i, j + 1).replace(/\\/g, '\\\\');
-                i = j + 1;
-            }
-        } else if (c === '{') {
-            const j = pattern.indexOf('}', i);
-            if (j === -1) {
-                regex += '\\{';
-                i++;
-            } else {
-                const inner = pattern.slice(i + 1, j).split(',').map(s => globToRegex(s).source).join('|');
-                regex += `(?:${inner})`;
-                i = j + 1;
-            }
-        } else if ('.+^$|()\\'.includes(c)) {
-            regex += '\\' + c;
-            i++;
-        } else {
-            regex += c;
-            i++;
-        }
-    }
-    return new RegExp('^' + regex + '$');
-}
-
-export async function* glob(pattern: string | readonly string[], options?: { cwd?: string; exclude?: string | string[]; withFileTypes?: boolean }): AsyncIterableIterator<string> {
-    const patterns = Array.isArray(pattern) ? pattern : [pattern];
-    const cwd = options?.cwd ?? '.';
-    const excludes = options?.exclude ? (Array.isArray(options.exclude) ? options.exclude : [options.exclude]) : [];
-    const regexes = patterns.map(p => globToRegex(p));
-    const excludeRegexes = excludes.map(p => globToRegex(p));
-
-    async function lstatOrNull(path: string): Promise<CModuleAsyncFS.StatResult | null> {
-        try {
-            return await w(asfs.lstat(path), 'lstat', path);
-        } catch {
-            return null;
-        }
-    }
-
-    async function* walk(dir: string): AsyncIterableIterator<string> {
-        let entries: string[];
-        try {
-            const dirIter = await w(asfs.readDir(dir), 'readdir', dir);
-            entries = [];
-            for await (const entry of dirIter) {
-                entries.push(entry.name);
-            }
-        }
-        catch { return; }
-        for (const name of entries) {
-            const full = join(dir, name);
-            let rel = full.slice(cwd.length + 1);
-            const stat = await lstatOrNull(full);
-            if (!stat) continue;
-            if (excludeRegexes.some(r => r.test(rel))) continue;
-            if (regexes.some(r => r.test(rel))) yield rel;
-            if (stat.isDirectory) yield* walk(full);
-        }
-    }
-
-    yield* walk(cwd);
+export async function* glob(
+    pattern: string | readonly string[],
+    options?: GlobOptions,
+): AsyncIterableIterator<GlobResult> {
+    for (const result of await globPaths(pattern, options)) yield result;
 }
 
 // Export constants

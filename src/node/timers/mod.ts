@@ -51,52 +51,67 @@ export interface TimerOptions {
 // Timeout wrapper
 
 class Timeout implements NodeJS.Timeout {
-    #id: number;
+    #id = 0;
     #isInterval: boolean;
-    #fn?: TimerCallback;
-    #ms?: number;
+    #fn: TimerCallback;
+    #ms: number;
     #args: unknown[];
     #cleared = false;
+    #active = false;
+    #refed = true;
 
-    constructor(id: number, isInterval = false, fn?: TimerCallback, ms?: number, args: unknown[] = []) {
-        this.#id = id;
+    constructor(isInterval: boolean, fn: TimerCallback, ms: number, args: unknown[] = []) {
         this.#isInterval = isInterval;
         this.#fn = fn;
         this.#ms = ms;
         this.#args = args;
+        this.#schedule();
+    }
+
+    #schedule(): void {
+        const callback = () => {
+            if (!this.#isInterval) this.#active = false;
+            this.#fn.apply(this, this.#args);
+        };
+        this.#id = this.#isInterval
+            ? timer.setInterval(callback, this.#ms)
+            : timer.setTimeout(callback, this.#ms);
+        this.#active = true;
+        if (!this.#refed) timer.unrefTimer(this.#id);
     }
 
     hasRef(): boolean {
-        return timer.hasRef(this.#id);
+        return this.#refed;
     }
 
     ref(): this {
-        timer.refTimer(this.#id);
+        this.#refed = true;
+        if (this.#active) timer.refTimer(this.#id);
         return this;
     }
 
     unref(): this {
-        timer.unrefTimer(this.#id);
+        this.#refed = false;
+        if (this.#active) timer.unrefTimer(this.#id);
         return this;
     }
 
     refresh(): this {
         if (this.#cleared) return this;
-        if (this.#fn) {
+        if (this.#active) {
             const clearFn = this.#isInterval ? timer.clearInterval : timer.clearTimeout;
             clearFn(this.#id);
-            if (this.#isInterval) {
-                this.#id = timer.setInterval(this.#fn, this.#ms, ...this.#args);
-            } else {
-                this.#id = timer.setTimeout(this.#fn, this.#ms, ...this.#args);
-            }
         }
+        this.#schedule();
         return this;
     }
 
     close(): this {
-        const clearFn = this.#isInterval ? timer.clearInterval : timer.clearTimeout;
-        clearFn(this.#id);
+        if (this.#active) {
+            const clearFn = this.#isInterval ? timer.clearInterval : timer.clearTimeout;
+            clearFn(this.#id);
+            this.#active = false;
+        }
         this.#cleared = true;
         return this;
     }
@@ -106,13 +121,11 @@ class Timeout implements NodeJS.Timeout {
     }
 
     [Symbol.dispose](): void {
-        const clearFn = this.#isInterval ? timer.clearInterval : timer.clearTimeout;
-        clearFn(this.#id);
-        this.#cleared = true;
+        this.close();
     }
 
     get _onTimeout(): TimerCallback | null {
-        return null;
+        return this.#cleared ? null : this.#fn;
     }
 
     get __cno_timer_id(): number {
@@ -123,36 +136,45 @@ class Timeout implements NodeJS.Timeout {
 // Immediate wrapper
 
 class Immediate implements NodeJS.Immediate {
-    #canceled = false;
+    #id: number;
+    #active = true;
     #refed = true;
 
     constructor(private handle: TimerCallback, args: unknown[] = []) {
-        queueMicrotask(() => {
-            if (this.#canceled) return;
+        this.#id = timer.setTimeout(() => {
+            if (!this.#active) return;
+            this.#active = false;
+            this.#refed = false;
             handle.apply(this, args);
-        });
+        }, 0);
     }
 
     hasRef(): boolean {
-        return this.#refed;
+        return this.#active && this.#refed;
     }
 
     ref(): this {
+        if (!this.#active) return this;
         this.#refed = true;
+        timer.refTimer(this.#id);
         return this;
     }
 
     unref(): this {
+        if (!this.#active) return this;
         this.#refed = false;
+        timer.unrefTimer(this.#id);
         return this;
     }
 
     [Symbol.dispose](): void {
-        this.#canceled = true;
+        this.close();
     }
 
     close(): this {
-        this.#canceled = true;
+        if (this.#active) timer.clearTimeout(this.#id);
+        this.#active = false;
+        this.#refed = false;
         return this;
     }
 
@@ -166,15 +188,13 @@ class Immediate implements NodeJS.Immediate {
 export function setTimeout<T>(callback: (...args: T[]) => void, ms?: number, ...args: T[]): NodeJS.Timeout {
     assertTimerCallback(callback);
     const delay = ms ?? 1;
-    const id = timer.setTimeout(callback, delay, ...args);
-    return new Timeout(id, false, callback, delay, args);
+    return new Timeout(false, callback, delay, args);
 }
 
 export function setInterval<T>(callback: (...args: T[]) => void, ms?: number, ...args: T[]): NodeJS.Timeout {
     assertTimerCallback(callback);
     const delay = ms ?? 1;
-    const id = timer.setInterval(callback, delay, ...args);
-    return new Timeout(id, true, callback, delay, args);
+    return new Timeout(true, callback, delay, args);
 }
 
 export function setImmediate<T>(callback: (...args: T[]) => void, ...args: T[]): NodeJS.Immediate {
@@ -222,6 +242,7 @@ export const promises = {
                 cleanup();
                 resolve(value as T);
             }, delay ?? 1);
+            if (options?.ref === false) timer.unrefTimer(id);
         });
     },
 
@@ -244,6 +265,7 @@ export const promises = {
                         cleanup();
                         resolve();
                     }, delay ?? 1);
+                    if (options?.ref === false) timer.unrefTimer(id);
                 });
 
                 return { done: false, value: value as T };
@@ -260,14 +282,15 @@ export const promises = {
         if (signal?.aborted) return Promise.reject(createAbortError(signal.reason));
 
         return new Promise<T>((resolve, reject) => {
-            const onAbort = () => { cleanup(); reject(createAbortError(signal?.reason)); };
+            const onAbort = () => { cleanup(); timer.clearTimeout(id); reject(createAbortError(signal?.reason)); };
             const cleanup = () => { signal?.removeEventListener('abort', onAbort); };
             signal?.addEventListener('abort', onAbort, { once: true });
 
-            queueMicrotask(() => {
+            const id = timer.setTimeout(() => {
                 cleanup();
                 resolve(value as T);
-            });
+            }, 0);
+            if (options?.ref === false) timer.unrefTimer(id);
         });
     },
 
@@ -287,11 +310,12 @@ export const promises = {
                     cleanup();
                     resolve();
                 }, delay);
+                if (Reflect.get(options ?? {}, 'ref') === false) timer.unrefTimer(id);
             });
         },
 
         yield(): Promise<void> {
-            return new Promise<void>(resolve => queueMicrotask(resolve));
+            return promises.setImmediate();
         },
     },
 };

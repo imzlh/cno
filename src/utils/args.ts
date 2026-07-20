@@ -13,7 +13,7 @@ export interface Args {
 // of keeping its own copy, so the two parsers can never drift.
 export const SUBCOMMANDS = [
     'run', 'task', 'eval', 'cache', 'pack', 'repl', 'exec',
-    'fmt', 'lint', 'test', 'upgrade', 'setup', 'help', 'version',
+    'test', 'setup', 'help', 'version',
 ] as const;
 export type Subcommand = typeof SUBCOMMANDS[number];
 const SUBCOMMAND_SET = new Set<string>(SUBCOMMANDS);

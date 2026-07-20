@@ -11,6 +11,7 @@ export const extname = win32Path.extname;
 export const format = win32Path.format;
 export const isAbsolute = win32Path.isAbsolute;
 export const join = win32Path.join;
+export const matchesGlob = win32Path.matchesGlob;
 export const normalize = win32Path.normalize;
 export const parse = win32Path.parse;
 export const relative = win32Path.relative;

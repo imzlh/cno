@@ -6,21 +6,29 @@ const process = import.meta.use('process');
 const os = import.meta.use('os');
 const error = import.meta.use('error');
 
+function closePipe(pipe: CModuleStreams.Pipe): void {
+    try {
+        pipe.close();
+    } catch {}
+}
+
 function pipeToReadable(pipe: CModuleStreams.Pipe): ReadableStream<Uint8Array> {
     return new ReadableStream({
         pull: async (controller) => {
-	            try {
-	                const buf = malloc(controller);
-	                const n = await pipe.read(buf);
-	                if (n === null) {
-	                    controller.close();
-	                    return;
-	                }
-	                controller.enqueue(buf.subarray(0, n));
-	            } catch (e) {
+            try {
+                const buf = malloc(controller);
+                const n = await pipe.read(buf);
+                if (n === 0) {
+                    closePipe(pipe);
+                    controller.close();
+                    return;
+                }
+                controller.enqueue(buf.subarray(0, n));
+            } catch (e) {
                 controller.error(wrapFSErr(e));
             }
-        }
+        },
+        cancel: () => closePipe(pipe),
     });
 }
 
@@ -29,7 +37,9 @@ function pipeToWritable(pipe: CModuleStreams.Pipe): WritableStream<Uint8Array> {
         write: async (data) => {
             const n = await pipe.write(data);
             if (n === null) throw error.Error(error.errno.EOF);
-        }
+        },
+        close: () => closePipe(pipe),
+        abort: () => closePipe(pipe),
     });
 }
 
@@ -37,8 +47,9 @@ class PtyProcess implements CNO.PtyPipe {
     #proc: CModuleProcess.ChildProcess<true>;
     #readable: ReadableStream<Uint8Array>;
     #writable: WritableStream<Uint8Array>;
+    #wait: Promise<CNO.ExitInfo>;
 
-    constructor(opts: CNO.OpenptyOptions) {
+    constructor(opts: CNO.OpenptyOptions = {}) {
         if (opts.argv !== undefined && !Array.isArray(opts.argv)) {
             throw new TypeError('argv must be an array of strings');
         }
@@ -53,6 +64,8 @@ class PtyProcess implements CNO.PtyPipe {
         }
         const spawnOpts: CModuleProcess.SpawnOptions<true> = {
             pty: true,
+            name: opts.argv?.[0] ?? opts.name,
+            argv: opts.argv,
             cols: opts.cols,
             rows: opts.rows,
             cwd: opts.cwd,
@@ -66,6 +79,10 @@ class PtyProcess implements CNO.PtyPipe {
         if (!this.#proc.readable || !this.#proc.writable) throw new Error('pty process pipes were not created');
         this.#readable = pipeToReadable(this.#proc.readable);
         this.#writable = pipeToWritable(this.#proc.writable);
+        this.#wait = this.#proc.wait().then(res => ({
+            exitStatus: res.exit_status,
+            termSignal: res.term_signal,
+        }));
     }
 
     get pid(): number { return this.#proc.pid; }
@@ -75,12 +92,9 @@ class PtyProcess implements CNO.PtyPipe {
     kill(signal: CNO.Signal = 'SIGINT') { this.#proc.kill(signal); }
     resize(cols: number, rows: number) { this.#proc.resize(cols, rows); }
     getwinsize(): CNO.WinSize { return this.#proc.getwinsize; }
-    wait(): Promise<CNO.ExitInfo> { return Promise.resolve(this.#proc.waitSync()).then(res => ({
-        exitStatus: res.exit_status,
-        termSignal: res.term_signal
-    })); }
+    wait(): Promise<CNO.ExitInfo> { return this.#wait; }
 }
 
-Reflect.set(CNO, 'openpty', async function (opts: CNO.OpenptyOptions): Promise<CNO.PtyPipe> {
+Reflect.set(CNO, 'openpty', async function (opts: CNO.OpenptyOptions = {}): Promise<CNO.PtyPipe> {
     return new PtyProcess(opts);
 });

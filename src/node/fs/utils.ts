@@ -47,6 +47,21 @@ export function errorFromUnknown(error: unknown): Error {
     return error instanceof Error ? error : new Error(String(error));
 }
 
+export function rmIsDirectoryError(path: string): NodeJS.ErrnoException {
+    const error = new Error(`Path is a directory: rm returned EISDIR (is a directory) ${path}`) as NodeJS.ErrnoException;
+    error.code = 'ERR_FS_EISDIR';
+    error.errno = 21;
+    error.syscall = 'rm';
+    error.path = path;
+    return error;
+}
+
+function dirClosedError(): NodeJS.ErrnoException {
+    const error = new Error('Directory handle was closed') as NodeJS.ErrnoException;
+    error.code = 'ERR_DIR_CLOSED';
+    return error;
+}
+
 /**
  * Read a file synchronously from a file descriptor in chunks, returning the concatenated result.
  */
@@ -167,11 +182,23 @@ const VALID_ENCODINGS = new Set([
     'buffer',
 ]);
 
-function validateEncodingOption(encoding: unknown): void {
+export function validateEncodingOption(encoding: unknown): void {
     if (encoding === undefined || encoding === null) return;
     if (typeof encoding !== 'string' || !VALID_ENCODINGS.has(encoding.toLowerCase())) {
-        throw new TypeError(`Invalid encoding: ${String(encoding)}`);
+        const error = new TypeError(`The argument '${String(encoding)}' is invalid encoding. Received 'encoding'`);
+        Reflect.set(error, 'code', 'ERR_INVALID_ARG_VALUE');
+        throw error;
     }
+}
+
+export function validateReaddirOptions(options: unknown): void {
+    if (options === undefined || options === null) return;
+    if (typeof options === 'string') {
+        validateEncodingOption(options);
+        return;
+    }
+    if (typeof options !== 'object') throw new TypeError('The "options" argument must be of type string or object');
+    validateEncodingOption(Reflect.get(options, 'encoding'));
 }
 
 export function validateOpendirOptions(options: unknown): void {
@@ -332,41 +359,67 @@ export interface DirEntryWithParent {
     isSocket?: boolean;
 }
 
-export function toNodeDirent(
-    name: string,
+type DirentInfo = Pick<DirEntryWithParent,
+    'isFile' | 'isDirectory' | 'isSymbolicLink' | 'isBlockDevice' |
+    'isCharacterDevice' | 'isFIFO' | 'isSocket'>;
+
+function direntType(info: DirentInfo): number {
+    if (info.isFile) return 1;
+    if (info.isDirectory) return 2;
+    if (info.isSymbolicLink) return 3;
+    if (info.isFIFO) return 4;
+    if (info.isSocket) return 5;
+    if (info.isCharacterDevice) return 6;
+    if (info.isBlockDevice) return 7;
+    return 0;
+}
+
+export class Dirent<Name extends string | Buffer = string> {
+    readonly name: Name;
+    readonly parentPath: string;
+    readonly #type: number;
+
+    constructor(name: Name, type: number, parentPath: string) {
+        this.name = name;
+        this.#type = type;
+        this.parentPath = parentPath;
+    }
+
+    isFile(): boolean { return this.#type === 1; }
+    isDirectory(): boolean { return this.#type === 2; }
+    isSymbolicLink(): boolean { return this.#type === 3; }
+    isFIFO(): boolean { return this.#type === 4; }
+    isSocket(): boolean { return this.#type === 5; }
+    isCharacterDevice(): boolean { return this.#type === 6; }
+    isBlockDevice(): boolean { return this.#type === 7; }
+}
+
+export function toNodeDirent<Name extends string | Buffer>(
+    name: Name,
     stat: Pick<CModuleFS.Stats, 'isFile' | 'isDirectory' | 'isSymbolicLink' | 'isBlockDevice' | 'isCharacterDevice' | 'isFIFO' | 'isSocket'>
         | Pick<CModuleFS.DirEnt, 'isFile' | 'isDirectory' | 'isSymbolicLink' | 'isBlockDevice' | 'isCharacterDevice' | 'isFIFO' | 'isSocket'>
         | DirEntryWithParent,
     parentPath: string,
-): import('fs').Dirent {
-    return {
-        name,
-        isFile: () => stat.isFile,
-        isDirectory: () => stat.isDirectory,
-        isBlockDevice: () => !!stat.isBlockDevice,
-        isCharacterDevice: () => !!stat.isCharacterDevice,
-        isSymbolicLink: () => stat.isSymbolicLink,
-        isFIFO: () => !!stat.isFIFO,
-        isSocket: () => !!stat.isSocket,
-        parentPath,
-    };
+): Dirent<Name> {
+    return new Dirent(name, direntType(stat), parentPath);
 }
 
 export function toNodeDirentAsync(
-    ent: CModuleAsyncFS.DirEnt | DirEntryWithParent,
+    ent: CModuleAsyncFS.DirEnt | CModuleAsyncFS.StatResult | DirEntryWithParent,
     parentPath: string,
-): import('fs').Dirent {
-    return {
-        name: ent.name,
-        isFile: () => ent.isFile,
-        isDirectory: () => ent.isDirectory,
-        isBlockDevice: () => !!ent.isBlockDevice,
-        isCharacterDevice: () => !!ent.isCharacterDevice,
-        isSymbolicLink: () => ent.isSymbolicLink,
-        isFIFO: () => !!ent.isFIFO,
-        isSocket: () => !!ent.isSocket,
-        parentPath,
-    };
+): Dirent<string>;
+export function toNodeDirentAsync<Name extends string | Buffer>(
+    ent: CModuleAsyncFS.DirEnt | CModuleAsyncFS.StatResult | DirEntryWithParent,
+    parentPath: string,
+    name: Name,
+): Dirent<Name>;
+export function toNodeDirentAsync(
+    ent: CModuleAsyncFS.DirEnt | CModuleAsyncFS.StatResult | DirEntryWithParent,
+    parentPath: string,
+    name?: string | Buffer,
+): Dirent<string | Buffer> {
+    const entryName = name ?? ('name' in ent ? ent.name : '');
+    return new Dirent(entryName, direntType(ent), parentPath);
 }
 
 export function readDirEntriesSync(pathStr: string, recursive = false, prefix = ''): DirEntryWithParent[] {
@@ -439,21 +492,24 @@ export class Dir {
     read(): Promise<import('fs').Dirent | null>;
     read(callback?: (err: NodeJS.ErrnoException | null, dirent: import('fs').Dirent | null) => void): Promise<import('fs').Dirent | null> | void {
         if (callback) {
-            let entry: import('fs').Dirent | null;
-            try {
-                entry = this.readSync();
-            } catch (err) {
-                callback(errorFromUnknown(err), null);
-                return;
-            }
-            callback(null, entry);
+            queueMicrotask(() => {
+                let entry: import('fs').Dirent | null;
+                try {
+                    entry = this.readSync();
+                } catch (err) {
+                    callback(errorFromUnknown(err), null);
+                    return;
+                }
+                callback(null, entry);
+            });
             return;
         }
-        return Promise.resolve(this.readSync());
+        return Promise.resolve().then(() => this.readSync());
     }
 
     readSync(): import('fs').Dirent | null {
-        if (this.closed || this.index >= this.entries.length) return null;
+        if (this.closed) throw dirClosedError();
+        if (this.index >= this.entries.length) return null;
         const entry = this.entries[this.index++];
         if (entry === undefined) return null;
         return toNodeDirent(entry.name, entry, this.path);
@@ -463,15 +519,21 @@ export class Dir {
     close(): Promise<void>;
     close(callback?: (err: NodeJS.ErrnoException | null) => void): Promise<void> | void {
         if (callback) {
-            this.closeSync();
-            callback(null);
+            queueMicrotask(() => {
+                try {
+                    this.closeSync();
+                    callback(null);
+                } catch (err) {
+                    callback(errorFromUnknown(err));
+                }
+            });
             return;
         }
-        this.closeSync();
-        return Promise.resolve();
+        return Promise.resolve().then(() => this.closeSync());
     }
 
     closeSync(): void {
+        if (this.closed) throw dirClosedError();
         this.closed = true;
         this.entries = [];
     }
@@ -494,28 +556,8 @@ export class Dir {
 
 // Flag parsing
 
-export function parseFlags(flag?: string | number): Exclude<CModuleFS.OpenFlags, number> {
-    if (typeof flag === 'number') {
-        const append = Boolean(flag & fs.OPEN_APPEND);
-        const create = Boolean(flag & fs.OPEN_CREAT);
-        const exclusive = Boolean(flag & fs.OPEN_EXCL);
-        const truncate = Boolean(flag & fs.OPEN_TRUNC);
-        const readWrite = Boolean(flag & fs.OPEN_RDWR);
-
-        if (append) {
-            if (exclusive) return readWrite ? 'ax+' : 'ax';
-            return readWrite ? 'a+' : 'a';
-        }
-        if (create || truncate) {
-            if (exclusive) return readWrite ? 'wx+' : 'wx';
-            return readWrite ? 'w+' : 'w';
-        }
-        if (flag & fs.OPEN_RDWR) return 'r+';
-        if (flag & fs.OPEN_WRONLY) return 'w';
-        return 'r';
-    }
-    // flag is string | undefined here (number branch handled above)
-    return (flag || 'r') as Exclude<CModuleFS.OpenFlags, number>;
+export function parseFlags(flag?: string | number): CModuleFS.OpenFlags | string {
+    return flag ?? 'r';
 }
 
 // Path handling
@@ -534,7 +576,10 @@ export function pathToString(path: string | URL | Uint8Array): string {
     if (path instanceof URL) {
         return fileURLToPath(path);
     }
-    return String(path);
+    throw Object.assign(
+        new TypeError('The "path" argument must be of type string or an instance of Buffer or URL.'),
+        { code: 'ERR_INVALID_ARG_TYPE' },
+    );
 }
 
 export function splitPathOrFd(path: PathLike | number): { fd: number } | { path: string } {
@@ -715,9 +760,10 @@ export function createFileHandle(fd: number, handle: CModuleAsyncFS.FileHandle) 
             await ensureOpen();
             const o = offset ?? 0, l = length ?? buffer.length;
             // native read() treats explicit null as offset 0, not "current offset" — omit the arg instead
-            const bytesRead = position == null
+            const result = position == null
                 ? await handle.read(buffer.subarray(o, o + l))
                 : await handle.read(buffer.subarray(o, o + l), position);
+            const bytesRead = result ?? 0;
             return { bytesRead, buffer };
         },
         async write(buffer: Uint8Array | string, offsetOrPosition?: number | null, lengthOrEncoding?: number | BufferEncoding, position?: number | null) {
@@ -739,10 +785,9 @@ export function createFileHandle(fd: number, handle: CModuleAsyncFS.FileHandle) 
             closed = true;
             await handle.close();
         },
-        async stat(ops?: StatFsOptions) {
+        async stat(options?: { bigint?: boolean }) {
             await ensureOpen();
-            if (ops?.bigint) throw new Error('bigint option is not supported');
-            return toNodeStat(await handle.stat());
+            return toNodeStat(await handle.stat(), options);
         },
         async sync() { await ensureOpen(); await handle.sync(); },
         async datasync() { await ensureOpen(); await handle.datasync(); },
@@ -755,32 +800,54 @@ export function createFileHandle(fd: number, handle: CModuleAsyncFS.FileHandle) 
         },
         async appendFile(data: string | Uint8Array | ArrayBuffer) {
             await ensureOpen();
-            await handle.write(toUint8Array(data));
+            await writeAll(toUint8Array(data));
         },
         async readFile(options?: { encoding?: BufferEncoding | null } | BufferEncoding) {
             await ensureOpen();
             const st = await handle.stat();
-            const buf = new Uint8Array(st.size);
-            let off = 0;
-            while (off < st.size) {
-                const n = await handle.read(buf.subarray(off));
-                if (n === 0) break;
-                off += n;
+            const chunks: Uint8Array[] = [];
+            let remaining = st.size > 0 ? st.size : Number.POSITIVE_INFINITY;
+            while (remaining > 0) {
+                const size = Number.isFinite(remaining) ? Math.min(64 * 1024, remaining) : 64 * 1024;
+                const buf = new Uint8Array(size);
+                const n = await handle.read(buf);
+                if (n === null || n === 0) break;
+                chunks.push(buf.slice(0, n));
+                remaining -= n;
             }
-            return decodeBuffer(buf, typeof options === 'string' ? options : options?.encoding);
+            return decodeBuffer(concatChunks(chunks), typeof options === 'string' ? options : options?.encoding);
         },
         async writeFile(data: string | Uint8Array | ArrayBuffer) {
             await ensureOpen();
             await writeAll(toUint8Array(data));
         },
-        async writev(buffers: readonly Uint8Array[], position?: number | null) {
+        async readv(buffers: readonly ArrayBufferView[], position?: number | null) {
             await ensureOpen();
+            if (!Array.isArray(buffers)) throw new TypeError('The "buffers" argument must be an Array');
+            let bytesRead = 0;
+            let currentPosition = position;
+            for (const buffer of buffers) {
+                if (!ArrayBuffer.isView(buffer)) throw new TypeError('The "buffers" argument must be an ArrayBufferView[]');
+                const chunk = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+                if (chunk.byteLength === 0) continue;
+                const read = currentPosition == null
+                    ? await handle.read(chunk)
+                    : await handle.read(chunk, currentPosition);
+                const count = read ?? 0;
+                bytesRead += count;
+                if (currentPosition != null) currentPosition += count;
+                if (count < chunk.byteLength) break;
+            }
+            return { bytesRead, buffers };
+        },
+        async writev(buffers: readonly ArrayBufferView[], position?: number | null) {
+            await ensureOpen();
+            if (!Array.isArray(buffers)) throw new TypeError('The "buffers" argument must be an Array');
             let bytesWritten = 0;
             let currentPosition = position;
             for (const buffer of buffers) {
-                const chunk = buffer instanceof Uint8Array
-                    ? buffer
-                    : new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+                if (!ArrayBuffer.isView(buffer)) throw new TypeError('The "buffers" argument must be an ArrayBufferView[]');
+                const chunk = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
                 const written = await writeAll(arrayBufferBackedBytes(chunk), currentPosition);
                 bytesWritten += written;
                 if (currentPosition != null) currentPosition += written;
@@ -811,7 +878,7 @@ export function createAsyncDir(
         path: pathStr,
 
         async read(): Promise<import('fs').Dirent | null> {
-            if (closed) return null;
+            if (closed) throw dirClosedError();
             const result = await dirHandle.next();
             if (result.done) return null;
             return toNodeDirentAsync(result.value, pathStr);
@@ -822,7 +889,7 @@ export function createAsyncDir(
         },
 
         async close(): Promise<void> {
-            if (closed) return;
+            if (closed) throw dirClosedError();
             closed = true;
             await dirHandle.close();
         },

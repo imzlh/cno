@@ -21,10 +21,24 @@ const isWindowsDriveLetter = (str: string): boolean => {
 
 
 const percentEncode = (str: string, encodeSet: RegExp): string => {
-    return str.replace(encodeSet, (char) => {
-        const hex = char.charCodeAt(0).toString(16).toUpperCase();
-        return `%${hex.padStart(2, '0')}`;
-    });
+    let result = '';
+    for (const char of str) {
+        encodeSet.lastIndex = 0;
+        const shouldEncode = encodeSet.test(char);
+        encodeSet.lastIndex = 0;
+        if (!shouldEncode) {
+            result += char;
+            continue;
+        }
+        try {
+            result += encodeURIComponent(char).replace(/[!'()*]/g, (value) =>
+                `%${value.charCodeAt(0).toString(16).toUpperCase()}`,
+            );
+        } catch {
+            result += '%EF%BF%BD';
+        }
+    }
+    return result;
 };
 
 function createObjectUrlId(): string {
@@ -47,10 +61,14 @@ export function resolveObjectURLBytes(url: string | globalThis.URL): { type: str
 }
 
 const percentDecode = (str: string): string => {
-    return str.replace(/%([0-9A-Fa-f]{2})/g, (_, hex) => {
-        return String.fromCharCode(parseInt(hex, 16));
-    });
+    try {
+        return decodeURIComponent(str);
+    } catch {
+        return str.replace(/%([0-9A-Fa-f]{2})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+    }
 };
+
+const URL_TEXT_ENCODE_SET = /[^\x21-\x7E]/;
 
 const formUrlEncode = (str: string): string => {
     return encodeURIComponent(str)
@@ -331,6 +349,7 @@ class URL implements globalThis.URL {
     #hasQuery = false;
     #query: string | null = null;
     #fragment = '';
+    #hasFragment = false;
     #searchParams: URLSearchParams;
 
     static parse(url: string, base?: string | globalThis.URL): URL | null {
@@ -360,10 +379,6 @@ class URL implements globalThis.URL {
         this.#parse(String(url), base);
     }
 
-    private encodeSpaces(str: string) {
-        return str.replaceAll(' ', '%20');
-    }
-
     #parse(input: string, base?: string | globalThis.URL): void {
         input = String(input).trim();
 
@@ -386,6 +401,7 @@ class URL implements globalThis.URL {
         // Extract fragment
         const fragmentIndex = input.indexOf('#');
         if (fragmentIndex !== -1) {
+            this.#hasFragment = true;
             this.#fragment = input.slice(fragmentIndex + 1);
             input = input.slice(0, fragmentIndex);
         }
@@ -567,6 +583,7 @@ class URL implements globalThis.URL {
         this.#scheme = ''; this.#host = ''; this.#port = '';
         this.#username = ''; this.#password = '';
         this.#path = []; this.#query = null; this.#hasQuery = false; this.#fragment = '';
+        this.#hasFragment = false;
         this.#parse(value);
     }
 
@@ -701,7 +718,7 @@ class URL implements globalThis.URL {
     get pathname(): string {
         if (this.#scheme === 'file') {
             if (this.#path.length === 0) return '/';
-            return this.encodeSpaces('/' + this.#path.join('/'));
+            return percentEncode('/' + this.#path.join('/'), PATH_ENCODE_SET);
         }
 
         if (this.#path.length === 0) return '/';
@@ -720,7 +737,7 @@ class URL implements globalThis.URL {
 
     get search(): string {
         if (this.#query === null || this.#query === '') return '';
-        return '?' + this.encodeSpaces(this.#query);
+        return '?' + percentEncode(this.#query, URL_TEXT_ENCODE_SET);
     }
 
     set search(value: string) {
@@ -743,15 +760,17 @@ class URL implements globalThis.URL {
 
     get hash(): string {
         if (!this.#fragment) return '';
-        return '#' + this.#fragment;
+        return '#' + percentEncode(this.#fragment, URL_TEXT_ENCODE_SET);
     }
 
     set hash(value: string) {
         const str = String(value);
         if (!str) {
             this.#fragment = '';
+            this.#hasFragment = false;
             return;
         }
+        this.#hasFragment = true;
         this.#fragment = percentEncode(
             str.startsWith('#') ? str.slice(1) : str,
             FRAGMENT_ENCODE_SET
@@ -782,10 +801,10 @@ class URL implements globalThis.URL {
 
         result += this.pathname;
 
-        if (this.#hasQuery) result += '?' + this.encodeSpaces(this.#query ?? '');
+        if (this.#hasQuery) result += '?' + percentEncode(this.#query ?? '', URL_TEXT_ENCODE_SET);
 
-        if (this.#fragment) {
-            result += '#' + this.#fragment;
+        if (this.#hasFragment) {
+            result += '#' + percentEncode(this.#fragment, URL_TEXT_ENCODE_SET);
         }
 
         return result;
@@ -837,6 +856,6 @@ Reflect.set(globalThis, 'URL', URL);
 Reflect.set(globalThis, 'URLSearchParams', URLSearchParams);
 
 export {
-    URL as URL,
-    URLSearchParams as URLSearchParams
+    URL,
+    URLSearchParams,
 };

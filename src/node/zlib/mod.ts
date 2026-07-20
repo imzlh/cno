@@ -60,18 +60,26 @@ export type CompressCallback = (err: Error | null, result?: Buffer) => void;
 type ZlibHandle = {
     deflate(input: Uint8Array, flush?: number): Uint8Array;
     inflate(input: Uint8Array, flush?: number): Uint8Array;
+    flush(): Uint8Array;
     finish(): Uint8Array;
     close?: () => void;
     reset?: () => void;
     params?: (level: number, strategy: number) => void;
+    getTotalIn?: () => number;
+    getTotalOut?: () => number;
 };
 type TransformCallback = (err: unknown, result?: Buffer) => void;
 type ZlibStreamCtor<T extends Transform, O> = new (options?: O & TransformOptions) => T;
 type BrotliNative = {
-    brotliCompress?: (input: Uint8Array) => Uint8Array;
-    brotliDecompress?: (input: Uint8Array) => Uint8Array;
+    available?: boolean;
+    compress?: (input: Uint8Array, options?: CModuleBrotli.CompressOptions) => Uint8Array;
+    decompress?: (input: Uint8Array, options?: CModuleBrotli.DecompressOptions) => Uint8Array;
+    createCompress?: (options?: CModuleBrotli.CompressOptions) => CModuleBrotli.BrotliCompress;
+    createDecompress?: (options?: CModuleBrotli.DecompressOptions) => CModuleBrotli.BrotliDecompress;
 };
-const nativeBrotli: BrotliNative = zlib;
+// brotli is an optional native module (built with libbrotli); tolerate absence
+let nativeBrotli: BrotliNative = {};
+try { nativeBrotli = import.meta.use('brotli'); } catch { /* unavailable */ }
 
 // Internal helper functions
 
@@ -95,15 +103,75 @@ function validateZlibInput(data: ZlibInput): void {
     throw new TypeError('The "buffer" argument must be a string, Buffer, TypedArray, DataView, or ArrayBuffer');
 }
 
-function validateOptions(options?: { flush?: number; finishFlush?: number; maxOutputLength?: number }): void {
+const VALID_FLUSH_FLAGS = new Set([NO_FLUSH, PARTIAL_FLUSH, SYNC_FLUSH, FULL_FLUSH, FINISH, BLOCK]);
+
+function validateFlushFlag(value: unknown, name: string): void {
+    if (typeof value !== 'number') throw new TypeError(`The "${name}" property must be of type number`);
+    if (!Number.isInteger(value) || !VALID_FLUSH_FLAGS.has(value)) {
+        throw new RangeError(`The value of "${name}" is out of range`);
+    }
+}
+
+function validateOptions(options?: ZlibOptions | BrotliOptions): void {
+    if (options !== undefined && (options === null || typeof options !== 'object')) {
+        throw new TypeError('The "options" argument must be of type object');
+    }
     if (options?.flush !== undefined && !Number.isInteger(options.flush)) {
-        throw new TypeError('The "options.flush" property must be an integer');
+        validateFlushFlag(options.flush, 'options.flush');
+    } else if (options?.flush !== undefined) {
+        validateFlushFlag(options.flush, 'options.flush');
     }
     if (options?.finishFlush !== undefined && !Number.isInteger(options.finishFlush)) {
-        throw new TypeError('The "options.finishFlush" property must be an integer');
+        validateFlushFlag(options.finishFlush, 'options.finishFlush');
+    } else if (options?.finishFlush !== undefined) {
+        validateFlushFlag(options.finishFlush, 'options.finishFlush');
     }
     if (options?.maxOutputLength !== undefined && (!Number.isInteger(options.maxOutputLength) || options.maxOutputLength < 0)) {
         throw new RangeError('The "options.maxOutputLength" property must be a non-negative integer');
+    }
+
+    const zlibOptions = options as ZlibOptions | undefined;
+    if (zlibOptions?.level !== undefined &&
+        (!Number.isInteger(zlibOptions.level) || zlibOptions.level < -1 || zlibOptions.level > 9)) {
+        throw new RangeError('The value of "options.level" is out of range. It must be >= -1 and <= 9');
+    }
+    if (zlibOptions?.memLevel !== undefined &&
+        (!Number.isInteger(zlibOptions.memLevel) || zlibOptions.memLevel < 1 || zlibOptions.memLevel > 9)) {
+        throw new RangeError('The value of "options.memLevel" is out of range. It must be >= 1 and <= 9');
+    }
+    if (zlibOptions?.strategy !== undefined &&
+        (!Number.isInteger(zlibOptions.strategy) || ![DEFAULT_STRATEGY, FILTERED, HUFFMAN_ONLY, RLE, FIXED].includes(zlibOptions.strategy))) {
+        throw new RangeError('The value of "options.strategy" is out of range');
+    }
+    if (zlibOptions?.chunkSize !== undefined &&
+        (!Number.isInteger(zlibOptions.chunkSize) || zlibOptions.chunkSize <= 0)) {
+        throw new RangeError('The value of "options.chunkSize" is out of range');
+    }
+    if (zlibOptions?.windowBits !== undefined && zlibOptions.windowBits !== 0 && zlibOptions.windowBits !== 15) {
+        throw new RangeError('Only windowBits values 0 and 15 are supported');
+    }
+    if (zlibOptions?.dictionary !== undefined) {
+        if (!(zlibOptions.dictionary instanceof ArrayBuffer) && !ArrayBuffer.isView(zlibOptions.dictionary)) {
+            throw new TypeError('The "options.dictionary" property must be an ArrayBuffer or ArrayBufferView');
+        }
+        if (zlibOptions.dictionary.byteLength !== 0) {
+            throw new Error('Non-empty zlib dictionaries are not supported');
+        }
+    }
+}
+
+function validateBrotliOptions(options?: BrotliOptions): void {
+    validateOptions(options);
+    for (const [name, value] of [['flush', options?.flush], ['finishFlush', options?.finishFlush]] as const) {
+        if (value !== undefined && (!Number.isInteger(value) || value < BROTLI_OPERATION_PROCESS || value > BROTLI_OPERATION_FINISH)) {
+            throw new RangeError(`The value of "options.${name}" is out of range`);
+        }
+    }
+    if (options?.params !== undefined && (options.params === null || typeof options.params !== 'object')) {
+        throw new TypeError('The "options.params" property must be an object');
+    }
+    for (const value of Object.values(options?.params ?? {})) {
+        if (!Number.isInteger(value)) throw new TypeError('Brotli parameter values must be integers');
     }
 }
 
@@ -120,19 +188,19 @@ function checkMaxOutputLength(output: Buffer, options?: { maxOutputLength?: numb
 export function deflateSync(buffer: ZlibInput, options?: ZlibOptions): Buffer {
     validateOptions(options);
     const level = options?.level ?? zlib.DEFAULT_COMPRESSION;
-    return checkMaxOutputLength(Buffer.from(zlib.deflate(toUint8Array(buffer), level)), options);
+    return checkMaxOutputLength(Buffer.from(zlib.deflate(toUint8Array(buffer), level, options?.strategy, options?.memLevel)), options);
 }
 
 export function deflateRawSync(buffer: ZlibInput, options?: ZlibOptions): Buffer {
     validateOptions(options);
     const level = options?.level ?? zlib.DEFAULT_COMPRESSION;
-    return checkMaxOutputLength(Buffer.from(zlib.deflateRaw(toUint8Array(buffer), level)), options);
+    return checkMaxOutputLength(Buffer.from(zlib.deflateRaw(toUint8Array(buffer), level, options?.strategy, options?.memLevel)), options);
 }
 
 export function gzipSync(buffer: ZlibInput, options?: ZlibOptions): Buffer {
     validateOptions(options);
     const level = options?.level ?? zlib.DEFAULT_COMPRESSION;
-    return checkMaxOutputLength(Buffer.from(zlib.gzip(toUint8Array(buffer), level)), options);
+    return checkMaxOutputLength(Buffer.from(zlib.gzip(toUint8Array(buffer), level, options?.strategy, options?.memLevel)), options);
 }
 
 export function inflateSync(buffer: ZlibInput, options?: ZlibOptions): Buffer {
@@ -152,35 +220,22 @@ export function gunzipSync(buffer: ZlibInput, options?: ZlibOptions): Buffer {
 
 export function unzipSync(buffer: ZlibInput, options?: ZlibOptions): Buffer {
     validateOptions(options);
-    const buf = toUint8Array(buffer);
-    // Auto-detect format by magic number
-    if (buf[0] === 0x1f && buf[1] === 0x8b) {
-        return checkMaxOutputLength(Buffer.from(zlib.gunzip(buf)), options);
-    }
-    if (buf[0] === 0x78 && (buf[1] === 0x01 || buf[1] === 0x5e || buf[1] === 0x9c || buf[1] === 0xda)) {
-        return checkMaxOutputLength(Buffer.from(zlib.inflate(buf)), options);
-    }
-    // Try gunzip first, then inflate
-    try {
-        return checkMaxOutputLength(Buffer.from(zlib.gunzip(buf)), options);
-    } catch {
-        // Fall through to raw zlib inflate for ambiguous payloads.
-    }
-    return checkMaxOutputLength(Buffer.from(zlib.inflate(buf)), options);
+    return checkMaxOutputLength(Buffer.from(zlib.unzip(toUint8Array(buffer))), options);
 }
 
 // Async compress/decompress (callback style)
 
-type SyncFn = (buf: ZlibInput, opts?: ZlibOptions) => Buffer;
+type SyncFn = (buf: ZlibInput, opts?: ZlibOptions | BrotliOptions) => Buffer;
 
-function wrapCallback(syncFn: SyncFn) {
-    return function(buffer: ZlibInput, optionsOrCallback?: ZlibOptions | CompressCallback, callback?: CompressCallback) {
+function wrapCallback(syncFn: SyncFn, validator: (options?: ZlibOptions | BrotliOptions) => void = validateOptions) {
+    return function(buffer: ZlibInput, optionsOrCallback?: ZlibOptions | BrotliOptions | CompressCallback, callback?: CompressCallback) {
         const opts = typeof optionsOrCallback === 'function' ? {} : optionsOrCallback;
         const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
         if (typeof cb !== 'function') {
             throw new TypeError('The "callback" argument must be of type function');
         }
         validateZlibInput(buffer);
+        validator(opts);
         const input = new Uint8Array(toUint8Array(buffer));
         queueMicrotask(() => {
             try { cb(null, syncFn(input, opts)); }
@@ -239,10 +294,46 @@ function toTransformOptions(o?: ZlibOptions & TransformOptions): TransformOption
     return rest;
 }
 
-function _doTransform(handle: ZlibHandle, chunk: ZlibInput, compress: boolean, cb: TransformCallback) {
+type ZlibStreamState = {
+    compress: boolean;
+    flush: number;
+    finishFlush: number;
+    maxOutputLength?: number;
+    outputLength: number;
+};
+
+const zlibStreamStates = new WeakMap<object, ZlibStreamState>();
+
+function configureZlibStream(stream: object, compress: boolean, options?: ZlibOptions): void {
+    zlibStreamStates.set(stream, {
+        compress,
+        flush: options?.flush ?? NO_FLUSH,
+        finishFlush: options?.finishFlush ?? FINISH,
+        maxOutputLength: options?.maxOutputLength,
+        outputLength: 0,
+    });
+}
+
+function streamState(stream: object): ZlibStreamState {
+    const state = zlibStreamStates.get(stream);
+    if (!state) throw new Error('zlib stream is not initialized');
+    return state;
+}
+
+function checkStreamOutput(stream: object, output: Buffer): Buffer {
+    const state = streamState(stream);
+    state.outputLength += output.byteLength;
+    if (state.maxOutputLength !== undefined && state.outputLength > state.maxOutputLength) {
+        throw new RangeError(`Cannot create a Buffer larger than ${state.maxOutputLength} bytes`);
+    }
+    return output;
+}
+
+function _doTransform(stream: NodeZlibTransform, chunk: ZlibInput, cb: TransformCallback) {
     try {
-        const fn = compress ? 'deflate' : 'inflate';
-        const output = Buffer.from(handle[fn](toUint8Array(chunk)));
+        const state = streamState(stream);
+        const fn = state.compress ? 'deflate' : 'inflate';
+        const output = checkStreamOutput(stream, Buffer.from(stream._handle[fn](toUint8Array(chunk), state.flush)));
         cb(null, output.length > 0 ? output : undefined);
     } catch (err) { cb(err); }
 }
@@ -264,9 +355,13 @@ function processChunk(handle: ZlibHandle, chunk: ZlibInput, compress: boolean, f
     }
 }
 
-function _doFlush(handle: ZlibHandle, cb: TransformCallback) {
+function _doFlush(stream: NodeZlibTransform, cb: TransformCallback) {
     try {
-        const output = Buffer.from(handle.finish());
+        const state = streamState(stream);
+        const raw = state.finishFlush === FINISH
+            ? stream._handle.finish()
+            : stream._handle[state.compress ? 'deflate' : 'inflate'](new Uint8Array(), state.finishFlush);
+        const output = checkStreamOutput(stream, Buffer.from(raw));
         cb(null, output.length > 0 ? output : undefined);
     } catch (err) {
         if (/already finished/i.test(asError(err).message)) {
@@ -277,10 +372,61 @@ function _doFlush(handle: ZlibHandle, cb: TransformCallback) {
     }
 }
 
-export interface Deflate extends Transform {
+interface NodeZlibTransform extends Transform {
     _handle: ZlibHandle;
     _processChunk(chunk: ZlibInput, flush?: number): Buffer;
-    close(): void;
+    flush(kind?: number | (() => void), callback?: () => void): this;
+    reset(): void;
+    params(level: number, strategy: number, callback?: () => void): this;
+    close(callback?: () => void): void;
+}
+
+function flushStream(this: NodeZlibTransform, kindOrCallback?: number | (() => void), callback?: () => void): NodeZlibTransform {
+    const kind = typeof kindOrCallback === 'number' ? kindOrCallback : SYNC_FLUSH;
+    const cb = typeof kindOrCallback === 'function' ? kindOrCallback : callback;
+    validateFlushFlag(kind, 'kind');
+    try {
+        const state = streamState(this);
+        const output = checkStreamOutput(this, processChunk(this._handle, Buffer.alloc(0), state.compress, kind));
+        if (output.length > 0) this.push(output);
+        if (cb) queueMicrotask(cb);
+    } catch (error) {
+        this.destroy(asError(error));
+    }
+    return this;
+}
+
+function resetStream(this: NodeZlibTransform): void {
+    this._handle.reset?.();
+    const state = streamState(this);
+    state.outputLength = 0;
+}
+
+function paramsStream(this: NodeZlibTransform, level: number, strategy: number, callback?: () => void): NodeZlibTransform {
+    validateOptions({ level, strategy });
+    if (!this._handle.params) throw new Error('params() is only supported for compression streams');
+    this._handle.params(level, strategy);
+    if (callback) queueMicrotask(callback);
+    return this;
+}
+
+function closeStream(this: NodeZlibTransform, callback?: () => void): void {
+    if (callback) this.once('close', callback);
+    this._handle.close?.();
+    this.destroy();
+}
+
+function installZlibMethods(prototype: NodeZlibTransform): void {
+    prototype.flush = flushStream;
+    prototype.reset = resetStream;
+    prototype.params = paramsStream;
+    prototype.close = closeStream;
+}
+
+export interface Deflate extends NodeZlibTransform {
+    _handle: ZlibHandle;
+    _processChunk(chunk: ZlibInput, flush?: number): Buffer;
+    close(callback?: () => void): void;
 }
 
 export interface DeflateConstructor {
@@ -293,6 +439,7 @@ function initDeflate(self: Deflate, o?: ZlibOptions & TransformOptions): void {
     validateOptions(o);
     Transform.call(self, toTransformOptions(o));
     self._handle = installHandleCompat(zlib.createDeflate(..._opts(o)));
+    configureZlibStream(self, true, o);
 }
 
 export const Deflate: DeflateConstructor = function Deflate(this: Deflate | undefined, o?: ZlibOptions & TransformOptions) {
@@ -305,15 +452,15 @@ Object.setPrototypeOf(Deflate, Transform);
 Deflate.prototype = Object.create(Transform.prototype);
 
 Deflate.prototype._transform = function _transform(this: Deflate, chunk: ZlibInput, _e: BufferEncoding, cb: TransformCallback): void {
-    _doTransform(this._handle, chunk, true, cb);
+    _doTransform(this, chunk, cb);
 };
 
 Deflate.prototype._flush = function _flush(this: Deflate, cb: TransformCallback): void {
-    _doFlush(this._handle, cb);
+    _doFlush(this, cb);
 };
 
 Deflate.prototype._processChunk = function _processChunk(this: Deflate, chunk: ZlibInput, flush?: number): Buffer {
-    return processChunk(this._handle, chunk, true, flush);
+    return checkStreamOutput(this, processChunk(this._handle, chunk, true, flush));
 };
 
 Deflate.prototype.close = function close(this: Deflate): void {
@@ -327,6 +474,7 @@ Object.defineProperty(Deflate.prototype, 'constructor', {
 });
 
 flattenPrototype(Deflate.prototype);
+installZlibMethods(Deflate.prototype);
 
 const _opts = (o?: ZlibOptions) => [
     o?.level ?? zlib.DEFAULT_COMPRESSION,
@@ -334,10 +482,10 @@ const _opts = (o?: ZlibOptions) => [
     o?.memLevel ?? 8
 ] as const;
 
-export interface Inflate extends Transform {
+export interface Inflate extends NodeZlibTransform {
     _handle: ZlibHandle;
     _processChunk(chunk: ZlibInput, flush?: number): Buffer;
-    close(): void;
+    close(callback?: () => void): void;
 }
 
 export interface InflateConstructor {
@@ -350,6 +498,7 @@ function initInflate(self: Inflate, o?: ZlibOptions & TransformOptions): void {
     validateOptions(o);
     Transform.call(self, toTransformOptions(o));
     self._handle = installHandleCompat(zlib.createInflate());
+    configureZlibStream(self, false, o);
 }
 
 export const Inflate: InflateConstructor = function Inflate(this: Inflate | undefined, o?: ZlibOptions & TransformOptions) {
@@ -362,15 +511,15 @@ Object.setPrototypeOf(Inflate, Transform);
 Inflate.prototype = Object.create(Transform.prototype);
 
 Inflate.prototype._transform = function _transform(this: Inflate, chunk: ZlibInput, _e: BufferEncoding, cb: TransformCallback): void {
-    _doTransform(this._handle, chunk, false, cb);
+    _doTransform(this, chunk, cb);
 };
 
 Inflate.prototype._flush = function _flush(this: Inflate, cb: TransformCallback): void {
-    _doFlush(this._handle, cb);
+    _doFlush(this, cb);
 };
 
 Inflate.prototype._processChunk = function _processChunk(this: Inflate, chunk: ZlibInput, flush?: number): Buffer {
-    return processChunk(this._handle, chunk, false, flush);
+    return checkStreamOutput(this, processChunk(this._handle, chunk, false, flush));
 };
 
 Inflate.prototype.close = function close(this: Inflate): void {
@@ -384,11 +533,12 @@ Object.defineProperty(Inflate.prototype, 'constructor', {
 });
 
 flattenPrototype(Inflate.prototype);
+installZlibMethods(Inflate.prototype);
 
-export interface Gzip extends Transform {
+export interface Gzip extends NodeZlibTransform {
     _handle: ZlibHandle;
     _processChunk(chunk: ZlibInput, flush?: number): Buffer;
-    close(): void;
+    close(callback?: () => void): void;
 }
 
 export interface GzipConstructor {
@@ -401,6 +551,7 @@ function initGzip(self: Gzip, o?: ZlibOptions & TransformOptions): void {
     validateOptions(o);
     Transform.call(self, toTransformOptions(o));
     self._handle = installHandleCompat(zlib.createGzip(..._opts(o)));
+    configureZlibStream(self, true, o);
 }
 
 export const Gzip: GzipConstructor = function Gzip(this: Gzip | undefined, o?: ZlibOptions & TransformOptions) {
@@ -413,15 +564,15 @@ Object.setPrototypeOf(Gzip, Transform);
 Gzip.prototype = Object.create(Transform.prototype);
 
 Gzip.prototype._transform = function _transform(this: Gzip, chunk: ZlibInput, _e: BufferEncoding, cb: TransformCallback): void {
-    _doTransform(this._handle, chunk, true, cb);
+    _doTransform(this, chunk, cb);
 };
 
 Gzip.prototype._flush = function _flush(this: Gzip, cb: TransformCallback): void {
-    _doFlush(this._handle, cb);
+    _doFlush(this, cb);
 };
 
 Gzip.prototype._processChunk = function _processChunk(this: Gzip, chunk: ZlibInput, flush?: number): Buffer {
-    return processChunk(this._handle, chunk, true, flush);
+    return checkStreamOutput(this, processChunk(this._handle, chunk, true, flush));
 };
 
 Gzip.prototype.close = function close(this: Gzip): void {
@@ -435,11 +586,12 @@ Object.defineProperty(Gzip.prototype, 'constructor', {
 });
 
 flattenPrototype(Gzip.prototype);
+installZlibMethods(Gzip.prototype);
 
-export interface Gunzip extends Transform {
+export interface Gunzip extends NodeZlibTransform {
     _handle: ZlibHandle;
     _processChunk(chunk: ZlibInput, flush?: number): Buffer;
-    close(): void;
+    close(callback?: () => void): void;
 }
 
 export interface GunzipConstructor {
@@ -452,6 +604,7 @@ function initGunzip(self: Gunzip, o?: ZlibOptions & TransformOptions): void {
     validateOptions(o);
     Transform.call(self, toTransformOptions(o));
     self._handle = installHandleCompat(zlib.createGunzip());
+    configureZlibStream(self, false, o);
 }
 
 export const Gunzip: GunzipConstructor = function Gunzip(this: Gunzip | undefined, o?: ZlibOptions & TransformOptions) {
@@ -464,15 +617,15 @@ Object.setPrototypeOf(Gunzip, Transform);
 Gunzip.prototype = Object.create(Transform.prototype);
 
 Gunzip.prototype._transform = function _transform(this: Gunzip, chunk: ZlibInput, _e: BufferEncoding, cb: TransformCallback): void {
-    _doTransform(this._handle, chunk, false, cb);
+    _doTransform(this, chunk, cb);
 };
 
 Gunzip.prototype._flush = function _flush(this: Gunzip, cb: TransformCallback): void {
-    _doFlush(this._handle, cb);
+    _doFlush(this, cb);
 };
 
 Gunzip.prototype._processChunk = function _processChunk(this: Gunzip, chunk: ZlibInput, flush?: number): Buffer {
-    return processChunk(this._handle, chunk, false, flush);
+    return checkStreamOutput(this, processChunk(this._handle, chunk, false, flush));
 };
 
 Gunzip.prototype.close = function close(this: Gunzip): void {
@@ -486,11 +639,12 @@ Object.defineProperty(Gunzip.prototype, 'constructor', {
 });
 
 flattenPrototype(Gunzip.prototype);
+installZlibMethods(Gunzip.prototype);
 
-export interface DeflateRaw extends Transform {
+export interface DeflateRaw extends NodeZlibTransform {
     _handle: ZlibHandle;
     _processChunk(chunk: ZlibInput, flush?: number): Buffer;
-    close(): void;
+    close(callback?: () => void): void;
 }
 
 export interface DeflateRawConstructor {
@@ -503,6 +657,7 @@ function initDeflateRaw(self: DeflateRaw, o?: ZlibOptions & TransformOptions): v
     validateOptions(o);
     Transform.call(self, toTransformOptions(o));
     self._handle = installHandleCompat(zlib.createDeflateRaw(..._opts(o)));
+    configureZlibStream(self, true, o);
 }
 
 export const DeflateRaw: DeflateRawConstructor = function DeflateRaw(this: DeflateRaw | undefined, o?: ZlibOptions & TransformOptions) {
@@ -515,15 +670,15 @@ Object.setPrototypeOf(DeflateRaw, Transform);
 DeflateRaw.prototype = Object.create(Transform.prototype);
 
 DeflateRaw.prototype._transform = function _transform(this: DeflateRaw, chunk: ZlibInput, _e: BufferEncoding, cb: TransformCallback): void {
-    _doTransform(this._handle, chunk, true, cb);
+    _doTransform(this, chunk, cb);
 };
 
 DeflateRaw.prototype._flush = function _flush(this: DeflateRaw, cb: TransformCallback): void {
-    _doFlush(this._handle, cb);
+    _doFlush(this, cb);
 };
 
 DeflateRaw.prototype._processChunk = function _processChunk(this: DeflateRaw, chunk: ZlibInput, flush?: number): Buffer {
-    return processChunk(this._handle, chunk, true, flush);
+    return checkStreamOutput(this, processChunk(this._handle, chunk, true, flush));
 };
 
 DeflateRaw.prototype.close = function close(this: DeflateRaw): void {
@@ -537,11 +692,12 @@ Object.defineProperty(DeflateRaw.prototype, 'constructor', {
 });
 
 flattenPrototype(DeflateRaw.prototype);
+installZlibMethods(DeflateRaw.prototype);
 
-export interface InflateRaw extends Transform {
+export interface InflateRaw extends NodeZlibTransform {
     _handle: ZlibHandle;
     _processChunk(chunk: ZlibInput, flush?: number): Buffer;
-    close(): void;
+    close(callback?: () => void): void;
 }
 
 export interface InflateRawConstructor {
@@ -554,6 +710,7 @@ function initInflateRaw(self: InflateRaw, o?: ZlibOptions & TransformOptions): v
     validateOptions(o);
     Transform.call(self, toTransformOptions(o));
     self._handle = installHandleCompat(zlib.createInflateRaw());
+    configureZlibStream(self, false, o);
 }
 
 export const InflateRaw: InflateRawConstructor = function InflateRaw(this: InflateRaw | undefined, o?: ZlibOptions & TransformOptions) {
@@ -566,15 +723,15 @@ Object.setPrototypeOf(InflateRaw, Transform);
 InflateRaw.prototype = Object.create(Transform.prototype);
 
 InflateRaw.prototype._transform = function _transform(this: InflateRaw, chunk: ZlibInput, _e: BufferEncoding, cb: TransformCallback): void {
-    _doTransform(this._handle, chunk, false, cb);
+    _doTransform(this, chunk, cb);
 };
 
 InflateRaw.prototype._flush = function _flush(this: InflateRaw, cb: TransformCallback): void {
-    _doFlush(this._handle, cb);
+    _doFlush(this, cb);
 };
 
 InflateRaw.prototype._processChunk = function _processChunk(this: InflateRaw, chunk: ZlibInput, flush?: number): Buffer {
-    return processChunk(this._handle, chunk, false, flush);
+    return checkStreamOutput(this, processChunk(this._handle, chunk, false, flush));
 };
 
 InflateRaw.prototype.close = function close(this: InflateRaw): void {
@@ -588,11 +745,12 @@ Object.defineProperty(InflateRaw.prototype, 'constructor', {
 });
 
 flattenPrototype(InflateRaw.prototype);
+installZlibMethods(InflateRaw.prototype);
 
-export interface Unzip extends Transform {
+export interface Unzip extends NodeZlibTransform {
     _handle: ZlibHandle;
     _processChunk(chunk: ZlibInput, flush?: number): Buffer;
-    close(): void;
+    close(callback?: () => void): void;
 }
 
 export interface UnzipConstructor {
@@ -604,7 +762,8 @@ export interface UnzipConstructor {
 function initUnzip(self: Unzip, o?: ZlibOptions & TransformOptions): void {
     validateOptions(o);
     Transform.call(self, toTransformOptions(o));
-    self._handle = installHandleCompat(zlib.createGunzip());
+    self._handle = installHandleCompat(zlib.createUnzip());
+    configureZlibStream(self, false, o);
 }
 
 export const Unzip: UnzipConstructor = function Unzip(this: Unzip | undefined, o?: ZlibOptions & TransformOptions) {
@@ -617,15 +776,15 @@ Object.setPrototypeOf(Unzip, Transform);
 Unzip.prototype = Object.create(Transform.prototype);
 
 Unzip.prototype._transform = function _transform(this: Unzip, chunk: ZlibInput, _e: BufferEncoding, cb: TransformCallback): void {
-    _doTransform(this._handle, chunk, false, cb);
+    _doTransform(this, chunk, cb);
 };
 
 Unzip.prototype._flush = function _flush(this: Unzip, cb: TransformCallback): void {
-    _doFlush(this._handle, cb);
+    _doFlush(this, cb);
 };
 
 Unzip.prototype._processChunk = function _processChunk(this: Unzip, chunk: ZlibInput, flush?: number): Buffer {
-    return processChunk(this._handle, chunk, false, flush);
+    return checkStreamOutput(this, processChunk(this._handle, chunk, false, flush));
 };
 
 Unzip.prototype.close = function close(this: Unzip): void {
@@ -639,6 +798,7 @@ Object.defineProperty(Unzip.prototype, 'constructor', {
 });
 
 flattenPrototype(Unzip.prototype);
+installZlibMethods(Unzip.prototype);
 
 // Factory functions
 
@@ -664,22 +824,59 @@ export function adler32(data: ZlibInput, value?: number): number {
     return zlib.adler32(toUint8Array(data), value);
 }
 
-// Brotli — use native if available, otherwise error
+// Brotli — use the native stateful encoder/decoder when available
+
+const BROTLI_OPERATION_PROCESS = 0;
+const BROTLI_OPERATION_FLUSH = 1;
+const BROTLI_OPERATION_FINISH = 2;
+const BROTLI_PARAM_MODE = 0;
+const BROTLI_PARAM_QUALITY = 1;
+const BROTLI_PARAM_LGWIN = 2;
+const BROTLI_PARAM_LGBLOCK = 3;
+const BROTLI_PARAM_SIZE_HINT = 5;
+const BROTLI_PARAM_LARGE_WINDOW = 6;
+
+function brotliParam(options: BrotliOptions | undefined, parameter: number): number | undefined {
+    return options?.params?.[String(parameter)];
+}
+
+function brotliCompressOptions(options?: BrotliOptions): CModuleBrotli.CompressOptions {
+    const result: CModuleBrotli.CompressOptions = {};
+    const mode = brotliParam(options, BROTLI_PARAM_MODE);
+    const quality = brotliParam(options, BROTLI_PARAM_QUALITY);
+    const lgwin = brotliParam(options, BROTLI_PARAM_LGWIN);
+    const lgblock = brotliParam(options, BROTLI_PARAM_LGBLOCK);
+    const sizeHint = brotliParam(options, BROTLI_PARAM_SIZE_HINT);
+    const largeWindow = brotliParam(options, BROTLI_PARAM_LARGE_WINDOW);
+    if (mode !== undefined) result.mode = mode;
+    if (quality !== undefined) result.quality = quality;
+    if (lgwin !== undefined) result.lgwin = lgwin;
+    if (lgblock !== undefined) result.lgblock = lgblock;
+    if (sizeHint !== undefined) result.sizeHint = sizeHint;
+    if (largeWindow !== undefined) result.largeWindow = Boolean(largeWindow);
+    return result;
+}
+
+function brotliDecompressOptions(options?: BrotliOptions): CModuleBrotli.DecompressOptions {
+    const largeWindow = brotliParam(options, 1);
+    return largeWindow === undefined ? {} : { largeWindow: Boolean(largeWindow) };
+}
+
+function requireBrotli<T>(value: T | undefined): T {
+    if (typeof value !== 'function') throw new Error('Brotli compression is not supported in this environment');
+    return value;
+}
 
 function brotliCompressImpl(buffer: ZlibInput, options?: BrotliOptions): Buffer {
-    validateOptions(options);
-    if (typeof nativeBrotli.brotliCompress === 'function') {
-        return checkMaxOutputLength(Buffer.from(nativeBrotli.brotliCompress(toUint8Array(buffer))), options);
-    }
-    throw new Error('Brotli compression is not supported in this environment');
+    validateBrotliOptions(options);
+    const compress = requireBrotli(nativeBrotli.compress);
+    return checkMaxOutputLength(Buffer.from(compress(toUint8Array(buffer), brotliCompressOptions(options))), options);
 }
 
 function brotliDecompressImpl(buffer: ZlibInput, options?: BrotliOptions): Buffer {
-    validateOptions(options);
-    if (typeof nativeBrotli.brotliDecompress === 'function') {
-        return checkMaxOutputLength(Buffer.from(nativeBrotli.brotliDecompress(toUint8Array(buffer))), options);
-    }
-    throw new Error('Brotli decompression is not supported in this environment');
+    validateBrotliOptions(options);
+    const decompress = requireBrotli(nativeBrotli.decompress);
+    return checkMaxOutputLength(Buffer.from(decompress(toUint8Array(buffer), brotliDecompressOptions(options))), options);
 }
 
 export function brotliCompressSync(buffer: ZlibInput, options?: BrotliOptions): Buffer {
@@ -690,10 +887,59 @@ export function brotliDecompressSync(buffer: ZlibInput, options?: BrotliOptions)
     return brotliDecompressImpl(buffer, options);
 }
 
-export const brotliCompress = wrapCallback(brotliCompressSync as SyncFn);
-export const brotliDecompress = wrapCallback(brotliDecompressSync as SyncFn);
+export const brotliCompress = wrapCallback(brotliCompressSync as SyncFn, options => validateBrotliOptions(options as BrotliOptions));
+export const brotliDecompress = wrapCallback(brotliDecompressSync as SyncFn, options => validateBrotliOptions(options as BrotliOptions));
 
-export interface BrotliCompress extends Transform {}
+type BrotliStreamState = {
+    flush: number;
+    finishFlush: number;
+    maxOutputLength?: number;
+    outputLength: number;
+};
+
+const brotliStreamStates = new WeakMap<object, BrotliStreamState>();
+
+function configureBrotliStream(stream: object, options?: BrotliOptions): void {
+    brotliStreamStates.set(stream, {
+        flush: options?.flush ?? BROTLI_OPERATION_PROCESS,
+        finishFlush: options?.finishFlush ?? BROTLI_OPERATION_FINISH,
+        maxOutputLength: options?.maxOutputLength,
+        outputLength: 0,
+    });
+}
+
+function checkBrotliStreamOutput(stream: object, output: Buffer): Buffer {
+    const state = brotliStreamStates.get(stream);
+    if (!state) throw new Error('Brotli stream is not initialized');
+    state.outputLength += output.byteLength;
+    if (state.maxOutputLength !== undefined && state.outputLength > state.maxOutputLength) {
+        throw new RangeError(`Cannot create a Buffer larger than ${state.maxOutputLength} bytes`);
+    }
+    return output;
+}
+
+function brotliCompressOperation(handle: CModuleBrotli.BrotliCompress, operation: number, input?: Uint8Array): Buffer {
+    switch (operation) {
+        case BROTLI_OPERATION_PROCESS:
+            return Buffer.from(handle.compress(input));
+        case BROTLI_OPERATION_FLUSH: {
+            const chunks: Buffer[] = [];
+            if (input) chunks.push(Buffer.from(handle.compress(input)));
+            chunks.push(Buffer.from(handle.flush()));
+            return Buffer.concat(chunks);
+        }
+        case BROTLI_OPERATION_FINISH:
+            return Buffer.from(handle.finish(input));
+        default:
+            throw new RangeError('Invalid Brotli stream operation');
+    }
+}
+
+export interface BrotliCompress extends Transform {
+    _handle: CModuleBrotli.BrotliCompress;
+    flush(callback?: () => void): this;
+    close(callback?: () => void): void;
+}
 
 export interface BrotliCompressConstructor {
     new (options?: BrotliOptions & TransformOptions): BrotliCompress;
@@ -703,8 +949,10 @@ export interface BrotliCompressConstructor {
 
 export const BrotliCompress: BrotliCompressConstructor = function BrotliCompress(this: BrotliCompress | undefined, options?: BrotliOptions & TransformOptions) {
     const target = receiverOrCreate(this, BrotliCompress.prototype);
-    validateOptions(options);
-    Transform.call(target, options);
+    validateBrotliOptions(options);
+    Transform.call(target, toTransformOptions(options));
+    target._handle = requireBrotli(nativeBrotli.createCompress)(brotliCompressOptions(options));
+    configureBrotliStream(target, options);
     return target;
 } as BrotliCompressConstructor;
 
@@ -712,7 +960,38 @@ Object.setPrototypeOf(BrotliCompress, Transform);
 BrotliCompress.prototype = Object.create(Transform.prototype);
 
 BrotliCompress.prototype._transform = function _transform(this: BrotliCompress, chunk: ZlibInput, _e: BufferEncoding, cb: TransformCallback): void {
-    finishTransform(cb, () => brotliCompressImpl(chunk));
+    finishTransform(cb, () => {
+        const state = brotliStreamStates.get(this)!;
+        return checkBrotliStreamOutput(this, brotliCompressOperation(this._handle, state.flush, toUint8Array(chunk)));
+    });
+};
+
+BrotliCompress.prototype._flush = function _flush(this: BrotliCompress, cb: TransformCallback): void {
+    finishTransform(cb, () => {
+        const state = brotliStreamStates.get(this)!;
+        try {
+            return checkBrotliStreamOutput(this, brotliCompressOperation(this._handle, state.finishFlush));
+        } catch (error) {
+            if (/already finished/i.test(asError(error).message)) return Buffer.alloc(0);
+            throw error;
+        }
+    });
+};
+
+BrotliCompress.prototype.flush = function flush(this: BrotliCompress, callback?: () => void): BrotliCompress {
+    try {
+        const output = checkBrotliStreamOutput(this, Buffer.from(this._handle.flush()));
+        if (output.length > 0) this.push(output);
+        if (callback) queueMicrotask(callback);
+    } catch (error) {
+        this.destroy(asError(error));
+    }
+    return this;
+};
+
+BrotliCompress.prototype.close = function close(this: BrotliCompress, callback?: () => void): void {
+    if (callback) this.once('close', callback);
+    this.destroy();
 };
 
 Object.defineProperty(BrotliCompress.prototype, 'constructor', {
@@ -723,7 +1002,11 @@ Object.defineProperty(BrotliCompress.prototype, 'constructor', {
 
 flattenPrototype(BrotliCompress.prototype);
 
-export interface BrotliDecompress extends Transform {}
+export interface BrotliDecompress extends Transform {
+    _handle: CModuleBrotli.BrotliDecompress;
+    flush(callback?: () => void): this;
+    close(callback?: () => void): void;
+}
 
 export interface BrotliDecompressConstructor {
     new (options?: BrotliOptions & TransformOptions): BrotliDecompress;
@@ -733,8 +1016,10 @@ export interface BrotliDecompressConstructor {
 
 export const BrotliDecompress: BrotliDecompressConstructor = function BrotliDecompress(this: BrotliDecompress | undefined, options?: BrotliOptions & TransformOptions) {
     const target = receiverOrCreate(this, BrotliDecompress.prototype);
-    validateOptions(options);
-    Transform.call(target, options);
+    validateBrotliOptions(options);
+    Transform.call(target, toTransformOptions(options));
+    target._handle = requireBrotli(nativeBrotli.createDecompress)(brotliDecompressOptions(options));
+    configureBrotliStream(target, options);
     return target;
 } as BrotliDecompressConstructor;
 
@@ -742,7 +1027,27 @@ Object.setPrototypeOf(BrotliDecompress, Transform);
 BrotliDecompress.prototype = Object.create(Transform.prototype);
 
 BrotliDecompress.prototype._transform = function _transform(this: BrotliDecompress, chunk: ZlibInput, _e: BufferEncoding, cb: TransformCallback): void {
-    finishTransform(cb, () => brotliDecompressImpl(chunk));
+    finishTransform(cb, () => checkBrotliStreamOutput(this, Buffer.from(this._handle.decompress(toUint8Array(chunk)))));
+};
+
+BrotliDecompress.prototype._flush = function _flush(this: BrotliDecompress, cb: TransformCallback): void {
+    finishTransform(cb, () => checkBrotliStreamOutput(this, Buffer.from(this._handle.finish())));
+};
+
+BrotliDecompress.prototype.flush = function flush(this: BrotliDecompress, callback?: () => void): BrotliDecompress {
+    try {
+        const output = checkBrotliStreamOutput(this, Buffer.from(this._handle.decompress(Buffer.alloc(0))));
+        if (output.length > 0) this.push(output);
+        if (callback) queueMicrotask(callback);
+    } catch (error) {
+        this.destroy(asError(error));
+    }
+    return this;
+};
+
+BrotliDecompress.prototype.close = function close(this: BrotliDecompress, callback?: () => void): void {
+    if (callback) this.once('close', callback);
+    this.destroy();
 };
 
 Object.defineProperty(BrotliDecompress.prototype, 'constructor', {
@@ -783,4 +1088,29 @@ export const constants = {
     Z_MEM_ERROR: -4,
     Z_BUF_ERROR: -5,
     Z_VERSION_ERROR: -6,
+    BROTLI_DECODE: 8,
+    BROTLI_ENCODE: 9,
+    BROTLI_OPERATION_PROCESS,
+    BROTLI_OPERATION_FLUSH,
+    BROTLI_OPERATION_FINISH,
+    BROTLI_PARAM_MODE,
+    BROTLI_MODE_GENERIC: 0,
+    BROTLI_MODE_TEXT: 1,
+    BROTLI_MODE_FONT: 2,
+    BROTLI_DEFAULT_MODE: 0,
+    BROTLI_PARAM_QUALITY,
+    BROTLI_MIN_QUALITY: 0,
+    BROTLI_MAX_QUALITY: 11,
+    BROTLI_DEFAULT_QUALITY: 11,
+    BROTLI_PARAM_LGWIN,
+    BROTLI_MIN_WINDOW_BITS: 10,
+    BROTLI_MAX_WINDOW_BITS: 24,
+    BROTLI_LARGE_MAX_WINDOW_BITS: 30,
+    BROTLI_DEFAULT_WINDOW: 22,
+    BROTLI_PARAM_LGBLOCK,
+    BROTLI_MIN_INPUT_BLOCK_BITS: 16,
+    BROTLI_MAX_INPUT_BLOCK_BITS: 24,
+    BROTLI_PARAM_SIZE_HINT,
+    BROTLI_PARAM_LARGE_WINDOW,
+    BROTLI_DECODER_PARAM_LARGE_WINDOW: 1,
 };

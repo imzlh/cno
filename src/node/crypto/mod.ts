@@ -12,9 +12,10 @@ import { Buffer } from '../buffer';
 export type { BinaryInput, KeyInput, KeyWithOptions, KeyExportOptions, SecretJwk, Hash, Hmac, Cipheriv, Decipheriv, CipherGCM, DecipherGCM, GcmEncryptResult, GcmDecryptResult, CipherInfo, Sign, Verify } from './types';
 export type { ScryptOptions } from './random';
 import type { BinaryInput, KeyInput, KeyObject as KeyObjectShape, KeyWithOptions, KeyExportOptions, SecretJwk, Hash, Hmac, Cipheriv, Decipheriv, CipherGCM, DecipherGCM, GcmEncryptResult, GcmDecryptResult, CipherInfo, Sign, Verify } from './types';
+import { Transform, type TransformOptions } from '../stream';
 
 // Import helpers from helpers.ts
-import { toBuffer, toExactArrayBuffer, encodeOutput, concatBuffers, createBufferedCipher, createBufferedDecipher, isGcmAlgorithm, normalizeHashAlgorithm, oneShotHmac, createOneShotHmac, isSupportedHmacAlgorithm, readAsymmetricCipherArgs, readKeyOptions, detectEcCoordinateSize, derToP1363, p1363ToDer, kKeyData, kKeyFormat, guessKeyFormat, isKeyObject, type KeyFormat } from './helpers';
+import { toBuffer, toExactArrayBuffer, encodeOutput, concatBuffers, isGcmAlgorithm, normalizeHashAlgorithm, oneShotHmac, isSupportedHmacAlgorithm, readAsymmetricCipherArgs, readKeyOptions, detectEcCoordinateSize, derToP1363, p1363ToDer, kKeyData, kKeyFormat, guessKeyFormat, isKeyObject, type KeyFormat } from './helpers';
 
 function assertCallback(callback: unknown): asserts callback is (...args: unknown[]) => void {
     if (typeof callback !== 'function') {
@@ -33,6 +34,13 @@ function resolveCurve(curve: string): 'p256' | 'p384' | 'p521' {
         case 'p521': case 'p-521': case 'secp521r1': return 'p521';
         default: throw new Error(`Unsupported curve: ${curve}`);
     }
+}
+
+type EcdhCurve = 'p256' | 'p384' | 'p521' | 'secp256k1';
+
+function resolveEcdhCurve(curve: string): EcdhCurve {
+    if (curve.toLowerCase() === 'secp256k1') return 'secp256k1';
+    return resolveCurve(curve);
 }
 
 function keyTypeFromPrivate(bytes: Uint8Array): 'rsa' | 'ec' {
@@ -122,19 +130,43 @@ function createDigestAlreadyCalledError(): Error {
     return err;
 }
 
+function createCipherInvalidStateError(operation: string): Error {
+    if (operation === 'update') return new Error('Trying to add data in unsupported state');
+    const message = operation === 'final' ? 'Invalid state' : `Invalid state for operation ${operation}`;
+    const err = new Error(message) as Error & { code?: string };
+    err.code = 'ERR_CRYPTO_INVALID_STATE';
+    return err;
+}
+
+function createInvalidGcmAuthTagLengthError(length: number): TypeError {
+    const err = new TypeError(`Invalid authentication tag length: ${length}`) as TypeError & { code?: string };
+    err.code = 'ERR_CRYPTO_INVALID_AUTH_TAG';
+    return err;
+}
+
+function validateGcmAuthTagLength(length: number | undefined): number | undefined {
+    if (length === undefined) return undefined;
+    if (length !== 4 && length !== 8 && !(Number.isInteger(length) && length >= 12 && length <= 16)) {
+        throw createInvalidGcmAuthTagLengthError(length);
+    }
+    return length;
+}
+
 export class KeyObject implements KeyObjectShape {
     readonly [Symbol.toStringTag] = 'KeyObject' as const;
     readonly type: 'private' | 'public' | 'secret';
     readonly asymmetricKeyType?: 'rsa' | 'ec';
+    readonly asymmetricKeyDetails?: { namedCurve?: string; modulusLength?: number };
     readonly symmetricKeySize?: number;
     [kKeyData]: Uint8Array;
     [kKeyFormat]: KeyFormat;
 
-    constructor(type: 'private' | 'public' | 'secret', asymmetricKeyType: 'rsa' | 'ec' | undefined, data: BinaryInput, format: KeyFormat) {
+    constructor(type: 'private' | 'public' | 'secret', asymmetricKeyType: 'rsa' | 'ec' | undefined, data: BinaryInput, format: KeyFormat, details?: { namedCurve?: string; modulusLength?: number }) {
         this.type = type;
         this.asymmetricKeyType = asymmetricKeyType;
         this[kKeyData] = toBuffer(data);
         this[kKeyFormat] = format;
+        this.asymmetricKeyDetails = details;
         if (type === 'secret') this.symmetricKeySize = this[kKeyData].byteLength;
     }
 
@@ -164,73 +196,114 @@ export class KeyObject implements KeyObjectShape {
     }
 }
 
+type DigestState = {
+    update(data: Uint8Array): void;
+    digest(): ArrayBuffer;
+    copy(): DigestState;
+};
+
+type NativeDigest = CModuleCrypto.Hash & { copy(): CModuleCrypto.Hash };
+
+function nativeDigest(factory: () => NativeDigest): DigestState {
+    const native = factory();
+    return {
+        update(data) { native.update(data); },
+        digest() { return native.digest(); },
+        copy() { return nativeDigest(() => native.copy() as NativeDigest); },
+    };
+}
+
+function bufferedDigest(fn: (data: Uint8Array) => ArrayBuffer, seed: Uint8Array[] = []): DigestState {
+    const chunks = seed.map(chunk => new Uint8Array(chunk));
+    return {
+        update(data) { chunks.push(new Uint8Array(data)); },
+        digest() { return fn(concatBuffers(chunks)); },
+        copy() { return bufferedDigest(fn, chunks); },
+    };
+}
+
+class HashImpl extends Transform implements Hash {
+    private readonly state: DigestState;
+    private finalized = false;
+
+    constructor(state: DigestState, options?: TransformOptions) {
+        super(options);
+        this.state = state;
+    }
+
+    update(input: BinaryInput, encoding?: string): Hash {
+        if (this.finalized) throw createDigestAlreadyCalledError();
+        this.state.update(toBuffer(input, encoding));
+        return this;
+    }
+
+    digest(encoding?: string): Uint8Array | string {
+        if (this.finalized) throw createDigestAlreadyCalledError();
+        this.finalized = true;
+        return encodeOutput(this.state.digest(), encoding);
+    }
+
+    copy(options?: TransformOptions): Hash {
+        if (this.finalized) throw createDigestAlreadyCalledError();
+        return new HashImpl(this.state.copy(), options);
+    }
+
+    _transform(chunk: unknown, encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
+        try {
+            this.update(chunk as BinaryInput, encoding);
+            callback();
+        } catch (error) {
+            callback(asError(error));
+        }
+    }
+
+    _flush(callback: (error?: Error | null, data?: unknown) => void): void {
+        try {
+            callback(null, this.digest());
+        } catch (error) {
+            callback(asError(error));
+        }
+    }
+}
+
 // createHash
 
-export function createHash(algorithm: string): Hash {
+export function createHash(algorithm: string, options?: TransformOptions & { outputLength?: number }): Hash {
     const a = normalizeHashAlgorithm(algorithm);
-
-    // Algorithms with native streaming support
-    const streamingAlgos: Record<string, () => CModuleCrypto.Hash> = {
-        md5:    () => crypto.createMd5(),
-        sha1:   () => crypto.createSha1(),
-        sha256: () => crypto.createSha256(),
-        sha512: () => crypto.createSha512(),
+    const isShake = a === 'shake128' || a === 'shake256';
+    if (options?.outputLength !== undefined &&
+        (!Number.isInteger(options.outputLength) || options.outputLength < 0 || options.outputLength > 0xffffffff)) {
+        throw new RangeError('The value of "options.outputLength" is out of range');
+    }
+    if (options?.outputLength !== undefined && !isShake) {
+        throw new RangeError('outputLength is only supported for SHAKE hash algorithms');
+    }
+    const streamingAlgos: Record<string, () => NativeDigest> = {
+        md5:       () => crypto.createMd5() as NativeDigest,
+        ripemd160: () => crypto.createRipemd160() as NativeDigest,
+        sha1:      () => crypto.createSha1() as NativeDigest,
+        sha224:    () => crypto.createSha224() as NativeDigest,
+        sha256:    () => crypto.createSha256() as NativeDigest,
+        sha384:    () => crypto.createSha384() as NativeDigest,
+        sha512:    () => crypto.createSha512() as NativeDigest,
+        sha512224: () => crypto.createSha512_224() as NativeDigest,
+        sha512256: () => crypto.createSha512_256() as NativeDigest,
+        sha3224:   () => crypto.createSha3_224() as NativeDigest,
+        sha3256:   () => crypto.createSha3_256() as NativeDigest,
+        sha3384:   () => crypto.createSha3_384() as NativeDigest,
+        sha3512:   () => crypto.createSha3_512() as NativeDigest,
+        blake2b512:() => crypto.createBlake2b512() as NativeDigest,
+        blake2s256:() => crypto.createBlake2s256() as NativeDigest,
     };
-
-    // Algorithms without native streaming — accumulate and use one-shot
+    const shakeLength = options?.outputLength;
     const oneshotAlgos: Record<string, (buf: Uint8Array) => ArrayBuffer> = {
-        ripemd160:  buf => crypto.ripemd160(buf),
-        sha224:     buf => crypto.sha224(buf),
-        sha384:     buf => crypto.sha384(buf),
-        sha512224:  buf => crypto.sha512_224(buf),
-        sha512256:  buf => crypto.sha512_256(buf),
-        sha3224:    buf => crypto.sha3_224(buf),
-        sha3256:    buf => crypto.sha3_256(buf),
-        sha3384:    buf => crypto.sha3_384(buf),
-        sha3512:    buf => crypto.sha3_512(buf),
-        blake2b512: buf => crypto.blake2b512(buf),
-        blake2s256: buf => crypto.blake2s256(buf),
-        shake128:   buf => crypto.shake128(buf),
-        shake256:   buf => crypto.shake256(buf),
+        shake128: buf => crypto.shake128(buf, shakeLength),
+        shake256: buf => crypto.shake256(buf, shakeLength),
     };
-
-    const streamingAlgo = streamingAlgos[a];
-    if (streamingAlgo) {
-        const hashObj = streamingAlgo();
-        let finalized = false;
-        return {
-            update(input: BinaryInput, encoding?: string) {
-                if (finalized) throw createDigestAlreadyCalledError();
-                hashObj.update(toBuffer(input, encoding));
-                return this;
-            },
-            digest(encoding?: string) {
-                if (finalized) throw createDigestAlreadyCalledError();
-                finalized = true;
-                return encodeOutput(hashObj.digest(), encoding);
-            },
-        };
-    }
-
-    const oneshotAlgo = oneshotAlgos[a];
-    if (oneshotAlgo) {
-        const fn = oneshotAlgo;
-        const chunks: Uint8Array[] = [];
-        let finalized = false;
-        return {
-            update(input: BinaryInput, encoding?: string) {
-                if (finalized) throw createDigestAlreadyCalledError();
-                chunks.push(toBuffer(input, encoding));
-                return this;
-            },
-            digest(encoding?: string) {
-                if (finalized) throw createDigestAlreadyCalledError();
-                finalized = true;
-                return encodeOutput(fn(concatBuffers(chunks)), encoding);
-            },
-        };
-    }
-
+    const factory = streamingAlgos[a];
+    if (factory) return new HashImpl(nativeDigest(factory), options);
+    const fn = oneshotAlgos[a];
+    if (fn) return new HashImpl(bufferedDigest(fn), options);
     throw new Error(`Unsupported hash algorithm: ${algorithm}`);
 }
 
@@ -265,45 +338,75 @@ export function hash(algorithm: string, data: ArrayBuffer | Uint8Array | string,
     return encodeOutput(result, outputEncoding);
 }
 
+type HmacState = {
+    update(data: Uint8Array): void;
+    digest(): ArrayBuffer;
+};
+
+class HmacImpl extends Transform implements Hmac {
+    private readonly state: HmacState;
+    private finalized = false;
+
+    constructor(state: HmacState, options?: TransformOptions) {
+        super(options);
+        this.state = state;
+    }
+
+    update(input: BinaryInput, encoding?: string): Hmac {
+        if (this.finalized) throw createDigestAlreadyCalledError();
+        this.state.update(toBuffer(input, encoding));
+        return this;
+    }
+
+    digest(encoding?: string): Uint8Array | string {
+        if (this.finalized) return encodeOutput(new ArrayBuffer(0), encoding);
+        this.finalized = true;
+        return encodeOutput(this.state.digest(), encoding);
+    }
+
+    _transform(chunk: unknown, encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
+        try {
+            this.update(chunk as BinaryInput, encoding);
+            callback();
+        } catch (error) {
+            callback(asError(error));
+        }
+    }
+
+    _flush(callback: (error?: Error | null, data?: unknown) => void): void {
+        try {
+            callback(null, this.digest());
+        } catch (error) {
+            callback(asError(error));
+        }
+    }
+}
+
 // createHmac
 
-export function createHmac(algorithm: string, key: KeyInput): Hmac {
+export function createHmac(algorithm: string, key: KeyInput, options?: TransformOptions): Hmac {
     const keyBuf = isKeyObject(key) ? key[kKeyData] : toBuffer(key);
     const a = normalizeHashAlgorithm(algorithm);
+    if (!isSupportedHmacAlgorithm(a)) throw new Error(`Unsupported HMAC algorithm: ${algorithm}`);
 
-    if (a !== 'sha256' && a !== 'sha512') {
-        if (!isSupportedHmacAlgorithm(a)) throw new Error(`Unsupported HMAC algorithm: ${algorithm}`);
-        return createOneShotHmac(algorithm, keyBuf);
-    }
-
-    let hmacObj: CModuleCrypto.Hmac;
-    switch (a) {
-        case 'sha256':
-            hmacObj = crypto.createHmacSha256(keyBuf);
-            break;
-        case 'sha512':
-            hmacObj = crypto.createHmacSha512(keyBuf);
-            break;
-        default:
-            throw new Error(`Unsupported HMAC algorithm: ${algorithm}`);
-    }
-
-    let finalized = false;
-    return {
-        update(input: ArrayBuffer | Uint8Array | string, encoding?: string) {
-            if (finalized) throw createDigestAlreadyCalledError();
-            hmacObj.update(toBuffer(input, encoding));
-            return this;
-        },
-        digest(encoding?: string) {
-            if (finalized) {
-                return encodeOutput(new Uint8Array(), encoding);
-            }
-            finalized = true;
-            const result = hmacObj.digest();
-            return encodeOutput(result, encoding);
-        },
+    const nativeAlgos: Record<string, () => CModuleCrypto.Hmac> = {
+        sha256: () => crypto.createHmacSha256(keyBuf),
+        sha512: () => crypto.createHmacSha512(keyBuf),
     };
+    const nativeFactory = nativeAlgos[a];
+    if (nativeFactory) {
+        const native = nativeFactory();
+        return new HmacImpl({
+            update(data) { native.update(data); },
+            digest() { return native.digest(); },
+        }, options);
+    }
+
+    const chunks: Uint8Array[] = [];
+    return new HmacImpl({
+        update(data) { chunks.push(new Uint8Array(data)); },
+        digest() { return oneShotHmac(algorithm, keyBuf, concatBuffers(chunks)); },
+    }, options);
 }
 
 // hmac - one-shot HMAC
@@ -445,8 +548,16 @@ export function createHmacSha512(key: ArrayBuffer | Uint8Array | string): CModul
 
 // createCipher / createDecipher
 
-type CipherivWithAutoPadding = Cipheriv & { setAutoPadding(v: boolean): void };
-type DecipherivWithAutoPadding = Decipheriv & { setAutoPadding(v: boolean): void };
+type CipherCore = {
+    update(data: BinaryInput, inputEncoding?: string, outputEncoding?: string): Uint8Array | string;
+    final(outputEncoding?: string): Uint8Array | string;
+    setAutoPadding?(value: boolean): void;
+    setAAD?(aad: ArrayBuffer | Uint8Array): unknown;
+    setAuthTag?(tag: ArrayBuffer | Uint8Array): unknown;
+    getAuthTag?(): Uint8Array;
+};
+type CipherivWithAutoPadding = CipherCore & { setAutoPadding(value: boolean): void };
+type DecipherivWithAutoPadding = CipherCore & { setAutoPadding(value: boolean): void };
 
 type CbcFns = {
     keyLength: number;
@@ -569,32 +680,98 @@ function makeCbcDecipher(key: Uint8Array, iv: Uint8Array, fns: CbcFns): Decipher
     };
 }
 
-export function createCipheriv(algorithm: string, key: ArrayBuffer | Uint8Array, iv: ArrayBuffer | Uint8Array): Cipheriv {
-    const keyBuf = toBuffer(key);
-    const ivBuf = toBuffer(iv);
-    const a = algorithm.toLowerCase();
+class CipherTransform extends Transform implements CipherGCM, DecipherGCM {
+    private readonly core: CipherCore;
+    private finalized = false;
+    private started = false;
 
-    if (isGcmAlgorithm(a)) {
-        return createCipherivGCM(a, keyBuf, ivBuf);
+    constructor(core: CipherCore, options?: TransformOptions) {
+        super(options);
+        this.core = core;
     }
 
-    const fns = getCbcFns(a);
-    validateCbcKeyIv(keyBuf, ivBuf, fns);
-    return makeCbcCipher(keyBuf, ivBuf, fns);
+    update(data: BinaryInput, inputEncoding?: string, outputEncoding?: string): Uint8Array | string {
+        if (this.finalized) throw createCipherInvalidStateError('update');
+        const output = this.core.update(data, inputEncoding, outputEncoding);
+        this.started = true;
+        return output;
+    }
+
+    final(outputEncoding?: string): Uint8Array | string {
+        if (this.finalized) throw createCipherInvalidStateError('final');
+        this.finalized = true;
+        return this.core.final(outputEncoding);
+    }
+
+    setAutoPadding(autoPadding = true): this {
+        if (this.finalized) throw createCipherInvalidStateError('setAutoPadding');
+        this.core.setAutoPadding?.(autoPadding);
+        return this;
+    }
+
+    setAAD(aad: ArrayBuffer | Uint8Array): this {
+        if (this.finalized || this.started) throw createCipherInvalidStateError('setAAD');
+        if (!this.core.setAAD) throw new TypeError('setAAD is only supported for authenticated ciphers');
+        this.core.setAAD(aad);
+        return this;
+    }
+
+    setAuthTag(tag: ArrayBuffer | Uint8Array): this {
+        if (this.finalized) throw createCipherInvalidStateError('setAuthTag');
+        if (!this.core.setAuthTag) throw new TypeError('setAuthTag is only supported for authenticated ciphers');
+        this.core.setAuthTag(tag);
+        return this;
+    }
+
+    getAuthTag(): Uint8Array {
+        if (!this.core.getAuthTag) throw new TypeError('getAuthTag is only supported for authenticated ciphers');
+        return this.core.getAuthTag();
+    }
+
+    _transform(chunk: unknown, encoding: BufferEncoding, callback: (error?: Error | null, data?: unknown) => void): void {
+        try {
+            const output = this.update(chunk as BinaryInput, encoding);
+            callback(null, output);
+        } catch (error) {
+            callback(asError(error));
+        }
+    }
+
+    _flush(callback: (error?: Error | null, data?: unknown) => void): void {
+        try {
+            callback(null, this.final());
+        } catch (error) {
+            callback(asError(error));
+        }
+    }
 }
 
-export function createDecipheriv(algorithm: string, key: ArrayBuffer | Uint8Array, iv: ArrayBuffer | Uint8Array): Decipheriv {
+export function createCipheriv(algorithm: string, key: ArrayBuffer | Uint8Array, iv: ArrayBuffer | Uint8Array, options?: TransformOptions & { authTagLength?: number }): Cipheriv {
     const keyBuf = toBuffer(key);
     const ivBuf = toBuffer(iv);
     const a = algorithm.toLowerCase();
 
     if (isGcmAlgorithm(a)) {
-        return createDecipherivGCM(a, keyBuf, ivBuf);
+        return createCipherivGCM(a, keyBuf, ivBuf, options);
     }
 
     const fns = getCbcFns(a);
     validateCbcKeyIv(keyBuf, ivBuf, fns);
-    return makeCbcDecipher(keyBuf, ivBuf, fns);
+    return new CipherTransform(makeCbcCipher(keyBuf, ivBuf, fns), options);
+}
+
+export function createDecipheriv(algorithm: string, key: ArrayBuffer | Uint8Array, iv: ArrayBuffer | Uint8Array, options?: TransformOptions & { authTagLength?: number }): Decipheriv {
+    const keyBuf = toBuffer(key);
+    const ivBuf = toBuffer(iv);
+    const a = algorithm.toLowerCase();
+
+    if (isGcmAlgorithm(a)) {
+        return createDecipherivGCM(a, keyBuf, ivBuf, options);
+    }
+
+    const fns = getCbcFns(a);
+    validateCbcKeyIv(keyBuf, ivBuf, fns);
+    return new CipherTransform(makeCbcDecipher(keyBuf, ivBuf, fns), options);
 }
 
 export function createCipherAes256Cbc(
@@ -613,7 +790,7 @@ export function createDecipherAes256Cbc(
 
 // createCipheriv GCM
 
-export function createCipherivGCM(algorithm: string, key: ArrayBuffer | Uint8Array, iv: ArrayBuffer | Uint8Array, options?: { authTagLength?: number }): CipherGCM {
+export function createCipherivGCM(algorithm: string, key: ArrayBuffer | Uint8Array, iv: ArrayBuffer | Uint8Array, options?: TransformOptions & { authTagLength?: number }): CipherGCM {
     const keyBuf = toBuffer(key);
     const ivBuf = toBuffer(iv);
     if (!isGcmAlgorithm(algorithm)) {
@@ -621,10 +798,11 @@ export function createCipherivGCM(algorithm: string, key: ArrayBuffer | Uint8Arr
     }
     const expectedKeyLength = GCM_KEY_LENGTHS[algorithm.toLowerCase()];
     if (keyBuf.byteLength !== expectedKeyLength) throw new Error('Invalid key length');
+    const authTagLength = validateGcmAuthTagLength(options?.authTagLength) ?? 16;
     const gcm = new crypto.GCM('encrypt', toExactArrayBuffer(keyBuf), toExactArrayBuffer(ivBuf));
-    let ctag: ArrayBuffer | undefined;
+    let ctag: Uint8Array | undefined;
 
-    return {
+    return new CipherTransform({
         setAAD(aad: ArrayBuffer | Uint8Array) {
             gcm.setAAD(toExactArrayBuffer(toBuffer(aad)));
             return this;
@@ -635,17 +813,17 @@ export function createCipherivGCM(algorithm: string, key: ArrayBuffer | Uint8Arr
         },
         final(outputEncoding?: string) {
             const { data, tag } = gcm.final();
-            // Store tag for getAuthTag
-            ctag = tag;
+            ctag = new Uint8Array(tag).subarray(0, authTagLength);
             return encodeOutput(data, outputEncoding);
         },
         getAuthTag() {
-            return Buffer.from(new Uint8Array(ctag || new ArrayBuffer(0)));
+            if (!ctag) throw createCipherInvalidStateError('getAuthTag');
+            return Buffer.from(ctag);
         },
-    };
+    }, options);
 }
 
-export function createDecipherivGCM(algorithm: string, key: ArrayBuffer | Uint8Array, iv: ArrayBuffer | Uint8Array, options?: { authTagLength?: number }): DecipherGCM {
+export function createDecipherivGCM(algorithm: string, key: ArrayBuffer | Uint8Array, iv: ArrayBuffer | Uint8Array, options?: TransformOptions & { authTagLength?: number }): DecipherGCM {
     const keyBuf = toBuffer(key);
     const ivBuf = toBuffer(iv);
     if (!isGcmAlgorithm(algorithm)) {
@@ -653,16 +831,22 @@ export function createDecipherivGCM(algorithm: string, key: ArrayBuffer | Uint8A
     }
     const expectedKeyLength = GCM_KEY_LENGTHS[algorithm.toLowerCase()];
     if (keyBuf.byteLength !== expectedKeyLength) throw new Error('Invalid key length');
+    const expectedAuthTagLength = validateGcmAuthTagLength(options?.authTagLength);
     const gcm = new crypto.GCM('decrypt', toExactArrayBuffer(keyBuf), toExactArrayBuffer(ivBuf));
     let authTag: ArrayBuffer | null = null;
 
-    return {
+    return new CipherTransform({
         setAAD(aad: ArrayBuffer | Uint8Array) {
             gcm.setAAD(toExactArrayBuffer(toBuffer(aad)));
             return this;
         },
         setAuthTag(tag: ArrayBuffer | Uint8Array) {
-            authTag = toExactArrayBuffer(toBuffer(tag));
+            const tagBuffer = toBuffer(tag);
+            validateGcmAuthTagLength(tagBuffer.byteLength);
+            if (expectedAuthTagLength !== undefined && tagBuffer.byteLength !== expectedAuthTagLength) {
+                throw createInvalidGcmAuthTagLengthError(tagBuffer.byteLength);
+            }
+            authTag = toExactArrayBuffer(tagBuffer);
             return this;
         },
         update(data: ArrayBuffer | Uint8Array | string, inputEncoding?: string, outputEncoding?: string) {
@@ -679,7 +863,7 @@ export function createDecipherivGCM(algorithm: string, key: ArrayBuffer | Uint8A
             }
             return encodeOutput(result.data, outputEncoding);
         },
-    };
+    }, options);
 }
 
 export function gcmEncrypt(
@@ -928,7 +1112,7 @@ export function createPublicKey(input: KeyInput | { key: KeyInput; type?: string
         }
         if (!input.asymmetricKeyType) throw new TypeError('Private key type is unknown');
         const derived = new Uint8Array(crypto.derivePublicKeyDer(input[kKeyData]));
-        return new KeyObject('public', input.asymmetricKeyType, derived, 'der');
+        return new KeyObject('public', input.asymmetricKeyType, derived, 'der', input.asymmetricKeyDetails);
     }
 
     const source = normalizeKeySource(input);
@@ -970,8 +1154,8 @@ function generateKeyPairSyncImpl(type: string, options: GenerateKeyPairOptions):
         }
 
         return {
-            publicKey: new KeyObject('public', 'ec', keyPair.publicKey, 'raw'),
-            privateKey: new KeyObject('private', 'ec', keyPair.privateKey, 'raw'),
+            publicKey: new KeyObject('public', 'ec', keyPair.publicKey, 'raw', { namedCurve: options.namedCurve }),
+            privateKey: new KeyObject('private', 'ec', keyPair.privateKey, 'raw', { namedCurve: options.namedCurve }),
         };
     }
 
@@ -1212,12 +1396,151 @@ export function ecdhComputeSecret(curve: string, privateKey: ArrayBuffer | Uint8
     const privBuf = toBuffer(privateKey);
     const pubBuf = toBuffer(publicKey);
 
-    const c = resolveCurve(curve);
+    const c = resolveEcdhCurve(curve);
     switch (c) {
         case 'p256': return crypto.ecdhDeriveP256(privBuf, pubBuf);
         case 'p384': return crypto.ecdhDeriveP384(privBuf, pubBuf);
         case 'p521': return crypto.ecdhDeriveP521(privBuf, pubBuf);
+        case 'secp256k1': return crypto.ecdhDeriveSecp256k1(privBuf, pubBuf);
     }
+}
+
+type EcdhPointFormat = 'compressed' | 'uncompressed' | 'hybrid';
+type EcdhNative = {
+    generate(): CModuleCrypto.EcKeyPair;
+    derive(privateKey: Uint8Array, publicKey: Uint8Array): ArrayBuffer;
+    publicFromPrivate(privateKey: Uint8Array, format: number): ArrayBuffer;
+    convertPublic(publicKey: Uint8Array, format: number): ArrayBuffer;
+};
+
+function pointFormatValue(format: EcdhPointFormat = 'uncompressed'): number {
+    switch (format) {
+        case 'compressed': return 2;
+        case 'uncompressed': return 4;
+        case 'hybrid': return 6;
+        default: throw new TypeError(`Invalid ECDH format: ${String(format)}`);
+    }
+}
+
+function ecdhNative(curve: EcdhCurve): EcdhNative {
+    switch (curve) {
+        case 'p256': return {
+            generate: crypto.generateEcKeyP256,
+            derive: crypto.ecdhDeriveP256,
+            publicFromPrivate: crypto.ecPublicFromPrivateP256,
+            convertPublic: crypto.ecConvertPublicP256,
+        };
+        case 'p384': return {
+            generate: crypto.generateEcKeyP384,
+            derive: crypto.ecdhDeriveP384,
+            publicFromPrivate: crypto.ecPublicFromPrivateP384,
+            convertPublic: crypto.ecConvertPublicP384,
+        };
+        case 'p521': return {
+            generate: crypto.generateEcKeyP521,
+            derive: crypto.ecdhDeriveP521,
+            publicFromPrivate: crypto.ecPublicFromPrivateP521,
+            convertPublic: crypto.ecConvertPublicP521,
+        };
+        case 'secp256k1': return {
+            generate: crypto.generateEcKeySecp256k1,
+            derive: crypto.ecdhDeriveSecp256k1,
+            publicFromPrivate: crypto.ecPublicFromPrivateSecp256k1,
+            convertPublic: crypto.ecConvertPublicSecp256k1,
+        };
+    }
+}
+
+function encodeEcdhOutput(data: ArrayBuffer | Uint8Array, encoding?: string): Buffer | string {
+    const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
+    return encodeOutput(toExactArrayBuffer(bytes), encoding);
+}
+
+export class ECDH {
+    private readonly curve: EcdhCurve;
+    private readonly native: EcdhNative;
+    private privateKey?: Uint8Array;
+    private publicKey?: Uint8Array;
+
+    constructor(curve: string) {
+        this.curve = resolveEcdhCurve(curve);
+        this.native = ecdhNative(this.curve);
+    }
+
+    static convertKey(key: BinaryInput, curve: string, inputEncoding?: string, outputEncoding?: string, format?: EcdhPointFormat): Buffer | string {
+        const native = ecdhNative(resolveEcdhCurve(curve));
+        return encodeEcdhOutput(native.convertPublic(toBuffer(key, inputEncoding), pointFormatValue(format)), outputEncoding);
+    }
+
+    generateKeys(encoding?: string, format?: EcdhPointFormat): Buffer | string {
+        const keyPair = this.native.generate();
+        this.privateKey = new Uint8Array(keyPair.privateKey);
+        this.publicKey = new Uint8Array(keyPair.publicKey);
+        return this.getPublicKey(encoding, format);
+    }
+
+    computeSecret(otherPublicKey: BinaryInput, inputEncoding?: string, outputEncoding?: string): Buffer | string {
+        if (!this.privateKey) throw new Error('Private key is not set');
+        const peer = toBuffer(otherPublicKey, inputEncoding);
+        try {
+            return encodeEcdhOutput(this.native.derive(this.privateKey, peer), outputEncoding);
+        } catch (error) {
+            const invalid = new Error('Public key is not valid for specified curve') as Error & { code?: string };
+            invalid.code = 'ERR_CRYPTO_ECDH_INVALID_PUBLIC_KEY';
+            (invalid as Error & { cause?: unknown }).cause = error;
+            throw invalid;
+        }
+    }
+
+    getPrivateKey(encoding?: string): Buffer | string {
+        if (!this.privateKey) throw new Error('Private key is not set');
+        return encodeEcdhOutput(this.privateKey, encoding);
+    }
+
+    getPublicKey(encoding?: string, format?: EcdhPointFormat): Buffer | string {
+        if (!this.publicKey) throw new Error('Public key is not set');
+        const converted = this.native.convertPublic(this.publicKey, pointFormatValue(format));
+        return encodeEcdhOutput(converted, encoding);
+    }
+
+    setPrivateKey(privateKey: BinaryInput, encoding?: string): void {
+        const key = new Uint8Array(toBuffer(privateKey, encoding));
+        const publicKey = this.native.publicFromPrivate(key, pointFormatValue());
+        this.privateKey = key;
+        this.publicKey = new Uint8Array(publicKey);
+    }
+
+    setPublicKey(publicKey: BinaryInput, encoding?: string): void {
+        const key = this.native.convertPublic(toBuffer(publicKey, encoding), pointFormatValue());
+        this.publicKey = new Uint8Array(key);
+    }
+}
+
+export function createECDH(curve: string): ECDH {
+    return new ECDH(curve);
+}
+
+export function getCurves(): string[] {
+    return ['prime256v1', 'secp256r1', 'secp384r1', 'secp521r1', 'secp256k1'];
+}
+
+export function diffieHellman(options: { privateKey: KeyObject; publicKey: KeyObject }): Buffer {
+    const privateKey = options?.privateKey;
+    const publicKey = options?.publicKey;
+    if (!isKeyObject(privateKey) || privateKey.type !== 'private') {
+        throw new TypeError('options.privateKey must be a private KeyObject');
+    }
+    if (!isKeyObject(publicKey) || publicKey.type !== 'public') {
+        throw new TypeError('options.publicKey must be a public KeyObject');
+    }
+
+    const privateCurve = privateKey.asymmetricKeyDetails?.namedCurve;
+    const publicCurve = publicKey.asymmetricKeyDetails?.namedCurve;
+    if (!privateCurve || !publicCurve || resolveEcdhCurve(privateCurve) !== resolveEcdhCurve(publicCurve) ||
+        privateKey[kKeyFormat] !== 'raw' || publicKey[kKeyFormat] !== 'raw') {
+        throw new TypeError('Only raw EC KeyObjects are supported by diffieHellman');
+    }
+    return Buffer.from(new Uint8Array(ecdhComputeSecret(privateCurve, privateKey[kKeyData], publicKey[kKeyData])));
 }
 
 export function generateEcKeyP256(): CModuleCrypto.EcKeyPair {

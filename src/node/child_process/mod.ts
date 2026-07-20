@@ -70,6 +70,8 @@ export interface SpawnOptions {
     timeout?: number;
     killSignal?: string | number;
     execArgv?: string[];
+    execPath?: string;
+    silent?: boolean;
     input?: SpawnInput;
     encoding?: BufferEncoding | 'buffer' | null;
     /** Enable IPC channel */
@@ -523,6 +525,8 @@ Object.defineProperty(ChildProcessImpl.prototype, 'constructor', {
 
 flattenPrototype(ChildProcessImpl.prototype);
 
+export const ChildProcess = ChildProcessImpl;
+
 // spawn
 
 export function spawn(command: string): ChildProcess;
@@ -633,7 +637,7 @@ export function spawn(command: string, argsOrOptions?: string[] | SpawnOptions, 
         }, { once: true });
     }
 
-    if (opts.timeout) {
+    if (opts.timeout !== undefined && opts.timeout > 0) {
         const tid = setTimeout(() => {
             if (!child.killed) {
                 child.kill(opts.killSignal || 'SIGTERM');
@@ -785,13 +789,20 @@ export function execFile(
 
 // fork
 
-export function fork(modulePath: string, args?: string[], options?: SpawnOptions): ChildProcess {
-    const forkArgs = args ?? [];
-    const execArgv = options?.execArgv ?? [];
-    const forkStdio: StdioEntry[] = ['pipe', 'pipe', 'pipe', 'ipc'];
-    // Fork automatically sets up IPC channel
-    return spawn(os.exePath, [...execArgv, modulePath, ...forkArgs], {
-        ...options,
+export function fork(modulePath: string, args?: string[] | SpawnOptions, options?: SpawnOptions): ChildProcess {
+    const forkArgs = Array.isArray(args) ? args : [];
+    const forkOptions = Array.isArray(args) ? (options ?? {}) : (args ?? {});
+    const execArgv = forkOptions.execArgv ?? [];
+    const configuredStdio = forkOptions.stdio;
+    const forkStdio: StdioEntry[] = configuredStdio === undefined
+        ? (forkOptions.silent ? ['pipe', 'pipe', 'pipe', 'ipc'] : ['inherit', 'inherit', 'inherit', 'ipc'])
+        : (Array.isArray(configuredStdio) ? configuredStdio : [configuredStdio, configuredStdio, configuredStdio, 'ipc']);
+    if (!forkStdio.includes('ipc')) {
+        throw new TypeError('fork() requires an IPC channel in the stdio array');
+    }
+    const { execArgv: _execArgv, execPath: _execPath, silent: _silent, ...spawnOptions } = forkOptions;
+    return spawn(forkOptions.execPath ?? os.exePath, [...execArgv, modulePath, ...forkArgs], {
+        ...spawnOptions,
         stdio: forkStdio,
     });
 }

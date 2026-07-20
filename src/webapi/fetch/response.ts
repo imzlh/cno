@@ -5,6 +5,26 @@ import { BOUNDARY_RE, CHARSET_RE, Decoder, ensureFormDataContentType, engine, is
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 type ResponseBodySource = BodyInit | ReadableStream<Uint8Array> | Uint8Array | null;
+const allowSwitchingProtocols = Symbol('cno.response.switchingProtocols');
+type InternalResponseInit = ResponseInit & { [allowSwitchingProtocols]?: boolean };
+
+function normalizeStatusText(value: unknown): string {
+    const text = String(value);
+    for (let i = 0; i < text.length; i++) {
+        const code = text.charCodeAt(i);
+        if (code === 0x0a || code === 0x0d || code > 0xff) throw new TypeError('Invalid statusText');
+    }
+    return text;
+}
+
+function bodyContentType(body: unknown): string | undefined {
+    if (body === null || body === undefined) return undefined;
+    if (body instanceof URLSearchParams) return 'application/x-www-form-urlencoded;charset=UTF-8';
+    if (body instanceof Blob) return body.type || undefined;
+    if (body instanceof FormData || isReadableStreamLike(body) || isBodyIterable(body)) return undefined;
+    if (ArrayBuffer.isView(body) || body instanceof ArrayBuffer) return undefined;
+    return 'text/plain;charset=UTF-8';
+}
 
 const responseInitiatorCallFrames = new WeakMap<globalThis.Response, NetworkCallFrame[]>();
 export function setResponseInitiatorCallFrames(
@@ -40,19 +60,22 @@ export class Response implements globalThis.Response {
         }
         const rawStatus = init?.status === undefined ? 200 : init.status;
         const status = Number(rawStatus);
-        if (!Number.isFinite(status) || Math.trunc(status) !== status || (status < 200 && status !== 101) || status > 599) {
+        const allow101 = status === 101 && (init as InternalResponseInit | undefined)?.[allowSwitchingProtocols] === true;
+        if (!Number.isFinite(status) || Math.trunc(status) !== status || (!allow101 && status < 200) || status > 599) {
             throw new RangeError(`Invalid response status: ${rawStatus}`);
         }
         if (body !== undefined && body !== null && isNullBodyStatus(status)) {
             throw new TypeError(`Response with status ${status} cannot have body`);
         }
         this.status = status;
-        this.statusText = init?.statusText || '';
+        this.statusText = init?.statusText === undefined ? '' : normalizeStatusText(init.statusText);
         this.ok = this.status >= 200 && this.status < 300;
         this.type = 'default';
         this.url = '';
         this.redirected = false;
         this.headers = new Headers(init?.headers);
+        const inferredType = bodyContentType(body);
+        if (inferredType && !this.headers.has('content-type')) this.headers.set('content-type', inferredType);
         const formDataBoundary = body instanceof FormData ? ensureFormDataContentType(this.headers) : undefined;
         this.body = (body !== undefined && body !== null) ? this.trackBodyStream(this.createBodyStream(body, formDataBoundary)) : null;
     }
@@ -61,7 +84,6 @@ export class Response implements globalThis.Response {
         if (isReadableStreamLike(bodyInit)) return bodyInit;
         const data = serializeBody(bodyInit);
         if (data !== null) {
-            if (!this.headers.has('content-length')) this.headers.set('content-length', String(data.length));
             const cap = data;
             return new ReadableStream({
                 start(c: ReadableStreamDefaultController<Uint8Array>) {
@@ -74,7 +96,6 @@ export class Response implements globalThis.Response {
             return new ReadableStream({
                 start: async (c: ReadableStreamDefaultController<Uint8Array>) => {
                     const r = new Uint8Array(await bodyInit.arrayBuffer());
-                    if (!this.headers.has('content-length')) this.headers.set('content-length', String(r.length));
                     c.enqueue(r);
                     c.close();
                 },
@@ -84,7 +105,6 @@ export class Response implements globalThis.Response {
             return new ReadableStream({
                 start: async (c: ReadableStreamDefaultController<Uint8Array>) => {
                     const r = await serializeFormData(bodyInit, formDataBoundary);
-                    if (!this.headers.has('content-length')) this.headers.set('content-length', String(r.length));
                     c.enqueue(r);
                     c.close();
                 },
@@ -94,7 +114,6 @@ export class Response implements globalThis.Response {
         return new ReadableStream({
             start: async (c: ReadableStreamDefaultController<Uint8Array>) => {
                 const r = engine.encodeString(String(bodyInit));
-                if (!this.headers.has('content-length')) this.headers.set('content-length', String(r.length));
                 c.enqueue(r);
                 c.close();
             },
@@ -159,6 +178,7 @@ export class Response implements globalThis.Response {
             while (true) {
                 const { done, value } = await reader.read();
                 if (done) break;
+                if (!(value instanceof Uint8Array)) throw new TypeError('Response body stream chunks must be Uint8Array values');
                 chunks.push(value);
             }
         } finally {
@@ -168,7 +188,7 @@ export class Response implements globalThis.Response {
         return this._bodyBuffer;
     }
     arrayBuffer(): Promise<ArrayBuffer> { return this.bytes().then(bytesToArrayBuffer); }
-    async blob(): Promise<Blob> { return new Blob([await this.arrayBuffer()], { type: this.headers.get('content-type') || 'application/octet-stream' }); }
+    async blob(): Promise<Blob> { return new Blob([await this.arrayBuffer()], { type: this.headers.get('content-type') || '' }); }
     async formData(): Promise<FormData> {
         const buf = await this.arrayBuffer();
         const bytes = new Uint8Array(buf);
@@ -199,15 +219,23 @@ export class Response implements globalThis.Response {
 
     static redirect(url: string, status: number = 302): Response {
         if (![301, 302, 303, 307, 308].includes(status)) throw new RangeError('Invalid redirect status');
-        const r = new Response(null, { status, headers: { Location: url } });
+        const rawUrl = String(url);
+        if (!/^[A-Za-z][A-Za-z\d+.-]*:/.test(rawUrl)) throw new TypeError(`Failed to parse URL from ${rawUrl}`);
+        const location = new URL(rawUrl).href;
+        const r = new Response(null, { status, headers: { Location: location } });
         Object.defineProperty(r, 'type', { value: 'default' });
         return r;
     }
 
     static json(data: unknown, init?: ResponseInit): Response {
         const body = JSON.stringify(data);
+        if (body === undefined) throw new TypeError('Value is not JSON serializable');
         const headers = new Headers(init?.headers);
         if (!headers.has('content-type')) headers.set('content-type', 'application/json');
         return new Response(body, { ...init, headers });
     }
+}
+
+export function createSwitchingProtocolsResponse(init: ResponseInit): Response {
+    return new Response(null, { ...init, status: 101, [allowSwitchingProtocols]: true } as InternalResponseInit);
 }

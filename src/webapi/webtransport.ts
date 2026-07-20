@@ -1,154 +1,214 @@
-/**
- * WebTransport API polyfill
- * Based on CModuleExternalQuic (quicly + picotls)
- * @see https://www.w3.org/TR/webtransport/
- */
+/** WebTransport-compatible streams backed by the native QUIC extension. */
+import { requireQuic } from '../quic-native';
+import { toOwnedBytes } from '../utils/bytes';
+import { DOMException } from './events';
 
-import quic from '@cnojs/quic'
+const WEBTRANSPORT_ALPN = 'webtransport';
+const DEFAULT_MAX_DATAGRAM_SIZE = 1200;
 
-// ---------------------------------------------------------------------------
-// WebTransportReady / WebTransportCloseInfo
-// ---------------------------------------------------------------------------
+type NativeChunk = Uint8Array<ArrayBufferLike> | ArrayBuffer;
+
+function nativeChunkBytes(chunk: NativeChunk): Uint8Array<ArrayBuffer> {
+    return chunk instanceof ArrayBuffer ? new Uint8Array(chunk.slice(0)) : toOwnedBytes(chunk);
+}
+
+function bufferSourceBytes(source: ArrayBuffer | ArrayBufferView<ArrayBufferLike>): Uint8Array<ArrayBuffer> {
+    if (source instanceof ArrayBuffer) return new Uint8Array(source.slice(0));
+    return toOwnedBytes(new Uint8Array(source.buffer, source.byteOffset, source.byteLength));
+}
+
+function streamErrorCode(reason: unknown): number {
+    if (typeof reason === 'number' && Number.isInteger(reason) && reason >= 0) return reason >>> 0;
+    if (reason && typeof reason === 'object') {
+        const value = Reflect.get(reason, 'streamErrorCode') ?? Reflect.get(reason, 'closeCode');
+        if (typeof value === 'number' && Number.isInteger(value) && value >= 0) return value >>> 0;
+    }
+    return 0;
+}
+
+function normalizeCloseInfo(info: WebTransportCloseInfo = {}): Required<WebTransportCloseInfo> {
+    const closeCode = info.closeCode ?? 0;
+    const reason = info.reason ?? '';
+    if (!Number.isInteger(closeCode) || closeCode < 0 || closeCode > 0xffffffff) {
+        throw new RangeError('closeCode must be an unsigned 32-bit integer');
+    }
+    if (typeof reason !== 'string') throw new TypeError('reason must be a string');
+    return { closeCode, reason };
+}
 
 export interface WebTransportCloseInfo {
-    closeCode: number;
-    reason: string;
+    closeCode?: number;
+    reason?: string;
 }
 
 export interface WebTransportHash {
-    algorithm: string;
-    value: BufferSource;
+    algorithm?: string;
+    value?: BufferSource;
 }
 
 export interface WebTransportOptions {
     allowPooling?: boolean;
+    congestionControl?: 'default' | 'low-latency' | 'throughput';
     requireUnreliable?: boolean;
-    ordered?: boolean;
     serverCertificateHashes?: WebTransportHash[];
 }
 
-// ---------------------------------------------------------------------------
-// WebTransportSendStream (WritableStream-like)
-// ---------------------------------------------------------------------------
+export interface WebTransportSendStreamOptions {
+    sendGroup?: WebTransportSendGroup;
+    sendOrder?: number;
+    waitUntilAvailable?: boolean;
+}
 
-export class WebTransportSendStream {
-    private _conn: CModuleExternalQuic.Connection;
-    private _streamId: number;
-    private _closed = false;
+export interface WebTransportErrorOptions {
+    source?: 'stream' | 'session';
+    streamErrorCode?: number | null;
+}
 
-    constructor(conn: CModuleExternalQuic.Connection, streamId: number) {
-        this._conn = conn;
-        this._streamId = streamId;
+export class WebTransportError extends DOMException {
+    readonly source: 'stream' | 'session';
+    readonly streamErrorCode: number | null;
+
+    constructor(message = '', options: WebTransportErrorOptions = {}) {
+        super(message, 'WebTransportError');
+        Object.setPrototypeOf(this, new.target.prototype);
+        this.source = options.source ?? 'session';
+        this.streamErrorCode = options.streamErrorCode ?? null;
     }
+}
 
-    get id(): number { return this._streamId; }
-
-    write(chunk: Uint8Array | ArrayBuffer): void {
-        if (this._closed) throw new TypeError('Stream is closed');
-        this._conn.sendStream(this._streamId, chunk);
-    }
-
-    close(): void {
-        if (this._closed) return;
-        this._closed = true;
-        this._conn.sendStream(this._streamId, new Uint8Array(0), true);
-    }
-
-    abort(errorCode: number = 0): void {
-        this._closed = true;
-        this._conn.resetStream(this._streamId, errorCode);
-    }
-
-    getStats(): { bytesWritten: number; bytesSent: number; bytesAcknowledged: number } {
+export class WebTransportSendGroup {
+    async getStats(): Promise<{ bytesWritten: number; bytesSent: number; bytesAcknowledged: number }> {
         return { bytesWritten: 0, bytesSent: 0, bytesAcknowledged: 0 };
     }
+}
 
-    get ready(): Promise<void> { return Promise.resolve(); }
-    get closed(): Promise<WebTransportCloseInfo> { return Promise.resolve({ closeCode: 0, reason: '' }); }
-    get writer(): WritableStreamDefaultWriter<Uint8Array> {
-        const self = this;
-        const ws = new WritableStream({
-            write(chunk: BufferSource) {
-                const data = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
-                self.write(data);
+type SendStreamState = {
+    closed: boolean;
+    bytesWritten: number;
+    controller?: WritableStreamDefaultController;
+};
+
+export class WebTransportSendStream extends WritableStream<Uint8Array<ArrayBufferLike>> {
+    readonly id: number;
+    sendOrder: number;
+    sendGroup?: WebTransportSendGroup;
+    #state: SendStreamState;
+
+    constructor(
+        conn: CModuleExternalQuic.Connection,
+        streamId: number,
+        options: WebTransportSendStreamOptions = {},
+    ) {
+        const state: SendStreamState = { closed: false, bytesWritten: 0 };
+        super({
+            start(controller) {
+                state.controller = controller;
             },
-            close() { self.close(); },
-            abort() { self.abort(); },
+            write(chunk) {
+                if (!(chunk instanceof Uint8Array)) throw new TypeError('WebTransport streams accept Uint8Array chunks');
+                if (state.closed) throw new TypeError('Stream is closed');
+                conn.sendStream(streamId, chunk, false);
+                state.bytesWritten += chunk.byteLength;
+            },
+            close() {
+                if (state.closed) return;
+                state.closed = true;
+                conn.sendStream(streamId, new Uint8Array(0), true);
+            },
+            abort(reason) {
+                if (state.closed) return;
+                state.closed = true;
+                conn.resetStream(streamId, streamErrorCode(reason));
+            },
         });
-        return ws.getWriter();
+        this.id = streamId;
+        this.sendOrder = options.sendOrder ?? 0;
+        this.sendGroup = options.sendGroup;
+        this.#state = state;
+    }
+
+    _stop(errorCode: number): void {
+        if (this.#state.closed) return;
+        this.#state.closed = true;
+        this.#state.controller?.error(new WebTransportError('Peer stopped the stream', {
+            source: 'stream',
+            streamErrorCode: errorCode,
+        }));
+    }
+
+    _connectionClosed(reason: string): void {
+        if (this.#state.closed) return;
+        this.#state.closed = true;
+        this.#state.controller?.error(new WebTransportError(reason || 'WebTransport session closed'));
+    }
+
+    async getStats(): Promise<{ bytesWritten: number; bytesSent: number; bytesAcknowledged: number }> {
+        return {
+            bytesWritten: this.#state.bytesWritten,
+            bytesSent: this.#state.bytesWritten,
+            bytesAcknowledged: 0,
+        };
     }
 }
 
-// ---------------------------------------------------------------------------
-// WebTransportReceiveStream (ReadableStream-like)
-// ---------------------------------------------------------------------------
+type ReceiveStreamState = {
+    closed: boolean;
+    bytesReceived: number;
+    controller?: ReadableStreamDefaultController<Uint8Array<ArrayBuffer>>;
+};
 
-export class WebTransportReceiveStream {
-    private _queue: Uint8Array[] = [];
-    private _closed = false;
-    private _closeInfo: WebTransportCloseInfo = { closeCode: 0, reason: '' };
-    private _onData: ((chunk: Uint8Array) => void) | null = null;
-    private _onClose: (() => void) | null = null;
+export class WebTransportReceiveStream extends ReadableStream<Uint8Array<ArrayBuffer>> {
+    readonly id: number;
+    #state: ReceiveStreamState;
 
-    _push(chunk: Uint8Array): void {
-        if (this._closed) return;
-        if (this._onData) {
-            this._onData(chunk);
-        } else {
-            this._queue.push(chunk);
-        }
-    }
-
-    _close(closeInfo?: WebTransportCloseInfo): void {
-        this._closed = true;
-        if (closeInfo) this._closeInfo = closeInfo;
-        this._onClose?.();
-    }
-
-    read(): Promise<{ done: false; value: Uint8Array } | { done: true; value: undefined }> {
-        if (this._queue.length > 0) {
-            const value = this._queue.shift();
-            if (value !== undefined) return Promise.resolve({ done: false, value });
-        }
-        if (this._closed) {
-            return Promise.resolve({ done: true, value: undefined });
-        }
-        return new Promise((resolve) => {
-            this._onData = (chunk) => {
-                this._onData = null;
-                resolve({ done: false, value: chunk });
-            };
-            this._onClose = () => {
-                this._onData = null;
-                this._onClose = null;
-                resolve({ done: true, value: undefined });
-            };
-        });
-    }
-
-    getStats(): { bytesReceived: number } {
-        return { bytesReceived: 0 };
-    }
-
-    get ready(): Promise<void> { return Promise.resolve(); }
-    get closed(): Promise<WebTransportCloseInfo> { return Promise.resolve(this._closeInfo); }
-    get reader(): ReadableStreamDefaultReader<Uint8Array> {
-        const self = this;
-        const rs = new ReadableStream({
-            pull(controller) {
-                return self.read().then((result) => {
-                    if (result.done) controller.close();
-                    else controller.enqueue(result.value);
-                });
+    constructor(conn?: CModuleExternalQuic.Connection, streamId = -1) {
+        const state: ReceiveStreamState = { closed: false, bytesReceived: 0 };
+        super({
+            start(controller) {
+                state.controller = controller;
+            },
+            cancel(reason) {
+                if (state.closed) return;
+                state.closed = true;
+                if (conn && streamId >= 0) conn.stopSending(streamId, streamErrorCode(reason));
             },
         });
-        return rs.getReader();
+        this.id = streamId;
+        this.#state = state;
+    }
+
+    _push(chunk: NativeChunk): void {
+        if (this.#state.closed) return;
+        const owned = nativeChunkBytes(chunk);
+        this.#state.bytesReceived += owned.byteLength;
+        if (owned.byteLength !== 0) this.#state.controller?.enqueue(owned);
+    }
+
+    _close(): void {
+        if (this.#state.closed) return;
+        this.#state.closed = true;
+        this.#state.controller?.close();
+    }
+
+    _reset(errorCode: number): void {
+        if (this.#state.closed) return;
+        this.#state.closed = true;
+        this.#state.controller?.error(new WebTransportError('Peer reset the stream', {
+            source: 'stream',
+            streamErrorCode: errorCode,
+        }));
+    }
+
+    _connectionClosed(reason: string): void {
+        if (this.#state.closed) return;
+        this.#state.closed = true;
+        this.#state.controller?.error(new WebTransportError(reason || 'WebTransport session closed'));
+    }
+
+    async getStats(): Promise<{ bytesReceived: number; bytesRead: number }> {
+        return { bytesReceived: this.#state.bytesReceived, bytesRead: this.#state.bytesReceived };
     }
 }
-
-// ---------------------------------------------------------------------------
-// WebTransportBidirectionalStream
-// ---------------------------------------------------------------------------
 
 export class WebTransportBidirectionalStream {
     readonly readable: WebTransportReceiveStream;
@@ -160,377 +220,406 @@ export class WebTransportBidirectionalStream {
     }
 }
 
-// ---------------------------------------------------------------------------
-// WebTransportDatagramDuplexStream
-// ---------------------------------------------------------------------------
-
 export class WebTransportDatagramDuplexStream {
-    private _conn: CModuleExternalQuic.Connection;
-    private _incomingQueue: Uint8Array[] = [];
-    private _onIncoming: ((chunk: Uint8Array) => void) | null = null;
+    incomingHighWaterMark = 1;
+    incomingMaxAge: number | null = null;
+    outgoingHighWaterMark = 1;
+    outgoingMaxAge: number | null = null;
+    readonly maxDatagramSize: number;
+    readonly readable: ReadableStream<Uint8Array<ArrayBuffer>>;
+    readonly writable: WritableStream<Uint8Array<ArrayBufferLike>>;
+    #closed = false;
+    #readController?: ReadableStreamDefaultController<Uint8Array<ArrayBuffer>>;
+    #writeController?: WritableStreamDefaultController;
 
-    constructor(conn: CModuleExternalQuic.Connection) {
-        this._conn = conn;
-        conn.ondatagram = (chunk: Uint8Array) => {
-            if (this._onIncoming) {
-                this._onIncoming(chunk);
-            } else {
-                this._incomingQueue.push(chunk);
-            }
+    constructor(conn: CModuleExternalQuic.Connection, maxDatagramSize = DEFAULT_MAX_DATAGRAM_SIZE) {
+        this.maxDatagramSize = maxDatagramSize;
+        this.readable = new ReadableStream({
+            start: (controller) => this.#readController = controller,
+        }, { highWaterMark: this.incomingHighWaterMark });
+        this.writable = new WritableStream({
+            start: (controller) => this.#writeController = controller,
+            write: (chunk) => {
+                if (this.#closed) throw new TypeError('WebTransport session is closed');
+                if (!(chunk instanceof Uint8Array)) throw new TypeError('Datagrams must be Uint8Array values');
+                const owned = bufferSourceBytes(chunk);
+                if (owned.byteLength > this.maxDatagramSize) {
+                    throw new RangeError(`Datagram exceeds maxDatagramSize (${this.maxDatagramSize})`);
+                }
+                conn.sendDatagram(owned);
+            },
+        }, { highWaterMark: this.outgoingHighWaterMark });
+        conn.ondatagram = (chunk: NativeChunk) => {
+            if (this.#closed || this.incomingMaxAge === 0) return;
+            if ((this.#readController?.desiredSize ?? 0) <= 0) return;
+            this.#readController?.enqueue(nativeChunkBytes(chunk));
         };
     }
 
-    get maxDatagramSize(): number { return 1200; }
-
-    writable: WritableStream = new WritableStream({
-        write: (chunk: BufferSource) => {
-            const data = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
-            this._conn.sendDatagram(data);
-        },
-    });
-
-    readable: ReadableStream = new ReadableStream({
-        pull: (controller) => {
-            if (this._incomingQueue.length > 0) {
-                controller.enqueue(this._incomingQueue.shift());
-                return;
-            }
-            return new Promise<void>((resolve) => {
-                this._onIncoming = (chunk: Uint8Array) => {
-                    this._onIncoming = null;
-                    controller.enqueue(chunk);
-                    resolve();
-                };
-            });
-        },
-    });
+    _close(reason = ''): void {
+        if (this.#closed) return;
+        this.#closed = true;
+        this.#readController?.close();
+        this.#writeController?.error(new WebTransportError(reason || 'WebTransport session closed'));
+    }
 }
-
-// ---------------------------------------------------------------------------
-// Incoming stream controllers
-// ---------------------------------------------------------------------------
 
 class IncomingStreamController {
-    private _uniStreams: WebTransportReceiveStream[] = [];
-    private _bidiStreams: WebTransportBidirectionalStream[] = [];
-    private _onUni: ((stream: WebTransportReceiveStream) => void) | null = null;
-    private _onBidi: ((stream: WebTransportBidirectionalStream) => void) | null = null;
-    private _conn: CModuleExternalQuic.Connection;
+    readonly incomingUnidirectionalStreams: ReadableStream<WebTransportReceiveStream>;
+    readonly incomingBidirectionalStreams: ReadableStream<WebTransportBidirectionalStream>;
+    #conn: CModuleExternalQuic.Connection;
+    #receivers = new Map<number, WebTransportReceiveStream>();
+    #senders = new Map<number, WebTransportSendStream>();
+    #uniController?: ReadableStreamDefaultController<WebTransportReceiveStream>;
+    #bidiController?: ReadableStreamDefaultController<WebTransportBidirectionalStream>;
+    #uniOpen = true;
+    #bidiOpen = true;
 
     constructor(conn: CModuleExternalQuic.Connection) {
-        this._conn = conn;
+        this.#conn = conn;
+        this.incomingUnidirectionalStreams = new ReadableStream<WebTransportReceiveStream>({
+            start: (controller) => this.#uniController = controller,
+            cancel: () => { this.#uniOpen = false; },
+        });
+        this.incomingBidirectionalStreams = new ReadableStream<WebTransportBidirectionalStream>({
+            start: (controller) => this.#bidiController = controller,
+            cancel: () => { this.#bidiOpen = false; },
+        });
+
         conn.onstream = (streamId: number, bidirectional: boolean) => {
+            if (this.#receivers.has(streamId)) return;
+            const receive = new WebTransportReceiveStream(conn, streamId);
+            this.#receivers.set(streamId, receive);
             if (bidirectional) {
-                const recv = new WebTransportReceiveStream();
                 const send = new WebTransportSendStream(conn, streamId);
-                const bidi = new WebTransportBidirectionalStream(recv, send);
-                if (this._onBidi) {
-                    this._onBidi(bidi);
+                this.#senders.set(streamId, send);
+                if (this.#bidiOpen) {
+                    this.#bidiController?.enqueue(new WebTransportBidirectionalStream(receive, send));
                 } else {
-                    this._bidiStreams.push(bidi);
+                    conn.stopSending(streamId, 0);
+                    conn.resetStream(streamId, 0);
                 }
+            } else if (this.#uniOpen) {
+                this.#uniController?.enqueue(receive);
             } else {
-                const recv = new WebTransportReceiveStream();
-                if (this._onUni) {
-                    this._onUni(recv);
-                } else {
-                    this._uniStreams.push(recv);
-                }
+                conn.stopSending(streamId, 0);
             }
         };
-
-        conn.ondata = (streamId: number, chunk: Uint8Array, fin: boolean) => {
-            // route data to the appropriate receive stream
+        conn.ondata = (streamId: number, chunk: NativeChunk, fin: boolean) => {
+            let receive = this.#receivers.get(streamId);
+            if (!receive) {
+                receive = new WebTransportReceiveStream(conn, streamId);
+                this.#receivers.set(streamId, receive);
+                if ((streamId & 2) === 0) {
+                    const send = new WebTransportSendStream(conn, streamId);
+                    this.#senders.set(streamId, send);
+                    if (this.#bidiOpen) {
+                        this.#bidiController?.enqueue(new WebTransportBidirectionalStream(receive, send));
+                    }
+                } else if (this.#uniOpen) {
+                    this.#uniController?.enqueue(receive);
+                }
+            }
+            receive._push(chunk);
+            if (fin) {
+                receive._close();
+                this.#receivers.delete(streamId);
+            }
+        };
+        conn.onstreamreset = (streamId: number, errorCode: number) => {
+            this.#receivers.get(streamId)?._reset(errorCode);
+            this.#receivers.delete(streamId);
+        };
+        conn.onstreamstop = (streamId: number, errorCode: number) => {
+            this.#senders.get(streamId)?._stop(errorCode);
+            this.#senders.delete(streamId);
         };
     }
 
-    get incomingUnidirectionalStreams(): ReadableStream<WebTransportReceiveStream> {
-        const self = this;
-        return new ReadableStream({
-            pull(controller) {
-                if (self._uniStreams.length > 0) {
-                    controller.enqueue(self._uniStreams.shift());
-                    return;
-                }
-                return new Promise<void>((resolve) => {
-                    self._onUni = (stream) => {
-                        self._onUni = null;
-                        controller.enqueue(stream);
-                        resolve();
-                    };
-                });
-            },
-        });
+    registerBidirectional(
+        streamId: number,
+        receive: WebTransportReceiveStream,
+        send: WebTransportSendStream,
+    ): void {
+        this.#receivers.set(streamId, receive);
+        this.#senders.set(streamId, send);
     }
 
-    get incomingBidirectionalStreams(): ReadableStream<WebTransportBidirectionalStream> {
-        const self = this;
-        return new ReadableStream({
-            pull(controller) {
-                if (self._bidiStreams.length > 0) {
-                    controller.enqueue(self._bidiStreams.shift());
-                    return;
-                }
-                return new Promise<void>((resolve) => {
-                    self._onBidi = (stream) => {
-                        self._onBidi = null;
-                        controller.enqueue(stream);
-                        resolve();
-                    };
-                });
-            },
-        });
+    registerSend(streamId: number, send: WebTransportSendStream): void {
+        this.#senders.set(streamId, send);
+    }
+
+    close(reason = ''): void {
+        for (const receive of this.#receivers.values()) receive._connectionClosed(reason);
+        for (const send of this.#senders.values()) send._connectionClosed(reason);
+        this.#receivers.clear();
+        this.#senders.clear();
+        if (this.#uniOpen) this.#uniController?.close();
+        if (this.#bidiOpen) this.#bidiController?.close();
+        this.#uniOpen = false;
+        this.#bidiOpen = false;
     }
 }
 
-// ---------------------------------------------------------------------------
-// WebTransport
-// ---------------------------------------------------------------------------
+type SessionState = 'connecting' | 'connected' | 'draining' | 'closed';
 
 export class WebTransport {
-    private _url: URL;
-    private _socket: CModuleExternalQuic.Socket;
-    private _connection: CModuleExternalQuic.Connection | null = null;
-    private _streamCtrl: IncomingStreamController | null = null;
-    private _datagrams: WebTransportDatagramDuplexStream | null = null;
-    private _readyResolve: ((value: void) => void) | null = null;
-    private _readyReject: ((reason: unknown) => void) | null = null;
-    private _closedResolve: ((value: WebTransportCloseInfo) => void) | null = null;
-    private _drainingResolve: ((value: void) => void) | null = null;
-    private _state: 'connecting' | 'connected' | 'draining' | 'closed' = 'connecting';
-
     readonly ready: Promise<void>;
     readonly closed: Promise<WebTransportCloseInfo>;
     readonly draining: Promise<void>;
+    readonly datagrams: WebTransportDatagramDuplexStream;
+    readonly incomingUnidirectionalStreams: ReadableStream<WebTransportReceiveStream>;
+    readonly incomingBidirectionalStreams: ReadableStream<WebTransportBidirectionalStream>;
+    #socket: CModuleExternalQuic.Socket;
+    #connection: CModuleExternalQuic.Connection;
+    #streams: IncomingStreamController;
+    #readyResult = Promise.withResolvers<void>();
+    #closedResult = Promise.withResolvers<WebTransportCloseInfo>();
+    #drainingResult = Promise.withResolvers<void>();
+    #state: SessionState = 'connecting';
 
-    constructor(url: string | URL, options?: WebTransportOptions) {
-        this._url = url instanceof URL ? url : new URL(url);
-        const host = this._url.hostname;
-        const port = parseInt(this._url.port) || 443;
-        const alpn = this._url.protocol === 'webtransport:' ? 'webtransport' : undefined;
+    constructor(url: string | URL, options: WebTransportOptions = {}) {
+        const target = url instanceof URL ? new URL(url.href) : new URL(url);
+        if (target.protocol !== 'https:' || target.username || target.password || target.hash) {
+            throw new DOMException('WebTransport requires an HTTPS URL without credentials or a fragment', 'SyntaxError');
+        }
+        if (options.serverCertificateHashes?.length) {
+            throw new DOMException('serverCertificateHashes are not supported by this QUIC backend', 'NotSupportedError');
+        }
 
-        this._socket = new quic.Socket({
-            host,
-            port,
+        this.ready = this.#readyResult.promise;
+        this.closed = this.#closedResult.promise;
+        this.draining = this.#drainingResult.promise;
+        const nativeQuic = requireQuic();
+        this.#socket = new nativeQuic.Socket({
+            host: '0.0.0.0',
+            port: 0,
             isServer: false,
-            alpn,
+            alpn: WEBTRANSPORT_ALPN,
+            verifyPeer: true,
         });
+        this.#connection = this.#socket.connect(target.hostname, Number(target.port) || 443, target.hostname);
+        this.#streams = new IncomingStreamController(this.#connection);
+        this.datagrams = new WebTransportDatagramDuplexStream(this.#connection);
+        this.incomingUnidirectionalStreams = this.#streams.incomingUnidirectionalStreams;
+        this.incomingBidirectionalStreams = this.#streams.incomingBidirectionalStreams;
 
-        this.ready = new Promise<void>((resolve, reject) => {
-            this._readyResolve = resolve;
-            this._readyReject = reject;
-        });
-
-        this.closed = new Promise<WebTransportCloseInfo>((resolve) => {
-            this._closedResolve = resolve;
-        });
-
-        this.draining = new Promise<void>((resolve) => {
-            this._drainingResolve = resolve;
-        });
-
-        this._socket.onerror = (msg: string) => {
-            if (this._state === 'connecting') {
-                this._readyReject?.(new Error(msg));
-            }
+        this.#socket.onerror = (message: string) => this.#fail(message);
+        this.#connection.onerror = (message: string) => this.#fail(message);
+        this.#connection.onconnected = () => {
+            if (this.#state !== 'connecting') return;
+            this.#state = 'connected';
+            this.#readyResult.resolve();
         };
-
-        const conn = this._socket.connect(host, port);
-        this._connection = conn;
-
-        conn.onconnected = () => {
-            this._state = 'connected';
-            this._streamCtrl = new IncomingStreamController(conn);
-            this._datagrams = new WebTransportDatagramDuplexStream(conn);
-            this._readyResolve?.();
-        };
-
-        conn.onclose = (errorCode: number, reason: string) => {
-            const wasDraining = this._state === 'draining';
-            this._state = 'closed';
-            this._closedResolve?.({ closeCode: errorCode, reason });
-            if (wasDraining) {
-                this._drainingResolve?.();
-            }
-        };
-
-        conn.onerror = (msg: string) => {
-            if (this._state === 'connecting') {
-                this._readyReject?.(new Error(msg));
-            }
+        this.#connection.onclose = (closeCode: number, reason: string) => {
+            const connecting = this.#state === 'connecting';
+            this.#state = 'closed';
+            this.#streams.close(reason);
+            this.datagrams._close(reason);
+            if (connecting) this.#readyResult.reject(new WebTransportError(reason || 'Connection closed during handshake'));
+            this.#drainingResult.resolve();
+            this.#closedResult.resolve({ closeCode, reason });
+            this.#socket.close();
         };
     }
 
-    get datagrams(): WebTransportDatagramDuplexStream {
-        if (!this._datagrams) throw new TypeError('WebTransport is not ready');
-        return this._datagrams;
+    async createUnidirectionalStream(
+        options: WebTransportSendStreamOptions = {},
+    ): Promise<WebTransportSendStream> {
+        await this.ready;
+        if (this.#state !== 'connected') throw new WebTransportError('WebTransport session is closed');
+        const streamId = this.#connection.openStream(false);
+        const send = new WebTransportSendStream(this.#connection, streamId, options);
+        this.#streams.registerSend(streamId, send);
+        return send;
     }
 
-    get incomingUnidirectionalStreams(): ReadableStream<WebTransportReceiveStream> {
-        if (!this._streamCtrl) throw new TypeError('WebTransport is not ready');
-        return this._streamCtrl.incomingUnidirectionalStreams;
+    async createBidirectionalStream(
+        options: WebTransportSendStreamOptions = {},
+    ): Promise<WebTransportBidirectionalStream> {
+        await this.ready;
+        if (this.#state !== 'connected') throw new WebTransportError('WebTransport session is closed');
+        const streamId = this.#connection.openStream(true);
+        const receive = new WebTransportReceiveStream(this.#connection, streamId);
+        const send = new WebTransportSendStream(this.#connection, streamId, options);
+        this.#streams.registerBidirectional(streamId, receive, send);
+        return new WebTransportBidirectionalStream(receive, send);
     }
 
-    get incomingBidirectionalStreams(): ReadableStream<WebTransportBidirectionalStream> {
-        if (!this._streamCtrl) throw new TypeError('WebTransport is not ready');
-        return this._streamCtrl.incomingBidirectionalStreams;
+    createSendGroup(): WebTransportSendGroup {
+        return new WebTransportSendGroup();
     }
 
-    createUnidirectionalStream(): WebTransportSendStream {
-        if (!this._connection) throw new TypeError('WebTransport is not connected');
-        const streamId = this._connection.openStream(false);
-        return new WebTransportSendStream(this._connection, streamId);
+    close(closeInfo: WebTransportCloseInfo = {}): void {
+        if (this.#state === 'closed' || this.#state === 'draining') return;
+        const { closeCode, reason } = normalizeCloseInfo(closeInfo);
+        this.#state = 'draining';
+        this.#drainingResult.resolve();
+        this.#connection.close(closeCode, reason);
     }
 
-    async createBidirectionalStream(): Promise<WebTransportBidirectionalStream> {
-        if (!this._connection) throw new TypeError('WebTransport is not connected');
-        const streamId = this._connection.openStream(true);
-        const recv = new WebTransportReceiveStream();
-        const send = new WebTransportSendStream(this._connection, streamId);
-        return new WebTransportBidirectionalStream(recv, send);
-    }
-
-    close(closeCode: number = 0, reason: string = ''): void {
-        if (this._state === 'closed' || this._state === 'draining') return;
-        this._state = 'draining';
-        this._connection?.close(closeCode, reason);
-        this._drainingResolve?.();
-    }
-
-    getStats(): { timestamp: number; bytesSent: number; bytesReceived: number; rttVariance: number; rttMin: number; rttSmoothed: number; datagramsSent: number; datagramsReceived: number; datagramsLost: number } {
-        const stats = this._connection?.getStats();
+    async getStats(): Promise<{
+        timestamp: number;
+        bytesSent: number;
+        bytesReceived: number;
+        rttVariance: number;
+        rttMin: number;
+        rttSmoothed: number;
+        datagramsSent: number;
+        datagramsReceived: number;
+        datagramsLost: number;
+    }> {
+        const stats = this.#connection.getStats();
         return {
             timestamp: Date.now(),
-            bytesSent: stats?.bytesSent ?? 0,
-            bytesReceived: stats?.bytesReceived ?? 0,
+            bytesSent: stats.bytesSent,
+            bytesReceived: stats.bytesReceived,
             rttVariance: 0,
-            rttMin: stats?.rttMin ?? 0,
-            rttSmoothed: stats?.rttSmoothed ?? 0,
+            rttMin: stats.rttMin,
+            rttSmoothed: stats.rttSmoothed,
             datagramsSent: 0,
             datagramsReceived: 0,
             datagramsLost: 0,
         };
     }
-}
 
-// ---------------------------------------------------------------------------
-// WebTransportError
-// ---------------------------------------------------------------------------
-
-export class WebTransportError extends Error {
-    source: 'stream' | 'session';
-    streamErrorCode?: number;
-
-    constructor(message: string, source: 'stream' | 'session' = 'session', streamErrorCode?: number) {
-        super(message);
-        this.name = 'WebTransportError';
-        this.source = source;
-        this.streamErrorCode = streamErrorCode;
+    #fail(message: string): void {
+        if (this.#state === 'closed') return;
+        const error = new WebTransportError(message || 'WebTransport connection failed');
+        const connecting = this.#state === 'connecting';
+        this.#state = 'closed';
+        this.#streams.close(error.message);
+        this.datagrams._close(error.message);
+        if (connecting) this.#readyResult.reject(error);
+        this.#drainingResult.resolve();
+        this.#closedResult.reject(error);
+        this.#socket.close();
     }
 }
 
-// ---------------------------------------------------------------------------
-// Server-side: WebTransportServer
-// ---------------------------------------------------------------------------
+export class WebTransportSession {
+    readonly ready: Promise<void>;
+    readonly closed: Promise<WebTransportCloseInfo>;
+    readonly datagrams: WebTransportDatagramDuplexStream;
+    readonly incomingUnidirectionalStreams: ReadableStream<WebTransportReceiveStream>;
+    readonly incomingBidirectionalStreams: ReadableStream<WebTransportBidirectionalStream>;
+    #conn: CModuleExternalQuic.Connection;
+    #streams: IncomingStreamController;
+    #readyResult = Promise.withResolvers<void>();
+    #closedResult = Promise.withResolvers<WebTransportCloseInfo>();
+    #state: SessionState = 'connecting';
+
+    constructor(conn: CModuleExternalQuic.Connection) {
+        this.#conn = conn;
+        this.ready = this.#readyResult.promise;
+        this.closed = this.#closedResult.promise;
+        this.#streams = new IncomingStreamController(conn);
+        this.datagrams = new WebTransportDatagramDuplexStream(conn);
+        this.incomingUnidirectionalStreams = this.#streams.incomingUnidirectionalStreams;
+        this.incomingBidirectionalStreams = this.#streams.incomingBidirectionalStreams;
+        conn.onconnected = () => {
+            if (this.#state !== 'connecting') return;
+            this.#state = 'connected';
+            this.#readyResult.resolve();
+        };
+        conn.onerror = (message: string) => this._terminate({ closeCode: 0, reason: message }, true);
+        conn.onclose = (closeCode: number, reason: string) => this._terminate({ closeCode, reason });
+    }
+
+    async createUnidirectionalStream(
+        options: WebTransportSendStreamOptions = {},
+    ): Promise<WebTransportSendStream> {
+        await this.ready;
+        if (this.#state !== 'connected') throw new WebTransportError('WebTransport session is closed');
+        const streamId = this.#conn.openStream(false);
+        const send = new WebTransportSendStream(this.#conn, streamId, options);
+        this.#streams.registerSend(streamId, send);
+        return send;
+    }
+
+    async createBidirectionalStream(
+        options: WebTransportSendStreamOptions = {},
+    ): Promise<WebTransportBidirectionalStream> {
+        await this.ready;
+        if (this.#state !== 'connected') throw new WebTransportError('WebTransport session is closed');
+        const streamId = this.#conn.openStream(true);
+        const receive = new WebTransportReceiveStream(this.#conn, streamId);
+        const send = new WebTransportSendStream(this.#conn, streamId, options);
+        this.#streams.registerBidirectional(streamId, receive, send);
+        return new WebTransportBidirectionalStream(receive, send);
+    }
+
+    createSendGroup(): WebTransportSendGroup {
+        return new WebTransportSendGroup();
+    }
+
+    close(closeInfo: WebTransportCloseInfo = {}): void {
+        if (this.#state === 'closed' || this.#state === 'draining') return;
+        const { closeCode, reason } = normalizeCloseInfo(closeInfo);
+        this.#state = 'draining';
+        this.#conn.close(closeCode, reason);
+    }
+
+    _terminate(info: Required<WebTransportCloseInfo>, failed = false): void {
+        if (this.#state === 'closed') return;
+        const connecting = this.#state === 'connecting';
+        this.#state = 'closed';
+        this.#streams.close(info.reason);
+        this.datagrams._close(info.reason);
+        if (connecting) this.#readyResult.reject(new WebTransportError(info.reason || 'Connection closed during handshake'));
+        if (failed) this.#closedResult.reject(new WebTransportError(info.reason || 'WebTransport connection failed'));
+        else this.#closedResult.resolve(info);
+    }
+}
 
 export class WebTransportServer {
-    private _socket: CModuleExternalQuic.Socket;
-    private _onSession: ((session: WebTransportSession) => void) | null = null;
+    #socket: CModuleExternalQuic.Socket;
+    #onSession: ((session: WebTransportSession) => void) | null = null;
+    #sessions = new Set<WebTransportSession>();
+    #pending: WebTransportSession[] = [];
 
-    constructor(opts: { host?: string; port?: number; cert: string; key: string; alpn?: string }) {
-        this._socket = new quic.Socket({
-            host: opts.host ?? '0.0.0.0',
-            port: opts.port ?? 4433,
+    constructor(options: { host?: string; port?: number; cert: string; key: string; alpn?: string }) {
+        const nativeQuic = requireQuic();
+        this.#socket = new nativeQuic.Socket({
+            host: options.host ?? '0.0.0.0',
+            port: options.port ?? 4433,
             isServer: true,
-            cert: opts.cert,
-            key: opts.key,
-            alpn: opts.alpn ?? 'webtransport',
+            cert: options.cert,
+            key: options.key,
+            alpn: options.alpn ?? WEBTRANSPORT_ALPN,
         });
-
-        this._socket.onconnection = (conn: CModuleExternalQuic.Connection) => {
+        this.#socket.onconnection = (conn: CModuleExternalQuic.Connection) => {
             const session = new WebTransportSession(conn);
-            if (this._onSession) {
-                this._onSession(session);
-            }
+            this.#sessions.add(session);
+            session.closed.finally(() => this.#sessions.delete(session));
+            if (this.#onSession) this.#onSession(session);
+            else this.#pending.push(session);
         };
     }
 
     onsession(handler: (session: WebTransportSession) => void): void {
-        this._onSession = handler;
+        this.#onSession = handler;
+        for (const session of this.#pending.splice(0)) handler(session);
     }
 
     close(): void {
-        this._socket.onerror = null;
-        this._socket.onconnection = null;
+        this.#socket.onerror = null;
+        this.#socket.onconnection = null;
+        for (const session of this.#sessions) {
+            session._terminate({ closeCode: 0, reason: 'WebTransport server closed' });
+        }
+        this.#sessions.clear();
+        this.#pending.length = 0;
+        this.#socket.close();
     }
 }
 
-// ---------------------------------------------------------------------------
-// WebTransportSession (server-side connection wrapper)
-// ---------------------------------------------------------------------------
-
-export class WebTransportSession {
-    private _conn: CModuleExternalQuic.Connection;
-    private _streamCtrl: IncomingStreamController;
-    private _datagrams: WebTransportDatagramDuplexStream;
-    private _readyResolve: ((value: void) => void) | null = null;
-    private _closedResolve: ((value: WebTransportCloseInfo) => void) | null = null;
-    private _state: 'connecting' | 'connected' | 'draining' | 'closed' = 'connecting';
-
-    readonly ready: Promise<void>;
-    readonly closed: Promise<WebTransportCloseInfo>;
-
-    constructor(conn: CModuleExternalQuic.Connection) {
-        this._conn = conn;
-        this._streamCtrl = new IncomingStreamController(conn);
-        this._datagrams = new WebTransportDatagramDuplexStream(conn);
-
-        this.ready = new Promise<void>((resolve) => {
-            this._readyResolve = resolve;
-        });
-
-        this.closed = new Promise<WebTransportCloseInfo>((resolve) => {
-            this._closedResolve = resolve;
-        });
-
-        conn.onconnected = () => {
-            this._state = 'connected';
-            this._streamCtrl = new IncomingStreamController(conn);
-            this._datagrams = new WebTransportDatagramDuplexStream(conn);
-            this._readyResolve?.();
-        };
-
-        conn.onclose = (errorCode: number, reason: string) => {
-            this._state = 'closed';
-            this._closedResolve?.({ closeCode: errorCode, reason });
-        };
-    }
-
-    get datagrams(): WebTransportDatagramDuplexStream { return this._datagrams; }
-    get incomingUnidirectionalStreams(): ReadableStream<WebTransportReceiveStream> { return this._streamCtrl.incomingUnidirectionalStreams; }
-    get incomingBidirectionalStreams(): ReadableStream<WebTransportBidirectionalStream> { return this._streamCtrl.incomingBidirectionalStreams; }
-
-    createUnidirectionalStream(): WebTransportSendStream {
-        const streamId = this._conn.openStream(false);
-        return new WebTransportSendStream(this._conn, streamId);
-    }
-
-    async createBidirectionalStream(): Promise<WebTransportBidirectionalStream> {
-        const streamId = this._conn.openStream(true);
-        return new WebTransportBidirectionalStream(
-            new WebTransportReceiveStream(),
-            new WebTransportSendStream(this._conn, streamId),
-        );
-    }
-
-    close(closeCode: number = 0, reason: string = ''): void {
-        this._state = 'draining';
-        this._conn.close(closeCode, reason);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Global registration
-// ---------------------------------------------------------------------------
-
-Reflect.set(globalThis, 'WebTransport', WebTransport);
+Object.assign(globalThis, {
+    WebTransport,
+    WebTransportBidirectionalStream,
+    WebTransportDatagramDuplexStream,
+    WebTransportError,
+    WebTransportReceiveStream,
+    WebTransportSendGroup,
+    WebTransportSendStream,
+});

@@ -19,6 +19,7 @@ type EventEmitterState = {
     _events?: Map<EventName, ListenerEntry[]>;
     _maxListeners?: number;
     _captureRejections?: boolean;
+    _warnedEvents?: Set<EventName>;
 };
 type EventTargetPrototypeWithTracking = typeof EventTarget.prototype & {
     __cnoNodeEventsTracking?: true;
@@ -50,6 +51,23 @@ function isPromiseLikeResult(value: unknown): value is PromiseLikeResult {
     return !!value && typeof value === 'object' && typeof Reflect.get(value, 'then') === 'function';
 }
 
+function normalizeEventName(eventName: unknown): EventName {
+    return typeof eventName === 'symbol' ? eventName : String(eventName);
+}
+
+function validateMaxListeners(value: unknown, name: string): asserts value is number {
+    if (typeof value !== 'number') {
+        throw Object.assign(new TypeError(`The "${name}" argument must be of type number.`), {
+            code: 'ERR_INVALID_ARG_TYPE',
+        });
+    }
+    if (value < 0 || Number.isNaN(value)) {
+        throw Object.assign(new RangeError(`The value of "${name}" is out of range. It must be >= 0.`), {
+            code: 'ERR_OUT_OF_RANGE',
+        });
+    }
+}
+
 export interface EventEmitterOptions {
     captureRejections?: boolean;
 }
@@ -75,8 +93,9 @@ function createAbortError(reason?: unknown): Error & { code: string; cause?: unk
 
 export interface EventEmitter<T extends EventMap<T> = DefaultEventMap> {
     _events: Map<EventName, ListenerEntry[]>;
-    _maxListeners: number;
+    _maxListeners?: number;
     _captureRejections: boolean;
+    _warnedEvents?: Set<EventName>;
     _emittingError?: boolean;
     ensureState(): void;
     addListener<E extends EventName>(eventName: E, listener: Listener<T, E>): this;
@@ -105,6 +124,7 @@ export interface EventEmitterConstructor {
     captureRejectionSymbol: symbol;
     errorMonitor: symbol;
     usingDomains: boolean;
+    init(this: EventEmitter, options?: EventEmitterOptions): void;
     getEventListeners(emitter: EventEmitter | EventTarget, name: EventName): EventListenerValue[];
     getMaxListeners(emitter: EventEmitter | EventTarget): number;
     setMaxListeners(n: number, ...eventTargets: Array<EventEmitter | EventTarget>): void;
@@ -116,7 +136,6 @@ export interface EventEmitterConstructor {
 function ensureEventEmitterState(self: unknown): asserts self is EventEmitter {
     const state = self as EventEmitterState;
     if (!(state._events instanceof Map)) state._events = new Map();
-    if (typeof state._maxListeners !== 'number' || Number.isNaN(state._maxListeners)) state._maxListeners = EventEmitter.defaultMaxListeners;
     if (typeof state._captureRejections !== 'boolean') state._captureRejections = false;
 }
 
@@ -139,6 +158,36 @@ function emitRemoveListener(self: EventEmitter, eventName: EventName, listener: 
     if (hasMetaListener(self, 'removeListener')) {
         self.emit('removeListener', eventName, listener);
     }
+}
+
+function warnIfListenerLimitExceeded(self: EventEmitter, eventName: EventName, count: number): void {
+    const maxListeners = self.getMaxListeners();
+    if (maxListeners === 0 || count <= maxListeners) return;
+    const warnedEvents = self._warnedEvents ??= new Set();
+    if (warnedEvents.has(eventName)) return;
+    warnedEvents.add(eventName);
+    console.warn(
+        `Possible EventEmitter memory leak detected. ${count} ${String(eventName)} listeners added. Use emitter.setMaxListeners() to increase limit`
+    );
+}
+
+function removeListenerEntry(
+    self: EventEmitter,
+    eventName: EventName,
+    entry: ListenerEntry,
+    reportedListener: AnyListener,
+): boolean {
+    const listeners = self._events.get(eventName);
+    if (!listeners) return false;
+    const index = listeners.lastIndexOf(entry);
+    if (index === -1) return false;
+    arrayRemoveAt(listeners, index);
+    if (listeners.length === 0) {
+        self._events.delete(eventName);
+        self._warnedEvents?.delete(eventName);
+    }
+    emitRemoveListener(self, eventName, reportedListener);
+    return true;
 }
 
 function flattenPrototype(target: object): void {
@@ -167,8 +216,35 @@ export const EventEmitter: EventEmitterConstructor = function EventEmitter(this:
 EventEmitter.captureRejectionSymbol = Symbol.for('nodejs.rejection');
 EventEmitter.errorMonitor = Symbol('events.errorMonitor');
 EventEmitter.usingDomains = false;
-EventEmitter.defaultMaxListeners = 10;
-EventEmitter.captureRejections = false;
+EventEmitter.init = function init(this: EventEmitter, options?: EventEmitterOptions): void {
+    initEventEmitter(this, options);
+};
+
+let defaultMaxListenersValue = 10;
+let captureRejectionsValue = false;
+
+Object.defineProperties(EventEmitter, {
+    defaultMaxListeners: {
+        get: () => defaultMaxListenersValue,
+        set: (value: unknown) => {
+            validateMaxListeners(value, 'defaultMaxListeners');
+            defaultMaxListenersValue = value;
+        },
+        enumerable: true,
+    },
+    captureRejections: {
+        get: () => captureRejectionsValue,
+        set: (value: unknown) => {
+            if (typeof value !== 'boolean') {
+                throw Object.assign(new TypeError('The "EventEmitter.captureRejections" property must be of type boolean.'), {
+                    code: 'ERR_INVALID_ARG_TYPE',
+                });
+            }
+            captureRejectionsValue = value;
+        },
+        enumerable: true,
+    },
+});
 
 type EventTargetListenerEntry = { listener: EventListenerOrEventListenerObject; capture: boolean };
 const eventTargetListeners = new WeakMap<EventTarget, Map<EventName, EventTargetListenerEntry[]>>();
@@ -323,6 +399,7 @@ EventEmitter.prototype.addListener = function addListener(eventName: EventName, 
 
 EventEmitter.prototype.on = function on(eventName: EventName, listener: AnyListener): EventEmitter {
     this.ensureState();
+    eventName = normalizeEventName(eventName);
     if (typeof listener !== 'function') {
         throw new TypeError('The "listener" argument must be of type Function');
     }
@@ -336,18 +413,14 @@ EventEmitter.prototype.on = function on(eventName: EventName, listener: AnyListe
     }
 
     arrayAppend(listeners, { listener, once: false });
-
-    if (listeners.length > this._maxListeners && this._maxListeners !== 0) {
-        console.warn(
-            `Possible EventEmitter memory leak detected. ${listeners.length} ${String(eventName)} listeners added. Use emitter.setMaxListeners() to increase limit`
-        );
-    }
+    warnIfListenerLimitExceeded(this, eventName, listeners.length);
 
     return this;
 };
 
 EventEmitter.prototype.once = function once(eventName: EventName, listener: AnyListener): EventEmitter {
     this.ensureState();
+    eventName = normalizeEventName(eventName);
     if (typeof listener !== 'function') {
         throw new TypeError('The "listener" argument must be of type Function');
     }
@@ -371,12 +444,14 @@ EventEmitter.prototype.once = function once(eventName: EventName, listener: AnyL
     });
 
     arrayAppend(listeners, { listener, once: true, wrapped });
+    warnIfListenerLimitExceeded(this, eventName, listeners.length);
 
     return this;
 };
 
 EventEmitter.prototype.prependListener = function prependListener(eventName: EventName, listener: AnyListener): EventEmitter {
     this.ensureState();
+    eventName = normalizeEventName(eventName);
     if (typeof listener !== 'function') {
         throw new TypeError('The "listener" argument must be of type Function');
     }
@@ -390,11 +465,13 @@ EventEmitter.prototype.prependListener = function prependListener(eventName: Eve
     }
 
     arrayPrepend(listeners, { listener, once: false });
+    warnIfListenerLimitExceeded(this, eventName, listeners.length);
     return this;
 };
 
 EventEmitter.prototype.prependOnceListener = function prependOnceListener(eventName: EventName, listener: AnyListener): EventEmitter {
     this.ensureState();
+    eventName = normalizeEventName(eventName);
     if (typeof listener !== 'function') {
         throw new TypeError('The "listener" argument must be of type Function');
     }
@@ -418,11 +495,13 @@ EventEmitter.prototype.prependOnceListener = function prependOnceListener(eventN
     });
 
     arrayPrepend(listeners, { listener, once: true, wrapped });
+    warnIfListenerLimitExceeded(this, eventName, listeners.length);
     return this;
 };
 
 EventEmitter.prototype.removeListener = function removeListener(eventName: EventName, listener: AnyListener): EventEmitter {
     this.ensureState();
+    eventName = normalizeEventName(eventName);
     if (typeof listener !== 'function') {
         throw new TypeError('The "listener" argument must be of type Function');
     }
@@ -430,13 +509,12 @@ EventEmitter.prototype.removeListener = function removeListener(eventName: Event
     const listeners = this._events.get(eventName);
     if (!listeners) return this;
 
-    const index = listeners.findIndex((entry) => entry.listener === listener || entry.wrapped === listener);
-    if (index !== -1) {
-        arrayRemoveAt(listeners, index);
-        if (listeners.length === 0) {
-            this._events.delete(eventName);
+    for (let index = listeners.length - 1; index >= 0; index--) {
+        const entry = listeners[index];
+        if (entry.listener === listener || entry.wrapped === listener) {
+            removeListenerEntry(this, eventName, entry, listener);
+            break;
         }
-        emitRemoveListener(this, eventName, listener);
     }
 
     return this;
@@ -448,10 +526,38 @@ EventEmitter.prototype.off = function off(eventName: EventName, listener: AnyLis
 
 EventEmitter.prototype.removeAllListeners = function removeAllListeners(eventName?: EventName): EventEmitter {
     this.ensureState();
+    if (!hasMetaListener(this, 'removeListener')) {
+        if (eventName === undefined) {
+            this._events.clear();
+            this._warnedEvents?.clear();
+        } else {
+            const normalizedName = normalizeEventName(eventName);
+            this._events.delete(normalizedName);
+            this._warnedEvents?.delete(normalizedName);
+        }
+        return this;
+    }
+
     if (eventName === undefined) {
+        for (const name of [...this._events.keys()]) {
+            if (name !== 'removeListener') this.removeAllListeners(name);
+        }
+        this._events.delete('removeListener');
+        this._warnedEvents?.delete('removeListener');
         this._events.clear();
     } else {
-        this._events.delete(eventName);
+        const normalizedName = normalizeEventName(eventName);
+        if (normalizedName === 'removeListener') {
+            this._events.delete(normalizedName);
+            this._warnedEvents?.delete(normalizedName);
+            return this;
+        }
+        const listeners = this._events.get(normalizedName);
+        if (!listeners) return this;
+        for (let index = listeners.length - 1; index >= 0; index--) {
+            const entry = listeners[index];
+            removeListenerEntry(this, normalizedName, entry, entry.listener);
+        }
     }
     return this;
 };
@@ -462,38 +568,18 @@ function emitEntries(self: EventEmitter, eventName: EventName, args: EventArgs):
 
     const toCall = [...listeners];
 
-    for (let i = listeners.length - 1; i >= 0; i--) {
-        if (listeners[i].once) {
-            arrayRemoveAt(listeners, i);
-        }
-    }
-
-    if (listeners.length === 0) {
-        self._events.delete(eventName);
-    }
-
-    for (const { listener } of toCall) {
-        try {
-            const result = listener.apply(self, args);
-            if (self._captureRejections && isPromiseLikeResult(result)) {
-                result.then(undefined, (err) => {
-                    const handler = (self as CaptureRejectionEmitter)[EventEmitter.captureRejectionSymbol];
-                    if (typeof handler === 'function') {
-                        handler.call(self, err, eventName, ...args);
-                    } else if (eventName !== 'error') {
-                        self.emit('error', err);
-                    }
-                });
-            }
-        } catch (err) {
-            if (eventName === 'error') throw err;
-            if (self._emittingError) throw err;
-            self._emittingError = true;
-            try {
-                self.emit('error', err);
-            } finally {
-                self._emittingError = false;
-            }
+    for (const entry of toCall) {
+        if (entry.once) removeListenerEntry(self, eventName, entry, entry.listener);
+        const result = entry.listener.apply(self, args);
+        if (self._captureRejections && isPromiseLikeResult(result)) {
+            result.then(undefined, (err) => {
+                const handler = (self as CaptureRejectionEmitter)[EventEmitter.captureRejectionSymbol];
+                if (typeof handler === 'function') {
+                    handler.call(self, err, eventName, ...args);
+                } else if (eventName !== 'error') {
+                    self.emit('error', err);
+                }
+            });
         }
     }
 
@@ -502,6 +588,7 @@ function emitEntries(self: EventEmitter, eventName: EventName, args: EventArgs):
 
 EventEmitter.prototype.emit = function emit(eventName: EventName, ...args: EventArgs): boolean {
     this.ensureState();
+    eventName = normalizeEventName(eventName);
     if (eventName === 'error') {
         emitEntries(this, EventEmitter.errorMonitor, args);
     }
@@ -524,36 +611,37 @@ EventEmitter.prototype.eventNames = function eventNames(): EventName[] {
 
 EventEmitter.prototype.listeners = function listeners(eventName: EventName): AnyListener[] {
     this.ensureState();
+    eventName = normalizeEventName(eventName);
     const listeners = this._events.get(eventName);
     return listeners ? listeners.map((entry) => entry.listener) : [];
 };
 
 EventEmitter.prototype.rawListeners = function rawListeners(eventName: EventName): AnyListener[] {
     this.ensureState();
+    eventName = normalizeEventName(eventName);
     const listeners = this._events.get(eventName);
     return listeners ? listeners.map((entry) => entry.wrapped ?? entry.listener) : [];
 };
 
 EventEmitter.prototype.listenerCount = function listenerCount(eventName: EventName, listener?: AnyListener): number {
     this.ensureState();
+    eventName = normalizeEventName(eventName);
     const listeners = this._events.get(eventName);
     if (!listeners) return 0;
     if (listener) {
-        return listeners.filter((entry) => entry.listener === listener).length;
+        return listeners.filter((entry) => entry.listener === listener || entry.wrapped === listener).length;
     }
     return listeners.length;
 };
 
 EventEmitter.prototype.getMaxListeners = function getMaxListeners(): number {
     this.ensureState();
-    return this._maxListeners;
+    return this._maxListeners ?? EventEmitter.defaultMaxListeners;
 };
 
 EventEmitter.prototype.setMaxListeners = function setMaxListeners(n: number): EventEmitter {
     this.ensureState();
-    if (typeof n !== 'number' || n < 0 || Number.isNaN(n)) {
-        throw new RangeError('The value of "n" is out of range. It must be a non-negative number.');
-    }
+    validateMaxListeners(n, 'setMaxListeners');
     this._maxListeners = n;
     return this;
 };
@@ -573,15 +661,16 @@ EventEmitter.getMaxListeners = function getMaxListeners(emitter: EventEmitter | 
         return emitter.getMaxListeners();
     }
     if (isEventTarget(emitter)) {
+        if (typeof AbortSignal === 'function' && emitter instanceof AbortSignal) {
+            return eventTargetMaxListeners.get(emitter) ?? 0;
+        }
         return eventTargetMaxListeners.get(emitter) ?? EventEmitter.defaultMaxListeners;
     }
     throw new TypeError('The "emitter" argument must be an instance of EventEmitter or EventTarget');
 };
 
 EventEmitter.setMaxListeners = function setMaxListeners(n: number, ...eventTargets: Array<EventEmitter | EventTarget>): void {
-    if (typeof n !== 'number' || n < 0 || Number.isNaN(n)) {
-        throw new RangeError('The value of "n" is out of range. It must be a non-negative number.');
-    }
+    validateMaxListeners(n, 'setMaxListeners');
     if (eventTargets.length === 0) {
         EventEmitter.defaultMaxListeners = n;
         return;
@@ -722,6 +811,10 @@ EventEmitter.once = function once(emitter: EventEmitter | EventTarget, eventName
 
 export const captureRejectionSymbol = EventEmitter.captureRejectionSymbol;
 export const errorMonitor = EventEmitter.errorMonitor;
+export const captureRejections = EventEmitter.captureRejections;
+export const defaultMaxListeners = EventEmitter.defaultMaxListeners;
+export const usingDomains = EventEmitter.usingDomains;
+export const init = EventEmitter.init;
 export const getMaxListeners = EventEmitter.getMaxListeners;
 export const listenerCount = EventEmitter.listenerCount;
 

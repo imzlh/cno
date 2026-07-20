@@ -9,8 +9,6 @@ export class Event implements globalThis.Event {
     readonly isTrusted: boolean = false;
 
     // Legacy aliases required by TypeScript lib.dom.d.ts
-    cancelBubble: boolean = false;
-    returnValue: boolean = true;
     srcElement: EventTarget | null = null;
 
     target: EventTarget | null = null;
@@ -20,8 +18,11 @@ export class Event implements globalThis.Event {
     private _stopped = false;
     private _immediateStopped = false;
     private _prevented = false;
+    private _inPassiveListener = false;
+    private _dispatching = false;
 
     constructor(type: string, options?: EventInit, trust = false) {
+        if (arguments.length === 0) throw new TypeError('Event constructor requires a type');
         this.type = String(type);
         if (options) {
             this.bubbles = !!options.bubbles;
@@ -32,17 +33,20 @@ export class Event implements globalThis.Event {
     }
 
     preventDefault(): void {
-        if (this.cancelable) this._prevented = true;
+        if (this.cancelable && !this._inPassiveListener) this._prevented = true;
     }
     stopPropagation(): void {
         this._stopped = true;
-        this.cancelBubble = true;
     }
     stopImmediatePropagation(): void {
         this._stopped = true;
         this._immediateStopped = true;
-        this.cancelBubble = true;
     }
+
+    get cancelBubble(): boolean { return this._stopped; }
+    set cancelBubble(value: boolean) { if (value) this._stopped = true; }
+    get returnValue(): boolean { return !this._prevented; }
+    set returnValue(value: boolean) { if (!value) this.preventDefault(); }
 
     get defaultPrevented(): boolean {
         return this._prevented;
@@ -53,6 +57,10 @@ export class Event implements globalThis.Event {
     get immediatePropagationStopped(): boolean {
         return this._immediateStopped;
     }
+
+    _setPassiveListener(value: boolean): void { this._inPassiveListener = value; }
+    _setDispatching(value: boolean): void { this._dispatching = value; }
+    get _isDispatching(): boolean { return this._dispatching; }
 
     static NONE = 0;
     static CAPTURING_PHASE = 1;
@@ -86,7 +94,9 @@ interface ListenerEntry {
     listener: EventListenerOrEventListenerObject;
     once: boolean;
     capture: boolean;
+    passive: boolean;
     signal?: AbortSignal;
+    abortHandler?: () => void;
 }
 
 const captureOption = (options?: AddEventListenerOptions | boolean): boolean =>
@@ -129,17 +139,18 @@ export class EventTarget implements globalThis.EventTarget {
         }
         const capture = !!opts.capture;
         if (bucket.some(e => e.listener === listener && e.capture === capture)) return;
-        const entry: ListenerEntry = { listener, once: !!opts.once, capture, signal: opts.signal };
+        const entry: ListenerEntry = { listener, once: !!opts.once, capture, passive: !!opts.passive, signal: opts.signal };
         bucket.push(entry);
         callTrackingHook('__cnoTrackEventTargetListener', target, eventType, listener, options);
         if (opts.signal) {
-            opts.signal.addEventListener('abort', () => {
+            entry.abortHandler = () => {
                 const idx = bucket.indexOf(entry);
                 if (idx !== -1) {
                     bucket.splice(idx, 1);
                     callTrackingHook('__cnoUntrackEventTargetListener', target, eventType, listener, entry.capture);
                 }
-            }, { once: true });
+            };
+            opts.signal.addEventListener('abort', entry.abortHandler, { once: true });
         }
     }
 
@@ -162,7 +173,9 @@ export class EventTarget implements globalThis.EventTarget {
         const capture = captureOption(options);
         const idx = bucket.findIndex(e => e.listener === listener && e.capture === capture);
         if (idx !== -1) {
+            const entry = bucket[idx];
             bucket.splice(idx, 1);
+            if (entry?.signal && entry.abortHandler) entry.signal.removeEventListener('abort', entry.abortHandler);
             callTrackingHook('__cnoUntrackEventTargetListener', target, eventType, listener, options);
         }
     }
@@ -175,6 +188,7 @@ export class EventTarget implements globalThis.EventTarget {
         if (!target) return globalThis.dispatchEvent(event);
         const listeners = target.#listeners;
         if (!(event instanceof Event)) throw new TypeError('Invalid event object');
+        if (event._isDispatching) throw new DOMException('The event is already being dispatched', 'InvalidStateError');
 
         event.target = target;
         event.currentTarget = target;
@@ -182,6 +196,7 @@ export class EventTarget implements globalThis.EventTarget {
 
         const bucket = listeners.get(event.type);
         event.eventPhase = Event.AT_TARGET;
+        event._setDispatching(true);
         try {
             if (bucket) {
                 const snapshot = [...bucket];
@@ -191,15 +206,23 @@ export class EventTarget implements globalThis.EventTarget {
                     if (idx === -1) continue;
                     if (entry.once) {
                         bucket.splice(idx, 1);
+                        if (entry.signal && entry.abortHandler) entry.signal.removeEventListener('abort', entry.abortHandler);
                         callTrackingHook('__cnoUntrackEventTargetListener', target, event.type, entry.listener, entry.capture);
                     }
                     const fn = entry.listener;
-                    // @ts-ignore
-                    if (typeof fn === 'function') fn.call(this, event);
-                    else fn.handleEvent?.(event);
+                    event._setPassiveListener(entry.passive);
+                    try {
+                        // @ts-ignore
+                        if (typeof fn === 'function') fn.call(this, event);
+                        else fn.handleEvent?.(event);
+                    } finally {
+                        event._setPassiveListener(false);
+                    }
                 }
             }
         } finally {
+            event._setDispatching(false);
+            event._setPassiveListener(false);
             event.eventPhase = Event.NONE;
             event.currentTarget = null;
         }
@@ -216,7 +239,7 @@ export class CustomEvent extends Event implements globalThis.CustomEvent {
     public readonly detail: unknown;
     constructor(type: string, eventInitDict?: CustomEventInit, trust?: boolean) {
         super(type, eventInitDict, trust);
-        this.detail = eventInitDict?.detail;
+        this.detail = eventInitDict?.detail ?? null;
     }
 
     get [Symbol.toStringTag]() {

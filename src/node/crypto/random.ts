@@ -113,7 +113,7 @@ function parseRandomFillRange(buffer: RandomFillBuffer, offset: number, size: nu
 
     const off = Math.trunc(offset);
     const sz = Math.trunc(size);
-    if (!Number.isFinite(size) || sz < 0 || off + sz > buffer.byteLength) {
+    if (!Number.isFinite(size) || size < 0 || off + sz > buffer.byteLength) {
         throw new RangeError('The value of "size + offset" is out of range');
     }
     return { off, sz };
@@ -197,13 +197,15 @@ export function randomFill<T extends RandomFillBuffer>(buffer: T, offset?: numbe
     );
     const cb = callback;
 
-    try {
-        crypto.randomFill(buffer, off, sz);
-    } catch (err) {
-        cb(asError(err), buffer);
-        return;
-    }
-    cb(null, buffer);
+    queueMicrotask(() => {
+        try {
+            crypto.randomFill(buffer, off, sz);
+        } catch (err) {
+            cb(asError(err), buffer);
+            return;
+        }
+        cb(null, buffer);
+    });
 }
 
 export function randomFillSync<T extends RandomFillBuffer>(buffer: T, offset = 0, size?: number): T {

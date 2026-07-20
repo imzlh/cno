@@ -13,6 +13,7 @@ export const extname = platformPath.extname;
 export const format = platformPath.format;
 export const isAbsolute = platformPath.isAbsolute;
 export const join = platformPath.join;
+export const matchesGlob = platformPath.matchesGlob;
 export const normalize = platformPath.normalize;
 export const parse = platformPath.parse;
 export const relative = platformPath.relative;
@@ -30,6 +31,7 @@ export default {
     format,
     isAbsolute,
     join,
+    matchesGlob,
     normalize,
     parse,
     posix: posixCompat,

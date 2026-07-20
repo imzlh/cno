@@ -73,9 +73,44 @@ export interface TlsOptions {
     sessionTimeout?: number;
 }
 
-type InternalSecureContextOptions = SecureContextOptions & Pick<CModuleSSL.ContextOptions, 'mode' | 'verify' | 'verifyHostname'>;
+type InternalSecureContextOptions = SecureContextOptions & Pick<CModuleSSL.ContextOptions, 'mode' | 'verify' | 'verifyHostname'> & {
+    alpn?: string[];
+};
 
-export interface SecureContextOptions extends TlsOptions {}
+export interface SecureContextOptions extends TlsOptions {
+    ALPNProtocols?: string[] | Buffer[] | Buffer;
+}
+
+function normalizeAlpnProtocols(value: string[] | Buffer[] | Buffer | undefined): string[] | undefined {
+    if (value === undefined) return undefined;
+    // Node wire format Buffer: length-prefixed protocol list
+    if (typeof value === 'object' && value !== null && !Array.isArray(value)
+        && typeof (value as { length?: unknown }).length === 'number'
+        && typeof (value as { subarray?: unknown }).subarray === 'function') {
+        const buf = value as Buffer;
+        const out: string[] = [];
+        let i = 0;
+        while (i < buf.length) {
+            const len = buf[i]!;
+            i++;
+            if (i + len > buf.length) break;
+            out.push(engine.decodeString(buf.subarray(i, i + len)));
+            i += len;
+        }
+        return out.length > 0 ? out : undefined;
+    }
+    if (!Array.isArray(value)) return undefined;
+    const list: string[] = [];
+    for (const v of value) {
+        if (typeof v === 'string') {
+            if (v.length > 0) list.push(v);
+        } else if (v && typeof (v as { byteLength?: unknown }).byteLength === 'number') {
+            const s = engine.decodeString(v as Uint8Array);
+            if (s.length > 0) list.push(s);
+        }
+    }
+    return list.length > 0 ? list : undefined;
+}
 
 export interface SecurePair {
     encrypted: TLSSocket;
@@ -260,6 +295,8 @@ export class SecureContext {
         if (options?.ecdhCurve) opts.ecdhCurve = options.ecdhCurve;
         if (options?.verify !== undefined) opts.verify = options.verify;
         if (options?.verifyHostname !== undefined) opts.verifyHostname = options.verifyHostname;
+        const alpn = options?.alpn ?? normalizeAlpnProtocols(options?.ALPNProtocols);
+        if (alpn) opts.alpn = alpn;
 
         this.#context = new ssl.Context(opts);
     }
@@ -405,6 +442,7 @@ function initTLSSocket(self: TLSSocket, socket: Duplex | CModuleStreams.Stream, 
         mode: self._isServer ? 'server' : 'client',
         verify: !self._isServer && self._rejectUnauthorized,
         verifyHostname: !self._isServer && !!self._servername,
+        alpn: normalizeAlpnProtocols(options?.ALPNProtocols),
     };
     self._secureContextStore = options?.secureContext ?? new SecureContext(contextOptions);
 
@@ -922,6 +960,7 @@ function initServer(
         maxVersion: options.maxVersion,
         dhparam: options.dhparam,
         ecdhCurve: options.ecdhCurve,
+        ALPNProtocols: options.ALPNProtocols,
     });
 
     if (secureConnectionListener) {
@@ -938,6 +977,7 @@ function initServer(
             rejectUnauthorized: self._rejectUnauthorized,
             requestCert: self._requestCert,
             secureContext: self._secureContext,
+            ALPNProtocols: options.ALPNProtocols,
         });
         queueMicrotask(() => {
             if (!tlsSocket.destroyed) socket.resume();
@@ -1090,6 +1130,7 @@ export function connect(
         maxVersion: options.maxVersion,
         dhparam: options.dhparam,
         ecdhCurve: options.ecdhCurve,
+        ALPNProtocols: options.ALPNProtocols,
     });
 
     // If an existing socket was provided, upgrade it
@@ -1099,6 +1140,7 @@ export function connect(
             rejectUnauthorized: options.rejectUnauthorized ?? true,
             secureContext,
             servername: options.servername ?? host,
+            ALPNProtocols: options.ALPNProtocols,
             start: true,
         });
 
@@ -1120,6 +1162,7 @@ export function connect(
         rejectUnauthorized: options.rejectUnauthorized ?? true,
         secureContext,
         servername: options.servername ?? host,
+        ALPNProtocols: options.ALPNProtocols,
         start: false,
     });
 

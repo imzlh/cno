@@ -3,6 +3,8 @@
  * URL query string parsing and stringifying
  */
 
+import { Buffer } from '../buffer';
+
 function hexValue(code: number): number {
     if (code >= 48 && code <= 57) return code - 48;
     if (code >= 65 && code <= 70) return code - 55;
@@ -206,4 +208,40 @@ export function escape(str: string): string {
 export function unescape(str: string): string {
     const input = typeof str === 'string' ? str : String(str);
     return decodePart(input, decodeURIComponent);
+}
+
+// Node keeps these historical aliases as the same function objects.
+export const decode = parse;
+export const encode = stringify;
+
+export function unescapeBuffer(str: string, decodeSpaces = false): Buffer {
+    const input = typeof str === 'string' ? str : String(str);
+    const out = Buffer.allocUnsafe(input.length);
+    let index = 0;
+    let outIndex = 0;
+    let hasHex = false;
+
+    while (index < input.length) {
+        let value = input.charCodeAt(index);
+        if (value === 0x2b && decodeSpaces) {
+            out[outIndex++] = 0x20;
+            index++;
+            continue;
+        }
+        if (value === 0x25 && index + 2 < input.length) {
+            const high = hexValue(input.charCodeAt(index + 1));
+            const low = hexValue(input.charCodeAt(index + 2));
+            if (high >= 0 && low >= 0) {
+                value = high * 16 + low;
+                hasHex = true;
+                index += 3;
+                out[outIndex++] = value;
+                continue;
+            }
+        }
+        out[outIndex++] = value;
+        index++;
+    }
+
+    return hasHex ? out.subarray(0, outIndex) : out;
 }

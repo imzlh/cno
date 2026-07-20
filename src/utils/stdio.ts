@@ -8,14 +8,14 @@
 
 import { malloc } from "./malloc";
 import { isPosixCompatible, isWindows } from "./platform";
-import { wrapFsClassDec as wrap } from "./wrap";
-import { arrayBufferBackedBytes } from "./bytes";
+import { wrapFsClassDec as wrap, wrapFSErr } from "./wrap";
+import { errors } from "../deno/01_errors";
 
 const os = import.meta.use('os');
 const pipe = import.meta.use('streams');
-const asyncfs = import.meta.use('asyncfs');
 const sfs = import.meta.use('fs');
-const error = import.meta.use('error');
+const sysError = import.meta.use('error');
+const timers = import.meta.use('timers');
 
 type AnyStream = CModuleStreams.Pipe | CModuleStreams.TTY | FileStdio | NullStdio;
 
@@ -25,14 +25,26 @@ const lockings: Record<number, boolean> = {
     [os.STDERR_FILENO]: false,
 };
 
-const asyncQueues: Record<number, Promise<void>> = {
-    [os.STDIN_FILENO]: Promise.resolve(),
-    [os.STDOUT_FILENO]: Promise.resolve(),
-    [os.STDERR_FILENO]: Promise.resolve(),
-};
+const asyncQueues: Record<number, Promise<void> | undefined> = {};
+const pendingReadCancels: Record<number, Set<() => void> | undefined> = {};
+
+function registerReadCancel(fd: number, cancel: () => void): () => void {
+    const entries = pendingReadCancels[fd] ?? (pendingReadCancels[fd] = new Set());
+    entries.add(cancel);
+    return () => {
+        entries.delete(cancel);
+        if (entries.size === 0) delete pendingReadCancels[fd];
+    };
+}
+
+function cancelReads(fd: number): void {
+    const entries = pendingReadCancels[fd];
+    if (!entries) return;
+    for (const cancel of [...entries]) cancel();
+}
 
 function lock(fd: number) {
-    if (lockings[fd]) throw new Error("File is already locked");
+    if (lockings[fd]) throw new errors.Busy("File is already locked");
     lockings[fd] = true;
 }
 
@@ -41,20 +53,36 @@ function unlock(fd: number) {
 }
 
 function tryLock(fd: number) {
-    if (lockings[fd]) throw new Error("File is already locked");
+    if (lockings[fd]) throw new errors.Busy("File is already locked");
 }
 
-async function queueFd<T>(fd: number, op: () => Promise<T>): Promise<T> {
-    const previous = asyncQueues[fd] ?? Promise.resolve();
-    let release = () => {};
-    const current = new Promise<void>(resolve => { release = resolve; });
-    asyncQueues[fd] = previous.then(() => current, () => current);
-    await previous.catch(() => {});
-    try {
-        return await op();
-    } finally {
-        release();
-    }
+function queueFd<T>(fd: number, op: () => Promise<T>): Promise<T> {
+    const previous = asyncQueues[fd];
+    const runOp = (): Promise<T> => {
+        let operation: Promise<T>;
+        try { operation = Promise.resolve(op()); }
+        catch (e) { operation = Promise.reject(e); }
+        void operation.catch(() => {});
+        return operation;
+    };
+    const result = previous ? previous.then(runOp) : runOp();
+    const tail = result.then(() => {}, () => {});
+    asyncQueues[fd] = tail;
+    void tail.then(() => {
+        if (asyncQueues[fd] === tail) delete asyncQueues[fd];
+    });
+    void result.catch(() => {});
+    return result;
+}
+
+function assertUint8Array(value: unknown): asserts value is Uint8Array {
+    if (!(value instanceof Uint8Array)) throw new TypeError('expected typed ArrayBufferView');
+}
+
+function isTransientTtyEio(value: unknown): value is Error {
+    return value instanceof Error &&
+        Reflect.get(value, 'code') === sysError.errno.EIO &&
+        Reflect.get(value, '_cnoTransientTtyEio') === true;
 }
 
 /**
@@ -88,48 +116,35 @@ function readSyncBlocking(stream: CModuleStreams.Stream, fd: number, buf: Uint8A
 }
 
 /**
- * Minimal file-backed stdio handle (replaces the FSFile dependency for the
- * rare case of stdin/stdout redirected to a regular file). Tracks its own
- * offset and reads/writes positionally, matching FSFile's behaviour.
+ * File-backed stdio uses the descriptor cursor shared with console and Node.
+ * The methods stay synchronous so sync calls cannot overtake async calls.
  */
 class FileStdio {
-    #h: CModuleAsyncFS.FileHandle;
-    #pos = 0;
+    #fd: number;
 
     constructor(fd: number) {
-        this.#h = asyncfs.newStdioFile('stdio', fd);
+        this.#fd = fd;
     }
 
     async read(buf: Uint8Array): Promise<number | null> {
-        if (buf.byteLength === 0) return 0;
-        const n = await this.#h.read(arrayBufferBackedBytes(buf), this.#pos);
-        if (n === null || n === 0) return null;
-        this.#pos += n;
-        return n;
+        return this.readSync(buf);
     }
 
     readSync(buf: Uint8Array): number | null {
-        if (buf.byteLength === 0) return 0;
-        const n = sfs.pread(this.#h.fileno(), buf, this.#pos);
-        if (n === 0) return null;
-        this.#pos += n;
-        return n;
+        const n = sfs.read(this.#fd, buf);
+        return n === 0 ? null : n;
     }
 
     async write(data: Uint8Array): Promise<number> {
-        const n = await this.#h.write(arrayBufferBackedBytes(data), this.#pos);
-        this.#pos += n;
-        return n;
+        return this.writeSync(data);
     }
 
     writeSync(data: Uint8Array): number {
-        const n = sfs.pwrite(this.#h.fileno(), data, this.#pos);
-        this.#pos += n;
-        return n;
+        return sfs.write(this.#fd, data);
     }
 
     close() {
-        this.#h.close();
+        sfs.close(this.#fd);
     }
 }
 
@@ -157,6 +172,8 @@ export class Stream {
     protected type: 'pipe' | 'tty' | 'file' | 'null';
     protected stream: AnyStream;
     readonly fd: number;
+    #closed = false;
+    #syncReadFd: number | undefined;
 
     constructor(fd: number, read = true, allowInvalid = false) {
         this.fd = fd;
@@ -193,9 +210,8 @@ export class Stream {
                         } catch {}
                     }
                     this.type = 'tty';
-                    if (isWindows && !isPosixCompatible) {
-                        // Sync should use $CONIN instead
-                        this.fd = sfs.open('CONIN$', 'r', 0);
+                    if (read && isWindows && !isPosixCompatible) {
+                        this.#syncReadFd = sfs.open('CONIN$', 'r', 0);
                     }
                 break;
                 case "file":
@@ -212,50 +228,141 @@ export class Stream {
 
     @wrap
     async write(data: Uint8Array) {
+        assertUint8Array(data);
+        this.assertOpen();
         if (data.byteLength === 0) return 0;
-        return queueFd(this.fd, () => this.stream.write(data));
+        if (this.type === 'file' || this.type === 'null') {
+            lock(this.fd);
+            try { return this.stream.writeSync(data); }
+            finally { unlock(this.fd); }
+        }
+        return queueFd(this.fd, async () => {
+            lock(this.fd);
+            try { return await this.stream.write(data); }
+            finally { unlock(this.fd); }
+        });
     }
 
     @wrap
     async read(buf: Uint8Array<ArrayBuffer>): Promise<number | null> {
+        return await this.readImpl(buf);
+    }
+
+    private async readImpl(
+        buf: Uint8Array<ArrayBuffer>,
+        signal?: AbortSignal
+    ): Promise<number | null> {
+        assertUint8Array(buf);
         if (buf.byteLength === 0) return 0;
+        this.assertOpen();
+        if (signal?.aborted) return null;
+        if (this.type === 'file' || this.type === 'null') {
+            lock(this.fd);
+            try { return this.stream.readSync(buf); }
+            finally { unlock(this.fd); }
+        }
+        const state: {
+            canceled: boolean;
+            started: boolean;
+            wake: (() => void) | undefined;
+        } = { canceled: false, started: false, wake: undefined };
+        let nativeStream: CModuleStreams.Stream | undefined;
+        let unregister = () => {};
+        const cancel = () => {
+            if (state.canceled) return;
+            state.canceled = true;
+            state.wake?.();
+            if (state.started) {
+                try { nativeStream?.cancelRead(); } catch {}
+            }
+        };
+        unregister = registerReadCancel(this.fd, cancel);
         return queueFd(this.fd, async () => {
-            if (this.type == 'file') {
-                return await (this.stream as FileStdio).read(buf);
-            } else {
-                const stream = (this.stream as CModuleStreams.Stream);
-                try {
-                    const n = await stream.read(buf);
-                    return n === 0 ? null : n;
-                } catch {
-                    return null;
+            try {
+                if (state.canceled || signal?.aborted) {
+                    if (signal) return null;
+                    throw new errors.Interrupted('operation canceled');
                 }
+                this.assertOpen();
+                lock(this.fd);
+                nativeStream = this.stream as CModuleStreams.Stream;
+                state.started = true;
+                signal?.addEventListener('abort', cancel, { once: true });
+                try {
+                    while (true) {
+                        if (state.canceled || signal?.aborted) {
+                            cancel();
+                            if (signal) return null;
+                            throw new errors.Interrupted('operation canceled');
+                        }
+                        let transientError: Error;
+                        try {
+                            const n = await nativeStream.read(buf);
+                            return n === 0 ? null : n;
+                        } catch (e) {
+                            if (!isTransientTtyEio(e) || this.type !== 'tty') throw e;
+                            transientError = e;
+                        }
+                        while (true) {
+                            if (state.canceled || signal?.aborted) {
+                                if (signal) return null;
+                                throw new errors.Interrupted('operation canceled');
+                            }
+                            try {
+                                if ((nativeStream as CModuleStreams.TTY).isForeground()) break;
+                            } catch {
+                                throw transientError;
+                            }
+                            let wake = () => {};
+                            await new Promise<void>((resolve) => {
+                                const timer = timers.setTimeout(resolve, 50);
+                                wake = () => {
+                                    timers.clearTimeout(timer);
+                                    resolve();
+                                };
+                                state.wake = wake;
+                            });
+                            if (state.wake === wake) state.wake = undefined;
+                        }
+                    }
+                } finally {
+                    signal?.removeEventListener('abort', cancel);
+                    state.wake = undefined;
+                    unlock(this.fd);
+                }
+            } finally {
+                unregister();
             }
         });
     }
 
     @wrap
     readSync(buf: Uint8Array): number | null {
+        assertUint8Array(buf);
         if (buf.byteLength === 0) return 0;
+        this.assertOpen();
         if (this.type == 'file') {
             tryLock(this.fd);
-            try { return (this.stream as FileStdio).readSync(buf); }
-            finally { unlock(this.fd); }
+            return (this.stream as FileStdio).readSync(buf);
+        } else if (this.type === 'null') {
+            return null;
         } else {
-            // TTY/pipe fd is non-blocking (libuv) — a raw read would EAGAIN.
-            // readSyncBlocking flips the stream to blocking for the read (or
-            // uses the CONIN$ handle on Windows), then restores.
-            return readSyncBlocking(this.stream as CModuleStreams.Stream, this.fd, buf);
+            return readSyncBlocking(
+                this.stream as CModuleStreams.Stream,
+                this.#syncReadFd ?? this.fd,
+                buf
+            );
         }
     }
 
     @wrap
     writeSync(data: Uint8Array): number {
+        assertUint8Array(data);
+        this.assertOpen();
         if (data.byteLength === 0) return 0;
+        tryLock(this.fd);
         if (this.type == 'file') {
-            tryLock(this.fd);
-            try { return (this.stream as FileStdio).writeSync(data); }
-            finally { unlock(this.fd); }
+            return (this.stream as FileStdio).writeSync(data);
         } else if (this.type == 'null') {
             return (this.stream as NullStdio).writeSync(data);
         } else {
@@ -264,78 +371,90 @@ export class Stream {
     }
 
     get size(){
-        if (this.type != 'tty') throw new Error('Only TTY streams have a size');
+        if (!this.isTTY) throw new Error('Only TTY streams have a size');
         return (this.stream as CModuleStreams.TTY).size;
     }
 
     @wrap
     createReadStream(): ReadableStream {
-        const stream = this.stream as CModuleStreams.Stream;
-        if (this.type == 'file') return new ReadableStream({
-            pull: async ctrl => {
-                try{
-                    const buf = malloc(ctrl);
-                    lock(this.fd);
-                    const readed = await (this.stream as FileStdio).read(buf);
-                    if (!readed) ctrl.close();
-                    else ctrl.enqueue(buf.slice(0, readed));
-                }catch(e){
-                    ctrl.error(e);
-                } finally {
-                    unlock(this.fd);
-                }
-            }
-        });
-        else return new ReadableStream({
-            async pull(controller) {
+        const abort = new AbortController();
+        return new ReadableStream({
+            type: 'bytes',
+            pull: async controller => {
                 try {
                     const buf = malloc(controller);
-                    const n = await stream.read(buf);
-                    if (n === 0) {
+                    const n = await this.readImpl(buf, abort.signal);
+                    if (n === null) {
                         controller.close();
                     } else {
                         controller.enqueue(buf.slice(0, n));
                     }
                 } catch (e) {
-                    controller.error(e);
+                    controller.error(wrapFSErr(e));
                 }
-            }
+            },
+            cancel: () => {
+                cancelReads(this.fd);
+                abort.abort();
+            },
         });
     }
 
     @wrap
     createWriteStream(): WritableStream {
-        return  new WritableStream({
+        return new WritableStream<Uint8Array>({
             write: async (chunk, control) => {
                 try {
-                    lock(this.fd);
-                    if (!await this.write(chunk)) control.error(error.Error(error.errno.EOF));
+                    const written = await this.write(chunk);
+                    if (chunk.byteLength > 0 && written === 0) {
+                        throw new errors.WriteZero('failed to write to stdio');
+                    }
                 } catch (e) {
                     control.error(e);
-                } finally {
-                    unlock(this.fd);
+                    throw e;
                 }
-            }
+            },
+            close: () => this.close(),
+            abort: () => {
+                if (!this.#closed) this.close();
+            },
         });
     }
 
     close() {
-        this.stream.close();
+        if (this.#closed) throw new errors.BadResource('Bad resource ID');
+        cancelReads(this.fd);
+        this.#closed = true;
+        try {
+            this.stream.close();
+        } finally {
+            if (this.#syncReadFd !== undefined) {
+                sfs.close(this.#syncReadFd);
+                this.#syncReadFd = undefined;
+            }
+        }
     }
 
     get isTTY(){
-        return this.type == 'tty';
+        return !this.#closed && this.type == 'tty';
+    }
+
+    get isClosed() {
+        return this.#closed;
     }
 
     @wrap
-    setRaw(mode: boolean) {
-        if (this.type != 'tty') throw new Error('Only TTY streams can be set raw');
-        (this.stream as CModuleStreams.TTY).mode =
-            mode ? pipe.TTY_MODE_RAW_VT : pipe.TTY_MODE_NORMAL;
+    setRaw(mode: boolean, cbreak = false) {
+        if (!this.isTTY) throw new errors.BadResource('ENOTTY: Not a typewriter');
+        (this.stream as CModuleStreams.TTY).setRaw(mode, cbreak);
     }
 
     get __stream() {
         return this.stream;
+    }
+
+    private assertOpen() {
+        if (this.#closed) throw new errors.BadResource('Bad resource ID');
     }
 }
 

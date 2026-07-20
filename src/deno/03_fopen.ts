@@ -2,10 +2,13 @@ import { malloc } from "../utils/malloc";
 import { toDenoStat, toString } from "./02_fs";
 import { wrapFsClassDec as wrap, wrapFSns, wrapFSErr } from "../utils/wrap";
 import { errors } from "./01_errors";
+import { isWindows } from "../utils/platform";
 
 const fs = import.meta.use('fs');
 const asfs = import.meta.use('asyncfs');
 const error = import.meta.use('error');
+const os = import.meta.use('os');
+const streams = import.meta.use('streams');
 const fsFileToken = Symbol('Deno.FsFile');
 
 export function optionsToMode(options: Deno.OpenOptions): CModuleFS.OpenFlags {
@@ -64,19 +67,28 @@ export class FsFile implements Deno.FsFile {
     fpointer = 0;
     private $handle: CModuleAsyncFS.FileHandle;
     private $append: boolean;
+    private $tty: CModuleStreams.TTY | undefined;
     private $closed = false;
 
-    constructor($handle?: CModuleAsyncFS.FileHandle, $append = false, token?: symbol) {
+    constructor(
+        $handle?: CModuleAsyncFS.FileHandle,
+        $append = false,
+        token?: symbol,
+        $tty?: CModuleStreams.TTY,
+    ) {
         if (token !== fsFileToken || !$handle) {
             throw new TypeError("'Deno.FsFile' cannot be constructed, use 'Deno.open()' or 'Deno.openSync()' instead");
         }
         this.$handle = $handle;
         this.$append = $append;
+        this.$tty = $tty;
         this.readable = new ReadableStream({
             pull: async (controller) => {
                 try {
                     const buf = malloc(controller);
-                    const n = await $handle.read(buf, this.fpointer);
+                    const n = this.$tty
+                        ? await this.$tty.read(buf)
+                        : await $handle.read(buf, this.fpointer);
                     if (n === null || n === 0) {
                         controller.close();
                         this.close();
@@ -85,13 +97,7 @@ export class FsFile implements Deno.FsFile {
                     controller.enqueue(buf.slice(0, n));
                     this.fpointer += n;
                 } catch (e) {
-                    // Wrap filesystem errors to Deno errors
-                    try {
-                        wrapFSErr(e);
-                    } catch (wrappedErr) {
-                        controller.error(wrappedErr);
-                        return;
-                    }
+                    controller.error(wrapFSErr(e));
                 }
             },
             cancel: () => this.close(),
@@ -100,13 +106,16 @@ export class FsFile implements Deno.FsFile {
         this.writable = new WritableStream<Uint8Array<ArrayBuffer>>({
             write: async (chunk, control) => {
                 try {
-                    const offset = await this.writeOffset();
+                    this.assertOpen();
+                    const offset = this.$tty ? undefined : await this.writeOffset();
                     let written = 0;
                     while (written < chunk.length) {
-                        const n = await $handle.write(chunk.subarray(written), offset + written);
+                        const n = this.$tty
+                            ? await this.$tty.write(chunk.subarray(written))
+                            : await $handle.write(chunk.subarray(written), offset! + written);
                         written += n;
                     }
-                    this.fpointer = offset + written;
+                    this.fpointer = (offset ?? this.fpointer) + written;
                 } catch (e) {
                     control.error(e);
                 }
@@ -132,31 +141,62 @@ export class FsFile implements Deno.FsFile {
         return fs.lstat(this.$handle.path).size;
     }
 
+    private readTtySync(p: Uint8Array): number | null {
+        if (isWindows) {
+            const n = fs.read(this.$handle.fileno(), p);
+            return n === 0 ? null : n;
+        }
+        const tty = this.$tty!;
+        let restore = false;
+        try {
+            tty.setBlocking(true);
+            restore = true;
+            return tty.readSync(p);
+        } finally {
+            if (restore) {
+                try { tty.setBlocking(false); } catch {}
+            }
+        }
+    }
+
     @wrap
     async write(data: Uint8Array<ArrayBuffer>) {
         assertUint8Array(data);
-        const offset = await this.writeOffset();
-        const n = await this.$handle.write(data, offset);
-        this.fpointer = offset + n;
+        this.assertOpen();
+        const offset = this.$tty ? undefined : await this.writeOffset();
+        // libuv's async zero-length write path can report an allocation error
+        // instead of the descriptor's real errno. Use the synchronous native
+        // operation for this edge case so /dev/full still reports ENOSPC.
+        const n = data.byteLength === 0
+            ? (this.$tty
+                ? (isWindows ? fs.write(this.$handle.fileno(), data) : this.$tty.writeSync(data))
+                : fs.pwrite(this.$handle.fileno(), data, offset!))
+            : (this.$tty ? await this.$tty.write(data) : await this.$handle.write(data, offset!));
+        this.fpointer = (offset ?? this.fpointer) + n;
         return n;
     }
 
     @wrap
     writeSync(p: Uint8Array): number {
         assertUint8Array(p);
+        this.assertOpen();
         const fno = this.$handle.fileno();
-        const offset = this.writeOffsetSync();
-        const n = fs.pwrite(fno, p, offset);
-        this.fpointer = offset + n;
+        const offset = this.$tty ? undefined : this.writeOffsetSync();
+        const n = this.$tty
+            ? (isWindows ? fs.write(fno, p) : this.$tty.writeSync(p))
+            : fs.pwrite(fno, p, offset!);
+        this.fpointer = (offset ?? this.fpointer) + n;
         return n;
     }
 
     @wrap
     async read(p: Uint8Array<ArrayBuffer>): Promise<number | null> {
         assertUint8Array(p);
-        this.assertOpen();
         if (p.byteLength === 0) return 0;
-        const n = await this.$handle.read(p, this.fpointer);
+        this.assertOpen();
+        const n = this.$tty
+            ? await this.$tty.read(p)
+            : await this.$handle.read(p, this.fpointer);
         if (n === null || n === 0) return null;
         this.fpointer += n;
         return n;
@@ -165,11 +205,11 @@ export class FsFile implements Deno.FsFile {
     @wrap
     readSync(p: Uint8Array): number | null {
         assertUint8Array(p);
-        this.assertOpen();
         if (p.byteLength === 0) return 0;
+        this.assertOpen();
         const fno = this.$handle.fileno();
-        const n = fs.pread(fno, p, this.fpointer);
-        if (n === 0) return null;
+        const n = this.$tty ? this.readTtySync(p) : fs.pread(fno, p, this.fpointer);
+        if (n === null || n === 0) return null;
         this.fpointer += n;
         return n;
     }
@@ -292,17 +332,23 @@ export class FsFile implements Deno.FsFile {
     }
 
     isTerminal(): boolean {
-        return false;
+        return !this.$closed && this.$tty !== undefined;
     }
 
     setRaw(mode: boolean, options?: Deno.SetRawOptions): void {
-        throw new Deno.errors.NotSupported();
+        this.assertOpen();
+        if (!this.$tty) throw new Deno.errors.NotSupported();
+        this.$tty.setRaw(mode, options === undefined ? false : !!options.cbreak);
     }
 
     close(): void {
         if (this.$closed) return;
         this.$closed = true;
-        this.$handle.close();
+        try {
+            this.$tty?.close();
+        } finally {
+            this.$handle.close();
+        }
     }
 
     [Symbol.dispose]() {
@@ -312,13 +358,44 @@ export class FsFile implements Deno.FsFile {
 
 export { FsFile as FSFile };
 
+function openFsFile(
+    pathStr: string,
+    fno: number,
+    flag: CModuleFS.OpenFlags,
+    mode: number | undefined,
+    append: boolean,
+    read: boolean,
+): FsFile {
+    let tty: CModuleStreams.TTY | undefined;
+    let ttyFd: number | undefined;
+    try {
+        if (os.guessHandle(fno) === 'tty') {
+            ttyFd = fs.open(pathStr, flag, mode);
+            tty = new streams.TTY(ttyFd, read);
+            if (!isWindows && tty.fileno !== ttyFd) {
+                fs.close(ttyFd);
+                ttyFd = undefined;
+            }
+        }
+        const handle = asfs.newStdioFile(pathStr, fno);
+        return new FsFile(handle, append, fsFileToken, tty);
+    } catch (e) {
+        try { tty?.close(); } catch {}
+        if (!tty && ttyFd !== undefined) {
+            try { fs.close(ttyFd); } catch {}
+        }
+        try { fs.close(fno); } catch {}
+        throw e;
+    }
+}
+
 Object.assign(Deno, wrapFSns({
     async open(path, opt) {
         let flag: CModuleFS.OpenFlags = "r";
         if (opt) flag = optionsToMode(opt);
         const pathStr = toString(path);
         const fno = fs.open(pathStr, flag, opt?.mode);
-        return new FsFile(asfs.newStdioFile(pathStr, fno), !!opt?.append, fsFileToken);
+        return openFsFile(pathStr, fno, flag, opt?.mode, !!opt?.append, !opt || opt.read === true);
     },
 
     openSync(path, opt) {
@@ -326,7 +403,7 @@ Object.assign(Deno, wrapFSns({
         if (opt) flag = optionsToMode(opt);
         const pathStr = toString(path);
         const fno = fs.open(pathStr, flag, opt?.mode);
-        return new FsFile(asfs.newStdioFile(pathStr, fno), !!opt?.append, fsFileToken);
+        return openFsFile(pathStr, fno, flag, opt?.mode, !!opt?.append, !opt || opt.read === true);
     },
 
     create(path) {

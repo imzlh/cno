@@ -10,7 +10,6 @@ import { HttpResponseParser } from "@cnojs/http/h1";
 import { connectHttp, buildRequest, readHeaders, type IHttpSocket } from "../utils/http";
 import { MessageEvent } from "./events";
 
-const engine = import.meta.use('engine');
 const timers = import.meta.use('timers');
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
@@ -45,9 +44,9 @@ export class EventSource extends EventTarget {
     private lastEventId: string = '';
     private eventTypeBuffer: string = '';
     private dataBuffer: string[] = [];
-    private idBuffer: string = '';
-    private retryBuffer: string = '';
+    private idBuffer: string | null = null;
     private lineBuffer: string = '';
+    private decoder = new TextDecoder();
 
     constructor(url: string | URL, eventSourceInitDict?: EventSourceInit) {
         super();
@@ -78,19 +77,24 @@ export class EventSource extends EventTarget {
             this.parser = new HttpResponseParser();
             const { status, headers: resHeaders, leftover } = await readHeaders(this.connection, this.parser);
 
-            if (status !== 200) {
+            if (status === 204) {
                 this.fail();
                 return;
             }
+            if (status !== 200) {
+                this.handleError(new Error(`EventSource request failed with status ${status}`));
+                return;
+            }
             const contentType = resHeaders.find(([n]) => n === 'content-type')?.[1];
-            if (!contentType || !contentType.includes('text/event-stream')) {
+            if (!contentType || contentType.split(';', 1)[0]?.trim().toLowerCase() !== 'text/event-stream') {
                 this.fail();
                 return;
             }
 
             this.readyState = EventSourceReadyState.OPEN;
-            this.dispatchEvent(new Event('open'));
-            this.onopen?.call(this, new Event('open'));
+            const openEvent = new Event('open');
+            this.dispatchEvent(openEvent);
+            this.onopen?.call(this, openEvent);
 
             // Switch to event-driven body reading before feeding any body bytes
             // that arrived together with the response headers.
@@ -112,14 +116,14 @@ export class EventSource extends EventTarget {
         parser.onData = (chunk) => { this.processChunk(chunk); };
         parser.onComplete = () => {
             this.flushEventStreamEnd();
-            this.reconnect();
+            this.handleError(new Error('EventSource connection closed'));
         };
         parser.onError = (err) => { this.handleError(err); };
 
         conn.onReadable(data => {
             if (!data) {
                 this.flushEventStreamEnd();
-                this.reconnect();
+                this.handleError(new Error('EventSource connection closed'));
                 return;
             }
             parser.feed(data);
@@ -129,7 +133,7 @@ export class EventSource extends EventTarget {
     }
 
     private processChunk(chunk: Uint8Array): void {
-        const text = engine.decodeString(chunk);
+        const text = this.decoder.decode(chunk, { stream: true });
         this.lineBuffer += text;
         // Guard against unbounded line buffer from malicious server
         if (this.lineBuffer.length > 1024 * 1024) {
@@ -167,10 +171,8 @@ export class EventSource extends EventTarget {
             case 'data': this.dataBuffer.push(value); break;
             case 'id': if (!value.includes('\0')) this.idBuffer = value; break;
             case 'retry': {
-                const r = parseInt(value);
-                if (!isNaN(r) && r >= 0) {
-                    this.retryBuffer = value;
-                    this.reconnectDelay = r;
+                if (/^\d+$/.test(value)) {
+                    this.reconnectDelay = Number(value);
                 }
                 break;
             }
@@ -178,6 +180,7 @@ export class EventSource extends EventTarget {
     }
 
     private flushEventStreamEnd(): void {
+        this.lineBuffer += this.decoder.decode();
         if (this.lineBuffer.length > 0) {
             const line = this.lineBuffer;
             this.lineBuffer = '';
@@ -188,7 +191,7 @@ export class EventSource extends EventTarget {
 
     private dispatchBufferedEvent(): void {
         if (this.dataBuffer.length === 0) return;
-        if (this.idBuffer) this.lastEventId = this.idBuffer;
+        if (this.idBuffer !== null) this.lastEventId = this.idBuffer;
         const data = this.dataBuffer.join('\n');
         const eventType = this.eventTypeBuffer || 'message';
         const event = new MessageEvent(eventType, { 
@@ -198,11 +201,14 @@ export class EventSource extends EventTarget {
         if (eventType === 'message' && this.onmessage) this.onmessage.call(this, event);
         this.eventTypeBuffer = '';
         this.dataBuffer = [];
-        this.idBuffer = '';
+        this.idBuffer = null;
     }
 
     private handleError(_err: Error): void {
+        if (this.readyState === EventSourceReadyState.CLOSED) return;
+        if (this.readyState === EventSourceReadyState.CONNECTING && this.reconnectTimer !== null) return;
         this.closeConnection();
+        this.readyState = EventSourceReadyState.CONNECTING;
         const errorEvent = new Event('error');
         this.dispatchEvent(errorEvent);
         this.onerror?.call(this, errorEvent);

@@ -23,8 +23,8 @@ class FormData implements globalThis.FormData {
     #entries: Array<[string, FormDataEntryValue]> = [];
 
     constructor(form?: unknown) {
-        if (form) {
-            throw new Error('HTMLFormElement parsing not supported in CNO');
+        if (arguments.length !== 0) {
+            throw new TypeError('FormData constructor: HTMLFormElement parsing not supported in CNO');
         }
     }
 
@@ -149,11 +149,18 @@ class Blob implements globalThis.Blob {
     #size: number;
 
     constructor(
-        blobParts?: BlobPart[],
+        blobParts?: BlobPart[] | Iterable<BlobPart> | null,
         options?: BlobPropertyBag
     ) {
         const endings = normalizeEndings(options?.endings ?? 'transparent');
-        this.#parts = blobParts ? blobParts.map((part) => snapshotBlobPart(part, endings)) : [];
+        if (blobParts === null) throw new TypeError('Blob parts must be a sequence');
+        if (blobParts === undefined) {
+            this.#parts = [];
+        } else {
+            const iterator = Reflect.get(Object(blobParts), Symbol.iterator);
+            if (typeof iterator !== 'function') throw new TypeError('Blob parts must be a sequence');
+            this.#parts = Array.from(blobParts, (part) => snapshotBlobPart(part, endings));
+        }
         this.#type = normalizeType(options?.type ?? '');
         this.#size = calculateSize(this.#parts);
     }

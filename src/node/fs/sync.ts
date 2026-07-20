@@ -2,12 +2,13 @@
  * Node.js fs module - sync operations
  */
 
-import { Dir, toUint8Array, decodeBuffer, encodePathResult, toNodeStat, toNodeStatFs, toNodeDirent, parseFlags, pathToString, splitPathOrFd, describeFd, removeRecursiveSync, mkdirRecursiveSync, modeToNumber, timeToNumber, readFileFromFdSync, randomHex, readDirEntriesSync, validateOpendirOptions, validateFd, assertCopyFileMode, type PathLike, type TimeLike, type Mode } from './utils';
+import { Dir, toUint8Array, decodeBuffer, encodePathResult, toNodeStat, toNodeStatFs, toNodeDirent, parseFlags, pathToString, splitPathOrFd, describeFd, removeRecursiveSync, mkdirRecursiveSync, modeToNumber, timeToNumber, readFileFromFdSync, randomHex, readDirEntriesSync, validateOpendirOptions, validateReaddirOptions, validateFd, assertCopyFileMode, rmIsDirectoryError, type PathLike, type TimeLike, type Mode } from './utils';
 import { wrapSync } from '../_internal/errno';
 import { getTierLimits } from '../_internal/memory';
-import path from '../path';
+import { resolve } from '../path';
+import { copyPathSync, validateCopyOptions, type CopySyncOptions } from './copy';
+import { globPathsSync, type GlobOptions, type GlobResult } from './glob';
 
-const { dirname, join } = path;
 const { readBufSize: READ_BUF_SIZE } = getTierLimits();
 
 const fs = import.meta.use('fs');
@@ -145,35 +146,38 @@ export function rmdirSync(path: PathLike, options?: { recursive?: boolean; maxRe
 
 export function rmSync(path: PathLike, options?: { force?: boolean; recursive?: boolean; maxRetries?: number; retryDelay?: number }): void {
     const pathStr = pathToString(path);
-
+    let stats: CModuleFS.Stats;
     try {
-        const stats = wrapSync(() => fs.lstat(pathStr), 'rmSync', pathStr);
-
-        // Symlink-to-dir is not a directory for rm — always unlink the link.
-        if (stats.isDirectory && !stats.isSymbolicLink) {
-            if (options?.recursive) {
-                removeRecursiveSync(pathStr);
-            } else {
-                wrapSync(() => fs.rmdir(pathStr), 'rmSync', pathStr);
-            }
-        } else {
-            wrapSync(() => fs.unlink(pathStr), 'rmSync', pathStr);
-        }
+        stats = wrapSync(() => fs.lstat(pathStr), 'rmSync', pathStr);
     } catch (err) {
-        if (!options?.force) {
-            throw err;
-        }
+        if (options?.force && Reflect.get(err, 'code') === 'ENOENT') return;
+        throw err;
+    }
+
+    // Symlink-to-dir is not a directory for rm — always unlink the link.
+    if (stats.isDirectory && !stats.isSymbolicLink) {
+        if (!options?.recursive) throw rmIsDirectoryError(pathStr);
+        wrapSync(() => removeRecursiveSync(pathStr), 'rmSync', pathStr);
+    } else {
+        wrapSync(() => fs.unlink(pathStr), 'rmSync', pathStr);
     }
 }
 
-export function readdirSync(path: PathLike, options?: { encoding?: BufferEncoding | 'buffer'; withFileTypes?: boolean; recursive?: boolean } | BufferEncoding): Array<string | Buffer> | import('fs').Dirent[] {
+export function readdirSync(path: PathLike, options?: { encoding?: BufferEncoding | 'buffer'; withFileTypes?: boolean; recursive?: boolean } | BufferEncoding): Array<string | Buffer> | import('fs').Dirent<string | Buffer>[] {
+    validateReaddirOptions(options);
     const pathStr = pathToString(path);
     const withFileTypes = typeof options === 'object' ? options?.withFileTypes : false;
     const recursive = typeof options === 'object' ? options?.recursive === true : false;
     const entries = wrapSync(() => readDirEntriesSync(pathStr, recursive), 'readdirSync', pathStr);
 
     if (withFileTypes) {
-        return entries.map(entry => toNodeDirent(entry.name, entry, entry.parentPath));
+        return entries.map(entry => {
+            const dirent = toNodeDirent(encodePathResult(entry.name, options), entry, entry.parentPath);
+            if (path instanceof Uint8Array) {
+                Reflect.set(dirent, 'parentPath', encodePathResult(entry.parentPath, 'buffer'));
+            }
+            return dirent;
+        });
     }
 
     // recursive string names are root-relative paths (e.g. "sub/f").
@@ -333,6 +337,27 @@ export function readSync(fd: number, buffer: Uint8Array, offset: number, length:
     return wrapSync(() => fs.read(fd, buffer.subarray(offset, offset + length)), 'readSync', fdPath);
 }
 
+function vectorView(buffer: ArrayBufferView): Uint8Array {
+    if (!ArrayBuffer.isView(buffer)) throw new TypeError('The "buffers" argument must be an ArrayBufferView[]');
+    return new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+}
+
+export function readvSync(fd: number, buffers: readonly ArrayBufferView[], position?: number | null): number {
+    validateFd(fd);
+    if (!Array.isArray(buffers)) throw new TypeError('The "buffers" argument must be an Array');
+    let bytesRead = 0;
+    let currentPosition = position;
+    for (const buffer of buffers) {
+        const view = vectorView(buffer);
+        if (view.byteLength === 0) continue;
+        const read = readSync(fd, view, 0, view.byteLength, currentPosition);
+        bytesRead += read;
+        if (currentPosition != null) currentPosition += read;
+        if (read < view.byteLength) break;
+    }
+    return bytesRead;
+}
+
 export function writeSync(fd: number, buffer: Uint8Array, offset?: number, length?: number, position?: number | null): number;
 export function writeSync(fd: number, string: string, position?: number | null, encoding?: BufferEncoding): number;
 export function writeSync(fd: number, buffer: Uint8Array | string, offsetOrPosition?: number | null, lengthOrEncoding?: number | BufferEncoding, position?: number | null): number {
@@ -348,6 +373,22 @@ export function writeSync(fd: number, buffer: Uint8Array | string, offsetOrPosit
         return wrapSync(() => fs.pwrite(fd, data.subarray(actualOffset, actualOffset + actualLength), actualPosition), 'writeSync', fdPath);
     }
     return wrapSync(() => fs.write(fd, data.subarray(actualOffset, actualOffset + actualLength)), 'writeSync', fdPath);
+}
+
+export function writevSync(fd: number, buffers: readonly ArrayBufferView[], position?: number | null): number {
+    validateFd(fd);
+    if (!Array.isArray(buffers)) throw new TypeError('The "buffers" argument must be an Array');
+    let bytesWritten = 0;
+    let currentPosition = position;
+    for (const buffer of buffers) {
+        const view = vectorView(buffer);
+        if (view.byteLength === 0) continue;
+        const written = writeSync(fd, view, 0, view.byteLength, currentPosition);
+        bytesWritten += written;
+        if (currentPosition != null) currentPosition += written;
+        if (written < view.byteLength) break;
+    }
+    return bytesWritten;
 }
 
 export function fsyncSync(fd: number): void {
@@ -374,48 +415,15 @@ export function statfsSync(path: PathLike, options?: { bigint?: boolean }): impo
 
 // cp / cpSync
 
-export interface CopyOptionsSync {
-    mode?: Mode;
-    force?: boolean;
-    recursive?: boolean;
-    errorOnExist?: boolean;
-    filter?: (src: string, dest: string) => boolean;
-}
+export type CopyOptionsSync = CopySyncOptions;
 
 export function cpSync(src: PathLike, dest: PathLike, options?: CopyOptionsSync): void {
-    const srcStr = pathToString(src);
-    const destStr = pathToString(dest);
+    const resolvedOptions = validateCopyOptions(options);
+    copyPathSync(pathToString(src), pathToString(dest), resolvedOptions);
+}
 
-    const srcStat = wrapSync(() => fs.stat(srcStr), 'cpSync', srcStr);
-    if (options?.filter && !options.filter(srcStr, destStr)) return;
-
-    if (srcStat.isDirectory) {
-        if (!options?.recursive) {
-            throw new Error('Cannot copy directory without recursive option');
-        }
-
-        if (!fs.exists(destStr)) {
-            fs.mkdir(destStr, srcStat.mode);
-        }
-
-        const entries = fs.readdir(srcStr);
-        for (const entry of entries) {
-            cpSync(join(srcStr, entry), join(destStr, entry), options);
-        }
-    } else {
-        if (fs.exists(destStr) && !options?.force) {
-            if (options?.errorOnExist) {
-                throw new Error(`File exists: ${destStr}`);
-            }
-            return;
-        }
-
-        const parent = dirname(destStr);
-        if (parent && parent !== destStr && !fs.exists(parent)) {
-            mkdirRecursiveSync(parent);
-        }
-        wrapSync(() => fs.copy(srcStr, destStr), 'cpSync', srcStr);
-    }
+export function globSync(pattern: string | readonly string[], options?: GlobOptions): GlobResult[] {
+    return globPathsSync(pattern, options);
 }
 
 export function mkdtempSync(prefix: string, options?: { encoding?: BufferEncoding | 'buffer' | null } | BufferEncoding): string | Buffer {
@@ -423,4 +431,24 @@ export function mkdtempSync(prefix: string, options?: { encoding?: BufferEncodin
     const result = encodePathResult(dirPath, options);
     wrapSync(() => fs.mkdir(dirPath), 'mkdtempSync', dirPath);
     return result;
+}
+
+export function mkdtempDisposableSync(prefix: string, options?: { encoding?: BufferEncoding | 'buffer' | null } | BufferEncoding): {
+    path: string | Buffer;
+    remove: () => void;
+    [Symbol.dispose]: () => void;
+} {
+    const dirPath = prefix + randomHex();
+    const result = encodePathResult(dirPath, options);
+    wrapSync(() => fs.mkdir(dirPath), 'mkdtempDisposableSync', dirPath);
+    const fullPath = resolve(dirPath);
+    const remove = () => {
+        if (!fs.exists(fullPath)) return;
+        wrapSync(() => removeRecursiveSync(fullPath), 'rm', fullPath);
+    };
+    return {
+        path: result,
+        remove,
+        [Symbol.dispose]() { remove(); },
+    };
 }

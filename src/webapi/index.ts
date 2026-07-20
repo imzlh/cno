@@ -160,8 +160,8 @@ Reflect.set(globalThis, 'scheduler', scheduler);
 // Intl (partial support)
 await import('./intl');
 
-// webtransport (QUIC)
-// await import('./webtransport');
+// webtransport (QUIC) — loads always; native gate fails closed in ctor
+await import('./webtransport');
 
 // temporal
 // const { Temporal } = await import('temporal-polyfill');

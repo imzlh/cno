@@ -15,95 +15,125 @@ type DenoStdioNamespace = {
     isatty(fd: number): boolean;
 };
 
+class Stdin {
+    #stream = stdin;
+    #readable = this.#stream.createReadStream() as typeof Deno.stdin.readable;
+
+    get rid() {
+        return this.#stream.fd;
+    }
+
+    close() {
+        if (!this.#stream.isClosed) this.#stream.close();
+    }
+
+    isTerminal() {
+        return this.#stream.isTTY;
+    }
+
+    async read(p: Uint8Array<ArrayBuffer>) {
+        if (p.length === 0) return 0;
+        return await this.#stream.read(p);
+    }
+
+    readSync(p: Uint8Array) {
+        if (p.length === 0) return 0;
+        return this.#stream.readSync(p);
+    }
+
+    get readable() {
+        return this.#readable;
+    }
+
+    setRaw(mode: boolean, options?: Deno.SetRawOptions) {
+        this.#stream.setRaw(mode, options === undefined ? false : !!options.cbreak);
+    }
+}
+
+class Stdout {
+    #stream = stdout;
+    #writable = this.#stream.createWriteStream() as typeof Deno.stdout.writable;
+
+    get rid() {
+        return this.#stream.fd;
+    }
+
+    close() {
+        this.#stream.close();
+    }
+
+    isTerminal() {
+        return this.#stream.isTTY;
+    }
+
+    write(data: Uint8Array) {
+        return this.#stream.write(data);
+    }
+
+    writeSync(data: Uint8Array) {
+        return this.#stream.writeSync(data);
+    }
+
+    get writable() {
+        return this.#writable;
+    }
+}
+
+class Stderr {
+    #stream = stderr;
+    #writable = this.#stream.createWriteStream() as typeof Deno.stderr.writable;
+
+    get rid() {
+        return this.#stream.fd;
+    }
+
+    close() {
+        this.#stream.close();
+    }
+
+    isTerminal() {
+        return this.#stream.isTTY;
+    }
+
+    write(data: Uint8Array) {
+        return this.#stream.write(data);
+    }
+
+    writeSync(data: Uint8Array) {
+        return this.#stream.writeSync(data);
+    }
+
+    get writable() {
+        return this.#writable;
+    }
+}
+
 const denoStdioNs: DenoStdioNamespace = {
-    stdin: {
-        rid: os.STDIN_FILENO,
-
-        close(){
-            stdin.close();
-        },
-
-        isTerminal() {
-            return stdin.isTTY;
-        },
-
-        read(p: Uint8Array<ArrayBuffer>) {
-            return stdin.read(p);
-        },
-
-        readSync(p: Uint8Array) {
-            return stdin.readSync(p);
-        },
-
-        get readable() {
-            return stdin.createReadStream();
-        },
-
-        setRaw(mode: boolean, options?: Deno.SetRawOptions) {
-            stdin.setRaw(mode);
-        },
-    },
-
-    stdout: {
-        rid: os.STDOUT_FILENO,
-
-        close() {
-            stdout.close();
-        },
-
-        isTerminal() {
-            return stdout.isTTY;
-        },
-
-        write(data: Uint8Array) {
-            return stdout.write(data);
-        },
-
-        writeSync(data: Uint8Array) {
-            return stdout.writeSync(data);
-        },
-
-        get writable() {
-            return stdout.createWriteStream();
-        }
-    },
-    stderr: {
-        rid: os.STDERR_FILENO,
-
-        close() {
-            return stderr.close();
-        },
-
-        write(p: Uint8Array) {
-            return stderr.write(p);
-        },
-
-        writeSync(p: Uint8Array) {
-            return stderr.writeSync(p);
-        },
-
-        isTerminal() {
-            return stderr.isTTY;
-        },
-
-        get writable() {
-            return stderr.createWriteStream();
-        }
-    },
+    stdin: new Stdin(),
+    stdout: new Stdout(),
+    stderr: new Stderr(),
 
     consoleSize(){
-        const sz = stdout.size;
-        return {
-            rows: sz.height,
-            columns: sz.width
-        };
+        for (const stream of [stdin, stdout, stderr]) {
+            if (!stream.isTTY) continue;
+            const size = stream.size;
+            return { rows: size.height, columns: size.width };
+        }
+        throw new Error(
+            'Could not get console size: stdin, stdout, and stderr are not connected to a terminal'
+        );
     },
 
     isatty(fd: number) {
-        if (fd === os.STDIN_FILENO) return stdin.isTTY;
-        if (fd === os.STDOUT_FILENO) return stdout.isTTY;
-        if (fd === os.STDERR_FILENO) return stderr.isTTY;
-        return false;
+        if (typeof fd !== 'number' && typeof fd !== 'bigint') {
+            throw new TypeError('expected i32');
+        }
+        const descriptor = Number(fd) | 0;
+        if (descriptor === os.STDIN_FILENO) return stdin.isTTY;
+        if (descriptor === os.STDOUT_FILENO) return stdout.isTTY;
+        if (descriptor === os.STDERR_FILENO) return stderr.isTTY;
+        try { return os.guessHandle(descriptor) === 'tty'; }
+        catch { return false; }
     }
 };
 

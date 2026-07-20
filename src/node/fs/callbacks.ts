@@ -2,9 +2,12 @@
  * Node.js fs module - callback-style API
  * All async operations support callback functions
  */
-import { toUint8Array, decodeBuffer, encodePathResult, toNodeStat, toNodeStatFs, toNodeDirentAsync, parseFlags, pathToString, splitPathOrFd, describeFd, removeRecursive, mkdirRecursive, modeToNumber, timeToNumber, readFileFromFdSync, randomHex, createAsyncDir, readDirEntries, validateOpendirOptions, validateFd, errorFromUnknown, assertCopyFileMode, makeAbortError, type PathLike, type TimeLike, type Mode } from './utils';
+import { toUint8Array, decodeBuffer, encodePathResult, toNodeStat, toNodeStatFs, toNodeDirentAsync, parseFlags, pathToString, splitPathOrFd, describeFd, removeRecursive, mkdirRecursive, modeToNumber, timeToNumber, readFileFromFdSync, randomHex, createAsyncDir, readDirEntries, validateOpendirOptions, validateReaddirOptions, validateFd, errorFromUnknown, assertCopyFileMode, makeAbortError, rmIsDirectoryError, type PathLike, type TimeLike, type Mode } from './utils';
 import { toErrnoException } from '../_internal/errno';
 import { getTierLimits } from '../_internal/memory';
+import { copyPath, validateCopyOptions, type CopyOptions } from './copy';
+import { globPaths, validateGlobOptions, validateGlobPatterns, type GlobOptions, type GlobResult } from './glob';
+import { readvSync, writevSync } from './sync';
 
 const fs = import.meta.use('fs');
 const asfs = import.meta.use('asyncfs');
@@ -401,18 +404,16 @@ export function rm(path: PathLike, options?: unknown, callback?: unknown): void 
                 if (option.recursive) {
                     removeRecursive(pathStr).then(() => callback(null), err => callback(toErrnoException(err, 'rm', pathStr)));
                 } else {
-                    asfs.rmdir(pathStr).then(() => callback(null), err => callback(toErrnoException(err, 'rm', pathStr)));
+                    callback(rmIsDirectoryError(pathStr));
                 }
             } else {
                 asfs.unlink(pathStr).then(() => callback(null), err => callback(toErrnoException(err, 'rm', pathStr)));
             }
         },
         err => {
-            if (!option.force) {
-                callback(toErrnoException(err, 'rm', pathStr));
-            } else {
-                callback(null);
-            }
+            const normalized = toErrnoException(err, 'rm', pathStr);
+            if (option.force && normalized.code === 'ENOENT') callback(null);
+            else callback(normalized);
         }
     );
 }
@@ -424,7 +425,7 @@ export function readdir(
 export function readdir(
     path: PathLike,
     options: { encoding?: BufferEncoding | 'buffer'; withFileTypes?: boolean; recursive?: boolean } | BufferEncoding,
-    callback: (err: NodeJS.ErrnoException | null, files: string[] | import('fs').Dirent[]) => void
+    callback: (err: NodeJS.ErrnoException | null, files: Array<string | Buffer> | import('fs').Dirent<string | Buffer>[]) => void
 ): void;
 export function readdir(path: PathLike, options?: unknown, callback?: unknown): void {
     if (typeof options === 'function') {
@@ -433,6 +434,7 @@ export function readdir(path: PathLike, options?: unknown, callback?: unknown): 
     }
 
     assertCallback(callback);
+    validateReaddirOptions(options);
     const pathStr = pathToString(path);
     const option = optionBag(options);
     const withFileTypes = option.withFileTypes === true;
@@ -441,7 +443,17 @@ export function readdir(path: PathLike, options?: unknown, callback?: unknown): 
     readDirEntries(pathStr, recursive).then(
         entries => {
             callback(null, withFileTypes
-                ? entries.map(entry => toNodeDirentAsync(entry, entry.parentPath))
+                ? entries.map(entry => {
+                    const dirent = toNodeDirentAsync(
+                        entry,
+                        entry.parentPath,
+                        encodePathResult(entry.name, typeof options === 'string' ? options : option),
+                    );
+                    if (path instanceof Uint8Array) {
+                        Reflect.set(dirent, 'parentPath', encodePathResult(entry.parentPath, 'buffer'));
+                    }
+                    return dirent;
+                })
                 : entries.map(entry => encodePathResult(entry.relativePath, typeof options === 'string' ? options : option))
             );
         },
@@ -487,6 +499,50 @@ export function copyFile(src: PathLike, dest: PathLike, mode?: unknown, callback
     asfs.copyFile(srcStr, destStr).then(
         () => callback(null),
         err => callback(toErrnoException(err, 'copyFile', srcStr, destStr))
+    );
+}
+
+export function cp(source: PathLike, destination: PathLike, callback: NoParamCallback): void;
+export function cp(source: PathLike, destination: PathLike, options: CopyOptions, callback: NoParamCallback): void;
+export function cp(source: PathLike, destination: PathLike, options?: CopyOptions | NoParamCallback, callback?: NoParamCallback): void {
+    if (typeof options === 'function') {
+        callback = options;
+        options = undefined;
+    }
+    assertCallback(callback);
+    const resolvedOptions = validateCopyOptions(options);
+    const sourcePath = pathToString(source);
+    const destinationPath = pathToString(destination);
+    copyPath(sourcePath, destinationPath, resolvedOptions).then(
+        () => callback(null),
+        error => callback(toErrnoException(error, 'cp', sourcePath, destinationPath)),
+    );
+}
+
+export function glob(
+    pattern: string | readonly string[],
+    callback: (error: NodeJS.ErrnoException | null, matches: string[]) => void,
+): void;
+export function glob(
+    pattern: string | readonly string[],
+    options: GlobOptions,
+    callback: (error: NodeJS.ErrnoException | null, matches: GlobResult[]) => void,
+): void;
+export function glob(
+    pattern: string | readonly string[],
+    options?: GlobOptions | ((error: NodeJS.ErrnoException | null, matches: string[]) => void),
+    callback?: (error: NodeJS.ErrnoException | null, matches: GlobResult[]) => void,
+): void {
+    if (typeof options === 'function') {
+        callback = options;
+        options = undefined;
+    }
+    assertCallback(callback);
+    validateGlobOptions(options);
+    validateGlobPatterns(pattern);
+    globPaths(pattern, options).then(
+        matches => callback(null, matches),
+        error => callback(toErrnoException(error, 'glob')),
     );
 }
 
@@ -797,6 +853,32 @@ export function read(
     });
 }
 
+export function readv(
+    fd: number,
+    buffers: readonly ArrayBufferView[],
+    callback: (err: NodeJS.ErrnoException | null, bytesRead: number, buffers: readonly ArrayBufferView[]) => void,
+): void;
+export function readv(
+    fd: number,
+    buffers: readonly ArrayBufferView[],
+    position: number | null,
+    callback: (err: NodeJS.ErrnoException | null, bytesRead: number, buffers: readonly ArrayBufferView[]) => void,
+): void;
+export function readv(fd: number, buffers: readonly ArrayBufferView[], position?: unknown, callback?: unknown): void {
+    if (typeof position === 'function') {
+        callback = position;
+        position = null;
+    }
+    const readPosition = position === null || position === undefined ? null : numberOr(position, 0);
+    runFsCallback(callback, () => {
+        try {
+            callback(null, readvSync(fd, buffers, readPosition), buffers);
+        } catch (err) {
+            callback(toErrnoException(err, 'readv', describeFd(fd)), 0, buffers);
+        }
+    });
+}
+
 export function write(
     fd: number,
     buffer: Buffer | Uint8Array | string,
@@ -842,6 +924,32 @@ export function write(fd: number, buffer: Buffer | Uint8Array | string, offset?:
             return;
         }
         callback(null, written, buffer);
+    });
+}
+
+export function writev(
+    fd: number,
+    buffers: readonly ArrayBufferView[],
+    callback: (err: NodeJS.ErrnoException | null, bytesWritten: number, buffers: readonly ArrayBufferView[]) => void,
+): void;
+export function writev(
+    fd: number,
+    buffers: readonly ArrayBufferView[],
+    position: number | null,
+    callback: (err: NodeJS.ErrnoException | null, bytesWritten: number, buffers: readonly ArrayBufferView[]) => void,
+): void;
+export function writev(fd: number, buffers: readonly ArrayBufferView[], position?: unknown, callback?: unknown): void {
+    if (typeof position === 'function') {
+        callback = position;
+        position = null;
+    }
+    const writePosition = position === null || position === undefined ? null : numberOr(position, 0);
+    runFsCallback(callback, () => {
+        try {
+            callback(null, writevSync(fd, buffers, writePosition), buffers);
+        } catch (err) {
+            callback(toErrnoException(err, 'writev', describeFd(fd)), 0, buffers);
+        }
     });
 }
 

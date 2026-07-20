@@ -282,8 +282,6 @@ class ReadableStreamController<R = unknown> implements globalThis.ReadableStream
         const source = this.#source;
         this.#source = null;
 
-        await source?.cancel?.(reason);
-
         for (const read of this.#pendingReads) {
             read.resolve({ value: undefined, done: true });
         }
@@ -293,6 +291,8 @@ class ReadableStreamController<R = unknown> implements globalThis.ReadableStream
             cb.resolve();
         }
         this.#closedCallbacks = [];
+
+        await source?.cancel?.(reason);
     }
 
     #finishClose(): void {
@@ -442,33 +442,7 @@ export class ReadableStream<R = unknown> implements globalThis.ReadableStream<R>
     ): globalThis.ReadableStream<T> {
         const pipePromise = this.pipeTo(transform.writable, options);
         void pipePromise.catch(() => {});
-        let reader: globalThis.ReadableStreamDefaultReader<T>;
-
-        const source: UnderlyingSource<T> = {
-            start(controller) {
-                const defaultController = controller as ReadableStreamDefaultController<T>;
-                reader = transform.readable.getReader();
-                void (async () => {
-                    try {
-                        for (;;) {
-                            const result = await reader.read();
-                            if (result.done) {
-                                defaultController.close();
-                                return;
-                            }
-                            defaultController.enqueue(result.value as T);
-                        }
-                    } catch (error) {
-                        defaultController.error(error);
-                    }
-                })();
-            },
-            async cancel(reason) {
-                await reader.cancel(reason);
-                await pipePromise.catch(() => {});
-            },
-        };
-        return new ReadableStream<T>(source) as globalThis.ReadableStream<T>;
+        return transform.readable;
     }
 
     async pipeTo(
@@ -487,9 +461,15 @@ export class ReadableStream<R = unknown> implements globalThis.ReadableStream<R>
         void writer.ready.catch(() => {});
 
         if (signal?.aborted) {
-            reader.releaseLock();
-            writer.releaseLock();
-            throw signal.reason;
+            const reason = signal.reason;
+            try {
+                if (!preventAbort) await writer.abort(reason);
+                if (!preventCancel) await reader.cancel(reason);
+            } finally {
+                reader.releaseLock();
+                writer.releaseLock();
+            }
+            throw reason;
         }
 
         let aborted = false;
@@ -561,6 +541,22 @@ export class ReadableStream<R = unknown> implements globalThis.ReadableStream<R>
         let reading = false;
         let done = false;
         let error: unknown;
+        const cancelReasons: [unknown, unknown] = [undefined, undefined];
+        const branchCanceled: [boolean, boolean] = [false, false];
+        const cancelResult = Promise.withResolvers<void>();
+        let cancelSettled = false;
+
+        const resolveCancel = (): void => {
+            if (cancelSettled) return;
+            cancelSettled = true;
+            cancelResult.resolve();
+        };
+
+        const rejectCancel = (reason: unknown): void => {
+            if (cancelSettled) return;
+            cancelSettled = true;
+            cancelResult.reject(reason);
+        };
 
         const flushBranch = (branchIndex: 0 | 1): void => {
             const controller = pending[branchIndex];
@@ -600,6 +596,7 @@ export class ReadableStream<R = unknown> implements globalThis.ReadableStream<R>
                 reading = false;
                 if (readDone) {
                     done = true;
+                    resolveCancel();
                 } else {
                     if (branches[0]) branches[0].push(value);
                     if (branches[1]) branches[1].push(value);
@@ -610,6 +607,7 @@ export class ReadableStream<R = unknown> implements globalThis.ReadableStream<R>
             }, (err) => {
                 reading = false;
                 error = err;
+                rejectCancel(err);
                 flushBranch(0);
                 flushBranch(1);
             });
@@ -625,10 +623,13 @@ export class ReadableStream<R = unknown> implements globalThis.ReadableStream<R>
                 // Clear this branch's buffer so the live branch stops pushing into it.
                 branches[branchIndex] = null;
                 pending[branchIndex] = null;
+                branchCanceled[branchIndex] = true;
+                cancelReasons[branchIndex] = reason;
                 // If both branches are cancelled, cancel the underlying reader.
-                if (!branches[0] && !branches[1]) {
-                    return reader.cancel(reason);
+                if (branchCanceled[0] && branchCanceled[1]) {
+                    void reader.cancel(cancelReasons).then(resolveCancel, rejectCancel);
                 }
+                return cancelResult.promise;
             }
         });
 
@@ -639,8 +640,9 @@ export class ReadableStream<R = unknown> implements globalThis.ReadableStream<R>
         return this.values();
     }
 
-    values(): AsyncIterableIterator<R> {
+    values(options?: { preventCancel?: boolean }): AsyncIterableIterator<R> {
         const reader = this.getReader();
+        const preventCancel = options?.preventCancel === true;
         let finished = false;
         let released = false;
 
@@ -671,7 +673,7 @@ export class ReadableStream<R = unknown> implements globalThis.ReadableStream<R>
                 if (!finished) {
                     finished = true;
                     try {
-                        await reader.cancel();
+                        if (!preventCancel) await reader.cancel();
                     } finally {
                         release();
                     }
@@ -752,24 +754,36 @@ class ReadableStreamDefaultReader<R = unknown> implements globalThis.ReadableStr
 
 // WritableStream State Machine
 class WritableStreamController<W = unknown> implements globalThis.WritableStreamDefaultController {
-    #state: 'writable' | 'closed' | 'erroring' | 'errored' = 'writable';
+    #state: 'writable' | 'closing' | 'closed' | 'errored' = 'writable';
     #sink: UnderlyingSink<W>;
     #sizeAlgorithm: (chunk: W) => number;
     #highWaterMark: number;
     #queueSize = 0;
     #storedError: unknown = undefined;
     #abortController = new AbortController();
-    #writeRequests: Array<{ resolve: () => void; reject: (reason?: unknown) => void }> = [];
     #closedCallbacks: Array<{ resolve: () => void; reject: (reason?: unknown) => void }> = [];
     #readyCallbacks: Array<{ resolve: () => void; reject: (reason?: unknown) => void }> = [];
+    #startPromise: Promise<void>;
+    #operation: Promise<void> = Promise.resolve();
+    #abortPromise: Promise<void> | null = null;
 
     constructor(sink: UnderlyingSink<W>, strategy: QueuingStrategy<W>) {
         this.#sink = sink;
         this.#sizeAlgorithm = extractSizeAlgorithm(strategy);
         this.#highWaterMark = extractHighWaterMark(strategy, 1);
 
-        Promise.resolve(sink.start?.(this))
-            .catch(error => this.error(error));
+        let startResult: void | PromiseLike<void>;
+        try {
+            startResult = sink.start?.(this);
+            this.#startPromise = Promise.resolve(startResult).then(() => undefined).catch(error => {
+                this.error(error);
+                throw error;
+            });
+        } catch (error) {
+            this.error(error);
+            this.#startPromise = Promise.reject(error);
+        }
+        void this.#startPromise.catch(() => {});
     }
 
     get signal(): AbortSignal {
@@ -781,11 +795,6 @@ class WritableStreamController<W = unknown> implements globalThis.WritableStream
 
         this.#state = 'errored';
         this.#storedError = e;
-
-        for (const req of this.#writeRequests) {
-            queueMicrotask(() => req.reject(e));
-        }
-        this.#writeRequests = [];
 
         for (const cb of this.#closedCallbacks) {
             queueMicrotask(() => cb.reject(e));
@@ -802,20 +811,35 @@ class WritableStreamController<W = unknown> implements globalThis.WritableStream
         return this.#highWaterMark - this.#queueSize;
     }
 
+    #throwIfErrored(): void {
+        if (this.#state === 'errored') throw this.#storedError;
+    }
+
     async #write(chunk: W): Promise<void> {
         if (this.#state !== 'writable') {
             throw new TypeError('Stream is not writable');
         }
 
-        const size = this.#sizeAlgorithm(chunk);
+        const size = Number(this.#sizeAlgorithm(chunk));
+        if (Number.isNaN(size) || size < 0) throw new RangeError('Invalid chunk size');
         this.#queueSize += size;
 
-        try {
-            await this.#sink.write?.(chunk, this);
-        } finally {
+        const operation = this.#operation.then(async () => {
+            await this.#startPromise;
+            if (this.#state !== 'writable') throw this.#storedError ?? new TypeError('Stream is not writable');
+            try {
+                await this.#sink.write?.(chunk, this);
+            } catch (error) {
+                this.error(error);
+                throw error;
+            }
+        });
+        this.#operation = operation.catch(() => {});
+
+        return operation.finally(() => {
             this.#queueSize -= size;
             this.#updateReady();
-        }
+        });
     }
 
     async #close(): Promise<void> {
@@ -823,28 +847,41 @@ class WritableStreamController<W = unknown> implements globalThis.WritableStream
             throw new TypeError('Stream is not writable');
         }
 
-        this.#state = 'closed';
-        await this.#sink.close?.();
-
-        for (const cb of this.#closedCallbacks) {
-            cb.resolve();
-        }
-        this.#closedCallbacks = [];
+        this.#state = 'closing';
+        const operation = this.#operation.then(async () => {
+            await this.#startPromise;
+            this.#throwIfErrored();
+            await this.#sink.close?.();
+            this.#throwIfErrored();
+            this.#state = 'closed';
+            for (const cb of this.#closedCallbacks) cb.resolve();
+            this.#closedCallbacks = [];
+        }).catch(error => {
+            this.error(error);
+            throw error;
+        });
+        this.#operation = operation.catch(() => {});
+        return operation;
     }
 
     async #abort(reason?: unknown): Promise<void> {
+        if (this.#abortPromise) return this.#abortPromise;
         if (this.#state === 'closed') return;
+        if (this.#state === 'errored') return;
 
         this.#abortController.abort(reason);
         this.#state = 'errored';
         this.#storedError = reason;
-
-        await this.#sink.abort?.(reason);
-
-        for (const cb of this.#closedCallbacks) {
-            cb.reject(reason);
-        }
+        for (const cb of this.#closedCallbacks) cb.reject(reason);
         this.#closedCallbacks = [];
+        for (const cb of this.#readyCallbacks) cb.reject(reason);
+        this.#readyCallbacks = [];
+
+        this.#abortPromise = (async () => {
+            await this.#operation.catch(() => {});
+            await this.#sink.abort?.(reason);
+        })();
+        return this.#abortPromise;
     }
 
     #updateReady(): void {
@@ -859,6 +896,8 @@ class WritableStreamController<W = unknown> implements globalThis.WritableStream
     #addReadyCallback(resolve: () => void, reject: (reason?: unknown) => void): void {
         if (this.#state === 'errored') {
             queueMicrotask(() => reject(this.#storedError));
+        } else if (this.#state !== 'writable') {
+            resolve();
         } else if (this.#getDesiredSize() > 0) {
             resolve();
         } else {
@@ -900,6 +939,9 @@ export class WritableStream<W = unknown> implements globalThis.WritableStream<W>
     }
 
     async abort(reason?: unknown): Promise<void> {
+        if (this.locked) {
+            throw new TypeError('Stream is locked');
+        }
         await this.#controller._abort(reason);
     }
 
@@ -927,17 +969,21 @@ class WritableStreamDefaultWriter<W = unknown> implements globalThis.WritableStr
     #stream: WritableStream<W> | null;
     #readyPromise: Promise<void>;
     #closedPromise: Promise<void>;
+    #readyReject: (reason?: unknown) => void;
+    #closedReject: (reason?: unknown) => void;
 
     constructor(stream: WritableStream<W>) {
         this.#stream = stream;
 
         const ready = Promise.withResolvers<void>();
         this.#readyPromise = ready.promise;
+        this.#readyReject = ready.reject;
         void ready.promise.catch(() => {});
         stream._controller._addReadyCallback(ready.resolve, ready.reject);
 
         const closed = Promise.withResolvers<void>();
         this.#closedPromise = closed.promise;
+        this.#closedReject = closed.reject;
         void closed.promise.catch(() => {});
         stream._controller._addClosedCallback(closed.resolve, closed.reject);
     }
@@ -949,7 +995,8 @@ class WritableStreamDefaultWriter<W = unknown> implements globalThis.WritableStr
     get desiredSize(): number | null {
         if (!this.#stream) throw new TypeError('Writer is released');
         const state = this.#stream._controller._state;
-        return state === 'writable' ? this.#stream._controller._getDesiredSize() : null;
+        if (state === 'errored' || state === 'closed') return null;
+        return state === 'closing' ? 0 : this.#stream._controller._getDesiredSize();
     }
 
     get ready(): Promise<void> {
@@ -968,6 +1015,18 @@ class WritableStreamDefaultWriter<W = unknown> implements globalThis.WritableStr
 
     releaseLock(): void {
         if (!this.#stream) return;
+        const error = new TypeError('Writer was released');
+        this.#readyReject(error);
+        this.#closedReject(error);
+
+        const ready = Promise.reject<void>(error);
+        void ready.catch(() => {});
+        this.#readyPromise = ready;
+
+        const closed = Promise.reject<void>(error);
+        void closed.catch(() => {});
+        this.#closedPromise = closed;
+
         this.#stream._releaseLock();
         this.#stream = null;
     }
@@ -976,13 +1035,14 @@ class WritableStreamDefaultWriter<W = unknown> implements globalThis.WritableStr
         if (!this.#stream) throw new TypeError('Writer is released');
 
         await this.ready;
-        await this.#stream._controller._write(chunk);
-
-        // Update ready promise
+        const stream = this.#stream;
+        const write = stream._controller._write(chunk);
         const ready = Promise.withResolvers<void>();
         this.#readyPromise = ready.promise;
+        this.#readyReject = ready.reject;
         void ready.promise.catch(() => {});
-        this.#stream._controller._addReadyCallback(ready.resolve, ready.reject);
+        stream._controller._addReadyCallback(ready.resolve, ready.reject);
+        await write;
     }
 }
 

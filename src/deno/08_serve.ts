@@ -4,10 +4,12 @@
  */
 
 import { Server, createServer, type HttpRequest, type HttpResponse } from '@cnojs/http/server';
+import { HttpVersion } from '@cnojs/http/protocol';
+import { h2Available } from '@cnojs/http/h2-native';
 import { TcpSocket } from '@cnojs/http/socket';
 import { assert } from '../utils/assert';
 import { createWebSocketFromConnection } from "../webapi/websocket";
-import { getResponseInitiatorCallFrames, setResponseInitiatorCallFrames } from '../webapi/fetch';
+import { createSwitchingProtocolsResponse, getResponseInitiatorCallFrames, setResponseInitiatorCallFrames } from '../webapi/fetch';
 import { wrapFsClassDec as wrap, wrapFSErr, wrapFSns } from "../utils/wrap";
 import { errors } from './01_errors';
 import { getServeHook, captureUserNetworkCallFrames, type NetworkCallFrame } from '../utils/network-hooks';
@@ -176,14 +178,16 @@ class ResponseAdapter {
     private coreRes: HttpResponse;
     private finishedEmitted = false;
     private method: string;
+    private httpVersion: string;
     private requestId: string;
     private url: string;
     private requestHeaders: Array<[string, string]>;
     private requestCallFrames?: NetworkCallFrame[];
 
-    constructor(coreRes: HttpResponse, method: string, requestId: string, url: string, requestHeaders: Array<[string, string]>, requestCallFrames?: NetworkCallFrame[]) {
+    constructor(coreRes: HttpResponse, method: string, httpVersion: string, requestId: string, url: string, requestHeaders: Array<[string, string]>, requestCallFrames?: NetworkCallFrame[]) {
         this.coreRes = coreRes;
         this.method = method;
+        this.httpVersion = httpVersion;
         this.requestId = requestId;
         this.url = url;
         this.requestHeaders = requestHeaders;
@@ -241,8 +245,11 @@ class ResponseAdapter {
         const hasBody = response.body !== null && !noBodyStatus && !isHead;
         const hasContentLength = headers2.has('content-length');
         const hasTransferEncoding = headers2.has('transfer-encoding');
+        const isHttp2 = this.httpVersion === '2.0';
 
-        if (hasBody && !hasContentLength && !hasTransferEncoding) {
+        if (isHttp2) {
+            headers2.delete('transfer-encoding');
+        } else if (hasBody && !hasContentLength && !hasTransferEncoding) {
             headers2.set('transfer-encoding', 'chunked');
         }
 
@@ -497,7 +504,7 @@ function serve(
                     });
                 }
 
-                const adapter = new ResponseAdapter(res, req.method, requestId, requestUrl, req.headers, requestEntryCallFrames);
+                const adapter = new ResponseAdapter(res, req.method, req.httpVersion, requestId, requestUrl, req.headers, requestEntryCallFrames);
                 adapter.verify(webResponse);
                 await adapter.sendResponse(webResponse);
 
@@ -532,7 +539,7 @@ function serve(
                             headers: { 'Content-Type': 'text/plain' },
                         });
 
-                        const adapter = new ResponseAdapter(res, req.method, requestId, requestUrl, req.headers, requestEntryCallFrames);
+                        const adapter = new ResponseAdapter(res, req.method, req.httpVersion, requestId, requestUrl, req.headers, requestEntryCallFrames);
                         adapter.verify(errorResponse);
                         await adapter.sendResponse(errorResponse);
                     } catch {
@@ -549,6 +556,13 @@ function serve(
             key: optionalStringOption(options, 'key'),
             keepAliveTimeout: optionalNumberOption(options, 'keepAliveTimeout'),
             requestTimeout: optionalNumberOption(options, 'requestTimeout'),
+            // TLS: offer h2 when the native extension is linked (client ALPN picks).
+            // Cleartext stays HTTP/1.1 only — Deno.serve does not speak prior-knowledge h2c.
+            protocols: (() => {
+                const hasTls = !!(optionalStringOption(options, 'cert') && optionalStringOption(options, 'key'));
+                if (hasTls && h2Available()) return [HttpVersion.HTTP2, HttpVersion.HTTP11];
+                return [HttpVersion.HTTP11];
+            })(),
         }
     );
 
@@ -628,8 +642,7 @@ function upgradeWebSocket(
     const conProm = Promise.withResolvers<ISocket>();
 
     // Create upgrade response
-    const response = new Response(null, {
-        status: 101,
+    const response = createSwitchingProtocolsResponse({
         statusText: 'Switching Protocols',
         headers
     }) as WebSocketResponse;

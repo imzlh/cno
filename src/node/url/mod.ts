@@ -6,7 +6,10 @@
  * Do not subclass globalThis.URL — QuickJS rejects super() with "not a function".
  */
 
+import { Buffer } from '../buffer';
+
 export const URLSearchParams = globalThis.URLSearchParams;
+export const URLPattern = globalThis.URLPattern;
 type ParsedQuery = Record<string, string | string[]>;
 
 export interface UrlWithStringQuery {
@@ -154,26 +157,55 @@ function findHostEnd(rest: string): number {
 // (super() → "not a function"), which killed fileURLToPath / createRequire.
 export const URL = globalThis.URL;
 
-export function parse(urlStr: string, parseQueryString = false, slashesDenoteHost = false): UrlWithStringQuery | UrlWithParsedQuery {
+export class Url {
+    protocol: string | null = null;
+    slashes: boolean | null = null;
+    auth: string | null = null;
+    host: string | null = null;
+    port: string | null = null;
+    hostname: string | null = null;
+    hash: string | null = null;
+    search: string | null = null;
+    query: string | ParsedQuery | null = null;
+    pathname: string | null = null;
+    path: string | null = null;
+    href = '';
+
+    parse(urlStr: string, parseQueryString = false, slashesDenoteHost = false): this {
+        const parsed = parse(urlStr, parseQueryString, slashesDenoteHost);
+        Object.assign(this, parsed);
+        return this;
+    }
+
+    format(): string {
+        return format(this);
+    }
+
+    resolve(relative: string): string {
+        return resolve(this.href, relative);
+    }
+
+    resolveObject(relative: string | Url): Url {
+        const result = resolveObject(this.href, typeof relative === 'string' ? relative : relative.href);
+        return typeof result === 'string' ? parse(result, false, true) : result;
+    }
+
+    parseHost(): void {
+        if (!this.host) return;
+        const info = splitHost(this.host);
+        this.hostname = info.hostname || null;
+        this.port = info.port;
+    }
+}
+
+export function parse(urlStr: string, parseQueryString = false, slashesDenoteHost = false): Url {
     if (typeof urlStr !== 'string') {
         throw new TypeError('The "url" argument must be of type string.');
     }
 
     let rest = urlStr.trim();
-    const result: MutableParsedUrl = {
-        protocol: null,
-        slashes: null,
-        auth: null,
-        host: null,
-        port: null,
-        hostname: null,
-        hash: null,
-        search: null,
-        query: parseQueryString ? '' : null,
-        pathname: null,
-        path: null,
-        href: '',
-    };
+    const result = new Url();
+    result.query = parseQueryString ? '' : null;
 
     const protoMatch = /^([a-z0-9.+-]+:)/i.exec(rest);
     if (protoMatch) {
@@ -241,7 +273,7 @@ export function parse(urlStr: string, parseQueryString = false, slashesDenoteHos
     }
 
     result.href = format(result);
-    return result as UrlWithStringQuery | UrlWithParsedQuery;
+    return result;
 }
 
 function formatWhatwgUrl(url: URL, options?: {
@@ -367,6 +399,12 @@ export function resolve(from: string, to: string): string {
         base.path = base.pathname;
         return format(base);
     }
+}
+
+export function resolveObject(from: string, to: string | Url): string | Url {
+    if (!from) return typeof to === 'string' ? to : to.href;
+    const relative = typeof to === 'string' ? to : to.href;
+    return parse(resolve(from, relative), false, true);
 }
 
 // Punycode (RFC 3492), enough for Node-compatible domain helpers.
@@ -566,9 +604,13 @@ function isUrl(value: unknown): value is URL {
     return false;
 }
 
+function urlError(message: string, code: string): TypeError & { code: string } {
+    return Object.assign(new TypeError(message), { code });
+}
+
 function assertFileUrl(value: URL): void {
     if (value.protocol !== 'file:') {
-        throw new TypeError('The URL must be of scheme file');
+        throw urlError('The URL must be of scheme file', 'ERR_INVALID_URL_SCHEME');
     }
 }
 
@@ -586,16 +628,28 @@ function runtimeSpecToLocalPath(spec: string): string | null {
     return null;
 }
 
-function decodePathname(pathname: string): string {
-    if (/%2f|%5c/i.test(pathname)) {
-        throw new TypeError('File URL path must not include encoded / or \\ characters');
+function decodePathname(pathname: string, windows: boolean): string {
+    if (windows ? /%2f|%5c/i.test(pathname) : /%2f/i.test(pathname)) {
+        throw urlError(
+            windows
+                ? 'File URL path must not include encoded \\ or / characters'
+                : 'File URL path must not include encoded / characters',
+            'ERR_INVALID_FILE_URL_PATH',
+        );
     }
     return decodeURIComponent(pathname);
 }
 
-export function fileURLToPath(url: string | URL): string {
+export interface FileURLPathOptions {
+    windows?: boolean;
+}
+
+export function fileURLToPath(url: string | URL, options?: FileURLPathOptions): string {
     if (typeof url !== 'string' && !isUrl(url)) {
-        throw new TypeError('The "url" argument must be of type string or an instance of URL');
+        throw urlError(
+            'The "path" argument must be of type string or an instance of URL',
+            'ERR_INVALID_ARG_TYPE',
+        );
     }
 
     if (typeof url === 'string' && !/^[a-z][a-z0-9.+-]*:/i.test(url)) {
@@ -617,19 +671,94 @@ export function fileURLToPath(url: string | URL): string {
     assertFileUrl(parsed);
 
     const hostname = parsed.hostname;
-    let pathname = decodePathname(parsed.pathname);
+    const windows = options?.windows ?? process.platform === 'win32';
+    let pathname = decodePathname(parsed.pathname, windows);
 
-    if (process.platform === 'win32') {
+    if (windows) {
         pathname = pathname.replace(/\//g, '\\');
-        if (hostname) return `\\\\${hostname}${pathname}`;
-        if (/^\\[a-zA-Z]:/.test(pathname)) pathname = pathname.slice(1);
+        if (hostname && hostname !== 'localhost') return `\\\\${domainToUnicode(hostname)}${pathname}`;
+        const letter = pathname.charAt(1).toLowerCase();
+        if (!/^[a-z]$/.test(letter) || pathname.charAt(2) !== ':') {
+            throw urlError('File URL path must be absolute', 'ERR_INVALID_FILE_URL_PATH');
+        }
+        pathname = pathname.slice(1);
         return pathname;
     }
 
     if (hostname && hostname !== 'localhost') {
-        throw new TypeError('File URL host must be "localhost" or empty on this platform');
+        throw urlError(
+            'File URL host must be "localhost" or empty on this platform',
+            'ERR_INVALID_FILE_URL_HOST',
+        );
     }
     return pathname;
+}
+
+function percentDecodeBuffer(pathname: string): Buffer {
+    const encoded = Buffer.from(pathname, 'utf8');
+    const output = Buffer.allocUnsafe(encoded.length);
+    let outIndex = 0;
+    for (let index = 0; index < encoded.length; index++) {
+        const value = encoded[index];
+        if (value === 0x25 && index + 2 < encoded.length) {
+            const high = encoded[index + 1];
+            const low = encoded[index + 2];
+            const highValue = high === undefined ? -1 : hexDigit(high);
+            const lowValue = low === undefined ? -1 : hexDigit(low);
+            if (highValue >= 0 && lowValue >= 0) {
+                output[outIndex++] = highValue * 16 + lowValue;
+                index += 2;
+                continue;
+            }
+        }
+        output[outIndex++] = value;
+    }
+    return output.subarray(0, outIndex);
+}
+
+function hexDigit(value: number): number {
+    if (value >= 0x30 && value <= 0x39) return value - 0x30;
+    if (value >= 0x41 && value <= 0x46) return value - 0x41 + 10;
+    if (value >= 0x61 && value <= 0x66) return value - 0x61 + 10;
+    return -1;
+}
+
+export function fileURLToPathBuffer(url: string | URL, options?: FileURLPathOptions): Buffer {
+    if (typeof url !== 'string' && !isUrl(url)) {
+        throw urlError(
+            'The "path" argument must be of type string or an instance of URL',
+            'ERR_INVALID_ARG_TYPE',
+        );
+    }
+    const parsed = typeof url === 'string' ? new URL(url) : url;
+    assertFileUrl(parsed);
+    const windows = options?.windows ?? process.platform === 'win32';
+    let pathname = parsed.pathname;
+    if (windows) pathname = pathname.replace(/\//g, '\\');
+    const decoded = percentDecodeBuffer(pathname);
+    const hostname = parsed.hostname;
+    if (windows) {
+        if (hostname && hostname !== 'localhost') {
+            return Buffer.concat([
+                Buffer.from('\\\\', 'ascii'),
+                Buffer.from(domainToUnicode(hostname), 'utf8'),
+                decoded,
+            ]);
+        }
+        const letter = decoded[1];
+        if (letter === undefined ||
+            (letter | 0x20) < 0x61 || (letter | 0x20) > 0x7a || decoded[2] !== 0x3a) {
+            throw urlError('File URL path must be absolute', 'ERR_INVALID_FILE_URL_PATH');
+        }
+        return decoded.subarray(1);
+    }
+    if (hostname && hostname !== 'localhost') {
+        throw urlError(
+            'File URL host must be "localhost" or empty on this platform',
+            'ERR_INVALID_FILE_URL_HOST',
+        );
+    }
+    return decoded;
 }
 
 function getCwd(): string {
@@ -649,7 +778,7 @@ function encodeFilePath(pathname: string): string {
     return encodeURI(pathname).replace(/[?#]/g, ch => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`);
 }
 
-export function pathToFileURL(filepath: string): URL {
+export function pathToFileURL(filepath: string, options?: FileURLPathOptions): URL {
     if (typeof filepath !== 'string') {
         throw new TypeError('The "path" argument must be of type string');
     }
@@ -660,7 +789,8 @@ export function pathToFileURL(filepath: string): URL {
         path = `${cwd.replace(/[\\/]+$/, '')}/${path}`;
     }
 
-    if (process.platform === 'win32') {
+    const windows = options?.windows ?? process.platform === 'win32';
+    if (windows) {
         path = path.replace(/\\/g, '/');
         if (path.startsWith('//')) {
             const withoutSlashes = path.slice(2);
@@ -721,13 +851,17 @@ export function urlToHttpOptions(url: URL): {
 
 export default {
     URL,
+    URLPattern,
     URLSearchParams,
+    Url,
     parse,
     resolve,
+    resolveObject,
     format,
     domainToASCII,
     domainToUnicode,
     fileURLToPath,
+    fileURLToPathBuffer,
     pathToFileURL,
     urlToHttpOptions,
 };

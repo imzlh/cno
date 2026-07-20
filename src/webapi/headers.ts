@@ -36,8 +36,19 @@ function normalizeHeaderValue(value: unknown): string {
     return result;
 }
 
-function isHeaderPair(value: unknown): value is HeaderPair {
-    return Array.isArray(value) && value.length === 2;
+function readHeaderPair(value: unknown): [unknown, unknown] {
+    if (value === null || value === undefined) {
+        throw new TypeError('Header init sequence must contain name/value pairs');
+    }
+    const iterator = Reflect.get(Object(value), Symbol.iterator);
+    if (typeof iterator !== 'function') {
+        throw new TypeError('Header init sequence must contain name/value pairs');
+    }
+    const pair = Array.from(value as Iterable<unknown>);
+    if (pair.length !== 2) {
+        throw new TypeError('Header init sequence must contain name/value pairs');
+    }
+    return [pair[0], pair[1]];
 }
 
 function isIterable(value: unknown): value is Iterable<unknown> {
@@ -64,15 +75,14 @@ export class Headers implements globalThis.Headers {
 
         if (isIterable(init)) {
             for (const item of init) {
-                if (!isHeaderPair(item)) throw new TypeError('Header init sequence must contain name/value pairs');
-                const [name, value] = item;
-                this.append(name, Array.isArray(value) ? value.join(', ') : String(value));
+                const [name, value] = readHeaderPair(item);
+                this.append(String(name), Array.isArray(value) ? value.join(', ') : String(value));
             }
             return;
         }
 
         if (typeof init === 'object') {
-            for (const name of Object.getOwnPropertyNames(init)) {
+            for (const name of Object.keys(init)) {
                 const value = (init as HeaderRecord)[name];
                 this.append(name, Array.isArray(value) ? value.join(', ') : String(value));
             }

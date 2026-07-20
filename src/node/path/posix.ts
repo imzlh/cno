@@ -11,6 +11,7 @@ export const extname = posixPath.extname;
 export const format = posixPath.format;
 export const isAbsolute = posixPath.isAbsolute;
 export const join = posixPath.join;
+export const matchesGlob = posixPath.matchesGlob;
 export const normalize = posixPath.normalize;
 export const parse = posixPath.parse;
 export const relative = posixPath.relative;
