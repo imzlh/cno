@@ -80,7 +80,8 @@ export class ReadStream extends Readable {
         this.end = options.end;
         this.fd = options.fd ?? null;
         this.pending = this.fd === null;
-        this.position = this.start ?? null;
+        // default to offset 0 when only `end` is given so the end bound applies
+        this.position = this.start ?? (this.end !== undefined ? 0 : null);
         this.readableEncoding = options.encoding ?? null;
         this._read = this.doRead.bind(this);
         if (this.fd === null) {

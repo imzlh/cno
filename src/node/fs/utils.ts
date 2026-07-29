@@ -76,7 +76,6 @@ export function readFileFromFdSync(
         const n = readFn(fd, buf);
         if (n <= 0) break;
         chunks.push(buf.slice(0, n));
-        if (n < bufSize) break;
     }
     return concatChunks(chunks);
 }
@@ -593,6 +592,23 @@ export function describeFd(fd: number): string {
 
 // Recursive deletion — use lstat so symlink-to-dir unlinks the link only.
 
+/**
+ * Remove a symlink. Windows cannot DeleteFile() a directory symlink or
+ * junction — that needs RemoveDirectory() — and which one applies is not
+ * knowable from lstat alone, so try the file path first and fall back.
+ */
+function unlinkLinkSync(targetPath: string): void {
+    try {
+        fs.unlink(targetPath);
+    } catch (e) {
+        try {
+            fs.rmdir(targetPath);
+        } catch {
+            throw e;
+        }
+    }
+}
+
 export function removeRecursiveSync(targetPath: string): void {
     const stats = fs.lstat(targetPath);
 
@@ -602,8 +618,22 @@ export function removeRecursiveSync(targetPath: string): void {
             removeRecursiveSync(join(targetPath, item));
         }
         fs.rmdir(targetPath);
+    } else if (stats.isSymbolicLink) {
+        unlinkLinkSync(targetPath);
     } else {
         fs.unlink(targetPath);
+    }
+}
+
+async function unlinkLinkAsync(targetPath: string): Promise<void> {
+    try {
+        await asfs.unlink(targetPath);
+    } catch (e) {
+        try {
+            await asfs.rmdir(targetPath);
+        } catch {
+            throw e;
+        }
     }
 }
 
@@ -620,6 +650,8 @@ export async function removeRecursive(targetPath: string): Promise<void> {
             await dirHandle.close();
         }
         await asfs.rmdir(targetPath);
+    } else if (stats.isSymbolicLink) {
+        await unlinkLinkAsync(targetPath);
     } else {
         await asfs.unlink(targetPath);
     }

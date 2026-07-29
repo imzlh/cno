@@ -421,7 +421,17 @@ const defaultInspectOptions: InspectOptions = {
 };
 
 export function inspect(object: unknown, options?: InspectOptions): string {
-    return formatWithOptions(options ?? defaultInspectOptions, object);
+    const opts = options ?? defaultInspectOptions;
+    return console.inspect(object, {
+        colors: opts.colors,
+        depth: opts.depth ?? undefined,
+        showHidden: opts.showHidden,
+        maxArrayLength: opts.maxArrayLength,
+        maxStringLength: opts.maxStringLength,
+        breakLength: opts.breakLength,
+        compact: opts.compact,
+        sorted: opts.sorted,
+    });
 }
 
 inspect.defaultOptions = defaultInspectOptions;

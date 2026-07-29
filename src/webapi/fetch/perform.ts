@@ -419,9 +419,15 @@ export async function performFetch(request: Request, url: URL): Promise<Response
             // Discard any body chunks accumulated from the redirect response
             // so the body stream and netHook only contain the final response.
             pendingBodyChunks.length = 0;
+            pendingBodySize = 0;
             return;
         }
 
+        // Drop any leftover redirect-hop body before the final response starts.
+        if (waitingForFinalHeaders) {
+            pendingBodyChunks.length = 0;
+            pendingBodySize = 0;
+        }
         waitingForFinalHeaders = false;
 
         // Parse headers into object only for the final response.
@@ -442,11 +448,13 @@ export async function performFetch(request: Request, url: URL): Promise<Response
     });
 
     curl.onData((chunk: ArrayBuffer) => {
+        // Drop redirect body data (e.g. 302 HTML page) entirely: no netHook
+        // emission and no buffering into the final response body.
+        if (waitingForFinalHeaders) return false;
         const chunkView = new Uint8Array(chunk);
         const chunkBytes = new Uint8Array(chunkView.byteLength);
         chunkBytes.set(chunkView);
-        // Skip netHook emission for redirect body data (e.g. 302 HTML page).
-        if (!waitingForFinalHeaders && netHook) {
+        if (netHook) {
             const hookBytes = new Uint8Array(chunkBytes.byteLength);
             hookBytes.set(chunkBytes);
             emitFetchHookQuietly(() => {

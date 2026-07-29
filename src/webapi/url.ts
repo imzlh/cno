@@ -476,14 +476,14 @@ class URL implements globalThis.URL {
         this.#scheme = 'file';
         path = normalizeWindowsPath(path);
 
-        // C:/aaa/bbb -> /C:/aaa/bbb
+        // C:/aaa/bbb -> ['C:','aaa','bbb']; the pathname getter adds the leading '/'
         this.#path = path.split('/').filter(p => p);
-        this.#path.unshift(''); // prepend empty element to generate /C:/aaa
     }
 
     #parseUnixPath(path: string): void {
         this.#scheme = 'file';
-        this.#path = path.split('/');
+        // Drop the leading empty segment only; the pathname getter adds the leading '/'
+        this.#path = path.split('/').slice(1);
     }
 
     #parseAuthority(authority: string): void {

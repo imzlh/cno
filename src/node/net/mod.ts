@@ -649,7 +649,10 @@ Socket.prototype._startPipeRead = function _startPipeRead(this: Socket): void {
 };
 
 Socket.prototype.setEncoding = function setEncoding(this: Socket, encoding?: BufferEncoding): Socket {
-    if (encoding) this.readableEncoding = encoding;
+    // Delegate to Duplex: it installs the StringDecoder so 'data' yields
+    // strings and a multi-byte sequence split across TCP segments is rejoined.
+    // Setting only the public field left both behaviours broken.
+    if (encoding) Duplex.prototype.setEncoding.call(this, encoding);
     return this;
 };
 
@@ -1301,7 +1304,11 @@ Server.prototype.listen = function listen(
         this.emit('listening');
         if (listeningListener) listeningListener();
     } catch (err) {
+        // Close the handle before surfacing the error: close() refuses to run
+        // (ERR_SERVER_NOT_RUNNING) while _listening is false, so the common
+        // EADDRINUSE retry idiom would overwrite _tcp and leak this fd.
         this._handleClosed = true;
+        try { this._tcp?.close(); } catch { /* already gone */ }
         this.emit('error', err);
         return this;
     }

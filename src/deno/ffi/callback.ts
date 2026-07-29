@@ -203,8 +203,8 @@ export class UnsafeCallback<
                         const addr = new DataView(buf.buffer, buf.byteOffset).getBigUint64(0, true);
                         return addr === 0n ? null : createPointerObject(addr);
                     }
-                    case 'usize':
-                    case 'isize': return new DataView(buf.buffer, buf.byteOffset).getBigUint64(0, true);
+                    case 'usize': return new DataView(buf.buffer, buf.byteOffset).getBigUint64(0, true);
+                    case 'isize': return new DataView(buf.buffer, buf.byteOffset).getBigInt64(0, true);
                 }
             }
             

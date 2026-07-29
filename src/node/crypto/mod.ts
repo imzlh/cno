@@ -359,7 +359,7 @@ class HmacImpl extends Transform implements Hmac {
     }
 
     digest(encoding?: string): Uint8Array | string {
-        if (this.finalized) return encodeOutput(new ArrayBuffer(0), encoding);
+        if (this.finalized) throw createDigestAlreadyCalledError();
         this.finalized = true;
         return encodeOutput(this.state.digest(), encoding);
     }

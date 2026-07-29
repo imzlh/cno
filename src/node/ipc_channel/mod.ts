@@ -217,6 +217,8 @@ export class IPCChannel extends EventEmitter {
     private _pipe: Pipe | null;
     private _decoder: MessageDecoder;
     private _connected: boolean = false;
+    /** False when the platform gave us a send-only endpoint (see _setupRead). */
+    private _readable: boolean = true;
     private _serialization: IPCSerialization;
     private _pendingWrites = 0;
     private _closeAfterWrites = false;
@@ -261,7 +263,15 @@ export class IPCChannel extends EventEmitter {
             this._decoder.feed(result);
         };
 
-        this._pipe.startRead();
+        // Windows spawns the IPC pair with _pipe() (anonymous, unidirectional),
+        // so a child adopting its inherited endpoint gets a write-only handle
+        // and startRead() fails with ENOTCONN. Send-only is still a usable
+        // channel — stay connected instead of throwing out of the constructor.
+        try {
+            this._pipe.startRead();
+        } catch {
+            this._readable = false;
+        }
         this._connected = true;
     }
 
@@ -377,5 +387,10 @@ export class IPCChannel extends EventEmitter {
 
     get connected(): boolean {
         return this._connected;
+    }
+
+    /** False when the endpoint is send-only (no 'message'/'close' will arrive). */
+    get readable(): boolean {
+        return this._readable;
     }
 }

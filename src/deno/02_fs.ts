@@ -161,11 +161,14 @@ async function denoWriteAnyFile(path: string | URL, data: string | Uint8Array | 
                 throwIfAborted(options?.signal);
                 const { value, done } = await reader.read();
                 if (done) break;
-                throwIfAborted(options?.signal);
-                const n = await fhandle.write(
-                    toWriteBytes(value)
-                );
-                if (n === null) throw new errors.UnexpectedEof("write");
+                const bytes = toWriteBytes(value);
+                let written = 0;
+                while (written < bytes.length) {
+                    throwIfAborted(options?.signal);
+                    const n = await fhandle.write(bytes.subarray(written));
+                    if (n === null) throw new errors.UnexpectedEof("write");
+                    written += n;
+                }
             }
         }
         writtenAll = true;
@@ -464,8 +467,8 @@ Object.assign(Deno, wrapFSns({
                 try {
                     fs.rmdir(pathStr);
                 } catch (error2) {
-                    // If both fail, throw the original error
-                    throw error1;
+                    // Directory removal failed; surface the rmdir error
+                    throw error2;
                 }
             }
             return;

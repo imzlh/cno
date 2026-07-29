@@ -493,7 +493,6 @@ function initReadable(self: Readable, options?: ReadableOptions): void {
     Stream.call(self);
     self.readable = true;
     self.readableEnded = false;
-    self.readableFlowing = null;
     self.readableObjectMode = options?.objectMode ?? false;
     self.readableHighWaterMark = options?.highWaterMark ?? defaultHighWaterMark(self.readableObjectMode);
     self.readableLength = 0;
@@ -722,6 +721,16 @@ Readable.prototype.isPaused = function isPaused(this: Readable): boolean {
     return this._readableState.flowing === false;
 };
 
+/* Mirror of _readableState.flowing rather than a field: it was assigned null at
+ * init and never updated, so anything branching on the documented
+ * null -> false -> true state machine saw null forever. */
+Object.defineProperty(Readable.prototype, 'readableFlowing', {
+    get(this: Readable): boolean | null { return this._readableState.flowing; },
+    set(this: Readable, v: boolean | null) { this._readableState.flowing = v; },
+    enumerable: true,
+    configurable: true,
+});
+
 Readable.prototype.unpipe = function unpipe(this: Readable, destination?: Writable): Readable {
     const destinations = destination ? [destination] : [...this._pipedDestinations];
     for (const dest of destinations) {
@@ -849,6 +858,11 @@ Readable.prototype[Symbol.asyncIterator] = function asyncIterator(this: Readable
             if (readable.readableEnded) {
                 return { done: true, value: undefined };
             }
+            // Already torn down: no further event will ever arrive.
+            if (readable.destroyed) {
+                if (readable.errored) throw readable.errored;
+                return { done: true, value: undefined };
+            }
             return new Promise((resolve, reject) => {
                 const onData = (chunk: unknown) => {
                     cleanup();
@@ -863,20 +877,40 @@ Readable.prototype[Symbol.asyncIterator] = function asyncIterator(this: Readable
                     cleanup();
                     reject(err);
                 };
+                // destroy() with no error emits only 'close'; without this the
+                // promise never settles and the for-await loop hangs forever.
+                const onClose = () => {
+                    cleanup();
+                    if (readable.readableEnded) {
+                        resolve({ done: true, value: undefined });
+                        return;
+                    }
+                    const err = readable.errored;
+                    if (err) {
+                        reject(err);
+                        return;
+                    }
+                    reject(Object.assign(new Error('Premature close'), { code: 'ERR_STREAM_PREMATURE_CLOSE' }));
+                };
                 const cleanup = () => {
                     readable.off('data', onData);
                     readable.off('end', onEnd);
                     readable.off('error', onError);
+                    readable.off('close', onClose);
                 };
 
                 readable.on('data', onData);
                 readable.on('end', onEnd);
                 readable.on('error', onError);
+                readable.on('close', onClose);
                 readable.resume();
             });
         },
         async return() {
+            // Node destroys the readable when the loop is exited early via
+            // break/return/throw — otherwise the fd or socket handle leaks.
             readable.pause();
+            readable.destroy();
             return { done: true, value: undefined };
         },
     } as AsyncIterableIterator<unknown>;
@@ -1239,6 +1273,14 @@ Writable.prototype.end = function end(
         this.once('finish', callback);
     }
 
+    // Node: `.end()` fully uncorks regardless of nesting depth. Without this a
+    // corked stream drops its buffer and never emits 'finish', so finished()
+    // and pipeline() on it hang forever.
+    if (state.corked) {
+        state.corked = 1;
+        this.uncork();
+    }
+
     if (!state.writing && state.buffer.length === 0) {
         this._doFinal();
     }
@@ -1327,7 +1369,6 @@ function initDuplex(self: Duplex, options?: DuplexOptions): void {
     self.writable = options?.writable ?? true;
     self.allowHalfOpen = options?.allowHalfOpen ?? true;
     self.readableEnded = false;
-    self.readableFlowing = null;
     self.readableObjectMode = !!(options?.objectMode || options?.readableObjectMode);
     self.readableHighWaterMark = options?.highWaterMark
         ?? options?.readableHighWaterMark
@@ -1522,6 +1563,13 @@ Duplex.prototype._duplexReadAndResolve = function _duplexReadAndResolve(this: Du
 Duplex.prototype.isPaused = function isPaused(this: Duplex): boolean {
     return this._readableState.flowing === false;
 };
+
+Object.defineProperty(Duplex.prototype, 'readableFlowing', {
+    get(this: Duplex): boolean | null { return this._readableState.flowing; },
+    set(this: Duplex, v: boolean | null) { this._readableState.flowing = v; },
+    enumerable: true,
+    configurable: true,
+});
 
 Duplex.prototype.unpipe = function unpipe(this: Duplex, destination?: Writable): Duplex {
     const destinations = destination ? [destination] : [...this._pipedDestinations];

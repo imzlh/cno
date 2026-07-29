@@ -195,7 +195,8 @@ class StreamingParser<T extends HttpStreamMessage> implements CNO.StreamingHttpP
             // Set up body stream if body is expected
             const cl = this.#headers.get('content-length');
             const te = this.#headers.get('transfer-encoding');
-            if (cl !== null || te !== null || this.#upgrade) {
+            // s.eof: llhttp message_needs_eof — response body delimited by connection close
+            if (cl !== null || te !== null || this.#upgrade || s.eof) {
                 this.#hasBody = true;
                 this.#bodyStream = new ReadableStream<Uint8Array>({
                     start: (ctrl) => { this.#bodyCtrl = ctrl; }
@@ -260,6 +261,20 @@ class StreamingParser<T extends HttpStreamMessage> implements CNO.StreamingHttpP
 
     pause(): void { this.#parser.pause(); }
     resume(): void { this.#parser.resume(); }
+
+    // Signal connection close/EOF: completes an EOF-delimited body, errors a truncated one
+    finish(): void {
+        const result = this.#parser.finish();
+        if (result.errno !== 0) {
+            const err = new Error(`HTTP parse error: ${result.reason ?? result.name}`);
+            this.#bodyCtrl?.error(err);
+            this.#bodyCtrl = null;
+            this.#onError?.(err);
+        } else if (this.#bodyCtrl) {
+            this.#bodyCtrl.close();
+            this.#bodyCtrl = null;
+        }
+    }
 
     reset(): void {
         this.#resetAccum();

@@ -47,7 +47,7 @@ function utf8TrailingBytes(bytes: Uint8Array): number {
     if (len === 0) return 0;
 
     let continuation = 0;
-    for (let i = len - 1; i >= 0 && continuation < 3; i--) {
+    for (let i = len - 1; i >= 0 && continuation < 4; i--) {
         const byte = bytes[i];
         if (byte === undefined) break;
         if ((byte & 0b1100_0000) === 0b1000_0000) {

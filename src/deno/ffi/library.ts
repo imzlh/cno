@@ -243,12 +243,17 @@ class DynamicLibraryImpl<S extends ForeignLibraryInterface> implements DynamicLi
                     return new Uint8Array(buf);
                 }
                 case 'u64':
-                case 'i64':
-                case 'usize':
-                case 'isize': {
+                case 'usize': {
                     const buf = new ArrayBuffer(8);
                     const num = toBigIntArg(value);
                     new DataView(buf).setBigUint64(0, num, true);
+                    return new Uint8Array(buf);
+                }
+                case 'i64':
+                case 'isize': {
+                    const buf = new ArrayBuffer(8);
+                    const num = toBigIntArg(value);
+                    new DataView(buf).setBigInt64(0, num, true);
                     return new Uint8Array(buf);
                 }
                 case 'f32': {

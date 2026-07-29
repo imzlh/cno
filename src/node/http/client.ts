@@ -463,6 +463,8 @@ export class Agent extends EventEmitter {
             }
             if (isReusableSocket(socket) || !socket._destroyed) socket.destroy();
         }, idle);
+        // Idle free-socket timer must not keep the event loop alive.
+        timer.unref?.();
         this._freeTimers.set(socket, timer);
     }
 

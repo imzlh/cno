@@ -132,6 +132,15 @@ export class EventSource extends EventTarget {
         });
     }
 
+    private resetParseState(): void {
+        // Per spec, reconnect resets the buffers but preserves lastEventId.
+        this.lineBuffer = '';
+        this.dataBuffer = [];
+        this.eventTypeBuffer = '';
+        this.idBuffer = null;
+        this.decoder = new TextDecoder();
+    }
+
     private processChunk(chunk: Uint8Array): void {
         const text = this.decoder.decode(chunk, { stream: true });
         this.lineBuffer += text;
@@ -222,7 +231,9 @@ export class EventSource extends EventTarget {
         if (this.reconnectTimer !== null) timers.clearTimeout(this.reconnectTimer);
         this.reconnectTimer = timers.setTimeout(() => {
             this.reconnectTimer = null;
-            if (this.readyState === EventSourceReadyState.CONNECTING) this.connect();
+            if (this.readyState !== EventSourceReadyState.CONNECTING) return;
+            this.resetParseState();
+            this.connect();
         }, this.reconnectDelay);
     }
 

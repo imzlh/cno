@@ -13,8 +13,13 @@ import { Buffer } from '../buffer';
 
 // Platform-specific IP multicast socket options
 const _isWindows = os.uname().sysname === 'Windows_NT';
+const _isLinux = os.uname().sysname === 'Linux';
 const IP_ADD_MEMBERSHIP = _isWindows ? 12 : 35;
 const IP_DROP_MEMBERSHIP = _isWindows ? 13 : 36;
+// Linux uses distinct values from BSD/macOS/Windows for these options
+const IP_MULTICAST_IF = _isLinux ? 32 : 12;
+const IP_MULTICAST_TTL = _isLinux ? 33 : 10;
+const IP_MULTICAST_LOOP = _isLinux ? 34 : 11;
 
 // Helper: get a PosixSocket from UDP's fd for setsockopt
 // We cache the fd at init time since fileno() is async but socket options
@@ -298,6 +303,8 @@ Socket.prototype._startRecv = async function _startRecv(this: Socket): Promise<v
             if (this._handle) {
                 this.emit('error', err);
             }
+            // Stop the recv loop on error so we don't busy-loop on a persistent failure
+            break;
         }
     }
 };
@@ -496,7 +503,7 @@ Socket.prototype.setMulticastTTL = function setMulticastTTL(this: Socket, ttl: n
         const s = _getSocket(this._handle);
         if (!s) return ttl;
         const val = new Uint8Array(4); new DataView(val.buffer).setUint32(0, ttl, true);
-        s.setopt(sock.defines.IPPROTO_IP, 10, val);
+        s.setopt(sock.defines.IPPROTO_IP, IP_MULTICAST_TTL, val);
     } catch { /* best-effort */ }
     return ttl;
 };
@@ -513,7 +520,7 @@ Socket.prototype.setMulticastInterface = function setMulticastInterface(this: So
                 for (let i = 0; i < 4; i++) buf[i] = parseInt(parts[i]);
             }
         }
-        s.setopt(sock.defines.IPPROTO_IP, 12, buf);
+        s.setopt(sock.defines.IPPROTO_IP, IP_MULTICAST_IF, buf);
     } catch { /* best-effort */ }
     return this;
 };
@@ -524,7 +531,7 @@ Socket.prototype.setMulticastLoopback = function setMulticastLoopback(this: Sock
         const s = _getSocket(this._handle);
         if (!s) return this;
         const val = new Uint8Array(4); new DataView(val.buffer).setUint32(0, flag ? 1 : 0, true);
-        s.setopt(sock.defines.IPPROTO_IP, 11, val);
+        s.setopt(sock.defines.IPPROTO_IP, IP_MULTICAST_LOOP, val);
     } catch { /* best-effort */ }
     return this;
 };

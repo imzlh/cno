@@ -40,6 +40,17 @@ function stopPipeReadQuietly(pipe: CModuleStreams.Pipe): void {
     }
 }
 
+// Resolve once a piped stdio Readable has ended, closed, or errored.
+function waitStreamEnd(stream: Readable | null): Promise<void> {
+    if (!stream) return Promise.resolve();
+    if (stream.readableEnded || stream.destroyed) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+        stream.once('end', resolve);
+        stream.once('close', resolve);
+        stream.once('error', resolve);
+    });
+}
+
 // Type definitions
 type StdioEntry = 'pipe' | 'ignore' | 'inherit' | 'ipc' | number | null | undefined;
 type NativeStdio = CModuleProcess.SpawnOptions<false>['stdin'];
@@ -422,6 +433,12 @@ ChildProcessImpl.prototype._waitExit = async function _waitExit(this: ChildProce
         this.signalCode = info.term_signal;
 
         this.emit('exit', this._exitCode, this._signalCode);
+
+        // 'close' must wait for exit AND EOF/close of every piped stdio stream
+        // so exec/execFile don't see truncated stdout/stderr.
+        await Promise.all(
+            [this._stdout, this._stderr].map((stream) => waitStreamEnd(stream)),
+        );
         this.emit('close', this._exitCode, this._signalCode);
     } catch (err) {
         this.emit('error', err);
