@@ -471,7 +471,7 @@ class Http2ServerResponse extends Writable {
                 || lower === 'proxy-connection' || lower === 'upgrade') continue;
             for (const value of values) pairs.push([name, value]);
         }
-        this.stream.respondPairs(pairs, false);
+        this.stream.respondPairs(pairs, { endStream: false });
         this.headersSent = true;
         return this;
     }

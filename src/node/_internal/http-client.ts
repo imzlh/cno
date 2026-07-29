@@ -7,11 +7,12 @@ const os = import.meta.use('os');
 const timers = import.meta.use('timers');
 const win32 = import.meta.use('win32');
 
+import { encodeChunkedFrame, formatRequestHead } from '@cnojs/http/src/h1-frame';
 import { IncomingMessageImpl } from '../http/server';
 import type { OutgoingHttpHeader, OutgoingHttpHeaders } from '../http/types';
 import { Socket } from '../net';
 import { type TLSSocket, type TlsOptions, connect as tlsConnect } from '../tls';
-import { viewToUint8Array } from './buffer';
+import { arrayBufferBackedBytes, viewToUint8Array } from './buffer';
 import { normalizeErrnoError } from './errno';
 import {
     buildNodeUrl,
@@ -22,11 +23,6 @@ import {
     normalizeHeaderRecord,
     setupResponseParser,
 } from './network-debug';
-import {
-    encodeChunkedFrame,
-    encodeChunkedTrailer,
-    formatRequestHead,
-} from '@cnojs/http/h1-frame';
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
@@ -120,6 +116,7 @@ type MaybeSecureTransport = ClientTransport & {
     off(event: 'secureConnect' | 'error', listener: (...args: unknown[]) => void): unknown;
 };
 
+const CHUNKED_TRAILER = engine.encodeString('0\r\n\r\n');
 function destroyTransportQuietly(transport: { destroy(): unknown }): void {
     try {
         transport.destroy();
@@ -216,16 +213,16 @@ export function shouldSendZeroContentLength(method: string): boolean {
 }
 
 export function encodeRequestChunk(chunk: unknown, encoding?: BufferEncoding): Uint8Array {
-    if (typeof chunk === 'string') return Buffer.from(chunk, encoding || 'utf8');
+    if (typeof chunk === 'string') return Buffer.from(chunk, encoding || 'utf8') as Uint8Array;
     if (typeof chunk === 'number' && Number.isInteger(chunk) && chunk >= 0 && chunk <= 255) {
         return Uint8Array.of(chunk);
     }
-    if (chunk instanceof Uint8Array) return chunk;
+    if (chunk instanceof Uint8Array) return chunk as Uint8Array;
     if (ArrayBuffer.isView(chunk)) {
-        return viewToUint8Array(chunk);
+        return viewToUint8Array(chunk) as Uint8Array;
     }
     if (chunk instanceof ArrayBuffer) return new Uint8Array(chunk);
-    return Buffer.from(String(chunk ?? ''), encoding || 'utf8');
+    return Buffer.from(String(chunk ?? ''), encoding || 'utf8') as Uint8Array;
 }
 
 function resolvePort(port: number | string | null | undefined, fallback: number): number {
@@ -312,7 +309,7 @@ export async function getSystemCa(): Promise<string | null> {
         const tmpDir = os.tmpDir || 'C:\\Windows\\Temp';
         const tmp = `${tmpDir}\\cno-ca-bundle.pem`;
         try {
-            const certs = win32.exportCerts();
+            const certs = win32!.exportCerts();
             if (certs?.length) {
                 await fs.writeFile(tmp, engine.encodeString(certs.join('\n')));
                 systemCaPath = tmp;
@@ -494,20 +491,26 @@ export function connectRequestWithAgent<TRequest extends ClientRequestState>(req
         };
         const transport = await new Promise<RequestTransport<TRequest>>((resolve, reject) => {
             const onSocket = (socket: RequestTransport<TRequest>) => {
+                // @ts-ignore - args cast
                 request.off('error', onError);
                 if (!request._transport) assignRequestTransport(request, socket, hooks);
                 resolve(request._transport || socket);
             };
             const onError = (error: Error) => {
+                // @ts-ignore - args cast
                 request.off('socket', onSocket);
                 reject(error);
             };
+            // @ts-ignore - args cast
             request.once('socket', onSocket);
+            // @ts-ignore - args cast
             request.once('error', onError);
             try {
                 agent.addRequest(request, agentOptions);
             } catch (error) {
+                // @ts-ignore - args cast
                 request.off('socket', onSocket);
+                // @ts-ignore - args cast
                 request.off('error', onError);
                 reject(error);
             }
@@ -593,9 +596,9 @@ export async function doBufferedRequest<TRequest extends ClientRequestState>(req
         if (request.hasHeader('transfer-encoding') && String(request.getHeader('transfer-encoding')).toLowerCase().includes('chunked')) {
             await sendRequestLine(request);
             if (bodyLength > 0) {
-                await writeToTransport(request._transport, encodeChunkedFrame(requestBody));
+                await writeToTransport(request._transport, encodeChunkedFrame(requestBody as Uint8Array));
             }
-            await writeToTransport(request._transport, encodeChunkedTrailer());
+            await writeToTransport(request._transport, CHUNKED_TRAILER);
             request._bodySent = true;
             markRequestFinished(request);
             readResponse(request);
@@ -664,7 +667,7 @@ export async function finishStreaming<TRequest extends ClientRequestState>(reque
         await sendRequestLine(request);
     }
     if (request._transport && request._chunkedEncoding) {
-        await writeToTransport(request._transport, encodeChunkedTrailer());
+        await writeToTransport(request._transport, CHUNKED_TRAILER);
     }
     request._bodySent = true;
     markRequestFinished(request);
@@ -678,7 +681,7 @@ export function readResponse<TRequest extends ClientRequestState>(request: TRequ
     const isConnect = request.method === 'CONNECT';
     let connectResponse: IncomingMessageImpl | null = null;
     let upgradeResponse: IncomingMessageImpl | null = null;
-    const { parser, finish } = setupResponseParser({
+    const { parser, finish } = setupResponseParser<IncomingMessageImpl>({
         requestId: request._requestId,
         protocol: request.protocol,
         host: request.host,
@@ -708,7 +711,10 @@ export function readResponse<TRequest extends ClientRequestState>(request: TRequ
     let pending: Uint8Array | null = null;
     let failed = false;
     const transport = request._transport;
-    const formatParseError = (result: CModuleHTTP.ParserExecuteResult | undefined, fallback: string): string => {
+    const formatParseError = (
+        result: Pick<CModuleHTTP.ParserExecuteResult, 'name' | 'reason'> | undefined,
+        fallback: string,
+    ): string => {
         const detail = result?.reason ?? result?.name;
         return detail ? `${fallback}: ${detail}` : fallback;
     };
@@ -754,7 +760,7 @@ export function readResponse<TRequest extends ClientRequestState>(request: TRequ
     const onData = (chunk: Uint8Array) => {
         let toParse = chunk;
         if (pending) {
-            const combined = algorithm.bytesConcat([pending, chunk]);
+            const combined = arrayBufferBackedBytes(algorithm.bytesConcat([pending, chunk]));
             pending = null;
             toParse = combined;
         }
@@ -867,7 +873,7 @@ export function endRequest<TRequest extends ClientRequestState>(request: TReques
     let callback: (() => void) | undefined;
     let finalChunk = chunk;
     if (typeof finalChunk === 'function') {
-        callback = finalChunk;
+        callback = finalChunk as () => void;
         finalChunk = undefined;
     } else if (typeof encodingOrCb === 'function') {
         callback = encodingOrCb;

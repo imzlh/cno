@@ -9,23 +9,23 @@ const debug = import.meta.use('debug');
 
 let nodeRequestSeq = 0;
 
-type HeaderValue = number | string | string[] | readonly string[] | undefined;
 type HeaderMap = Record<string, string | string[]>;
 
-interface ResponseParserMessage {
+/** Minimal surface the shared response parser reads/writes on IncomingMessage. */
+export interface ResponseParserMessage {
     statusCode?: number;
     statusMessage?: string;
     httpVersion: string;
     httpVersionMajor: number;
     httpVersionMinor: number;
-    headers: HeaderMap;
-    headersDistinct: Record<string, string[]>;
+    headers: HeaderMap | Record<string, string | string[] | undefined>;
+    headersDistinct: Record<string, string[] | undefined> | HeaderMap;
     rawHeaders: string[];
-    trailers: HeaderMap;
-    trailersDistinct: Record<string, string[]>;
+    trailers: HeaderMap | Record<string, string | undefined>;
+    trailersDistinct: Record<string, string[] | undefined> | HeaderMap;
     rawTrailers: string[];
     complete: boolean;
-    push(chunk: Uint8Array | null): boolean;
+    push(chunk: unknown, encoding?: BufferEncoding): boolean;
 }
 
 export interface ResponseInformation {
@@ -131,17 +131,17 @@ export function buildNodeServerUrl(
 const engine = import.meta.use('engine');
 const httpNative = import.meta.use('http');
 
-export interface ResponseParserContext {
+export interface ResponseParserContext<T extends ResponseParserMessage = ResponseParserMessage> {
     requestId: string;
     protocol: string;
     host: string;
     path: string;
-    res: ResponseParserMessage;
-    getHeaders: () => Record<string, HeaderValue>;
-    onResponse: (res: ResponseParserMessage) => void;
+    res: T;
+    getHeaders: () => object;
+    onResponse: (res: T) => void;
     onInformation?: (info: ResponseInformation) => void;
-    onConnect?: (res: ResponseParserMessage) => void;
-    onUpgrade?: (res: ResponseParserMessage) => void;
+    onConnect?: (res: T) => void;
+    onUpgrade?: (res: T) => void;
     onComplete: () => void;
     connectMode?: boolean;
     skipBody?: boolean;
@@ -152,7 +152,7 @@ function viewParserBuffer(buffer: CModuleHTTP.BufferSource): Uint8Array {
     return new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
 }
 
-export function setupResponseParser(ctx: ResponseParserContext) {
+export function setupResponseParser<T extends ResponseParserMessage>(ctx: ResponseParserContext<T>) {
     const fetchHook = getNodeFetchHook();
     let finished = false;
     const finish = (success: boolean, errorText?: string) => {
@@ -188,8 +188,8 @@ export function setupResponseParser(ctx: ResponseParserContext) {
     const flushHeader = () => {
         if (!currentHeaderField) return;
         const lowerField = currentHeaderField.toLowerCase();
-        const targetHeaders = responseStarted ? res.trailers : currentHeaders;
-        const targetDistinct = responseStarted ? res.trailersDistinct : currentHeadersDistinct;
+        const targetHeaders = (responseStarted ? res.trailers : currentHeaders) as HeaderMap;
+        const targetDistinct = (responseStarted ? res.trailersDistinct : currentHeadersDistinct) as Record<string, string[]>;
         const targetRaw = responseStarted ? res.rawTrailers : currentRawHeaders;
         const existing = targetHeaders[lowerField];
         if (existing) {

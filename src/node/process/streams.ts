@@ -4,6 +4,7 @@
  * singletons into Node-compatible Writable/Readable streams.
  */
 
+import type { Stream as StdioStream } from '../../utils/stdio';
 import { getTierLimits } from '../_internal/memory';
 import { Readable, Writable } from '../stream';
 
@@ -11,10 +12,7 @@ const engine = import.meta.use('engine');
 const streams = import.meta.use('streams');
 
 const { streamHighWaterMark: PROCESS_READ_STREAM_HWM } = getTierLimits();
-
-type StdioStream = CModuleStreams.StdioStream;
-
-const { stdin: denoStdin, stdout: denoStdout, stderr: denoStderr } = streams;
+const { stdin: denoStdin, stdout: denoStdout, stderr: denoStderr } = streams as any as Record<string, StdioStream>;
 
 function readTtySize(stdio: StdioStream): { width: number; height: number } | undefined {
     try {

@@ -47,6 +47,10 @@ interface BufferConstructor {
 declare var Buffer: BufferConstructor;
 
 declare namespace NodeJS {
+    interface Dict<T> {
+        [key: string]: T | undefined;
+    }
+
     interface ErrnoException extends Error {
         errno?: number;
         code?: string;
