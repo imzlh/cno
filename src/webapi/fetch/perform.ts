@@ -250,6 +250,8 @@ export async function performFetch(request: Request, url: URL): Promise<Response
         .setHeaders(objHeaders);
     curl.setOpt(curlMod.CURLOPT_AUTOREFERER, 1);  // update Referer to the Location URL on each redirect hop
     curl.setAcceptEncoding(acceptEncoding);
+    // Default timeouts (ms): bound a hung upstream so a single fetch can't block forever.
+    curl.setConnectTimeout(15000);
 
     // redirect mode
     if (request.redirect === 'error' || request.redirect === 'manual') {

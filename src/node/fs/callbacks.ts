@@ -606,7 +606,7 @@ export function symlink(target: PathLike, path: PathLike, type?: 'file' | 'dir' 
     }
 
     assertCallback(callback);
-    const symlinkType: CModuleAsyncFS.SymlinkType = type === 'dir' ? asfs.SymlinkType.DIR : type === 'junction' ? asfs.SymlinkType.JUNCTION : 0;
+    const symlinkType: CModuleAsyncFS.SymlinkType = type === 'dir' ? asfs.FS_SYMLINK_DIR : type === 'junction' ? asfs.FS_SYMLINK_JUNCTION : 0;
     asfs.symlink(pathToString(target), pathToString(path), symlinkType).then(
         () => callback(null),
         (err) => callback(toErrnoException(err, 'symlink', pathToString(path)))

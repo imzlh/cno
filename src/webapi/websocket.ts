@@ -332,6 +332,7 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
     private _rxTotal = 0;    // total unconsumed bytes across all chunks
     private fragments: Uint8Array[] = [];
     private fragmentOpcode: OpCode | null = null;
+    private _fragmentBytes = 0;
     private pingInterval: number | null = null;
     private pongTimeout: number | null = null;
     private _wsKey: string = '';
@@ -631,12 +632,18 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
                     this.close(WebSocketCloseCode.PROTOCOL_ERROR, 'Unexpected continuation frame');
                     return;
                 }
+                this._fragmentBytes = (this._fragmentBytes ?? 0) + frame.payload.length;
+                if (this._fragmentBytes > MAX_BUFFERED_AMOUNT) {
+                    this.close(WebSocketCloseCode.MESSAGE_TOO_BIG, 'Message too large');
+                    return;
+                }
                 this.fragments.push(frame.payload);
                 if (frame.fin) {
                     const combined = concatChunks(this.fragments);
                     this.emitMessage(this.fragmentOpcode, combined);
                     this.fragmentOpcode = null;
                     this.fragments = [];
+                    this._fragmentBytes = 0;
                 }
                 break;
             case OpCode.CLOSE: this.handleCloseFrame(frame.payload); break;

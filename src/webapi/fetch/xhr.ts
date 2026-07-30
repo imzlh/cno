@@ -166,6 +166,15 @@ export class XMLHttpRequest extends EventTarget {
 
     setRequestHeader(name: string, value: string): void {
         if (this.readyState !== XHR_OPENED) throw new DOMException('InvalidStateError', 'InvalidStateError');
+        // Reject CRLF/NUL to match fetch() header validation (prevents request smuggling).
+        for (const c of [name, value]) {
+            for (let i = 0; i < c.length; i++) {
+                const code = c.charCodeAt(i);
+                if (code === 0x00 || code === 0x0a || code === 0x0d || code > 0xff) {
+                    throw new TypeError('Invalid header name or value');
+                }
+            }
+        }
         this._headers.push([name, value]);
     }
 

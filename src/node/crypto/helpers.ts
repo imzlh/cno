@@ -6,7 +6,7 @@ const engine = import.meta.use('engine');
 const crypto = import.meta.use('crypto');
 const algorithm = import.meta.use('algorithm');
 import { Buffer } from '../buffer';
-import type { BinaryInput, KeyInput, KeyWithOptions } from './types';
+import type { BinaryInput, KeyInput, KeyObject, KeyWithOptions } from './types';
 import { concatChunks as concatBuffers } from '../_internal/buffer';
 export { concatBuffers };
 
@@ -63,12 +63,10 @@ export function encodeOutput(data: ArrayBuffer, encoding?: string): Buffer | str
     return Buffer.from(bytes);
 }
 
-export function isKeyObject(value: unknown): value is {
+export function isKeyObject(value: unknown): value is KeyObject & {
     [kKeyData]: Uint8Array;
     [kKeyFormat]: KeyFormat;
-    type: string;
-    asymmetricKeyType: string;
-    export(options?: unknown): Uint8Array | string | object;
+    asymmetricKeyType?: 'rsa' | 'ec';
 } {
     return value !== null && typeof value === 'object'
         && Reflect.get(value, Symbol.toStringTag) === 'KeyObject'
@@ -84,7 +82,10 @@ export function getKeyBytes(input: KeyInput): Uint8Array {
     if (isKeyObject(input)) {
         return input[kKeyData];
     }
-    return toBuffer(input);
+    if (typeof input === 'string' || input instanceof ArrayBuffer || ArrayBuffer.isView(input)) {
+        return toBuffer(input);
+    }
+    throw new TypeError('The key must be a KeyObject, string, ArrayBuffer, or ArrayBufferView');
 }
 
 export function readKeyOptions(input: KeyInput | KeyWithOptions): { key: Uint8Array; dsaEncoding: 'der' | 'ieee-p1363' } {
@@ -348,7 +349,12 @@ export function readAsymmetricCipherArgs(
     keyOrOptions: KeyInput | { key: KeyInput; oaepHash?: string; oaepLabel?: ArrayBuffer | Uint8Array },
     data: ArrayBuffer | Uint8Array,
 ): AsymmetricCipherArgs {
-    if (isKeyObject(keyOrOptions) || keyOrOptions instanceof ArrayBuffer || keyOrOptions instanceof Uint8Array || typeof keyOrOptions === 'string') {
+    if (
+        isKeyObject(keyOrOptions)
+        || typeof keyOrOptions === 'string'
+        || keyOrOptions instanceof ArrayBuffer
+        || ArrayBuffer.isView(keyOrOptions)
+    ) {
         return {
             key: getKeyBytes(keyOrOptions),
             data: toBuffer(data),
@@ -356,10 +362,14 @@ export function readAsymmetricCipherArgs(
         };
     }
 
-    return {
-        key: getKeyBytes(keyOrOptions.key),
-        data: toBuffer(data),
-        oaepHash: keyOrOptions.oaepHash?.toLowerCase() || 'sha256',
-        oaepLabel: keyOrOptions.oaepLabel ? toBuffer(keyOrOptions.oaepLabel) : undefined,
-    };
+    if (keyOrOptions && typeof keyOrOptions === 'object' && 'key' in keyOrOptions) {
+        return {
+            key: getKeyBytes(keyOrOptions.key),
+            data: toBuffer(data),
+            oaepHash: keyOrOptions.oaepHash?.toLowerCase() || 'sha256',
+            oaepLabel: keyOrOptions.oaepLabel ? toBuffer(keyOrOptions.oaepLabel) : undefined,
+        };
+    }
+
+    throw new TypeError('Invalid key or options for asymmetric cipher');
 }

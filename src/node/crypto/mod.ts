@@ -552,8 +552,8 @@ type CipherCore = {
     update(data: BinaryInput, inputEncoding?: string, outputEncoding?: string): Uint8Array | string;
     final(outputEncoding?: string): Uint8Array | string;
     setAutoPadding?(value: boolean): void;
-    setAAD?(aad: ArrayBuffer | Uint8Array): unknown;
-    setAuthTag?(tag: ArrayBuffer | Uint8Array): unknown;
+    setAAD?(aad: ArrayBuffer | ArrayBufferView): unknown;
+    setAuthTag?(tag: ArrayBuffer | ArrayBufferView): unknown;
     getAuthTag?(): Uint8Array;
 };
 type CipherivWithAutoPadding = CipherCore & { setAutoPadding(value: boolean): void };
@@ -568,11 +568,56 @@ type CbcFns = {
     decryptRaw: (key: Uint8Array, iv: Uint8Array, data: Uint8Array) => ArrayBuffer;
 };
 
+type EcbFns = {
+    keyLength: number;
+    encrypt: (key: Uint8Array, data: Uint8Array) => ArrayBuffer;
+    encryptRaw: (key: Uint8Array, data: Uint8Array) => ArrayBuffer;
+    decrypt: (key: Uint8Array, data: Uint8Array) => ArrayBuffer;
+    decryptRaw: (key: Uint8Array, data: Uint8Array) => ArrayBuffer;
+};
+
 const GCM_KEY_LENGTHS: Record<string, number> = {
     'aes-128-gcm': 16,
     'aes-192-gcm': 24,
     'aes-256-gcm': 32,
 };
+
+function toCipherKey(key: KeyInput): Uint8Array {
+    if (!isKeyObject(key)) return toBuffer(key);
+    if (key.type !== 'secret') throw new TypeError(`Invalid key object type ${key.type}, expected secret`);
+    return key[kKeyData];
+}
+
+function getEcbFns(algorithm: string): EcbFns {
+    switch (algorithm) {
+        case 'aes-128-ecb':
+            return {
+                keyLength: 16,
+                encrypt: (key, data) => crypto.aes128EcbEncrypt(key, null, data),
+                encryptRaw: (key, data) => crypto.aes128EcbEncryptRaw(key, null, data),
+                decrypt: (key, data) => crypto.aes128EcbDecrypt(key, null, data),
+                decryptRaw: (key, data) => crypto.aes128EcbDecryptRaw(key, null, data),
+            };
+        case 'aes-192-ecb':
+            return {
+                keyLength: 24,
+                encrypt: (key, data) => crypto.aes192EcbEncrypt(key, null, data),
+                encryptRaw: (key, data) => crypto.aes192EcbEncryptRaw(key, null, data),
+                decrypt: (key, data) => crypto.aes192EcbDecrypt(key, null, data),
+                decryptRaw: (key, data) => crypto.aes192EcbDecryptRaw(key, null, data),
+            };
+        case 'aes-256-ecb':
+            return {
+                keyLength: 32,
+                encrypt: (key, data) => crypto.aes256EcbEncrypt(key, null, data),
+                encryptRaw: (key, data) => crypto.aes256EcbEncryptRaw(key, null, data),
+                decrypt: (key, data) => crypto.aes256EcbDecrypt(key, null, data),
+                decryptRaw: (key, data) => crypto.aes256EcbDecryptRaw(key, null, data),
+            };
+        default:
+            throw new Error(`Unknown cipher: ${algorithm}`);
+    }
+}
 
 function getCbcFns(algorithm: string): CbcFns {
     switch (algorithm) {
@@ -612,6 +657,59 @@ function getCbcFns(algorithm: string): CbcFns {
 function validateCbcKeyIv(key: Uint8Array, iv: Uint8Array, fns: CbcFns): void {
     if (key.byteLength !== fns.keyLength) throw new RangeError('Invalid key length');
     if (iv.byteLength !== fns.ivLength) throw new TypeError('Invalid initialization vector');
+}
+
+function makeEcbCipher(key: Uint8Array, fns: EcbFns): CipherivWithAutoPadding {
+    let autoPadding = true;
+    const chunks: Uint8Array[] = [];
+
+    return {
+        update(data: BinaryInput, inputEncoding?: string, outputEncoding?: string) {
+            chunks.push(toBuffer(data, inputEncoding));
+            const buf = concatBuffers(chunks);
+            const processLength = Math.floor(buf.byteLength / 16) * 16;
+            chunks.length = 0;
+            if (buf.byteLength > processLength) chunks.push(buf.subarray(processLength));
+            if (processLength === 0) return encodeOutput(new ArrayBuffer(0), outputEncoding);
+            return encodeOutput(fns.encryptRaw(key, buf.subarray(0, processLength)), outputEncoding);
+        },
+        final(outputEncoding?: string) {
+            const buf = concatBuffers(chunks);
+            chunks.length = 0;
+            const out = autoPadding ? fns.encrypt(key, buf) : fns.encryptRaw(key, buf);
+            return encodeOutput(out, outputEncoding);
+        },
+        setAutoPadding(value: boolean) {
+            autoPadding = value;
+        },
+    };
+}
+
+function makeEcbDecipher(key: Uint8Array, fns: EcbFns): DecipherivWithAutoPadding {
+    let autoPadding = true;
+    const chunks: Uint8Array[] = [];
+
+    return {
+        update(data: BinaryInput, inputEncoding?: string, outputEncoding?: string) {
+            chunks.push(toBuffer(data, inputEncoding));
+            const buf = concatBuffers(chunks);
+            const fullLength = Math.floor(buf.byteLength / 16) * 16;
+            const processLength = autoPadding ? Math.max(0, fullLength - 16) : fullLength;
+            chunks.length = 0;
+            if (buf.byteLength > processLength) chunks.push(buf.subarray(processLength));
+            if (processLength === 0) return encodeOutput(new ArrayBuffer(0), outputEncoding);
+            return encodeOutput(fns.decryptRaw(key, buf.subarray(0, processLength)), outputEncoding);
+        },
+        final(outputEncoding?: string) {
+            const buf = concatBuffers(chunks);
+            chunks.length = 0;
+            const out = autoPadding ? fns.decrypt(key, buf) : fns.decryptRaw(key, buf);
+            return encodeOutput(out, outputEncoding);
+        },
+        setAutoPadding(value: boolean) {
+            autoPadding = value;
+        },
+    };
 }
 
 function makeCbcCipher(key: Uint8Array, iv: Uint8Array, fns: CbcFns): CipherivWithAutoPadding {
@@ -709,14 +807,14 @@ class CipherTransform extends Transform implements CipherGCM, DecipherGCM {
         return this;
     }
 
-    setAAD(aad: ArrayBuffer | Uint8Array): this {
+    setAAD(aad: ArrayBuffer | ArrayBufferView): this {
         if (this.finalized || this.started) throw createCipherInvalidStateError('setAAD');
         if (!this.core.setAAD) throw new TypeError('setAAD is only supported for authenticated ciphers');
         this.core.setAAD(aad);
         return this;
     }
 
-    setAuthTag(tag: ArrayBuffer | Uint8Array): this {
+    setAuthTag(tag: ArrayBuffer | ArrayBufferView): this {
         if (this.finalized) throw createCipherInvalidStateError('setAuthTag');
         if (!this.core.setAuthTag) throw new TypeError('setAuthTag is only supported for authenticated ciphers');
         this.core.setAuthTag(tag);
@@ -746,30 +844,46 @@ class CipherTransform extends Transform implements CipherGCM, DecipherGCM {
     }
 }
 
-export function createCipheriv(algorithm: string, key: ArrayBuffer | Uint8Array, iv: ArrayBuffer | Uint8Array, options?: TransformOptions & { authTagLength?: number }): Cipheriv {
-    const keyBuf = toBuffer(key);
-    const ivBuf = toBuffer(iv);
+export function createCipheriv(algorithm: string, key: KeyInput, iv: BinaryInput | null, options?: TransformOptions & { authTagLength?: number }): Cipheriv {
+    const keyBuf = toCipherKey(key);
     const a = algorithm.toLowerCase();
 
+    if (a.endsWith('-ecb')) {
+        const fns = getEcbFns(a);
+        if (iv !== null) throw new TypeError('Invalid initialization vector');
+        if (keyBuf.byteLength !== fns.keyLength) throw new RangeError('Invalid key length');
+        return new CipherTransform(makeEcbCipher(keyBuf, fns), options);
+    }
     if (isGcmAlgorithm(a)) {
-        return createCipherivGCM(a, keyBuf, ivBuf, options);
+        if (iv === null) throw new TypeError('Invalid initialization vector');
+        return createCipherivGCM(a, keyBuf, iv, options);
     }
 
     const fns = getCbcFns(a);
+    if (iv === null) throw new TypeError('Invalid initialization vector');
+    const ivBuf = toBuffer(iv);
     validateCbcKeyIv(keyBuf, ivBuf, fns);
     return new CipherTransform(makeCbcCipher(keyBuf, ivBuf, fns), options);
 }
 
-export function createDecipheriv(algorithm: string, key: ArrayBuffer | Uint8Array, iv: ArrayBuffer | Uint8Array, options?: TransformOptions & { authTagLength?: number }): Decipheriv {
-    const keyBuf = toBuffer(key);
-    const ivBuf = toBuffer(iv);
+export function createDecipheriv(algorithm: string, key: KeyInput, iv: BinaryInput | null, options?: TransformOptions & { authTagLength?: number }): Decipheriv {
+    const keyBuf = toCipherKey(key);
     const a = algorithm.toLowerCase();
 
+    if (a.endsWith('-ecb')) {
+        const fns = getEcbFns(a);
+        if (iv !== null) throw new TypeError('Invalid initialization vector');
+        if (keyBuf.byteLength !== fns.keyLength) throw new RangeError('Invalid key length');
+        return new CipherTransform(makeEcbDecipher(keyBuf, fns), options);
+    }
     if (isGcmAlgorithm(a)) {
-        return createDecipherivGCM(a, keyBuf, ivBuf, options);
+        if (iv === null) throw new TypeError('Invalid initialization vector');
+        return createDecipherivGCM(a, keyBuf, iv, options);
     }
 
     const fns = getCbcFns(a);
+    if (iv === null) throw new TypeError('Invalid initialization vector');
+    const ivBuf = toBuffer(iv);
     validateCbcKeyIv(keyBuf, ivBuf, fns);
     return new CipherTransform(makeCbcDecipher(keyBuf, ivBuf, fns), options);
 }
@@ -790,8 +904,8 @@ export function createDecipherAes256Cbc(
 
 // createCipheriv GCM
 
-export function createCipherivGCM(algorithm: string, key: ArrayBuffer | Uint8Array, iv: ArrayBuffer | Uint8Array, options?: TransformOptions & { authTagLength?: number }): CipherGCM {
-    const keyBuf = toBuffer(key);
+export function createCipherivGCM(algorithm: string, key: KeyInput, iv: BinaryInput, options?: TransformOptions & { authTagLength?: number }): CipherGCM {
+    const keyBuf = toCipherKey(key);
     const ivBuf = toBuffer(iv);
     if (!isGcmAlgorithm(algorithm)) {
         throw new Error(`Unsupported cipher algorithm: ${algorithm}`);
@@ -803,7 +917,7 @@ export function createCipherivGCM(algorithm: string, key: ArrayBuffer | Uint8Arr
     let ctag: Uint8Array | undefined;
 
     return new CipherTransform({
-        setAAD(aad: ArrayBuffer | Uint8Array) {
+        setAAD(aad: ArrayBuffer | ArrayBufferView) {
             gcm.setAAD(toExactArrayBuffer(toBuffer(aad)));
             return this;
         },
@@ -823,8 +937,8 @@ export function createCipherivGCM(algorithm: string, key: ArrayBuffer | Uint8Arr
     }, options);
 }
 
-export function createDecipherivGCM(algorithm: string, key: ArrayBuffer | Uint8Array, iv: ArrayBuffer | Uint8Array, options?: TransformOptions & { authTagLength?: number }): DecipherGCM {
-    const keyBuf = toBuffer(key);
+export function createDecipherivGCM(algorithm: string, key: KeyInput, iv: BinaryInput, options?: TransformOptions & { authTagLength?: number }): DecipherGCM {
+    const keyBuf = toCipherKey(key);
     const ivBuf = toBuffer(iv);
     if (!isGcmAlgorithm(algorithm)) {
         throw new Error(`Unsupported cipher algorithm: ${algorithm}`);
@@ -836,11 +950,11 @@ export function createDecipherivGCM(algorithm: string, key: ArrayBuffer | Uint8A
     let authTag: ArrayBuffer | null = null;
 
     return new CipherTransform({
-        setAAD(aad: ArrayBuffer | Uint8Array) {
+        setAAD(aad: ArrayBuffer | ArrayBufferView) {
             gcm.setAAD(toExactArrayBuffer(toBuffer(aad)));
             return this;
         },
-        setAuthTag(tag: ArrayBuffer | Uint8Array) {
+        setAuthTag(tag: ArrayBuffer | ArrayBufferView) {
             const tagBuffer = toBuffer(tag);
             validateGcmAuthTagLength(tagBuffer.byteLength);
             if (expectedAuthTagLength !== undefined && tagBuffer.byteLength !== expectedAuthTagLength) {
@@ -1733,13 +1847,20 @@ export function getHashes(): string[] {
 }
 
 export function getCiphers(): string[] {
-    return ['aes-128-cbc', 'aes-192-cbc', 'aes-256-cbc', 'aes-128-gcm', 'aes-192-gcm', 'aes-256-gcm'];
+    return [
+        'aes-128-cbc', 'aes-192-cbc', 'aes-256-cbc',
+        'aes-128-ecb', 'aes-192-ecb', 'aes-256-ecb',
+        'aes-128-gcm', 'aes-192-gcm', 'aes-256-gcm',
+    ];
 }
 
 const CIPHER_INFO: Record<string, CipherInfo> = {
     'aes-128-cbc': { name: 'aes-128-cbc', nid: 0, blockSize: 16, ivLength: 16, keyLength: 16, mode: 'cbc' },
     'aes-192-cbc': { name: 'aes-192-cbc', nid: 0, blockSize: 16, ivLength: 16, keyLength: 24, mode: 'cbc' },
     'aes-256-cbc': { name: 'aes-256-cbc', nid: 0, blockSize: 16, ivLength: 16, keyLength: 32, mode: 'cbc' },
+    'aes-128-ecb': { name: 'aes-128-ecb', nid: 0, blockSize: 16, ivLength: 0, keyLength: 16, mode: 'ecb' },
+    'aes-192-ecb': { name: 'aes-192-ecb', nid: 0, blockSize: 16, ivLength: 0, keyLength: 24, mode: 'ecb' },
+    'aes-256-ecb': { name: 'aes-256-ecb', nid: 0, blockSize: 16, ivLength: 0, keyLength: 32, mode: 'ecb' },
     'aes-128-gcm': { name: 'aes-128-gcm', nid: 0, blockSize: 1, ivLength: 12, keyLength: 16, mode: 'gcm' },
     'aes-192-gcm': { name: 'aes-192-gcm', nid: 0, blockSize: 1, ivLength: 12, keyLength: 24, mode: 'gcm' },
     'aes-256-gcm': { name: 'aes-256-gcm', nid: 0, blockSize: 1, ivLength: 12, keyLength: 32, mode: 'gcm' },

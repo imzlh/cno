@@ -374,6 +374,7 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
         this.response.statusCode = statusCode;
         if (typeof statusMessageOrHeaders === 'string') {
             // Empty string is not a real phrase — fill from STATUS_CODES like Node.
+            if (/[\r\n]/.test(statusMessageOrHeaders)) throw new TypeError('statusMessage must not contain CR/LF');
             this.response.statusMessage = statusMessageOrHeaders || reasonPhrase(statusCode);
             this.normalizeHeadersInput(headers);
         } else {

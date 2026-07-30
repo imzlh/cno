@@ -365,7 +365,7 @@ function _doFlush(stream: NodeZlibTransform, cb: TransformCallback) {
         cb(null, output.length > 0 ? output : undefined);
     } catch (err) {
         if (/already finished/i.test(asError(err).message)) {
-            cb();
+            cb(null);
             return;
         }
         cb(err);

@@ -256,7 +256,7 @@ export async function link(existingPath: PathLike, newPath: PathLike): Promise<v
 export async function symlink(target: PathLike, path: PathLike, type?: 'file' | 'dir' | 'junction'): Promise<void> {
     // Windows: DIR=1, JUNCTION=2, FILE=0 (no flags). SymlinkType enum lacks FILE,
     // so we use 0 for file symlinks which is the correct Windows API value.
-    const symlinkType: CModuleAsyncFS.SymlinkType = type === 'dir' ? asfs.SymlinkType.DIR : type === 'junction' ? asfs.SymlinkType.JUNCTION : 0;
+    const symlinkType: CModuleAsyncFS.SymlinkType = type === 'dir' ? asfs.FS_SYMLINK_DIR : type === 'junction' ? asfs.FS_SYMLINK_JUNCTION : 0;
     const pathStr = pathToString(path);
     await w(asfs.symlink(pathToString(target), pathStr, symlinkType), 'symlink', pathStr);
 }

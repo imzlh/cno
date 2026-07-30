@@ -121,6 +121,7 @@ export interface ChildProcess extends EventEmitter {
     readonly spawnfile: string;
     readonly killed: boolean;
     readonly connected: boolean;
+    kill(signal?: string | number): boolean;
 }
 
 // ChildProcess class

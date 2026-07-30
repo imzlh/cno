@@ -23,7 +23,7 @@ export function concatChunks(chunks: Uint8Array[]): Uint8Array<ArrayBuffer> {
     return arrayBufferBackedBytes(algorithm.bytesConcat(chunks));
 }
 
-export function viewToUint8Array(view: ArrayBufferView): Uint8Array {
+export function viewToUint8Array(view: ArrayBufferView): Uint8Array<ArrayBuffer> {
     if (view.buffer instanceof ArrayBuffer) return new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
     const bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
     const copy = new Uint8Array(bytes.byteLength);

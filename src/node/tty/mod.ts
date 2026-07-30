@@ -188,6 +188,7 @@ export class ReadStream extends Readable {
 export class WriteStream extends Writable {
     readonly fd: number;
     bytesWritten = 0;
+    isTTY = true;
     private handle: CModuleStreams.TTY;
     private owned = false;
     private currentSize: Size;

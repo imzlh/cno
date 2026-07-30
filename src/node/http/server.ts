@@ -19,12 +19,13 @@ import {
 } from '../_internal/network-debug';
 import { isTransportDisconnectError, normalizeErrnoError } from '../_internal/errno';
 import { viewToUint8Array } from '../_internal/buffer';
-import { ServerResponseAdapter } from '../_internal/server-response-adapter';
+import { ServerResponseAdapter, type ResponseAdapterServeHook } from '../_internal/server-response-adapter';
 import { dispatchServerRequest } from '../_internal/server-request-runtime';
 import { pumpIncomingRequestBody } from '../_internal/server-request-stream';
 import { emitNodeServerUpgrade } from '../_internal/server-upgrade';
 import type { IncomingHttpHeaders, OutgoingHttpHeader, OutgoingHttpHeaders, IncomingMessage, OutgoingMessage, ServerResponse, ListenOptions, Server, RequestListener, MessageSocket } from './types';
 import { IOpaque } from '../_internal/inject';
+import { STATUS_CODES } from './constants';
 export type { IncomingHttpHeaders, OutgoingHttpHeader, OutgoingHttpHeaders, IncomingMessage, OutgoingMessage, ServerResponse, ListenOptions, Server, RequestListener } from './types';
 type NativeHttpModule = typeof http & { __cno: IOpaque };
 
@@ -69,7 +70,7 @@ export function createWriteAfterEndError(): Error & { code: string } {
 
 function toBodyChunkBytes(chunk: unknown, encodeString: (value: string) => Uint8Array): Uint8Array {
     if (typeof chunk === 'string') return encodeString(chunk);
-    if (chunk instanceof Uint8Array) return chunk;
+    if (chunk instanceof Uint8Array) return chunk as Uint8Array;
     if (ArrayBuffer.isView(chunk)) return viewToUint8Array(chunk);
     if (chunk instanceof ArrayBuffer) return new Uint8Array(chunk);
     throw new TypeError('The "chunk" argument must be of type string or an instance of Buffer, TypedArray, DataView, or ArrayBuffer');
@@ -81,6 +82,7 @@ function normalizeEndArgs(
     cb?: () => void
 ): { chunk: unknown; callback?: () => void } {
     if (typeof chunk === 'function') {
+        // @ts-ignore - Function cast
         return { chunk: undefined, callback: chunk };
     }
     if (typeof encodingOrCb === 'function') {
@@ -330,8 +332,14 @@ OutgoingMessageImpl.prototype._requireHeadersNotSent = function _requireHeadersN
 
 OutgoingMessageImpl.prototype.setHeader = function setHeader(this: OutgoingMessageImpl, name: string, value: number | string | readonly string[]): OutgoingMessageImpl {
     this._requireHeadersNotSent();
+    validateHeaderName(name);
     const key = name.toLowerCase();
     this._headerNames.set(key, name);
+    if (Array.isArray(value)) {
+        for (const v of value) validateHeaderValue(name, String(v));
+    } else {
+        validateHeaderValue(name, String(value));
+    }
     this._headers[key] = value as OutgoingHttpHeader;
     return this;
 };
@@ -346,6 +354,9 @@ OutgoingMessageImpl.prototype.setHeaders = function setHeaders(this: OutgoingMes
 
 OutgoingMessageImpl.prototype.appendHeader = function appendHeader(this: OutgoingMessageImpl, name: string, value: string | readonly string[]): OutgoingMessageImpl {
     this._requireHeadersNotSent();
+    validateHeaderName(name);
+    const vals = Array.isArray(value) ? value : [value];
+    for (const v of vals) validateHeaderValue(name, String(v));
     const key = name.toLowerCase();
     const existing = this._headers[key];
     if (existing === undefined) {
@@ -468,7 +479,7 @@ Object.setPrototypeOf(ServerResponseImpl, OutgoingMessageImpl);
 ServerResponseImpl.prototype = Object.create(OutgoingMessageImpl.prototype);
 
 ServerResponseImpl.prototype.assignSocket = function assignSocket(this: ServerResponseImpl, socket: ServerSocketLike): void {
-    this.socket = socket;
+    this.socket = socket as MessageSocket;
     socket.once('close', () => {
         this.socket = null;
     });
@@ -488,6 +499,7 @@ ServerResponseImpl.prototype.writeHead = function writeHead(
 
     this.statusCode = statusCode;
     if (typeof statusMessageOrHeaders === 'string') {
+        if (/[\r\n]/.test(statusMessageOrHeaders)) throw new TypeError('statusMessage must not contain CR/LF');
         this.statusMessage = statusMessageOrHeaders || statusMessageFor(statusCode);
     } else {
         this.statusMessage = statusMessageFor(statusCode, this.statusMessage);
@@ -501,7 +513,12 @@ ServerResponseImpl.prototype.writeHead = function writeHead(
             }
         } else {
             for (const [key, value] of Object.entries(headers)) {
-                if (value !== undefined) this.setHeader(key, value);
+                if (value === undefined) continue;
+                if (typeof value === 'string' || typeof value === 'number') {
+                    this.setHeader(key, value);
+                } else {
+                    this.setHeader(key, value.map(String));
+                }
             }
         }
     }
@@ -622,7 +639,7 @@ class NodeResponseAdapter extends ServerResponseAdapter<ServerResponseImpl> {
             abort: () => {
                 try { coreResponse.close(); } catch { /* already closed */ }
             },
-        }, serveHook, {
+        }, serveHook as ResponseAdapterServeHook | null, {
             isBodyForbiddenStatus,
             createHeadersSentError,
             createWriteAfterEndError,
@@ -813,7 +830,15 @@ export class ServerImpl extends NetServer implements Server {
         }
         if (emitNodeServerUpgrade(this, res, incoming)) return;
 
-        pumpIncomingRequestBody(incoming, req.body);
+        pumpIncomingRequestBody(
+            incoming,
+            typeof req.body === 'function'
+                ? async () => {
+                    const chunk = await req.body!();
+                    return chunk === null ? null : viewToUint8Array(chunk);
+                }
+                : null,
+        );
 
         const adapter = new NodeResponseAdapter(response, res, serveHook, requestId, requestUrl, incoming.method === 'HEAD');
         await dispatchServerRequest({
@@ -827,7 +852,7 @@ export class ServerImpl extends NetServer implements Server {
             url: requestUrl,
             method: req.method,
             headers: requestHeaders,
-            postData: req.body instanceof Uint8Array ? req.body : undefined,
+            postData: undefined,
             callFrames: requestCallFrames,
             // Peer abort is not a server fault; never promote it to server 'error'.
             onError: (err) => {
@@ -837,13 +862,20 @@ export class ServerImpl extends NetServer implements Server {
         });
     }
 
-    private _handleNativeRequestError(err: Error, tcpSock: { socket?: CModuleStreams.TCP } | undefined): void {
+    private _handleNativeRequestError(err: Error, tcpSock: { socket?: unknown } | undefined): void {
         if (isTransportDisconnectError(err)) return;
         // H1 marks parse faults with this prefix (structured kind pending).
         // clientError is the Node-compatible surface for bad request lines.
         const message = String(err.message ?? err);
         if (message.startsWith('Parse error:')) {
-            const clientSocket = createAttachedSocketQuietly(tcpSock?.socket);
+            const transport = tcpSock?.socket;
+            const tcp = transport !== null
+                && typeof transport === 'object'
+                && 'setNoDelay' in transport
+                && 'setKeepAlive' in transport
+                ? transport as CModuleStreams.TCP
+                : undefined;
+            const clientSocket = createAttachedSocketQuietly(tcp);
             this.emit('clientError', err, clientSocket);
             return;
         }
@@ -855,7 +887,11 @@ export class ServerImpl extends NetServer implements Server {
             port: port ?? 0,
             hostname,
             keepAliveTimeout: this.keepAliveTimeout,
-            maxRequestsPerConnection: this.maxRequestsPerSocket > 0 ? this.maxRequestsPerSocket : Number.MAX_SAFE_INTEGER,
+            maxRequestsPerConnection: (
+                this.maxRequestsPerSocket != null && this.maxRequestsPerSocket > 0
+                    ? this.maxRequestsPerSocket
+                    : Number.MAX_SAFE_INTEGER
+            ),
             requestTimeout: this.requestTimeout,
         });
     }
@@ -902,6 +938,7 @@ export class ServerImpl extends NetServer implements Server {
     address(): AddressInfo | string | null {
         const addr = this._httpServer?.address();
         if (!addr) return super.address();
+        if ('path' in addr) return addr.path;
         return { address: addr.ip, family: addr.ip.includes(':') ? 'IPv6' : 'IPv4', port: addr.port };
     }
 }
@@ -917,7 +954,7 @@ export function validateHeaderName(name: string): void {
 }
 
 export function validateHeaderValue(name: string, value: string): void {
-    if (/[^\t\u0020-\u007E\u0080-\u00FF]/.test(value)) {
+    if (/[\x00-\x08\x0a-\x1f\x7f]/.test(value)) {
         throw new TypeError(`Invalid character in header content ["${name}"]`);
     }
 }

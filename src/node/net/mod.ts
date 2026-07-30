@@ -935,7 +935,7 @@ Socket.prototype._final = function _final(this: Socket, callback: (error?: Error
         };
         const onConnect = () => {
             cleanup();
-            this._final(callback);
+            Socket.prototype._final!.call(this, callback);
         };
         const onError = (err: Error) => settle(normalizeErrnoError(err, 'shutdown'));
         const onClose = () => settle();

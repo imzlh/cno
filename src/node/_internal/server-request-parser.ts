@@ -1,5 +1,6 @@
 const engine = import.meta.use('engine');
 const http = import.meta.use('http');
+const algorithm = import.meta.use('algorithm');
 
 import {
     appendIncomingHeader,
@@ -19,6 +20,10 @@ import {
 } from './server-request-stream';
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
+
+function concatUint8(a: Uint8Array, b: Uint8Array): Uint8Array {
+    return algorithm.bytesConcat([a, b]) as Uint8Array;
+}
 
 export interface ParsedServerRequest {
     requestId: string;
@@ -45,7 +50,8 @@ function toParserBuffer(chunk: Uint8Array): ArrayBuffer {
 
 function viewParserBuffer(buffer: CModuleHTTP.BufferSource): Uint8Array {
     if (buffer instanceof ArrayBuffer) return new Uint8Array(buffer);
-    return new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+    // Here, expect ArrayView<ArrayBuffer> that queued via `parser.execute()`
+    return new Uint8Array<ArrayBuffer>(buffer.buffer as ArrayBuffer, buffer.byteOffset, buffer.byteLength);
 }
 
 export function createServerRequestParser(options: ServerRequestParserOptions): { feed(chunk: Uint8Array): void } {
@@ -54,6 +60,7 @@ export function createServerRequestParser(options: ServerRequestParserOptions): 
     let currentHeaderField = '';
     let currentHeaderValue = '';
     let currentHeaderPart: 'field' | 'value' | null = null;
+    let pendingLeftover: Uint8Array | null = null;
 
     const decode = (buf: CModuleHTTP.BufferSource, off: number, len: number) =>
         engine.decodeString(viewParserBuffer(buf).subarray(off, off + len));
@@ -114,9 +121,20 @@ export function createServerRequestParser(options: ServerRequestParserOptions): 
 
     return {
         feed(chunk: Uint8Array): void {
-            const result = parser.execute(toParserBuffer(chunk));
+            // Prepend any bytes the parser could not consume on the previous call
+            // (a chunk that contained the tail of one request and the head of the
+            // next). Without this, coalesced/co-parsed bytes are silently dropped.
+            const buffered = pendingLeftover ? concatUint8(pendingLeftover, chunk) : chunk;
+            pendingLeftover = null;
+            const result = parser.execute(toParserBuffer(buffered));
             if (result.errno !== 0) {
-                options.onParseError?.(new Error('HTTP parse error'));
+                const consumed = Number(result.bytesConsumed ?? buffered.byteLength);
+                if (Number.isFinite(consumed) && consumed >= 0 && consumed < buffered.byteLength) {
+                    pendingLeftover = buffered.subarray(consumed);
+                }
+                if (result.name !== 'HPE_PAUSED_UPGRADE' && result.name !== 'HPE_PAUSED') {
+                    options.onParseError?.(new Error(`HTTP parse error: ${result.reason}`));
+                }
             }
         },
     };

@@ -232,15 +232,19 @@ export const {
     fs,
     crypto,
     zlib,
-    signals,
-    errno,
-    dlopen,
-    priority,
 } = constants as typeof constants & {
     os: typeof osConstants;
     fs: typeof fsConstants;
     crypto: typeof cryptoConstants;
     zlib: typeof zlibConstants;
 };
+
+// Node keeps these grouped under os.constants; re-export for constants.signals etc.
+export const {
+    signals,
+    errno,
+    dlopen,
+    priority,
+} = osConstants;
 
 export default constants;

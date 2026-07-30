@@ -108,6 +108,13 @@ export function tracingChannel(name: string): TracingChannel {
     if (typeof name !== 'string') {
         throw new TypeError('The "nameOrChannels" argument must be of type string');
     }
+    const traceHasSubscribers = (): boolean =>
+        trace.start.hasSubscribers
+        || trace.end.hasSubscribers
+        || trace.asyncStart.hasSubscribers
+        || trace.asyncEnd.hasSubscribers
+        || trace.error.hasSubscribers;
+
     const trace = {
         start: channel(`tracing:${name}:start`),
         end: channel(`tracing:${name}:end`),
@@ -129,7 +136,7 @@ export function tracingChannel(name: string): TracingChannel {
             return done;
         },
         traceSync<T>(fn: (...args: unknown[]) => T, context: Record<string, unknown> = {}, thisArg?: unknown, ...args: unknown[]): T {
-            if (!trace.hasSubscribers) return fn.apply(thisArg, args);
+            if (!traceHasSubscribers()) return fn.apply(thisArg, args);
             trace.start.publish(context);
             try {
                 const result = fn.apply(thisArg, args);
@@ -144,7 +151,7 @@ export function tracingChannel(name: string): TracingChannel {
             }
         },
         tracePromise<T>(fn: (...args: unknown[]) => T | PromiseLike<T>, context: Record<string, unknown> = {}, thisArg?: unknown, ...args: unknown[]): Promise<T> {
-            if (!trace.hasSubscribers) return Promise.resolve(fn.apply(thisArg, args));
+            if (!traceHasSubscribers()) return Promise.resolve(fn.apply(thisArg, args));
             trace.start.publish(context);
             let promise: Promise<T>;
             try {
@@ -173,7 +180,7 @@ export function tracingChannel(name: string): TracingChannel {
             );
         },
         traceCallback<T>(fn: (...args: unknown[]) => T, position = -1, context: Record<string, unknown> = {}, thisArg?: unknown, ...args: unknown[]): T {
-            if (!trace.hasSubscribers) return fn.apply(thisArg, args);
+            if (!traceHasSubscribers()) return fn.apply(thisArg, args);
             const index = position < 0 ? args.length + position : position;
             const callback = args[index];
             if (typeof callback !== 'function') {
@@ -206,13 +213,7 @@ export function tracingChannel(name: string): TracingChannel {
         },
     };
     return Object.defineProperty(trace, 'hasSubscribers', {
-        get() {
-            return trace.start.hasSubscribers
-                || trace.end.hasSubscribers
-                || trace.asyncStart.hasSubscribers
-                || trace.asyncEnd.hasSubscribers
-                || trace.error.hasSubscribers;
-        },
+        get: traceHasSubscribers,
         enumerable: true,
         configurable: true,
     }) as TracingChannel;

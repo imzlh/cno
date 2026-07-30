@@ -345,7 +345,7 @@ export function compileFunction(code: string, params?: string[], options?: { fil
     }
 
     const state = getContextState(compileContext.context);
-    const fn = state.sandbox.call(buildFunctionExpression(code, params ?? []), options.filename ?? 'vm.js');
+    const fn = state.sandbox.call(buildFunctionExpression(code, params ?? []), options?.filename ?? 'vm.js');
     if (typeof fn !== 'function') {
         throw new TypeError('Failed to compile function');
     }

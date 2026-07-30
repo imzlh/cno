@@ -55,15 +55,15 @@ export interface Decipheriv extends Transform {
 }
 
 export interface CipherGCM extends Cipheriv {
-    setAAD(aad: ArrayBuffer | Uint8Array): CipherGCM;
+    setAAD(aad: ArrayBuffer | ArrayBufferView): CipherGCM;
     update(data: BinaryInput, inputEncoding?: string, outputEncoding?: string): Uint8Array | string;
     final(outputEncoding?: string): Uint8Array | string;
     getAuthTag(): Uint8Array;
 }
 
 export interface DecipherGCM extends Decipheriv {
-    setAAD(aad: ArrayBuffer | Uint8Array): DecipherGCM;
-    setAuthTag(tag: ArrayBuffer | Uint8Array): DecipherGCM;
+    setAAD(aad: ArrayBuffer | ArrayBufferView): DecipherGCM;
+    setAuthTag(tag: ArrayBuffer | ArrayBufferView): DecipherGCM;
     update(data: BinaryInput, inputEncoding?: string, outputEncoding?: string): Uint8Array | string;
     final(outputEncoding?: string): Uint8Array | string;
 }

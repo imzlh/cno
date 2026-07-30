@@ -492,7 +492,7 @@ interface HttpsClientRequest extends OutgoingMessageImpl, ClientRequestState<TLS
     _timeoutId: number | null;
     _requestBody: Uint8Array[];
     _bodySent: boolean;
-    _tcp: Socket | null;
+    _tcp: CModuleStreams.TCP | null;
     _requestId: string;
     _requestCallFrames: ClientRequestState<TLSSocket>['_requestCallFrames'];
     _abortHandler: (() => void) | null;
