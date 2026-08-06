@@ -92,6 +92,71 @@ function readNumber(row: CModuleSQLite3.SqliteRow, column: string): number {
     throw new TypeError(`Expected number column: ${column}`);
 }
 
+/**
+ * Split a path into a filesystem root that already exists and the segments that
+ * may need creating.
+ *
+ * The root is never passed to mkdir. On Windows a bare drive spec is not a
+ * creatable directory: `mkdir("C:")` fails EACCES and `mkdir("C:/")` fails
+ * EACCES, so treating "C:" as an ordinary segment made every absolute path
+ * fail to open. `fs.exists("C:")` also reports false, so an exists() guard is
+ * not enough on its own.
+ *
+ * Handles: verbatim (`//?/D:/...`, `//./...`), UNC (`//server/share/...`),
+ * drive-absolute (`C:/...`), drive-relative (`C:foo` -> root "C:"),
+ * POSIX absolute (`/...`) and relative paths.
+ */
+function splitMkdirPath(posix: string): { root: string; parts: string[] } {
+    const split = (rest: string): string[] => rest.split('/').filter(Boolean);
+
+    // Verbatim / device namespace: \\?\D:\x, \\?\UNC\server\share\x, \\.\pipe\x
+    const verbatim = posix.match(/^\/\/[?.]\//);
+    if (verbatim) {
+        const body = posix.slice(verbatim[0].length);
+        const unc = body.match(/^UNC\/[^/]+\/[^/]+/i);
+        if (unc) {
+            return { root: `${verbatim[0]}${unc[0]}/`, parts: split(body.slice(unc[0].length)) };
+        }
+        const drive = body.match(/^[a-zA-Z]:(?:\/|$)/);
+        if (drive) {
+            return { root: `${verbatim[0]}${drive[0].replace(/\/?$/, '/')}`, parts: split(body.slice(drive[0].length)) };
+        }
+        // Unknown device path: do not attempt to create anything under it.
+        return { root: posix, parts: [] };
+    }
+
+    // UNC share root: //server/share is not creatable.
+    const unc = posix.match(/^\/\/[^/]+\/[^/]+/);
+    if (unc) {
+        return { root: `${unc[0]}/`, parts: split(posix.slice(unc[0].length)) };
+    }
+
+    const drive = posix.match(/^[a-zA-Z]:(?:\/|$)/);
+    if (drive) {
+        // "C:/x" -> root "C:/". Keep the trailing slash so the first segment is
+        // anchored at the drive root rather than the drive's current directory.
+        return { root: drive[0].replace(/\/?$/, '/'), parts: split(posix.slice(drive[0].length)) };
+    }
+
+    // Drive-relative, e.g. "C:foo" means "foo relative to CWD on C:".
+    const driveRelative = posix.match(/^[a-zA-Z]:/);
+    if (driveRelative) {
+        return { root: driveRelative[0], parts: split(posix.slice(driveRelative[0].length)) };
+    }
+
+    if (posix.startsWith('/')) return { root: '/', parts: split(posix) };
+    return { root: '', parts: split(posix) };
+}
+
+/** True when path is a directory right now (used after a losing mkdir race). */
+function isExistingDir(path: string): boolean {
+    try {
+        return fs.stat(path).isDirectory;
+    } catch {
+        return false;
+    }
+}
+
 export class KvDatabase {
     private db: CModuleSQLite3.Sqlite3Handle | null = null;
     private path: string;
@@ -135,16 +200,22 @@ export class KvDatabase {
     private mkdirRecursive(path: string): void {
         if (!path || path === '.') return;
 
-        const normalized = toPosixPath(path);
-        const parts = normalized.split('/').filter(p => p);
-        let current = normalized.startsWith('/') ? '/' : '';
+        const { root, parts } = splitMkdirPath(toPosixPath(path));
+        // `root` is a filesystem root (drive, UNC share, verbatim prefix or "/").
+        // It always already exists and must never be passed to mkdir: on Windows
+        // `mkdir("C:")` fails with EACCES, which used to make every absolute path
+        // unopenable.
+        let current = root;
 
         for (const part of parts) {
-            current += part;
-            if (!fs.exists(current)) {
+            current = current === '' || current.endsWith('/') ? `${current}${part}` : `${current}/${part}`;
+            if (fs.exists(current)) continue;
+            try {
                 fs.mkdir(current, 0o755);
+            } catch (e) {
+                // Tolerate a concurrent creator, but only if a directory is there now.
+                if (!isExistingDir(current)) throw e;
             }
-            current += '/';
         }
     }
 

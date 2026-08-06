@@ -12,6 +12,31 @@ const asyncfs = import.meta.use('asyncfs');
 
 const kInternal = Symbol('Deno.internal');
 
+/**
+ * Lifecycle event dispatch, via the shared multiplexer.
+ *
+ * Loaded dynamically and tolerantly for the same reason webapi does it
+ * (cno/src/webapi/index.ts): cno/src/deno has no build-time dependency on cts,
+ * and a standalone cno without the cts layer must still run its test harness —
+ * just without the 'load'/'unload' events, which is the pre-existing behaviour.
+ */
+type LifecycleMux = {
+    dispatchLoadEvent(): boolean;
+    dispatchUnloadEvent(): boolean;
+};
+
+let lifecycleMux: LifecycleMux | null | undefined;
+
+async function loadLifecycleMux(): Promise<LifecycleMux | null> {
+    if (lifecycleMux !== undefined) return lifecycleMux;
+    try {
+        lifecycleMux = await import('../../../cts/src/runtime/event-mux') as LifecycleMux;
+    } catch {
+        lifecycleMux = null;
+    }
+    return lifecycleMux;
+}
+
 // ─── Snapshot helpers ────────────────────────────────────────────────────────
 
 async function mkdirQuietly(path: string): Promise<void> {
@@ -22,12 +47,21 @@ async function mkdirQuietly(path: string): Promise<void> {
     }
 }
 
+/** Percent-decode, but keep malformed sequences literal like upstream Deno does. */
+function decodeUrlPathTolerant(raw: string): string {
+    try {
+        return decodeURIComponent(raw);
+    } catch {
+        return raw;
+    }
+}
+
 function urlToFsPath(url: string): string {
     if (url.startsWith('file:///')) {
-        const raw = url.slice(7); // keep leading '/'
+        const raw = decodeUrlPathTolerant(url.slice(7)); // keep leading '/'
         // On Windows: file:///C:/path → /C:/path → C:/path
-        if (/^\/[A-Za-z]:\//.test(raw)) return raw.slice(1).replace(/\//g, '\\');
-        return decodeURIComponent(raw);
+        if (/^\/[A-Za-z]:[\\/]/.test(raw)) return raw.slice(1).replace(/\//g, '\\');
+        return raw;
     }
     return url;
 }
@@ -190,15 +224,23 @@ function notSupported(): never {
 
 function toDenoSystemName(name: string): string {
     if (name.includes('MINGW') || name == 'Windows_NT') return 'windows';
-    if (name == 'macOS') return 'darwin';
+    // uname reports 'Darwin' on macOS — 'macOS' is never a uname sysname.
+    if (name == 'Darwin' || name == 'macOS') return 'darwin';
+    if (name == 'FreeBSD') return 'freebsd';
+    if (name == 'NetBSD') return 'netbsd';
     return 'linux';
+}
+
+/** Deno.build.arch is only ever 'x86_64' or 'aarch64' — normalize uname names. */
+function toDenoArch(arch: string): string {
+    if (arch === 'x86_64' || arch === 'x64' || arch === 'amd64' || arch === 'AMD64') return 'x86_64';
+    if (arch === 'aarch64' || arch === 'arm64' || arch === 'ARM64') return 'aarch64';
+    return arch;
 }
 
 /** Map uname.machine + toDenoSystemName to a standard Rust-style target triple. */
 function toDenoTarget(arch: string, os: string): string {
-    const a = arch === 'x86_64' || arch === 'x64' ? 'x86_64'
-            : arch === 'aarch64' || arch === 'arm64' ? 'aarch64'
-            : arch;
+    const a = toDenoArch(arch);
     if (os === 'windows') return `${a}-pc-windows-msvc`;
     if (os === 'darwin')   return `${a}-apple-darwin`;
     return `${a}-unknown-linux-gnu`;
@@ -663,6 +705,27 @@ function createBenchFunction(): BenchFunction {
 }
 
 export async function startTest(contextName = '<core>', test = true, bench = true, options: StartTestOptions = {}) {
+    // Deno fires the global 'load' event before the suite runs and 'unload'
+    // after it finishes (measured against 2.9.3: `load`, then the test bodies,
+    // then `unload`). Neither happened here.
+    //
+    // 'load' was not merely displaced by the single-slot engine.onEvent setter —
+    // it was unreachable. The native EV_LOAD is dispatched by
+    // TJS_EvalModuleContent (circu.js/src/utils.c:469) for the C-level main
+    // module, i.e. cno's own bootstrap, long before a test file exists. And
+    // 'unload' rides on EV_EXIT, which only fires via os.exit/TJS_Stop
+    // (mod_os.c:87, vm.c:282) — never on loop drain — so a test run that simply
+    // finished never produced one.
+    //
+    // Both helpers are idempotent, so reaching this alongside the dispatch in
+    // src/commands/run.ts cannot double-fire, and dispatchUnloadEvent() stands
+    // down if a test called Deno.exit() and webapi already fired 'unload' off
+    // EV_EXIT.
+    //
+    // This is what makes `addEventListener('load')` able to arm state (a timer,
+    // a server) that the tests then rely on, and 'unload' able to release it.
+    if (test) (await loadLifecycleMux())?.dispatchLoadEvent();
+
     // reportError / uncaught errors during a test fail the suite (specs/test/report_error).
     // Listeners may preventDefault on cancelable ErrorEvents (reportError is cancelable).
     let suiteUncaught: Error | null = null;
@@ -844,6 +907,16 @@ export async function startTest(contextName = '<core>', test = true, bench = tru
     } finally {
         if (test) {
             try { globalThis.removeEventListener('error', onSuiteError); } catch { /* */ }
+            // 'unload' after the suite, matching Deno. In the finally so it also
+            // fires when the suite throws.
+            //
+            // This is load-bearing beyond event parity: a 'load' listener that
+            // armed a setInterval pins the event loop, and clearing it is
+            // exactly what the 'unload' listener exists to do. With no unload,
+            // such a run hangs instead of exiting
+            // (tests/deno/test-harness.test.ts 'load before suite and unload
+            // after').
+            try { lifecycleMux?.dispatchUnloadEvent(); } catch { /* a listener threw; not fatal */ }
         }
     }
 }
@@ -917,7 +990,7 @@ Object.defineProperty(globalThis, "Deno", {
             setDenoExitCode(value);
         },
         build: {
-            arch: uname.machine,
+            arch: toDenoArch(uname.machine),
             os: toDenoSystemName(uname.sysname),
             standalone: false,
             target: toDenoTarget(uname.machine, toDenoSystemName(uname.sysname)),
@@ -1060,10 +1133,13 @@ Object.defineProperty(globalThis, "Deno", {
 
         uid() {
             // Mirrors the host user record; suid effective IDs are not exposed.
-            return os.userInfo.userId;
+            // Windows has no uid/gid, and upstream Deno returns null there.
+            const id = os.userInfo.userId;
+            return id < 0 ? null : id;
         },
         gid() {
-            return os.userInfo.groupId;
+            const id = os.userInfo.groupId;
+            return id < 0 ? null : id;
         },
 
         test: createTestFunction(),

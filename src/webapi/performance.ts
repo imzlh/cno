@@ -307,6 +307,11 @@ class PerformanceObserver {
     #observedTypes = new Set<PerformanceEntryType>();
     #connected = false;
     #buffered = false;
+    // Node latches an observer into single (`type`) or multiple (`entryTypes`)
+    // observation mode on the first observe() and refuses to switch until
+    // disconnect(). Tracked separately from #connected because the latch is set
+    // before any validation that might throw, so a rejected call still latches.
+    #observationType: 'single' | 'multiple' | undefined = undefined;
 
     static supportedEntryTypes: PerformanceEntryType[] = [
         'mark',
@@ -325,32 +330,75 @@ class PerformanceObserver {
         this.#callback = callback;
     }
 
-    observe(options: PerformanceObserverInit): void {
-        if (!options || typeof options !== 'object') {
-            throw new TypeError('Options must be an object');
+    observe(options: PerformanceObserverInit = {}): void {
+        if (options === null || typeof options !== 'object') {
+            throw Object.assign(
+                new TypeError('The "options" argument must be of type object.'),
+                { code: 'ERR_INVALID_ARG_TYPE' }
+            );
         }
 
         const { entryTypes, type, buffered } = options;
 
-        if (entryTypes && type) {
-            throw new TypeError('Cannot specify both entryTypes and type');
+        // Order matters and matches Node: missing-args, then mutual exclusion,
+        // then the mode latch, then the shape check. The latch happens *before*
+        // the array check, so `{ entryTypes: 'mark' }` throws yet still leaves
+        // the observer in multiple-observation mode.
+        if (entryTypes === undefined && type === undefined) {
+            throw Object.assign(
+                new TypeError('The "options.entryTypes" and "options.type" arguments must be specified'),
+                { code: 'ERR_MISSING_ARGS' }
+            );
         }
 
-        if (!entryTypes && !type) {
-            throw new TypeError('Must specify either entryTypes or type');
+        if (entryTypes != null && type != null) {
+            throw Object.assign(
+                new TypeError("The property 'options.entryTypes' options.entryTypes can not set with options.type together."),
+                { code: 'ERR_INVALID_ARG_VALUE' }
+            );
         }
 
-        const types = entryTypes ?? (type ? [type] : []);
+        if (this.#observationType === undefined) {
+            this.#observationType = entryTypes !== undefined ? 'multiple' : 'single';
+        } else if (this.#observationType === 'single' && entryTypes !== undefined) {
+            throw new DOMException(
+                'PerformanceObserver can not change to multiple observations',
+                'InvalidModificationError'
+            );
+        } else if (this.#observationType === 'multiple' && type !== undefined) {
+            throw new DOMException(
+                'PerformanceObserver can not change to single observation',
+                'InvalidModificationError'
+            );
+        }
 
-        for (const entryType of types) {
-            if (!PerformanceObserver.supportedEntryTypes.includes(entryType)) {
-                console.warn(`Unsupported entry type: ${entryType}`);
-                continue;
+        if (this.#observationType === 'multiple') {
+            if (!Array.isArray(entryTypes)) {
+                throw Object.assign(
+                    new TypeError(`The "options.entryTypes" property must be string[]. Received type ${typeof entryTypes}`),
+                    { code: 'ERR_INVALID_ARG_TYPE' }
+                );
             }
-            this.#observedTypes.add(entryType);
+            // Node replaces the observed set rather than accumulating, ignores
+            // `buffered` in this mode, and skips unsupported types silently.
+            this.#observedTypes.clear();
+            for (const entryType of entryTypes) {
+                if (PerformanceObserver.supportedEntryTypes.includes(entryType)) {
+                    this.#observedTypes.add(entryType);
+                }
+            }
+            this.#buffered = false;
+        } else {
+            if (!PerformanceObserver.supportedEntryTypes.includes(type as PerformanceEntryType)) return;
+            this.#observedTypes.add(type as PerformanceEntryType);
+            this.#buffered = buffered ?? false;
         }
 
-        this.#buffered = buffered ?? false;
+        if (this.#observedTypes.size === 0) {
+            this.disconnect();
+            return;
+        }
+
         this.#connected = true;
 
         const perf = currentPerformance();
@@ -365,6 +413,11 @@ class PerformanceObserver {
     }
 
     disconnect(): void {
+        // Cleared unconditionally: Node's disconnect() has no early return, and
+        // an observer whose every observe() call threw is never #connected, so
+        // guarding this would leave the latch stuck forever.
+        this.#observationType = undefined;
+
         if (!this.#connected) return;
 
         this.#connected = false;

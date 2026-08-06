@@ -10,18 +10,16 @@ import { concatChunks } from '../_internal/buffer';
 
 const WIRE_VERSION = 1;
 const HEADER_BYTES = Uint8Array.from([0x43, 0x54, 0x53, 0x56, 0x38, WIRE_VERSION]);
-const NativePromise = globalThis.Promise;
 type HookCallable = (...args: never[]) => unknown;
 type UnknownCallable = (...args: unknown[]) => unknown;
+type NativeHook = (state: number, promise: Promise<unknown>, parent?: Promise<unknown>) => void;
 
 let cachedFlags = '';
-let promiseHookInstalled = false;
 
 const initHooks = new Set<(promise: Promise<unknown>, parent?: Promise<unknown>) => void>();
 const beforeHooks = new Set<(promise: Promise<unknown>) => void>();
 const afterHooks = new Set<(promise: Promise<unknown>) => void>();
 const settledHooks = new Set<(promise: Promise<unknown>) => void>();
-const trackedPromises = new WeakSet<Promise<unknown>>();
 
 function fnv1a32(input: string): number {
     return algorithm.fnv1a32(engine.encodeString(input));
@@ -88,106 +86,93 @@ function invokeHookSet<T extends (...args: never[]) => unknown>(hooks: Set<T>, .
     for (const hook of hooks) Reflect.apply(hook, undefined, args);
 }
 
+// engine.PromiseState — CONSTRUCT / BEFORE_THEN / AFTER_THEN / FULFILLED.
+const STATE_CONSTRUCT = 0;
+const STATE_BEFORE = 1;
+const STATE_AFTER = 2;
+const STATE_SETTLED = 3;
+
+let dispatcher: NativeHook | null = null;
+let previousHook: NativeHook | null = null;
+
+function readNativeHook(): NativeHook | null {
+    const existing: unknown = engine.promiseHook();
+    return typeof existing === 'function' ? (existing as NativeHook) : null;
+}
+
+/**
+ * Dispatches through the native `engine.promiseHook` (single-slot, so the
+ * previous hook is chained). Replacing `globalThis.Promise` with a subclass
+ * cannot work: `Promise.prototype.then` species-constructs the result, so the
+ * subclass constructor re-enters itself unboundedly.
+ */
 function installPromiseHookDispatcher(): void {
-    if (promiseHookInstalled) return;
-    const trackPromise = (promise: Promise<unknown>, parent?: Promise<unknown>) => {
-        if (trackedPromises.has(promise)) return;
-        trackedPromises.add(promise);
-        invokeHookSet(initHooks, promise, parent);
-        NativePromise.prototype.then.call(
-            promise,
-            (value: unknown) => {
-                invokeHookSet(settledHooks, promise);
-                return value;
-            },
-            (error: unknown) => {
-                invokeHookSet(settledHooks, promise);
-                throw error;
-            },
-        );
+    if (dispatcher) return;
+    previousHook = readNativeHook();
+    dispatcher = (state: number, promise: Promise<unknown>, parent?: Promise<unknown>) => {
+        if (previousHook) {
+            try {
+                previousHook(state, promise, parent);
+            } catch {
+                // a foreign hook must not break ours
+            }
+        }
+        switch (state) {
+            case STATE_CONSTRUCT: return invokeHookSet(initHooks, promise, parent);
+            case STATE_BEFORE: return invokeHookSet(beforeHooks, promise);
+            case STATE_AFTER: return invokeHookSet(afterHooks, promise);
+            case STATE_SETTLED: return invokeHookSet(settledHooks, promise);
+        }
     };
+    engine.promiseHook(dispatcher);
+}
 
-    class HookedPromise<T> extends NativePromise<T> {
-        constructor(executor: ConstructorParameters<PromiseConstructor>[0]) {
-            super(executor);
-            trackPromise(this);
-        }
-
-        then<TResult1 = T, TResult2 = never>(
-            onFulfilled?: ((value: T) => TResult1 | PromiseLike<TResult1>) | null,
-            onRejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
-        ): Promise<TResult1 | TResult2> {
-            let continuation: Promise<unknown> | undefined;
-            const wrapFulfilled = (
-                callback: ((value: T) => TResult1 | PromiseLike<TResult1>) | null | undefined,
-            ): ((value: T) => TResult1 | PromiseLike<TResult1>) | undefined => {
-                if (typeof callback !== 'function') return callback ?? undefined;
-                return function(this: unknown, value: T) {
-                    if (continuation) invokeHookSet(beforeHooks, continuation);
-                    try {
-                        return Reflect.apply(callback, this, [value]) as TResult1 | PromiseLike<TResult1>;
-                    } finally {
-                        if (continuation) invokeHookSet(afterHooks, continuation);
-                    }
-                };
-            };
-            const wrapRejected = (
-                callback: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null | undefined,
-            ): ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | undefined => {
-                if (typeof callback !== 'function') return callback ?? undefined;
-                return function(this: unknown, reason: unknown) {
-                    if (continuation) invokeHookSet(beforeHooks, continuation);
-                    try {
-                        return Reflect.apply(callback, this, [reason]) as TResult2 | PromiseLike<TResult2>;
-                    } finally {
-                        if (continuation) invokeHookSet(afterHooks, continuation);
-                    }
-                };
-            };
-
-            const wrappedFulfilled = wrapFulfilled(onFulfilled);
-            const wrappedRejected = wrapRejected(onRejected);
-            const result = super.then(
-                wrappedFulfilled,
-                wrappedRejected,
-            );
-            continuation = result as Promise<unknown>;
-            trackPromise(continuation, this);
-            return result as Promise<TResult1 | TResult2>;
-        }
-    }
-
-    globalThis.Promise = HookedPromise as PromiseConstructor;
-    promiseHookInstalled = true;
+function uninstallPromiseHookDispatcher(): void {
+    if (!dispatcher) return;
+    if (initHooks.size || beforeHooks.size || afterHooks.size || settledHooks.size) return;
+    dispatcher = null;
+    // The native slot holds exactly one hook; hand it back to whoever had it.
+    engine.promiseHook(previousHook ?? (() => {}));
+    previousHook = null;
 }
 
 function addHook<T extends HookCallable>(name: string, target: Set<T>, callback: T): () => void {
     ensureHookCallback(name, callback);
     installPromiseHookDispatcher();
     target.add(callback);
+    let stopped = false;
     return () => {
+        if (stopped) return;
+        stopped = true;
         target.delete(callback);
+        uninstallPromiseHookDispatcher();
     };
 }
 
 export function getHeapStatistics(): Record<string, number> {
     const mem = os.memoryUsage();
+    const jsUsed = mem['vm.used'] ?? 0;
+    const allocated = mem.used ?? 0;
+    const rss = mem['os.rss'] ?? 0;
+    // QuickJS reports limit 0 when no --memory-limit was given; fall back to
+    // physical RAM so callers computing headroom get a usable number.
+    const limit = mem.limit || mem['os.total'] || 0;
     return {
-        total_heap_size: mem.used,
+        total_heap_size: allocated,
         total_heap_size_executable: 0,
-        total_physical_size: mem['vm.used'] ?? 0,
-        total_available_size: mem['os.free'] ?? 0,
-        used_heap_size: mem['vm.used'] ?? 0,
-        heap_size_limit: 0,
-        malloced_memory: 0,
+        total_physical_size: allocated,
+        total_available_size: limit > allocated ? limit - allocated : 0,
+        used_heap_size: jsUsed,
+        heap_size_limit: limit,
+        malloced_memory: mem['buffer.used'] ?? 0,
         peak_malloced_memory: 0,
         does_zap_garbage: 0,
         number_of_native_contexts: 1,
         number_of_detached_contexts: 0,
         total_global_handles_size: 0,
         used_global_handles_size: 0,
-        external_memory: mem['os.total'] ?? 0,
-        total_allocated_bytes: mem.used,
+        // Memory held outside the JS heap, not total system RAM.
+        external_memory: rss > allocated ? rss - allocated : 0,
     };
 }
 
@@ -196,23 +181,34 @@ export function getHeapSpaceStatistics(): Array<{
     space_available_size: number; physical_space_size: number;
 }> {
     const mem = os.memoryUsage();
-    const used = mem['vm.used'] ?? 0;
-    return [{
-        space_name: 'new_space',
-        space_size: used,
-        space_used_size: used,
-        space_available_size: 0,
-        physical_space_size: used,
-    }];
+    const allocated = mem.used ?? 0;
+    const jsUsed = mem['vm.used'] ?? 0;
+    // QuickJS has one unified heap; report it as old_space and keep the other
+    // V8 space names present-but-empty so shape-walking callers still work.
+    return [
+        { space_name: 'read_only_space', space_size: 0, space_used_size: 0, space_available_size: 0, physical_space_size: 0 },
+        { space_name: 'new_space', space_size: 0, space_used_size: 0, space_available_size: 0, physical_space_size: 0 },
+        {
+            space_name: 'old_space',
+            space_size: allocated,
+            space_used_size: jsUsed,
+            space_available_size: allocated > jsUsed ? allocated - jsUsed : 0,
+            physical_space_size: allocated,
+        },
+        { space_name: 'code_space', space_size: 0, space_used_size: 0, space_available_size: 0, physical_space_size: 0 },
+        { space_name: 'large_object_space', space_size: 0, space_used_size: 0, space_available_size: 0, physical_space_size: 0 },
+    ];
 }
 
 export function getHeapCodeStatistics(): {
-    code_and_metadata_size: number; bytecode_and_metadata_size: number; external_script_source_size: number;
+    code_and_metadata_size: number; bytecode_and_metadata_size: number;
+    external_script_source_size: number; cpu_profiler_metadata_size: number;
 } {
     return {
         code_and_metadata_size: 0,
         bytecode_and_metadata_size: 0,
         external_script_source_size: 0,
+        cpu_profiler_metadata_size: 0,
     };
 }
 
@@ -247,7 +243,10 @@ export class Serializer {
 
     writeValue(val: unknown): boolean {
         this.writeHeader();
-        const encoded = engine.serialize(val);
+        // prepare() lives here, not in the module-level serialize(), so the
+        // class API and v8.serialize() encode the same graph. Applying it twice
+        // would re-walk the boxed forms as plain objects and drop them.
+        const encoded = engine.serialize(prepare(val));
         this.writeUint32(encoded.byteLength);
         this._push(encoded);
         return true;
@@ -327,7 +326,7 @@ export class Deserializer {
         }
         const length = this.readUint32();
         const bytes = this._readBytes(length);
-        return engine.deserialize(new Uint8Array(bytes));
+        return restore(engine.deserialize(new Uint8Array(bytes)));
     }
 
     transferArrayBuffer(id: number, arrayBuffer: ArrayBuffer): void {
@@ -366,34 +365,195 @@ export class Deserializer {
 
 export class DefaultDeserializer extends Deserializer {}
 
-function containsFunction(value: unknown, seen = new WeakSet<object>()): boolean {
-    if (typeof value === 'function') return true;
-    if (!value || typeof value !== 'object') return false;
-    if (seen.has(value)) return false;
-    seen.add(value);
-    if (Array.isArray(value)) return value.some((item) => containsFunction(item, seen));
+const BOX = Symbol.for('cno.v8.box');
+type Boxed = { [BOX]: string; [key: string]: unknown };
+
+function isBoxed(value: unknown): value is Boxed {
+    return !!value && typeof value === 'object' && typeof Reflect.get(value, BOX) === 'string';
+}
+
+function cloneError(err: Error): Boxed {
+    const extra: Record<string, unknown> = {};
+    for (const key of Object.keys(err)) {
+        if (key === 'message' || key === 'stack') continue;
+        extra[key] = Reflect.get(err, key);
+    }
+    return { [BOX]: 'error', name: String(err.name), message: String(err.message), stack: err.stack, extra };
+}
+
+function errorByName(name: string): new (message?: string) => Error {
+    switch (name) {
+        case 'EvalError': return EvalError;
+        case 'RangeError': return RangeError;
+        case 'ReferenceError': return ReferenceError;
+        case 'SyntaxError': return SyntaxError;
+        case 'TypeError': return TypeError;
+        case 'URIError': return URIError;
+        default: return Error;
+    }
+}
+
+/**
+ * engine.serialize cannot represent Error/DataView, throws on own accessor
+ * properties, densifies sparse arrays and drops non-index array properties.
+ * `prepare` rewrites those into plain boxed forms; `restore` reverses it.
+ * A WeakMap keeps cycles and shared identity intact.
+ */
+function prepare(value: unknown, seen = new WeakMap<object, unknown>()): unknown {
+    if (typeof value === 'function') {
+        throw dataCloneError(String(value));
+    }
+    if (typeof value === 'symbol') {
+        throw dataCloneError(String(value));
+    }
+    if (!value || typeof value !== 'object') return value;
+    if (seen.has(value)) return seen.get(value);
+
+    if (value instanceof Date || value instanceof RegExp || value instanceof ArrayBuffer) return value;
+    // Boxed primitives are handled natively; rebuilding them would flatten
+    // them into plain objects.
+    if (value instanceof Number || value instanceof String || value instanceof Boolean) return value;
+
+    if (value instanceof Error) {
+        const box = cloneError(value);
+        seen.set(value, box);
+        box.extra = prepare(box.extra, seen);
+        return box;
+    }
+
+    if (value instanceof DataView) {
+        // Box the whole backing buffer, not a slice: slicing de-links a DataView
+        // from any typed array sharing the same ArrayBuffer, which the native
+        // serializer does preserve.
+        const buffer: unknown = value.buffer;
+        const box: Boxed = buffer instanceof ArrayBuffer
+            ? { [BOX]: 'dataview', buffer, byteOffset: value.byteOffset, byteLength: value.byteLength }
+            : { [BOX]: 'dataview', buffer: new Uint8Array(new Uint8Array(value.buffer, value.byteOffset, value.byteLength)).buffer, byteOffset: 0, byteLength: value.byteLength };
+        seen.set(value, box);
+        return box;
+    }
+
+    // Typed arrays pass through natively.
+    if (ArrayBuffer.isView(value)) return value;
+
+    if (Array.isArray(value)) {
+        const indexKeys = Object.keys(value);
+        const isSparse = indexKeys.length !== value.length;
+        const extraKeys = indexKeys.filter((k) => String(Number(k)) !== k);
+        if (isSparse || extraKeys.length > 0) {
+            const box: Boxed = { [BOX]: 'array', length: value.length, entries: [] as unknown[] };
+            seen.set(value, box);
+            const entries: unknown[] = [];
+            for (const key of indexKeys) entries.push([key, prepare(Reflect.get(value, key), seen)]);
+            box.entries = entries;
+            return box;
+        }
+        const out: unknown[] = [];
+        seen.set(value, out);
+        for (const item of value) out.push(prepare(item, seen));
+        return out;
+    }
+
     if (value instanceof Map) {
-        for (const [key, item] of value) {
-            if (containsFunction(key, seen) || containsFunction(item, seen)) return true;
-        }
-        return false;
+        const out = new Map<unknown, unknown>();
+        seen.set(value, out);
+        for (const [k, v] of value) out.set(prepare(k, seen), prepare(v, seen));
+        return out;
     }
+
     if (value instanceof Set) {
-        for (const item of value) {
-            if (containsFunction(item, seen)) return true;
+        const out = new Set<unknown>();
+        seen.set(value, out);
+        for (const item of value) out.add(prepare(item, seen));
+        return out;
+    }
+
+    // Plain object: materialise accessors into values (structuredClone does too).
+    const out: Record<string, unknown> = {};
+    seen.set(value, out);
+    for (const key of Object.keys(value)) out[key] = prepare(Reflect.get(value, key), seen);
+    return out;
+}
+
+function restore(value: unknown, seen = new WeakMap<object, unknown>()): unknown {
+    if (!value || typeof value !== 'object') return value;
+    if (seen.has(value)) return seen.get(value);
+
+    if (isBoxed(value)) {
+        const kind = Reflect.get(value, BOX);
+        if (kind === 'error') {
+            const err = new (errorByName(String(value.name)))(String(value.message ?? ''));
+            seen.set(value, err);
+            if (typeof value.stack === 'string') {
+                Object.defineProperty(err, 'stack', { value: value.stack, writable: true, configurable: true });
+            }
+            const extra = restore(value.extra, seen);
+            if (extra && typeof extra === 'object') Object.assign(err, extra);
+            return err;
         }
-        return false;
+        if (kind === 'dataview') {
+            const buf = value.buffer;
+            if (!(buf instanceof ArrayBuffer)) {
+                const empty = new DataView(new ArrayBuffer(0));
+                seen.set(value, empty);
+                return empty;
+            }
+            const off = Number(value.byteOffset) || 0;
+            const len = Number(value.byteLength);
+            const safe = off >= 0 && off <= buf.byteLength
+                && Number.isFinite(len) && len >= 0 && off + len <= buf.byteLength;
+            const view = safe ? new DataView(buf, off, len) : new DataView(buf);
+            seen.set(value, view);
+            return view;
+        }
+        if (kind === 'array') {
+            const arr = new Array(Number(value.length) || 0);
+            seen.set(value, arr);
+            const entries = Array.isArray(value.entries) ? value.entries : [];
+            for (const entry of entries) {
+                if (!Array.isArray(entry)) continue;
+                Reflect.set(arr, String(entry[0]), restore(entry[1], seen));
+            }
+            return arr;
+        }
     }
-    for (const item of Object.values(value)) {
-        if (containsFunction(item, seen)) return true;
+
+    if (value instanceof Date || value instanceof RegExp || value instanceof ArrayBuffer) return value;
+    if (value instanceof Number || value instanceof String || value instanceof Boolean) return value;
+    if (ArrayBuffer.isView(value)) return value;
+
+    if (Array.isArray(value)) {
+        const out: unknown[] = [];
+        seen.set(value, out);
+        for (const item of value) out.push(restore(item, seen));
+        return out;
     }
-    return false;
+
+    if (value instanceof Map) {
+        const out = new Map<unknown, unknown>();
+        seen.set(value, out);
+        for (const [k, v] of value) out.set(restore(k, seen), restore(v, seen));
+        return out;
+    }
+
+    if (value instanceof Set) {
+        const out = new Set<unknown>();
+        seen.set(value, out);
+        for (const item of value) out.add(restore(item, seen));
+        return out;
+    }
+
+    const out: Record<string, unknown> = {};
+    seen.set(value, out);
+    for (const key of Object.keys(value)) out[key] = restore(Reflect.get(value, key), seen);
+    return out;
+}
+
+function dataCloneError(what: string): Error {
+    return Object.assign(new Error(`${what} could not be cloned.`), { name: 'DataCloneError' });
 }
 
 export function serialize(value: unknown): Buffer {
-    if (containsFunction(value)) {
-        throw new Error('() => {} could not be cloned');
-    }
     const serializer = new DefaultSerializer();
     serializer.writeHeader();
     serializer.writeValue(value);

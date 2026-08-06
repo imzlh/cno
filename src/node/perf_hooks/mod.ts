@@ -1,7 +1,18 @@
 /**
  * Node.js perf_hooks module
- * Performance measurement hooks
+ * The spec surface (performance, marks, measures, observers, entry classes)
+ * delegates to the WebAPI implementation on globalThis, so both share one
+ * entry buffer and one set of classes — as Node does.
  */
+
+type UnknownFn = (...args: unknown[]) => unknown;
+type EventLoopUtilization = { idle: number; active: number; utilization: number };
+
+const NS_PER_MS = 1e6;
+// Node reports INT64_MAX as `min` while a histogram is still empty.
+const EMPTY_MIN = 9223372036854775807;
+const EMPTY_MIN_BIGINT = 9223372036854775807n;
+const PERCENTILE_KEYS = [0, 25, 50, 75, 90, 99, 99.9, 100];
 
 export const constants = {
     NODE_PERFORMANCE_GC_MAJOR: 4,
@@ -17,406 +28,216 @@ export const constants = {
     NODE_PERFORMANCE_GC_FLAGS_SCHEDULE_IDLE: 64,
 };
 
-type EntryType = 'mark' | 'measure' | 'function' | 'resource';
-type ObserverOptions = { entryTypes?: string[]; type?: string; buffered?: boolean };
+function outOfRange(name: string, range: string, actual: unknown): RangeError {
+    const error = new RangeError(
+        `The value of "${name}" is out of range. It must be ${range}. Received ${String(actual)}`,
+    );
+    return Object.assign(error, { code: 'ERR_OUT_OF_RANGE' });
+}
 
-class PerformanceEntryRecord implements PerformanceEntry {
-    name: string;
-    entryType: string;
-    startTime: number;
-    duration: number;
-    detail?: unknown;
-
-    constructor(name: string, entryType: string, startTime: number, duration: number, detail?: unknown) {
-        this.name = name;
-        this.entryType = entryType;
-        this.startTime = startTime;
-        this.duration = duration;
-        if (detail !== undefined) this.detail = detail;
+function assertPercentile(value: number): void {
+    if (typeof value !== 'number' || Number.isNaN(value) || value <= 0 || value > 100) {
+        throw outOfRange('percentile', '> 0 && <= 100', value);
     }
 }
 
-class PerformanceResourceTimingRecord extends PerformanceEntryRecord {
-    initiatorType: string;
-    transferSize: number;
-    encodedBodySize: number;
-    decodedBodySize: number;
+/** Shared sample store behind createHistogram() and monitorEventLoopDelay(). */
+class HistogramBase {
+    protected _samples: number[] = [];
 
-    constructor(name: string, startTime: number, duration: number, initiatorType: string, transferSize: number) {
-        super(name, 'resource', startTime, duration);
-        this.initiatorType = initiatorType;
-        this.transferSize = transferSize;
-        this.encodedBodySize = transferSize;
-        this.decodedBodySize = transferSize;
-    }
-}
+    get count(): number { return this._samples.length; }
+    get countBigInt(): bigint { return BigInt(this._samples.length); }
+    get exceeds(): number { return 0; }
+    get exceedsBigInt(): bigint { return 0n; }
 
-class EntryList implements PerformanceObserverEntryList {
-    private readonly _entries: PerformanceEntry[];
-
-    constructor(entries: PerformanceEntry[]) {
-        this._entries = entries;
+    get min(): number { return this._samples.length ? Math.min(...this._samples) : EMPTY_MIN; }
+    get minBigInt(): bigint {
+        return this._samples.length ? BigInt(Math.trunc(this.min)) : EMPTY_MIN_BIGINT;
     }
 
-    getEntries(): PerformanceEntry[] {
-        return [...this._entries];
+    get max(): number { return this._samples.length ? Math.max(...this._samples) : 0; }
+    get maxBigInt(): bigint { return BigInt(Math.trunc(this.max)); }
+
+    // Node returns NaN (not 0) for mean/stddev of an empty histogram.
+    get mean(): number {
+        if (!this._samples.length) return NaN;
+        return this._samples.reduce((a, b) => a + b, 0) / this._samples.length;
     }
 
-    getEntriesByName(name: string, type?: string): PerformanceEntry[] {
-        return this._entries.filter((entry) => entry.name === name && (type === undefined || entry.entryType === type));
+    get stddev(): number {
+        if (!this._samples.length) return NaN;
+        const m = this.mean;
+        return Math.sqrt(this._samples.reduce((a, b) => a + (b - m) ** 2, 0) / this._samples.length);
     }
 
-    getEntriesByType(type: string): PerformanceEntry[] {
-        return this._entries.filter((entry) => entry.entryType === type);
-    }
-}
-
-type ObserverState = {
-    callback: (list: PerformanceObserverEntryList, observer: PerformanceObserver) => void;
-    entryTypes: Set<string>;
-    records: PerformanceEntry[];
-};
-
-const marks = new Map<string, PerformanceEntryRecord>();
-const entries: PerformanceEntryRecord[] = [];
-const observers = new WeakMap<PerformanceObserver, ObserverState>();
-const activeObservers = new Set<PerformanceObserver>();
-
-function notifyObservers(entry: PerformanceEntryRecord): void {
-    for (const observer of activeObservers) {
-        const state = observers.get(observer);
-        if (!state || !state.entryTypes.has(entry.entryType)) continue;
-        state.records.push(entry);
-        state.callback(new EntryList([entry]), observer);
-    }
-}
-
-function addEntry(entry: PerformanceEntryRecord): PerformanceEntryRecord {
-    entries.push(entry);
-    if (entry.entryType === 'mark') marks.set(entry.name, entry);
-    notifyObservers(entry);
-    return entry;
-}
-
-function getEntriesByName(name: string, type?: string): PerformanceEntryRecord[] {
-    return entries.filter((entry) => entry.name === name && (type === undefined || entry.entryType === type));
-}
-
-function getEntriesByType(type: string): PerformanceEntryRecord[] {
-    return entries.filter((entry) => entry.entryType === type);
-}
-
-function clearEntries(type: EntryType, name?: string): void {
-    for (let i = entries.length - 1; i >= 0; i--) {
-        const entry = entries[i];
-        if (entry === undefined) continue;
-        if (entry.entryType !== type) continue;
-        if (name !== undefined && entry.name !== name) continue;
-        entries.splice(i, 1);
-    }
-    if (type === 'mark') {
-        if (name !== undefined) marks.delete(name);
-        else marks.clear();
-    }
-}
-
-function now(): number {
-    return globalThis.performance?.now?.() ?? Date.now();
-}
-
-function missingMark(name: string): SyntaxError & { code?: number } {
-    const error = new SyntaxError(`The "${name}" performance mark has not been set`) as SyntaxError & { code?: number };
-    error.code = 12;
-    return error;
-}
-
-export class PerformanceObserver {
-    static supportedEntryTypes = ['mark', 'measure', 'function', 'resource'];
-
-    constructor(callback: (list: PerformanceObserverEntryList, observer: PerformanceObserver) => void) {
-        observers.set(this, {
-            callback,
-            entryTypes: new Set(),
-            records: [],
-        });
+    percentile(p: number): number {
+        assertPercentile(p);
+        if (!this._samples.length) return 0;
+        const sorted = [...this._samples].sort((a, b) => a - b);
+        const idx = Math.ceil((p / 100) * sorted.length) - 1;
+        return sorted[Math.min(sorted.length - 1, Math.max(0, idx))] ?? 0;
     }
 
-    observe(options: ObserverOptions): void {
-        const state = observers.get(this);
-        if (!state) return;
-        if (options === undefined) {
-            throw new TypeError('The "options.entryTypes" and "options.type" arguments must be specified');
+    percentileBigInt(p: number): bigint { return BigInt(Math.trunc(this.percentile(p))); }
+
+    get percentiles(): Map<number, number> {
+        const out = new Map<number, number>();
+        if (!this._samples.length) {
+            out.set(100, 0);
+            return out;
         }
-        if (options === null || typeof options !== 'object') {
-            throw new TypeError('The "options" argument must be of type object');
+        for (const p of PERCENTILE_KEYS) {
+            out.set(p, p === 0 ? this.min : this.percentile(p));
         }
-        if (options.entryTypes !== undefined && options.type !== undefined) {
-            throw new TypeError("The property 'options.entryTypes' options.entryTypes can not set with options.type together");
-        }
-        if (options.entryTypes !== undefined && !Array.isArray(options.entryTypes)) {
-            throw new TypeError('The "options.entryTypes" property must be string[]');
-        }
-        if (options.entryTypes === undefined && options.type === undefined) {
-            throw new TypeError('The "options.entryTypes" and "options.type" arguments must be specified');
-        }
-        const entryTypes = options.entryTypes ?? (options.type ? [options.type] : []);
-        state.entryTypes = new Set(entryTypes);
-        activeObservers.add(this);
-        if (options.buffered) {
-            const buffered = entries.filter((entry) => state.entryTypes.has(entry.entryType));
-            if (buffered.length > 0) {
-                state.records.push(...buffered);
-                state.callback(new EntryList(buffered), this);
-            }
-        }
+        return out;
     }
 
-    disconnect(): void {
-        activeObservers.delete(this);
+    get percentilesBigInt(): Map<number, bigint> {
+        const out = new Map<number, bigint>();
+        for (const [p, v] of this.percentiles) out.set(p, BigInt(Math.trunc(v)));
+        return out;
     }
 
-    takeRecords(): PerformanceEntry[] {
-        const state = observers.get(this);
-        if (!state) return [];
-        const records = [...state.records];
-        state.records.length = 0;
-        return records;
-    }
-}
+    reset(): void { this._samples.length = 0; }
 
-export interface PerformanceObserverEntryList {
-    getEntries(): PerformanceEntry[];
-    getEntriesByName(name: string, type?: string): PerformanceEntry[];
-    getEntriesByType(type: string): PerformanceEntry[];
-}
-
-export interface PerformanceEntry {
-    name: string;
-    entryType: string;
-    startTime: number;
-    duration: number;
-    detail?: unknown;
-}
-
-export class PerformanceNodeTiming {
-    readonly name = 'node';
-    readonly entryType = 'node';
-    readonly startTime = 0;
-    readonly duration = 0;
-    readonly bootstrapComplete: number = now();
-    readonly environment: number = 0;
-    readonly idleTime: number = 0;
-    readonly loopExit: number = 0;
-    readonly loopStart: number = 0;
-    readonly v8Start: number = 0;
-}
-
-const timeOrigin = globalThis.performance?.timeOrigin ?? Date.now();
-
-export const performance = {
-    get timeOrigin() { return timeOrigin; },
-    now,
-    mark(name: string, options?: { detail?: unknown }): PerformanceEntry {
-        return addEntry(new PerformanceEntryRecord(name, 'mark', now(), 0, options?.detail));
-    },
-    measure(name: string, startMark?: string, endMark?: string): PerformanceEntry {
-        const start = startMark === undefined ? undefined : marks.get(startMark);
-        if (startMark !== undefined && !start) throw missingMark(startMark);
-        const end = endMark === undefined ? undefined : marks.get(endMark);
-        if (endMark !== undefined && !end) throw missingMark(endMark);
-        const startTime = start?.startTime ?? 0;
-        const endTime = end?.startTime ?? now();
-        return addEntry(new PerformanceEntryRecord(name, 'measure', startTime, Math.max(0, endTime - startTime)));
-    },
-    clearMarks(markName?: string): void { clearEntries('mark', markName); },
-    clearMeasures(measureName?: string): void { clearEntries('measure', measureName); },
-    clearResourceTimings(): void { clearEntries('resource'); },
-    getEntries(): PerformanceEntry[] { return [...entries]; },
-    getEntriesByName(name: string, type?: string): PerformanceEntry[] { return getEntriesByName(name, type); },
-    getEntriesByType(type: string): PerformanceEntry[] { return getEntriesByType(type); },
-    markResourceTiming(
-        timingInfo: { startTime?: number; endTime?: number; transferSize?: number; encodedBodySize?: number } = {},
-        requestedUrl = '',
-        initiatorType = 'other',
-        _global?: unknown,
-        _cacheMode?: string,
-        bodyInfo?: { transferSize?: number; encodedBodySize?: number } | string,
-        _responseStatus?: number,
-    ): PerformanceEntry {
-        const start = Number.isFinite(timingInfo.startTime) ? Number(timingInfo.startTime) : now();
-        const end = Number.isFinite(timingInfo.endTime) ? Number(timingInfo.endTime) : start;
-        const body = bodyInfo && typeof bodyInfo === 'object' ? bodyInfo : timingInfo;
-        const transferSize = Number.isFinite(body.transferSize)
-            ? Number(body.transferSize)
-            : Number.isFinite(body.encodedBodySize)
-                ? Number(body.encodedBodySize)
-                : 0;
-        return addEntry(new PerformanceResourceTimingRecord(
-            String(requestedUrl),
-            start,
-            Math.max(0, end - start),
-            String(initiatorType || 'other'),
-            transferSize,
-        ));
-    },
-    nodeTiming: new PerformanceNodeTiming(),
-    eventLoopUtilization(): { idle: number; active: number; utilization: number } {
-        return { idle: 0, active: 0, utilization: 0 };
-    },
-    timerify<T extends (...args: unknown[]) => unknown>(fn: T): T {
-        if (typeof fn !== 'function') throw new TypeError('The "fn" argument must be of type function');
-        const wrapped = function(this: unknown, ...args: unknown[]) {
-            const start = now();
-            const record = (duration: number) => {
-                addEntry(new PerformanceEntryRecord(fn.name || 'anonymous', 'function', start, duration, [...args]));
-            };
-            try {
-                const result = fn.apply(this, args);
-                if (result && typeof result.then === 'function') {
-                    return result.then(
-                        (value: unknown) => {
-                            record(Math.max(0, now() - start));
-                            return value;
-                        },
-                        (error: unknown) => {
-                            record(Math.max(0, now() - start));
-                            throw error;
-                        },
-                    );
-                }
-                record(Math.max(0, now() - start));
-                return result;
-            } catch (error) {
-                record(Math.max(0, now() - start));
-                throw error;
-            }
+    toJSON(): Record<string, unknown> {
+        return {
+            count: this.count,
+            min: this.min,
+            max: this.max,
+            mean: this.mean,
+            exceeds: this.exceeds,
+            stddev: this.stddev,
+            percentiles: Object.fromEntries(this.percentiles),
         };
-        try {
-            Object.defineProperty(wrapped, 'name', { value: `timerified ${fn.name || 'anonymous'}`, configurable: true });
-        } catch {}
-        return wrapped as T;
-    },
-};
-
-export interface IntervalHistogram {
-    readonly count: number;
-    readonly min: number;
-    readonly minBigInt: bigint;
-    readonly max: number;
-    readonly maxBigInt: bigint;
-    readonly mean: number;
-    readonly stddev: number;
-    readonly percentiles: Map<number, number>;
-    readonly exceeds: number;
-    enable(): boolean;
-    disable(): boolean;
-    reset(): void;
-    percentile(percentile: number): number;
-    percentileBigInt(percentile: number): bigint;
+    }
 }
 
-export interface RecordableHistogram extends IntervalHistogram {
-    record(value: number): void;
+export class RecordableHistogram extends HistogramBase {
+    #last = 0;
+
+    record(value: number | bigint): void {
+        const val = typeof value === 'bigint' ? Number(value) : value;
+        if (typeof val !== 'number' || !Number.isInteger(val)) {
+            throw outOfRange('val', 'an integer', value);
+        }
+        if (val < 1 || val > Number.MAX_SAFE_INTEGER) {
+            throw outOfRange('val', '>= 1 && <= 9007199254740991', value);
+        }
+        this._samples.push(val);
+    }
+
+    /** Records the ns elapsed since the previous recordDelta() call. */
+    recordDelta(): void {
+        const nowNs = Math.round(nowMs() * NS_PER_MS);
+        if (this.#last !== 0) this._samples.push(Math.max(1, nowNs - this.#last));
+        this.#last = nowNs;
+    }
+
+    add(other: RecordableHistogram): void {
+        if (!(other instanceof RecordableHistogram)) {
+            throw new TypeError('The "other" argument must be an instance of RecordableHistogram');
+        }
+        this._samples.push(...other._samples);
+    }
+}
+
+export class IntervalHistogram extends HistogramBase {
+    #resolution: number;
+    #timer: ReturnType<typeof setInterval> | undefined;
+    #last = 0;
+    #enabled = false;
+
+    constructor(resolution: number) {
+        super();
+        this.#resolution = resolution;
+    }
+
+    enable(): boolean {
+        if (this.#enabled) return false;
+        this.#enabled = true;
+        this.#last = nowMs();
+        this.#timer = setInterval(() => {
+            const now = nowMs();
+            // Node's histogram is in NANOSECONDS and holds integers.
+            this._samples.push(Math.max(1, Math.round((now - this.#last) * NS_PER_MS)));
+            if (this._samples.length > 1000) this._samples.shift();
+            this.#last = now;
+        }, this.#resolution);
+        return true;
+    }
+
+    disable(): boolean {
+        if (!this.#enabled) return false;
+        this.#enabled = false;
+        clearInterval(this.#timer);
+        this.#timer = undefined;
+        return true;
+    }
 }
 
 export function createHistogram(): RecordableHistogram {
-    const samples: number[] = [];
-    const histogram: RecordableHistogram = {
-        get min() { return samples.length ? Math.min(...samples) : 0; },
-        get minBigInt() { return BigInt(Math.trunc(histogram.min)); },
-        get max() { return samples.length ? Math.max(...samples) : 0; },
-        get maxBigInt() { return BigInt(Math.trunc(histogram.max)); },
-        get mean() { return samples.length ? samples.reduce((a, b) => a + b, 0) / samples.length : 0; },
-        get stddev() {
-            if (!samples.length) return 0;
-            const m = histogram.mean;
-            return Math.sqrt(samples.reduce((a, b) => a + (b - m) ** 2, 0) / samples.length);
-        },
-        get percentiles() {
-            const sorted = [...samples].sort((a, b) => a - b);
-            const m = new Map<number, number>();
-            for (const p of [50, 75, 90, 95, 99, 99.9]) {
-                const idx = Math.ceil(p / 100 * sorted.length) - 1;
-                m.set(p, sorted[Math.max(0, idx)] ?? 0);
-            }
-            return m;
-        },
-        get exceeds() { return 0; },
-        get count() { return samples.length; },
-        enable() { return true; },
-        disable() { return true; },
-        reset() { samples.length = 0; },
-        percentile(p: number) {
-            const sorted = [...samples].sort((a, b) => a - b);
-            const idx = Math.ceil(p / 100 * sorted.length) - 1;
-            return sorted[Math.max(0, idx)] ?? 0;
-        },
-        percentileBigInt(p: number) {
-            return BigInt(Math.trunc(histogram.percentile(p)));
-        },
-        record(value: number) {
-            samples.push(value);
-        },
-    };
-    return histogram;
+    return new RecordableHistogram();
 }
 
 export function monitorEventLoopDelay(options?: { resolution?: number }): IntervalHistogram {
     const resolution = options?.resolution ?? 10;
-    let enabled = false;
-    let _timer: ReturnType<typeof setInterval> | undefined;
-    const samples: number[] = [];
-    let _lastTime = performance.now();
-
-    const hist: IntervalHistogram = {
-        get count() { return samples.length; },
-        get min() { return samples.length ? Math.min(...samples) : 0; },
-        get minBigInt() { return BigInt(Math.trunc(hist.min)); },
-        get max() { return samples.length ? Math.max(...samples) : 0; },
-        get maxBigInt() { return BigInt(Math.trunc(hist.max)); },
-        get mean() { return samples.length ? samples.reduce((a, b) => a + b, 0) / samples.length : 0; },
-        get stddev() {
-            if (!samples.length) return 0;
-            const m = hist.mean;
-            return Math.sqrt(samples.reduce((a, b) => a + (b - m) ** 2, 0) / samples.length);
-        },
-        get percentiles() {
-            const sorted = [...samples].sort((a, b) => a - b);
-            const m = new Map<number, number>();
-            for (const p of [50, 75, 90, 95, 99, 99.9]) {
-                const idx = Math.ceil(p / 100 * sorted.length) - 1;
-                m.set(p, sorted[Math.max(0, idx)] ?? 0);
-            }
-            return m;
-        },
-        get exceeds() { return 0; },
-        percentile(p: number) {
-            const sorted = [...samples].sort((a, b) => a - b);
-            const idx = Math.ceil(p / 100 * sorted.length) - 1;
-            return sorted[Math.max(0, idx)] ?? 0;
-        },
-        percentileBigInt(p: number) {
-            return BigInt(Math.trunc(hist.percentile(p)));
-        },
-        enable() {
-            if (enabled) return false;
-            enabled = true;
-            _lastTime = performance.now();
-            _timer = setInterval(() => {
-                const now = performance.now();
-                samples.push(Math.max(1, now - _lastTime));
-                if (samples.length > 1000) samples.shift();
-                _lastTime = now;
-            }, resolution);
-            return true;
-        },
-        disable() {
-            if (!enabled) return false;
-            enabled = false;
-            clearInterval(_timer);
-            return true;
-        },
-        reset() { samples.length = 0; },
-    };
-    return hist;
+    if (typeof resolution !== 'number' || !Number.isInteger(resolution) || resolution < 1) {
+        throw outOfRange('options.resolution', '>= 1', resolution);
+    }
+    return new IntervalHistogram(resolution);
 }
+
+function globalFn(name: string): UnknownFn | undefined {
+    const value = Reflect.get(globalThis, name);
+    return typeof value === 'function' ? (value as UnknownFn) : undefined;
+}
+
+function nowMs(): number {
+    const perf = Reflect.get(globalThis, 'performance');
+    if (perf && typeof perf === 'object') {
+        const fn = Reflect.get(perf, 'now');
+        if (typeof fn === 'function') return Number(Reflect.apply(fn, perf, []));
+    }
+    return Date.now();
+}
+
+/**
+ * Node's `perf_hooks.performance` IS `globalThis.performance`. Reusing the
+ * WebAPI instance keeps one entry buffer, real PerformanceMark/Measure classes,
+ * spec measure() options, DOMException errors and deferred observer dispatch.
+ */
+type NodePerformance = Performance & {
+    nodeTiming: Record<string, unknown>;
+    timerify<T extends UnknownFn>(fn: T, options?: { histogram?: RecordableHistogram }): T;
+    eventLoopUtilization(a?: EventLoopUtilization, b?: EventLoopUtilization): EventLoopUtilization;
+};
+
+const globalPerformance = Reflect.get(globalThis, 'performance');
+if (!globalPerformance || typeof globalPerformance !== 'object') {
+    throw new Error('node:perf_hooks requires globalThis.performance (webapi bootstrap missing)');
+}
+
+export const performance = globalPerformance as NodePerformance;
+
+/** Module-level aliases Node also exports. */
+export function timerify<T extends UnknownFn>(fn: T, options?: { histogram?: RecordableHistogram }): T {
+    return performance.timerify(fn, options);
+}
+
+export function eventLoopUtilization(
+    a?: EventLoopUtilization,
+    b?: EventLoopUtilization,
+): EventLoopUtilization {
+    return performance.eventLoopUtilization(a, b);
+}
+
+// Entry classes come from the WebAPI layer so `instanceof` works across both.
+export const Performance = globalFn('Performance');
+export const PerformanceEntry = globalFn('PerformanceEntry');
+export const PerformanceMark = globalFn('PerformanceMark');
+export const PerformanceMeasure = globalFn('PerformanceMeasure');
+export const PerformanceObserver = globalFn('PerformanceObserver');
+export const PerformanceObserverEntryList = globalFn('PerformanceObserverEntryList');
+export const PerformanceResourceTiming = globalFn('PerformanceResourceTiming');
+export const PerformanceNodeTiming = globalFn('PerformanceNodeTiming');

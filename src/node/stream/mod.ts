@@ -1,5 +1,9 @@
 import { EventEmitter } from '../events';
 import { StringDecoder } from '../string_decoder';
+import {
+    installStreamOperators,
+    type StreamLike as OperatorStreamLike,
+} from './operators';
 
 const os = import.meta.use('os');
 
@@ -47,6 +51,17 @@ export interface PipeOptions {
     end?: boolean;
 }
 
+/* Shared shapes for the iterator helpers. node passes the callback a second
+ * `{ signal }` argument, so callbacks may legitimately be binary. */
+export interface StreamIteratorOptions {
+    signal?: AbortSignal;
+    concurrency?: number;
+    highWaterMark?: number;
+}
+
+export type StreamIteratorCallback = (value: unknown, options?: { signal: AbortSignal }) => unknown;
+export type StreamReducer = (previous: unknown, value: unknown, options?: { signal: AbortSignal }) => unknown;
+
 function isAsyncIterable(value: Iterable<unknown> | AsyncIterable<unknown>): value is AsyncIterable<unknown> {
     return value !== null && value !== undefined
         && typeof Reflect.get(value, Symbol.asyncIterator) === 'function';
@@ -91,8 +106,75 @@ function createInvalidChunkError(chunk: unknown): TypeError & { code: string } {
     ), { code: 'ERR_INVALID_ARG_TYPE' });
 }
 
+function createDestroyedError(): Error & { code: string } {
+    return Object.assign(new Error('Cannot call write after a stream was destroyed'), {
+        code: 'ERR_STREAM_DESTROYED',
+    });
+}
+
 function asError(error: unknown): Error {
     return error instanceof Error ? error : new Error(String(error));
+}
+
+/* Node runs destroy/error/close emissions on the next tick so that
+ * `stream.destroy(err)` never throws at the call site before the caller has had
+ * a chance to attach its 'error' listener. `process` is resolved lazily: this
+ * module is loaded by ../process/streams, so a static import would form a cycle. */
+type NextTickHost = { nextTick?: (callback: () => void, ...args: unknown[]) => void };
+
+function deferTick(callback: () => void): void {
+    const host = (globalThis as { process?: NextTickHost }).process;
+    if (host && typeof host.nextTick === 'function') {
+        host.nextTick(callback);
+        return;
+    }
+    queueMicrotask(callback);
+}
+
+type DestroyStateLike = { destroyed: boolean; emitClose: boolean; closed: boolean };
+type DestroyHookHost = Stream & {
+    _destroy?(error: Error | null, callback: (error?: Error | null) => void): void;
+};
+
+/* Shared tail of every destroy() override: invoke the user's `_destroy()` hook
+ * (Node's documented teardown seam) and only once it calls back emit 'error'
+ * then 'close', both deferred. */
+function runStreamDestroy(
+    stream: Stream,
+    error: Error | null | undefined,
+    states: Array<DestroyStateLike | undefined>,
+): void {
+    const host = stream as DestroyHookHost;
+    let settled = false;
+
+    const finish = (hookError?: Error | null) => {
+        if (settled) return;
+        settled = true;
+        const finalError = hookError ?? error ?? null;
+        // Node flips `closed` the moment the _destroy callback fires (so it is
+        // synchronous for streams with no hook), but still defers the events.
+        for (const state of states) {
+            if (state) state.closed = true;
+        }
+        deferTick(() => {
+            if (finalError) {
+                stream.errored = finalError;
+                stream.emit('error', finalError);
+            }
+            const emitClose = states.some(state => state?.emitClose);
+            if (emitClose) stream.emit('close');
+        });
+    };
+
+    if (typeof host._destroy === 'function') {
+        try {
+            host._destroy(error ?? null, finish);
+        } catch (thrown) {
+            finish(asError(thrown));
+        }
+        return;
+    }
+    finish(null);
 }
 
 const isWindows = os.uname().sysname === 'Windows_NT';
@@ -165,8 +247,10 @@ function bufferFromView(chunk: unknown): Buffer {
 
 export interface Stream extends EventEmitter {
     destroyed: boolean;
+    closed: boolean;
     errored: Error | null;
     _pipedDestinations: Writable[];
+    _destroy?(error: Error | null, callback: (error?: Error | null) => void): void;
     pipe<T extends Writable>(destination: T, options?: PipeOptions): T;
     destroy(error?: Error | null): this;
 }
@@ -177,10 +261,25 @@ export interface StreamConstructor {
     prototype: Stream;
 }
 
+/* Base-stream stand-in for the per-side state objects Readable/Writable carry:
+ * gives plain Stream instances somewhere to record emitClose/closed. */
+type BaseStreamState = DestroyStateLike;
+const baseStreamStates = new WeakMap<object, BaseStreamState>();
+
+function baseStreamState(self: Stream): BaseStreamState {
+    let state = baseStreamStates.get(self);
+    if (!state) {
+        state = { destroyed: false, emitClose: true, closed: false };
+        baseStreamStates.set(self, state);
+    }
+    return state;
+}
+
 function initStream(self: Stream): void {
     EventEmitter.call(self);
     if (typeof self.destroyed !== 'boolean') self.destroyed = false;
     self.errored = null;
+    baseStreamState(self);
     if (!Array.isArray(self._pipedDestinations)) self._pipedDestinations = [];
 }
 
@@ -268,13 +367,22 @@ Stream.prototype.pipe = function pipe<T extends Writable>(this: Stream, destinat
 Stream.prototype.destroy = function destroy(this: Stream, error?: Error | null): Stream {
     if (this.destroyed) return this;
     this.destroyed = true;
-    if (error) {
-        this.errored = error;
-        this.emit('error', error);
-    }
-    this.emit('close');
+    const state = baseStreamState(this);
+    state.destroyed = true;
+    runStreamDestroy(this, error, [state]);
     return this;
 };
+
+/* `closed` reads through to whichever state object the concrete stream owns; a
+ * bare Stream falls back to its side table entry. Readable/Writable/Duplex
+ * override this getter with a state-specific one. */
+Object.defineProperty(Stream.prototype, 'closed', {
+    get(this: Stream): boolean {
+        return baseStreamStates.get(this)?.closed ?? false;
+    },
+    enumerable: false,
+    configurable: true,
+});
 
 Object.defineProperty(Stream.prototype, 'constructor', {
     value: Stream,
@@ -306,6 +414,7 @@ type ReadableState = {
     disturbed: boolean;
     emitClose: boolean;
     autoDestroy: boolean;
+    closed: boolean;
 };
 
 type ReadableTarget = {
@@ -332,6 +441,19 @@ function updateReadableLength(stream: { _readableState: ReadableState; readableL
     return stream.readableLength;
 }
 
+/* O(1) counterparts to updateReadableLength's full rescan. Buffered chunks now
+ * accumulate (push() defers 'readable' instead of draining inline), so
+ * recomputing the total on every push/read made those paths quadratic. */
+function addReadableLength(stream: { _readableState: ReadableState; readableLength: number }, chunk: unknown): number {
+    stream.readableLength += readableChunkLength(stream._readableState, chunk);
+    return stream.readableLength;
+}
+
+function subtractReadableLength(stream: { _readableState: ReadableState; readableLength: number }, amount: number): number {
+    stream.readableLength = Math.max(0, stream.readableLength - amount);
+    return stream.readableLength;
+}
+
 function requestReadableData(target: ReadableTarget, size: number): void {
     const state = target._readableState;
     if (state.destroyed || state.ended || state.reading) return;
@@ -350,17 +472,21 @@ function joinReadableChunks(chunks: unknown[], stringMode: boolean): unknown {
     return Buffer.concat(chunks.map(bufferFromView));
 }
 
-function consumeReadableData(state: ReadableState, size: number): unknown {
-    if (state.objectMode) return state.buffer.shift();
+function consumeReadableData(state: ReadableState, size: number): { chunk: unknown; consumed: number } {
+    if (state.objectMode) {
+        return { chunk: state.buffer.shift(), consumed: 1 };
+    }
 
     const chunks: unknown[] = [];
     let remaining = size;
+    let consumed = 0;
     while (remaining > 0 && state.buffer.length > 0) {
         const chunk = state.buffer[0];
         const length = readableChunkLength(state, chunk);
         if (length <= remaining) {
             chunks.push(state.buffer.shift());
             remaining -= length;
+            consumed += length;
             continue;
         }
         if (typeof chunk === 'string') {
@@ -371,9 +497,10 @@ function consumeReadableData(state: ReadableState, size: number): unknown {
             chunks.push(bytes.subarray(0, remaining));
             state.buffer[0] = bytes.subarray(remaining);
         }
+        consumed += remaining;
         remaining = 0;
     }
-    return joinReadableChunks(chunks, typeof chunks[0] === 'string');
+    return { chunk: joinReadableChunks(chunks, typeof chunks[0] === 'string'), consumed };
 }
 
 function readReadableData(target: ReadableTarget, n?: number): unknown {
@@ -384,7 +511,7 @@ function readReadableData(target: ReadableTarget, n?: number): unknown {
         : Math.floor(numeric);
     requestReadableData(target, Math.max(state.highWaterMark, requested ?? 0));
 
-    const available = updateReadableLength(target);
+    const available = target.readableLength;
     if (requested !== undefined && requested <= 0) return null;
     if (available === 0) {
         if (state.ended) target._emitReadableEndIfNeeded();
@@ -402,10 +529,10 @@ function readReadableData(target: ReadableTarget, n?: number): unknown {
     }
     if (state.objectMode) size = 1;
 
-    const chunk = consumeReadableData(state, size);
+    const { chunk, consumed } = consumeReadableData(state, size);
     state.disturbed = true;
     target.readableDidRead = true;
-    updateReadableLength(target);
+    subtractReadableLength(target, consumed);
     emitDataAfterRead(target as Readable | Duplex, chunk);
     target._emitReadableEndIfNeeded();
     return chunk;
@@ -419,6 +546,22 @@ function scheduleReadableFlow(target: { _readableState: ReadableState }, resume:
         state.resumeScheduled = false;
         if (state.destroyed) return;
         resume();
+    });
+}
+
+/* Node coalesces 'readable' onto a nextTick via state.emittedReadable rather
+ * than firing it inline from push(): emitting synchronously re-enters push()
+ * from the listener, which mis-slices chunk boundaries and overflows the stack
+ * on large pushes. */
+function scheduleReadableEmit(target: Readable | Duplex): void {
+    const state = target._readableState;
+    if (state.destroyed || state.emittedReadable) return;
+    state.emittedReadable = true;
+    deferTick(() => {
+        state.emittedReadable = false;
+        if (state.destroyed) return;
+        if (state.buffer.length === 0 && !state.ended) return;
+        target.emit('readable');
     });
 }
 
@@ -451,7 +594,11 @@ function unshiftReadableChunk(stream: Readable | Duplex, chunk: unknown, encodin
     }
     state.buffer.unshift(chunk);
     updateReadableLength(stream);
-    if (!state.flowing || state.readableListening) stream.emit('readable');
+    /* Deferred for the same reason push() defers: unshift() is normally called
+     * from inside a 'readable' handler's read() loop, and a synchronous emit
+     * re-enters that handler, which appended the unshifted bytes *before* the
+     * outer loop appended the ones it already held ("cdabef" for "abcdef"). */
+    if (!state.flowing || state.readableListening) scheduleReadableEmit(stream);
     return stream.readableLength < state.highWaterMark;
 }
 
@@ -478,7 +625,19 @@ export interface Readable extends Stream {
     unshift(chunk: unknown, encoding?: BufferEncoding): boolean;
     wrap(stream: ReadableWrappedSource): this;
     push(chunk: unknown, encoding?: BufferEncoding): boolean;
-    toArray(): Promise<unknown[]>;
+    toArray(options?: StreamIteratorOptions): Promise<unknown[]>;
+    map(fn: StreamIteratorCallback, options?: StreamIteratorOptions): Readable;
+    filter(fn: StreamIteratorCallback, options?: StreamIteratorOptions): Readable;
+    flatMap(fn: StreamIteratorCallback, options?: StreamIteratorOptions): Readable;
+    take(count: number, options?: StreamIteratorOptions): Readable;
+    drop(count: number, options?: StreamIteratorOptions): Readable;
+    forEach(fn: StreamIteratorCallback, options?: StreamIteratorOptions): Promise<void>;
+    reduce(reducer: StreamReducer, initialValue?: unknown, options?: StreamIteratorOptions): Promise<unknown>;
+    some(fn: StreamIteratorCallback, options?: StreamIteratorOptions): Promise<boolean>;
+    every(fn: StreamIteratorCallback, options?: StreamIteratorOptions): Promise<boolean>;
+    find(fn: StreamIteratorCallback, options?: StreamIteratorOptions): Promise<unknown>;
+    iterator(options?: { destroyOnReturn?: boolean }): AsyncIterableIterator<unknown>;
+    compose(stream: unknown, options?: StreamIteratorOptions): Duplex;
     [Symbol.asyncIterator](): AsyncIterableIterator<unknown>;
 }
 
@@ -521,10 +680,14 @@ function initReadable(self: Readable, options?: ReadableOptions): void {
         disturbed: false,
         emitClose: options?.emitClose ?? true,
         autoDestroy: options?.autoDestroy ?? true,
+        closed: false,
     };
 
     if (options?.read) {
         self._read = options.read;
+    }
+    if (options?.destroy) {
+        self._destroy = options.destroy;
     }
 }
 
@@ -545,7 +708,11 @@ Readable.prototype.on = function on(this: Readable, event: string | symbol, fn: 
     if (event === 'readable') {
         const state = this._readableState;
         state.readableListening = true;
-        if (state.buffer.length > 0 || state.ended) this.emit('readable');
+        // Node parks the stream in paused mode when a 'readable' listener is
+        // attached, overriding an earlier flowing=true, so isPaused() and
+        // readableFlowing report false rather than null/true.
+        state.flowing = false;
+        if (state.buffer.length > 0 || state.ended) scheduleReadableEmit(this);
         else invokeReadableRead(this);
     }
     return this;
@@ -557,7 +724,11 @@ Readable.prototype.once = function once(this: Readable, event: string | symbol, 
     if (event === 'readable') {
         const state = this._readableState;
         state.readableListening = true;
-        if (state.buffer.length > 0 || state.ended) this.emit('readable');
+        // Node parks the stream in paused mode when a 'readable' listener is
+        // attached, overriding an earlier flowing=true, so isPaused() and
+        // readableFlowing report false rather than null/true.
+        state.flowing = false;
+        if (state.buffer.length > 0 || state.ended) scheduleReadableEmit(this);
         else invokeReadableRead(this);
     }
     return this;
@@ -587,8 +758,14 @@ Readable.prototype._emitReadableEndIfNeeded = function _emitReadableEndIfNeeded(
     state.endEmitted = true;
     this.readableEnded = true;
     this.readable = false;
-    this.emit('end');
-    maybeAutoDestroy(this);
+    /* Node emits 'end' from a nextTick (endReadableNT), never inline. This is
+     * reached from inside read(), so emitting synchronously ran the consumer's
+     * 'end' handler before read() had returned the chunk to its caller — a
+     * 'readable'+read() loop then reported an empty body with no error. */
+    deferTick(() => {
+        this.emit('end');
+        maybeAutoDestroy(this);
+    });
 };
 
 Readable.from = function from(iterable: Iterable<unknown> | AsyncIterable<unknown>, options?: ReadableOptions): Readable {
@@ -615,6 +792,32 @@ Readable.from = function from(iterable: Iterable<unknown> | AsyncIterable<unknow
 
     let reading = false;
     let ended = false;
+    let cleaned = false;
+    /* Node calls iterator.return() when the consumer bails out early (break,
+     * destroy, throw) so generators run their finally blocks and release
+     * handles; without it the source leaks. */
+    const cleanupIterator = () => {
+        if (cleaned) return;
+        cleaned = true;
+        if (typeof iterator.return !== 'function') return;
+        try {
+            const result = iterator.return();
+            if (result && typeof (result as Promise<unknown>).then === 'function') {
+                (result as Promise<unknown>).then(undefined, () => {});
+            }
+        } catch {
+            // Cleanup is best-effort; a throwing return() must not mask the
+            // original destroy reason.
+        }
+    };
+
+    readable._destroy = (error, callback) => {
+        ended = true;
+        cleanupIterator();
+        callback(error);
+    };
+    readable.once('end', cleanupIterator);
+
     readable._read = async () => {
         if (reading || ended) return;
         reading = true;
@@ -622,7 +825,11 @@ Readable.from = function from(iterable: Iterable<unknown> | AsyncIterable<unknow
             const { value, done } = await iterator.next();
             if (done) {
                 ended = true;
+                cleaned = true;
                 readable.push(null);
+            } else if (readable.destroyed) {
+                ended = true;
+                cleanupIterator();
             } else {
                 if (value === null) {
                     ended = true;
@@ -632,6 +839,7 @@ Readable.from = function from(iterable: Iterable<unknown> | AsyncIterable<unknow
                 readable.push(value);
             }
         } catch (err) {
+            cleaned = true;
             readable.destroy(err instanceof Error ? err : new Error(String(err)));
         } finally {
             reading = false;
@@ -705,7 +913,7 @@ Readable.prototype._readAndResolve = function _readAndResolve(this: Readable): v
         let chunk = state.buffer.shift();
         state.disturbed = true;
         this.readableDidRead = true;
-        updateReadableLength(this);
+        subtractReadableLength(this, readableChunkLength(state, chunk));
         this.emit('data', chunk);
     }
 
@@ -731,18 +939,35 @@ Object.defineProperty(Readable.prototype, 'readableFlowing', {
     configurable: true,
 });
 
-Readable.prototype.unpipe = function unpipe(this: Readable, destination?: Writable): Readable {
-    const destinations = destination ? [destination] : [...this._pipedDestinations];
+/* Node's unpipe() pauses the source once its last pipe is gone. Leaving
+ * `flowing` true is what loses data: push() then takes its flowing branch and
+ * emits 'data' to zero listeners, so every chunk produced after the unpipe is
+ * dropped on the floor instead of staying buffered for the next consumer.
+ * Only pauses when a pipe was actually removed (an unpipe() naming a
+ * never-piped destination, or with nothing piped at all, is a no-op in node)
+ * and only when no pipes remain (unpiping one of two keeps the source flowing). */
+function unpipeDestinations(source: Readable | Duplex, destination?: Writable): void {
+    const destinations = destination ? [destination] : [...source._pipedDestinations];
+    let removedAny = false;
     for (const dest of destinations) {
         const cleanups = (dest as PipeTrackedWritable).__pipeCleanups;
-        const entry = cleanups?.find(item => item.source === this);
+        const entry = cleanups?.find(item => item.source === source);
         if (entry) {
             entry.cleanup(true);
+            removedAny = true;
         } else {
-            const idx = this._pipedDestinations.indexOf(dest);
-            if (idx !== -1) this._pipedDestinations.splice(idx, 1);
+            const idx = source._pipedDestinations.indexOf(dest);
+            if (idx !== -1) {
+                source._pipedDestinations.splice(idx, 1);
+                removedAny = true;
+            }
         }
     }
+    if (removedAny && source._pipedDestinations.length === 0) source.pause();
+}
+
+Readable.prototype.unpipe = function unpipe(this: Readable, destination?: Writable): Readable {
+    unpipeDestinations(this, destination);
     return this;
 };
 
@@ -779,6 +1004,10 @@ Readable.prototype.push = function push(this: Readable, chunk: unknown, encoding
                 chunk = trailing;
                 decodedTrailing = true;
             } else {
+                // Same EOF notification as the no-decoder branch below. Without
+                // it, setEncoding() + a 'readable' listener never saw 'end':
+                // nothing re-entered read() to drain the buffer and emit it.
+                if (!state.flowing && state.readableListening) this.emit('readable');
                 if (state.flowing) this._emitReadableEndIfNeeded();
                 return false;
             }
@@ -793,6 +1022,11 @@ Readable.prototype.push = function push(this: Readable, chunk: unknown, encoding
     if (!state.objectMode && typeof chunk !== 'string' && !ArrayBuffer.isView(chunk)) {
         this.destroy(createInvalidChunkError(chunk));
         return false;
+    }
+    // Node drops zero-length pushes entirely: they are not EOF (unlike
+    // push(null)) and must not surface as an empty 'data' event.
+    if (!state.objectMode && !ending && readableChunkLength(state, chunk) === 0) {
+        return this.readableLength < state.highWaterMark;
     }
 
     if (!decodedTrailing) chunk = normalizeChunk(chunk, state.objectMode, encoding, state.defaultEncoding);
@@ -812,8 +1046,8 @@ Readable.prototype.push = function push(this: Readable, chunk: unknown, encoding
     }
 
     state.buffer.push(chunk);
-    updateReadableLength(this);
-    this.emit('readable');
+    addReadableLength(this, chunk);
+    scheduleReadableEmit(this);
 
     return ending ? false : this.readableLength < state.highWaterMark;
 };
@@ -832,12 +1066,15 @@ Readable.prototype.destroy = function destroy(this: Readable, error?: Error | nu
     this.readable = false;
     state.buffer.length = 0;
     this.readableLength = 0;
-    if (error) {
-        this.emit('error', error);
-    }
-    if (state.emitClose) this.emit('close');
+    runStreamDestroy(this, error, [state]);
     return this;
 };
+
+Object.defineProperty(Readable.prototype, 'closed', {
+    get(this: Readable): boolean { return this._readableState.closed; },
+    enumerable: false,
+    configurable: true,
+});
 
 Readable.prototype.toArray = function toArray(this: Readable): Promise<unknown[]> {
     return collectReadableToArray(this);
@@ -943,6 +1180,7 @@ type WritableState = {
     afterWriteCallbacks: Array<() => void>;
     afterWriteScheduled: boolean;
     pendingDrain: boolean;
+    closed: boolean;
 };
 
 function maybeAutoDestroy(stream: Stream): void {
@@ -1053,6 +1291,7 @@ function initWritable(self: Writable, options?: WritableOptions | DuplexOptions)
         afterWriteCallbacks: [],
         afterWriteScheduled: false,
         pendingDrain: false,
+        closed: false,
     };
 
     if (options?.write) {
@@ -1063,6 +1302,9 @@ function initWritable(self: Writable, options?: WritableOptions | DuplexOptions)
     }
     if (options?.final) {
         self._final = options.final;
+    }
+    if (options?.destroy) {
+        self._destroy = options.destroy;
     }
 }
 
@@ -1091,10 +1333,26 @@ Writable.prototype.write = function write(
 
     const state = this._writableState;
 
+    /* Node rejects writes on a torn-down stream before they can reach _write.
+     * The error goes to the write callback on a later tick and NOT to 'error':
+     * node routes it through errorOrDestroy(), which returns immediately when
+     * the stream is already destroyed. Emitting it unconditionally (as this did)
+     * killed the process whenever no 'error' listener was attached — verified
+     * against node 24, which survives the same program. */
+    if (state.destroyed) {
+        const err = createDestroyedError();
+        if (callback) deferTick(() => callback(err));
+        return false;
+    }
+
+    /* Write-after-end DOES surface as 'error' in node, but by way of
+     * errorOrDestroy(): the stream is destroyed with the error, which emits it
+     * once and only if the stream was still alive. A stream that already
+     * auto-destroyed after 'finish' therefore reports to the callback alone. */
     if (state.ended) {
         const err = createWriteAfterEndError();
-        callback?.(err);
-        queueMicrotask(() => this.emit('error', err));
+        if (callback) deferTick(() => callback(err));
+        this.destroy(err);
         return false;
     }
 
@@ -1237,6 +1495,22 @@ Writable.prototype.setDefaultEncoding = function setDefaultEncoding(this: Writab
     return this;
 };
 
+/* Node reports end()-after-teardown through the end callback and nowhere else:
+ * ERR_STREAM_ALREADY_FINISHED / ERR_STREAM_DESTROYED never reach 'error'
+ * (verified against node 24 with no 'error' listener attached — the process
+ * survives). So these are delivered to the callback only. */
+function createAlreadyFinishedError(): Error & { code: string } {
+    return Object.assign(new Error('Cannot call end after a stream was finished'), {
+        code: 'ERR_STREAM_ALREADY_FINISHED',
+    });
+}
+
+function createEndAfterDestroyError(): Error & { code: string } {
+    return Object.assign(new Error('Cannot call end after a stream was destroyed'), {
+        code: 'ERR_STREAM_DESTROYED',
+    });
+}
+
 Writable.prototype.end = function end(
     this: Writable,
     chunk?: unknown,
@@ -1253,36 +1527,64 @@ Writable.prototype.end = function end(
     }
 
     const state = this._writableState;
+    const endCallback = callback as ((error?: Error | null) => void) | undefined;
+
+    /* Node resolves ONE error for the whole call and reports it to the end
+     * callback and nowhere else, in a fixed precedence: a rejected write wins,
+     * then an already-*finished* stream, then a *destroyed* one. Testing
+     * destroyed first (as this did) dropped the callback entirely for the
+     * commonest shape — a second end() on a stream that finished and then
+     * auto-destroyed — because `finished` implies `destroyed` under the default
+     * autoDestroy:true, so the no-chunk destroyed branch swallowed it. */
+    let err: (Error & { code: string }) | undefined;
 
     if (chunk !== null && chunk !== undefined) {
+        /* write() rejects a torn-down stream itself and performs the matching
+         * destroy()/'error' side effects, but reports only to a *write*
+         * callback; node surfaces the same error on the end callback. Its order
+         * is write-after-end before destroyed, so a finished-then-destroyed
+         * stream reports ERR_STREAM_WRITE_AFTER_END, not ERR_STREAM_DESTROYED. */
+        if (state.ended) err = createWriteAfterEndError();
+        else if (state.destroyed) err = createDestroyedError();
         this.write(chunk, typeof encoding === 'string' ? encoding : undefined);
     }
 
-    if (state.ended) {
-        if (callback) {
-            if (state.finished) queueMicrotask(callback);
-            else this.once('finish', callback);
+    if (!err && !this.errored && !state.ended) {
+        state.ended = true;
+        this.writableEnded = true;
+
+        // Node hands the end callback an explicit `null` on the success path.
+        if (endCallback) this.once('finish', () => endCallback(null));
+
+        // Node: `.end()` fully uncorks regardless of nesting depth. Without this a
+        // corked stream drops its buffer and never emits 'finish', so finished()
+        // and pipeline() on it hang forever.
+        if (state.corked) {
+            state.corked = 1;
+            this.uncork();
         }
+
+        /* A destroyed stream never emits 'finish' (node's needFinish() requires
+         * !destroyed), so the callback armed above is deliberately left parked
+         * rather than settled. */
+        if (!state.destroyed && !state.writing && state.buffer.length === 0) {
+            this._doFinal();
+        }
+
         return this;
     }
 
-    state.ended = true;
-    this.writableEnded = true;
-
-    if (callback) {
-        this.once('finish', callback);
+    if (!err) {
+        if (state.finished) err = createAlreadyFinishedError();
+        else if (state.destroyed) err = createEndAfterDestroyError();
     }
 
-    // Node: `.end()` fully uncorks regardless of nesting depth. Without this a
-    // corked stream drops its buffer and never emits 'finish', so finished()
-    // and pipeline() on it hang forever.
-    if (state.corked) {
-        state.corked = 1;
-        this.uncork();
-    }
-
-    if (!state.writing && state.buffer.length === 0) {
-        this._doFinal();
+    if (endCallback) {
+        /* No error and still draining: node waits for 'finish' and reports
+         * success (measured — a second end() over a slow write settles with
+         * null once the first one completes). */
+        if (err) deferTick(() => endCallback(err));
+        else this.once('finish', () => endCallback(null));
     }
 
     return this;
@@ -1313,13 +1615,16 @@ Writable.prototype.destroy = function destroy(this: Writable, error?: Error | nu
     this.destroyed = true;
     this.writableAborted = !this.writableFinished;
     this.writable = false;
-    if (error) {
-        this.errored = error;
-        this.emit('error', error);
-    }
-    if (state.emitClose) this.emit('close');
+    if (error) this.errored = error;
+    runStreamDestroy(this, error, [state]);
     return this;
 };
+
+Object.defineProperty(Writable.prototype, 'closed', {
+    get(this: Writable): boolean { return this._writableState.closed; },
+    enumerable: false,
+    configurable: true,
+});
 
 Object.defineProperty(Writable.prototype, 'constructor', {
     value: Writable,
@@ -1352,7 +1657,19 @@ export interface Duplex extends Writable {
     unpipe(destination?: Writable): this;
     unshift(chunk: unknown, encoding?: BufferEncoding): boolean;
     push(chunk: unknown, encoding?: BufferEncoding): boolean;
-    toArray(): Promise<unknown[]>;
+    toArray(options?: StreamIteratorOptions): Promise<unknown[]>;
+    map(fn: StreamIteratorCallback, options?: StreamIteratorOptions): Readable;
+    filter(fn: StreamIteratorCallback, options?: StreamIteratorOptions): Readable;
+    flatMap(fn: StreamIteratorCallback, options?: StreamIteratorOptions): Readable;
+    take(count: number, options?: StreamIteratorOptions): Readable;
+    drop(count: number, options?: StreamIteratorOptions): Readable;
+    forEach(fn: StreamIteratorCallback, options?: StreamIteratorOptions): Promise<void>;
+    reduce(reducer: StreamReducer, initialValue?: unknown, options?: StreamIteratorOptions): Promise<unknown>;
+    some(fn: StreamIteratorCallback, options?: StreamIteratorOptions): Promise<boolean>;
+    every(fn: StreamIteratorCallback, options?: StreamIteratorOptions): Promise<boolean>;
+    find(fn: StreamIteratorCallback, options?: StreamIteratorOptions): Promise<unknown>;
+    iterator(options?: { destroyOnReturn?: boolean }): AsyncIterableIterator<unknown>;
+    compose(stream: unknown, options?: StreamIteratorOptions): Duplex;
     [Symbol.asyncIterator](): AsyncIterableIterator<unknown>;
 }
 
@@ -1361,6 +1678,7 @@ export interface DuplexConstructor {
     (options?: DuplexOptions): Duplex;
     prototype: Duplex;
     fromSource(source: Iterable<unknown> | AsyncIterable<unknown>): Duplex;
+    from(body: unknown): Duplex;
 }
 
 function initDuplex(self: Duplex, options?: DuplexOptions): void {
@@ -1399,6 +1717,7 @@ function initDuplex(self: Duplex, options?: DuplexOptions): void {
         disturbed: false,
         emitClose: options?.emitClose ?? true,
         autoDestroy: options?.autoDestroy ?? true,
+        closed: false,
     };
 
     if (options?.readable === false) {
@@ -1416,6 +1735,9 @@ function initDuplex(self: Duplex, options?: DuplexOptions): void {
     if (options?.read) {
         self._read = options.read;
     }
+    if (options?.destroy) {
+        self._destroy = options.destroy;
+    }
 }
 
 export const Duplex: DuplexConstructor = function Duplex(this: Duplex | undefined, options?: DuplexOptions) {
@@ -1430,7 +1752,11 @@ Object.setPrototypeOf(Duplex, Writable);
 Duplex.prototype = Object.create(Writable.prototype);
 
 Duplex.prototype.read = function read(this: Duplex, n?: number): unknown {
-    if (!this.readable) return null;
+    /* Gates on `destroyed`, NOT on the public `readable` flag: Node's read()
+     * never consults it, and net's EOF handler clears `socket.readable` right
+     * after push(null) while chunks are still buffered. Refusing those made a
+     * 'readable' + read() consumer see an empty body and no 'end' at all. */
+    if (this._readableState.destroyed) return null;
     return readReadableData(this, n);
 };
 
@@ -1493,7 +1819,11 @@ Duplex.prototype.on = function on(this: Duplex, event: string | symbol, fn: Stre
     if (event === 'readable') {
         const state = this._readableState;
         state.readableListening = true;
-        if (state.buffer.length > 0 || state.ended) this.emit('readable');
+        // Node parks the stream in paused mode when a 'readable' listener is
+        // attached, overriding an earlier flowing=true, so isPaused() and
+        // readableFlowing report false rather than null/true.
+        state.flowing = false;
+        if (state.buffer.length > 0 || state.ended) scheduleReadableEmit(this);
         else invokeReadableRead(this);
     }
     return this;
@@ -1505,7 +1835,11 @@ Duplex.prototype.once = function once(this: Duplex, event: string | symbol, fn: 
     if (event === 'readable') {
         const state = this._readableState;
         state.readableListening = true;
-        if (state.buffer.length > 0 || state.ended) this.emit('readable');
+        // Node parks the stream in paused mode when a 'readable' listener is
+        // attached, overriding an earlier flowing=true, so isPaused() and
+        // readableFlowing report false rather than null/true.
+        state.flowing = false;
+        if (state.buffer.length > 0 || state.ended) scheduleReadableEmit(this);
         else invokeReadableRead(this);
     }
     return this;
@@ -1535,9 +1869,12 @@ Duplex.prototype._emitReadableEndIfNeeded = function _emitReadableEndIfNeeded(th
     state.endEmitted = true;
     this.readableEnded = true;
     this.readable = false;
-    this.emit('end');
-    if (!this.allowHalfOpen && !this.writableEnded) queueMicrotask(() => this.end());
-    maybeAutoDestroy(this);
+    // Deferred for the same reason as the Readable copy above.
+    deferTick(() => {
+        this.emit('end');
+        if (!this.allowHalfOpen && !this.writableEnded) queueMicrotask(() => this.end());
+        maybeAutoDestroy(this);
+    });
 };
 
 Duplex.prototype._duplexReadAndResolve = function _duplexReadAndResolve(this: Duplex): void {
@@ -1548,7 +1885,7 @@ Duplex.prototype._duplexReadAndResolve = function _duplexReadAndResolve(this: Du
         let chunk = state.buffer.shift();
         state.disturbed = true;
         this.readableDidRead = true;
-        updateReadableLength(this);
+        subtractReadableLength(this, readableChunkLength(state, chunk));
         this.emit('data', chunk);
     }
 
@@ -1572,17 +1909,9 @@ Object.defineProperty(Duplex.prototype, 'readableFlowing', {
 });
 
 Duplex.prototype.unpipe = function unpipe(this: Duplex, destination?: Writable): Duplex {
-    const destinations = destination ? [destination] : [...this._pipedDestinations];
-    for (const dest of destinations) {
-        const cleanups = (dest as PipeTrackedWritable).__pipeCleanups;
-        const entry = cleanups?.find(item => item.source === this);
-        if (entry) {
-            entry.cleanup(true);
-        } else {
-            const idx = this._pipedDestinations.indexOf(dest);
-            if (idx !== -1) this._pipedDestinations.splice(idx, 1);
-        }
-    }
+    // Same helper as Readable.prototype.unpipe — see the comment there for why
+    // the source has to be paused.
+    unpipeDestinations(this, destination);
     return this;
 };
 
@@ -1606,6 +1935,9 @@ Duplex.prototype.push = function push(this: Duplex, chunk: unknown, encoding?: B
                 chunk = trailing;
                 decodedTrailing = true;
             } else {
+                // See the Readable copy: without this, setEncoding() plus a
+                // 'readable' listener never reaches 'end'.
+                if (!state.flowing && state.readableListening) this.emit('readable');
                 if (state.flowing) this._emitReadableEndIfNeeded();
                 return false;
             }
@@ -1620,6 +1952,9 @@ Duplex.prototype.push = function push(this: Duplex, chunk: unknown, encoding?: B
     if (!state.objectMode && typeof chunk !== 'string' && !ArrayBuffer.isView(chunk)) {
         this.destroy(createInvalidChunkError(chunk));
         return false;
+    }
+    if (!state.objectMode && !ending && readableChunkLength(state, chunk) === 0) {
+        return this.readableLength < state.highWaterMark;
     }
 
     if (!decodedTrailing) chunk = normalizeChunk(chunk, state.objectMode, encoding, state.defaultEncoding);
@@ -1637,9 +1972,9 @@ Duplex.prototype.push = function push(this: Duplex, chunk: unknown, encoding?: B
         if (!state.destroyed) scheduleReadableFlow(this, () => this._duplexReadAndResolve());
     } else {
         state.buffer.push(chunk);
+        addReadableLength(this, chunk);
     }
-    updateReadableLength(this);
-    if (!state.flowing) this.emit('readable');
+    if (!state.flowing) scheduleReadableEmit(this);
     return ending ? false : this.readableLength < state.highWaterMark;
 };
 
@@ -1728,16 +2063,23 @@ Duplex.prototype.destroy = function destroy(this: Duplex, error?: Error | null):
     this.readable = false;
     this.writable = false;
     const state = this._readableState;
+    const writableState = this._writableState;
     state.destroyed = true;
+    writableState.destroyed = true;
     state.buffer.length = 0;
     this.readableLength = 0;
-    if (error) {
-        this.errored = error;
-        this.emit('error', error);
-    }
-    if (this._writableState.emitClose) this.emit('close');
+    if (error) this.errored = error;
+    runStreamDestroy(this, error, [writableState, state]);
     return this;
 };
+
+Object.defineProperty(Duplex.prototype, 'closed', {
+    get(this: Duplex): boolean {
+        return this._writableState.closed || this._readableState.closed;
+    },
+    enumerable: false,
+    configurable: true,
+});
 
 (Duplex.prototype as Duplex & Record<symbol, unknown>)[Symbol.asyncIterator] = Readable.prototype[Symbol.asyncIterator];
 
@@ -1790,10 +2132,30 @@ Transform.prototype._transform = function _transform(
     throw new Error('_transform() must be implemented');
 };
 
+/* Node parks the write callback of a transform whose push() filled the readable
+ * side, and only releases it from _read() once a consumer has drained. Without
+ * that, write() reports `true` forever and the readable buffer grows without
+ * bound (measured at 25x highWaterMark). Held off the instance so it cannot
+ * collide with a subclass field, and off _writableState so flattenPrototype and
+ * the shared state shape stay untouched. */
+const transformPendingWriteCallbacks = new WeakMap<object, (error?: Error | null) => void>();
+
+/* Release a parked callback. Node's Transform.prototype._read does exactly this
+ * and nothing else: the readable output of a transform is produced by writes,
+ * not by pulls, so the only work a read can do is let the next write proceed. */
+function releaseTransformWrite(self: Transform): void {
+    const pending = transformPendingWriteCallbacks.get(self);
+    if (!pending) return;
+    transformPendingWriteCallbacks.delete(self);
+    pending();
+}
+
 Transform.prototype._read = function _read(this: Transform, _size: number): void {
-    // Transform/PassThrough readable output is driven by writes into the
-    // transform, so a default no-op read keeps the readable side from
-    // throwing when consumers switch into flowing mode before any chunks land.
+    // A pull is the signal that the readable side made room, so it is what
+    // unparks the write callback withheld by _write below. When nothing is
+    // parked this stays the no-op it always was: a transform's readable output
+    // is driven by writes, so there is nothing else a read could produce.
+    releaseTransformWrite(this);
 };
 
 Transform.prototype._write = function _write(
@@ -1802,13 +2164,36 @@ Transform.prototype._write = function _write(
     encoding: BufferEncoding,
     callback: (error?: Error | null) => void
 ): void {
+    const readableState = this._readableState;
+    const writableState = this._writableState;
+    // Sampled before _transform runs so a transform that pushes nothing (a
+    // digest accumulating state, a filter dropping a chunk) is never made to
+    // wait for a read that has nothing to consume.
+    const lengthBefore = this.readableLength;
+
     let called = false;
     const onTransform = (err?: Error | null, data?: unknown) => {
         if (called) return;
         called = true;
         if (err) return callback(err);
-        if (data !== undefined) this.push(data);
-        callback();
+        // Node's afterTransform tests `val != null`: cb(null, null) pushes
+        // nothing. Forwarding null to push() would signal EOF and end the
+        // readable side after the very first chunk.
+        if (data !== undefined && data !== null) this.push(data);
+
+        if (
+            // end() was already called: parking now would strand the writable
+            // buffer and 'finish' would never fire.
+            writableState.ended
+            // Nothing was pushed, so no read can release us.
+            || lengthBefore === this.readableLength
+            // The readable side still has room.
+            || this.readableLength < readableState.highWaterMark
+        ) {
+            callback();
+            return;
+        }
+        transformPendingWriteCallbacks.set(this, callback);
     };
     try {
         this._transform(chunk, encoding, onTransform);
@@ -2027,18 +2412,26 @@ export function duplexPair(options: DuplexOptions = {}): [Duplex, Duplex] {
             pendingWrites.delete(endpoint);
         }
     };
+    // Node propagates an errored destroy() to the opposite endpoint, but on a
+    // later tick and without re-emitting the error there (the peer only sees
+    // 'close'). A plain destroy() with no error does not touch the peer at all.
+    const destroyPeerLater = (peer: Duplex, peerDestroy: Duplex['destroy']) => {
+        process.nextTick(() => {
+            if (!peer.destroyed) peerDestroy.call(peer);
+        });
+    };
     first.destroy = function destroyFirst(error?: Error | null): Duplex {
         const completed = first.readableEnded && first.writableFinished;
         const result = firstDestroy.call(first, error);
         if (!completed) abortPendingWrites();
-        if (!completed && !second.destroyed) secondDestroy.call(second);
+        if (!completed && error) destroyPeerLater(second, secondDestroy);
         return result;
     };
     second.destroy = function destroySecond(error?: Error | null): Duplex {
         const completed = second.readableEnded && second.writableFinished;
         const result = secondDestroy.call(second, error);
         if (!completed) abortPendingWrites();
-        if (!completed && !first.destroyed) firstDestroy.call(first);
+        if (!completed && error) destroyPeerLater(first, firstDestroy);
         return result;
     };
 
@@ -2120,3 +2513,27 @@ export function addAbortSignal(signal: AbortSignal, stream: Stream): Stream {
     }
     return stream;
 }
+
+/* Iterator helpers (map/filter/forEach/reduce/some/every/find/take/drop/flatMap/
+ * iterator/compose) plus Duplex.from. Installed last, after every
+ * flattenPrototype() call above: flatten copies parent properties down as own
+ * properties, so installing earlier would leave Duplex.prototype holding a stale
+ * copy of Readable's version rather than sharing one implementation.
+ * Transform/PassThrough need no separate install — their prototypes are
+ * Object.create(Duplex.prototype), and flatten never severs that chain, so they
+ * inherit these through it. */
+installStreamOperators({
+    readableFrom: (src, options) => Readable.from(
+        src,
+        options as ReadableOptions | undefined,
+    ) as unknown as OperatorStreamLike,
+    makeDuplex: (options) => new Duplex(options as DuplexOptions) as unknown as OperatorStreamLike,
+    isReadableLike,
+    isWritableLike,
+    asError,
+    readablePrototype: Readable.prototype,
+    duplexPrototype: Duplex.prototype,
+    duplexConstructor: Duplex as unknown as { from?: unknown },
+    asyncIteratorFactory: Readable.prototype[Symbol.asyncIterator] as unknown as
+        (this: OperatorStreamLike) => AsyncIterableIterator<unknown>,
+});

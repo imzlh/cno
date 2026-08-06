@@ -1,7 +1,7 @@
 import { Headers } from "../headers";
 import { type NetworkCallFrame } from "../../utils/network-hooks";
 import { bytesToArrayBuffer } from "../../utils/bytes";
-import { BOUNDARY_RE, Decoder, ensureFormDataContentType, isBodyIterable, isReadableStreamLike, iterableBodyToStream, mergeChunks, parseMultipart, parseUrlEncoded, serializeBody, serializeFormData } from "./helpers";
+import { BOUNDARY_RE, Decoder, ensureFormDataContentType, isBodyIterable, isReadableStreamLike, iterableBodyToStream, mergeChunks, parseMultipart, parseUrlEncoded, rememberRawGetReader, serializeBody, serializeFormData, teeUntracked } from "./helpers";
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 type RequestBodySource = BodyInit | ReadableStream<Uint8Array> | Uint8Array | null;
@@ -54,6 +54,20 @@ function followSignal(source: AbortSignal | null | undefined): AbortSignal {
     return controller.signal;
 }
 
+/**
+ * Spec: the Request constructor parses `input` as a URL and throws on failure.
+ * The URL polyfill deliberately maps bare paths (`/foo`, `C:/x`) to `file:` for
+ * path-to-URL conversion, so the scheme is required explicitly here.
+ */
+function parseRequestUrl(value: string): string {
+    if (!/^[A-Za-z][A-Za-z\d+.-]*:/.test(value)) throw new TypeError(`Failed to parse URL from ${value}`);
+    try {
+        return new URL(value).href;
+    } catch {
+        throw new TypeError(`Failed to parse URL from ${value}`);
+    }
+}
+
 export class Request implements globalThis.Request {
     public readonly url: string;
     public readonly method: string;
@@ -84,7 +98,7 @@ export class Request implements globalThis.Request {
             this.method = requestInitMethod(init, 'GET');
             this.headers = new Headers(init?.headers);
         } else if (typeof input === 'string') {
-            this.url = input;
+            this.url = parseRequestUrl(input);
             this.method = requestInitMethod(init, 'GET');
             this.headers = new Headers(init?.headers);
         } else if (input instanceof Request) {
@@ -105,7 +119,7 @@ export class Request implements globalThis.Request {
                 }
             }
         } else {
-            this.url = String(input);
+            this.url = parseRequestUrl(String(input));
             this.method = requestInitMethod(init, 'GET');
             this.headers = new Headers(init?.headers);
         }
@@ -175,6 +189,10 @@ export class Request implements globalThis.Request {
     private trackBodyStream(stream: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
         const markUsed = () => { this.bodyUsed = true; };
         const getReader = stream.getReader.bind(stream);
+        // Keep the unpatched method for clone(): tee() acquires its source reader
+        // through this public property, so without this the clone's pulls would run
+        // THIS request's markUsed. See rememberRawGetReader in ./helpers.
+        rememberRawGetReader(stream, getReader);
         stream.getReader = ((options?: ReadableStreamGetReaderOptions) => {
             const reader = getReader(options) as ReadableStreamDefaultReader<Uint8Array>;
             const read = reader.read.bind(reader);
@@ -201,7 +219,11 @@ export class Request implements globalThis.Request {
         if (this.bodyUsed) throw new TypeError('Already read');
         let clonedBody: RequestBodySource = this._bodyBuffer ?? this._bodySource;
         if (this.body && !this._bodyBuffer) {
-            const [original, clone] = this.body.tee();
+            // teeUntracked, not this.body.tee() -- see the matching comment in
+            // Response.clone(). A serialisable body is buffered at construction and
+            // never reaches here, which is why this defect was invisible for
+            // strings and only showed on a ReadableStream body.
+            const [original, clone] = teeUntracked(this.body);
             const trackedOriginal = this.trackBodyStream(original);
             Object.defineProperty(this, 'body', { value: trackedOriginal, writable: false, configurable: true });
             this._bodySource = trackedOriginal;

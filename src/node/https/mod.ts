@@ -24,7 +24,6 @@ import {
     connectSecureTransport,
     destroyRequest,
     endRequest,
-    getSystemCa,
     initClientRequestState,
     mergeUrlOptions,
     normalizeRequestOptions,
@@ -42,6 +41,8 @@ import {
     ServerResponseImpl,
     METHODS as HTTP_METHODS,
     STATUS_CODES,
+    validateRequestMethod,
+    validateRequestPath,
 } from '../http/server';
 import { Agent as HttpAgent } from '../http/client';
 import type { ClientRequestArgs } from '../http/client';
@@ -54,6 +55,15 @@ import { ServerResponseAdapter } from '../_internal/server-response-adapter';
 import { isTransportDisconnectError, normalizeErrnoError } from '../_internal/errno';
 import { dispatchServerRequest } from '../_internal/server-request-runtime';
 import { createServerRequestParser, type ParsedServerRequest } from '../_internal/server-request-parser';
+import {
+    anyClientChannelActive,
+    instrumentClientRequest,
+    onClientRequestCreated,
+    onClientRequestStart,
+    onServerRequestStart,
+    onServerResponseCreated,
+    onServerResponseFinish,
+} from '../diagnostics_channel/builtins';
 import {
     encodeResponseHead,
     encodeChunkedFrame,
@@ -263,6 +273,14 @@ function dispatchHttpsServerRequest(
         releaseResponseTurn,
     );
     // runServerRequest never rejects disconnects; only surface real faults.
+    if (onServerRequestStart.hasSubscribers) {
+        onServerRequestStart.publish({ request: incoming, response, socket: tlsSocket, server: self });
+    }
+    if (onServerResponseFinish.hasSubscribers) {
+        response.once('finish', () => {
+            onServerResponseFinish.publish({ request: incoming, response, socket: tlsSocket, server: self });
+        });
+    }
     return dispatchServerRequest({
         listener,
         incoming,
@@ -311,6 +329,13 @@ function handleHttpsServerConnection(self: Server, tlsSocket: TLSSocket): void {
             const { promise: responseTurnDone, resolve: releaseResponseTurn } = Promise.withResolvers<void>();
             const currentResponseTurn = responseTurn;
             responseTurn = responseTurn.then(() => responseTurnDone, () => responseTurnDone);
+
+            // Published here rather than in createIncoming(): the parser only
+            // fills in method/url by the time onRequest fires, and Node's
+            // payload carries a populated IncomingMessage.
+            if (onServerResponseCreated.hasSubscribers) {
+                onServerResponseCreated.publish({ request: incoming, response });
+            }
 
             dispatchHttpsServerRequest(self, tlsSocket, incoming, response, serveHook, meta, currentResponseTurn, releaseResponseTurn);
         },
@@ -411,7 +436,11 @@ flattenPrototype(Server.prototype);
 export function createServer(options?: HttpsServerOptions, requestListener?: HttpsRequestListener): Server;
 export function createServer(requestListener?: HttpsRequestListener): Server;
 export function createServer(optionsOrListener?: HttpsServerOptions | HttpsRequestListener, requestListener?: HttpsRequestListener): Server {
-    return new Server(optionsOrListener, requestListener);
+    // Narrow to one ServerConstructor overload — TS cannot pick one for a union
+    // argument, though the constructor accepts both shapes at runtime.
+    return typeof optionsOrListener === 'function'
+        ? new Server(optionsOrListener)
+        : new Server(optionsOrListener, requestListener);
 }
 
 // HTTPS Agent
@@ -430,10 +459,18 @@ export class Agent extends HttpAgent {
     protocol: string = 'https:';
 
     createConnection(options: HttpsRequestOptions, callback: (err: Error | null, socket: TLSSocket | null) => void): TLSSocket | null {
-        const port = typeof options.port === 'string' ? parseInt(options.port) : options.port || 443;
-        const host = options.hostname || options.host || 'localhost';
-        const rejectUnauthorized = options.rejectUnauthorized ?? true;
-        const servername = options.servername ?? host;
+        // Node merges the agent's constructor options under the per-request
+        // ones. Reading only `options` meant every TLS setting passed to
+        // `new https.Agent({...})` — ca, cert, key, rejectUnauthorized,
+        // ciphers, servername — was silently dropped: an agent configured with
+        // a private CA failed to verify, and one configured with
+        // rejectUnauthorized:false still rejected.
+        const agentOptions = (this as unknown as { options?: HttpsRequestOptions }).options ?? {};
+        const merged: HttpsRequestOptions = { ...agentOptions, ...options };
+        const port = typeof merged.port === 'string' ? parseInt(merged.port) : merged.port || 443;
+        const host = merged.hostname || merged.host || 'localhost';
+        const rejectUnauthorized = merged.rejectUnauthorized ?? true;
+        const servername = merged.servername ?? host;
         let done = false;
 
         const finish = (err: Error | null, socket: TLSSocket | null = null) => {
@@ -443,18 +480,17 @@ export class Agent extends HttpAgent {
         };
 
         (async () => {
-            let ca = options.ca;
-            if (!ca && rejectUnauthorized) {
-                ca = (await getSystemCa()) ?? undefined;
-            }
-
+            // No getSystemCa() here: it returns a file PATH, and `ca` is PEM
+            // text, so passing it made the SecureContext constructor throw and
+            // every agent-backed https request (i.e. all keep-alive traffic)
+            // failed. tls's SecureContext already falls back to the platform
+            // trust store when `ca` is absent.
             const tlsSocket = connectSecureSocket({
-                ...options,
+                ...merged,
                 port,
                 host,
                 servername,
                 rejectUnauthorized,
-                ca,
                 noDelay: true,
             });
             tlsSocket.once('secureConnect', () => finish(null, tlsSocket));
@@ -540,8 +576,10 @@ function initHttpsClientRequest(self: HttpsClientRequest, url: string | URL | Re
         ? mergeUrlOptions<RequestOptions>(url)
         : normalizeRequestOptions(url);
 
+    if (self._options.method !== undefined) validateRequestMethod(self._options.method);
     self.method = self._options.method?.toUpperCase() || 'GET';
     self.path = self._options.path || '/';
+    validateRequestPath(self.path);
     self.host = self._options.hostname || self._options.host || 'localhost';
     self.protocol = 'https:';
     self.agent = self._options.agent ?? globalAgent;
@@ -566,6 +604,15 @@ function initHttpsClientRequest(self: HttpsClientRequest, url: string | URL | Re
         self.agent.options?.keepAlive
     );
     self.shouldKeepAlive = agentKeepAlive;
+
+    // Node's https.request returns a plain http.ClientRequest, so the same four
+    // http.client.* channels apply to https unchanged.
+    if (anyClientChannelActive()) {
+        instrumentClientRequest(self);
+        if (onClientRequestCreated.hasSubscribers) {
+            onClientRequestCreated.publish({ request: self });
+        }
+    }
 }
 
 const HttpsClientRequest: HttpsClientRequestConstructor = function HttpsClientRequest(
@@ -605,6 +652,9 @@ HttpsClientRequest.prototype.write = function write(this: HttpsClientRequest, ch
 };
 
 HttpsClientRequest.prototype.end = function end(this: HttpsClientRequest, chunk?: unknown, encodingOrCb?: BufferEncoding | (() => void), cb?: () => void): HttpsClientRequest {
+    if (!this.writableEnded && onClientRequestStart.hasSubscribers) {
+        onClientRequestStart.publish({ request: this });
+    }
     return endRequest(this, chunk, encodingOrCb, cb, HTTPS_CLIENT_HOOKS) as HttpsClientRequest;
 };
 

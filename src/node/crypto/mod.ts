@@ -15,11 +15,15 @@ import type { BinaryInput, KeyInput, KeyObject as KeyObjectShape, KeyWithOptions
 import { Transform, type TransformOptions } from '../stream';
 
 // Import helpers from helpers.ts
-import { toBuffer, toExactArrayBuffer, encodeOutput, concatBuffers, isGcmAlgorithm, normalizeHashAlgorithm, oneShotHmac, isSupportedHmacAlgorithm, readAsymmetricCipherArgs, readKeyOptions, detectEcCoordinateSize, derToP1363, p1363ToDer, kKeyData, kKeyFormat, guessKeyFormat, isKeyObject, type KeyFormat } from './helpers';
+import { toBuffer, toExactArrayBuffer, encodeOutput, concatBuffers, isGcmAlgorithm, normalizeHashAlgorithm, oneShotHmac, isSupportedHmacAlgorithm, readAsymmetricCipherArgs, readKeyOptions, rejectUnsupportedPadding, detectEcCoordinateSize, derToP1363, p1363ToDer, kKeyData, kKeyFormat, guessKeyFormat, isKeyObject, type KeyFormat } from './helpers';
 
 function assertCallback(callback: unknown): asserts callback is (...args: unknown[]) => void {
     if (typeof callback !== 'function') {
-        throw new TypeError('The "callback" argument must be of type function');
+        const err = new TypeError(
+            `The "callback" argument must be of type function. Received ${callback === undefined ? 'undefined' : typeof callback}`,
+        ) as TypeError & { code?: string };
+        err.code = 'ERR_INVALID_ARG_TYPE';
+        throw err;
     }
 }
 
@@ -32,7 +36,7 @@ function resolveCurve(curve: string): 'p256' | 'p384' | 'p521' {
         case 'p256': case 'p-256': case 'prime256v1': case 'secp256r1': return 'p256';
         case 'p384': case 'p-384': case 'secp384r1': return 'p384';
         case 'p521': case 'p-521': case 'secp521r1': return 'p521';
-        default: throw new Error(`Unsupported curve: ${curve}`);
+        default: throw withCode(new Error('Invalid EC curve name'), 'ERR_CRYPTO_INVALID_CURVE');
     }
 }
 
@@ -130,8 +134,35 @@ function createDigestAlreadyCalledError(): Error {
     return err;
 }
 
+// Node attaches a `.code` to every crypto error; bare Error/TypeError is a
+// detectable divergence for callers that branch on err.code.
+function withCode<E extends Error>(error: E, code: string): E & { code: string } {
+    const err = error as E & { code: string };
+    err.code = code;
+    return err;
+}
+
+function createInvalidIvError(): TypeError {
+    return withCode(new TypeError('Invalid initialization vector'), 'ERR_CRYPTO_INVALID_IV');
+}
+
+function createInvalidKeyLengthError(): RangeError {
+    return withCode(new RangeError('Invalid key length'), 'ERR_CRYPTO_INVALID_KEYLEN');
+}
+
+function createUnknownCipherError(algorithm: string): Error {
+    return withCode(new Error(`Unknown cipher: ${algorithm}`), 'ERR_CRYPTO_UNKNOWN_CIPHER');
+}
+
+// GCM/CBC authentication + padding failures surface as OpenSSL errors in Node.
+function createAuthenticationFailedError(): Error {
+    return withCode(new Error('Unsupported state or unable to authenticate data'), 'ERR_OSSL_EVP_UNSUPPORTED');
+}
+
 function createCipherInvalidStateError(operation: string): Error {
-    if (operation === 'update') return new Error('Trying to add data in unsupported state');
+    if (operation === 'update') {
+        return withCode(new Error('Trying to add data in unsupported state'), 'ERR_CRYPTO_INVALID_STATE');
+    }
     const message = operation === 'final' ? 'Invalid state' : `Invalid state for operation ${operation}`;
     const err = new Error(message) as Error & { code?: string };
     err.code = 'ERR_CRYPTO_INVALID_STATE';
@@ -358,8 +389,10 @@ class HmacImpl extends Transform implements Hmac {
         return this;
     }
 
+    // Node's Hmac (unlike Hash) does not throw on digest-after-digest; it
+    // returns empty output, because OpenSSL frees the context on first final.
     digest(encoding?: string): Uint8Array | string {
-        if (this.finalized) throw createDigestAlreadyCalledError();
+        if (this.finalized) return encodeOutput(new ArrayBuffer(0), encoding);
         this.finalized = true;
         return encodeOutput(this.state.digest(), encoding);
     }
@@ -393,7 +426,11 @@ export function createHmac(algorithm: string, key: KeyInput, options?: Transform
         sha256: () => crypto.createHmacSha256(keyBuf),
         sha512: () => crypto.createHmacSha512(keyBuf),
     };
-    const nativeFactory = nativeAlgos[a];
+    // The native streaming HMAC rejects a zero-length key with an InternalError,
+    // but Node accepts one (HMAC pads any key, including the empty key, to the
+    // block size). The generic one-shot path handles it and matches Node byte
+    // for byte, so keep empty keys off the native fast path.
+    const nativeFactory = keyBuf.byteLength === 0 ? undefined : nativeAlgos[a];
     if (nativeFactory) {
         const native = nativeFactory();
         return new HmacImpl({
@@ -615,7 +652,7 @@ function getEcbFns(algorithm: string): EcbFns {
                 decryptRaw: (key, data) => crypto.aes256EcbDecryptRaw(key, null, data),
             };
         default:
-            throw new Error(`Unknown cipher: ${algorithm}`);
+            throw createUnknownCipherError(algorithm);
     }
 }
 
@@ -650,13 +687,13 @@ function getCbcFns(algorithm: string): CbcFns {
                 decryptRaw: crypto.aes256CbcDecryptRaw,
             };
         default:
-            throw new Error(`Unknown cipher: ${algorithm}`);
+            throw createUnknownCipherError(algorithm);
     }
 }
 
 function validateCbcKeyIv(key: Uint8Array, iv: Uint8Array, fns: CbcFns): void {
-    if (key.byteLength !== fns.keyLength) throw new RangeError('Invalid key length');
-    if (iv.byteLength !== fns.ivLength) throw new TypeError('Invalid initialization vector');
+    if (key.byteLength !== fns.keyLength) throw createInvalidKeyLengthError();
+    if (iv.byteLength !== fns.ivLength) throw createInvalidIvError();
 }
 
 function makeEcbCipher(key: Uint8Array, fns: EcbFns): CipherivWithAutoPadding {
@@ -685,6 +722,27 @@ function makeEcbCipher(key: Uint8Array, fns: EcbFns): CipherivWithAutoPadding {
     };
 }
 
+// The C layer (circu.js mod_crypto.c) collapses every OpenSSL failure into a
+// generic InternalError, so a padded decipher final() failure is remapped here
+// to Node's code. Only applied to decipher final(), where bad padding is the
+// dominant cause.
+function mapBadDecrypt<T>(operation: () => T): T {
+    try {
+        return operation();
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (message === 'Cipher operation failed') {
+            const err = withCode(
+                new Error('error:1C800064:Provider routines::bad decrypt'),
+                'ERR_OSSL_BAD_DECRYPT',
+            );
+            (err as Error & { cause?: unknown }).cause = error;
+            throw err;
+        }
+        throw error;
+    }
+}
+
 function makeEcbDecipher(key: Uint8Array, fns: EcbFns): DecipherivWithAutoPadding {
     let autoPadding = true;
     const chunks: Uint8Array[] = [];
@@ -703,7 +761,9 @@ function makeEcbDecipher(key: Uint8Array, fns: EcbFns): DecipherivWithAutoPaddin
         final(outputEncoding?: string) {
             const buf = concatBuffers(chunks);
             chunks.length = 0;
-            const out = autoPadding ? fns.decrypt(key, buf) : fns.decryptRaw(key, buf);
+            const out = autoPadding
+                ? mapBadDecrypt(() => fns.decrypt(key, buf))
+                : fns.decryptRaw(key, buf);
             return encodeOutput(out, outputEncoding);
         },
         setAutoPadding(value: boolean) {
@@ -768,7 +828,7 @@ function makeCbcDecipher(key: Uint8Array, iv: Uint8Array, fns: CbcFns): Decipher
             const buf = concatBuffers(chunks);
             chunks.length = 0;
             const out = autoPadding
-                ? fns.decrypt(key, currentIv, buf)
+                ? mapBadDecrypt(() => fns.decrypt(key, currentIv, buf))
                 : fns.decryptRaw(key, currentIv, buf);
             return encodeOutput(out, outputEncoding);
         },
@@ -850,17 +910,17 @@ export function createCipheriv(algorithm: string, key: KeyInput, iv: BinaryInput
 
     if (a.endsWith('-ecb')) {
         const fns = getEcbFns(a);
-        if (iv !== null) throw new TypeError('Invalid initialization vector');
-        if (keyBuf.byteLength !== fns.keyLength) throw new RangeError('Invalid key length');
+        if (iv !== null) throw createInvalidIvError();
+        if (keyBuf.byteLength !== fns.keyLength) throw createInvalidKeyLengthError();
         return new CipherTransform(makeEcbCipher(keyBuf, fns), options);
     }
     if (isGcmAlgorithm(a)) {
-        if (iv === null) throw new TypeError('Invalid initialization vector');
+        if (iv === null) throw createInvalidIvError();
         return createCipherivGCM(a, keyBuf, iv, options);
     }
 
     const fns = getCbcFns(a);
-    if (iv === null) throw new TypeError('Invalid initialization vector');
+    if (iv === null) throw createInvalidIvError();
     const ivBuf = toBuffer(iv);
     validateCbcKeyIv(keyBuf, ivBuf, fns);
     return new CipherTransform(makeCbcCipher(keyBuf, ivBuf, fns), options);
@@ -872,17 +932,17 @@ export function createDecipheriv(algorithm: string, key: KeyInput, iv: BinaryInp
 
     if (a.endsWith('-ecb')) {
         const fns = getEcbFns(a);
-        if (iv !== null) throw new TypeError('Invalid initialization vector');
-        if (keyBuf.byteLength !== fns.keyLength) throw new RangeError('Invalid key length');
+        if (iv !== null) throw createInvalidIvError();
+        if (keyBuf.byteLength !== fns.keyLength) throw createInvalidKeyLengthError();
         return new CipherTransform(makeEcbDecipher(keyBuf, fns), options);
     }
     if (isGcmAlgorithm(a)) {
-        if (iv === null) throw new TypeError('Invalid initialization vector');
+        if (iv === null) throw createInvalidIvError();
         return createDecipherivGCM(a, keyBuf, iv, options);
     }
 
     const fns = getCbcFns(a);
-    if (iv === null) throw new TypeError('Invalid initialization vector');
+    if (iv === null) throw createInvalidIvError();
     const ivBuf = toBuffer(iv);
     validateCbcKeyIv(keyBuf, ivBuf, fns);
     return new CipherTransform(makeCbcDecipher(keyBuf, ivBuf, fns), options);
@@ -911,7 +971,10 @@ export function createCipherivGCM(algorithm: string, key: KeyInput, iv: BinaryIn
         throw new Error(`Unsupported cipher algorithm: ${algorithm}`);
     }
     const expectedKeyLength = GCM_KEY_LENGTHS[algorithm.toLowerCase()];
-    if (keyBuf.byteLength !== expectedKeyLength) throw new Error('Invalid key length');
+    if (keyBuf.byteLength !== expectedKeyLength) throw createInvalidKeyLengthError();
+    // OpenSSL rejects a 0-length GCM IV with a bare InternalError from the C
+    // layer; Node reports ERR_CRYPTO_INVALID_IV.
+    if (ivBuf.byteLength === 0) throw createInvalidIvError();
     const authTagLength = validateGcmAuthTagLength(options?.authTagLength) ?? 16;
     const gcm = new crypto.GCM('encrypt', toExactArrayBuffer(keyBuf), toExactArrayBuffer(ivBuf));
     let ctag: Uint8Array | undefined;
@@ -944,7 +1007,8 @@ export function createDecipherivGCM(algorithm: string, key: KeyInput, iv: Binary
         throw new Error(`Unsupported cipher algorithm: ${algorithm}`);
     }
     const expectedKeyLength = GCM_KEY_LENGTHS[algorithm.toLowerCase()];
-    if (keyBuf.byteLength !== expectedKeyLength) throw new Error('Invalid key length');
+    if (keyBuf.byteLength !== expectedKeyLength) throw createInvalidKeyLengthError();
+    if (ivBuf.byteLength === 0) throw createInvalidIvError();
     const expectedAuthTagLength = validateGcmAuthTagLength(options?.authTagLength);
     const gcm = new crypto.GCM('decrypt', toExactArrayBuffer(keyBuf), toExactArrayBuffer(ivBuf));
     let authTag: ArrayBuffer | null = null;
@@ -969,11 +1033,11 @@ export function createDecipherivGCM(algorithm: string, key: KeyInput, iv: Binary
         },
         final(outputEncoding?: string) {
             if (!authTag) {
-                throw new TypeError('Failed to authenticate data');
+                throw createAuthenticationFailedError();
             }
             const result = gcm.final(authTag);
             if (!result.verified) {
-                throw new TypeError('Failed to authenticate data');
+                throw createAuthenticationFailedError();
             }
             return encodeOutput(result.data, outputEncoding);
         },
@@ -1127,10 +1191,16 @@ export function decipheriv(algorithm: string, key: ArrayBuffer | Uint8Array, iv:
 
 function parseRandomBytesSize(size: number): number {
     if (typeof size !== 'number') {
-        throw new TypeError('The "size" argument must be of type number');
+        throw withCode(
+            new TypeError(`The "size" argument must be of type number. Received type ${typeof size}`),
+            'ERR_INVALID_ARG_TYPE',
+        );
     }
     if (!Number.isFinite(size) || size < 0 || size > 0x7fffffff) {
-        throw new RangeError('The value of "size" is out of range');
+        throw withCode(
+            new RangeError(`The value of "size" is out of range. It must be >= 0 && <= 2147483647. Received ${size}`),
+            'ERR_OUT_OF_RANGE',
+        );
     }
     return Math.trunc(size);
 }
@@ -1140,7 +1210,10 @@ export function randomBytes(size: number, callback: (err: Error | null, buf: Buf
 export function randomBytes(size: number, callback?: (err: Error | null, buf: Buffer) => void): Buffer | void {
     const length = parseRandomBytesSize(size);
     if (callback !== undefined && typeof callback !== 'function') {
-        throw new TypeError('The "callback" argument must be of type function');
+        throw withCode(
+            new TypeError(`The "callback" argument must be of type function. Received type ${typeof callback}`),
+            'ERR_INVALID_ARG_TYPE',
+        );
     }
 
     if (callback !== undefined) {
@@ -1172,15 +1245,22 @@ function toTimingSafeEqualBytes(value: ArrayBufferView | ArrayBuffer, name: stri
     if (ArrayBuffer.isView(value)) {
         return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
     }
-    throw new TypeError(`The "${name}" argument must be an instance of ArrayBuffer, Buffer, TypedArray, or DataView`);
+    throw withCode(
+        new TypeError(`The "${name}" argument must be an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received ${typeof value}`),
+        'ERR_INVALID_ARG_TYPE',
+    );
 }
 
 export function timingSafeEqual(a: ArrayBufferView | ArrayBuffer, b: ArrayBufferView | ArrayBuffer): boolean {
     const left = toTimingSafeEqualBytes(a, 'buf1');
     const right = toTimingSafeEqualBytes(b, 'buf2');
     if (left.byteLength !== right.byteLength) {
-        throw new RangeError('Input buffers must have the same byte length');
+        throw withCode(
+            new RangeError('Input buffers must have the same byte length'),
+            'ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH',
+        );
     }
+    // algorithm.bytesEqual is a constant-time XOR accumulate in C (no early exit).
     return algorithm.bytesEqual(left, right);
 }
 
@@ -1245,7 +1325,30 @@ type GenerateKeyPairOptions = {
     paramEncoding?: string;
 };
 
+// Node validates the key type and curve synchronously, even for the async form.
+function validateKeyPairArgs(type: string, options: GenerateKeyPairOptions): void {
+    if (type === 'rsa') return;
+    if (type === 'ec') {
+        if (options.paramEncoding === 'explicit') {
+            throw new Error('Explicit EC parameter encoding is not supported');
+        }
+        if (typeof options.namedCurve !== 'string') {
+            throw withCode(
+                new TypeError(`The "options.namedCurve" property must be of type string. Received ${options.namedCurve === undefined ? 'undefined' : typeof options.namedCurve}`),
+                'ERR_INVALID_ARG_TYPE',
+            );
+        }
+        resolveCurve(options.namedCurve);
+        return;
+    }
+    throw withCode(
+        new TypeError(`The argument 'type' must be a supported key type. Received '${type}'`),
+        'ERR_INVALID_ARG_VALUE',
+    );
+}
+
 function generateKeyPairSyncImpl(type: string, options: GenerateKeyPairOptions): { publicKey: KeyObject; privateKey: KeyObject } {
+    validateKeyPairArgs(type, options);
     if (type === 'rsa') {
         const keyPair = crypto.generateRsaKey(options.modulusLength || 2048);
         return {
@@ -1255,10 +1358,8 @@ function generateKeyPairSyncImpl(type: string, options: GenerateKeyPairOptions):
     }
 
     if (type === 'ec') {
-        if (options.paramEncoding === 'explicit') {
-            throw new Error('Explicit EC parameter encoding is not supported');
-        }
-        const curve = resolveCurve(options.namedCurve || '');
+        // validateKeyPairArgs already rejected a missing/unknown curve.
+        const curve = resolveCurve(options.namedCurve as string);
         let keyPair: CModuleCrypto.EcKeyPair;
 
         switch (curve) {
@@ -1273,7 +1374,10 @@ function generateKeyPairSyncImpl(type: string, options: GenerateKeyPairOptions):
         };
     }
 
-    throw new Error(`Unsupported key type: ${type}`);
+    throw withCode(
+        new TypeError(`The argument 'type' must be a supported key type. Received '${type}'`),
+        'ERR_INVALID_ARG_VALUE',
+    );
 }
 
 export function generateKeyPairSync(type: 'rsa', options: { modulusLength: number }): { publicKey: KeyObject; privateKey: KeyObject };
@@ -1286,6 +1390,7 @@ export function generateKeyPair(type: 'rsa', options: { modulusLength: number },
 export function generateKeyPair(type: 'ec', options: { namedCurve: string }, callback: (err: Error | null, publicKey?: KeyObject, privateKey?: KeyObject) => void): void;
 export function generateKeyPair(type: string, options: GenerateKeyPairOptions, callback: (err: Error | null, publicKey?: KeyObject, privateKey?: KeyObject) => void): void {
     assertCallback(callback);
+    validateKeyPairArgs(type, options);
     queueMicrotask(() => {
         let result: { publicKey: KeyObject; privateKey: KeyObject };
         try {
@@ -1309,7 +1414,12 @@ export function createSign(algorithm: string): Sign {
             return this;
         },
         sign(privateKey: KeyInput | KeyWithOptions, outputEncoding?: string) {
-            const { key } = readKeyOptions(privateKey);
+            const { key, padding } = readKeyOptions(privateKey);
+            // The one-shot crypto.sign() guards padding, but this streaming path
+            // read only `key` and dropped `padding`, so createSign(...).sign({
+            // key, padding: RSA_PKCS1_PSS_PADDING }) silently produced a PKCS#1
+            // v1.5 signature. Measured on the 21:53 binary against Node v24.18.0.
+            rejectUnsupportedPadding(padding, 'sign');
             const allData = concatBuffers(data);
             data = [];
 
@@ -1349,7 +1459,12 @@ export function createVerify(algorithm: string): Verify {
             return this;
         },
         verify(publicKey: KeyInput | KeyWithOptions, signature: BinaryInput, signatureEncoding?: string) {
-            const { key } = readKeyOptions(publicKey);
+            const { key, padding } = readKeyOptions(publicKey);
+            // Same hole as createSign above, and worse on this side: dropping
+            // `padding` made createVerify(...).verify({ key, padding: PSS }, sig)
+            // return TRUE for a PKCS#1 v1.5 signature — a signature-scheme
+            // confusion. Node v24.18.0 returns false. OBSERVED, then fixed.
+            rejectUnsupportedPadding(padding, 'verify');
             const sigBuf = normalizeSignatureForVerify(signature, signatureEncoding, publicKey);
             const allData = concatBuffers(data);
             data = [];
@@ -1376,7 +1491,8 @@ export function createVerify(algorithm: string): Verify {
 
 export function sign(algorithm: string, data: BinaryInput, key: KeyInput | KeyWithOptions): Uint8Array | string {
     const dataBuf = toBuffer(data);
-    const { key: keyBuf } = readKeyOptions(key);
+    const { key: keyBuf, padding } = readKeyOptions(key);
+    rejectUnsupportedPadding(padding, 'sign');
     let result: ArrayBuffer;
 
     switch (algorithm.toLowerCase()) {
@@ -1424,7 +1540,8 @@ export function signSha512(key: ArrayBuffer | Uint8Array | string, data: ArrayBu
 
 export function verify(algorithm: string, data: BinaryInput, key: KeyInput | KeyWithOptions, signature: BinaryInput): boolean {
     const dataBuf = toBuffer(data);
-    const { key: keyBuf } = readKeyOptions(key);
+    const { key: keyBuf, padding } = readKeyOptions(key);
+    rejectUnsupportedPadding(padding, 'verify');
     const sigBuf = normalizeSignatureForVerify(signature, undefined, key);
 
     switch (algorithm.toLowerCase()) {
@@ -1818,6 +1935,21 @@ export const constants = {
     RSA_PKCS1_PADDING: 1,
     RSA_NO_PADDING: 3,
     RSA_PKCS1_OAEP_PADDING: 4,
+    RSA_X931_PADDING: 5,
+    // PSS was missing, and its absence was a real padding-scheme DOWNGRADE, not
+    // just a missing constant. Measured on the 17:41 binary: because
+    // `RSA_PKCS1_PSS_PADDING` was `undefined`, `sign/verify({ padding:
+    // constants.RSA_PKCS1_PSS_PADDING })` passed `padding: undefined`, which
+    // falls back to PKCS#1 v1.5 — so a PKCS1 signature VERIFIED TRUE against a
+    // caller explicitly asking for PSS. Real Node returns false there. Code that
+    // opted in to PSS silently got the legacy scheme.
+    // Values checked against Node v24.18.0; SALTLEN_AUTO and MAX_SIGN are both -2
+    // upstream, and RSA_SSLV23_PADDING is genuinely absent in Node so it is not
+    // added here.
+    RSA_PKCS1_PSS_PADDING: 6,
+    RSA_PSS_SALTLEN_DIGEST: -1,
+    RSA_PSS_SALTLEN_MAX_SIGN: -2,
+    RSA_PSS_SALTLEN_AUTO: -2,
 };
 
 // Algorithm enumeration (feature-detection probes)
@@ -1841,8 +1973,8 @@ export function getHashes(): string[] {
         'sha3-512',
         'blake2b512',
         'blake2s256',
-        'shake-128',
-        'shake-256',
+        'shake128',
+        'shake256',
     ];
 }
 

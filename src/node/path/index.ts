@@ -23,22 +23,9 @@ export const toNamespacedPath = platformPath.toNamespacedPath;
 export const posix = posixCompat;
 export const win32 = win32Compat;
 
-export default {
-    basename,
-    delimiter,
-    dirname,
-    extname,
-    format,
-    isAbsolute,
-    join,
-    matchesGlob,
-    normalize,
-    parse,
-    posix: posixCompat,
-    relative,
-    resolve,
-    sep,
-    toNamespacedPath,
-    win32: win32Compat,
-    _makeLong,
-} as typeof import('node:path');
+// Node exports the platform flavour object itself (with .posix/.win32 already
+// cross-linked on it), so `path === path.win32` holds on Windows. Rebuilding a
+// fresh literal here would break that identity check for no benefit.
+// No cast: `platformPath` is already a fully-typed PathApi, and casting to
+// `typeof import('node:path')` referenced types this project does not ship.
+export default platformPath;

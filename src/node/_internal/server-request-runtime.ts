@@ -8,7 +8,7 @@ type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 type HeaderInput = OutgoingHttpHeaders | readonly string[];
 type WriteCallback = (err?: Error | null) => void;
 
-export interface RuntimeAdapter<TResponse> {
+export interface RuntimeAdapter<TResponse extends RuntimeResponse> {
     writeHead: TResponse['writeHead'];
     flushHeaders: TResponse['flushHeaders'];
     write: TResponse['write'];
@@ -149,17 +149,20 @@ function writeInternalServerErrorQuietly(response: RuntimeResponse): void {
     } catch {}
 }
 
-function abortAdapterQuietly<TResponse>(adapter: RuntimeAdapter<TResponse>, err: unknown): void {
+function abortAdapterQuietly<TResponse extends RuntimeResponse>(adapter: RuntimeAdapter<TResponse>, err: unknown): void {
     try {
         adapter.abort?.(err);
     } catch {}
 }
 
 function bindServerResponseAdapter<TResponse extends RuntimeResponse>(response: TResponse, adapter: RuntimeAdapter<TResponse>): void {
-    response.writeHead = adapter.writeHead.bind(adapter) as TResponse['writeHead'];
+    // writeHead/end are declared to return polymorphic `this`, which `.bind()`
+    // erases. The bound adapter proxies to this same response, so the identity
+    // holds at runtime even though TS cannot prove it.
+    response.writeHead = adapter.writeHead.bind(adapter) as typeof response.writeHead;
     response.flushHeaders = adapter.flushHeaders.bind(adapter) as TResponse['flushHeaders'];
     response.write = adapter.write.bind(adapter) as TResponse['write'];
-    response.end = adapter.end.bind(adapter) as TResponse['end'];
+    response.end = adapter.end.bind(adapter) as typeof response.end;
 }
 
 export async function runServerRequest<TIncoming, TResponse extends RuntimeResponse>(

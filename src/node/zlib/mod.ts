@@ -34,7 +34,7 @@ function asError(error: unknown): Error {
     return error instanceof Error ? error : new Error(String(error));
 }
 
-export interface ZlibOptions {
+interface ZlibOptions {
     flush?: number;
     finishFlush?: number;
     chunkSize?: number;
@@ -47,7 +47,7 @@ export interface ZlibOptions {
     maxOutputLength?: number;
 }
 
-export interface BrotliOptions {
+interface BrotliOptions {
     flush?: number;
     finishFlush?: number;
     chunkSize?: number;
@@ -55,20 +55,44 @@ export interface BrotliOptions {
     maxOutputLength?: number;
 }
 
-export type ZlibInput = string | ArrayBuffer | ArrayBufferView;
-export type CompressCallback = (err: Error | null, result?: Buffer) => void;
-type ZlibHandle = {
-    deflate(input: Uint8Array, flush?: number): Uint8Array;
-    inflate(input: Uint8Array, flush?: number): Uint8Array;
-    flush(): Uint8Array;
-    finish(): Uint8Array;
+type ZlibInput = string | ArrayBuffer | ArrayBufferView;
+type CompressCallback = (err: Error | null, result?: Buffer) => void;
+
+// The native zlib handles are direction-specific: createDeflate/createGzip/
+// createDeflateRaw expose only `deflate` (plus `params`), while createInflate/
+// createGunzip/createInflateRaw/createUnzip expose only `inflate`. Modelling
+// them as a single type requiring both methods made every handle fail to
+// assign. The `?: undefined` members keep both keys visible on the union so
+// dynamic dispatch sites can narrow with a plain `typeof` check.
+type ZlibHandleBase = {
+    flush(flush?: number): Uint8Array;
+    finish(input?: Uint8Array): Uint8Array;
     close?: () => void;
     reset?: () => void;
-    params?: (level: number, strategy: number) => void;
     getTotalIn?: () => number;
     getTotalOut?: () => number;
 };
-type TransformCallback = (err: unknown, result?: Buffer) => void;
+type ZlibDeflateHandle = ZlibHandleBase & {
+    deflate(input: Uint8Array, flush?: number): Uint8Array;
+    inflate?: undefined;
+    params?: (level: number, strategy: number) => void;
+};
+type ZlibInflateHandle = ZlibHandleBase & {
+    inflate(input: Uint8Array, flush?: number): Uint8Array;
+    deflate?: undefined;
+    params?: undefined;
+};
+type ZlibHandle = ZlibDeflateHandle | ZlibInflateHandle;
+
+// Direction is fixed when the handle is created, so dispatch on the handle
+// itself rather than on the separately tracked `state.compress` flag.
+function isDeflateHandle(handle: ZlibHandle): handle is ZlibDeflateHandle {
+    return typeof handle.deflate === 'function';
+}
+// Must match Transform.prototype._transform / _flush in ../stream exactly: the
+// base declares `error?: Error | null`, and an `unknown` first parameter is not
+// assignable to it (contravariance), which broke every prototype assignment.
+type TransformCallback = (error?: Error | null, result?: Buffer) => void;
 type ZlibStreamCtor<T extends Transform, O> = new (options?: O & TransformOptions) => T;
 type BrotliNative = {
     available?: boolean;
@@ -77,9 +101,10 @@ type BrotliNative = {
     createCompress?: (options?: CModuleBrotli.CompressOptions) => CModuleBrotli.BrotliCompress;
     createDecompress?: (options?: CModuleBrotli.DecompressOptions) => CModuleBrotli.BrotliDecompress;
 };
-// brotli is an optional native module (built with libbrotli); tolerate absence
+// brotli is an optional native module (built with libbrotli); `use()` types it
+// as `| null` for that reason, so tolerate both null and a throwing lookup.
 let nativeBrotli: BrotliNative = {};
-try { nativeBrotli = import.meta.use('brotli'); } catch { /* unavailable */ }
+try { nativeBrotli = import.meta.use('brotli') ?? {}; } catch { /* unavailable */ }
 
 // Internal helper functions
 
@@ -87,20 +112,39 @@ function finishTransform(cb: TransformCallback, operation: () => Buffer): void {
     try {
         cb(null, operation());
     } catch (err) {
-        cb(err);
+        cb(asError(err));
     }
+}
+
+function zlibInputTypeError(data: unknown): TypeError {
+    return codedError(
+        new TypeError(
+            'The "buffer" argument must be of type string or an instance of Buffer, '
+            + `TypedArray, DataView, or ArrayBuffer. Received ${receivedOf(data)}`,
+        ),
+        'ERR_INVALID_ARG_TYPE',
+    );
 }
 
 function toUint8Array(data: ZlibInput): Uint8Array {
     if (typeof data === 'string') return Buffer.from(data);
     if (data instanceof ArrayBuffer) return new Uint8Array(data);
     if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-    throw new TypeError('The "buffer" argument must be a string, Buffer, TypedArray, DataView, or ArrayBuffer');
+    throw zlibInputTypeError(data);
 }
 
 function validateZlibInput(data: ZlibInput): void {
     if (typeof data === 'string' || data instanceof ArrayBuffer || ArrayBuffer.isView(data)) return;
-    throw new TypeError('The "buffer" argument must be a string, Buffer, TypedArray, DataView, or ArrayBuffer');
+    throw zlibInputTypeError(data);
+}
+
+/**
+ * null is a valid "use the default" for Node, but the native call needs
+ * undefined. NaN passes Node's range check (all comparisons are false) yet the
+ * native layer rejects it, so it also falls back to the default.
+ */
+function orUndef(value: number | null | undefined): number | undefined {
+    return value === null || (typeof value === 'number' && Number.isNaN(value)) ? undefined : value;
 }
 
 const VALID_FLUSH_FLAGS = new Set([NO_FLUSH, PARTIAL_FLUSH, SYNC_FLUSH, FULL_FLUSH, FINISH, BLOCK]);
@@ -112,48 +156,117 @@ function validateFlushFlag(value: unknown, name: string): void {
     }
 }
 
+/** Node's `Received ...` clause. Verified against v24.18. */
+function receivedOf(actual: unknown): string {
+    if (actual === null) return 'null';
+    if (actual === undefined) return 'undefined';
+    const t = typeof actual;
+    if (t === 'string') return `type string ('${actual as string}')`;
+    if (t === 'number') return `type number (${Object.is(actual, -0) ? '-0' : String(actual)})`;
+    if (t === 'bigint') return `type bigint (${String(actual)}n)`;
+    if (t === 'boolean') return `type boolean (${String(actual)})`;
+    if (t === 'symbol') return `type symbol (${String(actual)})`;
+    if (t === 'function') return `function ${(actual as { name?: string }).name ?? ''}`;
+    if (t === 'object') {
+        if (Object.getPrototypeOf(actual) === null) return '[Object: null prototype] {}';
+        const ctor = (actual as object).constructor;
+        return `an instance of ${ctor && ctor.name ? ctor.name : 'Object'}`;
+    }
+    return `type ${t}`;
+}
+
+/**
+ * Node's `addNumericSeparator`: ERR_OUT_OF_RANGE prints the raw value with `_`
+ * inserted every 3 characters from the right, so 1e21 reports as `1e_+21`.
+ */
+function addNumericSeparator(val: string): string {
+    let res = '';
+    let i = val.length;
+    const start = val[0] === '-' ? 1 : 0;
+    for (; i >= start + 4; i -= 3) res = `_${val.slice(i - 3, i)}${res}`;
+    return i === val.length ? val : `${val.slice(0, i)}${res}`;
+}
+
+/** ERR_OUT_OF_RANGE reports the plain value, NOT the `type number (...)` form. */
+function receivedRange(actual: unknown): string {
+    if (typeof actual === 'bigint') return addNumericSeparator(`${actual}n`);
+    if (typeof actual === 'number') {
+        // Node only separates integers, so Infinity/NaN stay verbatim.
+        return Number.isInteger(actual) ? addNumericSeparator(String(actual)) : String(actual);
+    }
+    return receivedOf(actual);
+}
+
+function codedError<T extends Error>(err: T, code: string): T {
+    (err as T & { code?: string }).code = code;
+    return err;
+}
+
+/**
+ * Node's `checkRangesOrGetDefault`. Exact semantics, verified against v24.18:
+ *   undefined  -> use the default
+ *   non-number -> ERR_INVALID_ARG_TYPE (null included; null is not a number)
+ *   NaN        -> ACCEPTED, because `NaN < min` and `NaN > max` are both false
+ *   +/-Infinity-> ERR_OUT_OF_RANGE "must be a finite number"
+ *   non-integer inside the range -> accepted (`{ level: 1.5 }` is legal)
+ */
+function checkRange(value: unknown, name: string, min: number, max: number): void {
+    if (value === undefined) return;
+    if (typeof value !== 'number') {
+        throw codedError(
+            new TypeError(`The "${name}" property must be of type number. Received ${receivedOf(value)}`),
+            'ERR_INVALID_ARG_TYPE',
+        );
+    }
+    if (!Number.isFinite(value) && !Number.isNaN(value)) {
+        throw codedError(
+            new RangeError(`The value of "${name}" is out of range. It must be a finite number. Received ${receivedRange(value)}`),
+            'ERR_OUT_OF_RANGE',
+        );
+    }
+    if (value < min || value > max) {
+        const bound = max === Number.POSITIVE_INFINITY ? `>= ${min}` : `>= ${min} and <= ${max}`;
+        throw codedError(
+            new RangeError(`The value of "${name}" is out of range. It must be ${bound}. Received ${receivedRange(value)}`),
+            'ERR_OUT_OF_RANGE',
+        );
+    }
+}
+
 function validateOptions(options?: ZlibOptions | BrotliOptions): void {
     if (options !== undefined && (options === null || typeof options !== 'object')) {
-        throw new TypeError('The "options" argument must be of type object');
+        throw codedError(new TypeError('The "options" argument must be of type object'), 'ERR_INVALID_ARG_TYPE');
     }
-    if (options?.flush !== undefined && !Number.isInteger(options.flush)) {
-        validateFlushFlag(options.flush, 'options.flush');
-    } else if (options?.flush !== undefined) {
-        validateFlushFlag(options.flush, 'options.flush');
-    }
-    if (options?.finishFlush !== undefined && !Number.isInteger(options.finishFlush)) {
-        validateFlushFlag(options.finishFlush, 'options.finishFlush');
-    } else if (options?.finishFlush !== undefined) {
-        validateFlushFlag(options.finishFlush, 'options.finishFlush');
-    }
-    if (options?.maxOutputLength !== undefined && (!Number.isInteger(options.maxOutputLength) || options.maxOutputLength < 0)) {
-        throw new RangeError('The "options.maxOutputLength" property must be a non-negative integer');
-    }
+    if (options?.flush !== undefined) validateFlushFlag(options.flush, 'options.flush');
+    if (options?.finishFlush !== undefined) validateFlushFlag(options.finishFlush, 'options.finishFlush');
 
     const zlibOptions = options as ZlibOptions | undefined;
-    if (zlibOptions?.level !== undefined &&
-        (!Number.isInteger(zlibOptions.level) || zlibOptions.level < -1 || zlibOptions.level > 9)) {
-        throw new RangeError('The value of "options.level" is out of range. It must be >= -1 and <= 9');
-    }
-    if (zlibOptions?.memLevel !== undefined &&
-        (!Number.isInteger(zlibOptions.memLevel) || zlibOptions.memLevel < 1 || zlibOptions.memLevel > 9)) {
-        throw new RangeError('The value of "options.memLevel" is out of range. It must be >= 1 and <= 9');
-    }
-    if (zlibOptions?.strategy !== undefined &&
-        (!Number.isInteger(zlibOptions.strategy) || ![DEFAULT_STRATEGY, FILTERED, HUFFMAN_ONLY, RLE, FIXED].includes(zlibOptions.strategy))) {
-        throw new RangeError('The value of "options.strategy" is out of range');
-    }
-    if (zlibOptions?.chunkSize !== undefined &&
-        (!Number.isInteger(zlibOptions.chunkSize) || zlibOptions.chunkSize <= 0)) {
-        throw new RangeError('The value of "options.chunkSize" is out of range');
-    }
-    if (zlibOptions?.windowBits !== undefined && zlibOptions.windowBits !== 0 && zlibOptions.windowBits !== 15) {
-        throw new RangeError('Only windowBits values 0 and 15 are supported');
+    checkRange(zlibOptions?.maxOutputLength, 'options.maxOutputLength', 1, Number.MAX_SAFE_INTEGER);
+    checkRange(zlibOptions?.level, 'options.level', -1, 9);
+    checkRange(zlibOptions?.memLevel, 'options.memLevel', 1, 9);
+    checkRange(zlibOptions?.strategy, 'options.strategy', 0, 4);
+    checkRange(zlibOptions?.chunkSize, 'options.chunkSize', 64, Number.POSITIVE_INFINITY);
+    // Node's range is [8,15] for deflate and [0,15] for inflate, but the native
+    // binding accepts no windowBits argument at all, so anything that would
+    // change the window is refused rather than silently ignored.
+    if (zlibOptions?.windowBits !== undefined) {
+        checkRange(zlibOptions.windowBits, 'options.windowBits', 0, 15);
+        if (zlibOptions.windowBits !== 0 && zlibOptions.windowBits !== 15) {
+            throw codedError(
+                new RangeError('Only windowBits values 0 and 15 are supported'),
+                'ERR_OUT_OF_RANGE',
+            );
+        }
     }
     if (zlibOptions?.dictionary !== undefined) {
         if (!(zlibOptions.dictionary instanceof ArrayBuffer) && !ArrayBuffer.isView(zlibOptions.dictionary)) {
-            throw new TypeError('The "options.dictionary" property must be an ArrayBuffer or ArrayBufferView');
+            throw codedError(
+                new TypeError('The "options.dictionary" property must be an ArrayBuffer or ArrayBufferView'),
+                'ERR_INVALID_ARG_TYPE',
+            );
         }
+        // The native binding takes no dictionary argument; accepting one would
+        // silently produce a stream the peer cannot inflate.
         if (zlibOptions.dictionary.byteLength !== 0) {
             throw new Error('Non-empty zlib dictionaries are not supported');
         }
@@ -177,10 +290,116 @@ function validateBrotliOptions(options?: BrotliOptions): void {
 
 function checkMaxOutputLength(output: Buffer, options?: { maxOutputLength?: number }): Buffer {
     const max = options?.maxOutputLength;
-    if (max !== undefined && output.byteLength > max) {
-        throw new RangeError(`Cannot create a Buffer larger than ${max} bytes`);
+    // `null` means "no limit" (Node's default path), not a limit of zero.
+    if (max !== undefined && max !== null && output.byteLength > max) {
+        throw bufferTooLargeError(max);
     }
     return output;
+}
+
+// Error shaping: the native layer reports generic InternalErrors, so classify
+// them into Node's `{ code, errno }` zlib error surface here.
+
+interface ZlibNativeError extends Error {
+    errno: number;
+    code: string;
+}
+
+function bufferTooLargeError(max: number): RangeError {
+    const err = new RangeError(`Cannot create a Buffer larger than ${max} bytes`);
+    return Object.assign(err, { code: 'ERR_BUFFER_TOO_LARGE' });
+}
+
+function zlibError(code: string, errno: number, message: string): ZlibNativeError {
+    return Object.assign(new Error(message), { errno, code });
+}
+
+const truncatedError = () => zlibError('Z_BUF_ERROR', -5, 'unexpected end of file');
+const corruptError = () => zlibError('Z_DATA_ERROR', -3, 'incorrect header check');
+
+function isAlreadyFinished(error: unknown): boolean {
+    return /already finished/i.test(asError(error).message);
+}
+
+const hasErrorCode = (error: unknown): boolean =>
+    error instanceof Error && Object.hasOwn(error, 'code');
+
+// Native decompression handle factories, keyed by Node codec name.
+type DecompressKind = 'inflate' | 'inflateRaw' | 'gunzip' | 'unzip';
+
+const DECOMPRESS_FACTORIES: Record<DecompressKind, () => ZlibInflateHandle> = {
+    inflate: () => zlib.createInflate(),
+    inflateRaw: () => zlib.createInflateRaw(),
+    gunzip: () => zlib.createGunzip(),
+    unzip: () => zlib.createUnzip(),
+};
+
+const hasGzipMagic = (data: Uint8Array): boolean => data.length >= 2 && data[0] === 0x1f && data[1] === 0x8b;
+
+/**
+ * Node stops walking gzip members as soon as the byte after a finished member is
+ * NUL (`node_zlib.cc`: `... && next_in[0] != 0x00`) and discards everything that
+ * follows, however many bytes there are and whatever they hold. Requiring the
+ * whole remainder to be zero instead rejects NUL-padded gzip payloads that Node
+ * decodes fine.
+ */
+const trailingIsPadding = (data: Uint8Array): boolean => data.length > 0 && data[0] === 0;
+
+function isAllZeros(data: Uint8Array): boolean {
+    for (let i = 0; i < data.length; i++) if (data[i] !== 0) return false;
+    return true;
+}
+
+// Only gzip streams concatenate members; zlib/raw deflate ignore trailing bytes.
+const supportsMultiMember = (kind: DecompressKind, input: Uint8Array): boolean =>
+    kind === 'gunzip' || (kind === 'unzip' && hasGzipMagic(input));
+
+/**
+ * One-shot decompression over the native streaming handle. The native one-shot
+ * `zlib.inflate()` silently returns partial output for truncated input and
+ * drops trailing gzip members, so walk members explicitly instead.
+ */
+function decompressSync(kind: DecompressKind, buffer: ZlibInput, options?: ZlibOptions): Buffer {
+    validateOptions(options);
+    const input = toUint8Array(buffer);
+    const partialOk = (options?.finishFlush ?? FINISH) !== FINISH;
+    const multiMember = supportsMultiMember(kind, input);
+    const handle = DECOMPRESS_FACTORIES[kind]();
+    const chunks: Buffer[] = [];
+    let offset = 0;
+
+    while (true) {
+        let produced: Uint8Array;
+        try {
+            produced = handle.inflate(input.subarray(offset), NO_FLUSH);
+        } catch (err) {
+            if (isAlreadyFinished(err)) break;
+            throw corruptError();
+        }
+        if (produced.length > 0) chunks.push(Buffer.from(produced));
+
+        const used = handle.getTotalIn?.() ?? input.length - offset;
+        let complete: boolean;
+        try {
+            const tail = handle.finish();
+            if (tail.length > 0) chunks.push(Buffer.from(tail));
+            complete = true;
+        } catch (err) {
+            if (isAlreadyFinished(err)) complete = true;
+            else if (partialOk) complete = false;
+            else throw truncatedError();
+        }
+
+        if (!complete) break;
+        offset += used;
+        if (used === 0 || offset >= input.length || !multiMember) break;
+        // Trailing NUL padding after a complete member is not an error in Node.
+        if (trailingIsPadding(input.subarray(offset))) break;
+        if (!handle.reset) break;
+        handle.reset();
+    }
+
+    return checkMaxOutputLength(Buffer.concat(chunks), options);
 }
 
 // Sync compress/decompress
@@ -188,39 +407,35 @@ function checkMaxOutputLength(output: Buffer, options?: { maxOutputLength?: numb
 export function deflateSync(buffer: ZlibInput, options?: ZlibOptions): Buffer {
     validateOptions(options);
     const level = options?.level ?? zlib.DEFAULT_COMPRESSION;
-    return checkMaxOutputLength(Buffer.from(zlib.deflate(toUint8Array(buffer), level, options?.strategy, options?.memLevel)), options);
+    return checkMaxOutputLength(Buffer.from(zlib.deflate(toUint8Array(buffer), level, orUndef(options?.strategy), orUndef(options?.memLevel))), options);
 }
 
 export function deflateRawSync(buffer: ZlibInput, options?: ZlibOptions): Buffer {
     validateOptions(options);
     const level = options?.level ?? zlib.DEFAULT_COMPRESSION;
-    return checkMaxOutputLength(Buffer.from(zlib.deflateRaw(toUint8Array(buffer), level, options?.strategy, options?.memLevel)), options);
+    return checkMaxOutputLength(Buffer.from(zlib.deflateRaw(toUint8Array(buffer), level, orUndef(options?.strategy), orUndef(options?.memLevel))), options);
 }
 
 export function gzipSync(buffer: ZlibInput, options?: ZlibOptions): Buffer {
     validateOptions(options);
     const level = options?.level ?? zlib.DEFAULT_COMPRESSION;
-    return checkMaxOutputLength(Buffer.from(zlib.gzip(toUint8Array(buffer), level, options?.strategy, options?.memLevel)), options);
+    return checkMaxOutputLength(Buffer.from(zlib.gzip(toUint8Array(buffer), level, orUndef(options?.strategy), orUndef(options?.memLevel))), options);
 }
 
 export function inflateSync(buffer: ZlibInput, options?: ZlibOptions): Buffer {
-    validateOptions(options);
-    return checkMaxOutputLength(Buffer.from(zlib.inflate(toUint8Array(buffer))), options);
+    return decompressSync('inflate', buffer, options);
 }
 
 export function inflateRawSync(buffer: ZlibInput, options?: ZlibOptions): Buffer {
-    validateOptions(options);
-    return checkMaxOutputLength(Buffer.from(zlib.inflateRaw(toUint8Array(buffer))), options);
+    return decompressSync('inflateRaw', buffer, options);
 }
 
 export function gunzipSync(buffer: ZlibInput, options?: ZlibOptions): Buffer {
-    validateOptions(options);
-    return checkMaxOutputLength(Buffer.from(zlib.gunzip(toUint8Array(buffer))), options);
+    return decompressSync('gunzip', buffer, options);
 }
 
 export function unzipSync(buffer: ZlibInput, options?: ZlibOptions): Buffer {
-    validateOptions(options);
-    return checkMaxOutputLength(Buffer.from(zlib.unzip(toUint8Array(buffer))), options);
+    return decompressSync('unzip', buffer, options);
 }
 
 // Async compress/decompress (callback style)
@@ -300,17 +515,27 @@ type ZlibStreamState = {
     finishFlush: number;
     maxOutputLength?: number;
     outputLength: number;
+    // gzip members concatenate; track leftovers across chunk boundaries
+    multiMember: boolean;
+    autoDetect: boolean;
+    pending?: Uint8Array;
+    // a NUL byte after a finished gzip member ends the stream; later chunks are dropped
+    trailingDone?: boolean;
+    // sticky classification so a later flush cannot downgrade it
+    error?: Error;
 };
 
 const zlibStreamStates = new WeakMap<object, ZlibStreamState>();
 
-function configureZlibStream(stream: object, compress: boolean, options?: ZlibOptions): void {
+function configureZlibStream(stream: object, compress: boolean, options?: ZlibOptions, kind?: DecompressKind): void {
     zlibStreamStates.set(stream, {
         compress,
         flush: options?.flush ?? NO_FLUSH,
         finishFlush: options?.finishFlush ?? FINISH,
         maxOutputLength: options?.maxOutputLength,
         outputLength: 0,
+        multiMember: kind === 'gunzip',
+        autoDetect: kind === 'unzip',
     });
 }
 
@@ -329,24 +554,93 @@ function checkStreamOutput(stream: object, output: Buffer): Buffer {
     return output;
 }
 
+function concatBytes(a: Uint8Array, b: Uint8Array): Uint8Array {
+    const out = new Uint8Array(a.length + b.length);
+    out.set(a, 0);
+    out.set(b, a.length);
+    return out;
+}
+
+/**
+ * Feed one chunk into a decompression handle, walking gzip member boundaries and
+ * buffering any bytes that need more input before they can be decoded.
+ */
+function inflateChunk(stream: NodeZlibTransform, state: ZlibStreamState, handle: ZlibInflateHandle, chunk: Uint8Array): Buffer {
+    // A NUL after a finished member closed the stream; everything after is discarded.
+    if (state.trailingDone) return checkStreamOutput(stream, Buffer.alloc(0));
+    const data = state.pending && state.pending.length > 0 ? concatBytes(state.pending, chunk) : chunk;
+    state.pending = undefined;
+    if (state.autoDetect && data.length >= 2) {
+        state.multiMember = hasGzipMagic(data);
+        state.autoDetect = false;
+    }
+    const outputs: Buffer[] = [];
+    let offset = 0;
+    while (offset <= data.length) {
+        const before = handle.getTotalIn?.() ?? 0;
+        let produced: Uint8Array;
+        try {
+            produced = handle.inflate(data.subarray(offset), state.flush);
+        } catch (err) {
+            if (!isAlreadyFinished(err)) {
+                state.error = corruptError();
+                throw state.error;
+            }
+            // Current member ended; continue with the next one if input remains.
+            const rest = data.subarray(offset);
+            if (rest.length === 0) break;
+            // Only gzip concatenates members; trailing bytes elsewhere are ignored.
+            if (!state.multiMember) break;
+            if (trailingIsPadding(rest)) {
+                // NUL padding closes the stream: drop the rest and every later chunk.
+                state.trailingDone = true;
+                state.pending = undefined;
+                break;
+            }
+            if (!handle.reset) {
+                state.pending = rest;
+                break;
+            }
+            handle.reset();
+            continue;
+        }
+        if (produced.length > 0) outputs.push(Buffer.from(produced));
+        const used = (handle.getTotalIn?.() ?? before) - before;
+        offset += used;
+        if (used === 0) {
+            // Needs more input than this chunk carries.
+            state.pending = data.subarray(offset);
+            break;
+        }
+        if (offset >= data.length) break;
+    }
+    return checkStreamOutput(stream, Buffer.concat(outputs));
+}
+
 function _doTransform(stream: NodeZlibTransform, chunk: ZlibInput, cb: TransformCallback) {
     try {
         const state = streamState(stream);
-        const fn = state.compress ? 'deflate' : 'inflate';
-        const output = checkStreamOutput(stream, Buffer.from(stream._handle[fn](toUint8Array(chunk), state.flush)));
+        const handle = stream._handle;
+        const output = isDeflateHandle(handle)
+            ? checkStreamOutput(stream, Buffer.from(handle.deflate(toUint8Array(chunk), state.flush)))
+            : inflateChunk(stream, state, handle, toUint8Array(chunk));
         cb(null, output.length > 0 ? output : undefined);
-    } catch (err) { cb(err); }
+    } catch (err) { cb(asError(err)); }
 }
 
+function installHandleCompat(handle: ZlibDeflateHandle): ZlibDeflateHandle;
+function installHandleCompat(handle: ZlibInflateHandle): ZlibInflateHandle;
 function installHandleCompat(handle: ZlibHandle): ZlibHandle {
     handle.close ??= () => {};
     return handle;
 }
 
-function processChunk(handle: ZlibHandle, chunk: ZlibInput, compress: boolean, flush?: number): Buffer {
-    const fn = compress ? 'deflate' : 'inflate';
+function processChunk(handle: ZlibHandle, chunk: ZlibInput, flush?: number): Buffer {
     try {
-        return Buffer.from(handle[fn](toUint8Array(chunk), flush));
+        const input = toUint8Array(chunk);
+        return Buffer.from(isDeflateHandle(handle)
+            ? handle.deflate(input, flush)
+            : handle.inflate(input, flush));
     } catch (err) {
         if (/already finished/i.test(asError(err).message)) {
             return Buffer.alloc(0);
@@ -358,17 +652,41 @@ function processChunk(handle: ZlibHandle, chunk: ZlibInput, compress: boolean, f
 function _doFlush(stream: NodeZlibTransform, cb: TransformCallback) {
     try {
         const state = streamState(stream);
+        if (state.error) throw state.error;
+        // A NUL after a finished member already completed the stream.
+        if (state.trailingDone) { cb(null); return; }
+        // Leftover bytes that never formed a decodable member mean the stream was cut
+        // short; NUL padding after a complete member is handled by `trailingDone`.
+        if (!state.compress && state.pending && state.pending.length > 0) {
+            const pending = state.pending;
+            state.pending = undefined;
+            if (isAllZeros(pending)) { cb(null); return; }
+            if (state.finishFlush === FINISH) throw truncatedError();
+        }
+        const handle = stream._handle;
         const raw = state.finishFlush === FINISH
-            ? stream._handle.finish()
-            : stream._handle[state.compress ? 'deflate' : 'inflate'](new Uint8Array(), state.finishFlush);
+            ? handle.finish()
+            : isDeflateHandle(handle)
+                ? handle.deflate(new Uint8Array(), state.finishFlush)
+                : handle.inflate(new Uint8Array(), state.finishFlush);
         const output = checkStreamOutput(stream, Buffer.from(raw));
         cb(null, output.length > 0 ? output : undefined);
     } catch (err) {
-        if (/already finished/i.test(asError(err).message)) {
+        const state = zlibStreamStates.get(stream);
+        if (state?.error) {
+            cb(state.error);
+            return;
+        }
+        if (isAlreadyFinished(err)) {
             cb(null);
             return;
         }
-        cb(err);
+        // The native finish() reports a generic failure when input ended mid-member.
+        if (state && !state.compress && !hasErrorCode(err)) {
+            cb(truncatedError());
+            return;
+        }
+        cb(asError(err));
     }
 }
 
@@ -386,8 +704,9 @@ function flushStream(this: NodeZlibTransform, kindOrCallback?: number | (() => v
     const cb = typeof kindOrCallback === 'function' ? kindOrCallback : callback;
     validateFlushFlag(kind, 'kind');
     try {
-        const state = streamState(this);
-        const output = checkStreamOutput(this, processChunk(this._handle, Buffer.alloc(0), state.compress, kind));
+        // Called for its side effect: throws if the stream was never initialized.
+        streamState(this);
+        const output = checkStreamOutput(this, processChunk(this._handle, Buffer.alloc(0), kind));
         if (output.length > 0) this.push(output);
         if (cb) queueMicrotask(cb);
     } catch (error) {
@@ -404,8 +723,14 @@ function resetStream(this: NodeZlibTransform): void {
 
 function paramsStream(this: NodeZlibTransform, level: number, strategy: number, callback?: () => void): NodeZlibTransform {
     validateOptions({ level, strategy });
-    if (!this._handle.params) throw new Error('params() is only supported for compression streams');
-    this._handle.params(level, strategy);
+    const handle = this._handle;
+    if (!isDeflateHandle(handle) || !handle.params) throw new Error('params() is only supported for compression streams');
+    // Drain pending output before changing params, as Node does. The native
+    // deflateParams() would otherwise flush into the previous call's output buffer.
+    streamState(this);
+    const drained = checkStreamOutput(this, processChunk(handle, Buffer.alloc(0), SYNC_FLUSH));
+    if (drained.length > 0) this.push(drained);
+    handle.params(level, strategy);
     if (callback) queueMicrotask(callback);
     return this;
 }
@@ -424,12 +749,12 @@ function installZlibMethods(prototype: NodeZlibTransform): void {
 }
 
 export interface Deflate extends NodeZlibTransform {
-    _handle: ZlibHandle;
+    _handle: ZlibDeflateHandle;
     _processChunk(chunk: ZlibInput, flush?: number): Buffer;
     close(callback?: () => void): void;
 }
 
-export interface DeflateConstructor {
+interface DeflateConstructor {
     new (o?: ZlibOptions & TransformOptions): Deflate;
     (o?: ZlibOptions & TransformOptions): Deflate;
     prototype: Deflate;
@@ -460,7 +785,7 @@ Deflate.prototype._flush = function _flush(this: Deflate, cb: TransformCallback)
 };
 
 Deflate.prototype._processChunk = function _processChunk(this: Deflate, chunk: ZlibInput, flush?: number): Buffer {
-    return checkStreamOutput(this, processChunk(this._handle, chunk, true, flush));
+    return checkStreamOutput(this, processChunk(this._handle, chunk, flush));
 };
 
 Deflate.prototype.close = function close(this: Deflate): void {
@@ -483,12 +808,12 @@ const _opts = (o?: ZlibOptions) => [
 ] as const;
 
 export interface Inflate extends NodeZlibTransform {
-    _handle: ZlibHandle;
+    _handle: ZlibInflateHandle;
     _processChunk(chunk: ZlibInput, flush?: number): Buffer;
     close(callback?: () => void): void;
 }
 
-export interface InflateConstructor {
+interface InflateConstructor {
     new (o?: ZlibOptions & TransformOptions): Inflate;
     (o?: ZlibOptions & TransformOptions): Inflate;
     prototype: Inflate;
@@ -519,7 +844,7 @@ Inflate.prototype._flush = function _flush(this: Inflate, cb: TransformCallback)
 };
 
 Inflate.prototype._processChunk = function _processChunk(this: Inflate, chunk: ZlibInput, flush?: number): Buffer {
-    return checkStreamOutput(this, processChunk(this._handle, chunk, false, flush));
+    return checkStreamOutput(this, processChunk(this._handle, chunk, flush));
 };
 
 Inflate.prototype.close = function close(this: Inflate): void {
@@ -536,12 +861,12 @@ flattenPrototype(Inflate.prototype);
 installZlibMethods(Inflate.prototype);
 
 export interface Gzip extends NodeZlibTransform {
-    _handle: ZlibHandle;
+    _handle: ZlibDeflateHandle;
     _processChunk(chunk: ZlibInput, flush?: number): Buffer;
     close(callback?: () => void): void;
 }
 
-export interface GzipConstructor {
+interface GzipConstructor {
     new (o?: ZlibOptions & TransformOptions): Gzip;
     (o?: ZlibOptions & TransformOptions): Gzip;
     prototype: Gzip;
@@ -572,7 +897,7 @@ Gzip.prototype._flush = function _flush(this: Gzip, cb: TransformCallback): void
 };
 
 Gzip.prototype._processChunk = function _processChunk(this: Gzip, chunk: ZlibInput, flush?: number): Buffer {
-    return checkStreamOutput(this, processChunk(this._handle, chunk, true, flush));
+    return checkStreamOutput(this, processChunk(this._handle, chunk, flush));
 };
 
 Gzip.prototype.close = function close(this: Gzip): void {
@@ -589,12 +914,12 @@ flattenPrototype(Gzip.prototype);
 installZlibMethods(Gzip.prototype);
 
 export interface Gunzip extends NodeZlibTransform {
-    _handle: ZlibHandle;
+    _handle: ZlibInflateHandle;
     _processChunk(chunk: ZlibInput, flush?: number): Buffer;
     close(callback?: () => void): void;
 }
 
-export interface GunzipConstructor {
+interface GunzipConstructor {
     new (o?: ZlibOptions & TransformOptions): Gunzip;
     (o?: ZlibOptions & TransformOptions): Gunzip;
     prototype: Gunzip;
@@ -604,7 +929,7 @@ function initGunzip(self: Gunzip, o?: ZlibOptions & TransformOptions): void {
     validateOptions(o);
     Transform.call(self, toTransformOptions(o));
     self._handle = installHandleCompat(zlib.createGunzip());
-    configureZlibStream(self, false, o);
+    configureZlibStream(self, false, o, 'gunzip');
 }
 
 export const Gunzip: GunzipConstructor = function Gunzip(this: Gunzip | undefined, o?: ZlibOptions & TransformOptions) {
@@ -625,7 +950,7 @@ Gunzip.prototype._flush = function _flush(this: Gunzip, cb: TransformCallback): 
 };
 
 Gunzip.prototype._processChunk = function _processChunk(this: Gunzip, chunk: ZlibInput, flush?: number): Buffer {
-    return checkStreamOutput(this, processChunk(this._handle, chunk, false, flush));
+    return checkStreamOutput(this, processChunk(this._handle, chunk, flush));
 };
 
 Gunzip.prototype.close = function close(this: Gunzip): void {
@@ -642,12 +967,12 @@ flattenPrototype(Gunzip.prototype);
 installZlibMethods(Gunzip.prototype);
 
 export interface DeflateRaw extends NodeZlibTransform {
-    _handle: ZlibHandle;
+    _handle: ZlibDeflateHandle;
     _processChunk(chunk: ZlibInput, flush?: number): Buffer;
     close(callback?: () => void): void;
 }
 
-export interface DeflateRawConstructor {
+interface DeflateRawConstructor {
     new (o?: ZlibOptions & TransformOptions): DeflateRaw;
     (o?: ZlibOptions & TransformOptions): DeflateRaw;
     prototype: DeflateRaw;
@@ -678,7 +1003,7 @@ DeflateRaw.prototype._flush = function _flush(this: DeflateRaw, cb: TransformCal
 };
 
 DeflateRaw.prototype._processChunk = function _processChunk(this: DeflateRaw, chunk: ZlibInput, flush?: number): Buffer {
-    return checkStreamOutput(this, processChunk(this._handle, chunk, true, flush));
+    return checkStreamOutput(this, processChunk(this._handle, chunk, flush));
 };
 
 DeflateRaw.prototype.close = function close(this: DeflateRaw): void {
@@ -695,12 +1020,12 @@ flattenPrototype(DeflateRaw.prototype);
 installZlibMethods(DeflateRaw.prototype);
 
 export interface InflateRaw extends NodeZlibTransform {
-    _handle: ZlibHandle;
+    _handle: ZlibInflateHandle;
     _processChunk(chunk: ZlibInput, flush?: number): Buffer;
     close(callback?: () => void): void;
 }
 
-export interface InflateRawConstructor {
+interface InflateRawConstructor {
     new (o?: ZlibOptions & TransformOptions): InflateRaw;
     (o?: ZlibOptions & TransformOptions): InflateRaw;
     prototype: InflateRaw;
@@ -731,7 +1056,7 @@ InflateRaw.prototype._flush = function _flush(this: InflateRaw, cb: TransformCal
 };
 
 InflateRaw.prototype._processChunk = function _processChunk(this: InflateRaw, chunk: ZlibInput, flush?: number): Buffer {
-    return checkStreamOutput(this, processChunk(this._handle, chunk, false, flush));
+    return checkStreamOutput(this, processChunk(this._handle, chunk, flush));
 };
 
 InflateRaw.prototype.close = function close(this: InflateRaw): void {
@@ -748,12 +1073,12 @@ flattenPrototype(InflateRaw.prototype);
 installZlibMethods(InflateRaw.prototype);
 
 export interface Unzip extends NodeZlibTransform {
-    _handle: ZlibHandle;
+    _handle: ZlibInflateHandle;
     _processChunk(chunk: ZlibInput, flush?: number): Buffer;
     close(callback?: () => void): void;
 }
 
-export interface UnzipConstructor {
+interface UnzipConstructor {
     new (o?: ZlibOptions & TransformOptions): Unzip;
     (o?: ZlibOptions & TransformOptions): Unzip;
     prototype: Unzip;
@@ -763,7 +1088,7 @@ function initUnzip(self: Unzip, o?: ZlibOptions & TransformOptions): void {
     validateOptions(o);
     Transform.call(self, toTransformOptions(o));
     self._handle = installHandleCompat(zlib.createUnzip());
-    configureZlibStream(self, false, o);
+    configureZlibStream(self, false, o, 'unzip');
 }
 
 export const Unzip: UnzipConstructor = function Unzip(this: Unzip | undefined, o?: ZlibOptions & TransformOptions) {
@@ -784,7 +1109,7 @@ Unzip.prototype._flush = function _flush(this: Unzip, cb: TransformCallback): vo
 };
 
 Unzip.prototype._processChunk = function _processChunk(this: Unzip, chunk: ZlibInput, flush?: number): Buffer {
-    return checkStreamOutput(this, processChunk(this._handle, chunk, false, flush));
+    return checkStreamOutput(this, processChunk(this._handle, chunk, flush));
 };
 
 Unzip.prototype.close = function close(this: Unzip): void {
@@ -802,8 +1127,10 @@ installZlibMethods(Unzip.prototype);
 
 // Factory functions
 
+// The options reach `Cls` verbatim, so the parameter must carry the same
+// `& TransformOptions` the constructor declares rather than a bare `O`.
 function _create<T extends Transform, O>(Cls: ZlibStreamCtor<T, O>) {
-    return (options?: O) => new Cls(options);
+    return (options?: O & TransformOptions) => new Cls(options);
 }
 
 export const createDeflate = _create(Deflate);
@@ -941,7 +1268,7 @@ export interface BrotliCompress extends Transform {
     close(callback?: () => void): void;
 }
 
-export interface BrotliCompressConstructor {
+interface BrotliCompressConstructor {
     new (options?: BrotliOptions & TransformOptions): BrotliCompress;
     (options?: BrotliOptions & TransformOptions): BrotliCompress;
     prototype: BrotliCompress;
@@ -1008,7 +1335,7 @@ export interface BrotliDecompress extends Transform {
     close(callback?: () => void): void;
 }
 
-export interface BrotliDecompressConstructor {
+interface BrotliDecompressConstructor {
     new (options?: BrotliOptions & TransformOptions): BrotliDecompress;
     (options?: BrotliOptions & TransformOptions): BrotliDecompress;
     prototype: BrotliDecompress;
@@ -1113,4 +1440,71 @@ export const constants = {
     BROTLI_PARAM_SIZE_HINT,
     BROTLI_PARAM_LARGE_WINDOW,
     BROTLI_DECODER_PARAM_LARGE_WINDOW: 1,
+    // Stream mode identifiers and the option bounds Node publishes. Values
+    // measured from Node v24.18.
+    DEFLATE: 1,
+    INFLATE: 2,
+    GZIP: 3,
+    GUNZIP: 4,
+    DEFLATERAW: 5,
+    INFLATERAW: 6,
+    UNZIP: 7,
+    Z_MIN_WINDOWBITS: 8,
+    Z_MAX_WINDOWBITS: 15,
+    Z_DEFAULT_WINDOWBITS: 15,
+    Z_MIN_CHUNK: 64,
+    Z_MAX_CHUNK: Infinity,
+    Z_DEFAULT_CHUNK: 16384,
+    Z_MIN_MEMLEVEL: 1,
+    Z_MAX_MEMLEVEL: 9,
+    Z_DEFAULT_MEMLEVEL: 8,
+    Z_MIN_LEVEL: -1,
+    Z_MAX_LEVEL: 9,
+    Z_DEFAULT_LEVEL: -1,
+};
+
+/**
+ * Node's `zlib.codes`: a bidirectional name<->number map, frozen. Was missing
+ * entirely, so `zlib.codes.Z_DATA_ERROR` threw.
+ */
+const zlibCodeEntries: ReadonlyArray<readonly [string, number]> = [
+    ['Z_OK', 0],
+    ['Z_STREAM_END', 1],
+    ['Z_NEED_DICT', 2],
+    ['Z_ERRNO', -1],
+    ['Z_STREAM_ERROR', -2],
+    ['Z_DATA_ERROR', -3],
+    ['Z_MEM_ERROR', -4],
+    ['Z_BUF_ERROR', -5],
+    ['Z_VERSION_ERROR', -6],
+];
+
+export const codes: Readonly<Record<string, string | number>> = Object.freeze(
+    (() => {
+        const out: Record<string, string | number> = {};
+        // Node's insertion order: the three non-negative names first, then all
+        // names, then the negative numeric keys.
+        for (const [name, value] of zlibCodeEntries) if (value >= 0) out[String(value)] = name;
+        for (const [name, value] of zlibCodeEntries) out[name] = value;
+        for (const [name, value] of zlibCodeEntries) if (value < 0) out[String(value)] = name;
+        return out;
+    })(),
+);
+
+// `export type` (not `export interface`) so `export * from './mod'`
+// cannot materialise these as undefined runtime exports.
+export type {
+    ZlibOptions,
+    BrotliOptions,
+    ZlibInput,
+    CompressCallback,
+    DeflateConstructor,
+    InflateConstructor,
+    GzipConstructor,
+    GunzipConstructor,
+    DeflateRawConstructor,
+    InflateRawConstructor,
+    UnzipConstructor,
+    BrotliCompressConstructor,
+    BrotliDecompressConstructor,
 };

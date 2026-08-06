@@ -92,10 +92,16 @@ function typed<T extends Rrtype>(hostname: unknown, rrtype: T, source: QuerySour
 
 export function lookup(hostname: string, options?: LookupOptions | number): Promise<LookupAddress | LookupAddress[]> {
     if (hostname && typeof hostname !== 'string') {
-        throw new TypeError(`The "hostname" argument must be of type string. Received ${String(hostname)}`);
+        throw Object.assign(
+            new TypeError(`The "hostname" argument must be of type string. Received type ${typeof hostname} (${String(hostname)})`),
+            { code: 'ERR_INVALID_ARG_TYPE' },
+        );
     }
     if (typeof hostname === 'string' && hostname.includes('\0')) {
-        throw new TypeError('The "hostname" argument must be a string without null bytes');
+        throw Object.assign(
+            new TypeError('The "hostname" argument must be a string without null bytes'),
+            { code: 'ERR_INVALID_ARG_VALUE' },
+        );
     }
     const normalized = normalizeLookupOptions(options, getDefaultLookupOrder());
     if (!hostname) {
@@ -233,6 +239,11 @@ export class Resolver {
 
     setServers(servers: string[]): void {
         this.resolver.setServers(servers);
+    }
+
+    /** Parity-only; see the note on dns.Resolver#setLocalAddress. */
+    setLocalAddress(ipv4?: string, ipv6?: string): void {
+        this.resolver.setLocalAddress(ipv4, ipv6);
     }
 
     private query = (hostname: string, rrtype: Rrtype): Promise<CModuleDNS.DNSAnswer[]> => this.resolver.query(hostname, rrtype);

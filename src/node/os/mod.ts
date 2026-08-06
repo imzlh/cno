@@ -23,14 +23,54 @@ type NetworkInterfaceWithCidr = CModuleOS.NetworkInterface & {
 
 type SignalConstants = { [key in NodeJS.Signals]: number };
 
-const priorityOS: PriorityNativeOS = os;
-// Node exposes positive platform errno in os.constants.errno; UV stores negatives.
-const errnoConstants: Record<string, number> = Object.fromEntries(
-    Object.entries(err.errno)
-        .filter(([k, v]) => k !== 'OK' && k !== 'UNKNOWN' && typeof v === 'number')
-        .map(([k, v]) => [k, Math.abs(v as number)])
-);
-export interface CpuInfo {
+const priorityOS = os as typeof os & PriorityNativeOS;
+const isWindows = uname.sysname === 'Windows_NT';
+
+// Node's os.constants.errno holds *platform* errno, not libuv's. On Unix libuv
+// codes are -(platform errno) so Math.abs recovers them; on Windows libuv uses
+// its own -4095.. range, so the platform table has to be spelled out.
+const WIN32_ERRNO: Record<string, number> = {
+    E2BIG: 7, EACCES: 13, EADDRINUSE: 100, EADDRNOTAVAIL: 101, EAFNOSUPPORT: 102, EAGAIN: 11,
+    EALREADY: 103, EBADF: 9, EBADMSG: 104, EBUSY: 16, ECANCELED: 105, ECHILD: 10,
+    ECONNABORTED: 106, ECONNREFUSED: 107, ECONNRESET: 108, EDEADLK: 36, EDESTADDRREQ: 109,
+    EDOM: 33, EEXIST: 17, EFAULT: 14, EFBIG: 27, EHOSTUNREACH: 110, EIDRM: 111, EILSEQ: 42,
+    EINPROGRESS: 112, EINTR: 4, EINVAL: 22, EIO: 5, EISCONN: 113, EISDIR: 21, ELOOP: 114,
+    EMFILE: 24, EMLINK: 31, EMSGSIZE: 115, ENAMETOOLONG: 38, ENETDOWN: 116, ENETRESET: 117,
+    ENETUNREACH: 118, ENFILE: 23, ENOBUFS: 119, ENODATA: 120, ENODEV: 19, ENOENT: 2,
+    ENOEXEC: 8, ENOLCK: 39, ENOLINK: 121, ENOMEM: 12, ENOMSG: 122, ENOPROTOOPT: 123,
+    ENOSPC: 28, ENOSR: 124, ENOSTR: 125, ENOSYS: 40, ENOTCONN: 126, ENOTDIR: 20, ENOTEMPTY: 41,
+    ENOTSOCK: 128, ENOTSUP: 129, ENOTTY: 25, ENXIO: 6, EOPNOTSUPP: 130, EOVERFLOW: 132,
+    EPERM: 1, EPIPE: 32, EPROTO: 134, EPROTONOSUPPORT: 135, EPROTOTYPE: 136, ERANGE: 34,
+    EROFS: 30, ESPIPE: 29, ESRCH: 3, ETIME: 137, ETIMEDOUT: 138, ETXTBSY: 139,
+    EWOULDBLOCK: 140, EXDEV: 18, WSAEINTR: 10004, WSAEBADF: 10009, WSAEACCES: 10013,
+    WSAEFAULT: 10014, WSAEINVAL: 10022, WSAEMFILE: 10024, WSAEWOULDBLOCK: 10035,
+    WSAEINPROGRESS: 10036, WSAEALREADY: 10037, WSAENOTSOCK: 10038, WSAEDESTADDRREQ: 10039,
+    WSAEMSGSIZE: 10040, WSAEPROTOTYPE: 10041, WSAENOPROTOOPT: 10042, WSAEPROTONOSUPPORT: 10043,
+    WSAESOCKTNOSUPPORT: 10044, WSAEOPNOTSUPP: 10045, WSAEPFNOSUPPORT: 10046,
+    WSAEAFNOSUPPORT: 10047, WSAEADDRINUSE: 10048, WSAEADDRNOTAVAIL: 10049, WSAENETDOWN: 10050,
+    WSAENETUNREACH: 10051, WSAENETRESET: 10052, WSAECONNABORTED: 10053, WSAECONNRESET: 10054,
+    WSAENOBUFS: 10055, WSAEISCONN: 10056, WSAENOTCONN: 10057, WSAESHUTDOWN: 10058,
+    WSAETOOMANYREFS: 10059, WSAETIMEDOUT: 10060, WSAECONNREFUSED: 10061, WSAELOOP: 10062,
+    WSAENAMETOOLONG: 10063, WSAEHOSTDOWN: 10064, WSAEHOSTUNREACH: 10065, WSAENOTEMPTY: 10066,
+    WSAEPROCLIM: 10067, WSAEUSERS: 10068, WSAEDQUOT: 10069, WSAESTALE: 10070,
+    WSAEREMOTE: 10071, WSASYSNOTREADY: 10091, WSAVERNOTSUPPORTED: 10092,
+    WSANOTINITIALISED: 10093, WSAEDISCON: 10101, WSAENOMORE: 10102, WSAECANCELLED: 10103,
+    WSAEINVALIDPROCTABLE: 10104, WSAEINVALIDPROVIDER: 10105, WSAEPROVIDERFAILEDINIT: 10106,
+    WSASYSCALLFAILURE: 10107, WSASERVICE_NOT_FOUND: 10108, WSATYPE_NOT_FOUND: 10109,
+    WSA_E_NO_MORE: 10110, WSA_E_CANCELLED: 10111, WSAEREFUSED: 10112,
+};
+
+// libuv-only names with no platform errno; Node keeps them out of os.constants.errno.
+const UV_ONLY_ERRNO = /^(EOF|UNKNOWN|OK|ECHARSET|EAI_|ENONET|EFTYPE|EHOSTDOWN|EREMOTEIO|ESOCKTNOSUPPORT|EUNATCH|ESHUTDOWN)/;
+
+const errnoConstants: Record<string, number> = isWindows
+    ? { ...WIN32_ERRNO }
+    : Object.fromEntries(
+        Object.entries(err.errno)
+            .filter(([k, v]) => typeof v === 'number' && !UV_ONLY_ERRNO.test(k))
+            .map(([k, v]) => [k, Math.abs(v as number)])
+    );
+interface CpuInfo {
     model: string;
     speed: number;
     times: {
@@ -42,7 +82,7 @@ export interface CpuInfo {
     };
 }
 
-export interface NetworkInterfaceBase {
+interface NetworkInterfaceBase {
     address: string;
     netmask: string;
     mac: string;
@@ -51,16 +91,16 @@ export interface NetworkInterfaceBase {
     scopeid?: number;
 }
 
-export interface NetworkInterfaceInfoIPv4 extends NetworkInterfaceBase {
+interface NetworkInterfaceInfoIPv4 extends NetworkInterfaceBase {
     family: 'IPv4';
 }
 
-export interface NetworkInterfaceInfoIPv6 extends NetworkInterfaceBase {
+interface NetworkInterfaceInfoIPv6 extends NetworkInterfaceBase {
     family: 'IPv6';
     scopeid: number;
 }
 
-export interface UserInfo<T> {
+interface UserInfo<T> {
     username: T;
     uid: number;
     gid: number;
@@ -68,12 +108,12 @@ export interface UserInfo<T> {
     homedir: T;
 }
 
-export type NetworkInterfaceInfo = NetworkInterfaceInfoIPv4 | NetworkInterfaceInfoIPv6;
+type NetworkInterfaceInfo = NetworkInterfaceInfoIPv4 | NetworkInterfaceInfoIPv6;
 
 // Constants
 
 export const constants = {
-    UV_UDP_REUSEADDR: 0,
+    UV_UDP_REUSEADDR: 4,
 
     // `signals` is null inside a worker thread (POSIX signals are process-wide,
     // not per-thread) — fall back to an empty map instead of crashing on import.
@@ -83,7 +123,8 @@ export const constants = {
 
     errno: errnoConstants,
 
-    dlopen: {
+    // RTLD_* are POSIX only; Node ships an empty dlopen map on Windows.
+    dlopen: isWindows ? {} : {
         RTLD_LAZY: 1,
         RTLD_NOW: 2,
         RTLD_GLOBAL: 256,
@@ -104,10 +145,10 @@ export const constants = {
 // Constant properties
 
 /** Path of the null device */
-export const devNull = uname.sysname === 'Windows_NT' ? '\\\\.\\NUL' : '/dev/null';
+export const devNull = isWindows ? '\\\\.\\nul' : '/dev/null';
 
 /** Operating system-specific end-of-line marker */
-export const EOL = uname.sysname === 'Windows_NT' ? '\r\n' : '\n';
+export const EOL = isWindows ? '\r\n' : '\n';
 
 // Function implementations
 
@@ -177,6 +218,51 @@ export function release(): string {
     return uname.release;
 }
 
+/** Bit count of a contiguous IPv4 dotted-quad or IPv6 hex netmask, or null. */
+function netmaskPrefix(netmask: string, isIPv6: boolean): number | null {
+    const groups: number[] = [];
+    if (isIPv6) {
+        const parts = netmask.split('::');
+        if (parts.length > 2) return null;
+        const head = parts[0] ? parts[0].split(':') : [];
+        const tail = parts.length === 2 && parts[1] ? parts[1].split(':') : [];
+        if (head.length + tail.length > 8) return null;
+        const fill = new Array(8 - head.length - tail.length).fill('0');
+        for (const g of [...head, ...(parts.length === 2 ? fill : []), ...tail]) {
+            const n = parseInt(g, 16);
+            if (!Number.isInteger(n) || n < 0 || n > 0xffff) return null;
+            groups.push(n >> 8, n & 0xff);
+        }
+        if (groups.length !== 16) return null;
+    } else {
+        const parts = netmask.split('.');
+        if (parts.length !== 4) return null;
+        for (const p of parts) {
+            const n = Number(p);
+            if (!Number.isInteger(n) || n < 0 || n > 255) return null;
+            groups.push(n);
+        }
+    }
+
+    let bits = 0;
+    let seenZero = false;
+    for (const byte of groups) {
+        for (let i = 7; i >= 0; i--) {
+            if ((byte >> i) & 1) {
+                if (seenZero) return null;  // non-contiguous mask
+                bits++;
+            } else seenZero = true;
+        }
+    }
+    return bits;
+}
+
+/** Node derives `cidr` from address + netmask; a bad mask yields null. */
+function toCidr(address: string, netmask: string, isIPv6: boolean): string | null {
+    const prefix = netmaskPrefix(netmask, isIPv6);
+    return prefix === null ? null : `${address}/${prefix}`;
+}
+
 /**
  * Returns network interface information
  */
@@ -202,7 +288,7 @@ export function networkInterfaces(): NodeJS.Dict<NetworkInterfaceInfo[]> {
         const entries = result[iface.name] ??= [];
 
         const isIPv6 = iface.address.includes(':');
-        const cidr = iface.cidr ?? `${iface.address}/${isIPv6 ? 128 : 32}`;
+        const cidr = iface.cidr ?? toCidr(iface.address, iface.netmask, isIPv6);
 
         if (isIPv6) {
             entries.push({
@@ -236,7 +322,7 @@ export function homedir(): string {
     return os.homeDir;
 }
 
-export interface UserInfoOptions {
+interface UserInfoOptions {
     encoding?: BufferEncoding | 'buffer' | undefined;
 }
 
@@ -303,7 +389,7 @@ export function arch(): NodeJS.Architecture {
  * Returns the kernel version string
  */
 export function version(): string {
-        return uname.version;
+    return uname.version;
 }
 
 /**
@@ -356,54 +442,162 @@ export function endianness(): 'BE' | 'LE' {
     return new Uint8Array(buffer)[0] === 1 ? 'LE' : 'BE';
 }
 
-function validateInt32(value: number, name: string): void {
-    if (!Number.isInteger(value)) {
-        throw new RangeError(`The value of "${name}" is out of range. It must be an integer.`);
+/** Node's `Received ...` clause for ERR_INVALID_ARG_TYPE. Verified against v24.18. */
+function receivedOf(actual: unknown): string {
+    if (actual === null) return 'null';
+    if (actual === undefined) return 'undefined';
+    const t = typeof actual;
+    if (t === 'string') return `type string ('${actual as string}')`;
+    if (t === 'number') return `type number (${Object.is(actual, -0) ? '-0' : String(actual)})`;
+    if (t === 'bigint') return `type bigint (${String(actual)}n)`;
+    if (t === 'boolean') return `type boolean (${String(actual)})`;
+    if (t === 'symbol') return `type symbol (${String(actual)})`;
+    if (t === 'function') return `function ${(actual as { name?: string }).name ?? ''}`;
+    if (t === 'object') {
+        if (Object.getPrototypeOf(actual) === null) return '[Object: null prototype] {}';
+        const ctor = (actual as object).constructor;
+        return `an instance of ${ctor && ctor.name ? ctor.name : 'Object'}`;
     }
-    if (value < -2147483648 || value > 2147483647) {
-        throw new RangeError(`The value of "${name}" is out of range. It must be >= -2147483648 && <= 2147483647.`);
-    }
+    return `type ${t}`;
 }
 
-function validatePriority(priority: number): void {
-    if (!Number.isInteger(priority)) {
-        throw new RangeError('The value of "priority" is out of range. It must be an integer.');
-    }
-    if (priority < -20 || priority > 19) {
-        throw new RangeError('The value of "priority" is out of range. It must be >= -20 && <= 19.');
+/**
+ * Node groups an out-of-range integer's digits with `_` once |value| exceeds
+ * 2**32, so `1e21` reports as `1e_+21`. Mirrors internal addNumericSeparator.
+ */
+function addNumericSeparator(text: string): string {
+    let res = '';
+    let i = text.length;
+    const start = text[0] === '-' ? 1 : 0;
+    for (; i >= start + 4; i -= 3) res = `_${text.slice(i - 3, i)}${res}`;
+    return i === text.length ? text : `${text.slice(0, i)}${res}`;
+}
+
+function receivedNumber(value: number): string {
+    if (Object.is(value, -0)) return '-0';
+    const text = String(value);
+    return Number.isInteger(value) && Math.abs(value) > 2 ** 32
+        ? addNumericSeparator(text)
+        : text;
+}
+
+function outOfRange(name: string, reason: string, actual: number): RangeError {
+    const e = new RangeError(
+        `The value of "${name}" is out of range. It must be ${reason}. `
+        + `Received ${receivedNumber(actual)}`,
+    ) as RangeError & { code?: string };
+    e.code = 'ERR_OUT_OF_RANGE';
+    return e;
+}
+
+function invalidArgType(name: string, actual: unknown): TypeError {
+    const e = new TypeError(
+        `The "${name}" argument must be of type number. Received ${receivedOf(actual)}`,
+    ) as TypeError & { code?: string };
+    e.code = 'ERR_INVALID_ARG_TYPE';
+    return e;
+}
+
+/**
+ * Node's validateInt32: a non-number is a TypeError (ERR_INVALID_ARG_TYPE), a
+ * non-integer number is ERR_OUT_OF_RANGE "must be an integer", and only then is
+ * the range checked. Getting the ORDER wrong changes which error callers see.
+ */
+function validateInt32(value: unknown, name: string, min = -2147483648, max = 2147483647): number {
+    if (typeof value !== 'number') throw invalidArgType(name, value);
+    if (!Number.isInteger(value)) throw outOfRange(name, 'an integer', value);
+    if (value < min || value > max) throw outOfRange(name, `>= ${min} && <= ${max}`, value);
+    return value;
+}
+
+function systemError(syscall: string): Error {
+    const e = new Error(
+        `A system error occurred: ${syscall} returned ESRCH (no such process)`,
+    ) as Error & { code?: string; errno?: number; syscall?: string; info?: unknown };
+    e.code = 'ERR_SYSTEM_ERROR';
+    e.syscall = syscall;
+    e.errno = -4040;
+    e.info = { errno: -4040, code: 'ESRCH', message: 'no such process', syscall };
+    return e;
+}
+
+/**
+ * The native binding exposes no uv_os_{get,set}priority, so a bogus pid would
+ * otherwise be silently accepted. `process.kill(pid, 0)` delivers no signal and
+ * reports ESRCH for a dead pid, which recovers Node's error for that case.
+ * Deliberately ESRCH-only: an EPERM/EACCES pid DOES exist, and Node's
+ * uv_os_getpriority can still read it, so those must not be turned into errors.
+ */
+function assertPidExists(pid: number, syscall: string): void {
+    if (pid === 0) return;
+    const proc = globalThis.process as unknown as { pid?: number; kill?: (p: number, s: number | string) => unknown } | undefined;
+    if (!proc || typeof proc.kill !== 'function') return;
+    if (pid === proc.pid) return;
+    try {
+        proc.kill(pid, 0);
+    } catch (e) {
+        if ((e as { code?: string } | null)?.code === 'ESRCH') throw systemError(syscall);
     }
 }
 
 export function getPriority(pid?: number): number {
-    validateInt32(pid ?? 0, 'pid');
-    try {
-        return priorityOS.getPriority?.(pid ?? 0) ?? 0;
-    } catch {
-        throw new RangeError(`getPriority ${pid} is not a valid pid`);
-    }
+    // Node uses a default parameter (`pid = 0`), so ONLY undefined defaults —
+    // `pid ?? 0` would wrongly accept null and return a bogus priority.
+    const target = validateInt32(pid === undefined ? 0 : pid, 'pid');
+    assertPidExists(target, 'uv_os_getpriority');
+    // NOTE: no native uv_os_getpriority binding exists, so this reports the
+    // default priority rather than the process's real one. See audit notes.
+    return priorityOS.getPriority?.(target) ?? 0;
 }
 
 export function setPriority(priority: number): void;
 export function setPriority(pid: number, priority: number): void;
 export function setPriority(pidOrPriority: number, priority?: number): void {
-    const pid = priority !== undefined ? pidOrPriority : 0;
-    const prio = priority ?? pidOrPriority;
-    validateInt32(pid, 'pid');
-    validatePriority(prio);
-    try {
-        priorityOS.setPriority?.(pid, prio);
-    } catch {
-        throw new RangeError(`setPriority ${prio} is out of range`);
-    }
+    // Node's exact swap: it tests `priority === undefined`, so setPriority(0, null)
+    // must NOT be treated as the one-argument form (a `??` here would swallow null).
+    let pid: unknown = pidOrPriority;
+    let prio: unknown = priority;
+    if (prio === undefined) { prio = pid; pid = 0; }
+    const validPid = validateInt32(pid, 'pid');
+    const validPrio = validateInt32(prio, 'priority', -20, 19);
+    assertPidExists(validPid, 'uv_os_setpriority');
+    // NOTE: no native uv_os_setpriority binding exists, so this cannot actually
+    // change scheduling priority. See audit notes.
+    priorityOS.setPriority?.(validPid, validPrio);
 }
 
-function installPrimitiveCoercion(fn: () => string, getValue: () => string): void {
+function installPrimitiveCoercion(fn: (...args: never[]) => unknown, getValue: () => unknown): void {
     Object.defineProperties(fn, {
-        toString: { value: getValue, configurable: true },
+        toString: { value: () => String(getValue()), configurable: true },
         [Symbol.toPrimitive]: { value: getValue, configurable: true },
     });
 }
 
+// Node installs Symbol.toPrimitive on every zero-arg os getter, so `${os.arch}`
+// and `os.homedir + ''` work without the call.
 installPrimitiveCoercion(arch, arch);
+installPrimitiveCoercion(availableParallelism, availableParallelism);
 installPrimitiveCoercion(endianness, endianness);
+installPrimitiveCoercion(freemem, freemem);
+installPrimitiveCoercion(homedir, homedir);
+installPrimitiveCoercion(hostname, hostname);
+installPrimitiveCoercion(machine, machine);
 installPrimitiveCoercion(platform, platform);
+installPrimitiveCoercion(release, release);
+installPrimitiveCoercion(tmpdir, tmpdir);
+installPrimitiveCoercion(totalmem, totalmem);
+installPrimitiveCoercion(type, type);
+installPrimitiveCoercion(uptime, uptime);
+installPrimitiveCoercion(version, version);
+
+// `export type` (not `export interface`) so `export * from './mod'`
+// cannot materialise these as undefined runtime exports.
+export type {
+    CpuInfo,
+    NetworkInterfaceBase,
+    NetworkInterfaceInfoIPv4,
+    NetworkInterfaceInfoIPv6,
+    UserInfo,
+    NetworkInterfaceInfo,
+    UserInfoOptions,
+};

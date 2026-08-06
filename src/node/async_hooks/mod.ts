@@ -14,6 +14,16 @@ export interface HookCallbacks {
     promiseResolve?(asyncId: AsyncId): void;
 }
 
+export interface AsyncHook {
+    enable(): AsyncHook;
+    disable(): AsyncHook;
+}
+
+export interface AsyncResourceOptions {
+    triggerAsyncId?: AsyncId;
+    requireManualDestroy?: boolean;
+}
+
 type StoreMap = Map<AsyncLocalStorage<unknown>, unknown>;
 type Thenable<T = unknown> = {
     then(onFulfilled?: (value: T) => unknown, onRejected?: (reason: unknown) => unknown): unknown;
@@ -34,6 +44,7 @@ let _nextId = 2;
 let _currentId: AsyncId = 1;
 let _currentTriggerId: TriggerAsyncId = 0;
 let _currentStores: StoreMap = new Map();
+let _currentResource: object = {};
 let _patched = false;
 let _originalPromiseThen: Promise<unknown>['then'] | null = null;
 
@@ -124,10 +135,12 @@ function runInState<T>(state: AsyncState, callback: AnyCallable, thisArg: unknow
     const prevId = _currentId;
     const prevTriggerId = _currentTriggerId;
     const prevStores = _currentStores;
+    const prevResource = _currentResource;
 
     _currentId = state.id;
     _currentTriggerId = state.triggerId;
     _currentStores = snapshotStoresFrom(state.stores);
+    _currentResource = state.resource;
     emitBefore(state.id);
 
     try {
@@ -137,6 +150,7 @@ function runInState<T>(state: AsyncState, callback: AnyCallable, thisArg: unknow
         _currentId = prevId;
         _currentTriggerId = prevTriggerId;
         _currentStores = prevStores;
+        _currentResource = prevResource;
     }
 }
 
@@ -306,21 +320,25 @@ function installAsyncPatches(): void {
     }
 }
 
-export function createHook(callbacks: HookCallbacks): { enable(): void; disable(): void } {
-    return {
+export function createHook(callbacks: HookCallbacks): AsyncHook {
+    const hook: AsyncHook = {
         enable() {
             installAsyncPatches();
             if (!_hooks.includes(callbacks)) _hooks.push(callbacks);
+            return hook;
         },
         disable() {
             const idx = _hooks.indexOf(callbacks);
             if (idx !== -1) _hooks.splice(idx, 1);
+            return hook;
         },
     };
+    return hook;
 }
 
 export function executionAsyncId(): AsyncId { return _currentId; }
 export function triggerAsyncId(): TriggerAsyncId { return _currentTriggerId; }
+export function executionAsyncResource(): object { return _currentResource; }
 
 export const asyncWrapProviders: Record<string, number> = {
     PROMISE: 0,
@@ -335,8 +353,18 @@ export function newAsyncId(): AsyncId { return _nextId++; }
 export class AsyncResource {
     protected _asyncState: AsyncState;
 
-    constructor(type: string, triggerAsyncId?: AsyncId) {
-        this._asyncState = createState(type, triggerAsyncId ?? _currentId, this);
+    constructor(type: string, triggerAsyncId?: AsyncId | AsyncResourceOptions) {
+        if (typeof type !== 'string') {
+            throw Object.assign(
+                new TypeError(`The "type" argument must be of type string. Received ${type === undefined ? 'undefined' : typeof type}`),
+                { code: 'ERR_INVALID_ARG_TYPE' },
+            );
+        }
+        // Node accepts either a numeric triggerAsyncId or an options object.
+        const trigger = typeof triggerAsyncId === 'object' && triggerAsyncId !== null
+            ? triggerAsyncId.triggerAsyncId
+            : triggerAsyncId;
+        this._asyncState = createState(type, trigger ?? _currentId, this);
     }
 
     static bind<T extends AnyCallable>(fn: T, type?: string, thisArg?: unknown): T {
@@ -375,25 +403,37 @@ export class AsyncResource {
 }
 
 export class AsyncLocalStorage<T = unknown> {
-    run<R>(store: T, callback: () => R): R {
+    run<R, A extends unknown[]>(store: T, callback: (...args: A) => R, ...args: A): R {
         const prevStores = _currentStores;
         _currentStores = snapshotStoresFrom(_currentStores);
         _currentStores.set(this, store);
-        const result = callback();
+        let result: R;
+        try {
+            result = callback(...args);
+        } catch (error) {
+            _currentStores = prevStores;
+            throw error;
+        }
         if (isThenable(result) && _originalPromiseThen) {
-            return this._handleAsyncResult(result, prevStores);
+            return this._handleAsyncResult(result, prevStores) as R;
         }
         _currentStores = prevStores;
         return result;
     }
 
-    exit<R>(callback: () => R): R {
+    exit<R, A extends unknown[]>(callback: (...args: A) => R, ...args: A): R {
         const prevStores = _currentStores;
         _currentStores = snapshotStoresFrom(_currentStores);
         _currentStores.delete(this);
-        const result = callback();
+        let result: R;
+        try {
+            result = callback(...args);
+        } catch (error) {
+            _currentStores = prevStores;
+            throw error;
+        }
         if (isThenable(result) && _originalPromiseThen) {
-            return this._handleAsyncResult(result, prevStores);
+            return this._handleAsyncResult(result, prevStores) as R;
         }
         _currentStores = prevStores;
         return result;

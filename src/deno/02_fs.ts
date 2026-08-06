@@ -13,11 +13,14 @@ import { wrapFSErr, wrapFSns } from "../utils/wrap";
 import { errors } from "./01_errors";
 import { DOMException } from "../webapi/events";
 import { arrayBufferBackedBytes } from "../utils/bytes";
+import { isWindows } from "../utils/platform";
 
 export const toString = (e: URL | string): string => {
     if (!(e instanceof URL)) return e;
     if (e.protocol !== 'file:') throw new TypeError('Must be a file URL');
-    let p = decodeURIComponent(e.pathname);
+    // Malformed escapes stay literal so the fs call reports NotFound, as upstream does.
+    let p: string;
+    try { p = decodeURIComponent(e.pathname); } catch { p = e.pathname; }
     // On Windows, file:///C:/foo → pathname is /C:/foo — strip the leading slash
     if (p.length >= 3 && p[0] === '/' && p[2] === ':') p = p.slice(1);
     return p;
@@ -243,6 +246,48 @@ function symlinkType(opt?: Deno.SymlinkOptions): CModuleAsyncFS.SymlinkType {
     return 0;
 }
 
+// Windows needs to know at creation time whether a link points at a directory.
+// Real Deno infers this from the target when `options.type` is omitted; without
+// the hint the native layer creates a file symlink, which then fails with
+// ERROR_ACCESS_DENIED (or reports EPERM from stat) for directory targets.
+function inferredSymlinkType(old: string, opt?: Deno.SymlinkOptions): Deno.SymlinkOptions | undefined {
+    if (!isWindows || opt?.type !== undefined) return opt;
+    try {
+        if (fs.stat(old).isDirectory) return { ...opt, type: 'dir' };
+    } catch {
+        // Target missing or unreadable: leave the caller's options untouched.
+    }
+    return opt;
+}
+
+// The sync C layer reports symlink failures as a bare TypeError with no errno,
+// so wrapFSErr cannot classify them and callers saw a TypeError where async
+// symlink (and real Deno) give AlreadyExists.
+function classifySymlinkErr(e: unknown, newf: string): unknown {
+    if (typeof Reflect.get(e as object, 'code') === 'number') return e;
+    try {
+        fs.lstat(newf);
+        return new errors.AlreadyExists(`symlink '${newf}'`);
+    } catch {
+        return e;
+    }
+}
+
+// `Deno.chmod` follows symlinks. On Windows the mode is emulated with the
+// read-only attribute, and SetFileAttributes acts on the reparse point itself
+// rather than its target, so a link has to be resolved first. POSIX chmod(2)
+// already follows links, so leave the path alone there.
+function chmodTarget(path: string): string {
+    if (!isWindows) return path;
+    try {
+        if (!fs.lstat(path).isSymbolicLink) return path;
+        return fs.realpath(path);
+    } catch {
+        // Missing/unresolvable: let chmod itself produce the NotFound error.
+        return path;
+    }
+}
+
 function toEpochMilliseconds(t: number | Date): number {
     return typeof t === 'number' ? t * 1000 : t.getTime();
 }
@@ -427,7 +472,25 @@ Object.assign(Deno, wrapFSns({
     },
 
     readLinkSync(path) {
-        return fs.readlink(toString(path));
+        const target = toString(path);
+        try {
+            return fs.readlink(target);
+        } catch (e) {
+            // The native sync readlink reports failures as a TypeError with no
+            // errno, so wrapFSErr cannot classify it and callers saw a
+            // TypeError where async readLink (and real Deno) give NotFound.
+            // Anything carrying a numeric errno is left for wrapFSErr.
+            if (typeof Reflect.get(e as object, 'code') === 'number') throw e;
+            let exists = true;
+            try {
+                fs.lstat(target);
+            } catch {
+                exists = false;
+            }
+            if (!exists) throw new errors.NotFound(`readlink '${target}'`);
+            // Path resolves but is not a symlink — mirror the async path.
+            throw new errors.InvalidData(`readlink '${target}'`);
+        }
     },
 
 
@@ -440,11 +503,26 @@ Object.assign(Deno, wrapFSns({
     },
 
     async symlink(old, newf, opt) {
-        return asfs.symlink(toString(old), toString(newf), symlinkType(opt));
+        const oldStr = toString(old);
+        const newStr = toString(newf);
+        try {
+            return await asfs.symlink(oldStr, newStr, symlinkType(inferredSymlinkType(oldStr, opt)));
+        } catch (e) {
+            throw classifySymlinkErr(e, newStr);
+        }
     },
 
     symlinkSync(old, newf, opt) {
-        return fs.symlink(toString(old), toString(newf));
+        const oldStr = toString(old);
+        const newStr = toString(newf);
+        const resolved = inferredSymlinkType(oldStr, opt);
+        // Sync C layer takes a Windows hint string and has no junction flag — map to 'dir'.
+        const hint = resolved?.type === 'dir' || resolved?.type === 'junction' ? 'dir' : resolved?.type;
+        try {
+            return fs.symlink(oldStr, newStr, hint);
+        } catch (e) {
+            throw classifySymlinkErr(e, newStr);
+        }
     },
 
     realPath(path) {
@@ -606,19 +684,29 @@ Object.assign(Deno, wrapFSns({
     },
 
     chmod(path, mode) {
-        return asfs.chmod(toString(path), mode);
+        return asfs.chmod(chmodTarget(toString(path)), mode);
     },
 
     chmodSync(path, mode) {
-        return fs.chmod(toString(path), mode);
+        return fs.chmod(chmodTarget(toString(path)), mode);
     },
 
     chown(path, uid, gid) {
+        // Windows has no POSIX ownership model. Real Deno rejects with
+        // NotSupported; the native async chown silently succeeds here, which
+        // would let callers believe ownership changed.
+        if (isWindows) {
+            return Promise.reject(
+                new errors.NotSupported(`chown '${toString(path)}'`),
+            );
+        }
         const info = os.userInfo;
         return asfs.chown(toString(path), uid ?? info.userId, gid ?? info.groupId);
     },
 
     chownSync(path, uid, gid) {
+        // Native fs.chown raises a non-Deno InternalError on Windows.
+        if (isWindows) throw new errors.NotSupported(`chown '${toString(path)}'`);
         return fs.chown(toString(path), uid ?? os.userInfo.userId, gid ?? os.userInfo.groupId);
     },
 

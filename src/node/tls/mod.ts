@@ -11,6 +11,7 @@ import type { ListenOptions as NetListenOptions } from '../net';
 
 const streams = import.meta.use('streams');
 const os = import.meta.use('os');
+const fs = import.meta.use('fs');
 const ssl = import.meta.use('ssl');
 const engine = import.meta.use('engine');
 const dns = import.meta.use('dns');
@@ -29,6 +30,16 @@ type SslPipeSessionAccess = CModuleSSL.Pipe & {
     renegotiate?: () => void;
     setSession?: (session: Uint8Array) => void;
 };
+
+// The C layer hands back either an ArrayBuffer or a view into a larger one.
+// `Buffer.from(view)` treats a view as array-like and copies *elements*, dropping
+// byteOffset/byteLength — a session/ticket that is a window into a bigger buffer
+// would silently decode as the wrong bytes. Copy the exact window instead.
+function bufferFromRaw(raw: ArrayBuffer | ArrayBufferView): Buffer {
+    return ArrayBuffer.isView(raw)
+        ? Buffer.from(raw.buffer, raw.byteOffset, raw.byteLength)
+        : Buffer.from(raw);
+}
 type ReadableStateOwner = Duplex & {
     _readableState?: { flowing?: boolean };
     resume?: () => unknown;
@@ -50,6 +61,108 @@ export type TlsCertInput = TlsPemValue | TlsCertObject;
 
 function asError(error: unknown): Error {
     return error instanceof Error ? error : new Error(String(error));
+}
+
+/**
+ * OpenSSL X509_V_ERR_* → the `code` string Node puts on the error it emits and
+ * on `socket.authorizationError`. Callers branch on these (a proxy that retries
+ * only on CERT_HAS_EXPIRED, a pinning check that tolerates
+ * DEPTH_ZERO_SELF_SIGNED_CERT), so a bare OpenSSL string with `code: undefined`
+ * makes every failure indistinguishable.
+ */
+const X509_ERR_CODES: Record<number, string> = {
+    2: 'UNABLE_TO_GET_ISSUER_CERT',
+    3: 'UNABLE_TO_GET_CRL',
+    4: 'UNABLE_TO_DECRYPT_CERT_SIGNATURE',
+    5: 'UNABLE_TO_DECRYPT_CRL_SIGNATURE',
+    6: 'UNABLE_TO_DECODE_ISSUER_PUBLIC_KEY',
+    7: 'CERT_SIGNATURE_FAILURE',
+    8: 'CRL_SIGNATURE_FAILURE',
+    9: 'CERT_NOT_YET_VALID',
+    10: 'CERT_HAS_EXPIRED',
+    11: 'CRL_NOT_YET_VALID',
+    12: 'CRL_HAS_EXPIRED',
+    13: 'ERROR_IN_CERT_NOT_BEFORE_FIELD',
+    14: 'ERROR_IN_CERT_NOT_AFTER_FIELD',
+    15: 'ERROR_IN_CRL_LAST_UPDATE_FIELD',
+    16: 'ERROR_IN_CRL_NEXT_UPDATE_FIELD',
+    17: 'OUT_OF_MEM',
+    18: 'DEPTH_ZERO_SELF_SIGNED_CERT',
+    19: 'SELF_SIGNED_CERT_IN_CHAIN',
+    20: 'UNABLE_TO_GET_ISSUER_CERT_LOCALLY',
+    21: 'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+    22: 'CERT_CHAIN_TOO_LONG',
+    23: 'CERT_REVOKED',
+    24: 'INVALID_CA',
+    25: 'PATH_LENGTH_EXCEEDED',
+    26: 'INVALID_PURPOSE',
+    27: 'CERT_UNTRUSTED',
+    28: 'CERT_REJECTED',
+    29: 'SUBJECT_ISSUER_MISMATCH',
+    30: 'AKID_SKID_MISMATCH',
+    31: 'AKID_ISSUER_SERIAL_MISMATCH',
+    32: 'KEYUSAGE_NO_CERTSIGN',
+    50: 'APPLICATION_VERIFICATION',
+    // 62/63/64 are the name-check failures. Only 62 was mapped, so an IP-SAN
+    // mismatch (64) produced an Error with NO `code` at all, and a caller
+    // branching on err.code === 'ERR_TLS_CERT_ALTNAME_INVALID' silently missed
+    // it. Node reports ERR_TLS_CERT_ALTNAME_INVALID for all three. OBSERVED
+    // against Node v24.18.0: case A3 of the hostname matrix.
+    62: 'ERR_TLS_CERT_ALTNAME_INVALID',
+    63: 'ERR_TLS_CERT_ALTNAME_INVALID',
+    64: 'ERR_TLS_CERT_ALTNAME_INVALID',
+    68: 'EE_KEY_TOO_SMALL',
+    69: 'CA_KEY_TOO_SMALL',
+    70: 'CA_MD_TOO_WEAK',
+};
+
+type CodedError = Error & { code?: string; reason?: string; host?: string; cert?: PeerCertificate };
+
+/** Attach a Node-shaped `code` (and `reason`) to a verification failure. */
+function codedVerifyError(message: string, verifyCode?: number): CodedError {
+    const err = new Error(message) as CodedError;
+    const mapped = verifyCode === undefined ? undefined : X509_ERR_CODES[verifyCode];
+    if (mapped) {
+        err.code = mapped;
+        err.reason = message;
+    }
+    return err;
+}
+
+/**
+ * Build Node's ERR_TLS_CERT_ALTNAME_INVALID for a name-check failure.
+ *
+ * OpenSSL reports only "hostname mismatch" / "IP address mismatch" and aborts
+ * the handshake itself when SSL_set1_host is armed, so the terse text was all a
+ * caller ever saw and `host`/`cert` were absent. Node names the host and lists
+ * the cert's altnames. Rebuild that when the peer cert is reachable; otherwise
+ * keep OpenSSL's text but still attach what we have.
+ *
+ * X509 codes: 62 hostname, 63 email, 64 IP address mismatch.
+ */
+function nameFailureError(
+    verifyCode: number | undefined,
+    rawMessage: string,
+    servername: string | undefined,
+    cert: PeerCertificate | undefined,
+): CodedError {
+    const isNameFailure = verifyCode === 62 || verifyCode === 63 || verifyCode === 64;
+    const hasCert = !!cert && Object.keys(cert).length > 0;
+    if (isNameFailure && servername && hasCert) {
+        const detailed = checkServerIdentity(servername, cert!) as CodedError | undefined;
+        if (detailed) {
+            detailed.cert = cert;
+            return detailed;
+        }
+    }
+    const err = codedVerifyError(rawMessage, verifyCode);
+    if (isNameFailure) {
+        err.code = 'ERR_TLS_CERT_ALTNAME_INVALID';
+        if (!err.reason) err.reason = rawMessage;
+        if (servername) err.host = servername;
+        if (hasCert) err.cert = cert;
+    }
+    return err;
 }
 
 export interface TlsOptions {
@@ -149,16 +262,116 @@ export interface TlsServerOptions extends TlsOptions {
 export interface PeerCertificate {
     subject?: Record<string, string>;
     issuer?: Record<string, string>;
+    /** Node's spelling: typed, comma-separated ("DNS:a, IP Address:1.2.3.4"). */
+    subjectaltname?: string;
+    /** Alias of `subjectaltname`, kept for existing callers of this module. */
     subjectAltName?: string;
     serialNumber?: string;
+    /** Node's spelling. */
+    valid_from?: string;
+    /** Node's spelling. */
+    valid_to?: string;
+    /** Aliases of valid_from / valid_to. */
     validFrom?: string;
     validTo?: string;
+    /**
+     * Node reports the SHA-1 digest here. The C layer computes only SHA-256 and
+     * does not expose the raw DER, so this is left unset rather than filled with
+     * a SHA-256 value that a pin comparison would silently reject.
+     */
     fingerprint?: string;
     fingerprint256?: string;
     raw?: Buffer;
 }
 
 let defaultCACertificates: string[] = [];
+/** null = not probed yet; [] = probed, nothing found. */
+let systemCACertificates: string[] | null = null;
+let defaultCAOverridden = false;
+
+/**
+ * Load the platform trust store, once, synchronously.
+ *
+ * SecureContext construction is synchronous, so this cannot await. On Windows
+ * we read the OS cert stores directly; elsewhere we read the conventional
+ * OpenSSL bundle paths. Without this, `verify: true` relies solely on
+ * OpenSSL's compiled-in default verify paths, which on Windows point at
+ * directories that do not exist — so verification failed closed against
+ * every public server (see AGENT.md "TLS trust store").
+ */
+function loadSystemCACertificates(): string[] {
+    if (systemCACertificates !== null) return systemCACertificates;
+    const collected: string[] = [];
+
+    let sysname = '';
+    try {
+        sysname = os.uname().sysname;
+    } catch {
+        // uname unavailable — fall through to the POSIX bundle probe.
+    }
+
+    if (sysname === 'Windows_NT') {
+        // ROOT = trusted roots, CA = intermediates. Both belong in the store.
+        for (const store of ['ROOT', 'CA']) {
+            try {
+                const win32 = import.meta.use('win32');
+                if (win32 === null) break;	// module absent: no point trying the second store
+                const certs = win32.exportCerts(store);
+                if (certs?.length) collected.push(...certs);
+            } catch {
+                // Store unreadable or win32 module absent.
+            }
+        }
+    } else {
+        const candidates = sysname === 'Darwin'
+            ? ['/etc/ssl/cert.pem', '/opt/homebrew/etc/openssl@3/cert.pem', '/usr/local/etc/openssl@3/cert.pem']
+            : sysname === 'FreeBSD'
+                ? ['/usr/local/share/certs/ca-root-nss.crt', '/etc/ssl/cert.pem']
+                : [
+                    '/etc/ssl/certs/ca-certificates.crt',
+                    '/etc/pki/tls/certs/ca-bundle.crt',
+                    '/etc/pki/tls/cert.pem',
+                    '/etc/ssl/cert.pem',
+                ];
+        for (const path of candidates) {
+            try {
+                const bytes = fs.readFile(path);
+                const text = engine.decodeString(new Uint8Array(bytes));
+                if (text.includes('BEGIN CERTIFICATE')) {
+                    collected.push(text);
+                    break;
+                }
+            } catch {
+                // Missing path — try the next candidate.
+            }
+        }
+    }
+
+    systemCACertificates = collected;
+    return collected;
+}
+
+/** CA PEMs to trust when the caller supplied no explicit `ca`. */
+function effectiveDefaultCACertificates(): string[] {
+    // An explicit setDefaultCACertificates() call replaces the system store,
+    // matching Node, where it overrides the bundled roots.
+    if (defaultCAOverridden) return defaultCACertificates;
+    return loadSystemCACertificates();
+}
+
+/**
+ * Split PEM text into individual certificate blocks.
+ *
+ * The Windows stores hand back one PEM per entry, but the POSIX bundle paths
+ * are a single concatenated file, and `tls.rootCertificates` is specified as
+ * one string per certificate.
+ */
+function splitPemCertificates(input: string): string[] {
+    const blocks: string[] = [];
+    const re = /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g;
+    for (const match of input.match(re) ?? []) blocks.push(match);
+    return blocks;
+}
 
 function pemValueToString(value: TlsPemValue | undefined): string | undefined {
     if (value === undefined) return undefined;
@@ -285,8 +498,14 @@ export class SecureContext {
         if (options?.ca) {
             const ca = Array.isArray(options.ca) ? options.ca : [options.ca];
             opts.ca = ca.map(c => certInputToString(c)).filter(value => value !== undefined).join('\n');
-        } else if (defaultCACertificates.length > 0) {
-            opts.ca = defaultCACertificates.join('\n');
+        } else {
+            // effectiveDefaultCACertificates() falls back to the platform trust
+            // store. Reading the bare `defaultCACertificates` here meant the
+            // store was never consulted unless the caller had first called
+            // setDefaultCACertificates(), so `verify: true` had no trust
+            // anchors at all and failed closed against every public server.
+            const defaults = effectiveDefaultCACertificates();
+            if (defaults.length > 0) opts.ca = defaults.join('\n');
         }
         if (options?.ciphers) opts.ciphers = options.ciphers;
         if (options?.minVersion) opts.minVersion = options.minVersion;
@@ -342,6 +561,7 @@ interface TLSSocketOptions extends TlsOptions {
     ALPNProtocols?: string[] | Buffer[] | Buffer;
     enableTrace?: boolean;
     start?: boolean;
+    checkServerIdentity?: (servername: string, cert: PeerCertificate) => Error | undefined;
 }
 
 export interface TLSSocket extends Duplex {
@@ -375,18 +595,24 @@ export interface TLSSocket extends Duplex {
     _destroyed: boolean;
     _connecting: boolean;
     _rejectUnauthorized: boolean;
+    _requestCert: boolean;
+    _checkServerIdentity?: (servername: string, cert: PeerCertificate) => Error | undefined;
     _writeQueue: Uint8Array[];
     _handle: InternalSocketHandle;
 
     _initTls(): void;
     _flushOutput(): void;
     _feedEncrypted(data: Uint8Array): void;
+    _feedEncryptedSafely(data: Uint8Array): void;
     _drainWriteQueue(): void;
+    _drainPlaintext(): void;
+    _settleAuthorization(): Error | null;
 
     getPeerCertificate(detailed?: boolean): PeerCertificate;
     getCertificate(): PeerCertificate | null;
     getSharedSigalgs(): string[];
     getCipher(): { name: string; version: string; standardName?: string } | undefined;
+    getProtocol(): string | null;
     getTLSTicket(): Buffer | undefined;
     enableTrace(): void;
     setMaxSendFragment(size: number): boolean;
@@ -436,12 +662,28 @@ function initTLSSocket(self: TLSSocket, socket: Duplex | CModuleStreams.Stream, 
 
     self._isServer = options?.isServer ?? false;
     self._rejectUnauthorized = options?.rejectUnauthorized ?? true;
+    self._requestCert = options?.requestCert ?? false;
     self._servername = options?.servername ?? '';
+    self._checkServerIdentity = options?.checkServerIdentity;
     const contextOptions: InternalSecureContextOptions = {
         ...options,
         mode: self._isServer ? 'server' : 'client',
-        verify: !self._isServer && self._rejectUnauthorized,
-        verifyHostname: !self._isServer && !!self._servername,
+        // A server only asks for a client certificate when requestCert is set,
+        // and the C layer's verify flag maps to
+        // SSL_VERIFY_PEER|SSL_VERIFY_FAIL_IF_NO_PEER_CERT — which both sends the
+        // CertificateRequest and fails the handshake on an anonymous client.
+        // Passing it only for clients meant `requestCert` never reached OpenSSL:
+        // the server sent no CertificateRequest, got no client certificate, and
+        // then reported authorized:true because nothing had failed.
+        verify: self._isServer
+            ? (self._requestCert && self._rejectUnauthorized)
+            : self._rejectUnauthorized,
+        // A caller-supplied checkServerIdentity *replaces* the built-in name
+        // check in Node, so it must be able to accept a name OpenSSL would
+        // refuse. SSL_set1_host fails the handshake in the C layer before any JS
+        // runs, so stand it down and let _settleAuthorization run the callback.
+        // The chain is still verified; only the name decision moves to JS.
+        verifyHostname: !self._isServer && !!self._servername && !options?.checkServerIdentity,
         alpn: normalizeAlpnProtocols(options?.ALPNProtocols),
     };
     self._secureContextStore = options?.secureContext ?? new SecureContext(contextOptions);
@@ -488,7 +730,11 @@ TLSSocket.prototype._initTls = function _initTls(this: TLSSocket): void {
     // Wire up the underlying stream
     if (this._underlying instanceof Duplex) {
         this._underlying.on('data', (chunk: Uint8Array | ArrayBuffer) => {
-            this._feedEncrypted(chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk));
+            // This callback is driven by the stream (and, for a native stream,
+            // by C). A throw escaping here becomes an uncaught fault that no
+            // caller can intercept, so it is contained and reported on the
+            // socket instead.
+            this._feedEncryptedSafely(chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk));
         });
         this._underlying.on('end', () => {
             this.push(null);
@@ -516,9 +762,29 @@ TLSSocket.prototype._initTls = function _initTls(this: TLSSocket): void {
                 this.push(null);
                 return;
             }
-            if (result) this._feedEncrypted(result);
+            if (result) this._feedEncryptedSafely(result);
         };
         stream.startRead();
+    }
+};
+
+/**
+ * _feedEncrypted at a callback boundary.
+ *
+ * Both read pumps call in from outside JS control flow (a stream 'data' event,
+ * or the native onread callback). Anything that escapes there surfaces as an
+ * uncaught exception or an unhandled rejection that the application cannot
+ * intercept, and the socket never settles — so faults are converted into an
+ * 'error' on the socket, which is what Node does.
+ */
+TLSSocket.prototype._feedEncryptedSafely = function _feedEncryptedSafely(this: TLSSocket, data: Uint8Array): void {
+    try {
+        this._feedEncrypted(data);
+    } catch (err) {
+        if (this._destroyed) return;
+        const error = asError(err);
+        try { this.emit('error', error); } catch { /* no consumer; still tear down */ }
+        try { this.destroy(); } catch { /* already tearing down */ }
     }
 };
 
@@ -552,43 +818,79 @@ TLSSocket.prototype._feedEncrypted = function _feedEncrypted(this: TLSSocket, da
         // We limit iterations to avoid an infinite loop when the handshake
         // needs more network data (multi-round-trip). After flushing, we
         // break and wait for the next _feedEncrypted call with new data.
+        //
+        // pipe.handshake() THROWS on a fatal handshake fault (e.g. OpenSSL
+        // "certificate verify failed"). This runs inside the underlying
+        // stream's onread/'data' callback, so an escaping throw becomes an
+        // unhandled job exception and the socket never settles — the peer
+        // hangs until its own timeout. Node instead emits 'error' on the
+        // TLSSocket. Convert, emit, and tear down.
         let iterations = 0;
         const MAX_HANDSHAKE_ITERATIONS = 16;
-        while (this._sslPipe && !this._sslPipe.handshake()) {
+        try {
+            while (this._sslPipe && !this._sslPipe.handshake()) {
+                this._flushOutput();
+                if (++iterations >= MAX_HANDSHAKE_ITERATIONS) break;
+            }
             this._flushOutput();
-            if (++iterations >= MAX_HANDSHAKE_ITERATIONS) break;
+        } catch (err) {
+            // Flush any alert OpenSSL queued (e.g. bad_certificate) so the
+            // peer learns why, then surface the fault the Node way.
+            try { this._flushOutput(); } catch { /* wire already gone */ }
+            let error = asError(err);
+            // The raw OpenSSL text carries no `code`, so every handshake fault
+            // looked identical to a caller. When the fault was a certificate
+            // rejection the verify result names the exact reason; use it to
+            // produce Node's code (CERT_HAS_EXPIRED, DEPTH_ZERO_SELF_SIGNED_CERT,
+            // ...) and Node's message.
+            try {
+                const verify = this._sslPipe?.verifyResult;
+                if (verify && !verify.ok) {
+                    let cert: PeerCertificate | undefined;
+                    try { cert = this.getPeerCertificate(); } catch { /* not exposed on a failed handshake */ }
+                    error = nameFailureError(
+                        verify.code,
+                        verify.error ?? String(error.message),
+                        this._isServer ? undefined : this._servername,
+                        cert,
+                    );
+                }
+            } catch { /* keep the original error */ }
+            this.authorized = false;
+            if (!this.authorizationError) this.authorizationError = error;
+            this.emit('error', error);
+            this.destroy();
+            return;
         }
-        this._flushOutput();
 
         if (this._sslPipe?.handshakeComplete) {
             this._handshakeComplete = true;
             this._connecting = false;
             this.readyState = 'open';
 
-            const verify = this._sslPipe.verifyResult;
-            this.authorized = verify.ok;
-            if (!verify.ok) {
-                this.authorizationError = new Error(verify.error ?? `Certificate verification failed: ${verify.code}`);
-            }
-
             const cipher = this._sslPipe.cipher;
             if (cipher) {
                 this.protocol = cipher.name;
                 this.tlsVersion = cipher.version;
             }
-            this.alpnProtocol = this._sslPipe.alpnProtocol;
+            // Node reports `false` — not null — when no ALPN was negotiated.
+            const negotiatedAlpn = this._sslPipe.alpnProtocol;
+            this.alpnProtocol = (negotiatedAlpn ?? false) as string | null;
+
+            // Decide authorized/authorizationError, and run the identity check,
+            // BEFORE announcing the connection: a 'secureConnect' listener reads
+            // socket.authorized to decide whether to trust the peer.
+            const identityError = this._settleAuthorization();
+            if (identityError && this._rejectUnauthorized) {
+                this.emit('error', identityError);
+                this.destroy();
+                return;
+            }
 
             this.emit('secureConnect');
 
             // Read any plaintext that arrived with the final handshake flight
-            for (;;) {
-                const pipe = this._sslPipe;
-                if (!pipe) break;
-                const plaintext = pipe.read();
-                if (!plaintext) break;
-                this.bytesRead += plaintext.byteLength;
-                this.push(new Uint8Array(plaintext));
-            }
+            this._drainPlaintext();
 
             // Flush queued writes now that TLS is ready
             this._drainWriteQueue();
@@ -597,13 +899,55 @@ TLSSocket.prototype._feedEncrypted = function _feedEncrypted(this: TLSSocket, da
     }
 
     // Normal: decrypt and push all available plaintext
-    for (;;) {
-        const pipe = this._sslPipe;
-        if (!pipe) break;
-        const plaintext = pipe.read();
-        if (!plaintext) break;
-        this.bytesRead += plaintext.byteLength;
-        this.push(new Uint8Array(plaintext));
+    this._drainPlaintext();
+};
+
+/**
+ * Drain decrypted plaintext out of the SSL pipe.
+ *
+ * pipe.read() THROWS on a fatal record — a peer that rejects our certificate and
+ * drops the connection produces "shutdown while in init" from SSL_read. This
+ * runs inside the underlying stream's data callback, so an escaping throw became
+ * an unhandled job exception: the process printed an uncaught error the caller
+ * had no way to intercept, and the socket never settled.
+ *
+ * A peer teardown detected during a read is end-of-stream, not an application
+ * fault — Node surfaces it as EOF. Emitting 'error' unconditionally would also
+ * re-throw whenever the last listener had already detached (a finished
+ * keep-alive request), which is how the leak survived the first fix. So report
+ * it only when someone is listening, and otherwise close the readable side.
+ */
+TLSSocket.prototype._drainPlaintext = function _drainPlaintext(this: TLSSocket): void {
+    try {
+        for (;;) {
+            const pipe = this._sslPipe;
+            if (!pipe) break;
+            const plaintext = pipe.read();
+            if (!plaintext) break;
+            this.bytesRead += plaintext.byteLength;
+            this.push(new Uint8Array(plaintext));
+        }
+    } catch (err) {
+        if (this._destroyed) return;
+        const error = asError(err);
+        let hasListener = false;
+        try {
+            const count = (this as unknown as { listenerCount?: (event: string) => number }).listenerCount;
+            hasListener = typeof count === 'function' && count.call(this, 'error') > 0;
+        } catch {
+            hasListener = false;
+        }
+        if (hasListener) {
+            // A listener may itself throw (or reject); this runs inside the
+            // underlying stream's read callback, so letting that escape reaches
+            // native code as an uncaught fault.
+            try { this.emit('error', error); } catch { /* reported; keep tearing down */ }
+        } else {
+            // No consumer for the fault: treat it as EOF rather than turning it
+            // into an uncaught exception.
+            try { this.push(null); } catch { /* readable already ended */ }
+        }
+        try { this.destroy(); } catch { /* already tearing down */ }
     }
 };
 
@@ -618,6 +962,128 @@ TLSSocket.prototype._drainWriteQueue = function _drainWriteQueue(this: TLSSocket
         this._flushOutput();
         this.bytesWritten += data.length;
     }
+};
+
+/**
+ * Decide `authorized` / `authorizationError`, and run the hostname identity
+ * check. Returns the identity error, if any, so the caller can reject.
+ *
+ * Two holes this closes:
+ *
+ *  1. Server side. OpenSSL's verify result is X509_V_OK when verification never
+ *     ran, so a server that asked for a client certificate and received none
+ *     reported `authorized: true`. Authorized now requires a peer certificate
+ *     to actually be present.
+ *
+ *  2. Client side with rejectUnauthorized:false. The C layer only calls
+ *     SSL_set1_host when verifyHostname is set, so the name was never checked
+ *     and a certificate issued for another host reported `authorized: true`.
+ *     The name check now runs in JS whenever OpenSSL did not run it, so
+ *     `authorized` reflects it. Node's contract is that rejectUnauthorized:false
+ *     still connects but reports authorized:false with the reason.
+ *
+ *  3. checkServerIdentity was accepted as an option and never called. It now
+ *     runs on every client handshake, and a returned Error rejects the
+ *     connection when rejectUnauthorized is set.
+ */
+TLSSocket.prototype._settleAuthorization = function _settleAuthorization(this: TLSSocket): Error | null {
+    const pipe = this._sslPipe;
+    if (!pipe) return null;
+
+    let verifyOk = false;
+    let verifyCode: number | undefined;
+    let verifyMessage: string | undefined;
+    try {
+        const verify = pipe.verifyResult;
+        verifyOk = !!verify?.ok;
+        verifyCode = verify?.code;
+        verifyMessage = verify?.error;
+    } catch {
+        // Treat an unreadable verify result as unverified rather than trusted.
+        verifyOk = false;
+    }
+
+    const peerCert = this.getPeerCertificate();
+    const hasPeerCert = !!peerCert && Object.keys(peerCert).length > 0;
+
+    if (!verifyOk) {
+        this.authorized = false;
+        this.authorizationError = nameFailureError(
+            verifyCode,
+            verifyMessage ?? `Certificate verification failed: ${verifyCode}`,
+            this._isServer ? undefined : this._servername,
+            hasPeerCert ? peerCert : undefined,
+        );
+        return null;
+    }
+
+    if (this._isServer) {
+        // X509_V_OK with no certificate means nothing was verified.
+        if (!hasPeerCert) {
+            this.authorized = false;
+            if (this._requestCert) {
+                this.authorizationError = codedVerifyError('peer did not return a certificate');
+            }
+            return null;
+        }
+        this.authorized = true;
+        this.authorizationError = null;
+        return null;
+    }
+
+    // Client: the chain verified (or verification was skipped). The peer name
+    // still has to match, and a caller-supplied checkServerIdentity gets the
+    // final say — Node calls it on every client handshake.
+    const expectedName = this._servername;
+    const custom = this._checkServerIdentity;
+
+    // Did OpenSSL already check the name? The C layer calls SSL_set1_host only
+    // when the context has verifyHostname set, which tracks rejectUnauthorized.
+    // When it did check, its result is authoritative AND more complete than
+    // anything reproducible here: the C layer exposes only dNSName SANs
+    // (mod_ssl.c, GEN_DNS branch), so iPAddress SANs are invisible to JS and a
+    // second built-in check would wrongly reject a valid IP certificate.
+    const opensslCheckedName = this._rejectUnauthorized && !!expectedName;
+
+    if (custom && expectedName) {
+        // Node calls a caller-supplied checkServerIdentity on every client
+        // handshake, so it runs regardless of who else checked.
+        let identityError: Error | undefined;
+        try {
+            identityError = custom(expectedName, peerCert) ?? undefined;
+        } catch (err) {
+            identityError = asError(err);
+        }
+        if (identityError) {
+            const coded = identityError as CodedError;
+            if (!coded.code) coded.code = 'ERR_TLS_CERT_ALTNAME_INVALID';
+            this.authorized = false;
+            this.authorizationError = coded;
+            return coded;
+        }
+    } else if (hasPeerCert && expectedName && !opensslCheckedName) {
+        // rejectUnauthorized:false, so OpenSSL skipped the name check. Node
+        // still reports authorized:false for a name mismatch, so run the check
+        // here to keep that signal honest. An IP peer name is skipped because
+        // iPAddress SANs are not visible from JS (see above) and the check
+        // would produce a false mismatch.
+        const isIpPeer = /^[0-9.]+$/.test(expectedName) || expectedName.includes(':');
+        if (!isIpPeer) {
+            const identityError = checkServerIdentity(expectedName, peerCert);
+            if (identityError) {
+                const coded = identityError as CodedError;
+                if (!coded.code) coded.code = 'ERR_TLS_CERT_ALTNAME_INVALID';
+                this.authorized = false;
+                this.authorizationError = coded;
+                // rejectUnauthorized:false must still connect, so this is
+                // reported but not returned as a rejection.
+                return null;
+            }
+        }
+    }
+    this.authorized = true;
+    this.authorizationError = null;
+    return null;
 };
 
 Object.defineProperty(TLSSocket.prototype, '_tlsOptions', {
@@ -660,17 +1126,51 @@ TLSSocket.prototype.getPeerCertificate = function getPeerCertificate(this: TLSSo
         return result;
     };
 
-    return {
+    // The C layer hands back bare names. Node's `subjectaltname` is a
+    // comma-separated list of *typed* entries ("DNS:a, IP Address:1.2.3.4"), and
+    // checkServerIdentity parses those prefixes. Emitting bare names made the
+    // SAN filter match nothing and silently fall back to the CN — so a
+    // certificate whose SAN covered only another host could be accepted on its
+    // CN alone.
+    const rawNames = cert.subjectAltNames ?? [];
+    const isIp = (v: string) => /^[0-9.]+$/.test(v) || v.includes(':');
+    const typed = rawNames.map(n => (n.startsWith('DNS:') || n.startsWith('IP Address:') || n.startsWith('URI:') || n.startsWith('email:'))
+        ? n
+        : (isIp(n) ? `IP Address:${n}` : `DNS:${n}`));
+    const subjectaltname = typed.length ? typed.join(', ') : undefined;
+
+    const out: PeerCertificate = {
         subject: parseDN(cert.subject),
         issuer: parseDN(cert.issuer),
-        subjectAltName: cert.subjectAltNames?.join(', '),
+        // Node's key is lowercase `subjectaltname`. The camelCase spelling is
+        // kept as an alias so existing callers of this module keep working.
+        subjectaltname,
+        subjectAltName: subjectaltname,
         serialNumber: cert.serialNumber,
+        valid_from: cert.validFrom,
+        valid_to: cert.validTo,
         validFrom: cert.validFrom,
         validTo: cert.validTo,
-        fingerprint: cert.fingerprint256,
         fingerprint256: cert.fingerprint256,
         raw: Buffer.from([]),
     };
+    // Node's `fingerprint` is the SHA-1 digest. The C layer only computes
+    // SHA-256 (mod_ssl.c tjs_ssl_pipe_get_peer_certificate) and does not expose
+    // the raw DER, so SHA-1 cannot be derived here. Reporting the SHA-256 digest
+    // under the `fingerprint` name would make a pin comparison silently
+    // mismatch, so the field is omitted rather than filled with the wrong hash.
+    return out;
+};
+
+TLSSocket.prototype.getProtocol = function getProtocol(this: TLSSocket): string | null {
+    // Node returns the negotiated version, or null before the handshake.
+    if (!this._handshakeComplete || !this._sslPipe) return null;
+    try {
+        const cipher = this._sslPipe.cipher;
+        if (cipher?.version) return cipher.version;
+        const version = this._sslPipe.version;
+        return version ?? null;
+    } catch { return null; }
 };
 
 TLSSocket.prototype.getCertificate = function getCertificate(this: TLSSocket): PeerCertificate | null { return this.getPeerCertificate(); };
@@ -690,7 +1190,7 @@ TLSSocket.prototype.getTLSTicket = function getTLSTicket(this: TLSSocket): Buffe
     if (!this._sslPipe) return undefined;
     try {
         const ticket = (this._sslPipe as SslPipeSessionAccess).sessionTicket;
-        return ticket ? Buffer.from(ticket) : undefined;
+        return ticket ? bufferFromRaw(ticket) : undefined;
     } catch { return undefined; }
 };
 
@@ -719,7 +1219,7 @@ TLSSocket.prototype.getSession = function getSession(this: TLSSocket): Buffer | 
     if (!this._sslPipe) return null;
     try {
         const sess = (this._sslPipe as SslPipeSessionAccess).session;
-        return sess ? Buffer.from(sess) : null;
+        return sess ? bufferFromRaw(sess) : null;
     } catch { return null; }
 };
 
@@ -803,12 +1303,18 @@ TLSSocket.prototype._write = function _write(this: TLSSocket, chunk: unknown, en
         return;
     }
 
-    const data = typeof chunk === 'string' ? engine.encodeString(chunk) :
-        Buffer.isBuffer(chunk) ? new Uint8Array(chunk) : chunk;
+    // Narrow to Uint8Array here rather than casting at each use: a non-string,
+    // non-Buffer chunk from a user stream may be any ArrayBufferView, and both
+    // _sslPipe.write and the bytesWritten tally need a concrete byte view.
+    const data: Uint8Array = typeof chunk === 'string' ? engine.encodeString(chunk) :
+        Buffer.isBuffer(chunk) ? new Uint8Array(chunk) :
+        chunk instanceof Uint8Array ? chunk :
+        ArrayBuffer.isView(chunk) ? new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength) :
+        new Uint8Array(chunk as ArrayBuffer);
 
     // Queue writes until handshake completes
     if (!this._handshakeComplete) {
-        this._writeQueue.push(data instanceof Uint8Array ? data : new Uint8Array(data));
+        this._writeQueue.push(data);
         callback();
         return;
     }
@@ -961,6 +1467,10 @@ function initServer(
         dhparam: options.dhparam,
         ecdhCurve: options.ecdhCurve,
         ALPNProtocols: options.ALPNProtocols,
+        // Without this the server context ran with SSL_VERIFY_NONE, so
+        // requestCert never produced a CertificateRequest and every anonymous
+        // client was accepted (and reported authorized).
+        verify: self._requestCert && self._rejectUnauthorized,
     });
 
     if (secureConnectionListener) {
@@ -1029,7 +1539,12 @@ Object.setPrototypeOf(Server, EventEmitter);
 Server.prototype = Object.create(EventEmitter.prototype);
 
 Server.prototype.listen = function listen(this: Server, ...args: ServerListenArgs): Server {
-    this._netServer.listen(...args);
+    // Narrow to a single net overload: TS cannot resolve a spread of a *union*
+    // tuple, and the forms differ only in which trailing args are present.
+    const [first, ...rest] = args as [unknown, ...Array<string | number | (() => void)>];
+    if (typeof first === 'number') this._netServer.listen(first, ...rest as []);
+    else if (typeof first === 'string') this._netServer.listen(first, ...rest as []);
+    else this._netServer.listen(first as NetListenOptions, ...rest as []);
     return this;
 };
 
@@ -1074,7 +1589,11 @@ flattenPrototype(Server.prototype);
 export function createServer(options?: TlsServerOptions, secureConnectionListener?: (socket: TLSSocket) => void): Server;
 export function createServer(secureConnectionListener?: (socket: TLSSocket) => void): Server;
 export function createServer(optionsOrListener?: TlsServerOptions | ((socket: TLSSocket) => void), secureConnectionListener?: (socket: TLSSocket) => void): Server {
-    return new Server(optionsOrListener, secureConnectionListener);
+    // Narrow to one ServerConstructor overload — TS cannot pick one for a union
+    // argument, though initServer accepts both shapes at runtime.
+    return typeof optionsOrListener === 'function'
+        ? new Server(optionsOrListener)
+        : new Server(optionsOrListener, secureConnectionListener);
 }
 
 export function connect(options: TlsConnectOptions, secureConnectListener?: () => void): TLSSocket;
@@ -1121,7 +1640,12 @@ export function connect(
     const secureContext = new SecureContext({
         mode: 'client',
         verify: options.rejectUnauthorized ?? true,
-        verifyHostname: (options.rejectUnauthorized ?? true) && !!(options.servername ?? host),
+        // See initTLSSocket: a caller-supplied checkServerIdentity replaces the
+        // built-in name check, so the C-layer SSL_set1_host check must not
+        // pre-empt it by failing the handshake first.
+        verifyHostname: (options.rejectUnauthorized ?? true)
+            && !!(options.servername ?? host)
+            && !options.checkServerIdentity,
         key: options.key,
         cert: options.cert,
         ca: options.ca,
@@ -1141,6 +1665,7 @@ export function connect(
             secureContext,
             servername: options.servername ?? host,
             ALPNProtocols: options.ALPNProtocols,
+            checkServerIdentity: options.checkServerIdentity,
             start: true,
         });
 
@@ -1163,6 +1688,7 @@ export function connect(
         secureContext,
         servername: options.servername ?? host,
         ALPNProtocols: options.ALPNProtocols,
+        checkServerIdentity: options.checkServerIdentity,
         start: false,
     });
 
@@ -1220,7 +1746,24 @@ export const DEFAULT_CIPHERS = ssl.ciphers.join(':');
 export const DEFAULT_ECDH_CURVE = 'auto';
 export const DEFAULT_MIN_VERSION = 'TLSv1.2';
 export const DEFAULT_MAX_VERSION = 'TLSv1.3';
-export const rootCertificates: string[] = [];
+/**
+ * The platform trust anchors, one PEM per certificate.
+ *
+ * Node exposes its bundled Mozilla roots here; cno has no bundled set, so this
+ * reports the platform store that `verify: true` actually uses. It was
+ * previously a permanently empty array, which told callers no trust anchors
+ * existed while the store held dozens.
+ */
+export const rootCertificates: string[] = (() => {
+    try {
+        const collected: string[] = [];
+        for (const pem of loadSystemCACertificates()) collected.push(...splitPemCertificates(pem));
+        return collected;
+    } catch {
+        // Never let trust-store probing break `import 'node:tls'`.
+        return [];
+    }
+})();
 
 export function setDefaultCACertificates(certs: string[]): void {
     if (!Array.isArray(certs)) {
@@ -1232,6 +1775,10 @@ export function setDefaultCACertificates(certs: string[]): void {
         }
     }
     defaultCACertificates = [...certs];
+    // Without this the override flag stayed false forever, so
+    // effectiveDefaultCACertificates() would keep returning the system store
+    // and silently ignore the caller's replacement set.
+    defaultCAOverridden = true;
 }
 
 export function getCiphers(): string[] {
@@ -1245,18 +1792,53 @@ export function convertProtocols(protocols: string[] | Buffer[] | Buffer): Buffe
     return [protocols as Buffer];
 }
 
+/**
+ * Node's ERR_TLS_CERT_ALTNAME_INVALID carries `reason`, `host` and `cert`
+ * alongside `code`, and the message is always the fixed prefix plus `reason`.
+ * The exported checkServerIdentity returned a bare Error with none of those, so
+ * a caller doing `err.code === 'ERR_TLS_CERT_ALTNAME_INVALID'` or reading
+ * `err.host` got undefined. OBSERVED against Node v24.18.0.
+ */
+function altNameError(reason: string, host: string, cert?: PeerCertificate): CodedError {
+    const err = new Error(`Hostname/IP does not match certificate's altnames: ${reason}`) as CodedError;
+    err.code = 'ERR_TLS_CERT_ALTNAME_INVALID';
+    err.reason = reason;
+    err.host = host;
+    if (cert) err.cert = cert;
+    return err;
+}
+
 export function checkServerIdentity(servername: string, cert: PeerCertificate): Error | undefined {
     const cn = cert.subject?.CN ?? '';
-    const sans: string[] = cert.subjectAltName
-        ? cert.subjectAltName.split(', ')
-              .filter((s: string) => s.startsWith('DNS:'))
-              .map((s: string) => s.slice(4))
-        : [];
-
-    const names = sans.length ? sans : (cn ? [cn] : []);
-    if (!names.length) return new Error('Cert has no name');
+    const sanText = cert.subjectaltname ?? cert.subjectAltName ?? '';
+    const entries = sanText ? sanText.split(',').map(s => s.trim()).filter(Boolean) : [];
+    const dnsNames: string[] = [];
+    const ipNames: string[] = [];
+    for (const entry of entries) {
+        if (entry.startsWith('DNS:')) dnsNames.push(entry.slice(4));
+        else if (entry.startsWith('IP Address:')) ipNames.push(entry.slice(11).trim());
+        else if (entry.startsWith('IP:')) ipNames.push(entry.slice(3).trim());
+    }
 
     const host = servername.toLowerCase();
+    const looksLikeIp = /^[0-9.]+$/.test(servername) || servername.includes(':');
+
+    // An IP peer name matches only an iPAddress SAN. Node never falls back to
+    // the CN for an IP, and never matches a wildcard against one.
+    if (looksLikeIp) {
+        for (const ip of ipNames) {
+            if (ip.toLowerCase() === host) return undefined;
+        }
+        return altNameError(
+            `IP: ${servername} is not in the cert's list: ${ipNames.join(', ')}`,
+            servername, cert,
+        );
+    }
+
+    // Per RFC 6125 the CN is only consulted when there is no dNSName SAN at all.
+    const names = dnsNames.length ? dnsNames : (cn ? [cn] : []);
+    if (!names.length) return new Error('Cert has no name');
+
     for (const name of names) {
         const pattern = name.toLowerCase();
         if (pattern === host) return undefined;
@@ -1267,5 +1849,8 @@ export function checkServerIdentity(servername: string, cert: PeerCertificate): 
             }
         }
     }
-    return new Error(`Hostname/IP does not match certificate's altnames: Host: ${servername}. is not in the cert's altnames`);
+    return altNameError(
+        `Host: ${servername}. is not in the cert's altnames: ${sanText || `CN=${cn}`}`,
+        servername, cert,
+    );
 }

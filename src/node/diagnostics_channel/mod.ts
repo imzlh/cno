@@ -6,25 +6,35 @@ function isChannelName(name: unknown): name is ChannelName {
     return typeof name === 'string' || typeof name === 'symbol';
 }
 
+/** Node stamps ERR_INVALID_ARG_TYPE on all of these; callers branch on .code. */
+function invalidArgType(message: string): TypeError {
+    return Object.assign(new TypeError(message), { code: 'ERR_INVALID_ARG_TYPE' });
+}
+
 function assertChannelName(name: unknown): asserts name is ChannelName {
     if (!isChannelName(name)) {
-        throw new TypeError('The "channel" argument must be one of type string or symbol');
+        throw invalidArgType('The "channel" argument must be one of type string or symbol');
     }
 }
 
 function assertMessageHandler(onMessage: unknown): asserts onMessage is MessageHandler {
     if (typeof onMessage !== 'function') {
-        throw new TypeError('The "subscription" argument must be of type function');
+        throw invalidArgType('The "subscription" argument must be of type function');
     }
 }
+
+type StoreLike = { run<T>(store: unknown, fn: (...args: unknown[]) => T, ...args: unknown[]): T };
+type StoreBinding = { store: StoreLike; transform: (message: unknown) => unknown };
 
 export class Channel {
     readonly name: ChannelName;
     private _subscribers: MessageHandler[];
+    private _stores: StoreBinding[];
 
     constructor(name: ChannelName) {
         this.name = name;
         this._subscribers = [];
+        this._stores = [];
     }
 
     subscribe(onMessage: MessageHandler): void {
@@ -51,6 +61,42 @@ export class Channel {
                 queueMicrotask(() => { throw error; });
             }
         }
+    }
+
+    /** Binds an AsyncLocalStorage whose store is set from each published message. */
+    bindStore(store: StoreLike, transform?: (message: unknown) => unknown): void {
+        if (!store || typeof store.run !== 'function') {
+            throw invalidArgType('The "store" argument must be an AsyncLocalStorage instance');
+        }
+        if (transform !== undefined && typeof transform !== 'function') {
+            throw invalidArgType('The "transform" argument must be of type function');
+        }
+        this._stores.push({ store, transform: transform ?? ((message: unknown) => message) });
+    }
+
+    unbindStore(store: StoreLike): boolean {
+        const index = this._stores.findIndex((binding) => binding.store === store);
+        if (index === -1) return false;
+        this._stores.splice(index, 1);
+        return true;
+    }
+
+    /** Runs `fn` inside every bound store; the publish happens inside them too. */
+    runStores<T>(message: unknown, fn: (...args: unknown[]) => T, thisArg?: unknown, ...args: unknown[]): T {
+        if (typeof fn !== 'function') {
+            throw invalidArgType('The "fn" argument must be of type function');
+        }
+        // publish() must run *inside* the innermost bound store, as Node does —
+        // a subscriber calling als.getStore() otherwise sees undefined.
+        let run = (): T => {
+            this.publish(message);
+            return Reflect.apply(fn, thisArg, args) as T;
+        };
+        for (const { store, transform } of this._stores) {
+            const next = run;
+            run = () => store.run(transform(message), next);
+        }
+        return run();
     }
 
     get hasSubscribers(): boolean {
@@ -102,12 +148,32 @@ type TracingChannel = {
     traceCallback<T>(fn: (...args: unknown[]) => T, position?: number, context?: Record<string, unknown>, thisArg?: unknown, ...args: unknown[]): T;
 };
 
+type TracingChannelSubscribers = Partial<Record<typeof traceEvents[number], Channel>>;
+
 const traceEvents = ['start', 'end', 'asyncStart', 'asyncEnd', 'error'] as const;
 
-export function tracingChannel(name: string): TracingChannel {
-    if (typeof name !== 'string') {
-        throw new TypeError('The "nameOrChannels" argument must be of type string');
+/** Node accepts either a name prefix or an object of ready-made channels. */
+function resolveTraceChannels(nameOrChannels: string | TracingChannelSubscribers): Record<string, Channel> {
+    if (typeof nameOrChannels === 'string') {
+        const out: Record<string, Channel> = {};
+        for (const event of traceEvents) out[event] = channel(`tracing:${nameOrChannels}:${event}`);
+        return out;
     }
+    if (!nameOrChannels || typeof nameOrChannels !== 'object') {
+        throw invalidArgType('The "nameOrChannels" argument must be of type string or object');
+    }
+    const out: Record<string, Channel> = {};
+    for (const event of traceEvents) {
+        const provided = nameOrChannels[event];
+        if (provided instanceof Channel) out[event] = provided;
+        else if (provided === undefined) out[event] = channel(Symbol(`tracing:${event}`));
+        else throw invalidArgType(`The "nameOrChannels.${event}" property must be an instance of Channel`);
+    }
+    return out;
+}
+
+export function tracingChannel(nameOrChannels: string | TracingChannelSubscribers): TracingChannel {
+    const resolved = resolveTraceChannels(nameOrChannels);
     const traceHasSubscribers = (): boolean =>
         trace.start.hasSubscribers
         || trace.end.hasSubscribers
@@ -116,11 +182,11 @@ export function tracingChannel(name: string): TracingChannel {
         || trace.error.hasSubscribers;
 
     const trace = {
-        start: channel(`tracing:${name}:start`),
-        end: channel(`tracing:${name}:end`),
-        asyncStart: channel(`tracing:${name}:asyncStart`),
-        asyncEnd: channel(`tracing:${name}:asyncEnd`),
-        error: channel(`tracing:${name}:error`),
+        start: resolved.start as Channel,
+        end: resolved.end as Channel,
+        asyncStart: resolved.asyncStart as Channel,
+        asyncEnd: resolved.asyncEnd as Channel,
+        error: resolved.error as Channel,
         subscribe(handlers: TraceHandlers): void {
             for (const event of traceEvents) {
                 const handler = handlers[event];
@@ -151,7 +217,8 @@ export function tracingChannel(name: string): TracingChannel {
             }
         },
         tracePromise<T>(fn: (...args: unknown[]) => T | PromiseLike<T>, context: Record<string, unknown> = {}, thisArg?: unknown, ...args: unknown[]): Promise<T> {
-            if (!traceHasSubscribers()) return Promise.resolve(fn.apply(thisArg, args));
+            // Node returns fn()'s own value untouched when nothing is subscribed.
+            if (!traceHasSubscribers()) return fn.apply(thisArg, args) as Promise<T>;
             trace.start.publish(context);
             let promise: Promise<T>;
             try {
@@ -184,7 +251,7 @@ export function tracingChannel(name: string): TracingChannel {
             const index = position < 0 ? args.length + position : position;
             const callback = args[index];
             if (typeof callback !== 'function') {
-                throw new TypeError('The "callback" argument must be of type function');
+                throw invalidArgType('The "callback" argument must be of type function');
             }
             args.splice(index, 1, function(this: unknown, error: unknown, result: unknown, ...rest: unknown[]) {
                 if (error) {

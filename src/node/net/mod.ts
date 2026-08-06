@@ -7,10 +7,15 @@ const streams = import.meta.use('streams');
 const os = import.meta.use('os');
 const engine = import.meta.use('engine');
 const nativeDns = import.meta.use('dns');
+const nativeError = import.meta.use('error');
 
 import { EventEmitter } from '../events';
 import { Duplex, Readable, Writable } from '../stream';
 import { matchesErrnoCode, normalizeErrnoError } from '../_internal/errno';
+import { onNetClientSocket, onNetServerSocket } from '../diagnostics_channel/builtins';
+
+/** Guards net.client.socket against the pipe branch's re-entrant connect(). */
+const kNetClientSocketPublished = Symbol('kNetClientSocketPublished');
 
 // Type definitions
 
@@ -139,6 +144,86 @@ function emitErrorQuietly(emitter: EventEmitter, error: Error): void {
     } catch {
         // Preserve destroy() cleanup even if an error listener throws.
     }
+}
+
+// Node's bind/listen failures carry `syscall:'listen'` plus the address that
+// failed, and the message is `listen <CODE>: <desc> <address>[:<port>]`.
+// Verified against real Node v24.18 on Windows:
+//   listen EADDRINUSE: address already in use 127.0.0.1:49625
+//   listen EACCES: permission denied C:\...\x.sock
+function toListenError(raw: unknown, address: string, port?: number): Error {
+    const err = normalizeErrnoError(raw, 'listen') as NodeJS.ErrnoException & {
+        address?: string;
+        port?: number;
+    };
+    const code = typeof err.code === 'string' ? err.code : 'UNKNOWN';
+    let desc = typeof err.errno === 'number' ? nativeError.strerror(err.errno) : '';
+    if (!desc) desc = err.message;
+    // strerror/message already carry a `CODE: ` prefix; keep the readable half.
+    desc = desc.replace(/^[A-Z][A-Z0-9]*:\s*/, '').trim() || 'unknown error';
+    const where = port === undefined ? address : `${address}:${port}`;
+    err.message = `listen ${code}: ${desc}${where ? ` ${where}` : ''}`;
+    err.syscall = 'listen';
+    err.address = address;
+    if (port !== undefined) err.port = port;
+    // toErrnoException stamps an own `name`; Node's listen errors do not carry
+    // one, so `Object.keys(err)` would otherwise not match upstream.
+    delete (err as { name?: string }).name;
+    return err;
+}
+
+// A read error is fatal in Node: `onStreamRead` calls `destroy(err)`, which
+// emits 'error' once and then 'close' with hadError=true. Emitting bare and
+// leaving the socket open was measured to produce, on a peer RST mid-write:
+//   cno: 35 'error' emissions, later ones raw native IOError objects whose
+//        `.code` is the NUMBER -4047 and which carry no own properties, and
+//        NO 'close' at all — `destroyed` stayed false, readyState 'open'.
+//   node: exactly 1 error (code 'ECONNRESET', string) then close(hadError=true).
+// A `err.code === 'ECONNRESET'` check — the standard idiom — silently fails
+// against a numeric code, so the repeats were also unclassifiable.
+function destroyWithReadError(socket: Socket, raw: unknown): void {
+    if (socket._destroyed) return;
+    socket.destroy(normalizeErrnoError(raw, 'read'));
+}
+
+// Node runs 'listening' / listen-error emissions on the next tick so that
+// `server.listen(p); server.on('listening'|'error', h)` — the standard idiom —
+// still observes them. `process` is resolved lazily to avoid an import cycle
+// (same approach as stream/mod.ts's deferTick).
+type NextTickHost = { nextTick?: (callback: () => void, ...args: unknown[]) => void };
+
+function deferTick(callback: () => void): void {
+    const host = (globalThis as { process?: NextTickHost }).process;
+    if (host && typeof host.nextTick === 'function') {
+        host.nextTick(callback);
+        return;
+    }
+    queueMicrotask(callback);
+}
+
+// Node defers listen failures to nextTick, so `server.listen(p);
+// server.on('error', h)` still catches them. Emitting inline instead makes that
+// idiom (the standard EADDRINUSE retry) throw out of listen().
+function emitListenErrorAsync(server: Server, err: Error): void {
+    deferTick(() => emitErrorQuietly(server, err));
+}
+
+// Measured against real Node v24.18: `listen()` NEVER emits 'listening' inline.
+//   listen(0):              AFTER-listen() listening=true > listening-event > listen-cb > nextTick
+//   listen(0,'127.0.0.1'):  AFTER-listen() listening=false > microtask > nextTick > listening-event
+// Emitting inline broke two things:
+//   1. `server.listen(p); server.on('listening', h)` never fired h at all — the
+//      event was already gone by the time the listener attached.
+//   2. A listen callback that calls `server.close()` ran *inside* listen(),
+//      which tripped a C-level bug where a handle closed from within another
+//      handle's close-callback delivery does not hold the loop alive, so the
+//      close callback was silently dropped and the process exited early.
+function emitListeningAsync(server: Server): void {
+    deferTick(() => {
+        // close() between listen() and this tick means Node never emits.
+        if (!server._listening) return;
+        server.emit('listening');
+    });
 }
 
 // Flattens a prototype chain onto `target` for interop with consumers that
@@ -445,7 +530,11 @@ function handleSocketEof(socket: Socket): void {
     socket._pipeReadStarted = false;
     socket._upgradeReadStarted = false;
     socket.push(null);
-    socket.readable = false;
+    // Node keeps `readable` true until 'end' is emitted, i.e. until the buffer has
+    // actually drained — measured: with 3 bytes still buffered it reports
+    // `readable === true`. Clearing it here while chunks remain is what let
+    // `Duplex.read()`'s old `if (!this.readable) return null` gate strand them
+    // forever, so the flag flip is deferred to _emitReadableEndIfNeeded below.
     socket._readable = false;
     if (socket._destroyed) return;
     if (!socket._readableState.flowing && socket._readableState.buffer.length === 0) {
@@ -454,7 +543,37 @@ function handleSocketEof(socket: Socket): void {
 
     if (!socket._allowHalfOpen && !socket.writableEnded) {
         socket.readyState = 'readOnly';
-        socket.end();
+        // Node's `allowHalfOpen:false` means "auto-end AFTER the 'end' handler
+        // has had its turn", not "close the write side now". Node implements it
+        // as an `onReadableStreamEnd` listener, which runs on the tick after
+        // 'end' — so a server doing `s.on('end', () => s.write(tail))` still
+        // delivers `tail`. Calling end() inline here flipped `writable` false
+        // before the user's 'end' handler ran, so that write was REJECTED and
+        // the peer received "" instead of the payload — measured:
+        //   node: S:end(writable=true)  > write returned true  > C:end(recv="AFTER-END")
+        //   cno:  S:end(writable=false) > write returned false > C:end(recv="")
+        // i.e. silent data loss on every allowHalfOpen:false socket whose 'end'
+        // handler writes a farewell (the standard request/response shape).
+        // Node's `allowHalfOpen:false` means "auto-end AFTER the 'end' handler
+        // has had its turn", not "close the write side now". Node implements it
+        // as an `onReadableStreamEnd` listener, which runs on the tick after
+        // 'end' — so a server doing `s.on('end', () => s.write(tail))` still
+        // delivers `tail`. Calling end() inline flips `writable` false before
+        // the user's 'end' handler runs, so that write is REJECTED — measured:
+        //   node: S:end(writable=true)  > write returned true  > C:end("AFTER-END")
+        //   cno:  S:end(writable=false) > write returned false > C:end("")
+        // i.e. silent data loss on an allowHalfOpen:false socket whose 'end'
+        // handler writes a farewell (the standard request/response shape).
+        // HTTP-owned sockets keep the inline path: core drives its own
+        // shutdown sequencing and deferring here hangs every TLS response.
+        if (socket._httpOwned) {
+            socket.end();
+            return;
+        }
+        deferTick(() => {
+            if (socket._destroyed || socket.writableEnded) return;
+            socket.end();
+        });
         return;
     }
 
@@ -485,6 +604,14 @@ Socket.prototype.connect = function connect(
     hostOrCb?: string | (() => void),
     cb?: () => void
 ): Socket {
+    // Node publishes net.client.socket at the top of connect(), before any
+    // resolution or connection work, with just `{ socket }`. The `{ path }`
+    // branch below re-enters connect(), so the flag keeps this exactly-once
+    // per user-initiated call rather than publishing twice for a pipe.
+    if (onNetClientSocket.hasSubscribers && !Reflect.get(this, kNetClientSocketPublished)) {
+        Reflect.set(this, kNetClientSocketPublished, true);
+        onNetClientSocket.publish({ socket: this });
+    }
     let port: number | undefined;
     let host: string = 'localhost';
     let connectListener: (() => void) | undefined;
@@ -548,7 +675,10 @@ Socket.prototype.connect = function connect(
         }).catch((err) => {
             this.connecting = false;
             this._connecting = false;
-            if (!this._destroyed) this.destroy(normalizeErrnoError(err, 'connect'));
+            // Node pipe connect errors report the socket path as `address`.
+            const error = normalizeErrnoError(err, 'connect');
+            Reflect.set(error, 'address', portOrPath);
+            if (!this._destroyed) this.destroy(error);
         });
         if (!this._refed) pipe.unref();
 
@@ -566,9 +696,11 @@ Socket.prototype.connect = function connect(
     this.readyState = 'opening';
 
     let lookupSucceeded = false;
+    let resolvedAddress: string | undefined;
     resolveConnectAddress(host, options).then(({ address, family }) => {
         if (this._destroyed) return;
         lookupSucceeded = true;
+        resolvedAddress = address;
         if (!isIPv4(host) && !isIPv6(host)) this.emit('lookup', null, address, family, host);
 
         const localAddress = options?.localAddress;
@@ -621,7 +753,13 @@ Socket.prototype.connect = function connect(
         }
         this.connecting = false;
         this._connecting = false;
-        if (!this._destroyed) this.destroy(normalizeErrnoError(err, 'connect'));
+        // Node connect errors carry the dialed address/port — user code reads them.
+        const error = normalizeErrnoError(err, 'connect');
+        if (lookupSucceeded) {
+            Reflect.set(error, 'address', resolvedAddress ?? host);
+            Reflect.set(error, 'port', port);
+        }
+        if (!this._destroyed) this.destroy(error);
     });
 
     return this;
@@ -634,7 +772,7 @@ Socket.prototype._startPipeRead = function _startPipeRead(this: Socket): void {
     this._stream.onread = (result: NativeReadResult, error: NativeReadError) => {
         if (error) {
             if ((this._destroyed || this.readyState === 'closed') && matchesErrnoCode(error, 'ECANCELED', 'EBADF')) return;
-            this.emit('error', normalizeErrnoError(error, 'read'));
+            destroyWithReadError(this, error);
             return;
         }
         if (result === null || result === undefined) {
@@ -780,7 +918,7 @@ Socket.prototype._startTcpRead = function _startTcpRead(this: Socket): void {
     this._tcp.onread = (result: NativeReadResult, error: NativeReadError) => {
         if (error) {
             if ((this._destroyed || this.readyState === 'closed') && matchesErrnoCode(error, 'ECANCELED', 'EBADF')) return;
-            this.emit('error', normalizeErrnoError(error, 'read'));
+            destroyWithReadError(this, error);
             return;
         }
         if (result === null || result === undefined) {
@@ -812,7 +950,7 @@ Socket.prototype._startUpgradeRead = function _startUpgradeRead(this: Socket): v
         armSocketTimeout(this);
         this.push(data);
     }, (err) => {
-        this.emit('error', normalizeErrnoError(err, 'read'));
+        destroyWithReadError(this, err);
     });
 };
 
@@ -832,9 +970,14 @@ Socket.prototype._read = function _read(this: Socket, size: number): void {
 
 /** Duplex _write — called by _writeBuffered with one chunk at a time */
 Socket.prototype._write = function _write(this: Socket, chunk: string | Uint8Array, encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
-    if (this._destroyed || (!this._allowHalfOpen && this._peerEnded)) {
-        callback(Object.assign(new Error(this._peerEnded ? 'broken pipe' : 'Socket is destroyed'), {
-            code: this._peerEnded ? 'EPIPE' : 'ERR_SOCKET_CLOSED',
+    // Only a DESTROYED socket refuses writes. Receiving the peer's FIN closes
+    // the read half only — the write half stays open until we shut it down, so
+    // Node happily writes after 'end' regardless of allowHalfOpen. Rejecting
+    // with EPIPE on `_peerEnded` was the second half of the data-loss bug
+    // documented in handleSocketEof.
+    if (this._destroyed) {
+        callback(Object.assign(new Error('Socket is destroyed'), {
+            code: 'ERR_SOCKET_CLOSED',
             syscall: 'write',
         }));
         return;
@@ -1032,10 +1175,15 @@ Socket.prototype.destroy = function destroy(this: Socket, error?: Error): Socket
     // Sync parent Duplex destroyed state
     this.destroyed = true;
 
-    if (error) {
-        emitErrorQuietly(this, normalizeErrnoError(error));
-    }
-    queueMicrotask(() => this.emit('close', !!error));
+    // Node's destroy() never emits inline: it defers to nextTick (emitErrorNT /
+    // emitCloseNT) so `sock.destroy(err); sock.on('error', h)` — legal because
+    // the emit has not happened yet — still reaches h. Measured on Node v24.18
+    // that idiom catches; emitting inline here made it miss (caught=false).
+    // Both emissions go through the SAME queue so 'error' stays before 'close'.
+    deferTick(() => {
+        if (error) emitErrorQuietly(this, normalizeErrnoError(error));
+        this.emit('close', !!error);
+    });
 
     return this;
 };
@@ -1061,7 +1209,7 @@ export interface Server extends EventEmitter {
     _keepAlive: boolean;
     _keepAliveDelay: number;
     _noDelay: boolean;
-    _address: AddressInfo | null;
+    _address: AddressInfo | string | null;
     _closing: boolean;
     _handleClosed: boolean;
     _closeCallbacks: Array<(err?: Error) => void>;
@@ -1199,6 +1347,41 @@ function configureAcceptedSocket(server: Server, socket: Socket): void {
     if (server._pauseOnConnect) socket.pause();
 }
 
+// Set only for the internal listen({path}) -> listen(path) hop below, so that
+// an explicit `path` which happens to look numeric (e.g. {path:'8080'}) is NOT
+// coerced into a TCP port by the normalization in listen(). Safe as a module
+// flag because listen() is synchronous and consumes/clears it on entry.
+let forcePipePath = false;
+
+// Node's `isPipeName`: a string is a PATH only if it does not look numeric.
+// `listen('8080')` therefore binds TCP port 8080 — and `listen(process.env.PORT)`
+// is the single most common form of that, since env vars are always strings.
+// cno treated every string as a pipe path, so it bound a pipe literally named
+// "8080" and failed EACCES. Measured: node LISTENED boundPort=8080.
+function looksNumeric(value: string): boolean {
+    if (value.length === 0) return false;
+    return !Number.isNaN(Number(value));
+}
+
+// Node throws RangeError ERR_SOCKET_BAD_PORT synchronously:
+//   options.port should be >= 0 and < 65536. Received type number (-1).
+// cno performed NO validation, so the value went straight to bind() and was
+// silently coerced by the C layer — measured misbinds:
+//   listen(-1)    -> bound 65535       listen(65536) -> bound an ephemeral port
+//   listen(1.5)   -> bound 1           listen(NaN)   -> bound an ephemeral port
+// A server asked for one port and silently listening on another is a security
+// as well as a correctness problem.
+function validateListenPort(value: unknown): number {
+    if (typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 65535) {
+        return value;
+    }
+    const shown = typeof value === 'number' ? String(value) : JSON.stringify(value);
+    throw Object.assign(
+        new RangeError(`options.port should be >= 0 and < 65536. Received type ${typeof value} (${shown}).`),
+        { code: 'ERR_SOCKET_BAD_PORT' },
+    );
+}
+
 Server.prototype.listen = function listen(
     this: Server,
     portOrPathOrOptions?: unknown,
@@ -1216,8 +1399,38 @@ Server.prototype.listen = function listen(
     let listeningListener: (() => void) | undefined;
     let ipv6Only: boolean = false;
 
+    // Normalize the first argument the way Node's normalizeArgs does, BEFORE
+    // dispatching on its type. Measured on Node v24.18:
+    //   listen(undefined) / listen(null) -> bind an ephemeral port (cno: hung
+    //     silently — no 'listening', no 'error', nothing at all)
+    //   listen('8080')                   -> TCP port 8080, not a pipe
+    //   listen(true) / listen({})        -> throw ERR_INVALID_ARG_VALUE
+    // Consume the explicit-path flag on entry so it can never leak into a later
+    // call, even if this one throws.
+    const explicitPipePath = forcePipePath;
+    forcePipePath = false;
+
+    if (portOrPathOrOptions === undefined || portOrPathOrOptions === null) {
+        portOrPathOrOptions = 0;
+    } else if (
+        typeof portOrPathOrOptions === 'string'
+        && !explicitPipePath
+        && looksNumeric(portOrPathOrOptions)
+    ) {
+        portOrPathOrOptions = Number(portOrPathOrOptions);
+    } else if (
+        typeof portOrPathOrOptions === 'boolean'
+        || typeof portOrPathOrOptions === 'bigint'
+        || typeof portOrPathOrOptions === 'symbol'
+    ) {
+        throw Object.assign(
+            new TypeError(`The argument 'options' is invalid. Received { port: ${String(portOrPathOrOptions)} }`),
+            { code: 'ERR_INVALID_ARG_VALUE' },
+        );
+    }
+
     if (typeof portOrPathOrOptions === 'number') {
-        port = portOrPathOrOptions;
+        port = validateListenPort(portOrPathOrOptions);
         for (const arg of args) {
             if (typeof arg === 'string') host = arg;
             else if (typeof arg === 'number') backlog = arg;
@@ -1237,7 +1450,9 @@ Server.prototype.listen = function listen(
             this._pipe.onconnection = (error: CModuleError.Error | undefined, client: CModuleStreams.Stream | undefined) => {
                 if (error) {
                     if (!this._listening || matchesErrnoCode(error, 'ECANCELED', 'EBADF')) return;
-                    this.emit('error', error);
+                    // Raw native errors carry a NUMERIC `.code`; normalize so
+                    // `err.code === 'EMFILE'` works as it does in Node.
+                    this.emit('error', normalizeErrnoError(error, 'accept'));
                     return;
                 }
                 if (!client) return;
@@ -1247,31 +1462,49 @@ Server.prototype.listen = function listen(
                 if (!trackServerSocket(this, socket)) return;
                 configureAcceptedSocket(this, socket);
                 this.emit('connection', socket);
+                // Node publishes net.server.socket directly after emit('connection').
+                if (onNetServerSocket.hasSubscribers) {
+                    onNetServerSocket.publish({ socket });
+                }
                 if (!this._pauseOnConnect && !socket._destroyed) socket._startPipeRead();
             };
-            this._address = { address: pipePath, family: 'Unix', port: -1 };
+            // Node returns the bare path string from address() for a pipe
+            // server, not an AddressInfo object (verified on real Node v24.18).
+            this._address = pipePath;
             this._listening = true;
             if (listeningListener) this.once('listening', listeningListener);
-            this.emit('listening');
+            emitListeningAsync(this);
         } catch (err) {
             this._handleClosed = true;
-            this.emit('error', err);
+            closePipeQuietly(this._pipe);
+            emitListenErrorAsync(this, toListenError(err, pipePath));
         }
         return this;
     } else if (portOrPathOrOptions && typeof portOrPathOrOptions === 'object') {
         const options = portOrPathOrOptions as ListenOptions;
         if (options.path !== undefined) {
             const listener = typeof args[0] === 'function' ? args[0] : undefined;
+            // An explicit path stays a path even if it looks numeric.
+            forcePipePath = true;
             const server = listener
                 ? this.listen(options.path, options.backlog ?? 511, listener)
                 : this.listen(options.path, options.backlog ?? 511);
+            forcePipePath = false;
             if (options.signal) {
                 if (options.signal.aborted) queueMicrotask(() => server.close());
                 else options.signal.addEventListener('abort', () => server.close(), { once: true });
             }
             return server;
         }
-        port = options.port;
+        // Node validates options.port identically to the positional form:
+        // `listen({port:-1})` throws RangeError ERR_SOCKET_BAD_PORT.
+        port = options.port === undefined || options.port === null
+            ? 0
+            : validateListenPort(
+                typeof options.port === 'string' && looksNumeric(options.port)
+                    ? Number(options.port)
+                    : options.port,
+            );
         host = options.host ?? '0.0.0.0';
         backlog = options.backlog ?? 511;
         ipv6Only = options.ipv6Only ?? false;
@@ -1299,17 +1532,20 @@ Server.prototype.listen = function listen(
 
         this._listening = true;
         this._acceptLoop().catch((err) => {
-            if (this._listening) this.emit('error', err);
+            if (this._listening) this.emit('error', normalizeErrnoError(err, 'accept'));
         });
-        this.emit('listening');
-        if (listeningListener) listeningListener();
+        // Node registers the listen callback as a one-shot 'listening' listener
+        // *inside* listen(), so a pre-existing s.on('listening') handler runs
+        // first; then it emits on the next tick, never inline.
+        if (listeningListener) this.once('listening', listeningListener);
+        emitListeningAsync(this);
     } catch (err) {
         // Close the handle before surfacing the error: close() refuses to run
         // (ERR_SERVER_NOT_RUNNING) while _listening is false, so the common
         // EADDRINUSE retry idiom would overwrite _tcp and leak this fd.
         this._handleClosed = true;
         try { this._tcp?.close(); } catch { /* already gone */ }
-        this.emit('error', err);
+        emitListenErrorAsync(this, toListenError(err, host, port ?? 0));
         return this;
     }
 
@@ -1353,6 +1589,11 @@ Server.prototype._acceptLoop = function _acceptLoop(this: Server): Promise<void>
         configureAcceptedSocket(this, socket);
 
         this.emit('connection', socket);
+
+        // Node publishes net.server.socket directly after emit('connection').
+        if (onNetServerSocket.hasSubscribers) {
+            onNetServerSocket.publish({ socket });
+        }
 
         if (!this._pauseOnConnect && !socket._destroyed) {
             socket._startTcpRead();

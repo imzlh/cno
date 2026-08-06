@@ -134,18 +134,53 @@ class Storage {
     }
 
     /**
-     * Create directory recursively
+     * Create directory recursively.
+     *
+     * Seeds the loop with a non-creatable filesystem root rather than an empty
+     * prefix. The old version started from `''` and treated a Windows drive spec
+     * as an ordinary segment, so the first iteration called `mkdir('D:')`. That
+     * is not masked by the `exists` guard, because `fs.exists('D:')` is **false**
+     * while `fs.exists('D:/')` is true (measured). Normally hidden — `getDefaultPath`
+     * glues forward slashes onto `$HOME`, keeping the drive inside the first
+     * segment — but `CNO_STORAGE_DIR=D:/` reproduced it as
+     * `EEXIST: file already exists, path 'D:'`.
+     *
+     * Also normalizes backslashes: this split on `/` only, so a native Windows
+     * path arrived as one unsplittable segment.
      */
     private mkdirRecursive(path: string): void {
         if (!path || path === '.') return;
-        
-        const parts = path.split('/').filter(p => p);
-        let current = path.startsWith('/') ? '/' : '';
 
-        for (const part of parts) {
+        const normalized = path.replace(/\\/g, '/');
+        // Drive-absolute (`D:/x`), drive-relative (`D:x`), UNC/verbatim (`//srv/share`),
+        // posix-absolute, or relative — each has a different uncreatable prefix.
+        let root = '';
+        let rest = normalized;
+        const drive = /^([a-zA-Z]:)(\/?)/.exec(normalized);
+        if (drive) {
+            root = drive[1] + (drive[2] ? '/' : '');
+            rest = normalized.slice(drive[0].length);
+        } else if (normalized.startsWith('//')) {
+            // Keep `//server/share` (or `//?/D:/`) intact; its parts are not creatable.
+            const seg = normalized.slice(2).split('/').filter(Boolean);
+            const keep = seg.slice(0, 2).join('/');
+            root = `//${keep}/`;
+            rest = normalized.slice(root.length);
+        } else if (normalized.startsWith('/')) {
+            root = '/';
+            rest = normalized.slice(1);
+        }
+
+        let current = root;
+        for (const part of rest.split('/').filter(p => p)) {
             current += part;
             if (!fs.exists(current)) {
-                fs.mkdir(current, 0o755);
+                try {
+                    fs.mkdir(current, 0o755);
+                } catch (e) {
+                    // Tolerate a lost race only when a directory really is there now.
+                    if (!fs.exists(current)) throw e;
+                }
             }
             current += '/';
         }

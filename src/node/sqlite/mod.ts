@@ -5,6 +5,8 @@
  * circu.js' native sqlite3 binding.
  */
 
+import { resolve as resolvePath } from '../path';
+
 const native = import.meta.use('sqlite3');
 const engine = import.meta.use('engine');
 
@@ -56,17 +58,137 @@ function paramsFrom(args: unknown[]): BindParams | undefined {
     return args;
 }
 
+/**
+ * Every native sqlite3 entry point must funnel through here. The C binding
+ * throws a bare Error carrying only `message` and a non-enumerable `errno`, so
+ * without this wrapper `err.code` is undefined on every failure and the
+ * standard `if (err.code === 'ERR_SQLITE_ERROR')` branch never matches.
+ */
+function nativeCall<T>(fn: () => T): T {
+    try {
+        return fn();
+    } catch (e) {
+        throw sqliteError(e);
+    }
+}
+
 function allRows(stmt: Sqlite3Stmt, params?: BindParams): SqliteRow[] {
-    return params === undefined ? stmt.all() : stmt.all(params);
+    return nativeCall(() => (params === undefined ? stmt.all() : stmt.all(params)));
 }
 
 function runStmt(stmt: Sqlite3Stmt, params?: BindParams): void {
-    if (params === undefined) stmt.run();
-    else stmt.run(params);
+    nativeCall(() => {
+        if (params === undefined) stmt.run();
+        else stmt.run(params);
+    });
 }
 
 function unsupported(name: string): never {
     throw new Error(`node:sqlite ${name} is not implemented by this runtime`);
+}
+
+/** A raw error straight out of the C binding: `errno` set, `code` still absent. */
+function isNativeSqliteError(e: unknown): e is Error & { errno: number } {
+    return e instanceof Error
+        && typeof (e as { errno?: unknown }).errno === 'number'
+        && (e as { code?: unknown }).code === undefined;
+}
+
+/**
+ * The bind path throws plain RangeError/TypeError with the C module's own
+ * wording. Node uses different constructors, codes and messages for the same
+ * two conditions, and callers branch on the code.
+ */
+function mapBindError(e: Error): Error | null {
+    if (/^BigInt value is out of int64 range at position \d+$/.test(e.message)) {
+        return Object.assign(new TypeError('BigInt value is too large to bind.'), {
+            code: 'ERR_INVALID_ARG_VALUE',
+        });
+    }
+    const badType = /^Invalid bound parameter type at position (\d+)$/.exec(e.message);
+    if (badType) {
+        return Object.assign(
+            new TypeError(`Provided value cannot be bound to SQLite parameter ${badType[1]}.`),
+            { code: 'ERR_INVALID_ARG_TYPE' },
+        );
+    }
+    return null;
+}
+
+/**
+ * Give a native error Node's `node:sqlite` shape: enumerable `code`, `errcode`
+ * and `errstr`, matching Node's own enumerable key set exactly.
+ *
+ * DIVERGENCE: Node's `errcode` is the *extended* result code (2067 for a UNIQUE
+ * violation, 1299 for NOT NULL, 275 for CHECK, 787 for FOREIGN KEY) and its
+ * `message` is sqlite3_errmsg (`UNIQUE constraint failed: u.k`). The binding
+ * only surfaces the primary code (19 for every one of those) and sqlite3_errstr
+ * (`constraint failed` for every one of those), so all five distinguishable
+ * constraint failures collapse into one indistinguishable error. Closing that
+ * needs sqlite3_extended_errcode + sqlite3_errmsg in mod_sqlite3.c — it cannot
+ * be done here, because neither value is reachable from JS and `errstr` is the
+ * same string for all five, so there is nothing to derive the distinction from.
+ * `code` — the part callers actually branch on — is exact.
+ *
+ * `errstr` is read from the binding when present and falls back to `message`
+ * otherwise. That fallback is today's only path (the binding sets no `errstr`),
+ * and it keeps `errstr` *enumerable* either way: defining it only-when-absent
+ * would silently drop it out of Object.keys the moment the binding starts
+ * reporting it separately, breaking the key set this function exists to match.
+ */
+function sqliteError(e: unknown): unknown {
+    if (!(e instanceof Error)) return e;
+    const mapped = mapBindError(e);
+    if (mapped) return mapped;
+    if (!isNativeSqliteError(e)) return e;
+    const prop = (value: unknown) => ({ value, writable: true, enumerable: true, configurable: true });
+    const native = (e as { errstr?: unknown }).errstr;
+    const shape: PropertyDescriptorMap = {
+        code: prop('ERR_SQLITE_ERROR'),
+        errcode: prop(e.errno),
+        errstr: prop(typeof native === 'string' ? native : e.message),
+    };
+    return Object.defineProperties(e, shape);
+}
+
+/** 2**63, exactly representable as a double: the int64 magnitude ceiling. */
+const INT64_ABS_LIMIT = 9223372036854775808;
+
+/**
+ * Could this number have come out of an INTEGER column? Every int64 lies within
+ * ±2**63, so a larger integral double (1e300 and friends) must be a REAL and is
+ * left alone. The binding does not expose sqlite3_column_type, so the column's
+ * declared affinity is genuinely unavailable here.
+ */
+function isPlausibleInt64(value: number): boolean {
+    return Number.isInteger(value) && Math.abs(value) <= INT64_ABS_LIMIT;
+}
+
+/**
+ * Default (readBigInts off) path. Node throws ERR_OUT_OF_RANGE for any INTEGER
+ * column outside ±2**53 — including -2**63, which is exactly representable as a
+ * double but still not a safe integer.
+ */
+function isUnsafeInt64(value: number): boolean {
+    return !Number.isSafeInteger(value) && isPlausibleInt64(value);
+}
+
+/**
+ * readBigInts path: the value whose double *cannot* be the int64 that was
+ * stored, because the C binding reads int64 through JS_NewInt64 and narrows to
+ * double. -2**63 is the one unsafe magnitude that survives exactly (INT64_MIN),
+ * so it is excluded; a positive 2**63 cannot be a valid int64 at all and is
+ * therefore a rounded-up INT64_MAX.
+ */
+function isCorruptInt64(value: number): boolean {
+    return isUnsafeInt64(value) && value !== -INT64_ABS_LIMIT;
+}
+
+function throwOutOfRange(value: number): never {
+    throw Object.assign(
+        new RangeError(`Value is too large to be represented as a JavaScript number: ${value}`),
+        { code: 'ERR_OUT_OF_RANGE' },
+    );
 }
 
 function optionalBoolean(options: Record<string, unknown>, name: string): boolean {
@@ -81,14 +203,34 @@ function normalizeLocation(location: DatabaseLocation): string {
     if (typeof location === 'string') return location;
     if (location instanceof URL) {
         if (location.protocol !== 'file:') {
-            throw new TypeError('Database path URL must use the file: protocol');
+            throw Object.assign(new TypeError('The URL must be of scheme file:'), {
+                code: 'ERR_INVALID_URL_SCHEME',
+            });
         }
-        return decodeURIComponent(location.pathname);
+        // Percent-decoding is deliberate: Node hands the URL to SQLite's own URI
+        // parser, which decodes %2F where fileURLToPath throws ERR_INVALID_FILE_URL_PATH.
+        const pathname = decodeURIComponent(location.pathname);
+        // `/C:/x` → `C:/x`. Windows tolerates the leading slash, so this was latent.
+        return /^\/[A-Za-z]:/.test(pathname) ? pathname.slice(1) : pathname;
     }
     if (location instanceof Uint8Array) {
         return engine.decodeString(location);
     }
     throw new TypeError('Database path must be a string, Buffer, Uint8Array, or file: URL');
+}
+
+/**
+ * Absolute path SQLite would have captured for the `main` schema, or null for
+ * databases with no backing file (`:memory:`, `''`, `file:` URI forms).
+ */
+function resolveMainLocation(dbPath: string): string | null {
+    if (dbPath === '' || dbPath === ':memory:') return null;
+    if (dbPath.startsWith('file:')) return null;
+    // Emulated: real Node asks SQLite (sqlite3_db_filename). The native binding
+    // exposes no filename accessor, so path.resolve stands in for SQLite's win32
+    // VFS expansion. Matches the common case; drifts on UNC paths, `\\?\`
+    // prefixes and drive-relative forms like `C:foo`.
+    return resolvePath(dbPath);
 }
 
 function isNameChar(ch: string | undefined): boolean {
@@ -145,7 +287,21 @@ export class StatementSync {
 
     constructor(private readonly db: DatabaseSync, private readonly stmt: Sqlite3Stmt, readonly sourceSQL = '') {}
 
+    /**
+     * Node finalizes every outstanding statement when the database closes, so
+     * any later use reports ERR_INVALID_STATE. The native binding here does not
+     * finalize on close and the sqlite3_stmt keeps returning its cached rows, so
+     * without this guard a statement outlives its database and reads memory the
+     * connection no longer owns. Check before touching the native handle.
+     */
+    private assertUsable(): void {
+        if (!this.db.isOpen) {
+            throw Object.assign(new Error('statement has been finalized'), { code: 'ERR_INVALID_STATE' });
+        }
+    }
+
     all(...anonymousParameters: unknown[]): SqliteRow[] {
+        this.assertUsable();
         return this.convertRows(allRows(this.stmt, this.normalizeParams(paramsFrom(anonymousParameters))));
     }
 
@@ -154,16 +310,20 @@ export class StatementSync {
     }
 
     run(...anonymousParameters: unknown[]): RunResult {
+        this.assertUsable();
         runStmt(this.stmt, this.normalizeParams(paramsFrom(anonymousParameters)));
+        const rowid = nativeCall(() => this.db.raw().lastInsertRowid());
         return {
-            changes: this.db.raw().changes(),
+            changes: nativeCall(() => this.db.raw().changes()),
+            // Same narrowing as convertCell: only an exact integer may be widened.
             lastInsertRowid: this.readBigInts
-                ? BigInt(this.db.raw().lastInsertRowid())
-                : this.db.raw().lastInsertRowid(),
+                ? (Number.isSafeInteger(rowid) ? BigInt(rowid) : throwOutOfRange(rowid))
+                : rowid,
         };
     }
 
     iterate(...anonymousParameters: unknown[]): IterableIterator<SqliteRow> {
+        this.assertUsable();
         const rows = this.all(...anonymousParameters);
         let index = 0;
         return {
@@ -182,6 +342,7 @@ export class StatementSync {
     }
 
     columns(): StatementColumnMetadata[] {
+        this.assertUsable();
         const row = this.get();
         if (!row) return [];
         const names = Array.isArray(row) ? row.map((_, index: number) => String(index)) : Object.keys(row);
@@ -205,7 +366,7 @@ export class StatementSync {
     }
 
     get expandedSQL(): string {
-        return this.stmt.expand();
+        return nativeCall(() => this.stmt.expand());
     }
 
     raw(): Sqlite3Stmt {
@@ -213,17 +374,48 @@ export class StatementSync {
     }
 
     finalize(): void {
-        this.stmt.finalize();
+        nativeCall(() => this.stmt.finalize());
     }
 
     private convertCell(value: unknown): unknown {
-        return this.readBigInts && typeof value === 'number' && Number.isInteger(value)
-            ? BigInt(value)
-            : value;
+        // Forward-compatible with the proposed mod_sqlite3.c fix (see the
+        // DIVERGENCE note below): once the binding hands large int64 columns to
+        // TS as a BigInt instead of a narrowed double, this is the branch that
+        // keeps parity — without it, readBigInts=false would start returning
+        // BigInts where Node throws.
+        if (typeof value === 'bigint') {
+            if (this.readBigInts) return value;
+            if (value >= BigInt(Number.MIN_SAFE_INTEGER) && value <= BigInt(Number.MAX_SAFE_INTEGER)) {
+                return Number(value);
+            }
+            throwOutOfRange(value as unknown as number);
+        }
+        if (typeof value !== 'number') return value;
+        if (!this.readBigInts) {
+            if (isUnsafeInt64(value)) throwOutOfRange(value);
+            return value;
+        }
+        // DIVERGENCE, deliberate: Node returns the exact BigInt here because its
+        // binding never narrows through a double. cno's does, so for a value
+        // past 2**53 the low bits are already gone and BigInt() would mint a
+        // confidently wrong number (measured: INT64_MAX read back as ...808).
+        // Throwing is the only honest option until mod_sqlite3.c hands TS the
+        // int64 unnarrowed; a loud RangeError beats silent corruption.
+        if (isCorruptInt64(value)) throwOutOfRange(value);
+        return isPlausibleInt64(value) ? BigInt(value) : value;
     }
 
     private convertRow(row: SqliteRow): SqliteRow {
-        if (!this.readBigInts) return row;
+        // The range check has to run even when readBigInts is off — that is the
+        // path Node throws ERR_OUT_OF_RANGE on — so this can no longer early-out.
+        if (!this.readBigInts) {
+            if (Array.isArray(row)) {
+                for (const value of row) this.convertCell(value);
+            } else if (row && typeof row === 'object') {
+                for (const key of Object.keys(row)) this.convertCell(row[key]);
+            }
+            return row;
+        }
         if (Array.isArray(row)) return row.map(value => this.convertCell(value));
         if (!row || typeof row !== 'object') return row;
 
@@ -281,17 +473,18 @@ export class StatementSync {
 
 export class DatabaseSync {
     private handle: Sqlite3Handle | null = null;
-    readonly location: string;
+    private readonly dbPath: string;
+    private mainLocation: string | null = null;
 
     constructor(location: DatabaseLocation, options: DatabaseSyncOptions = {}) {
-        this.location = normalizeLocation(location);
+        this.dbPath = normalizeLocation(location);
         if (options.open === false) return;
         this.open(options.readOnly ? native.O_READONLY : DEFAULT_FLAGS);
         if (options.enableForeignKeyConstraints !== false) {
             this.exec('PRAGMA foreign_keys = ON');
         }
         if (options.timeout !== undefined) {
-            this.raw().busyTimeout(options.timeout);
+            nativeCall(() => this.raw().busyTimeout(options.timeout as number));
         }
     }
 
@@ -300,26 +493,55 @@ export class DatabaseSync {
     }
 
     get isTransaction(): boolean {
-        return this.raw().inTransaction();
+        return nativeCall(() => this.raw().inTransaction());
+    }
+
+    /**
+     * Path of an attached database file, or null when it has no backing file.
+     * Node checks open state *before* the argument type, so keep that order.
+     */
+    location(...args: [dbName?: string]): string | null {
+        if (!this.handle) {
+            throw Object.assign(new Error('database is not open'), { code: 'ERR_INVALID_STATE' });
+        }
+        const dbName = args[0];
+        if (dbName !== undefined && typeof dbName !== 'string') {
+            throw Object.assign(new TypeError('The "dbName" argument must be a string.'), {
+                code: 'ERR_INVALID_ARG_TYPE',
+            });
+        }
+        // Only `main` is tracked. DIVERGENCE: after ATTACH, Node returns the
+        // attached file's real path while this returns null — a wrong answer,
+        // not just a missing one. Fixing it needs sqlite3_db_filename natively.
+        return dbName === undefined || dbName === 'main' ? this.mainLocation : null;
     }
 
     open(flags = DEFAULT_FLAGS): void {
         if (this.handle) return;
-        this.handle = native.open(this.location, flags);
+        this.handle = nativeCall(() => native.open(this.dbPath, flags));
+        // Captured at open time, like SQLite does: a later os.chdir must not
+        // change what location() reports for an already-open database.
+        this.mainLocation = resolveMainLocation(this.dbPath);
     }
 
     close(): void {
-        if (!this.handle) return;
-        this.handle.close();
+        // Node throws ERR_INVALID_STATE on a second close rather than no-oping.
+        if (!this.handle) {
+            throw Object.assign(new Error('database is not open'), { code: 'ERR_INVALID_STATE' });
+        }
+        const handle = this.handle;
+        // Drop the reference first: a failed close must not leave a half-usable
+        // database whose next call reopens the same failure.
         this.handle = null;
+        nativeCall(() => handle.close());
     }
 
     exec(sql: string): void {
-        this.raw().exec(sql);
+        nativeCall(() => this.raw().exec(sql));
     }
 
     prepare(sql: string): StatementSync {
-        return new StatementSync(this, this.raw().prepare(sql), sql);
+        return new StatementSync(this, nativeCall(() => this.raw().prepare(sql)), sql);
     }
 
     /**
@@ -358,7 +580,7 @@ export class DatabaseSync {
         if (directOnly) nativeOpts.directOnly = true;
         if (useBigIntArguments) nativeOpts.useBigIntArguments = true;
 
-        this.raw().createFunction(name, nArg, fn, nativeOpts);
+        nativeCall(() => this.raw().createFunction(name, nArg, fn, nativeOpts));
     }
 
     /**
@@ -394,7 +616,7 @@ export class DatabaseSync {
             nArg = Math.max(0, stepLen - 1);
         }
 
-        this.raw().createAggregate(name, nArg, {
+        nativeCall(() => this.raw().createAggregate(name, nArg, {
             start: options.start,
             step: options.step as (...args: unknown[]) => unknown,
             result: typeof options.result === 'function' ? options.result : undefined,
@@ -402,7 +624,7 @@ export class DatabaseSync {
             deterministic: !!options.deterministic,
             directOnly,
             useBigIntArguments,
-        });
+        }));
     }
 
     createSession(): void {
@@ -416,11 +638,15 @@ export class DatabaseSync {
     enableLoadExtension(_allow: boolean): void {}
 
     loadExtension(path: string, entryPoint?: string): void {
-        this.raw().loadExtension(path, entryPoint);
+        nativeCall(() => this.raw().loadExtension(path, entryPoint));
     }
 
     raw(): Sqlite3Handle {
-        if (!this.handle) throw new Error('Database is not open');
+        // Node's message is lowercase and carries ERR_INVALID_STATE; callers
+        // branch on the code, so a bare Error breaks parity.
+        if (!this.handle) {
+            throw Object.assign(new Error('database is not open'), { code: 'ERR_INVALID_STATE' });
+        }
         return this.handle;
     }
 }
@@ -460,7 +686,7 @@ export function backup(
     const sourceName = options.source ?? 'main';
     const destName = options.target ?? 'main';
     try {
-        const pages = sourceDb.raw().backupTo(destPath, sourceName, destName);
+        const pages = nativeCall(() => sourceDb.raw().backupTo(destPath, sourceName, destName));
         return Promise.resolve(pages);
     } catch (e) {
         return Promise.reject(e);

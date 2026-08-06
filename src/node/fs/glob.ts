@@ -2,8 +2,9 @@ import path from '../path';
 import { pathToString, toNodeDirent, toNodeDirentAsync } from './utils';
 
 const { basename, dirname, isAbsolute, join, relative, resolve, sep } = path;
-const fs = import.meta.use('fs');
-const asfs = import.meta.use('asyncfs');
+import { nsfs, nsasfs } from './syspath';
+const fs = nsfs;
+const asfs = nsasfs;
 
 export type GlobResult = string | import('fs').Dirent;
 export type GlobExclude = readonly string[] | ((entry: GlobResult) => boolean);

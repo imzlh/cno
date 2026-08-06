@@ -5,7 +5,9 @@
 const dns = import.meta.use('dns');
 const engine = import.meta.use('engine');
 const fs = import.meta.use('fs');
+const os = import.meta.use('os');
 const timers = import.meta.use('timers');
+const uverror = import.meta.use('error');
 
 import { toErrnoException } from '../_internal/errno';
 
@@ -123,7 +125,22 @@ export interface ResolverOptions {
 
 const DNS_QUERY_TIMEOUT_MS = 2000;
 const DEFAULT_RESOLVER_TRIES = 4;
-const VALID_HINTS = 8 | 16 | 32;
+
+/**
+ * getaddrinfo hint flags are platform ABI values, not portable constants:
+ * Windows/Darwin use AI_ALL=0x100, AI_ADDRCONFIG=0x400, AI_V4MAPPED=0x800,
+ * while glibc uses 0x10 / 0x20 / 0x08. Node exports the platform's numbers, so
+ * the accepted hint mask has to follow the platform too.
+ */
+export const hintFlags = (() => {
+    const sysname = os.uname().sysname;
+    if (sysname === 'Windows_NT' || sysname === 'Darwin') {
+        return { V4MAPPED: 0x0800, ALL: 0x0100, ADDRCONFIG: 0x0400 };
+    }
+    return { V4MAPPED: 8, ALL: 16, ADDRCONFIG: 32 };
+})();
+
+const VALID_HINTS = hintFlags.V4MAPPED | hintFlags.ALL | hintFlags.ADDRCONFIG;
 const RETRYABLE_DNS_CODES = new Set([
     'ETIMEOUT', 'EAI_AGAIN', 'ESERVFAIL', 'ECONNREFUSED', 'ECONNRESET',
     'EHOSTUNREACH', 'ENETUNREACH', 'EADDRNOTAVAIL', 'EIO', 'EBADRESP',
@@ -169,9 +186,17 @@ export function isTxtAnswer(answer: CModuleDNS.DNSAnswer): answer is CModuleDNS.
     return answer.type === dns.TXT;
 }
 
+function invalidArgType(message: string): TypeError & { code: string } {
+    return Object.assign(new TypeError(message), { code: 'ERR_INVALID_ARG_TYPE' });
+}
+
+function invalidArgValue(message: string): TypeError & { code: string } {
+    return Object.assign(new TypeError(message), { code: 'ERR_INVALID_ARG_VALUE' });
+}
+
 export function validateHostname(hostname: unknown): asserts hostname is string {
     if (typeof hostname !== 'string') {
-        throw new TypeError(`The "name" argument must be of type string. Received ${String(hostname)}`);
+        throw invalidArgType(`The "name" argument must be of type string. Received ${String(hostname)}`);
     }
 }
 
@@ -179,7 +204,7 @@ export function normalizeLookupFamily(family: unknown, allowNames = false): 0 | 
     if (allowNames && family === 'IPv4') return 4;
     if (allowNames && family === 'IPv6') return 6;
     if (family === 0 || family === 4 || family === 6) return family;
-    throw new TypeError(`The property 'options.family' must be one of: 0, 4, 6. Received ${String(family)}`);
+    throw invalidArgValue(`The property 'options.family' must be one of: 0, 4, 6. Received ${String(family)}`);
 }
 
 export function normalizeLookupOptions(
@@ -194,31 +219,33 @@ export function normalizeLookupOptions(
         return { family: normalizeLookupFamily(options, allowFamilyNames), all: false, hints: 0, order: defaultOrder };
     }
     if (typeof options !== 'object') {
-        throw new TypeError(`The "options" argument must be of type object or integer. Received type ${typeof options}`);
+        throw invalidArgType(`The "options" argument must be of type object or integer. Received type ${typeof options}`);
     }
 
     const family = normalizeLookupFamily(Reflect.get(options, 'family') ?? 0, allowFamilyNames);
     const rawAll = Reflect.get(options, 'all');
     if (rawAll != null && typeof rawAll !== 'boolean') {
-        throw new TypeError(`The "options.all" property must be of type boolean. Received type ${typeof rawAll}`);
+        throw invalidArgType(`The "options.all" property must be of type boolean. Received type ${typeof rawAll}`);
     }
 
     const rawHints = Reflect.get(options, 'hints');
     let hints = 0;
     if (rawHints != null) {
         if (typeof rawHints !== 'number') {
-            throw new TypeError(`The "options.hints" property must be of type number. Received type ${typeof rawHints}`);
+            throw invalidArgType(`The "options.hints" property must be of type number. Received type ${typeof rawHints}`);
         }
         hints = rawHints >>> 0;
         if ((hints & ~VALID_HINTS) !== 0) {
-            throw new TypeError(`The argument 'hints' is invalid. Received ${String(rawHints)}`);
+            // Node reports the uint32-coerced value, not the raw argument, so
+            // 8.5 surfaces as 8 and -1 as 4294967295.
+            throw invalidArgValue(`The argument 'hints' is invalid. Received ${String(hints)}`);
         }
     }
 
     const rawOrder = Reflect.get(options, 'order');
     const rawVerbatim = Reflect.get(options, 'verbatim');
     if (rawVerbatim != null && typeof rawVerbatim !== 'boolean') {
-        throw new TypeError(`The "options.verbatim" property must be of type boolean. Received type ${typeof rawVerbatim}`);
+        throw invalidArgType(`The "options.verbatim" property must be of type boolean. Received type ${typeof rawVerbatim}`);
     }
 
     let order = defaultOrder;
@@ -245,22 +272,37 @@ export function orderLookupAddresses(
 }
 
 export function validateRrtype(rrtype: unknown): Rrtype {
-    if (typeof rrtype !== 'string') throw new TypeError('The "rrtype" argument must be of type string');
-    if (!Object.hasOwn(typeMap, rrtype)) throw new TypeError(`The argument 'rrtype' is invalid. Received '${rrtype}'`);
+    if (typeof rrtype !== 'string') throw invalidArgType('The "rrtype" argument must be of type string');
+    if (!Object.hasOwn(typeMap, rrtype)) throw invalidArgValue(`The argument 'rrtype' is invalid. Received '${rrtype}'`);
     return rrtype as Rrtype;
 }
 
 export function validateDefaultResultOrder(order: unknown): asserts order is DefaultResultOrder {
     if (order !== 'verbatim' && order !== 'ipv4first' && order !== 'ipv6first') {
-        throw new TypeError(`The argument 'dnsOrder' must be one of: 'verbatim', 'ipv4first', 'ipv6first'. Received ${String(order)}`);
+        throw invalidArgValue(
+            `The argument 'dnsOrder' must be one of: 'verbatim', 'ipv4first', 'ipv6first'. Received ${
+                typeof order === 'string' ? `'${order}'` : String(order)
+            }`,
+        );
     }
 }
 
 function validatePort(raw: string): number {
-    if (!/^\d+$/.test(raw)) throw new TypeError(`Invalid DNS server port: ${raw}`);
+    if (!/^\d+$/.test(raw)) throw invalidIpAddress(`Invalid DNS server port: ${raw}`);
     const port = Number(raw);
-    if (!Number.isInteger(port) || port < 1 || port > 65535) throw new TypeError(`Invalid DNS server port: ${raw}`);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) throw invalidIpAddress(`Invalid DNS server port: ${raw}`);
     return port;
+}
+
+function invalidIpAddress(message: string): TypeError & { code: string } {
+    return Object.assign(new TypeError(message), { code: 'ERR_INVALID_IP_ADDRESS' });
+}
+
+function outOfRange(name: string, value: unknown): RangeError & { code: string } {
+    return Object.assign(
+        new RangeError(`The value of "${name}" is out of range. Received ${String(value)}`),
+        { code: 'ERR_OUT_OF_RANGE' },
+    );
 }
 
 function isIPv4(host: string): boolean {
@@ -304,9 +346,9 @@ export function getAddressFamily(address: string): 0 | 4 | 6 {
 
 export function validateLookupServiceAddress(address: unknown): asserts address is string {
     if (typeof address === 'string' && getAddressFamily(address) !== 0) return;
-    const error: NodeJS.ErrnoException = new TypeError(`The argument 'address' is invalid. Received ${String(address)}`);
-    error.code = 'ERR_INVALID_ARG_VALUE';
-    throw error;
+    throw invalidArgValue(
+        `The argument 'address' is invalid. Received ${typeof address === 'string' ? `'${address}'` : String(address)}`,
+    );
 }
 
 export function normalizeLookupServicePort(port: unknown): number {
@@ -328,7 +370,7 @@ export interface DnsServerEndpoint {
 export function parseServer(server: string): DnsServerEndpoint {
     if (server.startsWith('[')) {
         const match = /^\[([^\]]+)\](?::([^:]+))?$/.exec(server);
-        if (!match || !isIPv6(match[1])) throw new TypeError(`Invalid IP address: ${server}`);
+        if (!match || !isIPv6(match[1])) throw invalidIpAddress(`Invalid IP address: ${server}`);
         return { host: match[1], port: match[2] === undefined ? 53 : validatePort(match[2]) };
     }
 
@@ -336,16 +378,16 @@ export function parseServer(server: string): DnsServerEndpoint {
     const lastColon = server.lastIndexOf(':');
     if (firstColon !== -1 && firstColon === lastColon) {
         const host = server.slice(0, firstColon);
-        if (!isIPv4(host)) throw new TypeError(`Invalid IP address: ${server}`);
+        if (!isIPv4(host)) throw invalidIpAddress(`Invalid IP address: ${server}`);
         return { host, port: validatePort(server.slice(firstColon + 1)) };
     }
     if (isIPv4(server) || isIPv6(server)) return { host: server, port: 53 };
-    throw new TypeError(`Invalid IP address: ${server}`);
+    throw invalidIpAddress(`Invalid IP address: ${server}`);
 }
 
 function normalizeServer(server: unknown): string {
     if (typeof server !== 'string') {
-        throw new TypeError(`DNS server must be a string. Received ${typeof server}`);
+        throw invalidArgType(`DNS server must be a string. Received ${typeof server}`);
     }
     const endpoint = parseServer(server);
     if (endpoint.port === 53) return endpoint.host;
@@ -354,7 +396,11 @@ function normalizeServer(server: unknown): string {
 
 export function normalizeServers(servers: unknown): string[] {
     if (!Array.isArray(servers)) {
-        throw new TypeError(`The "servers" argument must be an instance of Array. Received ${typeof servers}`);
+        throw invalidArgType(
+            `The "servers" argument must be an instance of Array. Received type ${typeof servers}${
+                typeof servers === 'string' ? ` ('${servers}')` : ''
+            }`,
+        );
     }
     return servers.map(normalizeServer);
 }
@@ -409,6 +455,10 @@ export function createDnsError(code: string, syscall: string, hostname: string):
     error.code = code;
     error.syscall = syscall;
     error.hostname = hostname;
+    // Node attaches the platform UV errno when one exists (e.g. EINVAL is
+    // -4071 on Windows, -22 on Linux); c-ares-only codes have none.
+    const errno = Reflect.get(uverror.errno as unknown as Record<string, number | undefined>, code);
+    if (typeof errno === 'number') error.errno = errno;
     return error;
 }
 
@@ -696,25 +746,29 @@ export function normalizeResolverOptions(options: unknown): NormalizedResolverOp
     }
     const timeout = Reflect.get(options, 'timeout') ?? -1;
     if (typeof timeout !== 'number') {
-        throw new TypeError(`The "options.timeout" property must be of type number. Received ${String(timeout)}`);
+        throw invalidArgType(
+            `The "options.timeout" property must be of type number. Received type ${typeof timeout}${
+                typeof timeout === 'string' ? ` ('${timeout}')` : ''
+            }`,
+        );
     }
     if (!Number.isInteger(timeout) || timeout < -1 || timeout > 0x7fffffff) {
-        throw new RangeError(`The value of "options.timeout" is out of range. Received ${String(timeout)}`);
+        throw outOfRange('options.timeout', timeout);
     }
 
     const tries = Reflect.get(options, 'tries');
     if (tries !== undefined) {
-        if (typeof tries !== 'number') throw new TypeError(`The "options.tries" property must be of type number. Received ${String(tries)}`);
+        if (typeof tries !== 'number') throw invalidArgType(`The "options.tries" property must be of type number. Received type ${typeof tries}`);
         if (!Number.isInteger(tries) || tries < 1 || tries > 0x7fffffff) {
-            throw new RangeError(`The value of "options.tries" is out of range. Received ${String(tries)}`);
+            throw outOfRange('options.tries', tries);
         }
     }
 
     const maxTimeout = Reflect.get(options, 'maxTimeout');
     if (maxTimeout !== undefined) {
-        if (typeof maxTimeout !== 'number') throw new TypeError(`The "options.maxTimeout" property must be of type number. Received ${String(maxTimeout)}`);
+        if (typeof maxTimeout !== 'number') throw invalidArgType(`The "options.maxTimeout" property must be of type number. Received type ${typeof maxTimeout}`);
         if (!Number.isInteger(maxTimeout) || maxTimeout < 0 || maxTimeout > 0xffffffff) {
-            throw new RangeError(`The value of "options.maxTimeout" is out of range. Received ${String(maxTimeout)}`);
+            throw outOfRange('options.maxTimeout', maxTimeout);
         }
     }
     return {
@@ -727,6 +781,8 @@ export function normalizeResolverOptions(options: unknown): NormalizedResolverOp
 export class ResolverQuery {
     private readonly pending = new Set<AbortableDnsQuery>();
     private servers: string[];
+    private localAddressV4?: string;
+    private localAddressV6?: string;
     readonly timeout: number;
     readonly tries: number;
     readonly maxTimeout: number;
@@ -745,6 +801,25 @@ export class ResolverQuery {
 
     setServers(servers: unknown): void {
         this.servers = normalizeServers(servers);
+    }
+
+    /**
+     * Records the requested source addresses after Node's validation rules.
+     * cno's resolver cannot bind a source address, so this is parity-only.
+     */
+    setLocalAddress(ipv4?: string, ipv6?: string): void {
+        if (ipv4 !== undefined) {
+            if (typeof ipv4 !== 'string' || !isIPv4(ipv4)) {
+                throw invalidIpAddress(`Invalid IP address: ${String(ipv4)}`);
+            }
+            this.localAddressV4 = ipv4;
+        }
+        if (ipv6 !== undefined) {
+            if (typeof ipv6 !== 'string' || !isIPv6(ipv6)) {
+                throw invalidIpAddress(`Invalid IP address: ${String(ipv6)}`);
+            }
+            this.localAddressV6 = ipv6;
+        }
     }
 
     query(hostname: string, rrtype: Rrtype): AbortableDnsQuery {

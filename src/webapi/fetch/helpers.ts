@@ -2,7 +2,7 @@ import { Headers } from "../headers";
 import { DOMException } from "../events";
 import { type FetchConnectionInfo } from "../../utils/network-hooks";
 import { getTierLimits } from "../../utils/memory-tier";
-import { toOwnedBytes } from "../../utils/bytes";
+import { toOwnedBytes, sanitizeSurrogates } from "../../utils/bytes";
 import type { Request } from "./request";
 
 const { maxPendingBodyBytes, streamHighWaterMark, hookPayloadCap } = getTierLimits();
@@ -245,6 +245,75 @@ export function isReadableStreamLike(body: unknown): body is ReadableStream<Uint
     return !!body && typeof body === 'object' && typeof Reflect.get(body, 'getReader') === 'function';
 }
 
+/**
+ * Body-consumption tracking vs. tee(), and why clone() needs a way around it.
+ *
+ * Request and Response track consumption by installing a wrapping `getReader` as
+ * an OWN property of the body stream (their `trackBodyStream`). That is
+ * deliberate and load-bearing: it is how a direct `res.body.tee()`, `pipeTo()`,
+ * `for await` or `cancel()` comes to mark the body used, and all of those match
+ * node today.
+ *
+ * The problem is that `ReadableStream.prototype.tee()` acquires its ONE source
+ * reader through that same public method (streams.ts:604) and feeds both branches
+ * from it. So teeing a tracked stream makes every pull -- including pulls made by
+ * a clone -- run the ORIGINAL object's `markUsed`. `clone()` tees, so reading the
+ * clone marked the original consumed, and the original then threw "Already read"
+ * with its bytes still sitting there intact. node's tee reaches the source through
+ * internal slots and is immune (OBSERVED: under cno, tee() calls a patched public
+ * getReader; under node it does not).
+ *
+ * `clone()` must therefore tee through the pre-patch reader and then track each
+ * branch against its own Request/Response. `rememberRawGetReader` preserves the
+ * raw method so it can, without weakening tracking for any other caller.
+ */
+type BodyStream = ReadableStream<Uint8Array>;
+type RawGetReader = (options?: ReadableStreamGetReaderOptions) => unknown;
+
+const rawBodyGetReaders = new WeakMap<BodyStream, RawGetReader>();
+
+/** Called by `trackBodyStream` with the `getReader` it is about to shadow. */
+export function rememberRawGetReader(stream: BodyStream, raw: RawGetReader): void {
+    // Keep the FIRST one seen. One stream object can back two bodies
+    // (`new Response(s)` twice), which nests the patches; the first is the
+    // untracked prototype method, and that is the one tee() must use.
+    if (!rawBodyGetReaders.has(stream)) rawBodyGetReaders.set(stream, raw);
+}
+
+/**
+ * `stream.tee()`, but with consumption tracking bypassed for the duration, so
+ * neither branch's pulls are attributed to the stream's current owner.
+ *
+ * The raw method is installed ON THE REAL STREAM rather than on a
+ * `Object.create(stream, ...)` facade: cno's ReadableStream holds real private
+ * fields (`#reader`, `#controller`), which do not travel down a prototype chain,
+ * so a facade throws "private class field '#reader' does not exist" the moment
+ * tee() reads `this.locked` (OBSERVED).
+ *
+ * The swap is restored in a `finally`, from the captured descriptor, so a throwing
+ * tee (a locked stream, streams.ts:601) cannot leave the body permanently
+ * untracked.
+ */
+export function teeUntracked(stream: BodyStream): [BodyStream, BodyStream] {
+    const raw = rawBodyGetReaders.get(stream);
+    // Never tracked (only possible for a body that never went through
+    // trackBodyStream): plain tee is already correct.
+    if (raw === undefined) return stream.tee();
+    const saved = Object.getOwnPropertyDescriptor(stream, 'getReader');
+    try {
+        Object.defineProperty(stream, 'getReader', {
+            value: raw,
+            writable: true,
+            enumerable: saved ? saved.enumerable : false,
+            configurable: true,
+        });
+        return stream.tee();
+    } finally {
+        if (saved) Object.defineProperty(stream, 'getReader', saved);
+        else Reflect.deleteProperty(stream, 'getReader');
+    }
+}
+
 function bytesWithArrayBuffer(body: globalThis.Uint8Array<ArrayBufferLike>): Uint8Array {
     return body.buffer instanceof ArrayBuffer
         ? new Uint8Array(body.buffer, body.byteOffset, body.byteLength)
@@ -281,13 +350,14 @@ export function serializeBody(body: unknown): Uint8Array | null {
     if (body instanceof Uint8Array) return bytesWithArrayBuffer(body);
     if (ArrayBuffer.isView(body)) return toOwnedBytes(new Uint8Array(body.buffer, body.byteOffset, body.byteLength));
     if (body instanceof ArrayBuffer) return new Uint8Array(body);
-    if (typeof body === 'string') return engine.encodeString(body);
-    if (body instanceof String) return engine.encodeString(String(body));
+    // Bodies are UTF-8 encoded per spec: lone surrogates become U+FFFD, not WTF-8.
+    if (typeof body === 'string') return engine.encodeString(sanitizeSurrogates(body));
+    if (body instanceof String) return engine.encodeString(sanitizeSurrogates(String(body)));
     if (body instanceof URLSearchParams) return engine.encodeString(body.toString());
     if (body instanceof Blob) return null; // async, handled separately
     if (body instanceof FormData) return null; // async, handled separately
     if (isBodyIterable(body)) return null;
-    return engine.encodeString(String(body));
+    return engine.encodeString(sanitizeSurrogates(String(body)));
 }
 
 function serializeBodyChunk(chunk: unknown): Uint8Array {
@@ -416,11 +486,11 @@ export async function serializeFormData(fd: FormData, boundary: string = createM
             header += `; filename="${filename}"\r\nContent-Type: ${value.type || 'application/octet-stream'}`;
         }
         header += '\r\n\r\n';
-        parts.push(engine.encodeString(header));
+        parts.push(engine.encodeString(sanitizeSurrogates(header)));
         if (value instanceof Blob) {
             parts.push(new Uint8Array(await value.arrayBuffer()));
         } else {
-            parts.push(engine.encodeString(value));
+            parts.push(engine.encodeString(sanitizeSurrogates(value)));
         }
         parts.push(engine.encodeString('\r\n'));
     }
@@ -429,7 +499,7 @@ export async function serializeFormData(fd: FormData, boundary: string = createM
 }
 
 export function parseUrlEncoded(body: Uint8Array): FormData {
-    const str = engine.decodeString(body);
+    const str = new Decoder().decode(body);
     const params = new URLSearchParams(str);
     const fd = new FormData();
     for (const [key, value] of params) fd.append(key, value);
@@ -459,7 +529,7 @@ export function parseMultipart(body: Uint8Array, boundary: string): FormData {
         // Parse part headers until blank line.
         const hdrEnd = algorithm.bytesIndexOf(body, CRLF2, pos);
         if (hdrEnd < 0) break;
-        const hdrStr = engine.decodeString(body.subarray(pos, hdrEnd));
+        const hdrStr = new Decoder().decode(body.subarray(pos, hdrEnd));
         pos = hdrEnd + 4;
 
         // Extract name and filename from Content-Disposition.
@@ -482,7 +552,8 @@ export function parseMultipart(body: Uint8Array, boundary: string): FormData {
             Object.defineProperty(blob, 'name', { value: filenameMatch[1] });
             fd.append(name, blob, filenameMatch[1]);
         } else {
-            fd.append(name, engine.decodeString(partBody));
+            // Field values are UTF-8 decoded per spec, so malformed bytes become U+FFFD.
+            fd.append(name, new Decoder().decode(partBody));
         }
     }
     return fd;

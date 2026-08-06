@@ -1,7 +1,8 @@
 import { decodeBuffer, pathToString, type PathLike } from './utils';
 
-const fs = import.meta.use('fs');
-const asfs = import.meta.use('asyncfs');
+import { nsfs, nsasfs } from './syspath';
+const fs = nsfs;
+const asfs = nsasfs;
 
 interface OpenAsBlobOptions {
     type?: string;

@@ -203,7 +203,8 @@ const HASH_FUNCTIONS: Record<string, (data: ArrayBuffer) => ArrayBuffer> = {
 function getHashFunction(algorithm: HashAlgorithmIdentifier): (data: ArrayBuffer) => ArrayBuffer {
     const normalized = typeof algorithm === 'string' ? algorithm.toUpperCase() : normalizeAlgorithm(algorithm).name;
     const fn = HASH_FUNCTIONS[normalized];
-    if (!fn) throw new Error(`Unsupported hash algorithm: ${normalized}`);
+    // WebCrypto requires NotSupportedError, not a bare Error.
+    if (!fn) throw new DOMException(`Unrecognized algorithm name: ${normalized}`, 'NotSupportedError');
     return fn;
 }
 
@@ -260,6 +261,96 @@ function ecCurveBits(curve: string): number {
     throw new Error(`Unsupported curve: ${curve}`);
 }
 
+// WebCrypto ECDSA signatures are fixed-width r||s: the spec calls for the
+// concatenation of r and s, each padded to the byte length of the curve order.
+// The C layer emits and expects DER because node:crypto's EC contract is DER, so
+// the conversion belongs at this boundary and not in mod_crypto.c.
+const EC_COORD_BYTES: Record<string, number> = {
+    'P-256': 32,
+    'P-384': 48,
+    'P-521': 66,   // ceil(521/8)
+};
+
+function ecCoordBytes(curve: string): number {
+    const n = EC_COORD_BYTES[curve];
+    if (n === undefined) {
+        throw new DOMException(`Unsupported curve: ${curve}`, 'NotSupportedError');
+    }
+    return n;
+}
+
+// DER SEQUENCE { INTEGER r, INTEGER s }  ->  r||s, each left-padded to coordLen.
+function ecdsaDerToRaw(der: ArrayBuffer, coordLen: number): ArrayBuffer {
+    const d = new Uint8Array(der);
+    let i = 0;
+    const bad = () => new DOMException('Invalid ECDSA signature', 'OperationError');
+    if (d[i++] !== 0x30) throw bad();
+    let seqLen = d[i++];
+    if (seqLen & 0x80) {                       // long-form length (P-521)
+        const n = seqLen & 0x7f;
+        if (n === 0 || n > 2) throw bad();
+        seqLen = 0;
+        for (let k = 0; k < n; k++) seqLen = (seqLen << 8) | d[i++];
+    }
+    if (i + seqLen !== d.length) throw bad();
+    const readInt = (): Uint8Array => {
+        if (d[i++] !== 0x02) throw bad();
+        const len = d[i++];
+        if (len === 0 || i + len > d.length) throw bad();
+        let v = d.subarray(i, i + len);
+        i += len;
+        let z = 0;
+        while (z < v.length - 1 && v[z] === 0) z++;   // drop DER sign padding
+        v = v.subarray(z);
+        if (v.length > coordLen) throw bad();
+        const out = new Uint8Array(coordLen);
+        out.set(v, coordLen - v.length);              // left-pad
+        return out;
+    };
+    const r = readInt();
+    const s = readInt();
+    if (i !== d.length) throw bad();
+    const out = new Uint8Array(coordLen * 2);
+    out.set(r, 0);
+    out.set(s, coordLen);
+    return out.buffer;
+}
+
+// r||s  ->  DER SEQUENCE { INTEGER r, INTEGER s }.
+function ecdsaRawToDer(raw: ArrayBuffer, coordLen: number): ArrayBuffer {
+    const u = new Uint8Array(raw);
+    if (u.length !== coordLen * 2) {
+        throw new DOMException('Invalid ECDSA signature', 'OperationError');
+    }
+    const encodeInt = (v: Uint8Array): Uint8Array => {
+        let z = 0;
+        while (z < v.length - 1 && v[z] === 0) z++;   // minimal encoding
+        const body = v.subarray(z);
+        const pad = (body[0] & 0x80) !== 0 ? 1 : 0;   // DER INTEGER is signed
+        const out = new Uint8Array(2 + pad + body.length);
+        out[0] = 0x02;
+        out[1] = pad + body.length;
+        out.set(body, 2 + pad);
+        return out;
+    };
+    const r = encodeInt(u.subarray(0, coordLen));
+    const s = encodeInt(u.subarray(coordLen));
+    const bodyLen = r.length + s.length;
+    // P-521 bodies exceed 127 bytes and need the long form.
+    const header = bodyLen < 0x80 ? 2 : 3;
+    const out = new Uint8Array(header + bodyLen);
+    out[0] = 0x30;
+    if (bodyLen < 0x80) {
+        out[1] = bodyLen;
+    } else {
+        out[1] = 0x81;
+        out[2] = bodyLen;
+    }
+    out.set(r, header);
+    out.set(s, header + r.length);
+    return out.buffer;
+}
+
 function normalizeDeriveBitsLength(length: number | null, defaultLength: number | null): number {
     if (length === null && defaultLength === null) {
         throw new DOMException('Invalid length', 'OperationError');
@@ -284,6 +375,49 @@ function normalizeGcmTagLength(length: number | undefined): number {
 
 function invalidAccess(message: string): DOMException {
     return new DOMException(message, 'InvalidAccessError');
+}
+
+// Per WebCrypto, importKey must reject usages the algorithm cannot support,
+// and secret/private keys may not be imported with an empty usage list.
+const ALGORITHM_USAGES: Record<string, KeyUsage[]> = {
+    'HMAC': ['sign', 'verify'],
+    'AES-CBC': ['encrypt', 'decrypt', 'wrapKey', 'unwrapKey'],
+    'AES-GCM': ['encrypt', 'decrypt', 'wrapKey', 'unwrapKey'],
+    'AES-KW': ['wrapKey', 'unwrapKey'],
+    'PBKDF2': ['deriveKey', 'deriveBits'],
+    'HKDF': ['deriveKey', 'deriveBits'],
+    'RSASSA-PKCS1-V1_5': ['sign', 'verify'],
+    'RSA-PSS': ['sign', 'verify'],
+    'RSA-OAEP': ['encrypt', 'decrypt', 'wrapKey', 'unwrapKey'],
+    'ECDSA': ['sign', 'verify'],
+    'ECDH': ['deriveKey', 'deriveBits'],
+};
+
+function describeUsageAlgorithm(name: string): string {
+    if (name === 'HMAC') return 'HMAC key';
+    if (name.startsWith('AES')) return 'an AES key';
+    return `a ${name} key`;
+}
+
+function validateKeyUsages(
+    algorithmName: string,
+    usages: KeyUsage[],
+    requireNonEmpty: boolean,
+    context: string = 'importing a secret key'
+): void {
+    if (!Array.isArray(usages)) {
+        throw new DOMException('Key usages must be an array', 'SyntaxError');
+    }
+    if (requireNonEmpty && usages.length === 0) {
+        throw new DOMException(`Usages cannot be empty when ${context}.`, 'SyntaxError');
+    }
+    const allowed = ALGORITHM_USAGES[algorithmName];
+    if (!allowed) return;
+    for (const usage of usages) {
+        if (!allowed.includes(usage)) {
+            throw new DOMException(`Unsupported key usage for ${describeUsageAlgorithm(algorithmName)}`, 'SyntaxError');
+        }
+    }
 }
 
 function operationError(error: unknown, fallback: string): DOMException {
@@ -336,8 +470,18 @@ function pbkdf2Sha1(password: ArrayBuffer, salt: ArrayBuffer, iterations: number
 
 // CryptoKey Implementation
 
+// Key bytes live outside the object graph so they are not an own property and
+// cannot be reached by Object.keys/getOwnPropertyDescriptors/structuredClone or
+// dumped by a debug log. Membership in this map is also the brand: only _create
+// inserts, so a duck-typed literal can never satisfy handleOf().
+const KEY_HANDLES = new WeakMap<object, ArrayBuffer>();
+
 class CryptoKeyImpl implements CryptoKey {
     static #allowConstruct = false;
+    #type: KeyType;
+    #extractable: boolean;
+    #algorithm: KeyAlgorithm;
+    #usages: readonly KeyUsage[];
 
     static _create(
         type: KeyType,
@@ -348,27 +492,59 @@ class CryptoKeyImpl implements CryptoKey {
     ): CryptoKeyImpl {
         CryptoKeyImpl.#allowConstruct = true;
         try {
-            return new CryptoKeyImpl(type, extractable, algorithm, usages, handle);
+            const key = new CryptoKeyImpl(type, extractable, algorithm, usages);
+            KEY_HANDLES.set(key, handle);
+            // Required, or the prototype accessors below are shadowable with
+            // Object.defineProperty(key, 'extractable', { value: true }) and the
+            // whole hardening is decorative.
+            Object.preventExtensions(key);
+            return key;
         } finally {
             CryptoKeyImpl.#allowConstruct = false;
         }
     }
 
     constructor(
-        public type: KeyType,
-        public extractable: boolean,
-        public algorithm: KeyAlgorithm,
-        public usages: KeyUsage[],
-        public _handle: ArrayBuffer
+        type: KeyType,
+        extractable: boolean,
+        algorithm: KeyAlgorithm,
+        usages: KeyUsage[]
     ) {
         if (!CryptoKeyImpl.#allowConstruct) {
             throw new TypeError('Illegal constructor');
         }
+        this.#type = type;
+        this.#extractable = extractable;
+        // Frozen copy so `key.algorithm.length = 512` cannot retarget an
+        // operation. A copy also stops the two halves of a generated key pair
+        // from sharing one mutable algorithm object.
+        this.#algorithm = Object.freeze({ ...algorithm });
+        // Frozen copy so `key.usages.push('sign')` cannot escalate, and so a
+        // caller-supplied array cannot be mutated after the fact either.
+        this.#usages = Object.freeze([...usages]);
     }
-    
+
+    // Accessors, not data properties: assignment throws in strict mode (all
+    // module code is strict) and defineProperty on the instance fails because
+    // these live on the prototype and the instance is non-extensible.
+    get type(): KeyType { return this.#type; }
+    get extractable(): boolean { return this.#extractable; }
+    get algorithm(): KeyAlgorithm { return this.#algorithm; }
+    get usages(): KeyUsage[] { return this.#usages as KeyUsage[]; }
+
     get [Symbol.toStringTag]() {
         return 'CryptoKey';
     }
+}
+
+// Brand check. Every operation fetches key bytes through this, so a plain object
+// is refused with a TypeError before any crypto runs.
+function handleOf(key: CryptoKey): ArrayBuffer {
+    const handle = KEY_HANDLES.get(key as unknown as object);
+    if (!handle) {
+        throw new TypeError('Argument is not a CryptoKey');
+    }
+    return handle;
 }
 
 // SubtleCrypto Implementation
@@ -391,6 +567,13 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
         keyUsages: KeyUsage[]
     ): Promise<CryptoKeyPair | CryptoKey> {
         const alg = normalizeAlgorithm(algorithm);
+
+        // validateKeyUsages already existed and was called from importKey, but
+        // generateKey never called it, so AES-GCM with ['sign'] was accepted.
+        // The caller's requested set is validated once here rather than per half:
+        // the RSA and EC branches legitimately filter each half to a subset, and
+        // the public half of an ECDSA key generated with ['sign'] is empty.
+        validateKeyUsages(alg.name, keyUsages, true, 'creating a key');
 
         // RSA algorithms
         if (alg.name === 'RSASSA-PKCS1-V1_5' || alg.name === 'RSA-PSS' || alg.name === 'RSA-OAEP') {
@@ -483,6 +666,9 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
      * Sign data
      */
     async sign(algorithm: AlgorithmIdentifier, key: CryptoKey, data: BufferSource): Promise<ArrayBuffer> {
+        // Brand check first: node reports a TypeError for a non-CryptoKey
+        // argument before it ever looks at usages.
+        const keyHandle = handleOf(key);
         if (!key.usages.includes('sign')) {
             throw invalidAccess('Key cannot be used for signing');
         }
@@ -497,7 +683,7 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
             const keyAlg = keyImpl.algorithm as RsaHashedKeyAlgorithm;
 
             if (keyAlg.hash.name === 'SHA-256') {
-                return crypto.rsaPssSha256Sign(keyImpl._handle, dataBuffer, params.saltLength);
+                return crypto.rsaPssSha256Sign(keyHandle, dataBuffer, params.saltLength);
             }
             throw new Error(`Unsupported hash for RSA-PSS: ${keyAlg.hash.name}`);
         }
@@ -507,27 +693,30 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
             const keyAlg = keyImpl.algorithm as RsaHashedKeyAlgorithm;
 
             if (keyAlg.hash.name === 'SHA-256') {
-                return crypto.signSha256(keyImpl._handle, dataBuffer);
+                return crypto.signSha256(keyHandle, dataBuffer);
             }
             if (keyAlg.hash.name === 'SHA-512') {
-                return crypto.signSha512(keyImpl._handle, dataBuffer);
+                return crypto.signSha512(keyHandle, dataBuffer);
             }
             throw new Error(`Unsupported hash for RSASSA-PKCS1-v1_5: ${keyAlg.hash.name}`);
         }
 
         // ECDSA
         if (alg.name === 'ECDSA') {
-            const params = algorithm as EcdsaParams;
             const keyAlg = keyImpl.algorithm as EcKeyAlgorithm;
+            // The C layer emits DER because node:crypto's EC contract is DER.
+            // WebCrypto's contract is fixed-width r||s, so convert here rather
+            // than in C, which would fix WebCrypto and break node:crypto.
+            const coordLen = ecCoordBytes(keyAlg.namedCurve);
 
             if (keyAlg.namedCurve === 'P-256') {
-                return crypto.ecdsaSignP256(keyImpl._handle, dataBuffer);
+                return ecdsaDerToRaw(crypto.ecdsaSignP256(keyHandle, dataBuffer), coordLen);
             }
             if (keyAlg.namedCurve === 'P-384') {
-                return crypto.ecdsaSignP384(keyImpl._handle, dataBuffer);
+                return ecdsaDerToRaw(crypto.ecdsaSignP384(keyHandle, dataBuffer), coordLen);
             }
             if (keyAlg.namedCurve === 'P-521') {
-                return crypto.ecdsaSignP521(keyImpl._handle, dataBuffer);
+                return ecdsaDerToRaw(crypto.ecdsaSignP521(keyHandle, dataBuffer), coordLen);
             }
             throw new Error(`Unsupported curve for ECDSA: ${keyAlg.namedCurve}`);
         }
@@ -537,13 +726,13 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
             const keyAlg = keyImpl.algorithm as HmacKeyAlgorithm;
 
             if (keyAlg.hash.name === 'SHA-256') {
-                return crypto.hmacSha256(keyImpl._handle, dataBuffer);
+                return crypto.hmacSha256(keyHandle, dataBuffer);
             }
             if (keyAlg.hash.name === 'SHA-512') {
-                return crypto.hmacSha512(keyImpl._handle, dataBuffer);
+                return crypto.hmacSha512(keyHandle, dataBuffer);
             }
             if (keyAlg.hash.name === 'SHA-1') {
-                return crypto.hmacSha1(keyImpl._handle, dataBuffer);
+                return crypto.hmacSha1(keyHandle, dataBuffer);
             }
             throw new Error(`Unsupported hash for HMAC: ${keyAlg.hash.name}`);
         }
@@ -560,6 +749,7 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
         signature: BufferSource,
         data: BufferSource
     ): Promise<boolean> {
+        const keyHandle = handleOf(key);
         if (!key.usages.includes('verify')) {
             throw invalidAccess('Key cannot be used for verification');
         }
@@ -575,7 +765,7 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
             const keyAlg = keyImpl.algorithm as RsaHashedKeyAlgorithm;
 
             if (keyAlg.hash.name === 'SHA-256') {
-                return crypto.rsaPssSha256Verify(keyImpl._handle, dataBuffer, signatureBuffer, params.saltLength);
+                return crypto.rsaPssSha256Verify(keyHandle, dataBuffer, signatureBuffer, params.saltLength);
             }
             throw new Error(`Unsupported hash for RSA-PSS: ${keyAlg.hash.name}`);
         }
@@ -585,10 +775,10 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
             const keyAlg = keyImpl.algorithm as RsaHashedKeyAlgorithm;
 
             if (keyAlg.hash.name === 'SHA-256') {
-                return crypto.verifySha256(keyImpl._handle, dataBuffer, signatureBuffer);
+                return crypto.verifySha256(keyHandle, dataBuffer, signatureBuffer);
             }
             if (keyAlg.hash.name === 'SHA-512') {
-                return crypto.verifySha512(keyImpl._handle, dataBuffer, signatureBuffer);
+                return crypto.verifySha512(keyHandle, dataBuffer, signatureBuffer);
             }
             throw new Error(`Unsupported hash for RSASSA-PKCS1-v1_5: ${keyAlg.hash.name}`);
         }
@@ -596,15 +786,34 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
         // ECDSA
         if (alg.name === 'ECDSA') {
             const keyAlg = keyImpl.algorithm as EcKeyAlgorithm;
+            const coordLen = ecCoordBytes(keyAlg.namedCurve);
 
-            if (keyAlg.namedCurve === 'P-256') {
-                return crypto.ecdsaVerifyP256(keyImpl._handle, dataBuffer, signatureBuffer);
+            // Per spec, verify() reports false for a signature it cannot use;
+            // only key, usage and algorithm problems reject. A malformed,
+            // truncated or wrong-length signature is data, not an error, and it
+            // previously escaped as InternalError 'Failed to parse signature'.
+            // An all-zero 64-byte input is a structurally valid raw width, so it
+            // converts successfully and the C verifier rejects it on the merits.
+            let der: ArrayBuffer;
+            try {
+                der = ecdsaRawToDer(signatureBuffer, coordLen);
+            } catch {
+                return false;
             }
-            if (keyAlg.namedCurve === 'P-384') {
-                return crypto.ecdsaVerifyP384(keyImpl._handle, dataBuffer, signatureBuffer);
-            }
-            if (keyAlg.namedCurve === 'P-521') {
-                return crypto.ecdsaVerifyP521(keyImpl._handle, dataBuffer, signatureBuffer);
+            try {
+                if (keyAlg.namedCurve === 'P-256') {
+                    return crypto.ecdsaVerifyP256(keyHandle, dataBuffer, der);
+                }
+                if (keyAlg.namedCurve === 'P-384') {
+                    return crypto.ecdsaVerifyP384(keyHandle, dataBuffer, der);
+                }
+                if (keyAlg.namedCurve === 'P-521') {
+                    return crypto.ecdsaVerifyP521(keyHandle, dataBuffer, der);
+                }
+            } catch {
+                // A public key the C layer cannot parse also yields false rather
+                // than InternalError, matching node.
+                return false;
             }
             throw new Error(`Unsupported curve for ECDSA: ${keyAlg.namedCurve}`);
         }
@@ -616,11 +825,11 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
 
             let computedHmac: ArrayBuffer;
             if (hashAlg.name === 'SHA-256') {
-                computedHmac = crypto.hmacSha256(keyImpl._handle, dataBuffer);
+                computedHmac = crypto.hmacSha256(keyHandle, dataBuffer);
             } else if (hashAlg.name === 'SHA-512') {
-                computedHmac = crypto.hmacSha512(keyImpl._handle, dataBuffer);
+                computedHmac = crypto.hmacSha512(keyHandle, dataBuffer);
             } else if (hashAlg.name === 'SHA-1') {
-                computedHmac = crypto.hmacSha1(keyImpl._handle, dataBuffer);
+                computedHmac = crypto.hmacSha1(keyHandle, dataBuffer);
             } else {
                 throw new Error(`Unsupported hash for HMAC: ${hashAlg.name}`);
             }
@@ -641,6 +850,7 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
      * Encrypt data
      */
     async encrypt(algorithm: AlgorithmIdentifier, key: CryptoKey, data: BufferSource): Promise<ArrayBuffer> {
+        handleOf(key);
         if (!key.usages.includes('encrypt')) {
             throw invalidAccess('Key cannot be used for encryption');
         }
@@ -649,6 +859,7 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
 
     private encryptData(algorithm: AlgorithmIdentifier, keyImpl: CryptoKeyImpl, dataBuffer: ArrayBuffer): ArrayBuffer {
         const alg = normalizeAlgorithm(algorithm);
+        const keyHandle = handleOf(keyImpl);
 
         // RSA-OAEP
         if (alg.name === 'RSA-OAEP') {
@@ -657,10 +868,10 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
             const label = params.label ? toArrayBuffer(params.label) : undefined;
 
             if (keyAlg.hash.name === 'SHA-256') {
-                return runOperation(() => crypto.rsaOaepSha256Encrypt(keyImpl._handle, dataBuffer, label), 'RSA-OAEP encryption failed');
+                return runOperation(() => crypto.rsaOaepSha256Encrypt(keyHandle, dataBuffer, label), 'RSA-OAEP encryption failed');
             }
             if (keyAlg.hash.name === 'SHA-512') {
-                return runOperation(() => crypto.rsaOaepSha512Encrypt(keyImpl._handle, dataBuffer, label), 'RSA-OAEP encryption failed');
+                return runOperation(() => crypto.rsaOaepSha512Encrypt(keyHandle, dataBuffer, label), 'RSA-OAEP encryption failed');
             }
             throw new Error(`Unsupported hash for RSA-OAEP: ${keyAlg.hash.name}`);
         }
@@ -672,13 +883,13 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
             const iv = toArrayBuffer(params.iv);
 
             if (keyAlg.length === 128) {
-                return crypto.aes128CbcEncrypt(keyImpl._handle, iv, dataBuffer);
+                return crypto.aes128CbcEncrypt(keyHandle, iv, dataBuffer);
             }
             if (keyAlg.length === 192) {
-                return crypto.aes192CbcEncrypt(keyImpl._handle, iv, dataBuffer);
+                return crypto.aes192CbcEncrypt(keyHandle, iv, dataBuffer);
             }
             if (keyAlg.length === 256) {
-                return crypto.aes256CbcEncrypt(keyImpl._handle, iv, dataBuffer);
+                return crypto.aes256CbcEncrypt(keyHandle, iv, dataBuffer);
             }
             throw new Error(`Unsupported AES key length: ${keyAlg.length}`);
         }
@@ -690,7 +901,7 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
             const aad = params.additionalData ? toArrayBuffer(params.additionalData) : undefined;
             const tagLength = normalizeGcmTagLength(params.tagLength);
 
-            const result = crypto.gcmEncrypt(keyImpl._handle, iv, dataBuffer, aad, tagLength);
+            const result = crypto.gcmEncrypt(keyHandle, iv, dataBuffer, aad, tagLength);
             const ciphertext = new Uint8Array(result.ciphertext);
             const tag = new Uint8Array(result.tag);
             const output = algo.bytesConcat([ciphertext, tag]);
@@ -704,6 +915,7 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
      * Decrypt data
      */
     async decrypt(algorithm: AlgorithmIdentifier, key: CryptoKey, data: BufferSource): Promise<ArrayBuffer> {
+        handleOf(key);
         if (!key.usages.includes('decrypt')) {
             throw invalidAccess('Key cannot be used for decryption');
         }
@@ -712,6 +924,7 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
 
     private decryptData(algorithm: AlgorithmIdentifier, keyImpl: CryptoKeyImpl, dataBuffer: ArrayBuffer): ArrayBuffer {
         const alg = normalizeAlgorithm(algorithm);
+        const keyHandle = handleOf(keyImpl);
 
         // RSA-OAEP
         if (alg.name === 'RSA-OAEP') {
@@ -720,10 +933,10 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
             const label = params.label ? toArrayBuffer(params.label) : undefined;
 
             if (keyAlg.hash.name === 'SHA-256') {
-                return runOperation(() => crypto.rsaOaepSha256Decrypt(keyImpl._handle, dataBuffer, label), 'RSA-OAEP decryption failed');
+                return runOperation(() => crypto.rsaOaepSha256Decrypt(keyHandle, dataBuffer, label), 'RSA-OAEP decryption failed');
             }
             if (keyAlg.hash.name === 'SHA-512') {
-                return runOperation(() => crypto.rsaOaepSha512Decrypt(keyImpl._handle, dataBuffer, label), 'RSA-OAEP decryption failed');
+                return runOperation(() => crypto.rsaOaepSha512Decrypt(keyHandle, dataBuffer, label), 'RSA-OAEP decryption failed');
             }
             throw new Error(`Unsupported hash for RSA-OAEP: ${keyAlg.hash.name}`);
         }
@@ -735,13 +948,13 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
             const iv = toArrayBuffer(params.iv);
 
             if (keyAlg.length === 128) {
-                return crypto.aes128CbcDecrypt(keyImpl._handle, iv, dataBuffer);
+                return crypto.aes128CbcDecrypt(keyHandle, iv, dataBuffer);
             }
             if (keyAlg.length === 192) {
-                return crypto.aes192CbcDecrypt(keyImpl._handle, iv, dataBuffer);
+                return crypto.aes192CbcDecrypt(keyHandle, iv, dataBuffer);
             }
             if (keyAlg.length === 256) {
-                return crypto.aes256CbcDecrypt(keyImpl._handle, iv, dataBuffer);
+                return crypto.aes256CbcDecrypt(keyHandle, iv, dataBuffer);
             }
             throw new Error(`Unsupported AES key length: ${keyAlg.length}`);
         }
@@ -758,7 +971,7 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
             const ciphertext = ciphertextWithTag.slice(0, ciphertextWithTag.byteLength - tagLength);
             const tag = ciphertextWithTag.slice(ciphertextWithTag.byteLength - tagLength);
 
-            const result = crypto.gcmDecrypt(keyImpl._handle, iv, ciphertext, tag, aad);
+            const result = crypto.gcmDecrypt(keyHandle, iv, ciphertext, tag, aad);
             if (!result.verified) {
                 throw new DOMException('AES-GCM decryption failed: authentication tag mismatch', 'OperationError');
             }
@@ -793,6 +1006,7 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
      * Derive bits from base key
      */
     async deriveBits(algorithm: AlgorithmIdentifier, baseKey: CryptoKey, length: number | null): Promise<ArrayBuffer> {
+        const keyHandle = handleOf(baseKey);
         if (!baseKey.usages.includes('deriveBits') && !baseKey.usages.includes('deriveKey')) {
             throw new Error('Key cannot be used for derivation');
         }
@@ -804,16 +1018,19 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
         if (alg.name === 'ECDH') {
             const params = algorithm as EcdhKeyDeriveParams;
             const keyAlg = keyImpl.algorithm as EcKeyAlgorithm;
-            const publicKeyImpl = params.public as CryptoKeyImpl;
+            // The peer public key is brand-checked too: it arrives from the
+            // caller's algorithm object, so it is the easiest place to smuggle a
+            // plain object in.
+            const publicKeyHandle = handleOf(params.public);
             const bits = normalizeDeriveBitsLength(length, ecCurveBits(keyAlg.namedCurve));
 
             let sharedSecret: ArrayBuffer;
             if (keyAlg.namedCurve === 'P-256') {
-                sharedSecret = crypto.ecdhDeriveP256(keyImpl._handle, publicKeyImpl._handle);
+                sharedSecret = crypto.ecdhDeriveP256(keyHandle, publicKeyHandle);
             } else if (keyAlg.namedCurve === 'P-384') {
-                sharedSecret = crypto.ecdhDeriveP384(keyImpl._handle, publicKeyImpl._handle);
+                sharedSecret = crypto.ecdhDeriveP384(keyHandle, publicKeyHandle);
             } else if (keyAlg.namedCurve === 'P-521') {
-                sharedSecret = crypto.ecdhDeriveP521(keyImpl._handle, publicKeyImpl._handle);
+                sharedSecret = crypto.ecdhDeriveP521(keyHandle, publicKeyHandle);
             } else {
                 throw new Error(`Unsupported curve for ECDH: ${keyAlg.namedCurve}`);
             }
@@ -835,10 +1052,10 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
             const hashAlg = normalizeAlgorithm(params.hash);
 
             if (hashAlg.name === 'SHA-256') {
-                return crypto.hkdfSha256(keyImpl._handle, bits / 8, salt, info);
+                return crypto.hkdfSha256(keyHandle, bits / 8, salt, info);
             }
             if (hashAlg.name === 'SHA-512') {
-                return crypto.hkdfSha512(keyImpl._handle, bits / 8, salt, info);
+                return crypto.hkdfSha512(keyHandle, bits / 8, salt, info);
             }
             throw new Error(`Unsupported hash for HKDF: ${hashAlg.name}`);
         }
@@ -852,13 +1069,13 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
             const hashAlg = normalizeAlgorithm(params.hash);
 
             if (hashAlg.name === 'SHA-1') {
-                return pbkdf2Sha1(keyImpl._handle, salt, params.iterations, bits / 8);
+                return pbkdf2Sha1(keyHandle, salt, params.iterations, bits / 8);
             }
             if (hashAlg.name === 'SHA-256') {
-                return crypto.pbkdf2Sha256(keyImpl._handle, salt, params.iterations, bits / 8);
+                return crypto.pbkdf2Sha256(keyHandle, salt, params.iterations, bits / 8);
             }
             if (hashAlg.name === 'SHA-512') {
-                return crypto.pbkdf2Sha512(keyImpl._handle, salt, params.iterations, bits / 8);
+                return crypto.pbkdf2Sha512(keyHandle, salt, params.iterations, bits / 8);
             }
             throw new Error(`Unsupported hash for PBKDF2: ${hashAlg.name}`);
         }
@@ -880,6 +1097,7 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
 
         if (format === 'raw') {
             const keyBuffer = toArrayBuffer(keyData as BufferSource);
+            validateKeyUsages(alg.name, keyUsages, true);
 
             // HMAC
             if (alg.name === 'HMAC') {
@@ -917,6 +1135,7 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
         if (format === 'jwk') {
             const jwk = keyData as JsonWebKey;
             if (alg.name === 'HMAC') {
+                validateKeyUsages(alg.name, keyUsages, true);
                 if (jwk.kty !== 'oct' || typeof jwk.k !== 'string') {
                     throw new DOMException('Invalid HMAC JWK', 'DataError');
                 }
@@ -936,6 +1155,8 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
         if (format === 'spki' || format === 'pkcs8') {
             // RSA or EC keys in PEM/DER format
             const keyBuffer = toArrayBuffer(keyData as BufferSource);
+            // Public keys may legitimately carry an empty usage list.
+            validateKeyUsages(alg.name, keyUsages, format === 'pkcs8');
 
             if (alg.name.startsWith('RSA')) {
                 const params = algorithm as RsaHashedImportParams;
@@ -970,6 +1191,7 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
      * Export key to external format
      */
     async exportKey(format: string, key: CryptoKey): Promise<ArrayBuffer | JsonWebKey> {
+        const keyHandle = handleOf(key);
         if (!key.extractable) {
             throw new DOMException('Key is not extractable', 'InvalidAccessError');
         }
@@ -980,7 +1202,9 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
             if (key.type !== 'secret') {
                 throw new Error('Can only export secret keys as raw');
             }
-            return keyImpl._handle;
+            // A copy. Returning the live handle let a caller mutate the key in
+            // place, and handed back the same ArrayBuffer identity every call.
+            return keyHandle.slice(0);
         }
 
         if (format === 'jwk') {
@@ -992,7 +1216,7 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
                 const hmacAlg = keyAlg as HmacKeyAlgorithm;
                 return {
                     kty: 'oct',
-                    k: algo.base64UrlEncode(new Uint8Array(keyImpl._handle)),
+                    k: algo.base64UrlEncode(new Uint8Array(keyHandle)),
                     alg: hmacJwkAlg(hmacAlg.hash),
                     ext: key.extractable,
                     key_ops: [...key.usages],
@@ -1002,11 +1226,11 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
         }
 
         if (format === 'spki' && key.type === 'public') {
-            return keyImpl._handle;
+            return keyHandle.slice(0);
         }
 
         if (format === 'pkcs8' && key.type === 'private') {
-            return keyImpl._handle;
+            return keyHandle.slice(0);
         }
 
         throw new Error(`Unsupported export format: ${format}`);
@@ -1020,6 +1244,7 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
         wrappingKey: CryptoKey,
         wrapAlgorithm: AlgorithmIdentifier
     ): Promise<ArrayBuffer> {
+        handleOf(wrappingKey);
         if (!wrappingKey.usages.includes('wrapKey')) {
             throw new Error('Key cannot be used for wrapping');
         }
@@ -1043,6 +1268,7 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
         extractable: boolean,
         keyUsages: KeyUsage[]
     ): Promise<CryptoKey> {
+        handleOf(unwrappingKey);
         if (!unwrappingKey.usages.includes('unwrapKey')) {
             throw new Error('Key cannot be used for unwrapping');
         }

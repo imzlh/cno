@@ -25,7 +25,14 @@ import * as streamConsumers from './consumers';
 }).toWeb = streamWeb.writableToWeb;
 (stream.Duplex as typeof stream.Duplex & {
     fromWeb?: typeof streamWeb.duplexFromWeb;
+    toWeb?: typeof streamWeb.duplexToWeb;
 }).fromWeb = streamWeb.duplexFromWeb;
+// Duplex inherits from Writable, so without this it would pick up
+// Writable.toWeb and silently drop the readable side.
+(stream.Duplex as typeof stream.Duplex & {
+    fromWeb?: typeof streamWeb.duplexFromWeb;
+    toWeb?: typeof streamWeb.duplexToWeb;
+}).toWeb = streamWeb.duplexToWeb;
 
 type StreamCallback = (error?: Error | null) => void;
 type StreamPipelineArgs =

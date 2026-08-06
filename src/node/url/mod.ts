@@ -7,12 +7,13 @@
  */
 
 import { Buffer } from '../buffer';
+import path from '../path';
 
 export const URLSearchParams = globalThis.URLSearchParams;
 export const URLPattern = globalThis.URLPattern;
 type ParsedQuery = Record<string, string | string[]>;
 
-export interface UrlWithStringQuery {
+interface UrlWithStringQuery {
     protocol: string | null;
     slashes: boolean | null;
     auth: string | null;
@@ -27,7 +28,7 @@ export interface UrlWithStringQuery {
     href: string;
 }
 
-export interface UrlWithParsedQuery extends Omit<UrlWithStringQuery, 'query'> {
+interface UrlWithParsedQuery extends Omit<UrlWithStringQuery, 'query'> {
     query: ParsedQuery;
 }
 
@@ -42,7 +43,6 @@ type UrlObject = Partial<Omit<UrlWithStringQuery, 'query'>> & {
 const SLASHED_PROTOCOLS = new Set(['http:', 'https:', 'ftp:', 'gopher:', 'file:', 'ws:', 'wss:']);
 const HOSTLESS_PROTOCOLS = new Set(['javascript:']);
 const UNSAFE_AUTH = /[/?#]/g;
-const WINDOWS_DRIVE_RE = /^[a-zA-Z]:[\\/]/;
 
 function stringifyQuery(query: Record<string, unknown>): string {
     const pairs: string[] = [];
@@ -102,8 +102,15 @@ function encodePathname(value: string): string {
     return value.replace(/[?#]/g, ch => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`);
 }
 
+// Node brackets a colon-bearing hostname unless it is ALREADY bracketed at both
+// ends, so a half-open `[a:b` becomes `[[a:b]`.
+function isIpv6Hostname(hostname: string): boolean {
+    return hostname.charCodeAt(0) === 0x5b /* [ */ &&
+        hostname.charCodeAt(hostname.length - 1) === 0x5d /* ] */;
+}
+
 function formatHostname(hostname: string): string {
-    return hostname.includes(':') && !hostname.startsWith('[') ? `[${hostname}]` : hostname;
+    return hostname.includes(':') && !isIpv6Hostname(hostname) ? `[${hostname}]` : hostname;
 }
 
 function decodeAuth(value: string): string {
@@ -148,9 +155,113 @@ function splitHost(host: string): { host: string; hostname: string; port: string
     };
 }
 
-function findHostEnd(rest: string): number {
-    const slash = rest.search(/[/?#]/);
-    return slash === -1 ? rest.length : slash;
+// --- Legacy url.parse internals, ported from Node's lib/url.js ------------
+
+const PROTOCOL_RE = /^[a-z0-9.+-]+:/i;
+const PORT_RE = /:[0-9]*$/;
+// `//user@host` is always read as a host, even with no protocol.
+const HOST_RE = /^\/\/[^@/]+@[^@/]+/;
+const SIMPLE_PATH_RE = /^(\/\/?(?!\/)[^?\s]*)(\?[^\s]*)?$/;
+const HOSTNAME_MAX_LEN = 255;
+const FORBIDDEN_HOST_CHARS = /[\0\t\n\r #%/:<>?@[\\\]^|]/;
+const FORBIDDEN_HOST_CHARS_IPV6 = /[\0\t\n\r #%/<>?@\\^|]/;
+
+// RFC 2396 delimiters + unwise chars, auto-escaped in the post-host remainder.
+const AUTO_ESCAPE: Record<string, string> = {
+    '\t': '%09', '\n': '%0A', '\r': '%0D', ' ': '%20', '"': '%22', "'": '%27',
+    '<': '%3C', '>': '%3E', '\\': '%5C', '^': '%5E', '`': '%60',
+    '{': '%7B', '|': '%7C', '}': '%7D',
+};
+const AUTO_ESCAPE_RE = /[\t\n\r "'<>\\^`{|}]/g;
+
+function autoEscapeStr(rest: string): string {
+    return rest.replace(AUTO_ESCAPE_RE, ch => AUTO_ESCAPE[ch]);
+}
+
+// A char that can never appear in a hostname moves that tail into the path.
+function trimHostname(result: Url, rest: string, hostname: string): string {
+    for (let i = 0; i < hostname.length; i++) {
+        const ch = hostname[i];
+        if (ch === '/' || ch === '\\' || ch === '#' || ch === '?' || ch === ':') {
+            result.hostname = hostname.slice(0, i);
+            return `/${hostname.slice(i)}${rest}`;
+        }
+    }
+    return rest;
+}
+
+function parseHostPart(result: Url, rest: string, urlStr: string): string {
+    let hostEnd = -1;
+    let atSign = -1;
+    let nonHost = -1;
+    for (let i = 0; i < rest.length; i++) {
+        const ch = rest[i];
+        // WHATWG URL strips tab/LF/CR; legacy parse copies that.
+        if (ch === '\t' || ch === '\n' || ch === '\r') {
+            rest = rest.slice(0, i) + rest.slice(i + 1);
+            i -= 1;
+            continue;
+        }
+        if (' "%\';<>\\^`{|}'.includes(ch)) {
+            if (nonHost === -1) nonHost = i;
+        } else if (ch === '#' || ch === '/' || ch === '?') {
+            if (nonHost === -1) nonHost = i;
+            hostEnd = i;
+        } else if (ch === '@') {
+            atSign = i;
+            nonHost = -1;
+        }
+        if (hostEnd !== -1) break;
+    }
+
+    let start = 0;
+    if (atSign !== -1) {
+        result.auth = decodeAuth(rest.slice(0, atSign));
+        start = atSign + 1;
+    }
+    if (nonHost === -1) {
+        result.host = rest.slice(start);
+        rest = '';
+    } else {
+        result.host = rest.slice(start, nonHost);
+        rest = rest.slice(nonHost);
+    }
+
+    result.parseHost();
+    if (typeof result.hostname !== 'string') result.hostname = '';
+
+    const hostname = result.hostname;
+    const ipv6 = hostname.startsWith('[') && hostname.endsWith(']');
+    if (!ipv6) rest = trimHostname(result, rest, hostname);
+
+    if ((result.hostname ?? '').length > HOSTNAME_MAX_LEN) {
+        result.hostname = '';
+    } else {
+        result.hostname = (result.hostname ?? '').toLowerCase();
+    }
+
+    if (result.hostname !== '') {
+        if (ipv6) {
+            if (FORBIDDEN_HOST_CHARS_IPV6.test(result.hostname)) {
+                throw urlError(`Invalid URL: ${urlStr}`, 'ERR_INVALID_URL');
+            }
+        } else {
+            // IDNA: punycode only the labels that need it. Legacy parse is
+            // lenient about disallowed ASCII, unlike url.domainToASCII.
+            result.hostname = lenientDomainToASCII(result.hostname);
+            if (result.hostname === '' || FORBIDDEN_HOST_CHARS.test(result.hostname)) {
+                throw urlError(`Invalid URL: ${urlStr}`, 'ERR_INVALID_URL');
+            }
+        }
+    }
+
+    result.host = `${result.hostname ?? ''}${result.port ? `:${result.port}` : ''}`;
+
+    if (ipv6) {
+        result.hostname = (result.hostname ?? '').slice(1, -1);
+        if (rest[0] !== '/') rest = `/${rest}`;
+    }
+    return rest;
 }
 
 // Re-export the runtime URL. Subclassing globalThis.URL breaks on QuickJS
@@ -190,11 +301,17 @@ export class Url {
         return typeof result === 'string' ? parse(result, false, true) : result;
     }
 
+    // Node splits the port with /:[0-9]*$/, so "ho:st" keeps a null port.
     parseHost(): void {
-        if (!this.host) return;
-        const info = splitHost(this.host);
-        this.hostname = info.hostname || null;
-        this.port = info.port;
+        const host = this.host ?? '';
+        const match = PORT_RE.exec(host);
+        let rest = host;
+        if (match) {
+            const port = match[0];
+            if (port !== ':') this.port = port.slice(1);
+            rest = rest.slice(0, rest.length - port.length);
+        }
+        if (rest) this.hostname = rest;
     }
 }
 
@@ -203,72 +320,77 @@ export function parse(urlStr: string, parseQueryString = false, slashesDenoteHos
         throw new TypeError('The "url" argument must be of type string.');
     }
 
-    let rest = urlStr.trim();
     const result = new Url();
-    result.query = parseQueryString ? '' : null;
+    // Backslashes before the query string become forward slashes (browser parity).
+    const split = urlStr.search(/[?#]/);
+    let rest = split === -1
+        ? urlStr.replace(/\\/g, '/')
+        : urlStr.slice(0, split).replace(/\\/g, '/') + urlStr.slice(split);
+    rest = rest.replace(/^[\s ﻿\0- ]+|[\s ﻿\0- ]+$/g, '');
 
-    const protoMatch = /^([a-z0-9.+-]+:)/i.exec(rest);
+    const hasHash = rest.includes('#');
+    const hasAt = rest.slice(0, split === -1 ? rest.length : split).includes('@');
+    if (!slashesDenoteHost && !hasHash && !hasAt) {
+        const simple = SIMPLE_PATH_RE.exec(rest);
+        if (simple) {
+            result.path = rest;
+            result.href = rest;
+            result.pathname = simple[1];
+            if (simple[2]) {
+                result.search = simple[2];
+                result.query = parseQueryString ? parseQuery(simple[2].slice(1)) : simple[2].slice(1);
+            } else if (parseQueryString) {
+                result.query = Object.create(null) as ParsedQuery;
+            }
+            return result;
+        }
+    }
+
+    const protoMatch = PROTOCOL_RE.exec(rest);
+    let proto: string | null = null;
     if (protoMatch) {
-        result.protocol = protoMatch[1].toLowerCase();
+        proto = protoMatch[0].toLowerCase();
+        result.protocol = proto;
         rest = rest.slice(protoMatch[0].length);
     }
 
-    const slashes = rest.startsWith('//');
-    const hasHost = slashes && (slashesDenoteHost || !result.protocol || SLASHED_PROTOCOLS.has(result.protocol));
-    if (hasHost && !HOSTLESS_PROTOCOLS.has(result.protocol ?? '')) {
-        result.slashes = true;
-        rest = rest.slice(2);
-
-        const hostEnd = findHostEnd(rest);
-        let hostPart = rest.slice(0, hostEnd);
-        rest = rest.slice(hostEnd);
-
-        const at = hostPart.lastIndexOf('@');
-        if (at !== -1) {
-            result.auth = decodeAuth(hostPart.slice(0, at));
-            hostPart = hostPart.slice(at + 1);
-        }
-
-        const hostInfo = splitHost(hostPart);
-        result.host = hostInfo.host || null;
-        result.hostname = hostInfo.hostname || null;
-        result.port = hostInfo.port;
-    } else if (result.protocol && !HOSTLESS_PROTOCOLS.has(result.protocol)) {
-        const at = rest.lastIndexOf('@');
-        const firstPathChar = rest.search(/[/?#]/);
-        if (at !== -1 && (firstPathChar === -1 || at < firstPathChar)) {
-            result.auth = decodeAuth(rest.slice(0, at));
-            rest = rest.slice(at + 1);
-            const hostEnd = findHostEnd(rest);
-            const hostInfo = splitHost(rest.slice(0, hostEnd));
-            result.host = hostInfo.host || null;
-            result.hostname = hostInfo.hostname || null;
-            result.port = hostInfo.port;
-            rest = rest.slice(hostEnd);
+    let slashes = false;
+    if (slashesDenoteHost || proto || HOST_RE.test(rest)) {
+        slashes = rest.startsWith('//');
+        if (slashes && !(proto && HOSTLESS_PROTOCOLS.has(proto))) {
+            rest = rest.slice(2);
+            result.slashes = true;
         }
     }
+
+    if (!HOSTLESS_PROTOCOLS.has(proto ?? '') && (slashes || (proto && !SLASHED_PROTOCOLS.has(proto)))) {
+        rest = parseHostPart(result, rest, urlStr);
+    }
+
+    if (!HOSTLESS_PROTOCOLS.has(proto ?? '')) rest = autoEscapeStr(rest);
 
     const hashIndex = rest.indexOf('#');
-    if (hashIndex !== -1) {
-        result.hash = rest.slice(hashIndex);
-        rest = rest.slice(0, hashIndex);
-    }
-
     const queryIndex = rest.indexOf('?');
-    if (queryIndex !== -1) {
-        result.search = rest.slice(queryIndex);
-        const query = rest.slice(queryIndex + 1);
+    if (hashIndex !== -1) result.hash = rest.slice(hashIndex);
+    if (queryIndex !== -1 && (hashIndex === -1 || queryIndex < hashIndex)) {
+        result.search = hashIndex === -1 ? rest.slice(queryIndex) : rest.slice(queryIndex, hashIndex);
+        const query = result.search.slice(1);
         result.query = parseQueryString ? parseQuery(query) : query;
-        rest = rest.slice(0, queryIndex);
     } else if (parseQueryString) {
-        const query: ParsedQuery = Object.create(null);
-        result.query = query;
+        result.query = Object.create(null) as ParsedQuery;
     }
 
-    if (rest || result.host || result.protocol) {
-        result.pathname = rest || (result.host ? '/' : null);
+    const firstIdx = queryIndex !== -1 && (hashIndex === -1 || queryIndex < hashIndex) ? queryIndex : hashIndex;
+    if (firstIdx === -1) {
+        if (rest.length > 0) result.pathname = rest;
+    } else if (firstIdx > 0) {
+        result.pathname = rest.slice(0, firstIdx);
     }
-    if (result.pathname !== null || result.search !== null) {
+    if (proto && SLASHED_PROTOCOLS.has(proto) && result.hostname && !result.pathname) {
+        result.pathname = '/';
+    }
+
+    if (result.pathname || result.search) {
         result.path = `${result.pathname ?? ''}${result.search ?? ''}`;
     }
 
@@ -325,6 +447,8 @@ export function format(url: string | URL | UrlObject, options?: {
     }
 
     const protocol = normalizeProtocol(url.protocol);
+    // Node adds "//" only for an explicit `slashes` or a slashed protocol —
+    // a bare host on e.g. mailto: must NOT gain one.
     const slashes = Boolean(url.slashes) || (protocol !== null && SLASHED_PROTOCOLS.has(protocol));
     let out = protocol ?? '';
 
@@ -334,11 +458,9 @@ export function format(url: string | URL | UrlObject, options?: {
         if (url.port) host += `:${url.port}`;
     }
 
-    if (slashes || host) {
-        out += '//';
-        if (url.auth) out += `${encodeAuth(String(url.auth)).replace(UNSAFE_AUTH, encodeURIComponent)}@`;
-        if (host) out += host;
-    }
+    if (slashes) out += '//';
+    if (url.auth) out += `${encodeAuth(String(url.auth)).replace(UNSAFE_AUTH, encodeURIComponent)}@`;
+    if (host) out += host;
 
     let pathname = url.pathname ?? '';
     if (pathname && host && !pathname.startsWith('/')) pathname = `/${pathname}`;
@@ -379,26 +501,29 @@ export function resolve(from: string, to: string): string {
         throw new TypeError('The "url" argument must be of type string.');
     }
 
-    try {
-        return new URL(to, new URL(from)).href;
-    } catch {
-        if (/^[a-z][a-z0-9.+-]*:/i.test(to) || to.startsWith('//')) return to;
-        const base = parse(from) as MutableParsedUrl;
-        const target = parse(to) as MutableParsedUrl;
-        if (target.search && !target.pathname) {
-            base.search = target.search;
-            base.query = target.query;
-            base.hash = target.hash;
-            base.path = `${base.pathname ?? ''}${target.search}`;
-            return format(base);
-        }
-        base.pathname = resolveRelativePath(base.pathname ?? '/', to);
-        base.search = null;
-        base.query = null;
+    // Node's `new URL(from)` throws for a bare path, falling through to the
+    // legacy resolver. cno's URL accepts bare paths as file:, so gate on a scheme.
+    if (PROTOCOL_RE.test(from)) {
+        try {
+            return new URL(to, new URL(from)).href;
+        } catch {}
+    }
+    if (/^[a-z][a-z0-9.+-]*:/i.test(to) || to.startsWith('//')) return to;
+    const base = parse(from) as MutableParsedUrl;
+    const target = parse(to) as MutableParsedUrl;
+    if (target.search && !target.pathname) {
+        base.search = target.search;
+        base.query = target.query;
         base.hash = target.hash;
-        base.path = base.pathname;
+        base.path = `${base.pathname ?? ''}${target.search}`;
         return format(base);
     }
+    base.pathname = resolveRelativePath(base.pathname ?? '/', to);
+    base.search = null;
+    base.query = null;
+    base.hash = target.hash;
+    base.path = base.pathname;
+    return format(base);
 }
 
 export function resolveObject(from: string, to: string | Url): string | Url {
@@ -540,28 +665,81 @@ function splitDomain(domain: string): string[] {
     return domain.split(/[.\u3002\uff0e\uff61]/);
 }
 
+// UTS-46 with UseSTD3ASCIIRules=false: only controls, space, DEL and the
+// forbidden host code points are disallowed. `! " $ & ' ( ) * + , ; = ` { } ~`
+// are all legal in a domain label, which Node's domainToASCII confirms.
+const DISALLOWED_DOMAIN_ASCII = /[\0-\x20\x7F#%/:<>?@[\\\]^|]/;
+
 function validAsciiLabel(label: string): boolean {
-    return label.length <= 63 && /^[A-Za-z0-9_-]*$/.test(label);
+    return !DISALLOWED_DOMAIN_ASCII.test(label);
+}
+
+// UTS-46 also disallows C1 controls, so an A-label decoding to them
+// (`xn--a` → U+0080) is not a valid domain.
+const DISALLOWED_ULABEL = /[\0-\x20\x7F-\x9F#%/:<>?@[\\\]^|]/;
+
+// Returns the U-label, or null when the A-label is not a valid one.
+function decodeALabel(label: string): string | null {
+    if (!/^[\x00-\x7F]+$/.test(label)) return null;
+    let decoded: string;
+    try {
+        decoded = punyDecode(label.slice(4));
+    } catch {
+        return null;
+    }
+    if (decoded === '' || DISALLOWED_ULABEL.test(decoded)) return null;
+    // A valid A-label must re-encode to itself.
+    if (`xn--${punyEncode(decoded)}`.toLowerCase() !== label.toLowerCase()) return null;
+    return decoded;
+}
+
+// Legacy url.parse uses a LENIENT IDNA: disallowed ASCII passes through
+// untouched (`http://a\bb/p` keeps its host), only non-ASCII can fail.
+// Returns '' on failure, which the caller turns into ERR_INVALID_URL.
+function lenientDomainToASCII(domain: string): string {
+    const out: string[] = [];
+    for (const label of splitDomain(domain)) {
+        if (/^xn--/i.test(label)) {
+            if (decodeALabel(label) === null) return '';
+            out.push(label.toLowerCase());
+        } else if (/^[\x00-\x7F]*$/.test(label)) {
+            out.push(label.toLowerCase());
+        } else if (/[\x7F-\x9F]/.test(label)) {
+            return '';
+        } else {
+            try {
+                out.push(`xn--${punyEncode(label)}`.toLowerCase());
+            } catch {
+                return '';
+            }
+        }
+    }
+    return out.join('.');
 }
 
 export function domainToASCII(domain: string): string {
-    const input = String(domain);
+    let input = String(domain);
     if (input === '') return '';
     if (/^\[[0-9A-Fa-f:.]+\]$/.test(input)) return input;
+
+    // The URL host parser strips tab/LF/CR and stops at a path/query/fragment
+    // delimiter, so `a/b` yields `a` rather than failing outright.
+    input = input.replace(/[\t\n\r]/g, '');
+    const stop = input.search(/[#/?\\]/);
+    if (stop !== -1) input = input.slice(0, stop);
+    if (input === '') return '';
 
     try {
         const labels = splitDomain(input);
         let invalid = false;
         const converted = labels.map(label => {
             if (label === '') return '';
-            if (/^xn--/i.test(label)) {
-                if (!/^[\x00-\x7F]+$/.test(label)) {
-                    invalid = true;
-                    return '';
-                }
-                punyDecode(label.slice(4));
+            if (/^xn--/i.test(label) && decodeALabel(label) === null) {
+                invalid = true;
+                return '';
             }
             if (/^[\x00-\x7F]+$/.test(label)) {
+                // Node runs UTS-46 with VerifyDnsLength=false, so a long ASCII label passes.
                 if (validAsciiLabel(label)) return label.toLowerCase();
                 invalid = true;
                 return '';
@@ -578,19 +756,26 @@ export function domainToASCII(domain: string): string {
 }
 
 export function domainToUnicode(domain: string): string {
-    const input = String(domain);
+    let input = String(domain);
     if (input === '') return '';
 
-    try {
-        return splitDomain(input).map(label => {
-            if (label.toLowerCase().startsWith('xn--')) {
-                return punyDecode(label.slice(4));
-            }
-            return label;
-        }).join('.');
-    } catch {
-        return '';
+    input = input.replace(/[\t\n\r]/g, '');
+    const stop = input.search(/[#/?\\]/);
+    if (stop !== -1) input = input.slice(0, stop);
+    if (input === '') return '';
+
+    const converted: string[] = [];
+    for (const label of splitDomain(input)) {
+        if (/^xn--/i.test(label)) {
+            const decoded = decodeALabel(label);
+            if (decoded === null) return '';
+            converted.push(decoded);
+        } else {
+            if (/^[\x00-\x7F]*$/.test(label) && !validAsciiLabel(label)) return '';
+            converted.push(label.toLowerCase());
+        }
     }
+    return converted.join('.');
 }
 
 function isUrl(value: unknown): value is URL {
@@ -606,6 +791,28 @@ function isUrl(value: unknown): value is URL {
 
 function urlError(message: string, code: string): TypeError & { code: string } {
     return Object.assign(new TypeError(message), { code });
+}
+
+// Node's ERR_INVALID_ARG_TYPE "Received …" suffix, for the common cases.
+function describeReceived(value: unknown): string {
+    if (value === null) return 'null';
+    if (value === undefined) return 'undefined';
+    const type = typeof value;
+    if (type === 'string') return `type string ('${value as string}')`;
+    if (type === 'number' || type === 'boolean' || type === 'bigint' || type === 'symbol') {
+        return `type ${type} (${String(value)})`;
+    }
+    if (type === 'function') return `function ${(value as () => void).name}`;
+    const name = Object.getPrototypeOf(value) === null ? null : (value as object).constructor?.name;
+    return name ? `an instance of ${name}` : '[Object: null prototype] {}';
+}
+
+function invalidPathType(value: unknown, allowUrl: boolean): TypeError & { code: string } {
+    const expected = allowUrl ? 'string or an instance of URL' : 'string';
+    return urlError(
+        `The "path" argument must be of type ${expected}. Received ${describeReceived(value)}`,
+        'ERR_INVALID_ARG_TYPE',
+    );
 }
 
 function assertFileUrl(value: URL): void {
@@ -640,20 +847,23 @@ function decodePathname(pathname: string, windows: boolean): string {
     return decodeURIComponent(pathname);
 }
 
-export interface FileURLPathOptions {
+interface FileURLPathOptions {
     windows?: boolean;
 }
 
 export function fileURLToPath(url: string | URL, options?: FileURLPathOptions): string {
     if (typeof url !== 'string' && !isUrl(url)) {
-        throw urlError(
-            'The "path" argument must be of type string or an instance of URL',
-            'ERR_INVALID_ARG_TYPE',
-        );
+        throw invalidPathType(url, true);
+    }
+
+    // A Windows drive path parses as scheme "c:" in Node's URL (so: not file:),
+    // but cno's URL accepts it as a file: path — reject it explicitly.
+    if (typeof url === 'string' && /^[A-Za-z]:[\\/]/.test(url)) {
+        throw urlError('The URL must be of scheme file', 'ERR_INVALID_URL_SCHEME');
     }
 
     if (typeof url === 'string' && !/^[a-z][a-z0-9.+-]*:/i.test(url)) {
-        return url;
+        throw urlError('Invalid URL', 'ERR_INVALID_URL');
     }
 
     const raw = typeof url === 'string' ? url : url.href;
@@ -687,7 +897,7 @@ export function fileURLToPath(url: string | URL, options?: FileURLPathOptions): 
 
     if (hostname && hostname !== 'localhost') {
         throw urlError(
-            'File URL host must be "localhost" or empty on this platform',
+            `File URL host must be "localhost" or empty on ${process.platform}`,
             'ERR_INVALID_FILE_URL_HOST',
         );
     }
@@ -725,10 +935,7 @@ function hexDigit(value: number): number {
 
 export function fileURLToPathBuffer(url: string | URL, options?: FileURLPathOptions): Buffer {
     if (typeof url !== 'string' && !isUrl(url)) {
-        throw urlError(
-            'The "path" argument must be of type string or an instance of URL',
-            'ERR_INVALID_ARG_TYPE',
-        );
+        throw invalidPathType(url, true);
     }
     const parsed = typeof url === 'string' ? new URL(url) : url;
     assertFileUrl(parsed);
@@ -754,56 +961,64 @@ export function fileURLToPathBuffer(url: string | URL, options?: FileURLPathOpti
     }
     if (hostname && hostname !== 'localhost') {
         throw urlError(
-            'File URL host must be "localhost" or empty on this platform',
+            `File URL host must be "localhost" or empty on ${process.platform}`,
             'ERR_INVALID_FILE_URL_HOST',
         );
     }
     return decoded;
 }
 
-function getCwd(): string {
-    const proc = Reflect.get(globalThis, 'process');
-    const cwd = (proc && (typeof proc === 'object' || typeof proc === 'function'))
-        ? Reflect.get(proc, 'cwd')
-        : undefined;
-    if (typeof cwd === 'function') return String(Reflect.apply(cwd, proc, []));
-    try {
-        return import.meta.use('os').cwd;
-    } catch {
-        return '/';
-    }
-}
+// Node's file-URL encode set (Ada `href_from_file`): everything else becomes
+// UTF-8 percent-escapes, including `%`, `~`, `[`, `]`, `|`, `^`.
+const FILE_URL_UNSAFE = /[^A-Za-z0-9!$&'()*+,\-./:;=@_]/gu;
 
 function encodeFilePath(pathname: string): string {
-    return encodeURI(pathname).replace(/[?#]/g, ch => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`);
+    return pathname.replace(FILE_URL_UNSAFE, ch => {
+        let out = '';
+        for (const byte of Buffer.from(ch, 'utf8')) out += `%${byte.toString(16).toUpperCase().padStart(2, '0')}`;
+        return out;
+    });
+}
+
+function invalidArgValue(value: string, reason: string): TypeError & { code: string } {
+    const quoted = `'${value.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`;
+    return Object.assign(
+        new TypeError(`The argument 'path' ${reason}. Received ${quoted}`),
+        { code: 'ERR_INVALID_ARG_VALUE' },
+    );
 }
 
 export function pathToFileURL(filepath: string, options?: FileURLPathOptions): URL {
     if (typeof filepath !== 'string') {
-        throw new TypeError('The "path" argument must be of type string');
-    }
-
-    let path = filepath;
-    if (!path.startsWith('/') && !WINDOWS_DRIVE_RE.test(path) && !path.startsWith('\\\\')) {
-        const cwd = getCwd();
-        path = `${cwd.replace(/[\\/]+$/, '')}/${path}`;
+        throw invalidPathType(filepath, false);
     }
 
     const windows = options?.windows ?? process.platform === 'win32';
-    if (windows) {
-        path = path.replace(/\\/g, '/');
-        if (path.startsWith('//')) {
-            const withoutSlashes = path.slice(2);
-            const slash = withoutSlashes.indexOf('/');
-            const host = slash === -1 ? withoutSlashes : withoutSlashes.slice(0, slash);
-            const rest = slash === -1 ? '/' : withoutSlashes.slice(slash);
-            return new URL(`file://${host}${encodeFilePath(rest)}`);
+    // A UNC path is never run through resolve(); everything else is, which is
+    // what supplies the current drive for `/tmp/x`, `C:a`, and relative paths.
+    const isUnc = windows && filepath.startsWith('\\\\');
+    let resolved = isUnc ? filepath : (windows ? path.win32.resolve(filepath) : path.posix.resolve(filepath));
+
+    if (windows && resolved.startsWith('\\\\')) {
+        // `\\?\` is a local-path prefix, not a server name — unlike `\\?\UNC\`.
+        if (resolved.startsWith('\\\\?\\') && !resolved.startsWith('\\\\?\\UNC\\')) {
+            return new URL(`file:///${encodeFilePath(resolved.slice(4).replace(/\\/g, '/'))}`);
         }
-        if (/^[a-zA-Z]:/.test(path)) path = `/${path}`;
+        const prefixLength = resolved.startsWith('\\\\?\\UNC\\') ? 8 : 2;
+        const hostEnd = resolved.indexOf('\\', prefixLength);
+        if (hostEnd === -1) throw invalidArgValue(resolved, 'Missing UNC resource path');
+        if (hostEnd === prefixLength) throw invalidArgValue(resolved, 'Empty UNC servername');
+        const host = domainToASCII(resolved.slice(prefixLength, hostEnd));
+        return new URL(`file://${host}${encodeFilePath(resolved.slice(hostEnd).replace(/\\/g, '/'))}`);
     }
 
-    if (!path.startsWith('/')) path = `/${path}`;
-    return new URL(`file://${encodeFilePath(path)}`);
+    // resolve() strips a trailing separator; Node puts it back.
+    const last = filepath.charCodeAt(filepath.length - 1);
+    if ((last === 0x2f || (windows && last === 0x5c)) && !resolved.endsWith(path.sep)) resolved += '/';
+
+    if (windows) resolved = resolved.replace(/\\/g, '/');
+    if (!resolved.startsWith('/')) resolved = `/${resolved}`;
+    return new URL(`file://${encodeFilePath(resolved)}`);
 }
 
 export function urlToHttpOptions(url: URL): {
@@ -864,4 +1079,12 @@ export default {
     fileURLToPathBuffer,
     pathToFileURL,
     urlToHttpOptions,
+};
+
+// `export type` (not `export interface`) so `export * from './mod'`
+// cannot materialise these as undefined runtime exports.
+export type {
+    UrlWithStringQuery,
+    UrlWithParsedQuery,
+    FileURLPathOptions,
 };

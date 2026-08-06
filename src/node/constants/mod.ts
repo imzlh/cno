@@ -8,6 +8,10 @@ const nested = {
     fs: fsConstants,
     crypto: cryptoConstants,
     zlib: zlibConstants,
+    signals: osConstants.signals,
+    errno: osConstants.errno,
+    dlopen: osConstants.dlopen,
+    priority: osConstants.priority,
 };
 
 export const constants = Object.freeze({

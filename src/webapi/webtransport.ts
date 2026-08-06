@@ -1,6 +1,7 @@
 /** WebTransport-compatible streams backed by the native QUIC extension. */
 import { requireQuic } from '../quic-native';
 import { toOwnedBytes } from '../utils/bytes';
+import { systemCaCerts } from '../utils/ca-certs';
 import { DOMException } from './events';
 
 const WEBTRANSPORT_ALPN = 'webtransport';
@@ -397,6 +398,8 @@ export class WebTransport {
             isServer: false,
             alpn: WEBTRANSPORT_ALPN,
             verifyPeer: true,
+            // OpenSSL's default verify paths are empty on Windows — pass the OS store.
+            caCerts: systemCaCerts(),
         });
         this.#connection = this.#socket.connect(target.hostname, Number(target.port) || 443, target.hostname);
         this.#streams = new IncomingStreamController(this.#connection);

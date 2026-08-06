@@ -74,7 +74,16 @@ export interface Key {
 }
 
 function flushPendingLine(self: Interface): void {
-    if (self._rawMode || self._lineBuf.length === 0) return;
+    // A trailing chunk with no newline still produces one final 'line' in Node.
+    if (self._terminal) {
+        if (self._line.length === 0) return;
+        const line = self._line;
+        self._line = '';
+        self._cursorPos = 0;
+        self.emit('line', line);
+        return;
+    }
+    if (self._lineBuf.length === 0) return;
     const line = self._lineBuf.join('');
     self._lineBuf = [];
     self.emit('line', line);
@@ -117,8 +126,11 @@ export interface Interface extends EventEmitter {
     _readBuf: Uint8Array;
     _lineBuf: string[];
     _reading: boolean;
+    /** A CR ended the previous chunk; a leading LF in the next one is its pair. */
+    _pendingCR: boolean;
     _decoder: CModuleText.Decoder;
     _outputQueue: Promise<void>;
+    _outputPending: number;
     _detachInput?: () => void;
 
     _queueOutput(task: () => Promise<void>): Promise<void>;
@@ -135,6 +147,7 @@ export interface Interface extends EventEmitter {
     _addHistory(line: string): void;
 
     getTerminal(): boolean;
+    getCursorPos(): { rows: number; cols: number };
     setPrompt(prompt: string): void;
     prompt(preserveCursor?: boolean): void;
     question(query: string, callback: (answer: string) => void): void;
@@ -147,6 +160,8 @@ export interface Interface extends EventEmitter {
     [Symbol.asyncIterator](): AsyncIterableIterator<string>;
 
     readonly cursorPos: { rows: number; cols: number };
+    readonly cursor: number;
+    terminal: boolean;
     readonly history: string[];
     readonly line: string;
     readonly closed: boolean;
@@ -174,8 +189,15 @@ function initInterface(self: Interface, options: ReadLineOptions | NodeJS.Readab
     self._readBuf = new Uint8Array(4096);
     self._lineBuf = [];
     self._reading = false;
-    self._decoder = new text.Decoder(undefined, { stream: true });
+    self._pendingCR = false;
+    // `stream: true` must be passed to each decode() call, not just the ctor —
+    // the ctor flag alone does not retain the partial-sequence state, so a
+    // multi-byte character split across two chunks decodes to U+FFFD per byte.
+    // `ignoreBOM: true` keeps a leading U+FEFF in the data: Node's readline
+    // reports the BOM as part of the first line rather than swallowing it.
+    self._decoder = new text.Decoder(undefined, { stream: true, ignoreBOM: true });
     self._outputQueue = Promise.resolve();
+    self._outputPending = 0;
 
     const opts: ReadLineOptions = 'input' in options
         ? options as ReadLineOptions
@@ -183,12 +205,19 @@ function initInterface(self: Interface, options: ReadLineOptions | NodeJS.Readab
     self._input = opts.input;
     self._output = opts.output ?? stdout;
     self._completer = opts.completer;
-    self._terminal = opts.terminal ?? stdin.isTTY;
+    // Node derives `terminal` from the streams actually passed, not from stdin.
+    const outIsTTY = Reflect.get(self._output ?? {}, 'isTTY');
+    const inIsTTY = Reflect.get(self._input ?? {}, 'isTTY');
+    self._terminal = opts.terminal ?? !!(outIsTTY ?? inIsTTY);
     self._historySize = Math.max(opts.historySize ?? 30, 0);
-    self._removeHistoryDups = opts.removeHistoryDuplicates ?? true;
+    self._removeHistoryDups = opts.removeHistoryDuplicates ?? false;
     self._prompt = opts.prompt ?? '> ';
 
-    if (self._terminal && stdin.isTTY) try {
+    // Only touch raw mode when the input really is the shared stdin TTY;
+    // otherwise a readline over an unrelated stream would flip the whole
+    // process's terminal into raw mode and never be able to restore it.
+    const isSharedStdin = (self._input as unknown) === (stdin as unknown);
+    if (self._terminal && isSharedStdin && stdin.isTTY) try {
         const stream = stdin.__stream as CModuleStreams.TTY;
         self._prevMode = stream.mode;
         stream.mode = streams.TTY_MODE_RAW_VT;
@@ -216,14 +245,27 @@ Object.setPrototypeOf(Interface, EventEmitter);
 Interface.prototype = Object.create(EventEmitter.prototype);
 
 Interface.prototype._queueOutput = function _queueOutput(this: Interface, task: () => Promise<void>): Promise<void> {
+    this._outputPending++;
     const next = this._outputQueue.then(task, task);
-    this._outputQueue = next.catch((err) => {
-        this.emit('error', err instanceof Error ? err : new Error(String(err)));
-    });
+    this._outputQueue = next.then(
+        () => { this._outputPending--; },
+        (err) => {
+            this._outputPending--;
+            this.emit('error', err instanceof Error ? err : new Error(String(err)));
+        },
+    );
     return next;
 };
 
 Interface.prototype._scheduleWrite = function _scheduleWrite(this: Interface, data: string): void {
+    // Node writes prompts synchronously. Only fall back to the async queue when
+    // an earlier write is still in flight, so ordering is still preserved.
+    if (this._outputPending === 0 && !isCnoStream(this._output)) {
+        try {
+            (this._output as NodeJS.WritableStream).write(data);
+            return;
+        } catch { /* fall through to the queued path */ }
+    }
     void this._queueOutput(() => writeTarget(this._output, data));
 };
 
@@ -238,15 +280,26 @@ Interface.prototype._refreshLine = function _refreshLine(this: Interface): void 
     this._scheduleWrite(`\x1b[2K\r${this._prompt}${this._line}${moveBack}`);
 };
 
+type StreamListener = (...args: never[]) => void;
+
+/** The duck-typed surface `_startRead` actually probes on an input stream. */
+type EmitterInput = NodeJS.ReadableStream & {
+    __stream?: CModuleStreams.Stream;
+    on?: (event: string, listener: StreamListener) => unknown;
+    once?: (event: string, listener: StreamListener) => unknown;
+    off?: (event: string, listener: StreamListener) => unknown;
+    resume?: () => unknown;
+};
+
 Interface.prototype._startRead = function _startRead(this: Interface): void {
     if (this._reading || this._closed || this._paused) return;
-    const input = this._input as NodeJS.ReadableStream & { __stream?: CModuleStreams.Stream };
+    const input = this._input as EmitterInput;
     if (typeof input?.on === 'function' && !input.__stream) {
         this._reading = true;
         const onData = (chunk: string | Uint8Array) => {
             const textChunk = typeof chunk === 'string'
                 ? chunk
-                : this._decoder.decode(arrayBufferBackedBytes(chunk));
+                : this._decoder.decode(arrayBufferBackedBytes(chunk), { stream: true });
             this._processInput(textChunk);
         };
         const onEnd = () => {
@@ -254,15 +307,19 @@ Interface.prototype._startRead = function _startRead(this: Interface): void {
             this._reading = false;
             this.close();
         };
-        const onError = () => {
+        // Node re-emits an input stream error on the Interface (and leaves it
+        // open). Swallowing it made a failed read indistinguishable from a
+        // clean EOF, because 'close' still arrived.
+        const onError = (err: unknown) => {
             this._reading = false;
+            this.emit('error', err);
         };
-        input.on('data', onData);
-        input.once('end', onEnd);
-        input.once('close', onEnd);
-        input.once('error', onError);
+        input.on('data', onData as StreamListener);
+        input.once?.('end', onEnd);
+        input.once?.('close', onEnd);
+        input.once?.('error', onError);
         this._detachInput = () => {
-            input.off?.('data', onData);
+            input.off?.('data', onData as StreamListener);
             input.off?.('end', onEnd);
             input.off?.('close', onEnd);
             input.off?.('error', onError);
@@ -293,7 +350,7 @@ Interface.prototype._readLoop = async function _readLoop(this: Interface): Promi
                 this.close();
                 return;
             }
-            const chunk = this._decoder.decode(this._readBuf.subarray(0, n));
+            const chunk = this._decoder.decode(this._readBuf.subarray(0, n), { stream: true });
             this._processInput(chunk);
         }
     } finally {
@@ -302,15 +359,39 @@ Interface.prototype._readLoop = async function _readLoop(this: Interface): Promi
 };
 
 Interface.prototype._processInput = function _processInput(this: Interface, data: string): void {
-    if (this._rawMode) this._processRawInput(data);
+    // `terminal` (not the OS raw-mode flag) selects line editing + history, so a
+    // terminal:true interface over a plain stream still behaves like Node's.
+    if (this._terminal) this._processRawInput(data);
     else this._processLineInput(data);
 };
+
+/**
+ * Node splits lines on LF, CR, CRLF *and* the Unicode separators U+2028 /
+ * U+2029. Missing the latter two collapses a whole LS/PS-separated file into a
+ * single line.
+ */
+function isLineTerminator(ch: string | undefined): boolean {
+    return ch === '\r' || ch === '\n' || ch === ' ' || ch === ' ';
+}
 
 Interface.prototype._processLineInput = function _processLineInput(this: Interface, data: string): void {
     for (let i = 0; i < data.length; i++) {
         const ch = data[i];
-        if (ch === '\r' || ch === '\n') {
-            if (ch === '\r' && i + 1 < data.length && data[i + 1] === '\n') i++;
+        // A CR that ended the *previous* chunk leaves its LF to be swallowed
+        // here; without this, a chunk boundary landing inside a CRLF pair
+        // emits a spurious empty line.
+        if (this._pendingCR) {
+            this._pendingCR = false;
+            if (ch === '\n') continue;
+        }
+        if (isLineTerminator(ch)) {
+            if (ch === '\r') {
+                if (i + 1 < data.length) {
+                    if (data[i + 1] === '\n') i++;
+                } else {
+                    this._pendingCR = true;
+                }
+            }
             const line = this._lineBuf.join('');
             this._lineBuf = [];
             this.emit('line', line);
@@ -325,7 +406,18 @@ Interface.prototype._processRawInput = function _processRawInput(this: Interface
         const ch = data[i];
         const code = ch.charCodeAt(0);
 
-        if (ch === '\r' || ch === '\n') {
+        if (this._pendingCR) {
+            this._pendingCR = false;
+            if (ch === '\n') continue;
+        }
+        if (isLineTerminator(ch)) {
+            if (ch === '\r') {
+                if (i + 1 < data.length) {
+                    if (data[i + 1] === '\n') i++;
+                } else {
+                    this._pendingCR = true;
+                }
+            }
             this._scheduleWrite('\r\n');
             this.emit('line', this._line);
             this._addHistory(this._line);
@@ -431,18 +523,27 @@ Interface.prototype._moveHistory = function _moveHistory(this: Interface, dir: n
     } else {
         return;
     }
-    this._line = this._history[this._history.length - 1 - this._historyIndex] ?? '';
+    this._line = this._history[this._historyIndex] ?? '';
     this._cursorPos = this._line.length;
     this._refreshLine();
 };
 
 Interface.prototype._addHistory = function _addHistory(this: Interface, line: string): void {
     if (!line) return;
-    if (this._removeHistoryDups && this._history[this._history.length - 1] === line) return;
-    this._history.push(line);
-    if (this._historySize > 0 && this._history.length > this._historySize) {
-        this._history.shift();
+    // Node stores history newest-first and always collapses a consecutive repeat;
+    // removeHistoryDuplicates additionally drops every earlier occurrence.
+    if (this._history[0] === line) return;
+    if (this._historySize === 0) {
+        this._historyIndex = -1;
+        this._historyDraft = '';
+        return;
     }
+    if (this._removeHistoryDups) {
+        const dup = this._history.indexOf(line);
+        if (dup !== -1) this._history.splice(dup, 1);
+    }
+    this._history.unshift(line);
+    if (this._history.length > this._historySize) this._history.pop();
     this._historyIndex = -1;
     this._historyDraft = '';
 };
@@ -606,6 +707,23 @@ Object.defineProperty(Interface.prototype, 'cursorPos', {
     },
     configurable: true,
 });
+
+// Node's public surface: a `terminal` property, a `cursor` offset, and
+// getCursorPos(). `getTerminal()`/`cursorPos` are kept as pre-existing aliases.
+Object.defineProperty(Interface.prototype, 'terminal', {
+    get(this: Interface): boolean { return this._terminal; },
+    set(this: Interface, value: boolean) { this._terminal = value; },
+    configurable: true,
+});
+
+Object.defineProperty(Interface.prototype, 'cursor', {
+    get(this: Interface): number { return this._cursorPos; },
+    configurable: true,
+});
+
+Interface.prototype.getCursorPos = function getCursorPos(this: Interface): { rows: number; cols: number } {
+    return { rows: 0, cols: this._prompt.length + this._cursorPos };
+};
 
 Object.defineProperty(Interface.prototype, 'history', {
     get(this: Interface): string[] { return this._history; },

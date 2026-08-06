@@ -4,7 +4,7 @@ export * from './callbacks';
 export * from './blob';
 export * from './watch';
 export * from './streams';
-export { Dir, Dirent, Stats } from './utils';
+export { BigIntStats, Dir, Dirent, Stats } from './utils';
 export { ReadStream as FileReadStream, WriteStream as FileWriteStream } from './streams';
 
 import * as promises from './_promises';

@@ -58,7 +58,7 @@ class AbortSignal extends EventTarget implements globalThis.AbortSignal {
 
     static abort(reason?: unknown): globalThis.AbortSignal {
         const signal = createAbortSignal();
-        signal._abort(reason === undefined ? new DOMException('Signal aborted', 'AbortError') : reason);
+        signal._abort(reason === undefined ? new DOMException('This operation was aborted', 'AbortError') : reason);
         return signal;
     }
 
@@ -66,8 +66,8 @@ class AbortSignal extends EventTarget implements globalThis.AbortSignal {
         const signal = createAbortSignal();
         const ms = Number(milliseconds);
 
-        if (ms < 0 || !Number.isFinite(ms)) {
-            throw new TypeError('Invalid timeout value');
+        if (!Number.isFinite(ms) || ms < 0) {
+            throw new RangeError('The value of "milliseconds" is out of range. It must be >= 0');
         }
 
         const id = setTimeout(() => {
@@ -78,15 +78,17 @@ class AbortSignal extends EventTarget implements globalThis.AbortSignal {
         return signal;
     }
 
-    static any(signals: globalThis.AbortSignal[]): globalThis.AbortSignal {
-        if (!Array.isArray(signals)) {
-            throw new TypeError('signals must be an array');
+    // Spec takes any iterable of signals, not just an Array.
+    static any(signals: Iterable<globalThis.AbortSignal>): globalThis.AbortSignal {
+        if (signals === null || signals === undefined || typeof Reflect.get(Object(signals), Symbol.iterator) !== 'function') {
+            throw new TypeError('signals is not iterable');
         }
+        const list = Array.from(signals);
 
         const resultSignal = createAbortSignal();
 
         // If any signal is already aborted, abort immediately
-        for (const signal of signals) {
+        for (const signal of list) {
             if (signal.aborted) {
                 resultSignal._abort(signal.reason);
                 return resultSignal;
@@ -103,7 +105,7 @@ class AbortSignal extends EventTarget implements globalThis.AbortSignal {
             handlers.clear();
         };
 
-        for (const signal of signals) {
+        for (const signal of list) {
             const handler = () => {
                 resultSignal._abort(signal.reason);
                 cleanup();
@@ -126,8 +128,6 @@ class AbortSignal extends EventTarget implements globalThis.AbortSignal {
         const event = new Event('abort');
         this.dispatchEvent(event);
     }
-
-    [Symbol.toStringTag] = 'AbortSignal';
 }
 
 // ==================== AbortController ====================
@@ -144,11 +144,13 @@ class AbortController implements globalThis.AbortController {
     }
 
     abort(reason?: unknown): void {
-        this.#signal._abort(reason === undefined ? new DOMException('Aborted', 'AbortError') : reason);
+        this.#signal._abort(reason === undefined ? new DOMException('This operation was aborted', 'AbortError') : reason);
     }
-
-    [Symbol.toStringTag] = 'AbortController';
 }
+
+// Spec puts Symbol.toStringTag on the prototype, not on each instance.
+Object.defineProperty(AbortSignal.prototype, Symbol.toStringTag, { value: 'AbortSignal', configurable: true });
+Object.defineProperty(AbortController.prototype, Symbol.toStringTag, { value: 'AbortController', configurable: true });
 
 // ==================== Export ====================
 export {

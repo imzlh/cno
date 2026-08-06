@@ -148,6 +148,21 @@ function shouldRefIpcForProcessEvent(event: string | symbol): boolean {
     return event === 'message' || event === 'disconnect';
 }
 
+/**
+ * Events whose delivery depends on the native engine-event bridge below.
+ * Registering one is the cue to (re)attempt installation, in case this module
+ * was evaluated before the multiplexer existed.
+ */
+function needsEventBridge(event: string | symbol): boolean {
+    return event === 'exit' ||
+        event === 'uncaughtException' ||
+        event === 'uncaughtExceptionMonitor';
+}
+
+function retryEventBridge(event: string | symbol): void {
+    if (needsEventBridge(event)) ensureEventBridge();
+}
+
 function hasIpcRefListener(emitter: EventEmitter): boolean {
     return emitter.listenerCount('message') > 0 || emitter.listenerCount('disconnect') > 0;
 }
@@ -160,7 +175,48 @@ function syncIpcRef(emitter: EventEmitter): void {
 
 // Environment variables
 
+/**
+ * `envTarget` must stay permanently EMPTY. `ownKeys` reports only the real OS
+ * environment, so any own property parked on the target breaks the Proxy
+ * invariant "ownKeys must include every own key of a non-extensible target /
+ * every non-configurable own key" and makes `Object.keys(process.env)`,
+ * `for..in`, spread and `JSON.stringify` throw *forever*. Every trap below
+ * therefore routes through the OS and never falls back to Reflect.*et on it.
+ */
 const envTarget: NodeJS.ProcessEnv = {};
+
+/**
+ * Node converts env values with ToString, which THROWS for a symbol
+ * ("Cannot convert a Symbol value to a string") rather than yielding
+ * "Symbol(x)" the way `String(sym)` would. Same for a symbol used as a key.
+ */
+function envToString(value: unknown): string {
+    if (typeof value === 'symbol') {
+        throw new TypeError('Cannot convert a Symbol value to a string');
+    }
+    return `${value as string}`;
+}
+
+/**
+ * Windows rejects a name containing `=` or an empty name; POSIX likewise.
+ * Node's setenv/unsetenv fail SILENTLY there (the assignment is a no-op and the
+ * read returns undefined) — verified on v24.18/win32. The native binding raises
+ * EINVAL instead, so swallow it or a config loader iterating keys would crash.
+ */
+function setEnvQuietly(key: string, value: string): void {
+    try {
+        os.setenv(key, value);
+    } catch {
+        // Match Node: an unusable variable name is a silent no-op.
+    }
+}
+
+function invalidDefineProperty(message: string): TypeError {
+    const e = new TypeError(message) as TypeError & { code?: string };
+    e.code = 'ERR_INVALID_OBJECT_DEFINE_PROPERTY';
+    return e;
+}
+
 const envProxy = new Proxy(envTarget, {
     get(target, key: string | symbol, receiver: unknown): unknown {
         if (typeof key !== 'string') {
@@ -168,22 +224,24 @@ const envProxy = new Proxy(envTarget, {
         }
         const value = safeGetEnv(key);
         if (value !== undefined) return value;
+        // Inherited members (toString, hasOwnProperty, ...) still resolve, but
+        // the target itself carries no own keys.
         return Reflect.get(target, key, receiver);
     },
-    set(target, key: string | symbol, value: unknown, receiver: unknown): boolean {
-        if (typeof key !== 'string') {
-            return Reflect.set(target, key, value, receiver);
-        }
-        os.setenv(key, String(value));
+    set(_target, key: string | symbol, value: unknown): boolean {
+        // A symbol key must throw like Node rather than being parked on the
+        // target, where it would also show up in getOwnPropertySymbols.
+        const name = envToString(key);
+        setEnvQuietly(name, envToString(value));
         return true;
     },
     has(target, key: string | symbol): boolean {
         if (typeof key !== 'string') return Reflect.has(target, key);
         return safeGetEnv(key) !== undefined || Reflect.has(target, key);
     },
-    deleteProperty(target, key: string | symbol): boolean {
-        if (typeof key !== 'string') return Reflect.deleteProperty(target, key);
-        os.unsetenv(key);
+    deleteProperty(_target, key: string | symbol): boolean {
+        if (typeof key !== 'string') return true;
+        unsetEnvQuietly(key);
         return true;
     },
     ownKeys(): string[] {
@@ -194,12 +252,36 @@ const envProxy = new Proxy(envTarget, {
             return Reflect.getOwnPropertyDescriptor(target, key);
         }
         const value = safeGetEnv(key);
-        if (value === undefined) return Reflect.getOwnPropertyDescriptor(target, key);
+        if (value === undefined) return undefined;
+        // `writable` must be spelled out: omitting it defaults to false, which
+        // makes the descriptor read-only and violates the ownKeys invariant.
         return {
+            value,
+            writable: true,
             enumerable: true,
             configurable: true,
-            value,
         };
+    },
+    defineProperty(_target, key: string | symbol, desc: PropertyDescriptor): boolean {
+        // Node only accepts a fully configurable+writable+enumerable DATA
+        // descriptor and forwards it to setenv; anything else is a TypeError.
+        const name = envToString(key);
+        if ('get' in desc || 'set' in desc) {
+            throw invalidDefineProperty(
+                "'process.env' does not accept an accessor(getter/setter) descriptor",
+            );
+        }
+        if (desc.configurable !== true || desc.writable !== true || desc.enumerable !== true) {
+            throw invalidDefineProperty(
+                "'process.env' only accepts a configurable, writable, and enumerable data descriptor",
+            );
+        }
+        setEnvQuietly(name, envToString(desc.value));
+        return true;
+    },
+    preventExtensions(): boolean {
+        // Node throws instead of letting the env be sealed.
+        throw new TypeError('Cannot prevent extensions');
     },
 });
 
@@ -224,12 +306,18 @@ class ProcessEventEmitter extends EventEmitter {
         if (typeof event === 'string' && (event.startsWith('SIG') || event.startsWith('sig'))) {
             addSignalListener(event, listener);
         }
+        // Retry the native bridge: if this module was evaluated before the mux
+        // existed, the eager install was a no-op and 'exit'/'uncaughtException'
+        // would stay dead. Registering a listener is the point at which it
+        // starts to matter.
+        retryEventBridge(event);
         const result = super.on(event, listener);
         if (shouldRefIpcForProcessEvent(event)) syncIpcRef(this);
         return result;
     }
 
     override once(event: string | symbol, listener: ProcessListener): this {
+        retryEventBridge(event);
         if (typeof event === 'string' && (event.startsWith('SIG') || event.startsWith('sig'))) {
             // Register with the native signal system using a wrapper that cleans
             // itself up AND removes the super.once listener to avoid double-fire.
@@ -251,12 +339,14 @@ class ProcessEventEmitter extends EventEmitter {
     }
 
     override prependListener(event: string | symbol, listener: ProcessListener): this {
+        retryEventBridge(event);
         const result = super.prependListener(event, listener);
         if (shouldRefIpcForProcessEvent(event)) syncIpcRef(this);
         return result;
     }
 
     override prependOnceListener(event: string | symbol, listener: ProcessListener): this {
+        retryEventBridge(event);
         const result = super.prependOnceListener(event, listener);
         if (shouldRefIpcForProcessEvent(event)) syncIpcRef(this);
         return result;
@@ -283,7 +373,93 @@ class ProcessEventEmitter extends EventEmitter {
     }
 }
 
-const processEE = new ProcessEventEmitter();
+/* ------------------------------------------------------------------ *
+ * One emitter per process, not one per copy of this file
+ * ------------------------------------------------------------------ *
+ *
+ * TWO copies of this module are live at once: the one baked into cno.exe and the
+ * one `cno setup` writes to $CTS_CACHE_DIR/node/process/mod.ts. `import process
+ * from 'node:process'` resolves to the baked copy's singleton (below), while
+ * `import * as ns from 'node:process'` reaches the disk copy — so a
+ * module-scoped `new ProcessEventEmitter()` gave each copy its own listener set
+ * (OBSERVED: proc.emit('probe') was heard only by proc.on, procNS.emit('probe')
+ * only by procNS.on, each reporting listenerCount === 1). The native 'exit'
+ * bridge then emitted on whichever copy loaded last, so the portable
+ * `process.on('exit')` form silently received nothing.
+ *
+ * The fix is the same order-independence trick the mux uses: the emitter lives on
+ * a `Symbol.for()` slot, and a copy that finds one already there ADOPTS it
+ * instead of creating a rival. Adoption (rather than migrating listeners across)
+ * is what makes this work without a rebuild: whichever copy runs first owns the
+ * emitter and all its listeners, and the second copy has none of its own to
+ * move.
+ */
+const PROCESS_EE_SLOT = Symbol.for('cno.node.process.emitter');
+const PROCESS_DEFAULT_SINGLETON = Symbol.for('cno.node.process.default');
+
+function getExistingProcessDefault(): NodeJS.Process & Record<string, unknown> | null {
+    const existing = Reflect.get(globalThis, PROCESS_DEFAULT_SINGLETON);
+    if (existing && (typeof existing === 'object' || typeof existing === 'function')) {
+        return existing as NodeJS.Process & Record<string, unknown>;
+    }
+    return null;
+}
+
+const existingProcessDefault = getExistingProcessDefault();
+
+function isEmitterLike(value: unknown): value is EventEmitter {
+    if (!value || typeof value !== 'object') return false;
+    const v = value as Record<string, unknown>;
+    return typeof v.on === 'function' &&
+        typeof v.emit === 'function' &&
+        typeof v.listenerCount === 'function';
+}
+
+/**
+ * The emitter behind an already-installed singleton.
+ *
+ * A copy old enough to predate PROCESS_EE_SLOT publishes nothing, so the slot
+ * alone is not enough to unify with the currently baked binary. Its exported
+ * `removeAllListeners` returns `processEE` (EventEmitter methods return `this`),
+ * and called with a private symbol it is a pure no-op: nothing listens on it,
+ * and syncIpcRef() only reacts to `undefined`/'message'/'disconnect'. So this
+ * recovers the emitter without a rebuild and without side effects.
+ */
+function probeSingletonEmitter(): EventEmitter | null {
+    if (!existingProcessDefault) return null;
+    try {
+        // Reached through Reflect.get and a plain call signature: the declared
+        // NodeJS.Process['removeAllListeners'] is an overloaded generic and
+        // `?.()` on it does not typecheck (TS2349), even though the runtime call
+        // is a straightforward one-argument invocation.
+        const removeAll = Reflect.get(existingProcessDefault, 'removeAllListeners');
+        if (typeof removeAll !== 'function') return null;
+        const probe = (removeAll as (e: symbol) => unknown).call(
+            existingProcessDefault,
+            Symbol('cno.process.emitter.probe'),
+        );
+        if (isEmitterLike(probe) && (probe as unknown) !== existingProcessDefault) return probe;
+    } catch { /* exotic singleton; fall through */ }
+    return null;
+}
+
+function resolveProcessEmitter(): ProcessEventEmitter {
+    const slotted = Reflect.get(globalThis, PROCESS_EE_SLOT);
+    if (isEmitterLike(slotted)) return slotted as ProcessEventEmitter;
+
+    const probed = probeSingletonEmitter();
+    if (probed) {
+        // Publish it so a third copy finds it on the slot directly.
+        Reflect.set(globalThis, PROCESS_EE_SLOT, probed);
+        return probed as ProcessEventEmitter;
+    }
+
+    const created = new ProcessEventEmitter();
+    Reflect.set(globalThis, PROCESS_EE_SLOT, created);
+    return created;
+}
+
+const processEE: ProcessEventEmitter = resolveProcessEmitter();
 type NextTickCallback = (...args: unknown[]) => void;
 const nextTickQueue: Array<{ callback: NextTickCallback; args: unknown[] }> = [];
 let nextTickScheduled = false;
@@ -309,6 +485,127 @@ function handleUncaughtException(error: unknown): void {
         return;
     }
     throw error;
+}
+
+/* ------------------------------------------------------------------ *
+ * Native engine-event bridges: 'exit' and 'uncaughtException'
+ * ------------------------------------------------------------------ *
+ *
+ * Neither existed. `processEE.emit('exit')` appeared in exactly one place —
+ * inside process.exit() below — so `process.on('exit')` never fired for any
+ * other termination path. And handleUncaughtException() was only ever reached
+ * from the nextTick drain, so a throw from a timer, an I/O callback or a stray
+ * socket 'error' produced no 'uncaughtException' at all (independently OBSERVED:
+ * an unhandled socket 'error' event yielded nothing).
+ *
+ * Both are wired through the shared multiplexer in cts/src/runtime/event-mux.ts.
+ * Not via engine.onEvent(): that is a single-slot setter which frees the
+ * previous receiver (circu.js/src/mod_engine.c:871), so a direct call here would
+ * destroy webapi's 'load'/'unload' bridge — trading one broken feature for
+ * another. This module cannot *import* the mux (AGENT.md: node/ modules must not
+ * import across the node/ boundary, and node/ is copied to the polyfill cache
+ * dir where ../../../cts does not exist), so it reaches the registry through the
+ * Symbol.for() slot the mux publishes for exactly this purpose.
+ */
+
+const EVENT_MUX_SLOT = Symbol.for('cno.engine.eventMux.v1');
+
+type MuxEventContext = { handled: boolean; dispatched: boolean };
+type MuxReceiver = (name: number, data: unknown, ctx: MuxEventContext) => boolean | undefined;
+type MuxRegistry = {
+    install(role: string, fn: MuxReceiver, priority?: number): () => void;
+    has?(role: string): boolean;
+};
+
+function eventMux(): MuxRegistry | null {
+    try {
+        const slot = (globalThis as unknown as Record<symbol, unknown>)[EVENT_MUX_SLOT];
+        if (slot && typeof (slot as MuxRegistry).install === 'function') return slot as MuxRegistry;
+    } catch { /* exotic global; treat as absent */ }
+    return null;
+}
+
+/** Node fires 'exit' exactly once. Both paths that can emit it go through here. */
+let exitEmitted = false;
+
+function emitProcessExit(code: number): void {
+    if (exitEmitted) return;
+    exitEmitted = true;
+    _exiting = true;
+    try {
+        processEE.emit('exit', code);
+    } catch {
+        // A listener threw. Node prints and still exits; swallowing here keeps
+        // teardown going rather than losing the exit path entirely.
+    }
+}
+
+let eventBridgeInstalled = false;
+
+const NODE_PROCESS_ROLE = 'node-process';
+
+function ensureEventBridge(): void {
+    if (eventBridgeInstalled) return;
+    const mux = eventMux();
+    // No mux yet (module load order, or a standalone cno without cts): stay off
+    // the bus. Falling back to a raw engine.onEvent() here would displace
+    // whatever receiver *is* installed, which is the very bug being fixed.
+    // ensureEventBridge() is retried when a listener is registered.
+    if (!mux) return;
+
+    // mux.install() is ROLE-keyed and replaces same-role, so the second copy of
+    // this module to load used to EVICT the first copy's receiver. With the
+    // emitter now shared that eviction would be harmless for delivery, but it
+    // would also swap in a receiver whose module-scoped `exitEmitted` flag is a
+    // different variable — and the once-guard is per-copy. First install wins:
+    // whichever copy is on the bus emits through the shared emitter, so every
+    // listener is reached and exactly one flag governs the fire count.
+    if (mux.has?.(NODE_PROCESS_ROLE)) {
+        eventBridgeInstalled = true;
+        return;
+    }
+    eventBridgeInstalled = true;
+
+    // Above PRIORITY_DIAGNOSTICS (0) so setting ctx.handled can suppress the
+    // cts "unhandled job exception" warning, the way a Node
+    // 'uncaughtException' handler suppresses the default report. Below
+    // PRIORITY_WEBAPI (100) so the web ErrorEvent still dispatches first.
+    mux.install(NODE_PROCESS_ROLE, (name, data, ctx) => {
+        const ET = engine.EventType;
+
+        if (name === ET.EXIT) {
+            // EV_EXIT carries the status as an int (mod_os.c:87, vm.c:282).
+            emitProcessExit(typeof data === 'number' ? data : (exitCode ?? 0));
+            // Return value is freed and ignored by the C for this event.
+            return undefined;
+        }
+
+        if (name === ET.JOB_EXCEPTION) {
+            processEE.emit('uncaughtExceptionMonitor', data, 'uncaughtException');
+            if (processEE.listenerCount('uncaughtException') === 0) {
+                // No handler: leave the outcome exactly as it was. Do NOT call
+                // handleUncaughtException() — it rethrows, and the mux swallows
+                // receiver exceptions, so the error would disappear instead of
+                // being reported.
+                return undefined;
+            }
+            try {
+                processEE.emit('uncaughtException', data, 'uncaughtException');
+            } catch {
+                // A throw from inside the handler must not become a TJS_Stop.
+            }
+            // The program dealt with it: silence the runtime diagnostic.
+            ctx.handled = true;
+            // POLARITY: utils.c:180 calls TJS_Stop when the receiver returns
+            // FALSE. So "handled, keep running" is `true` here — the opposite
+            // constant from EV_UNHANDLED_REJECTION, where vm.c:242 aborts on any
+            // non-false and "handled" is `false`. Returning false here would
+            // kill the process on precisely the errors the program handled.
+            return true;
+        }
+
+        return undefined;
+    }, 50);
 }
 
 function scheduleNextTickDrain(): void {
@@ -407,7 +704,9 @@ export const platform: NodeJS.Platform = (() => {
     }
 })();
 
-export const env: NodeJS.ProcessEnv = envProxy;
+// `let`, not `const`: a SECOND copy of this module must export the singleton's
+// env proxy, not its own. Re-pointed next to the processDefault fixups below.
+export let env: NodeJS.ProcessEnv = envProxy;
 
 export function cwd(): string {
     return os.cwd;
@@ -422,15 +721,40 @@ export function chdir(directory: string): void {
 }
 
 export function exit(code?: number): never {
+    // Forward to the singleton's exit when this is the SECOND copy of the module
+    // (same pattern as _setupIPC/send/disconnect below). `exitEmitted` is
+    // module-scoped and therefore per-copy: with the emitter now shared, a disk
+    // copy running its own exit() would emit on the shared emitter, and the
+    // baked copy's still-clear flag would let the native EV_EXIT bridge emit a
+    // SECOND time — a double-fire that was previously invisible only because the
+    // two emitters had disjoint listeners. Routing through the one live exit()
+    // keeps a single flag in charge.
+    if (existingProcessDefault) {
+        const activeExit = Reflect.get(processDefault, 'exit');
+        if (typeof activeExit === 'function' && activeExit !== exit) {
+            Reflect.apply(activeExit, processDefault, [code]);
+            throw new Error('unreachable');
+        }
+    }
     const exitCode_ = normalizeExitCodeValue(code) ?? exitCode ?? 0;
-    _exiting = true;
-    processEE.emit('exit', exitCode_);
+    // Via emitProcessExit, not a bare emit: os.exit() below dispatches native
+    // EV_EXIT (mod_os.c:87), which the bridge above also turns into 'exit'.
+    // Node guarantees the event fires exactly once, so both paths share one
+    // once-flag.
+    emitProcessExit(exitCode_);
     os.exit(exitCode_);
     throw new Error('unreachable');
 }
 
 export let exitCode: number | undefined = undefined;
 export let _exiting: boolean = false;
+
+// Installed here, not at the definition site: the receiver reads `exitCode` and
+// writes `_exiting`, both `let` bindings declared just above. Attaching the
+// bridge before they are initialised would leave a window in which a native
+// EV_EXIT reaches emitProcessExit() and dies on a temporal-dead-zone error
+// instead of emitting 'exit'.
+ensureEventBridge();
 
 export const execPath: string = os.exePath;
 
@@ -895,25 +1219,55 @@ export const report: NodeJS.ProcessReport = {
     },
 };
 
-export function emitWarning(warning: string | Error, options?: ProcessWarningOptions): void {
-    const normalized = createProcessWarning(warning, options);
-    console.warn(normalized.message);
-    nextTick(() => processEE.emit('warning', normalized));
+/**
+ * Node's default warning printer, verified against v24.18:
+ *   (node:PID) [CODE] Name: message
+ *   <detail, when present>
+ *   (Use `node --trace-warnings ...` to show where the warning was created)
+ * The code is omitted when absent, and a DeprecationWarning gets the
+ * --trace-deprecation hint instead. Tooling and CI greps depend on the
+ * `Name:` prefix, so a bare message is not a cosmetic difference.
+ */
+function formatWarning(warning: ProcessWarning): string {
+    const code = warning.code === undefined ? '' : ` [${String(warning.code)}]`;
+    let out = `(node:${pid})${code} ${warning.name}: ${warning.message}`;
+    if (warning.detail !== undefined) out += `\n${String(warning.detail)}`;
+    const flag = warning.name === 'DeprecationWarning' ? 'trace-deprecation' : 'trace-warnings';
+    out += `\n(Use \`node --${flag} ...\` to show where the warning was created)`;
+    return out;
 }
 
-export function getuid(): number {
+export function emitWarning(warning: string | Error, options?: ProcessWarningOptions): void {
+    const normalized = createProcessWarning(warning, options);
+    // Node defers BOTH the print and the event to the next tick, so a
+    // synchronous console.log after emitWarning lands first. A user 'warning'
+    // listener does NOT replace the default printer — v24.18 emits both.
+    nextTick(() => {
+        processEE.emit('warning', normalized);
+        if (normalized.name === 'DeprecationWarning' && noDeprecation) return;
+        console.error(formatWarning(normalized));
+    });
+}
+
+// POSIX credential accessors. Real Node does not expose any of these on
+// Windows — verified on v24.18/win32: getuid, getgid, geteuid, getegid,
+// setuid, setgid, seteuid, setegid, getgroups, setgroups and initgroups are
+// all absent (not even present as keys). They are declared unconditionally
+// here and gated onto the exported surface below.
+
+function getuidImpl(): number {
     return os.userInfo.userId;
 }
 
-export function getgid(): number {
+function getgidImpl(): number {
     return os.userInfo.groupId;
 }
 
-export function geteuid(): number {
+function geteuidImpl(): number {
     return os.userInfo.userId;
 }
 
-export function getegid(): number {
+function getegidImpl(): number {
     return os.userInfo.groupId;
 }
 
@@ -921,15 +1275,34 @@ function unsupported(name: string): never {
     throw new Error(`${name} is not supported`);
 }
 
-export function setuid(): void { unsupported('setuid'); }
+function setuidImpl(): void { unsupported('setuid'); }
 
-export function setgid(): void { unsupported('setgid'); }
+function setgidImpl(): void { unsupported('setgid'); }
 
-export function seteuid(): void { unsupported('seteuid'); }
+function seteuidImpl(): void { unsupported('seteuid'); }
 
-export function setegid(): void { unsupported('setegid'); }
+function setegidImpl(): void { unsupported('setegid'); }
 
-export function setgroups(): void { unsupported('setgroups'); }
+function setgroupsImpl(): void { unsupported('setgroups'); }
+
+function getgroupsImpl(): number[] {
+    return processGroups();
+}
+
+function initgroupsImpl(): void { unsupported('initgroups'); }
+
+/** Windows has no POSIX uid/gid concept; match Node and expose nothing. */
+const hasCredentialApi = platform !== 'win32';
+
+export const getuid: (() => number) | undefined = hasCredentialApi ? getuidImpl : undefined;
+export const getgid: (() => number) | undefined = hasCredentialApi ? getgidImpl : undefined;
+export const geteuid: (() => number) | undefined = hasCredentialApi ? geteuidImpl : undefined;
+export const getegid: (() => number) | undefined = hasCredentialApi ? getegidImpl : undefined;
+export const setuid: (() => void) | undefined = hasCredentialApi ? setuidImpl : undefined;
+export const setgid: (() => void) | undefined = hasCredentialApi ? setgidImpl : undefined;
+export const seteuid: (() => void) | undefined = hasCredentialApi ? seteuidImpl : undefined;
+export const setegid: (() => void) | undefined = hasCredentialApi ? setegidImpl : undefined;
+export const setgroups: (() => void) | undefined = hasCredentialApi ? setgroupsImpl : undefined;
 
 export function umask(mask?: number | string): number {
     const prev = readUmask();
@@ -1055,23 +1428,29 @@ type UvBinding = {
     getErrorMessage(code: number): string;
     getErrorMap(): Map<number, [string, string]>;
     getCodeMap(): Map<string, number>;
-};
+} & Record<string, unknown>;
 
 let uvBinding: UvBinding | undefined;
 
 function createUvBinding(): UvBinding {
     const errorMap = new Map<number, [string, string]>();
     const codeMap = new Map<string, number>();
+    const constants: Record<string, number> = {};
     for (const [name, code] of Object.entries(errMod.errno)) {
-        if (name === 'OK' || name === 'UNKNOWN') continue;
+        // Real Node keeps UNKNOWN in the map (-4094 → 'unknown error'); only
+        // the non-error OK sentinel is excluded.
+        if (name === 'OK') continue;
         if (typeof code !== 'number') continue;
         const errno = code;
         const message = errMod.strerror(errno).replace(new RegExp(`^${name}:\\s*`), '');
         errorMap.set(errno, [name, message]);
         codeMap.set(name, errno);
+        // Node exposes every errno as a UV_<NAME> constant on the binding.
+        constants[`UV_${name}`] = errno;
     }
 
     return {
+        ...constants,
         errname(code: number): string {
             return errorMap.get(code)?.[0] ?? `Unknown system error ${code}`;
         },
@@ -1108,11 +1487,9 @@ export function openStdin(): typeof stdin {
     return stdin;
 }
 
-export function getgroups(): number[] {
-    return processGroups();
-}
+export const getgroups: (() => number[]) | undefined = hasCredentialApi ? getgroupsImpl : undefined;
 
-export function initgroups(): void { unsupported('initgroups'); }
+export const initgroups: (() => void) | undefined = hasCredentialApi ? initgroupsImpl : undefined;
 
 export function threadCpuUsage(previousValue?: NodeJS.CpuUsage): NodeJS.CpuUsage {
     return cpuUsage(previousValue);
@@ -1137,18 +1514,6 @@ export function hasUncaughtExceptionCaptureCallback(): boolean {
 export const traceProcessWarnings: boolean = false;
 
 function Process(this: object): void { }
-
-const PROCESS_DEFAULT_SINGLETON = Symbol.for('cno.node.process.default');
-
-function getExistingProcessDefault(): NodeJS.Process & Record<string, unknown> | null {
-    const existing = Reflect.get(globalThis, PROCESS_DEFAULT_SINGLETON);
-    if (existing && (typeof existing === 'object' || typeof existing === 'function')) {
-        return existing as NodeJS.Process & Record<string, unknown>;
-    }
-    return null;
-}
-
-const existingProcessDefault = getExistingProcessDefault();
 
 const processDefault = existingProcessDefault ?? {
     stdout,
@@ -1193,15 +1558,6 @@ const processDefault = existingProcessDefault ?? {
     cpuUsage,
     resourceUsage,
     emitWarning,
-    getuid,
-    getgid,
-    geteuid,
-    getegid,
-    setuid,
-    setgid,
-    seteuid,
-    setegid,
-    setgroups,
     umask,
     nextTick,
     kill,
@@ -1222,8 +1578,6 @@ const processDefault = existingProcessDefault ?? {
     _getActiveHandles,
     _getActiveRequests,
     openStdin,
-    getgroups,
-    initgroups,
     threadCpuUsage,
     constrainedMemory,
     availableMemory,
@@ -1235,11 +1589,32 @@ const processDefault = existingProcessDefault ?? {
 	constructor: Process,
 } as unknown as NodeJS.Process;
 
+// POSIX-only credential methods: added as own keys only where Node has them,
+// so `'getgid' in process` is false on Windows exactly as in real Node.
+if (!existingProcessDefault && hasCredentialApi) Object.assign(processDefault, {
+    getuid: getuidImpl,
+    getgid: getgidImpl,
+    geteuid: geteuidImpl,
+    getegid: getegidImpl,
+    setuid: setuidImpl,
+    setgid: setgidImpl,
+    seteuid: seteuidImpl,
+    setegid: setegidImpl,
+    getgroups: getgroupsImpl,
+    setgroups: setgroupsImpl,
+    initgroups: initgroupsImpl,
+});
+
 // Re-evaluation (e.g. after `cno setup` refreshes cache) reuses the singleton
 // but must pick up newly filled surfaces like report.
 if (existingProcessDefault) {
     Reflect.set(processDefault, 'versions', versions);
     Reflect.set(processDefault, 'report', report);
+    // The named export was this copy's own proxy while globalThis.process.env
+    // stayed the first copy's — identity-only, but `process.env === env` is a
+    // documented Node invariant. Derive it from the live singleton.
+    const activeEnv = Reflect.get(processDefault, 'env');
+    if (activeEnv && typeof activeEnv === 'object') env = activeEnv as NodeJS.ProcessEnv;
 }
 
 if (!existingProcessDefault) Object.defineProperties(processDefault, {

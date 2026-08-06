@@ -3,11 +3,49 @@ const engine = import.meta.use('engine');
 const PIPE_ERROR_TAG = '__cno_structured_clone_error__';
 const PIPE_DATE_TAG = '__cno_structured_clone_date__';
 const PIPE_REGEXP_TAG = '__cno_structured_clone_regexp__';
+const PIPE_DATAVIEW_TAG = '__cno_structured_clone_dataview__';
+const arrayBufferByteLengthGetter = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength')?.get;
+const arrayBufferResizableGetter = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'resizable')?.get;
+const arrayBufferMaxByteLengthGetter = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'maxByteLength')?.get;
+const arrayBufferSlice = ArrayBuffer.prototype.slice;
+const arrayBufferTransfer = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'transfer')?.value;
+const dateGetTime = Date.prototype.getTime;
+const booleanValueOf = Boolean.prototype.valueOf;
+const numberValueOf = Number.prototype.valueOf;
+const stringValueOf = String.prototype.valueOf;
+const bigintValueOf = BigInt.prototype.valueOf;
+const symbolValueOf = Symbol.prototype.valueOf;
+const mapForEach = Map.prototype.forEach;
+const mapClear = Map.prototype.clear;
+const mapSet = Map.prototype.set;
+const setForEach = Set.prototype.forEach;
+const setClear = Set.prototype.clear;
+const setAdd = Set.prototype.add;
+const regexpSourceGetter = Object.getOwnPropertyDescriptor(RegExp.prototype, 'source')?.get;
+const regexpFlagGetters = [
+    ['hasIndices', 'd'],
+    ['global', 'g'],
+    ['ignoreCase', 'i'],
+    ['multiline', 'm'],
+    ['dotAll', 's'],
+    ['unicode', 'u'],
+    ['unicodeSets', 'v'],
+    ['sticky', 'y'],
+] as const;
+const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
+const typedArrayBufferGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')?.get;
+const typedArrayByteOffsetGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteOffset')?.get;
+const typedArrayLengthGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'length')?.get;
+const typedArrayTagGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, Symbol.toStringTag)?.get;
+const dataViewBufferGetter = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer')?.get;
+const dataViewByteOffsetGetter = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset')?.get;
+const dataViewByteLengthGetter = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength')?.get;
+const sharedArrayBufferByteLengthGetter = typeof SharedArrayBuffer === 'function'
+    ? Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength')?.get
+    : undefined;
 
 type TransferInput = readonly unknown[] | StructuredSerializeOptions | undefined;
 type TypedArrayConstructor = new (buffer: ArrayBufferLike, byteOffset?: number, length?: number) => ArrayBufferView;
-type TransferableArrayBuffer = ArrayBuffer & { transfer?: () => ArrayBuffer };
-type WeakRefConstructor = new (target: object) => object;
 type CloneRecord = Record<string, unknown>;
 
 type TransferHooks<TPort extends object, TPortClone extends object = TPort> = {
@@ -22,6 +60,7 @@ type TransferHooks<TPort extends object, TPortClone extends object = TPort> = {
 
 type CloneState<TPort extends object, TPortClone extends object = TPort> = {
     buffers: Map<ArrayBuffer, ArrayBuffer>;
+    sharedBuffers: Map<SharedArrayBuffer, SharedArrayBuffer>;
     transferBuffers: Set<ArrayBuffer>;
     ports: Map<TPort, TPortClone>;
     hooks: TransferHooks<TPort, TPortClone>;
@@ -40,23 +79,116 @@ function dataCloneError(message: string): Error {
 function normalizeTransferList(input: TransferInput): readonly unknown[] {
     if (input === undefined) return [];
     if (Array.isArray(input)) return input;
-    return (input as StructuredSerializeOptions).transfer ?? [];
+    if (input === null) return [];
+    if (typeof input !== 'object') {
+        throw new TypeError('structuredClone options must be an object');
+    }
+    const transfer = (input as StructuredSerializeOptions).transfer;
+    if (transfer === undefined) return [];
+    if (transfer === null || typeof transfer !== 'object') {
+        throw new TypeError('structuredClone transfer must be an iterable sequence');
+    }
+    const iterator = Reflect.get(transfer, Symbol.iterator);
+    if (typeof iterator !== 'function') {
+        throw new TypeError('structuredClone transfer must be an iterable sequence');
+    }
+    return Array.from(transfer as Iterable<unknown>);
 }
 
 function isSharedArrayBuffer(value: unknown): value is SharedArrayBuffer {
-    return typeof SharedArrayBuffer === 'function' && value instanceof SharedArrayBuffer;
-}
-
-function isWeakRefConstructor(value: unknown): value is WeakRefConstructor {
-    return typeof value === 'function';
+    if (!value || typeof value !== 'object' || !sharedArrayBufferByteLengthGetter) return false;
+    try {
+        Reflect.apply(sharedArrayBufferByteLengthGetter, value, []);
+        return true;
+    } catch {
+        return false;
+    }
 }
 
 function isUnsupportedObject(value: object): boolean {
-    const weakRef: unknown = Reflect.get(globalThis, 'WeakRef');
-    return value instanceof WeakMap
-        || value instanceof WeakSet
-        || value instanceof Promise
-        || (isWeakRefConstructor(weakRef) && value instanceof weakRef);
+    return engine.isWeakMap(value)
+        || engine.isWeakSet(value)
+        || engine.isPromise(value)
+        || engine.isWeakRef(value);
+}
+
+// Blob/File carry their bytes in a private field, so the plain-object fallback
+// below cloned them to `{}` and silently dropped the payload. `Symbol.for`
+// avoids importing webapi/formdata here (that would be circular).
+const blobBytesSymbol = Symbol.for('cno.blob.bytes');
+
+function cloneBlob(value: object): object | null {
+    const BlobCtor = globalThis.Blob;
+    if (typeof BlobCtor !== 'function' || !(value instanceof BlobCtor)) return null;
+    const getBytes = Reflect.get(value, blobBytesSymbol);
+    if (typeof getBytes !== 'function') {
+        throw dataCloneError('Blob could not be cloned.');
+    }
+    const bytes = Reflect.apply(getBytes, value, []) as Uint8Array<ArrayBuffer>;
+    const FileCtor = globalThis.File;
+    if (typeof FileCtor === 'function' && value instanceof FileCtor) {
+        const f = value as unknown as File;
+        return new FileCtor([bytes], f.name, { type: f.type, lastModified: f.lastModified });
+    }
+    return new BlobCtor([bytes], { type: (value as unknown as Blob).type });
+}
+
+// Platform objects with internal slots and no serialization steps must throw
+// DataCloneError. The plain-object fallback used to hand back a hollow `{}` —
+// e.g. a cloned URL with `href === undefined`. This list is the measured
+// intersection of what Node 24 and Deno 2 both reject; AbortSignal, EventTarget,
+// TextEncoder/Decoder, Performance and BroadcastChannel are deliberately absent
+// because both engines clone those to plain objects.
+const nonSerializableCtors = ['URL', 'URLSearchParams', 'Headers', 'FormData',
+    'Request', 'Response', 'ReadableStream', 'WritableStream', 'TransformStream'];
+
+function throwIfNonSerializable(value: object): void {
+    for (const name of nonSerializableCtors) {
+        const ctor = Reflect.get(globalThis, name);
+        if (typeof ctor === 'function' && value instanceof ctor) {
+            throw dataCloneError(`${name} could not be cloned.`);
+        }
+    }
+}
+
+function arrayBufferByteLength(buffer: ArrayBuffer): number {
+    if (!arrayBufferByteLengthGetter) throw dataCloneError('ArrayBuffer byteLength is unavailable');
+    return Reflect.apply(arrayBufferByteLengthGetter, buffer, []);
+}
+
+function isResizableArrayBuffer(buffer: ArrayBuffer): boolean {
+    return arrayBufferResizableGetter ? Reflect.apply(arrayBufferResizableGetter, buffer, []) : false;
+}
+
+function arrayBufferMaxByteLength(buffer: ArrayBuffer): number {
+    return arrayBufferMaxByteLengthGetter
+        ? Reflect.apply(arrayBufferMaxByteLengthGetter, buffer, [])
+        : arrayBufferByteLength(buffer);
+}
+
+function applyGetter<T>(getter: ((this: unknown) => T) | undefined, receiver: object, name: string): T {
+    if (!getter) throw dataCloneError(`${name} is unavailable`);
+    return Reflect.apply(getter, receiver, []);
+}
+
+function isArrayBufferView(value: unknown): value is ArrayBufferView {
+    if (!value || typeof value !== 'object') return false;
+    if (engine.isDataView(value)) return true;
+    if (!typedArrayBufferGetter) return false;
+    try { Reflect.apply(typedArrayBufferGetter, value, []); return true; } catch { return false; }
+}
+
+function regexpSource(value: RegExp): string {
+    return applyGetter(regexpSourceGetter, value, 'RegExp source');
+}
+
+function regexpFlags(value: RegExp): string {
+    let flags = '';
+    for (const [property, flag] of regexpFlagGetters) {
+        const getter = Object.getOwnPropertyDescriptor(RegExp.prototype, property)?.get;
+        if (getter && Reflect.apply(getter, value, [])) flags += flag;
+    }
+    return flags;
 }
 
 function cloneArrayBuffer(buffer: ArrayBuffer): ArrayBuffer {
@@ -64,9 +196,22 @@ function cloneArrayBuffer(buffer: ArrayBuffer): ArrayBuffer {
         throw dataCloneError('An ArrayBuffer is detached and could not be cloned');
     }
     try {
-        return buffer.slice(0);
+        if (isResizableArrayBuffer(buffer)) {
+            const out = new ArrayBuffer(arrayBufferByteLength(buffer), { maxByteLength: arrayBufferMaxByteLength(buffer) });
+            new Uint8Array(out).set(new Uint8Array(buffer));
+            return out;
+        }
+        return Reflect.apply(arrayBufferSlice, buffer, [0]);
     } catch (e) {
         throw dataCloneError('An ArrayBuffer is detached and could not be cloned');
+    }
+}
+
+function cloneSharedArrayBuffer(buffer: SharedArrayBuffer): SharedArrayBuffer {
+    try {
+        return engine.deserialize(engine.serialize(buffer, engine.DUMP_DEEP | engine.DUMP_LOCAL));
+    } catch {
+        throw dataCloneError('A SharedArrayBuffer could not be cloned');
     }
 }
 
@@ -81,30 +226,33 @@ function isDetachedArrayBuffer(buffer: ArrayBuffer): boolean {
 
 function transferArrayBuffer(buffer: ArrayBuffer): void {
     try {
-        const transferable = buffer as TransferableArrayBuffer;
-        if (typeof transferable.transfer === 'function') {
-            transferable.transfer();
+        // Never consult an instance property named `transfer`: structured cloning
+        // operates on the ArrayBuffer internal slot, and user code must not be able
+        // to intercept or suppress the detach step by shadowing the prototype.
+        if (typeof arrayBufferTransfer === 'function') {
+            Reflect.apply(arrayBufferTransfer, buffer, []);
         } else {
             engine.detachArrayBuffer(buffer);
         }
     } catch (e) {
-        if (buffer.byteLength !== 0) throw e;
+        if (arrayBufferByteLength(buffer) !== 0) throw e;
     }
 }
 
 function typedArrayConstructor(value: ArrayBufferView): TypedArrayConstructor {
-    switch (Object.prototype.toString.call(value)) {
-        case '[object Int8Array]': return Int8Array;
-        case '[object Uint8Array]': return Uint8Array;
-        case '[object Uint8ClampedArray]': return Uint8ClampedArray;
-        case '[object Int16Array]': return Int16Array;
-        case '[object Uint16Array]': return Uint16Array;
-        case '[object Int32Array]': return Int32Array;
-        case '[object Uint32Array]': return Uint32Array;
-        case '[object Float32Array]': return Float32Array;
-        case '[object Float64Array]': return Float64Array;
-        case '[object BigInt64Array]': return BigInt64Array as TypedArrayConstructor;
-        case '[object BigUint64Array]': return BigUint64Array as TypedArrayConstructor;
+    const tag = applyGetter(typedArrayTagGetter, value, 'TypedArray tag');
+    switch (tag) {
+        case 'Int8Array': return Int8Array;
+        case 'Uint8Array': return Uint8Array;
+        case 'Uint8ClampedArray': return Uint8ClampedArray;
+        case 'Int16Array': return Int16Array;
+        case 'Uint16Array': return Uint16Array;
+        case 'Int32Array': return Int32Array;
+        case 'Uint32Array': return Uint32Array;
+        case 'Float32Array': return Float32Array;
+        case 'Float64Array': return Float64Array;
+        case 'BigInt64Array': return BigInt64Array as TypedArrayConstructor;
+        case 'BigUint64Array': return BigUint64Array as TypedArrayConstructor;
         default: throw dataCloneError('Unsupported ArrayBuffer view');
     }
 }
@@ -115,6 +263,7 @@ function prepareTransfers<TPort extends object, TPortClone extends object = TPor
 ): CloneState<TPort, TPortClone> {
     const seen = new Set<object>();
     const buffers = new Map<ArrayBuffer, ArrayBuffer>();
+    const sharedBuffers = new Map<SharedArrayBuffer, SharedArrayBuffer>();
     const transferBuffers = new Set<ArrayBuffer>();
     const ports = new Map<TPort, TPortClone>();
 
@@ -122,6 +271,9 @@ function prepareTransfers<TPort extends object, TPortClone extends object = TPor
         const item = transferList[index];
         if (!item || typeof item !== 'object') {
             throw dataCloneError('Value not transferable');
+        }
+        if (engine.isProxy(item)) {
+            throw dataCloneError('Proxy objects cannot be transferred');
         }
         if (seen.has(item)) {
             throw dataCloneError('Transfer list contains duplicate object');
@@ -131,12 +283,13 @@ function prepareTransfers<TPort extends object, TPortClone extends object = TPor
             throw dataCloneError('Object cannot be transferred');
         }
 
-        if (item instanceof ArrayBuffer) {
-            if (isDetachedArrayBuffer(item)) {
+        if (engine.isArrayBuffer(item)) {
+            const buffer = item as ArrayBuffer;
+            if (isDetachedArrayBuffer(buffer)) {
                 throw dataCloneError(`ArrayBuffer at index ${index} is already detached`);
             }
-            buffers.set(item, cloneArrayBuffer(item));
-            transferBuffers.add(item);
+            buffers.set(buffer, cloneArrayBuffer(buffer));
+            transferBuffers.add(buffer);
             continue;
         }
         if (hooks.isPort?.(item)) {
@@ -147,7 +300,7 @@ function prepareTransfers<TPort extends object, TPortClone extends object = TPor
         throw dataCloneError('Value not transferable');
     }
 
-    return { buffers, transferBuffers, ports, hooks };
+    return { buffers, sharedBuffers, transferBuffers, ports, hooks };
 }
 
 function cloneBuffer<TPort extends object, TPortClone extends object>(
@@ -158,6 +311,17 @@ function cloneBuffer<TPort extends object, TPortClone extends object>(
     if (existing) return existing;
     const cloned = cloneArrayBuffer(buffer);
     state.buffers.set(buffer, cloned);
+    return cloned;
+}
+
+function cloneSharedBuffer<TPort extends object, TPortClone extends object>(
+    buffer: SharedArrayBuffer,
+    state: CloneState<TPort, TPortClone>,
+): SharedArrayBuffer {
+    const existing = state.sharedBuffers.get(buffer);
+    if (existing) return existing;
+    const cloned = cloneSharedArrayBuffer(buffer);
+    state.sharedBuffers.set(buffer, cloned);
     return cloned;
 }
 
@@ -176,18 +340,30 @@ function cloneView<TPort extends object, TPortClone extends object>(
     state: CloneState<TPort, TPortClone>,
     seen: Map<object, unknown>,
 ): ArrayBufferView {
-    const source = value.buffer;
-    const buffer = source instanceof ArrayBuffer
+    const cached = seen.get(value);
+    if (isArrayBufferView(cached)) return cached;
+    const isDataView = engine.isDataView(value);
+    const source = isDataView
+        ? applyGetter(dataViewBufferGetter, value, 'DataView buffer')
+        : applyGetter(typedArrayBufferGetter, value, 'TypedArray buffer');
+    const buffer = engine.isArrayBuffer(source)
         ? state.buffers.get(source) ?? cloneBuffer(source, state)
-        : source;
+        : cloneSharedBuffer(source, state);
 
-    if (value instanceof DataView) {
-        return new DataView(buffer, value.byteOffset, value.byteLength);
+    if (isDataView) {
+        const byteOffset = applyGetter(dataViewByteOffsetGetter, value, 'DataView byteOffset');
+        const byteLength = applyGetter(dataViewByteLengthGetter, value, 'DataView byteLength');
+        const out = new DataView(buffer, byteOffset, byteLength);
+        seen.set(value, out);
+        return out;
     }
 
     const ctor = typedArrayConstructor(value);
-    const length = 'length' in value && typeof value.length === 'number' ? value.length : undefined;
-    return new ctor(buffer, value.byteOffset, length);
+    const byteOffset = applyGetter(typedArrayByteOffsetGetter, value, 'TypedArray byteOffset');
+    const length = applyGetter(typedArrayLengthGetter, value, 'TypedArray length');
+    const out = new ctor(buffer, byteOffset, length);
+    seen.set(value, out);
+    return out;
 }
 
 function cloneObjectProperties<TPort extends object, TPortClone extends object>(
@@ -197,15 +373,18 @@ function cloneObjectProperties<TPort extends object, TPortClone extends object>(
     seen: Map<object, unknown>,
 ): void {
     const sourceRecord = source as CloneRecord;
-    const targetRecord = target as CloneRecord;
     for (const key of Object.keys(source)) {
         const descriptor = Object.getOwnPropertyDescriptor(source, key);
         if (!descriptor) continue;
-        if ('value' in descriptor) {
-            targetRecord[key] = cloneValue(descriptor.value, state, seen);
-            continue;
-        }
-        targetRecord[key] = cloneValue(sourceRecord[key], state, seen);
+        const value = 'value' in descriptor ? descriptor.value : sourceRecord[key];
+        // Assignment would invoke Object.prototype.__proto__. Structured clone
+        // instead creates an ordinary enumerable own data property for every key.
+        Object.defineProperty(target, key, {
+            value: cloneValue(value, state, seen),
+            writable: true,
+            enumerable: true,
+            configurable: true,
+        });
     }
 }
 
@@ -214,30 +393,23 @@ function cloneBoxedPrimitive<TPort extends object, TPortClone extends object>(
     state: CloneState<TPort, TPortClone>,
     seen: Map<object, unknown>,
 ): object | undefined {
-    const tag = Object.prototype.toString.call(value);
     let out: object | undefined;
-    if (tag === '[object Boolean]') out = new Boolean((value as Boolean).valueOf());
-    else if (tag === '[object Number]') out = new Number((value as Number).valueOf());
-    else if (tag === '[object String]') out = new String((value as String).valueOf());
-    else if (tag === '[object BigInt]') {
-        const valueOf = Reflect.get(value, 'valueOf');
-        if (typeof valueOf !== 'function') return undefined;
-        out = Object(Reflect.apply(valueOf, value, []));
+    try { out = new Boolean(Reflect.apply(booleanValueOf, value, [])); } catch {}
+    if (!out) try { out = new Number(Reflect.apply(numberValueOf, value, [])); } catch {}
+    if (!out) try { out = new String(Reflect.apply(stringValueOf, value, [])); } catch {}
+    if (!out) try { out = Object(Reflect.apply(bigintValueOf, value, [])); } catch {}
+    if (!out) {
+        let isSymbol = false;
+        try { Reflect.apply(symbolValueOf, value, []); isSymbol = true; } catch {}
+        if (isSymbol) throw dataCloneError('Symbol object could not be cloned.');
     }
-    else if (tag === '[object Symbol]') throw dataCloneError('Symbol object could not be cloned.');
     if (!out) return undefined;
     seen.set(value, out);
     return out;
 }
 
 function errorConstructor(value: Error): new (message?: string) => Error {
-    if (value instanceof EvalError) return EvalError;
-    if (value instanceof RangeError) return RangeError;
-    if (value instanceof ReferenceError) return ReferenceError;
-    if (value instanceof SyntaxError) return SyntaxError;
-    if (value instanceof TypeError) return TypeError;
-    if (value instanceof URIError) return URIError;
-    return Error;
+    return errorConstructorByName(String(value.name));
 }
 
 function errorConstructorByName(name: string): new (message?: string) => Error {
@@ -259,23 +431,26 @@ function cloneError<TPort extends object, TPortClone extends object>(
 ): Error {
     if (seen.has(value)) {
         const cached = seen.get(value);
-        if (cached instanceof Error) return cached;
+        if (cached && engine.isError(cached)) return cached as Error;
     }
-    const out = new (errorConstructor(value))(value.message);
+    const messageDescriptor = Object.getOwnPropertyDescriptor(value, 'message');
+    const message = messageDescriptor && 'value' in messageDescriptor
+        ? String(messageDescriptor.value)
+        : undefined;
+    const Ctor = errorConstructor(value);
+    const out = messageDescriptor && 'value' in messageDescriptor ? new Ctor(message) : new Ctor();
     seen.set(value, out);
-    if (value.stack) {
-        Object.defineProperty(out, 'stack', {
-            value: value.stack,
-            writable: true,
-            enumerable: false,
-            configurable: true,
-        });
-    }
+    const stack = value.stack;
+    Object.defineProperty(out, 'stack', {
+        value: typeof stack === 'string' ? stack : undefined,
+        writable: true,
+        enumerable: false,
+        configurable: true,
+    });
     const cause = Object.getOwnPropertyDescriptor(value, 'cause');
-    if (cause) {
-        const causeValue = 'value' in cause ? cause.value : Reflect.get(value, 'cause');
+    if (cause && 'value' in cause) {
         Object.defineProperty(out, 'cause', {
-            value: cloneValue(causeValue, state, seen),
+            value: cloneValue(cause.value, state, seen),
             writable: true,
             enumerable: false,
             configurable: true,
@@ -296,53 +471,87 @@ function isPipeEncodedRegExp(value: unknown): value is CloneRecord {
     return !!value && typeof value === 'object' && (value as CloneRecord)[PIPE_REGEXP_TAG] === true;
 }
 
+function isPipeEncodedDataView(value: unknown): value is CloneRecord {
+    return !!value && typeof value === 'object' && (value as CloneRecord)[PIPE_DATAVIEW_TAG] === true;
+}
+
 function encodeForPipe(value: unknown, seen: Map<object, unknown>): unknown {
     if (!value || typeof value !== 'object') return value;
     if (seen.has(value)) return seen.get(value);
 
-    if (value instanceof Error) {
+    if (engine.isError(value)) {
+        const error = value as Error;
         const out: CloneRecord = {
             [PIPE_ERROR_TAG]: true,
-            name: value.name,
-            message: value.message,
+            name: error.name,
         };
         seen.set(value, out);
-        if (value.stack) out.stack = value.stack;
-        if (Object.prototype.hasOwnProperty.call(value, 'cause')) {
-            out.cause = encodeForPipe(Reflect.get(value, 'cause'), seen);
+        const message = Object.getOwnPropertyDescriptor(error, 'message');
+        if (message && 'value' in message) out.message = String(message.value);
+        const stack = error.stack;
+        out.stack = typeof stack === 'string' ? stack : undefined;
+        const cause = Object.getOwnPropertyDescriptor(error, 'cause');
+        if (cause && 'value' in cause) {
+            out.cause = encodeForPipe(cause.value, seen);
         }
         return out;
     }
 
-    if (value instanceof Date) {
-        const out = { [PIPE_DATE_TAG]: true, value: value.getTime() };
+    if (engine.isDate(value)) {
+        const out = { [PIPE_DATE_TAG]: true, value: Reflect.apply(dateGetTime, value, []) };
         seen.set(value, out);
         return out;
     }
-    if (value instanceof RegExp) {
-        const out = { [PIPE_REGEXP_TAG]: true, source: value.source, flags: value.flags };
+    if (engine.isRegExp(value)) {
+        const regexp = value as RegExp;
+        const out = { [PIPE_REGEXP_TAG]: true, source: regexpSource(regexp), flags: regexpFlags(regexp) };
         seen.set(value, out);
         return out;
     }
-    if (value instanceof ArrayBuffer || isSharedArrayBuffer(value)) {
+    if (engine.isArrayBuffer(value) || isSharedArrayBuffer(value)) {
         return value;
     }
-    if (ArrayBuffer.isView(value)) return value;
+    // A DataView IS an ArrayBufferView, so without this it fell through to the
+    // passthrough below and reached the native pipe serializer, which rejects it
+    // with "unsupported object class". Typed arrays survive that encoder; DataView
+    // does not, so it needs a tag the way Date and RegExp above do. Encoded as its
+    // backing buffer plus the window, since a bare ArrayBuffer crosses intact.
+    //
+    // Not cosmetic: when the receiving worker is not ready the payload is queued,
+    // so the throw surfaces later from _flushOutgoingQueue as an unhandled
+    // rejection no try/catch around postMessage can reach, and the loop wedges.
+    // Measured before this fix: cno rc=124 (killed on timeout) vs node rc=0.
+    if (engine.isDataView(value)) {
+        const view = value as DataView;
+        const out: CloneRecord = {
+            [PIPE_DATAVIEW_TAG]: true,
+            buffer: encodeForPipe(view.buffer, seen),
+            byteOffset: view.byteOffset,
+            byteLength: view.byteLength,
+        };
+        seen.set(value, out);
+        return out;
+    }
+    if (isArrayBufferView(value)) return value;
 
     seen.set(value, value);
-    if (value instanceof Map) {
-        const entries = Array.from(value.entries());
-        value.clear();
+    if (engine.isMap(value)) {
+        const map = value as Map<unknown, unknown>;
+        const entries: Array<[unknown, unknown]> = [];
+        Reflect.apply(mapForEach, map, [(item: unknown, key: unknown) => entries.push([key, item])]);
+        Reflect.apply(mapClear, map, []);
         for (const [key, item] of entries) {
-            value.set(encodeForPipe(key, seen), encodeForPipe(item, seen));
+            Reflect.apply(mapSet, map, [encodeForPipe(key, seen), encodeForPipe(item, seen)]);
         }
-        return value;
+        return map;
     }
-    if (value instanceof Set) {
-        const items = Array.from(value.values());
-        value.clear();
-        for (const item of items) value.add(encodeForPipe(item, seen));
-        return value;
+    if (engine.isSet(value)) {
+        const set = value as Set<unknown>;
+        const items: unknown[] = [];
+        Reflect.apply(setForEach, set, [(item: unknown) => items.push(item)]);
+        Reflect.apply(setClear, set, []);
+        for (const item of items) Reflect.apply(setAdd, set, [encodeForPipe(item, seen)]);
+        return set;
     }
     const record = value as CloneRecord;
     for (const key of Object.keys(value)) {
@@ -356,16 +565,17 @@ function decodeFromPipe(value: unknown, seen: Map<object, unknown>): unknown {
     if (seen.has(value)) return seen.get(value);
 
     if (isPipeEncodedError(value)) {
-        const out = new (errorConstructorByName(String(value.name)))(String(value.message ?? ''));
+        const Ctor = errorConstructorByName(String(value.name));
+        const out = Object.prototype.hasOwnProperty.call(value, 'message')
+            ? new Ctor(String(value.message))
+            : new Ctor();
         seen.set(value, out);
-        if (typeof value.stack === 'string') {
-            Object.defineProperty(out, 'stack', {
-                value: value.stack,
-                writable: true,
-                enumerable: false,
-                configurable: true,
-            });
-        }
+        Object.defineProperty(out, 'stack', {
+            value: typeof value.stack === 'string' ? value.stack : undefined,
+            writable: true,
+            enumerable: false,
+            configurable: true,
+        });
         if (Object.prototype.hasOwnProperty.call(value, 'cause')) {
             Object.defineProperty(out, 'cause', {
                 value: decodeFromPipe(value.cause, seen),
@@ -387,25 +597,37 @@ function decodeFromPipe(value: unknown, seen: Map<object, unknown>): unknown {
         seen.set(value, out);
         return out;
     }
-    if (value instanceof Date || value instanceof RegExp || value instanceof ArrayBuffer || isSharedArrayBuffer(value)) {
+    if (isPipeEncodedDataView(value)) {
+        // Routed through decodeFromPipe so two views over one buffer decode to two
+        // views over ONE buffer: ArrayBuffer returns identity, preserving sharing.
+        const buffer = decodeFromPipe(value.buffer, seen) as ArrayBuffer;
+        const out = new DataView(buffer, Number(value.byteOffset), Number(value.byteLength));
+        seen.set(value, out);
+        return out;
+    }
+    if (engine.isDate(value) || engine.isRegExp(value) || engine.isArrayBuffer(value) || isSharedArrayBuffer(value)) {
         return value;
     }
-    if (ArrayBuffer.isView(value)) return value;
+    if (isArrayBufferView(value)) return value;
 
     seen.set(value, value);
-    if (value instanceof Map) {
-        const entries = Array.from(value.entries());
-        value.clear();
+    if (engine.isMap(value)) {
+        const map = value as Map<unknown, unknown>;
+        const entries: Array<[unknown, unknown]> = [];
+        Reflect.apply(mapForEach, map, [(item: unknown, key: unknown) => entries.push([key, item])]);
+        Reflect.apply(mapClear, map, []);
         for (const [key, item] of entries) {
-            value.set(decodeFromPipe(key, seen), decodeFromPipe(item, seen));
+            Reflect.apply(mapSet, map, [decodeFromPipe(key, seen), decodeFromPipe(item, seen)]);
         }
-        return value;
+        return map;
     }
-    if (value instanceof Set) {
-        const items = Array.from(value.values());
-        value.clear();
-        for (const item of items) value.add(decodeFromPipe(item, seen));
-        return value;
+    if (engine.isSet(value)) {
+        const set = value as Set<unknown>;
+        const items: unknown[] = [];
+        Reflect.apply(setForEach, set, [(item: unknown) => items.push(item)]);
+        Reflect.apply(setClear, set, []);
+        for (const item of items) Reflect.apply(setAdd, set, [decodeFromPipe(item, seen)]);
+        return set;
     }
     const record = value as CloneRecord;
     for (const key of Object.keys(value)) {
@@ -424,6 +646,9 @@ function cloneValue<T, TPort extends object, TPortClone extends object>(
         throw dataCloneError(`${String(value)} could not be cloned.`);
     }
     if (typeof value !== 'object') return value;
+    if (engine.isProxy(value)) {
+        throw dataCloneError('Proxy objects cannot be cloned');
+    }
     if (state.hooks.isUncloneable?.(value)) {
         throw dataCloneError('Object cannot be cloned');
     }
@@ -432,40 +657,51 @@ function cloneValue<T, TPort extends object, TPortClone extends object>(
         if (!port) throw dataCloneError('Object cannot be cloned');
         return port;
     }
-    if (value instanceof ArrayBuffer) {
-        return cloneBuffer(value, state);
+    if (seen.has(value)) return seen.get(value);
+    if (engine.isArrayBuffer(value)) {
+        return cloneBuffer(value as unknown as ArrayBuffer, state);
     }
-    if (isSharedArrayBuffer(value)) return value;
-    if (ArrayBuffer.isView(value)) return cloneView(value, state, seen);
-    if (value instanceof Date) return new Date(value.getTime());
-    if (value instanceof RegExp) {
-        const out = new RegExp(value.source, value.flags);
+    if (isSharedArrayBuffer(value)) return cloneSharedBuffer(value, state);
+    if (isArrayBufferView(value)) return cloneView(value, state, seen);
+    if (engine.isDate(value)) {
+        const out = new Date(Reflect.apply(dateGetTime, value, []));
+        seen.set(value, out);
+        return out;
+    }
+    if (engine.isRegExp(value)) {
+        const regexp = value as unknown as RegExp;
+        const out = new RegExp(regexpSource(regexp), regexpFlags(regexp));
+        seen.set(value, out);
         return out;
     }
     if (isUnsupportedObject(value)) throw dataCloneError(`${String(value)} could not be cloned.`);
     const boxed = cloneBoxedPrimitive(value, state, seen);
     if (boxed) return boxed;
-    if (value instanceof Map) {
-        if (seen.has(value)) return seen.get(value);
+    if (engine.isMap(value)) {
         const out = new Map();
         seen.set(value, out);
-        for (const [key, item] of value) {
-            out.set(cloneValue(key, state, seen), cloneValue(item, state, seen));
-        }
+        Reflect.apply(mapForEach, value, [(item: unknown, key: unknown) => {
+            Reflect.apply(mapSet, out, [cloneValue(key, state, seen), cloneValue(item, state, seen)]);
+        }]);
         return out;
     }
-    if (value instanceof Set) {
-        if (seen.has(value)) return seen.get(value);
+    if (engine.isSet(value)) {
         const out = new Set();
         seen.set(value, out);
-        for (const item of value) out.add(cloneValue(item, state, seen));
+        Reflect.apply(setForEach, value, [(item: unknown) => {
+            Reflect.apply(setAdd, out, [cloneValue(item, state, seen)]);
+        }]);
         return out;
     }
-    if (value instanceof Error) {
-        return cloneError(value, state, seen);
+    if (engine.isError(value)) {
+        return cloneError(value as unknown as Error, state, seen);
     }
-    if (seen.has(value)) return seen.get(value);
-
+    const blob = cloneBlob(value);
+    if (blob) {
+        seen.set(value, blob);
+        return blob;
+    }
+    throwIfNonSerializable(value);
     const out = Array.isArray(value)
         ? new Array(value.length)
         : {};
@@ -505,4 +741,4 @@ export function decodeStructuredCloneFromPipe<T>(value: T): T {
     return decodeFromPipe(value, new Map()) as T;
 }
 
-export { dataCloneError };
+export { dataCloneError, errorConstructorByName };

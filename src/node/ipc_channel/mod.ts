@@ -217,8 +217,12 @@ export class IPCChannel extends EventEmitter {
     private _pipe: Pipe | null;
     private _decoder: MessageDecoder;
     private _connected: boolean = false;
-    /** False when the platform gave us a send-only endpoint (see _setupRead). */
+    /** False when startRead() failed, so no 'message'/'close' can ever arrive. */
     private _readable: boolean = true;
+    /** Why startRead() failed, kept for diagnosis instead of being swallowed. */
+    private _readError: unknown = undefined;
+    /** True once uv_read_start is armed. Never disarmed — see _armRead. */
+    private _readArmed = false;
     private _serialization: IPCSerialization;
     private _pendingWrites = 0;
     private _closeAfterWrites = false;
@@ -263,16 +267,46 @@ export class IPCChannel extends EventEmitter {
             this._decoder.feed(result);
         };
 
-        // Windows spawns the IPC pair with _pipe() (anonymous, unidirectional),
-        // so a child adopting its inherited endpoint gets a write-only handle
-        // and startRead() fails with ENOTCONN. Send-only is still a usable
-        // channel — stay connected instead of throwing out of the constructor.
+        this._connected = true;
+
+        // Arm the read only once something consumes read-driven events, and arm
+        // it as soon as that happens. On Windows the child's inherited IPC
+        // endpoint may be a *synchronous* pipe handle, and NT serialises all I/O
+        // on a synchronous file object: a pending read then blocks this process's
+        // own writes on the same handle until the peer happens to write first.
+        // A send-only endpoint (the `cno test` worker: send the result, close,
+        // exit) therefore deadlocked for ~30 s. Nothing is lost by arming late —
+        // unread bytes wait in the OS pipe buffer, and an unarmed handle does not
+        // hold the event loop open.
+        this.on('newListener', (event: unknown) => {
+            if (event === 'message' || event === 'internalMessage' || event === 'close') {
+                this._armRead();
+            }
+        });
+        for (const event of ['message', 'internalMessage', 'close'] as const) {
+            if (this.listenerCount(event) > 0) { this._armRead(); break; }
+        }
+    }
+
+    /**
+     * Start reading, once. Deliberately monotonic: stopRead()/startRead() around
+     * writes is not a fix — cancelling a pending synchronous read spins on
+     * CancelSynchronousIo and races the re-arm against the queued write.
+     */
+    private _armRead(): void {
+        if (this._readArmed || !this._pipe) return;
+        this._readArmed = true;
         try {
             this._pipe.startRead();
-        } catch {
+        } catch (e) {
+            // Not expected on a duplex IPC pipe: the old unidirectional
+            // anonymous _pipe() gave the child a write-only handle and
+            // startRead() failed ENOTCONN, but that transport is gone. Keep the
+            // channel usable for sending rather than throwing out of a listener
+            // registration, and record why reading is dead instead of hiding it.
             this._readable = false;
+            this._readError = e;
         }
-        this._connected = true;
     }
 
     /** Send a user message. Accepts any JSON-serializable value (Node-compatible). */
@@ -392,5 +426,10 @@ export class IPCChannel extends EventEmitter {
     /** False when the endpoint is send-only (no 'message'/'close' will arrive). */
     get readable(): boolean {
         return this._readable;
+    }
+
+    /** The startRead() failure that made this endpoint send-only, if any. */
+    get readError(): unknown {
+        return this._readError;
     }
 }

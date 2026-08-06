@@ -714,7 +714,12 @@ export const sqlite3 = {
     OPEN_NOFOLLOW,
 };
 
+/** node-sqlite3 returns its own module exports; mirror the CJS interop view. */
 export function verbose(): typeof sqlite3 {
+    try {
+        const mod = require('node:sqlite3');
+        if (mod && typeof mod === 'object' && 'Database' in mod) return mod as typeof sqlite3;
+    } catch { /* module still evaluating; fall back to the literal */ }
     return sqlite3;
 }
 

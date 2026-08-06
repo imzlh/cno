@@ -1,9 +1,13 @@
 import { EventEmitter } from '../events';
 import buffer from '../buffer';
+import { toErrnoException } from '../_internal/errno';
 import { pathToString, toNodeStat, type PathLike } from './utils';
 
-const fswatch = import.meta.use('fswatch');
-const fs = import.meta.use('fs');
+import { nsfs, nsasfs, nsfswatch } from './syspath';
+const fswatch = nsfswatch;
+const fs = nsfs;
+const asfs = nsasfs;
+const engine = import.meta.use('engine');
 const { Buffer } = buffer;
 
 type WatchEncoding = BufferEncoding | 'buffer';
@@ -133,15 +137,47 @@ export function watch(
         }, !!options.recursive);
         watcher.attach(nativeWatcher);
     } catch (err) {
-        watcher.emitError(err);
-        watcher.close();
+        // fswatch throws a numeric UV code; Node callers match on 'ENOENT'.
+        throw toErrnoException(err, 'watch', pathStr);
     }
 
     return watcher;
 }
 
-function readStat(pathStr: string): import('fs').Stats {
-    return toNodeStat(fs.stat(pathStr));
+// The sync C stat truncates timestamps to whole seconds, so a same-size rewrite
+// within one second looks unchanged. asyncfs keeps ms precision — bridge it.
+function readStat(pathStr: string, bigint = false): import('fs').Stats {
+    const pending = asfs.stat(pathStr);
+    // engine.waitIO rethrows synchronously but leaves the underlying promise
+    // unclaimed, so a missing path also printed an "unhandled promise
+    // rejection" banner on every poll tick. Claim it before waiting.
+    void pending.catch(() => { /* surfaced synchronously by waitIO */ });
+    return toNodeStat(engine.waitIO(pending), { bigint });
+}
+
+/**
+ * Node's watchFile polls a path that need not exist yet: the first callback for
+ * a missing file reports an all-zero Stats and a later create fires a change.
+ * Throwing ENOENT out of watchFile instead escaped as an unhandled rejection
+ * from engine.waitIO and killed the process.
+ */
+function readStatOrZero(pathStr: string, bigint: boolean): import('fs').Stats {
+    try {
+        return readStat(pathStr, bigint);
+    } catch {
+        return zeroStat(bigint);
+    }
+}
+
+function zeroStat(bigint: boolean): import('fs').Stats {
+    // Stats/BigIntStats default every field to 0 and every date to epoch when the
+    // native stat is absent, which is exactly Node's "file does not exist" Stats.
+    return toNodeStat(undefined as unknown as Parameters<typeof toNodeStat>[0], { bigint });
+}
+
+function statsEqual(a: import('fs').Stats, b: import('fs').Stats): boolean {
+    return a.mtimeMs === b.mtimeMs && a.size === b.size && a.mode === b.mode
+        && a.ino === b.ino && a.nlink === b.nlink;
 }
 
 export function watchFile(
@@ -161,20 +197,12 @@ export function watchFile(
     }
 
     const listeners = new Set<WatchFileListener>([cb]);
-    let prev = readStat(pathStr);
+    const bigint = options.bigint === true;
+    let prev = readStatOrZero(pathStr, bigint);
     const interval = Math.max(1, options.interval ?? 5007);
     const timer = setInterval(() => {
-        let curr: import('fs').Stats;
-        try {
-            curr = readStat(pathStr);
-        } catch {
-            return;
-        }
-        if (
-            curr.mtimeMs !== prev.mtimeMs ||
-            curr.size !== prev.size ||
-            curr.mode !== prev.mode
-        ) {
+        const curr = readStatOrZero(pathStr, bigint);
+        if (!statsEqual(curr, prev)) {
             const old = prev;
             prev = curr;
             for (const fn of listeners) fn(curr, old);

@@ -43,6 +43,92 @@ function isReturnOnExit(error: unknown): boolean {
     return typeof info.message === 'string' && info.message.includes('exit');
 }
 
+/* WASI errnos used by the path-resolution guard. */
+const WASI_EBADF = 8;
+const WASI_ENOENT = 44;
+const WASI_ENOTCAPABLE = 76;
+
+/* The first directory file descriptor handed to a WASI guest. 0/1/2 are stdio. */
+const FIRST_PREOPEN_FD = 3;
+
+function isAbsolutePath(p: string): boolean {
+    /* POSIX root, Windows drive letter, and UNC/backslash-root forms. */
+    return p.startsWith('/')
+        || p.startsWith('\\')
+        || /^[A-Za-z]:[\\/]/.test(p);
+}
+
+/*
+ * Resolve a guest-supplied path against a preopened host directory, rejecting
+ * anything that leaves that directory. WASI capability semantics say a guest
+ * may only name paths reachable from a directory fd it was granted, so an
+ * absolute path or a ".." that climbs above the root must be refused rather
+ * than passed to the host fs.
+ *
+ * Returns the host path to use, or a WASI errno on refusal.
+ */
+function resolveWithinRoot(root: string, guestPath: string): { path: string } | { errno: number } {
+    if (isAbsolutePath(guestPath)) {
+        return { errno: WASI_ENOTCAPABLE };
+    }
+    /* Walk the components, tracking depth, so ".." can never escape the root. */
+    const segments = guestPath.split(/[\\/]+/);
+    const stack: string[] = [];
+    for (const seg of segments) {
+        if (seg === '' || seg === '.') continue;
+        if (seg === '..') {
+            if (stack.length === 0) {
+                return { errno: WASI_ENOTCAPABLE };
+            }
+            stack.pop();
+            continue;
+        }
+        /* A NUL byte would truncate the path inside the host C layer. */
+        if (seg.includes('\0')) {
+            return { errno: WASI_ENOENT };
+        }
+        stack.push(seg);
+    }
+    const suffix = stack.join('/');
+    const base = root.replace(/[\\/]+$/, '');
+    return { path: suffix ? `${base}/${suffix}` : base };
+}
+
+/*
+ * Canonicalise `p`, falling back to the deepest ancestor that exists so a path
+ * being created (O_CREAT) can still be checked. Returns null if nothing on the
+ * chain resolves. The unresolved tail is returned separately because it has
+ * already been validated as plain segments by resolveWithinRoot.
+ */
+function canonicalisePrefix(p: string): string | null {
+    let candidate = p.replace(/[\\/]+$/, '');
+    for (let i = 0; i < 64; i++) {
+        try {
+            const real = syncfs.realpath(candidate);
+            if (typeof real === 'string' && real.length > 0) return real;
+        } catch { /* try the parent */ }
+        const cut = Math.max(candidate.lastIndexOf('/'), candidate.lastIndexOf('\\'));
+        if (cut <= 0) return null;
+        candidate = candidate.slice(0, cut);
+    }
+    return null;
+}
+
+function normaliseForCompare(p: string): string {
+    /* Windows paths are case-insensitive and mix separators. */
+    return p.replace(/[\\/]+/g, '/').replace(/\/+$/, '').toLowerCase();
+}
+
+/*
+ * True when `child` is the root itself or lies beneath it. Compares whole path
+ * segments so a sibling like "/jail-evil" is not accepted as being under "/jail".
+ */
+function isContainedIn(root: string, child: string): boolean {
+    const r = normaliseForCompare(root);
+    const c = normaliseForCompare(child);
+    return c === r || c.startsWith(r + '/');
+}
+
 export class WASI {
     private _args: string[];
     private _env: Record<string, string>;
@@ -55,6 +141,8 @@ export class WASI {
     private _memory: DataView | null = null;
     private _memBuf: ArrayBuffer | SharedArrayBuffer | null = null;
     private _started = false;
+    /* dirfd -> { guest mount name, host directory }. Populated from _preopens. */
+    private _preopenFds = new Map<number, { guestName: string; hostPath: string }>();
     public wasiImport: Record<string, WasiBinding>;
 
     private _bindMemory(instance: WebAssembly.Instance): void {
@@ -137,6 +225,16 @@ export class WASI {
         this._args = options?.args ?? [];
         this._env = options?.env ?? {};
         this._preopens = options?.preopens ?? {};
+        /* Assign a directory fd to each preopen, in declaration order, starting
+         * at 3. path_open/path_filestat_get resolve a guest dirfd through this
+         * table, so a fd that is not here has no filesystem capability at all. */
+        {
+            let fd = FIRST_PREOPEN_FD;
+            for (const guestName of Object.keys(this._preopens)) {
+                this._preopenFds.set(fd, { guestName, hostPath: this._preopens[guestName] });
+                fd++;
+            }
+        }
         this._returnOnExit = options?.returnOnExit ?? false;
         this._stdin = options?.stdin ?? os.STDIN_FILENO;
         this._stdout = options?.stdout ?? os.STDOUT_FILENO;
@@ -322,23 +420,27 @@ export class WASI {
             this._memoryView().setBigUint64(timePtr, now, true);
             return 0;
         };
-        bindings.path_open = (_dirfd: number, _dirflags: number, pathPtr: number, pathLen: number, oflags: number, _fsRightsBase: number, _fsRightsInheriting: number, fdflags: number, fdPtr: number): number => {
+        bindings.path_open = (dirfd: number, _dirflags: number, pathPtr: number, pathLen: number, oflags: number, _fsRightsBase: number, _fsRightsInheriting: number, fdflags: number, fdPtr: number): number => {
             try {
-                const relPath = this._str(pathPtr, pathLen);
+                const guestPath = this._str(pathPtr, pathLen);
+                const resolved = this._resolvePreopenPath(dirfd, guestPath);
+                if ('errno' in resolved) return resolved.errno;
                 let flag = syncfs.OPEN_RDONLY;
                 if (oflags & 1) flag = syncfs.OPEN_WRONLY | syncfs.OPEN_CREAT; // CREATE
                 if (oflags & 4) flag |= syncfs.OPEN_EXCL; // EXCLUSIVE
                 if (oflags & 8) flag |= syncfs.OPEN_TRUNC; // TRUNCATE
                 if (fdflags & 1) flag = syncfs.OPEN_APPEND | syncfs.OPEN_CREAT; // APPEND
-                const fd = syncfs.open(relPath, flag);
+                const fd = syncfs.open(resolved.path, flag);
                 this._wu32(fdPtr, fd);
                 return 0;
-            } catch { return 44; }
+            } catch { return WASI_ENOENT; }
         };
-        bindings.path_filestat_get = (_dirfd: number, _flags: number, pathPtr: number, pathLen: number, statPtr: number): number => {
+        bindings.path_filestat_get = (dirfd: number, _flags: number, pathPtr: number, pathLen: number, statPtr: number): number => {
             try {
-                const relPath = this._str(pathPtr, pathLen);
-                const st = syncfs.stat(relPath);
+                const guestPath = this._str(pathPtr, pathLen);
+                const resolved = this._resolvePreopenPath(dirfd, guestPath);
+                if ('errno' in resolved) return resolved.errno;
+                const st = syncfs.stat(resolved.path);
                 const memory = this._memoryView();
                 memory.setBigUint64(statPtr, BigInt(st.dev), true);
                 memory.setBigUint64(statPtr + 8, BigInt(st.ino), true);
@@ -349,9 +451,64 @@ export class WASI {
                 memory.setBigUint64(statPtr + 48, BigInt(st.mtim.getTime()) * 1000000n, true);
                 memory.setBigUint64(statPtr + 56, BigInt(st.ctim.getTime()) * 1000000n, true);
                 return 0;
-            } catch { return 44; }
+            } catch { return WASI_ENOENT; }
+        };
+
+        /* Advertise the preopens so guest runtimes can discover their roots. */
+        bindings.fd_prestat_get = (fd: number, prestatPtr: number): number => {
+            const entry = this._preopenFds.get(fd);
+            if (!entry) return WASI_EBADF;
+            /* prestat: u8 tag (0 = dir) + u32 name length, at offset 4 for alignment. */
+            this._memoryView().setUint8(prestatPtr, 0);
+            this._wu32(prestatPtr + 4, this._utf8len(entry.guestName));
+            return 0;
+        };
+        bindings.fd_prestat_dir_name = (fd: number, pathPtr: number, pathLen: number): number => {
+            const entry = this._preopenFds.get(fd);
+            if (!entry) return WASI_EBADF;
+            const bytes = new TextEncoder().encode(entry.guestName);
+            if (bytes.length > pathLen) return WASI_ENOTCAPABLE;
+            this._bytes(pathPtr, bytes.length).set(bytes);
+            return 0;
         };
 
         return bindings;
+    }
+
+    private _utf8len(s: string): number {
+        return new TextEncoder().encode(s).length;
+    }
+
+    /*
+     * Map a guest (dirfd, path) pair onto a host path, or refuse.
+     * A dirfd that was never granted yields EBADF; a path that escapes its
+     * preopen yields ENOTCAPABLE. This is the WASI capability boundary --
+     * without it a guest can name any file on the host.
+     */
+    private _resolvePreopenPath(dirfd: number, guestPath: string): { path: string } | { errno: number } {
+        const entry = this._preopenFds.get(dirfd);
+        if (!entry) return { errno: WASI_EBADF };
+        const lexical = resolveWithinRoot(entry.hostPath, guestPath);
+        if ('errno' in lexical) return lexical;
+
+        /*
+         * The lexical check above cannot see symlinks or directory junctions: a
+         * link sitting inside the preopen names no ".." and is not absolute, yet
+         * resolves to an arbitrary host location. Canonicalise both sides and
+         * re-check containment so the link target -- not the link path -- decides.
+         *
+         * Note this does NOT contain hard links. A hard link is not a reference
+         * to another path but a second name for the same file, so it canonicalises
+         * to itself inside the preopen and no path-based check can detect it.
+         * Granting a directory that contains attacker-planted hard links is
+         * outside what preopen confinement can express.
+         */
+        const rootReal = canonicalisePrefix(entry.hostPath);
+        if (rootReal === null) return { errno: WASI_ENOENT };
+        const targetReal = canonicalisePrefix(lexical.path);
+        if (targetReal === null) return { errno: WASI_ENOENT };
+        if (!isContainedIn(rootReal, targetReal)) return { errno: WASI_ENOTCAPABLE };
+
+        return lexical;
     }
 }

@@ -6,6 +6,9 @@ type DomainEmitter = EventEmitter & { domain?: Domain | null };
 // Active domain stack (Node: enter pushes, exit pops this domain and above).
 const stack: Domain[] = [];
 
+/** Node exposes the live stack as `domain._stack`. */
+export const _stack = stack;
+
 export let active: Domain | null = null;
 
 function setActive(domain: Domain | null): void {
@@ -62,24 +65,28 @@ export class Domain extends EventEmitter {
         if (emitter.domain === this) emitter.domain = null;
     }
 
-    run<T>(fn: (...args: unknown[]) => T, ...args: unknown[]): T | undefined {
+    /**
+     * Node does NOT catch here: a sync throw propagates to the caller and its
+     * uncaughtException handler re-enters the domain. cno has no domain-aware
+     * uncaught handler, so we match Node's propagation but still exit in
+     * `finally` — leaving the domain entered (as Node does) would strand
+     * `domain.active` for all later code.
+     */
+    run<T>(fn: (...args: unknown[]) => T, ...args: unknown[]): T {
         this.enter();
         try {
             return fn(...args);
-        } catch (error) {
-            this.emit('error', error);
-            return undefined;
         } finally {
             this.exit();
         }
     }
 
-    bind<T extends AnyFn>(callback: T): (...args: Parameters<T>) => ReturnType<T> | undefined {
+    bind<T extends AnyFn>(callback: T): (...args: Parameters<T>) => ReturnType<T> {
         if (typeof callback !== 'function') {
             throw new TypeError('The "callback" argument must be of type function');
         }
         const domain = this;
-        return function bound(this: unknown, ...args: Parameters<T>): ReturnType<T> | undefined {
+        return function bound(this: unknown, ...args: Parameters<T>): ReturnType<T> {
             return domain.run(() => callback.apply(this, args) as ReturnType<T>);
         };
     }

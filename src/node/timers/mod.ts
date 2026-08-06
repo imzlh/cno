@@ -8,6 +8,9 @@ const timer = import.meta.use('timers');
 
 type TimerCallback = (...args: unknown[]) => void;
 
+// Node clamps every timer delay into [1, 2^31-1] and warns outside that range.
+const TIMEOUT_MAX = 2 ** 31 - 1;
+
 function createAbortError(reason?: unknown): Error & { name: string; code: string; cause?: unknown } {
     const error: Error & { name: string; code: string; cause?: unknown } = Object.assign(new Error('The operation was aborted'), {
         name: 'AbortError',
@@ -17,21 +20,59 @@ function createAbortError(reason?: unknown): Error & { name: string; code: strin
     return error;
 }
 
-function assertTimerCallback(callback: unknown): asserts callback is TimerCallback {
-    if (typeof callback !== 'function') {
-        throw new TypeError('The "callback" argument must be of type function');
+function describeReceived(value: unknown): string {
+    if (value === null) return 'null';
+    if (value === undefined) return 'undefined';
+    const type = typeof value;
+    if (type === 'object' || type === 'function') {
+        const name = Reflect.get(Object(value), 'constructor');
+        const ctorName = typeof name === 'function' ? name.name : undefined;
+        return `an instance of ${ctorName || 'Object'}`;
     }
+    if (type === 'string') return `type string ('${String(value)}')`;
+    if (type === 'bigint') return `type bigint (${String(value)}n)`;
+    return `type ${type} (${String(value)})`;
+}
+
+function invalidArgType(name: string, expected: string, value: unknown): TypeError & { code: string } {
+    return Object.assign(
+        new TypeError(`The "${name}" argument must be of type ${expected}. Received ${describeReceived(value)}`),
+        { code: 'ERR_INVALID_ARG_TYPE' },
+    );
+}
+
+function emitTimerWarning(message: string, name: string): void {
+    const proc = Reflect.get(globalThis, 'process');
+    const emit = proc === null || proc === undefined ? undefined : Reflect.get(Object(proc), 'emitWarning');
+    if (typeof emit === 'function') emit.call(proc, message, name);
+}
+
+// Mirrors Node's Timeout duration validation: clamp to 1 and warn on bad input.
+function normalizeDelay(msecs: unknown): number {
+    if (msecs === undefined) return 1;
+    const after = Number(msecs);
+    if (after >= 1 && after <= TIMEOUT_MAX) return after;
+    if (after > TIMEOUT_MAX) {
+        emitTimerWarning(`${after} does not fit into a 32-bit signed integer.\nTimeout duration was set to 1.`, 'TimeoutOverflowWarning');
+    } else if (after < 0) {
+        emitTimerWarning(`${after} is a negative number.\nTimeout duration was set to 1.`, 'TimeoutNegativeWarning');
+    } else if (Number.isNaN(after)) {
+        emitTimerWarning(`${after} is not a number.\nTimeout duration was set to 1.`, 'TimeoutNaNWarning');
+    }
+    return 1;
+}
+
+function assertTimerCallback(callback: unknown): asserts callback is TimerCallback {
+    if (typeof callback !== 'function') throw invalidArgType('callback', 'function', callback);
 }
 
 function assertPromiseDelay(delay: unknown): asserts delay is number | undefined {
-    if (delay !== undefined && typeof delay !== 'number') {
-        throw new TypeError('The "delay" argument must be of type number');
-    }
+    if (delay !== undefined && typeof delay !== 'number') throw invalidArgType('delay', 'number', delay);
 }
 
 function assertTimerOptions(options: unknown): asserts options is TimerOptions | undefined {
     if (options !== undefined && (typeof options !== 'object' || options === null)) {
-        throw new TypeError('The "options" argument must be of type object');
+        throw invalidArgType('options', 'object', options);
     }
 }
 
@@ -59,19 +100,38 @@ class Timeout implements NodeJS.Timeout {
     #cleared = false;
     #active = false;
     #refed = true;
+    #generation = 0;
+
+    // Node-visible internals relied on by ecosystem code.
+    _idleTimeout: number;
+    _repeat: number | null;
+    _destroyed = false;
 
     constructor(isInterval: boolean, fn: TimerCallback, ms: number, args: unknown[] = []) {
         this.#isInterval = isInterval;
         this.#fn = fn;
         this.#ms = ms;
         this.#args = args;
+        this._idleTimeout = ms;
+        this._repeat = isInterval ? ms : null;
         this.#schedule();
     }
 
     #schedule(): void {
+        // Node marks a one-shot destroyed only once its callback RETURNS, and
+        // leaves it live if the callback re-armed it via refresh(). Bumping a
+        // generation on every (re)schedule lets the finally block tell those
+        // two cases apart. Measured against Node v24.18.0.
+        const generation = ++this.#generation;
         const callback = () => {
             if (!this.#isInterval) this.#active = false;
-            this.#fn.apply(this, this.#args);
+            try {
+                this.#fn.apply(this, this.#args);
+            } finally {
+                if (!this.#isInterval && this.#generation === generation) {
+                    this._destroyed = true;
+                }
+            }
         };
         this.#id = this.#isInterval
             ? timer.setInterval(callback, this.#ms)
@@ -102,6 +162,8 @@ class Timeout implements NodeJS.Timeout {
             const clearFn = this.#isInterval ? timer.clearInterval : timer.clearTimeout;
             clearFn(this.#id);
         }
+        this._idleTimeout = this.#ms;
+        this._destroyed = false;
         this.#schedule();
         return this;
     }
@@ -113,6 +175,8 @@ class Timeout implements NodeJS.Timeout {
             this.#active = false;
         }
         this.#cleared = true;
+        this._destroyed = true;
+        this._idleTimeout = -1;
         return this;
     }
 
@@ -140,11 +204,14 @@ class Immediate implements NodeJS.Immediate {
     #active = true;
     #refed = true;
 
+    _destroyed = false;
+
     constructor(private handle: TimerCallback, args: unknown[] = []) {
         this.#id = timer.setTimeout(() => {
             if (!this.#active) return;
             this.#active = false;
             this.#refed = false;
+            this._destroyed = true;
             handle.apply(this, args);
         }, 0);
     }
@@ -175,26 +242,50 @@ class Immediate implements NodeJS.Immediate {
         if (this.#active) timer.clearTimeout(this.#id);
         this.#active = false;
         this.#refed = false;
+        this._destroyed = true;
         return this;
+    }
+
+    // globalThis.clearImmediate (webapi/basic.ts) can only reach a handle through
+    // Number(handle); without valueOf that is NaN and the clear silently no-ops.
+    valueOf(): number {
+        return Number(this.#id);
     }
 
     get _onImmediate(): TimerCallback {
         return this.handle;
     }
+
+    get __cno_timer_id(): number {
+        return Number(this.#id);
+    }
+}
+
+// The global setImmediate returns webapi/basic.ts's own Immediate class, so a
+// cross-boundary clearImmediate has to recognise foreign handles too. Both
+// classes share the native timer registry, so cancelling by id is sufficient.
+function clearForeignImmediate(handle: object): boolean {
+    if (!('_onImmediate' in handle)) return false;
+    const close = Reflect.get(handle, 'close');
+    if (typeof close === 'function') {
+        close.call(handle);
+        return true;
+    }
+    const id = Number(handle);
+    if (!Number.isNaN(id) && id !== 0) timer.clearTimeout(id);
+    return true;
 }
 
 // Timer functions
 
 export function setTimeout<T>(callback: (...args: T[]) => void, ms?: number, ...args: T[]): NodeJS.Timeout {
     assertTimerCallback(callback);
-    const delay = ms ?? 1;
-    return new Timeout(false, callback, delay, args);
+    return new Timeout(false, callback, normalizeDelay(ms), args);
 }
 
 export function setInterval<T>(callback: (...args: T[]) => void, ms?: number, ...args: T[]): NodeJS.Timeout {
     assertTimerCallback(callback);
-    const delay = ms ?? 1;
-    return new Timeout(true, callback, delay, args);
+    return new Timeout(true, callback, normalizeDelay(ms), args);
 }
 
 export function setImmediate<T>(callback: (...args: T[]) => void, ...args: T[]): NodeJS.Immediate {
@@ -221,7 +312,12 @@ export function clearInterval(timeout: NodeJS.Timeout | string | number | undefi
 }
 
 export function clearImmediate(immediate: NodeJS.Immediate | undefined): void {
-    if (immediate) immediate[Symbol.dispose]();
+    if (immediate instanceof Immediate) {
+        immediate[Symbol.dispose]();
+        return;
+    }
+    // Foreign (global) Immediate handles must clear too; bare ids/objects stay no-ops.
+    if (typeof immediate === 'object' && immediate !== null) clearForeignImmediate(immediate);
 }
 
 // promises namespace
@@ -241,7 +337,7 @@ export const promises = {
             const id = timer.setTimeout(() => {
                 cleanup();
                 resolve(value as T);
-            }, delay ?? 1);
+            }, normalizeDelay(delay));
             if (options?.ref === false) timer.unrefTimer(id);
         });
     },
@@ -250,28 +346,48 @@ export const promises = {
         assertPromiseDelay(delay);
         assertTimerOptions(options);
         const signal = options?.signal;
+        const ms = normalizeDelay(delay);
+        let finished = false;
+        let pendingId: number | undefined;
+
+        // return()/throw() must cancel the pending tick so the loop can drain.
+        const stop = () => {
+            finished = true;
+            if (pendingId !== undefined) {
+                timer.clearTimeout(pendingId);
+                pendingId = undefined;
+            }
+        };
 
         return {
             [Symbol.asyncIterator]() { return this; },
             async next(): Promise<IteratorResult<T>> {
-                if (signal?.aborted) return Promise.reject(createAbortError(signal.reason));
+                if (finished) return { done: true, value: undefined };
+                if (signal?.aborted) { stop(); throw createAbortError(signal.reason); }
 
                 await new Promise<void>((resolve, reject) => {
-                    const onAbort = () => { cleanup(); timer.clearTimeout(id); reject(createAbortError(signal?.reason)); };
                     const cleanup = () => { signal?.removeEventListener('abort', onAbort); };
+                    const onAbort = () => { cleanup(); stop(); reject(createAbortError(signal?.reason)); };
                     signal?.addEventListener('abort', onAbort, { once: true });
 
-                    const id = timer.setTimeout(() => {
+                    pendingId = timer.setTimeout(() => {
+                        pendingId = undefined;
                         cleanup();
                         resolve();
-                    }, delay ?? 1);
-                    if (options?.ref === false) timer.unrefTimer(id);
+                    }, ms);
+                    if (options?.ref === false) timer.unrefTimer(pendingId);
                 });
 
+                if (finished) return { done: true, value: undefined };
                 return { done: false, value: value as T };
             },
             async return(): Promise<IteratorResult<T>> {
+                stop();
                 return { done: true, value: undefined };
+            },
+            async throw(err?: unknown): Promise<IteratorResult<T>> {
+                stop();
+                throw err;
             },
         };
     },
@@ -309,7 +425,7 @@ export const promises = {
                 const id = timer.setTimeout(() => {
                     cleanup();
                     resolve();
-                }, delay);
+                }, normalizeDelay(delay));
                 if (Reflect.get(options ?? {}, 'ref') === false) timer.unrefTimer(id);
             });
         },

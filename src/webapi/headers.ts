@@ -61,8 +61,16 @@ function isHeadersLike(value: unknown): value is HeadersLike {
         && typeof Reflect.get(value, 'forEach') === 'function';
 }
 
+export type HeadersGuard = 'none' | 'immutable' | 'request' | 'response';
+
 export class Headers implements globalThis.Headers {
     #map = new Map<string, string[]>();
+    #guard: HeadersGuard = 'none';
+
+    /** `immutable` makes every mutation throw, as the spec requires. */
+    static setGuard(headers: Headers, guard: HeadersGuard): void {
+        headers.#guard = guard;
+    }
 
     constructor(init?: HeadersInit | HeaderRecord | Array<HeaderPair> | Headers) {
         if (init === undefined) return;
@@ -92,10 +100,16 @@ export class Headers implements globalThis.Headers {
         throw new TypeError('Invalid Headers init');
     }
 
+    // Validation of name/value happens before the guard check, matching the spec order.
+    #checkMutable(): void {
+        if (this.#guard === 'immutable') throw new TypeError('immutable');
+    }
+
     append(name: string, value: string): void {
         if (arguments.length < 2) throw new TypeError('Headers.append requires 2 arguments');
         const key = normalizeHeaderName(name);
         const next = normalizeHeaderValue(value);
+        this.#checkMutable();
         const values = this.#map.get(key);
         if (key === 'set-cookie') {
             if (values) values.push(next);
@@ -109,7 +123,10 @@ export class Headers implements globalThis.Headers {
 
     set(name: string, value: string): void {
         if (arguments.length < 2) throw new TypeError('Headers.set requires 2 arguments');
-        this.#map.set(normalizeHeaderName(name), [normalizeHeaderValue(value)]);
+        const key = normalizeHeaderName(name);
+        const next = normalizeHeaderValue(value);
+        this.#checkMutable();
+        this.#map.set(key, [next]);
     }
 
     get(name: string): string | null {
@@ -125,7 +142,9 @@ export class Headers implements globalThis.Headers {
 
     delete(name: string): void {
         if (arguments.length < 1) throw new TypeError('Headers.delete requires 1 argument');
-        this.#map.delete(normalizeHeaderName(name));
+        const key = normalizeHeaderName(name);
+        this.#checkMutable();
+        this.#map.delete(key);
     }
 
     forEach<ThisArg = this>(

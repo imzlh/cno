@@ -91,7 +91,7 @@ export class FsFile implements Deno.FsFile {
                         : await $handle.read(buf, this.fpointer);
                     if (n === null || n === 0) {
                         controller.close();
-                        this.close();
+                        this.$closeQuiet();
                         return;
                     }
                     controller.enqueue(buf.slice(0, n));
@@ -100,7 +100,7 @@ export class FsFile implements Deno.FsFile {
                     controller.error(wrapFSErr(e));
                 }
             },
-            cancel: () => this.close(),
+            cancel: () => this.$closeQuiet(),
             type: "bytes"
         });
         this.writable = new WritableStream<Uint8Array<ArrayBuffer>>({
@@ -120,8 +120,8 @@ export class FsFile implements Deno.FsFile {
                     control.error(e);
                 }
             },
-            close: () => this.close(),
-            abort: () => this.close(),
+            close: () => this.$closeQuiet(),
+            abort: () => this.$closeQuiet(),
         });
     }
 
@@ -208,7 +208,21 @@ export class FsFile implements Deno.FsFile {
         if (p.byteLength === 0) return 0;
         this.assertOpen();
         const fno = this.$handle.fileno();
-        const n = this.$tty ? this.readTtySync(p) : fs.pread(fno, p, this.fpointer);
+        let n: number | null;
+        if (this.$tty) {
+            n = this.readTtySync(p);
+        } else {
+            try {
+                n = fs.pread(fno, p, this.fpointer);
+            } catch (e) {
+                // Windows reports read-past-EOF as ERROR_HANDLE_EOF, which the
+                // native layer surfaces as UV_ENOENT. A live fd cannot really be
+                // ENOENT, so treat it as EOF: async read() and real Deno both
+                // return null here instead of throwing NotFound.
+                if (!hasErrno(e, error.errno.ENOENT)) throw e;
+                return null;
+            }
+        }
         if (n === null || n === 0) return null;
         this.fpointer += n;
         return n;
@@ -342,7 +356,14 @@ export class FsFile implements Deno.FsFile {
     }
 
     close(): void {
-        if (this.$closed) return;
+        // Real Deno throws BadResource when close() is called on an
+        // already-closed file. Returning silently also risks closing an
+        // unrelated file if the fd number has since been recycled.
+        if (this.$closed) throw new errors.BadResource('File closed');
+        this.$closeHandles();
+    }
+
+    private $closeHandles(): void {
         this.$closed = true;
         try {
             this.$tty?.close();
@@ -351,8 +372,16 @@ export class FsFile implements Deno.FsFile {
         }
     }
 
+    /** Idempotent close for internal teardown (stream cancel/close/abort, EOF). */
+    private $closeQuiet(): void {
+        if (this.$closed) return;
+        this.$closeHandles();
+    }
+
     [Symbol.dispose]() {
-        this.close();
+        // Dispose stays idempotent: `using f = ...` plus an explicit
+        // close() inside the block must not throw (verified against Deno).
+        this.$closeQuiet();
     }
 }
 

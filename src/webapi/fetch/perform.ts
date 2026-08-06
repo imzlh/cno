@@ -591,9 +591,47 @@ export async function performFetch(request: Request, url: URL): Promise<Response
     }
 }
 
+/**
+ * Attach an `init.client` (Deno.HttpClient) to the request so performFetch applies
+ * its proxy/CA/mTLS settings.
+ *
+ * The option used to be dropped on the floor: `Request` does not retain unknown
+ * init keys, and nothing in the tree ever called `setRequestClient`, so every
+ * caller that configured a proxy, pinned a CA or supplied a client certificate got
+ * a default connection and no indication that it had happened. Silently ignoring a
+ * security-relevant option is the defect, so a non-HttpClient value is rejected
+ * rather than ignored.
+ *
+ * Measured against Deno 2.9.3: `fetch(url, { client: {} })` rejects with
+ * `TypeError: Failed to construct 'Request': Argument 2 \`client\` must be a
+ * Deno.HttpClient` — duck-typed objects are refused too — while `null` and
+ * `undefined` mean "no client". A client attached to a Request also survives
+ * `fetch(new Request(rq))`, which the carry-over below preserves.
+ */
+async function attachRequestClient(request: Request, init: RequestInit | undefined, input: unknown): Promise<void> {
+    const client = (init as { client?: unknown } | undefined)?.client;
+    // Import only when a client is actually in play: the common path must not pay
+    // for loading the Deno http module on every fetch.
+    if ((client === undefined || client === null) && !(input instanceof Request)) return;
+    const http = await import('../../deno/07_http');
+    if (client === undefined || client === null) {
+        // Carry a client forward off an input Request, matching Deno.
+        if (input instanceof Request) {
+            const inherited = http.getRequestClient(input);
+            if (inherited) http.setRequestClient(request, inherited);
+        }
+        return;
+    }
+    if (!(client instanceof http.HttpClient)) {
+        throw new TypeError("Failed to construct 'Request': Argument 2 `client` must be a Deno.HttpClient");
+    }
+    http.setRequestClient(request, client);
+}
+
 export async function fetchAsync(input: unknown, init?: RequestInit, initiatorCallFrames?: NetworkCallFrame[]): Promise<Response> {
     if (input instanceof URL) input = input.href;
     const request = new Request(toRequestInput(input), init);
+    await attachRequestClient(request, init, input);
     request.setInitiatorCallFrames(initiatorCallFrames);
     throwIfAborted(request.signal);
     const url = new URL(request.url);

@@ -1,10 +1,12 @@
-import { matchesErrnoCode, normalizeErrnoError, wrapPromise, wrapSync } from '../_internal/errno';
+import { matchesErrnoCode, normalizeErrnoError, wrapPromise } from '../_internal/errno';
+import { wrapSync } from './errno-fix';
 import path from '../path';
 import { assertCopyFileMode, mkdirRecursive, mkdirRecursiveSync } from './utils';
 
 const { dirname, isAbsolute, join, parse, relative, resolve } = path;
-const fs = import.meta.use('fs');
-const asfs = import.meta.use('asyncfs');
+import { nsfs, nsasfs } from './syspath';
+const fs = nsfs;
+const asfs = nsasfs;
 
 interface CopyOptionsBase {
     dereference?: boolean;

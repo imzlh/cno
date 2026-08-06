@@ -59,6 +59,16 @@ export function readableFromWeb(webStream: ReadableStream, options?: { encoding?
         highWaterMark: options?.highWaterMark,
         objectMode: options?.objectMode,
         read,
+        // Destroying the Node stream must release the underlying web source,
+        // otherwise the ReadableStream stays locked and its producer leaks.
+        destroy(error: Error | null, callback: (error?: Error | null) => void) {
+            const finish = () => callback(error);
+            try {
+                reader.cancel(error ?? undefined).then(finish, finish);
+            } catch {
+                finish();
+            }
+        },
     });
 
     return readable;
@@ -137,25 +147,77 @@ export function writableFromWeb(webStream: WritableStream, options?: { decodeStr
 
 export function writableToWeb(writable: Writable): WritableStream {
     const WS = getGlobal('WritableStream') as typeof WritableStream;
+
+    // The web stream owns this writable now, and its errors are reported through
+    // the writer's promises. Node emits 'error' asynchronously, so without a
+    // permanent sink the error would land after the per-write listener is gone
+    // and crash the process as an unhandled 'error' event.
+    writable.on('error', () => {});
+
+    // Rejects as soon as the Node writable errors or closes early, so a web
+    // writer never waits on a stream that can no longer make progress.
+    const guard = <T>(body: (resolve: () => void, reject: (err: Error) => void) => void): Promise<T | void> =>
+        new Promise<void>((resolve, reject) => {
+            let settled = false;
+            const cleanup = () => {
+                writable.removeListener('error', onError);
+                writable.removeListener('close', onClose);
+            };
+            const ok = () => {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                resolve();
+            };
+            const fail = (err: Error) => {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                reject(err);
+            };
+            function onError(err: unknown) { fail(asError(err)); }
+            function onClose() {
+                fail(Object.assign(new Error('Premature close'), { code: 'ERR_STREAM_PREMATURE_CLOSE' }));
+            }
+            writable.on('error', onError);
+            writable.on('close', onClose);
+
+            const existing = Reflect.get(writable, 'errored');
+            if (existing != null) { fail(asError(existing)); return; }
+            if (writable.destroyed) { onClose(); return; }
+
+            body(ok, fail);
+        });
+
     return new WS({
-        async write(chunk: Uint8Array) {
-            await new Promise<void>((resolve, reject) => {
-                if (!writable.write(chunk)) {
-                    writable.once('drain', resolve);
-                } else {
-                    resolve();
-                }
+        write(chunk: Uint8Array) {
+            return guard((resolve, reject) => {
+                const drained = writable.write(chunk, (err?: Error | null) => {
+                    if (err) reject(asError(err));
+                });
+                if (drained) resolve();
+                else writable.once('drain', resolve);
             });
         },
-        async close() {
-            await new Promise<void>((resolve) => {
-                writable.end(resolve);
+        close() {
+            return guard((resolve) => {
+                writable.end(() => resolve());
             });
         },
         abort(reason: unknown) {
-            writable.destroy(reason instanceof Error ? reason : new Error(String(reason)));
+            writable.destroy(asError(reason));
         },
     });
+}
+
+// ── Duplex.toWeb(duplex) ──────────────────────────────────────────────────────
+// Converts a Node.js Duplex into { readable, writable } Web stream pair
+
+export function duplexToWeb(duplex: Duplex): { readable: ReadableStream; writable: WritableStream } {
+    return {
+        readable: readableToWeb(duplex as unknown as Readable),
+        writable: writableToWeb(duplex as unknown as Writable),
+    };
 }
 
 // ── Duplex.fromWeb(duplexStream, options?) ────────────────────────────────────
@@ -227,4 +289,5 @@ export default {
     writableFromWeb,
     writableToWeb,
     duplexFromWeb,
+    duplexToWeb,
 };

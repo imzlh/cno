@@ -2,8 +2,8 @@
  * Node.js fs module - sync operations
  */
 
-import { Dir, toUint8Array, decodeBuffer, encodePathResult, toNodeStat, toNodeStatFs, toNodeDirent, parseFlags, pathToString, splitPathOrFd, describeFd, removeRecursiveSync, mkdirRecursiveSync, modeToNumber, timeToNumber, readFileFromFdSync, randomHex, readDirEntriesSync, validateOpendirOptions, validateReaddirOptions, validateFd, assertCopyFileMode, rmIsDirectoryError, type PathLike, type TimeLike, type Mode } from './utils';
-import { wrapSync } from '../_internal/errno';
+import { Dir, toUint8Array, normalizeRwArgs, decodeBuffer, encodePathResult, toNodeStat, toNodeStatFs, toNodeDirent, parseFlags, pathToString, splitPathOrFd, describeFd, removeRecursiveSync, mkdirRecursiveSync, modeToNumber, timeToUnixSeconds, timeToUnixMs, readFileFromFdSync, randomHex, readDirEntriesSync, validateOpendirOptions, validateReaddirOptions, validateFd, assertCopyFileMode, rmIsDirectoryError, writeAllSync, type PathLike, type TimeLike, type Mode } from './utils';
+import { wrapSync } from './errno-fix';
 import { getTierLimits } from '../_internal/memory';
 import { resolve } from '../path';
 import { copyPathSync, validateCopyOptions, type CopySyncOptions } from './copy';
@@ -11,9 +11,13 @@ import { globPathsSync, type GlobOptions, type GlobResult } from './glob';
 
 const { readBufSize: READ_BUF_SIZE } = getTierLimits();
 
-const fs = import.meta.use('fs');
-const asfs = import.meta.use('asyncfs');
+import { nsfs, nsasfs } from './syspath';
+const fs = nsfs;
+const asfs = nsasfs;
 const engine = import.meta.use('engine');
+const os = import.meta.use('os');
+/** Matches fs/constants.ts; see fchownSync for why this file needs it. */
+const isWindows = os.uname().sysname === 'Windows_NT';
 
 // File read/write
 
@@ -45,7 +49,7 @@ export function writeFileSync(path: PathLike | number, data: string | Uint8Array
     if ('fd' in target) {
         // Node: write from current offset; do not ftruncate(0) the fd.
         wrapSync(() => {
-            fs.write(target.fd, buffer);
+            writeAllSync(target.fd, buffer);
         }, 'writeFileSync', describeFd(target.fd));
         return;
     }
@@ -53,7 +57,7 @@ export function writeFileSync(path: PathLike | number, data: string | Uint8Array
         wrapSync(() => {
             const fd = fs.open(target.path, flag, mode);
             try {
-                fs.write(fd, buffer);
+                writeAllSync(fd, buffer);
             } finally {
                 fs.close(fd);
             }
@@ -72,7 +76,7 @@ export function appendFileSync(path: PathLike | number, data: string | Uint8Arra
         const fd = 'fd' in target ? target.fd : fs.open(target.path, flag, mode);
         try {
             const buffer = toUint8Array(data, encoding);
-            fs.write(fd, buffer);
+            writeAllSync(fd, buffer);
         } finally {
             if (!('fd' in target)) fs.close(fd);
         }
@@ -109,6 +113,7 @@ export function lstatSync(path: PathLike, options?: { bigint?: boolean; throwIfN
 }
 
 export function fstatSync(fd: number, options?: { bigint?: boolean }): import('fs').Stats {
+    validateFd(fd);
     const st = wrapSync(() => fs.fstat(fd), 'fstatSync', describeFd(fd));
     return toNodeStat(st, options);
 }
@@ -138,7 +143,13 @@ export function rmdirSync(path: PathLike, options?: { recursive?: boolean; maxRe
     const pathStr = pathToString(path);
 
     if (options?.recursive) {
-        removeRecursiveSync(pathStr);
+        // Was unwrapped, so a failure escaped as a bare native errno with no
+        // `code`/`syscall`/`path`. Measured before: rmdirSync(missing,{recursive})
+        // threw `-4058` and the sqlite-held case threw `-4092`, both with
+        // syscall=undefined. Node reports ENOENT and EPERM, and labels the
+        // syscall `rm` (not `rmdir`) for the recursive form — v24 routes
+        // rmdir(recursive) through the same path as rm.
+        wrapSync(() => removeRecursiveSync(pathStr), 'rm', pathStr);
     } else {
         wrapSync(() => fs.rmdir(pathStr), 'rmdirSync', pathStr);
     }
@@ -164,11 +175,13 @@ export function rmSync(path: PathLike, options?: { force?: boolean; recursive?: 
 }
 
 export function readdirSync(path: PathLike, options?: { encoding?: BufferEncoding | 'buffer'; withFileTypes?: boolean; recursive?: boolean } | BufferEncoding): Array<string | Buffer> | import('fs').Dirent<string | Buffer>[] {
-    validateReaddirOptions(options);
+    validateReaddirOptions(options, true);
     const pathStr = pathToString(path);
     const withFileTypes = typeof options === 'object' ? options?.withFileTypes : false;
     const recursive = typeof options === 'object' ? options?.recursive === true : false;
-    const entries = wrapSync(() => readDirEntriesSync(pathStr, recursive), 'readdirSync', pathStr);
+    // 'follow' both with and without withFileTypes: recursive readdirSync walks
+    // junctions and directory symlinks alike (measured against node v24.18.0).
+    const entries = wrapSync(() => readDirEntriesSync(pathStr, recursive, '', 'follow'), 'readdirSync', pathStr);
 
     if (withFileTypes) {
         return entries.map(entry => {
@@ -184,9 +197,10 @@ export function readdirSync(path: PathLike, options?: { encoding?: BufferEncodin
     return entries.map(entry => encodePathResult(entry.relativePath, options));
 }
 
-export function opendirSync(path: PathLike, options?: { encoding?: BufferEncoding; bufferSize?: number }): import('fs').Dir {
+export function opendirSync(path: PathLike, options?: { encoding?: BufferEncoding; bufferSize?: number; recursive?: boolean }): import('fs').Dir {
     validateOpendirOptions(options);
-    return new Dir(pathToString(path)) as import('fs').Dir;
+    // opendir does not type-check `recursive`; a truthy value walks (measured).
+    return new Dir(pathToString(path), Boolean(options?.recursive)) as import('fs').Dir;
 }
 
 // File operations
@@ -217,6 +231,7 @@ export function truncateSync(path: PathLike, len?: number): void {
 }
 
 export function ftruncateSync(fd: number, len?: number): void {
+    validateFd(fd);
     wrapSync(() => fs.ftruncate(fd, len ?? 0), 'ftruncateSync', describeFd(fd));
 }
 
@@ -229,15 +244,15 @@ export function linkSync(existingPath: PathLike, newPath: PathLike): void {
 
 export function symlinkSync(target: PathLike, path: PathLike, type?: 'file' | 'dir' | 'junction'): void {
     const pathStr = pathToString(path);
-    wrapSync(() => fs.symlink(pathToString(target), pathStr), 'symlinkSync', pathStr);
+    // Sync C layer takes a Windows hint string and has no junction flag — map to 'dir'.
+    const hint = type === 'dir' || type === 'junction' ? 'dir' : type;
+    wrapSync(() => fs.symlink(pathToString(target), pathStr, hint), 'symlinkSync', pathStr);
 }
 
-export function readlinkSync(path: PathLike, options?: { encoding?: BufferEncoding | 'buffer' } | BufferEncoding): string | Uint8Array {
+export function readlinkSync(path: PathLike, options?: { encoding?: BufferEncoding | 'buffer' } | BufferEncoding): string | Buffer {
     const pathStr = pathToString(path);
     const result = wrapSync(() => fs.readlink(pathStr), 'readlinkSync', pathStr);
-    const encoding = typeof options === 'string' ? options : options?.encoding;
-    if (encoding === 'buffer') return engine.encodeString(result);
-    return result;
+    return encodePathResult(result, options);
 }
 
 export function realpathSync(pathLike: PathLike, options?: { encoding?: BufferEncoding | 'buffer' } | BufferEncoding): string | Buffer {
@@ -261,6 +276,7 @@ export function chmodSync(path: PathLike, mode: Mode): void {
 }
 
 export function fchmodSync(fd: number, mode: Mode): void {
+    validateFd(fd);
     wrapSync(() => fs.fchmod(fd, modeToNumber(mode)), 'fchmodSync', describeFd(fd));
 }
 
@@ -282,11 +298,25 @@ export function lchmodSync(path: PathLike, mode: Mode): void {
 }
 
 export function chownSync(path: PathLike, uid: number, gid: number): void {
+    // Bridge asyncfs via waitIO, exactly as lchownSync below. The sync C layer
+    // throws a bare TypeError "chown not supported on Windows" (no errno, so it
+    // surfaced as code UNKNOWN), whereas libuv's Windows `fs__chown` is
+    // `SET_REQ_RESULT(req, 0)` — a deliberate no-op. Measured v24.18.0:
+    // chownSync succeeds on Windows for any path, even a missing one. Going
+    // through asyncfs inherits that per-platform behaviour instead of hardcoding
+    // it, so POSIX still performs a real chown and reports its real errors.
     const pathStr = pathToString(path);
-    wrapSync(() => fs.chown(pathStr, uid, gid), 'chownSync', pathStr);
+    wrapSync(() => engine.waitIO(asfs.chown(pathStr, uid, gid)), 'chownSync', pathStr);
 }
 
 export function fchownSync(fd: number, uid: number, gid: number): void {
+    validateFd(fd);
+    // asyncfs exposes no fchown, and the sync C layer throws "fchown not
+    // supported on Windows" with no errno. libuv's `fs__fchown` is the same
+    // `SET_REQ_RESULT(req, 0)` no-op as `fs__chown`, and Node on Windows
+    // therefore succeeds for ANY fd — measured v24.18.0: fchownSync(9999)
+    // does not throw. Match that on Windows; elsewhere keep the native call.
+    if (isWindows) return;
     wrapSync(() => fs.fchown(fd, uid, gid), 'fchownSync', describeFd(fd));
 }
 
@@ -300,21 +330,22 @@ export function lchownSync(path: PathLike, uid: number, gid: number): void {
 
 export function utimesSync(path: PathLike, atime: TimeLike, mtime: TimeLike): void {
     const pathStr = pathToString(path);
-    wrapSync(() => fs.utimes(pathStr, timeToNumber(atime) / 1000, timeToNumber(mtime) / 1000), 'utimesSync', pathStr);
+    wrapSync(() => fs.utimes(pathStr, timeToUnixSeconds(atime, 'atime'), timeToUnixSeconds(mtime, 'mtime')), 'utimesSync', pathStr);
 }
 
 export function lutimesSync(path: PathLike, atime: TimeLike, mtime: TimeLike): void {
     // Sync C layer has no lutimes; bridge asyncfs via waitIO.
     const pathStr = pathToString(path);
     wrapSync(
-        () => engine.waitIO(asfs.lutime(pathStr, timeToNumber(atime), timeToNumber(mtime))),
+        () => engine.waitIO(asfs.lutime(pathStr, timeToUnixMs(atime, 'atime'), timeToUnixMs(mtime, 'mtime'))),
         'lutimesSync',
         pathStr,
     );
 }
 
 export function futimesSync(fd: number, atime: TimeLike, mtime: TimeLike): void {
-    wrapSync(() => fs.futimes(fd, timeToNumber(atime) / 1000, timeToNumber(mtime) / 1000), 'futimesSync', describeFd(fd));
+    validateFd(fd);
+    wrapSync(() => fs.futimes(fd, timeToUnixSeconds(atime, 'atime'), timeToUnixSeconds(mtime, 'mtime')), 'futimesSync', describeFd(fd));
 }
 
 // Low-level file descriptor operations
@@ -329,12 +360,14 @@ export function closeSync(fd: number): void {
     wrapSync(() => fs.close(fd), 'closeSync', describeFd(fd));
 }
 
-export function readSync(fd: number, buffer: Uint8Array, offset: number, length: number, position?: number | null): number {
+export function readSync(fd: number, buffer: ArrayBufferView, offset?: number | null | object, length?: number | null, position?: number | null): number {
+    validateFd(fd);
     const fdPath = describeFd(fd);
-    if (position !== null && position !== undefined) {
-        return wrapSync(() => fs.pread(fd, buffer.subarray(offset, offset + length), position), 'readSync', fdPath);
+    const { window, position: pos } = normalizeRwArgs(buffer, offset, length, position);
+    if (pos !== null) {
+        return wrapSync(() => fs.pread(fd, window, pos), 'readSync', fdPath);
     }
-    return wrapSync(() => fs.read(fd, buffer.subarray(offset, offset + length)), 'readSync', fdPath);
+    return wrapSync(() => fs.read(fd, window), 'readSync', fdPath);
 }
 
 function vectorView(buffer: ArrayBufferView): Uint8Array {
@@ -358,21 +391,24 @@ export function readvSync(fd: number, buffers: readonly ArrayBufferView[], posit
     return bytesRead;
 }
 
-export function writeSync(fd: number, buffer: Uint8Array, offset?: number, length?: number, position?: number | null): number;
+export function writeSync(fd: number, buffer: ArrayBufferView, offset?: number | null, length?: number | null, position?: number | null): number;
+export function writeSync(fd: number, buffer: ArrayBufferView, options?: { offset?: number; length?: number; position?: number | null }): number;
 export function writeSync(fd: number, string: string, position?: number | null, encoding?: BufferEncoding): number;
-export function writeSync(fd: number, buffer: Uint8Array | string, offsetOrPosition?: number | null, lengthOrEncoding?: number | BufferEncoding, position?: number | null): number {
-    const isString = typeof buffer === 'string';
-    const encoding = isString && typeof lengthOrEncoding === 'string' ? lengthOrEncoding : undefined;
-    const data = isString ? toUint8Array(buffer, encoding) : buffer;
-    const actualOffset = isString ? 0 : offsetOrPosition ?? 0;
-    const actualLength = isString ? data.length : typeof lengthOrEncoding === 'number' ? lengthOrEncoding : data.length;
-    const actualPosition = isString ? offsetOrPosition : position;
+export function writeSync(fd: number, buffer: ArrayBufferView | string, offsetOrPosition?: unknown, lengthOrEncoding?: unknown, position?: number | null): number {
+    validateFd(fd);
     const fdPath = describeFd(fd);
-
-    if (actualPosition !== null && actualPosition !== undefined) {
-        return wrapSync(() => fs.pwrite(fd, data.subarray(actualOffset, actualOffset + actualLength), actualPosition), 'writeSync', fdPath);
+    if (typeof buffer === 'string') {
+        const encoding = typeof lengthOrEncoding === 'string' ? (lengthOrEncoding as BufferEncoding) : undefined;
+        const data = toUint8Array(buffer, encoding);
+        const at = offsetOrPosition === null || offsetOrPosition === undefined ? null : Number(offsetOrPosition);
+        if (at !== null) return wrapSync(() => fs.pwrite(fd, data, at), 'writeSync', fdPath);
+        return wrapSync(() => fs.write(fd, data), 'writeSync', fdPath);
     }
-    return wrapSync(() => fs.write(fd, data.subarray(actualOffset, actualOffset + actualLength)), 'writeSync', fdPath);
+    const { window, position: pos } = normalizeRwArgs(buffer, offsetOrPosition, lengthOrEncoding, position);
+    if (pos !== null) {
+        return wrapSync(() => fs.pwrite(fd, window, pos), 'writeSync', fdPath);
+    }
+    return wrapSync(() => fs.write(fd, window), 'writeSync', fdPath);
 }
 
 export function writevSync(fd: number, buffers: readonly ArrayBufferView[], position?: number | null): number {
@@ -392,16 +428,19 @@ export function writevSync(fd: number, buffers: readonly ArrayBufferView[], posi
 }
 
 export function fsyncSync(fd: number): void {
+    validateFd(fd);
     wrapSync(() => fs.fsync(fd), 'fsyncSync', describeFd(fd));
 }
 
 export function fdatasyncSync(fd: number): void {
+    validateFd(fd);
     wrapSync(() => fs.fdatasync(fd), 'fdatasyncSync', describeFd(fd));
 }
 
 // File locking
 
 export function flockSync(fd: number, operation: number): void {
+    validateFd(fd);
     wrapSync(() => fs.flock(fd, operation), 'flockSync', describeFd(fd));
 }
 

@@ -13,6 +13,32 @@ function asError(error: unknown): Error {
     return error instanceof Error ? error : new Error(String(error));
 }
 
+// Node attaches a `.code` to every crypto error; bare Error/TypeError is a
+// detectable divergence for callers that branch on err.code.
+function withCode<E extends Error>(error: E, code: string): E & { code: string } {
+    const err = error as E & { code: string };
+    err.code = code;
+    return err;
+}
+
+function outOfRange(message: string): RangeError {
+    return withCode(new RangeError(message), 'ERR_OUT_OF_RANGE');
+}
+
+function invalidArgType(message: string): TypeError {
+    return withCode(new TypeError(message), 'ERR_INVALID_ARG_TYPE');
+}
+
+function invalidDigest(digest: unknown): TypeError {
+    return withCode(new TypeError(`Invalid digest: ${String(digest)}`), 'ERR_CRYPTO_INVALID_DIGEST');
+}
+
+function assertDigestArg(digest: unknown): asserts digest is string {
+    if (typeof digest !== 'string') {
+        throw invalidArgType(`The "digest" argument must be of type string. Received ${digest === undefined ? 'undefined' : typeof digest}`);
+    }
+}
+
 export interface ScryptOptions {
     N?: number;
     cost?: number;
@@ -29,20 +55,20 @@ function readScryptNumberOption(options: ScryptOptions | undefined, primary: key
         return defaultValue;
     }
     if (typeof value !== 'number') {
-        throw new TypeError(`The "${String(primary)}" argument must be of type number. Received type ${typeof value}`);
+        throw invalidArgType(`The "${String(primary)}" argument must be of type number. Received type ${typeof value}`);
     }
     if (!Number.isInteger(value)) {
-        throw new RangeError(`The value of "${String(primary)}" is out of range. It must be an integer. Received ${value}`);
+        throw outOfRange(`The value of "${String(primary)}" is out of range. It must be an integer. Received ${value}`);
     }
     return value;
 }
 
 function parseScryptKeylen(keylen: number): number {
     if (typeof keylen !== 'number') {
-        throw new TypeError(`The "keylen" argument must be of type number. Received type ${typeof keylen}`);
+        throw invalidArgType(`The "keylen" argument must be of type number. Received type ${typeof keylen}`);
     }
     if (!Number.isInteger(keylen) || keylen < 0 || keylen > 0x7fffffff) {
-        throw new RangeError(`The value of "keylen" is out of range. It must be >= 0 && <= 2147483647. Received ${keylen}`);
+        throw outOfRange(`The value of "keylen" is out of range. It must be >= 0 && <= 2147483647. Received ${keylen}`);
     }
     return keylen;
 }
@@ -56,7 +82,7 @@ function parseScryptOptions(options?: ScryptOptions): { N: number; r: number; p:
         return { N: 16384, r: 8, p: 1, maxmem: 32 * 1024 * 1024 };
     }
     if (options === null || typeof options !== 'object') {
-        throw new TypeError('The "options" argument must be of type object');
+        throw invalidArgType('The "options" argument must be of type object');
     }
 
     const N = readScryptNumberOption(options, 'N', 'cost', 16384);
@@ -65,13 +91,18 @@ function parseScryptOptions(options?: ScryptOptions): { N: number; r: number; p:
     const maxmem = options.maxmem ?? 32 * 1024 * 1024;
 
     if (typeof maxmem !== 'number') {
-        throw new TypeError(`The "maxmem" argument must be of type number. Received type ${typeof maxmem}`);
+        throw invalidArgType(`The "maxmem" argument must be of type number. Received type ${typeof maxmem}`);
     }
     if (!Number.isInteger(maxmem) || maxmem < 0 || maxmem > Number.MAX_SAFE_INTEGER) {
-        throw new RangeError(`The value of "maxmem" is out of range. It must be >= 0 && <= ${Number.MAX_SAFE_INTEGER}. Received ${maxmem}`);
+        throw outOfRange(`The value of "maxmem" is out of range. It must be >= 0 && <= ${Number.MAX_SAFE_INTEGER}. Received ${maxmem}`);
     }
     if (!isPowerOfTwo(N) || r < 0 || p < 0) {
-        throw new RangeError('Invalid scrypt params');
+        throw withCode(new RangeError('Invalid scrypt params'), 'ERR_CRYPTO_INVALID_SCRYPT_PARAMS');
+    }
+    // OpenSSL's own budget check, verified against Node: the C layer would
+    // otherwise surface a bare RangeError with no code.
+    if (128 * r * p + 128 * r * (N + 2) > maxmem) {
+        throw withCode(new RangeError('Invalid scrypt params'), 'ERR_CRYPTO_INVALID_SCRYPT_PARAMS');
     }
 
     return { N, r, p, maxmem };
@@ -79,7 +110,7 @@ function parseScryptOptions(options?: ScryptOptions): { N: number; r: number; p:
 
 function assertCallback(callback: unknown): asserts callback is (...args: unknown[]) => void {
     if (typeof callback !== 'function') {
-        throw new TypeError('The "callback" argument must be of type function');
+        throw invalidArgType(`The "callback" argument must be of type function. Received ${callback === undefined ? 'undefined' : typeof callback}`);
     }
 }
 
@@ -90,31 +121,31 @@ const RANDOM_INT_MAX_RANGE = RANDOM_INT_MAX - 1;
 
 function assertRandomInt(name: string, value: number): void {
     if (!Number.isSafeInteger(value)) {
-        throw new TypeError(`The "${name}" argument must be a safe integer`);
+        throw invalidArgType(`The "${name}" argument must be a safe integer`);
     }
 }
 
 function assertRandomFillBuffer(buffer: unknown): asserts buffer is RandomFillBuffer {
     if (!(buffer instanceof ArrayBuffer) && !ArrayBuffer.isView(buffer)) {
-        throw new TypeError('The "buf" argument must be an instance of ArrayBuffer or ArrayBufferView');
+        throw invalidArgType('The "buf" argument must be an instance of ArrayBuffer or ArrayBufferView');
     }
 }
 
 function parseRandomFillRange(buffer: RandomFillBuffer, offset: number, size: number): { off: number; sz: number } {
     if (typeof offset !== 'number') {
-        throw new TypeError('The "offset" argument must be of type number');
+        throw invalidArgType('The "offset" argument must be of type number');
     }
     if (!Number.isFinite(offset) || offset < 0 || offset > buffer.byteLength) {
-        throw new RangeError('The value of "offset" is out of range');
+        throw outOfRange(`The value of "offset" is out of range. It must be >= 0 && <= ${buffer.byteLength}. Received ${offset}`);
     }
     if (typeof size !== 'number') {
-        throw new TypeError('The "size" argument must be of type number');
+        throw invalidArgType('The "size" argument must be of type number');
     }
 
     const off = Math.trunc(offset);
     const sz = Math.trunc(size);
     if (!Number.isFinite(size) || size < 0 || off + sz > buffer.byteLength) {
-        throw new RangeError('The value of "size + offset" is out of range');
+        throw outOfRange(`The value of "size + offset" is out of range. It must be <= ${buffer.byteLength}. Received ${off + sz}`);
     }
     return { off, sz };
 }
@@ -137,13 +168,13 @@ export function randomInt(min: number, max?: number | ((err: Error | null, n: nu
     assertRandomInt('max', max);
     const range = max - min;
     if (range <= 0) {
-        throw new RangeError(`The value of "max" must be greater than the value of "min"`);
+        throw outOfRange(`The value of "max" is out of range. It must be greater than the value of "min"`);
     }
     if (range > RANDOM_INT_MAX_RANGE) {
-        throw new RangeError(`The value of "max - min" must be <= ${RANDOM_INT_MAX_RANGE}`);
+        throw outOfRange(`The value of "max - min" is out of range. It must be <= ${RANDOM_INT_MAX_RANGE}`);
     }
     if (callback !== undefined && typeof callback !== 'function') {
-        throw new TypeError('The "callback" argument must be of type function');
+        throw invalidArgType('The "callback" argument must be of type function');
     }
 
     const limit = Math.floor(RANDOM_INT_MAX / range) * range;
@@ -187,7 +218,7 @@ export function randomFill<T extends RandomFillBuffer>(buffer: T, offset?: numbe
     }
 
     if (typeof callback !== 'function') {
-        throw new TypeError('The "callback" argument must be of type function');
+        throw invalidArgType('The "callback" argument must be of type function');
     }
 
     const { off, sz } = parseRandomFillRange(
@@ -219,6 +250,11 @@ export function randomFillSync<T extends RandomFillBuffer>(buffer: T, offset = 0
 
 export function pbkdf2(password: ArrayBuffer | Uint8Array | string, salt: ArrayBuffer | Uint8Array | string, iterations: number, keylen: number, digest: string, callback: (err: Error | null, derivedKey: Buffer) => void): void {
     assertCallback(callback);
+    // Node validates digest/iterations/keylen eagerly and throws synchronously;
+    // only the derivation itself is deferred.
+    assertDigestArg(digest);
+    validatePbkdf2Params(iterations, keylen);
+    if (!isSupportedPbkdf2Digest(digest)) throw invalidDigest(digest);
     queueMicrotask(() => {
         let result: Buffer;
         try {
@@ -231,7 +267,19 @@ export function pbkdf2(password: ArrayBuffer | Uint8Array | string, salt: ArrayB
     });
 }
 
+function isSupportedPbkdf2Digest(digest: string): boolean {
+    switch (normalizeHashAlgorithm(digest)) {
+        case 'md5': case 'ripemd160': case 'sha1': case 'sha224':
+        case 'sha256': case 'sha384': case 'sha512':
+            return true;
+        default:
+            return false;
+    }
+}
+
 export function pbkdf2Sync(password: ArrayBuffer | Uint8Array | string, salt: ArrayBuffer | Uint8Array | string, iterations: number, keylen: number, digest: string): Buffer {
+    assertDigestArg(digest);
+    validatePbkdf2Params(iterations, keylen);
     const passwordBuf = toBuffer(password);
     const saltBuf = toBuffer(salt);
     let result: ArrayBuffer;
@@ -259,10 +307,19 @@ export function pbkdf2Sync(password: ArrayBuffer | Uint8Array | string, salt: Ar
             result = crypto.pbkdf2Sha512(passwordBuf, saltBuf, iterations, keylen);
             break;
         default:
-            throw new Error(`Unsupported digest: ${digest}`);
+            throw invalidDigest(digest);
     }
 
     return Buffer.from(result);
+}
+
+function validatePbkdf2Params(iterations: number, keylen: number): void {
+    if (typeof iterations !== 'number' || !Number.isInteger(iterations) || iterations < 1 || iterations > 0x7fffffff) {
+        throw outOfRange(`The value of "iterations" is out of range. It must be >= 1 && <= 2147483647. Received ${iterations}`);
+    }
+    if (typeof keylen !== 'number' || !Number.isInteger(keylen) || keylen < 0 || keylen > 0x7fffffff) {
+        throw outOfRange(`The value of "keylen" is out of range. It must be >= 0 && <= 2147483647. Received ${keylen}`);
+    }
 }
 
 function pbkdf2Digest(
@@ -274,7 +331,7 @@ function pbkdf2Digest(
     hashLen: number,
 ): ArrayBuffer {
     if (iterations < 1 || keylen < 1) {
-        throw new RangeError('Invalid iterations or keylen');
+        throw outOfRange(`The value of "iterations" is out of range. It must be >= 1 && <= 2147483647. Received ${iterations}`);
     }
 
     const blocks = Math.ceil(keylen / hashLen);
@@ -376,15 +433,34 @@ export function scryptSync(
 
 function assertHkdfInfo(info: Uint8Array): void {
     if (info.byteLength > 1024) {
-        throw new RangeError('The "info" argument must not contain more than 1024 bytes');
+        throw outOfRange('The value of "info" is out of range. It must be must not contain more than 1024 bytes');
     }
 }
 
+const HKDF_HASH_LENGTHS: Record<string, number> = { sha256: 32, sha512: 64 };
+
+// Node validates digest, info length and keylen eagerly — even for the async
+// form, these throw synchronously rather than reaching the callback.
+function validateHkdfArgs(digest: string, salt: BinaryInput, info: BinaryInput, keylen: number): number {
+    assertDigestArg(digest);
+    const hashLength = HKDF_HASH_LENGTHS[digest.toLowerCase()];
+    if (hashLength === undefined) throw invalidDigest(digest);
+    if (typeof keylen !== 'number' || !Number.isInteger(keylen) || keylen < 0) {
+        throw outOfRange(`The value of "length" is out of range. It must be an integer >= 0. Received ${keylen}`);
+    }
+    if (keylen > 255 * hashLength) {
+        throw withCode(new RangeError('Invalid key length'), 'ERR_CRYPTO_INVALID_KEYLEN');
+    }
+    const infoBuf = info ? toBuffer(info) : undefined;
+    if (infoBuf) assertHkdfInfo(infoBuf);
+    return hashLength;
+}
+
 function deriveHkdf(digest: string, ikm: BinaryInput, salt: BinaryInput, info: BinaryInput, keylen: number): ArrayBuffer {
+    validateHkdfArgs(digest, salt, info, keylen);
     const ikmBuf = toBuffer(ikm);
     const saltBuf = salt ? toBuffer(salt) : undefined;
     const infoBuf = info ? toBuffer(info) : undefined;
-    if (infoBuf) assertHkdfInfo(infoBuf);
 
     switch (digest.toLowerCase()) {
         case 'sha256':
@@ -392,12 +468,13 @@ function deriveHkdf(digest: string, ikm: BinaryInput, salt: BinaryInput, info: B
         case 'sha512':
             return crypto.hkdfSha512(ikmBuf, keylen, saltBuf, infoBuf);
         default:
-            throw new Error(`Unsupported digest: ${digest}`);
+            throw invalidDigest(digest);
     }
 }
 
 export function hkdf(digest: string, ikm: BinaryInput, salt: BinaryInput, info: BinaryInput, keylen: number, callback: (err: Error | null, derivedKey?: ArrayBuffer) => void): void {
     assertCallback(callback);
+    validateHkdfArgs(digest, salt, info, keylen);
     queueMicrotask(() => {
         let result: ArrayBuffer;
         try {

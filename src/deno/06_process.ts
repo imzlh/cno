@@ -2,6 +2,7 @@ import { assert } from "../utils/assert";
 import { bytesToArrayBuffer, concatChunks } from "../utils/bytes";
 import { malloc } from "../utils/malloc";
 import { join } from "../utils/path";
+import { isWindows } from "../utils/platform";
 import { wrapFsClassDec as wrap, wrapFSns } from "../utils/wrap";
 import { ReadableStream } from "../webapi/streams";
 import { toString } from "./02_fs";
@@ -59,7 +60,10 @@ function isDenoSignal(value: string): value is Deno.Signal {
     return denoSignals.has(value);
 }
 
+// Windows has no signals: TerminateProcess yields a plain exit code, so upstream
+// Deno always reports `signal: null` and the raw status there.
 function toDenoSignal(value: string | null): Deno.Signal | null {
+    if (isWindows) return null;
     return value !== null && isDenoSignal(value) ? value : null;
 }
 
@@ -348,20 +352,41 @@ function spawn(path: string, args: string[], options?: Deno.CommandOptions): CMo
     return child;
 }
 
+/**
+ * The native sync spawn surfaces launch failures as an InternalError carrying a
+ * raw Win32 code in its message and no numeric `code`, so wrapFSErr cannot
+ * classify it. Real Deno reports a missing executable as NotFound/ENOENT for
+ * both the async and sync paths; the async path already arrives as UV_ENOENT.
+ */
+function wrapSpawnErr(e: unknown, path: string): unknown {
+    if (typeof e !== 'object' || e === null) return e;
+    if (typeof Reflect.get(e, 'code') === 'number') return e;
+    const message = String(Reflect.get(e, 'message') ?? '');
+    // Win32: 2 = ERROR_FILE_NOT_FOUND, 3 = ERROR_PATH_NOT_FOUND.
+    if (/CreateProcess failed:\s*(2|3)\b/.test(message) || /ENOENT/.test(message)) {
+        return new errors.NotFound(`Failed to spawn '${path}': entity not found`);
+    }
+    return e;
+}
+
 function spawnSync(path: string, args: string[], options?: Deno.CommandOptions): CModuleProcess.SpawnSyncResult {
     const cwd = options?.cwd ? commandCwd(options.cwd) : undefined;
     ensureCommandPath(path, cwd);
-    return proc.spawnSync([path, ...args], {
-        cwd,
-        env: commandEnv(options),
-        clearEnv: options?.clearEnv,
-        stdin: pipe(options?.stdin, 'stdin'),
-        stdout: pipe(options?.stdout, 'stdout'),
-        stderr: pipe(options?.stderr, 'stderr'),
-        detached: options?.detached,
-        uid: options?.uid,
-        gid: options?.gid
-    });
+    try {
+        return proc.spawnSync([path, ...args], {
+            cwd,
+            env: commandEnv(options),
+            clearEnv: options?.clearEnv,
+            stdin: pipe(options?.stdin, 'stdin'),
+            stdout: pipe(options?.stdout, 'stdout'),
+            stderr: pipe(options?.stderr, 'stderr'),
+            detached: options?.detached,
+            uid: options?.uid,
+            gid: options?.gid
+        });
+    } catch (e) {
+        throw wrapSpawnErr(e, path);
+    }
 }
 
 function commandArgs(
@@ -416,7 +441,7 @@ class Command implements Deno.Command {
         assert(!this.#detached, "Detached process cannot be waited");
 
         const res = spawnSync(this.#path, this.#args, outputOptions(this.#options));
-        if (res.error) throw res.error;
+        if (res.error) throw wrapSpawnErr(res.error, this.#path);
         return {
             code: commandCode(res.status, res.signal),
             signal: toDenoSignal(res.signal),

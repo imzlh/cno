@@ -1,8 +1,9 @@
 import { malloc } from "../utils/malloc";
 import { Buffer } from "node-buffer";
-import { bytesToArrayBuffer } from "../utils/bytes";
+import { bytesToArrayBuffer, sanitizeSurrogates } from "../utils/bytes";
 
 const engine = import.meta.use('engine');
+const textMod = import.meta.use('text');
 const os = import.meta.use('os');
 const asfs = import.meta.use('asyncfs');
 const fs = import.meta.use('fs');
@@ -157,11 +158,15 @@ class Blob implements globalThis.Blob {
         if (blobParts === undefined) {
             this.#parts = [];
         } else {
+            // A bare string is iterable but is NOT a BlobPart sequence: WebIDL rejects
+            // it, and accepting it silently turns `new Blob('ab')` into two parts.
+            if (typeof blobParts === 'string') throw new TypeError('Blob parts must be a sequence');
             const iterator = Reflect.get(Object(blobParts), Symbol.iterator);
             if (typeof iterator !== 'function') throw new TypeError('Blob parts must be a sequence');
             this.#parts = Array.from(blobParts, (part) => snapshotBlobPart(part, endings));
         }
-        this.#type = normalizeType(options?.type ?? '');
+        // `?? ''` would swallow an explicit null, which WebIDL stringifies to "null".
+        this.#type = normalizeType(options?.type === undefined ? '' : options.type);
         this.#size = calculateSize(this.#parts);
     }
 
@@ -174,8 +179,10 @@ class Blob implements globalThis.Blob {
     }
 
     slice(start?: number, end?: number, contentType?: string): globalThis.Blob {
-        const relativeStart = start === undefined ? 0 : normalizeIndex(start, this.#size);
-        const relativeEnd = end === undefined ? this.#size : normalizeIndex(end, this.#size);
+        // `start`/`end` are WebIDL `long long`: NaN and +/-Infinity become 0 *before*
+        // the relative-index clamp, so `slice(7, Infinity)` is empty, not the tail.
+        const relativeStart = start === undefined ? 0 : normalizeIndex(toLongLong(start), this.#size);
+        const relativeEnd = end === undefined ? this.#size : normalizeIndex(toLongLong(end), this.#size);
         const span = Math.max(relativeEnd - relativeStart, 0);
 
         const buffer = this.#toBuffer();
@@ -199,7 +206,9 @@ class Blob implements globalThis.Blob {
 
     async text(): Promise<string> {
         const buffer = this.#toBuffer();
-        return engine.decodeString(buffer);
+        // Spec requires UTF-8 decode (U+FFFD for malformed input); engine.decodeString
+        // is WTF-8-tolerant and would leak a lone surrogate back out.
+        return new textMod.Decoder().decode(buffer);
     }
 
     stream(): ReadableStream<Uint8Array<ArrayBuffer>> {
@@ -207,7 +216,9 @@ class Blob implements globalThis.Blob {
 
         return new ReadableStream({
             start(controller) {
-                controller.enqueue(new Uint8Array(buffer));
+                // An empty Blob must close with no chunk at all; enqueuing a
+                // zero-length one makes the first read report `done: false`.
+                if (buffer.byteLength > 0) controller.enqueue(new Uint8Array(buffer));
                 controller.close();
             }
         });
@@ -254,7 +265,11 @@ class File extends Blob implements globalThis.File {
         requireArguments('File.constructor', arguments.length, 2);
         super(fileBits, options);
         this.#name = String(fileName);
-        this.#lastModified = options?.lastModified ?? Date.now();
+        // WebIDL `long long`: a Date (or any object) must be coerced to a number,
+        // otherwise `lastModified` hands back the Date itself.
+        this.#lastModified = options?.lastModified === undefined
+            ? Date.now()
+            : toLongLong(Number(options.lastModified));
     }
 
     get name(): string {
@@ -423,10 +438,11 @@ const snapshotBlobPart = (part: unknown, endings: EndingType): BlobPartSnapshot 
 };
 
 const blobPartBytes = (part: Exclude<BlobPartSnapshot, Blob>): Uint8Array => {
-    if (typeof part === 'string') return engine.encodeString(part);
+    // Blob parts are UTF-8 encoded: lone surrogates become U+FFFD, not WTF-8.
+    if (typeof part === 'string') return engine.encodeString(sanitizeSurrogates(part));
     if (ArrayBuffer.isView(part)) return new Uint8Array(part.buffer, part.byteOffset, part.byteLength);
     if (part instanceof ArrayBuffer) return new Uint8Array(part);
-    return engine.encodeString(String(part));
+    return engine.encodeString(sanitizeSurrogates(String(part)));
 };
 
 const calculateSize = (parts: BlobPartSnapshot[]): number => {
@@ -453,6 +469,12 @@ const normalizeIndex = (index: number, length: number): number => {
         return Math.max(length + num, 0);
     }
     return Math.min(num, length);
+};
+
+/** WebIDL `long long` coercion: NaN and +/-Infinity are 0, finite values truncate. */
+const toLongLong = (value: number): number => {
+    const num = Number(value);
+    return Number.isFinite(num) ? Math.trunc(num) : 0;
 };
 
 const guessContentType = (filename: string): string => {

@@ -1,11 +1,10 @@
 import { TcpSocket, type SocketTransport } from '@cnojs/http/socket';
 import { dnsCache } from '@cnojs/http/dns-cache';
-import { connectDirectTcp, openTcp } from './http';
+import { connectDirectTcp, createClientTlsContext, openTcp, type TlsOptions } from './http';
 import type { RawConnection, RawConnectionHook } from './network-hooks';
 
 const engine = import.meta.use('engine');
 const crypto = import.meta.use('crypto');
-const ssl = import.meta.use('ssl');
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
@@ -71,27 +70,131 @@ async function readExact(socket: TcpSocket, size: number): Promise<Uint8Array> {
     return output;
 }
 
-async function readHttpHead(socket: TcpSocket): Promise<string> {
+/** An HTTP head plus any bytes read past its terminator. */
+interface HttpHead {
+    text: string;
+    /** Bytes after `\r\n\r\n`. Belong to the tunnelled stream, never to the head. */
+    leftover: Uint8Array | null;
+}
+
+/**
+ * Read an HTTP head, stopping exactly at `\r\n\r\n`.
+ *
+ * Reads are 4096 bytes at a time, so the last one routinely returns bytes past the
+ * terminator. For a CONNECT tunnel those bytes are the tunnelled stream's first
+ * bytes, and returning them as part of the "head" silently destroyed them: whatever
+ * the proxy pipelined behind `200 Connection Established` — a tunnelled response
+ * body, or bytes injected by a tampering proxy — was consumed here and never
+ * reached the tunnel. They are handed back as `leftover` so the caller can put them
+ * back in front of the stream.
+ *
+ * @internal Exported for tests.
+ */
+export async function readHttpHead(socket: TcpSocket): Promise<HttpHead> {
     const chunks: Uint8Array[] = [];
     let length = 0;
     let matched = 0;
+    /** Index one past the terminator, in the concatenation of `chunks`. */
+    let headEnd = -1;
     const marker = [13, 10, 13, 10];
     while (length < 64 * 1024) {
         const chunk = await socket.read(4096);
         if (!chunk) throw new Error('HTTP proxy closed during CONNECT');
-        chunks.push(chunk); length += chunk.length;
-        for (const byte of chunk) {
+        chunks.push(chunk);
+        for (let index = 0; index < chunk.length; index++) {
+            const byte = chunk[index]!;
             matched = byte === marker[matched] ? matched + 1 : byte === marker[0] ? 1 : 0;
-            if (matched === marker.length) break;
+            if (matched === marker.length) { headEnd = length + index + 1; break; }
         }
-        if (matched === marker.length) break;
+        length += chunk.length;
+        if (headEnd >= 0) break;
     }
     const joined = new Uint8Array(length);
     let offset = 0;
     for (const chunk of chunks) { joined.set(chunk, offset); offset += chunk.length; }
-    const text = engine.decodeString(joined);
-    if (!text.includes('\r\n\r\n')) throw new Error('HTTP proxy response headers are too large');
-    return text;
+    if (headEnd < 0) throw new Error('HTTP proxy response headers are too large');
+    return {
+        text: engine.decodeString(joined.slice(0, headEnd)),
+        leftover: headEnd < length ? joined.slice(headEnd) : null,
+    };
+}
+
+function asBytes(buffer: CModuleStreams.BufferSource): Uint8Array {
+    return buffer instanceof ArrayBuffer
+        ? new Uint8Array(buffer)
+        : new Uint8Array(buffer.buffer as ArrayBuffer, buffer.byteOffset, buffer.byteLength);
+}
+
+/**
+ * A transport that serves `prefix` before anything from `inner`.
+ *
+ * Every read path in TcpSocket — `read`, `readRaw`, both handshake loops, the
+ * `onread` callback path — funnels through its `SocketTransport`, so replacing the
+ * transport is the one interception point that covers all of them. That is why
+ * pushback happens here rather than in each caller: the over-read becomes invisible
+ * to every consumer of the returned socket, including the TLS handshake that runs
+ * next, and no consumer needs to know a tunnel was involved.
+ */
+class PrependTransport implements SocketTransport {
+    private prefix: Uint8Array | null;
+
+    constructor(private readonly inner: SocketTransport, prefix: Uint8Array) {
+        this.prefix = prefix.length > 0 ? prefix : null;
+    }
+
+    get onread(): SocketTransport['onread'] { return this.inner.onread; }
+    set onread(value: SocketTransport['onread']) { this.inner.onread = value; }
+
+    /** Hand back up to `max` prefix bytes, retaining the rest. */
+    private take(max: number): Uint8Array | null {
+        const prefix = this.prefix;
+        if (!prefix || max <= 0) return null;
+        if (prefix.length <= max) { this.prefix = null; return prefix; }
+        this.prefix = prefix.subarray(max);
+        return prefix.subarray(0, max);
+    }
+
+    async read(buffer: CModuleStreams.BufferSource): Promise<number> {
+        const view = asBytes(buffer);
+        const chunk = this.take(view.byteLength);
+        if (!chunk) return this.inner.read(buffer);
+        view.set(chunk);
+        return chunk.byteLength;
+    }
+
+    write(buffer: CModuleStreams.BufferSource): Promise<number> { return this.inner.write(buffer); }
+
+    startRead(): void {
+        // Deliver the prefix before arming the inner reader, or the tunnel's first
+        // bytes would arrive after bytes that followed them on the wire.
+        const chunk = this.take(Number.MAX_SAFE_INTEGER);
+        if (chunk) this.inner.onread?.(chunk, undefined);
+        this.inner.startRead();
+    }
+
+    stopRead(): void { this.inner.stopRead(); }
+    close(): void { this.inner.close(); }
+}
+
+/**
+ * Wrap `transport` so `leftover` is served before anything from it.
+ *
+ * @internal Exported for tests.
+ */
+export function prependTunnelTransport(transport: SocketTransport, leftover: Uint8Array | null): SocketTransport {
+    if (!leftover || leftover.length === 0) return transport;
+    return new PrependTransport(transport, leftover);
+}
+
+/**
+ * Put `leftover` back in front of `socket`'s stream.
+ *
+ * @internal Exported for tests.
+ */
+export function prependTunnelBytes(socket: TcpSocket, leftover: Uint8Array | null): TcpSocket {
+    if (!leftover || leftover.length === 0) return socket;
+    socket.socket = prependTunnelTransport(socket.socket, leftover);
+    return socket;
 }
 
 function proxyPort(config: ProxyConfig, proxy: URL): number {
@@ -104,17 +207,19 @@ function authority(hostname: string, port: number): string {
     return `${host}:${port}`;
 }
 
-async function httpConnect(socket: TcpSocket, url: URL, config: ProxyConfig): Promise<void> {
+/** Perform the CONNECT exchange. Returns bytes the proxy pipelined behind the 2xx. */
+async function httpConnect(socket: TcpSocket, url: URL, config: ProxyConfig): Promise<Uint8Array | null> {
     const target = authority(url.hostname, targetPort(url));
     let request = `CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\nProxy-Connection: keep-alive\r\n`;
     const authorization = proxyAuthorization(config);
     if (authorization) request += `Proxy-Authorization: ${authorization}\r\n`;
     await socket.write(engine.encodeString(`${request}\r\n`));
-    const response = await readHttpHead(socket);
+    const { text: response, leftover } = await readHttpHead(socket);
     const statusLine = response.slice(0, response.indexOf('\r\n'));
     if (!/^HTTP\/\d\.\d 2\d\d(?:\s|$)/.test(statusLine)) {
         throw new Error(`HTTP proxy CONNECT failed: ${statusLine}`);
     }
+    return leftover;
 }
 
 function proxyAuthorization(config: ProxyConfig): string | undefined {
@@ -245,22 +350,33 @@ class SocketStreamAdapter implements SocketTransport {
     close(): void { this.socket.close(); }
 }
 
-async function startTls(socket: TcpSocket, hostname: string): Promise<TcpSocket> {
-    const context = new ssl.Context({ alpn: ['http/1.1'], mode: 'client' });
-    await socket.clientHandshake(context, hostname);
+/**
+ * Wrap `socket` in TLS as a client, verifying the peer by default.
+ *
+ * Used for two distinct trust decisions: the connection to an `https` proxy
+ * (verified against the *proxy's* hostname) and the tunnelled connection to the
+ * target (verified against the *target's* hostname). Both go through the same
+ * shared context builder so neither can silently end up unverified.
+ */
+async function startTls(socket: TcpSocket, hostname: string, tls?: TlsOptions): Promise<TcpSocket> {
+    await socket.clientHandshake(createClientTlsContext(['http/1.1'], tls, hostname), hostname);
     return socket;
 }
 
-async function startNestedTls(socket: TcpSocket, hostname: string): Promise<TcpSocket> {
-    const nested = new TcpSocket(new SocketStreamAdapter(socket));
-    return startTls(nested, hostname);
+async function startNestedTls(socket: TcpSocket, hostname: string, leftover: Uint8Array | null, tls?: TlsOptions): Promise<TcpSocket> {
+    // The leftover was read through the *outer* TLS session, so it is plaintext to
+    // the proxy and ciphertext to the tunnel. It therefore belongs in front of the
+    // nested socket's transport (the adapter), not the outer socket's transport,
+    // which carries proxy-side cipher.
+    const nested = new TcpSocket(prependTunnelTransport(new SocketStreamAdapter(socket), leftover));
+    return startTls(nested, hostname, tls);
 }
 
-export async function connectViaProxy(url: URL, config: ProxyConfig): Promise<RawConnection> {
-    if (shouldBypassProxy(url, config.noProxy)) return { socket: await connectDirectTcp(url) };
+export async function connectViaProxy(url: URL, config: ProxyConfig, tls?: TlsOptions): Promise<RawConnection> {
+    if (shouldBypassProxy(url, config.noProxy)) return { socket: await connectDirectTcp(url, tls) };
     const proxy = new URL(config.url);
     let socket = await openTcp(normalizeHost(proxy.hostname), proxyPort(config, proxy));
-    if (config.type === 'https') socket = await startTls(socket, normalizeHost(proxy.hostname));
+    if (config.type === 'https') socket = await startTls(socket, normalizeHost(proxy.hostname), tls);
     const secureTarget = url.protocol === 'https:' || url.protocol === 'wss:';
     if ((config.type === 'http' || config.type === 'https') && !secureTarget) {
         return {
@@ -269,19 +385,24 @@ export async function connectViaProxy(url: URL, config: ProxyConfig): Promise<Ra
             proxyAuthorization: proxyAuthorization(config),
         };
     }
-    if (config.type === 'http' || config.type === 'https') await httpConnect(socket, url, config);
+    let leftover: Uint8Array | null = null;
+    if (config.type === 'http' || config.type === 'https') leftover = await httpConnect(socket, url, config);
     else if (config.type === 'socks5' || config.type === 'socks5h') await socks5Connect(socket, url, config);
     else await socks4Connect(socket, url, config);
     if (secureTarget) {
         const hostname = normalizeHost(url.hostname);
-        socket = config.type === 'https' ? await startNestedTls(socket, hostname) : await startTls(socket, hostname);
+        socket = config.type === 'https'
+            ? await startNestedTls(socket, hostname, leftover, tls)
+            : await startTls(prependTunnelBytes(socket, leftover), hostname, tls);
+    } else {
+        socket = prependTunnelBytes(socket, leftover);
     }
     return { socket };
 }
 
-export function createProxyConnector(getConfig: (url: URL) => ProxyConfig | null): RawConnectionHook {
+export function createProxyConnector(getConfig: (url: URL) => ProxyConfig | null, tls?: TlsOptions): RawConnectionHook {
     return url => {
         const config = getConfig(url);
-        return config ? connectViaProxy(url, config) : connectDirectTcp(url).then(socket => ({ socket }));
+        return config ? connectViaProxy(url, config, tls) : connectDirectTcp(url, tls).then(socket => ({ socket }));
     };
 }

@@ -23,6 +23,12 @@ import { ServerResponseAdapter, type ResponseAdapterServeHook } from '../_intern
 import { dispatchServerRequest } from '../_internal/server-request-runtime';
 import { pumpIncomingRequestBody } from '../_internal/server-request-stream';
 import { emitNodeServerUpgrade } from '../_internal/server-upgrade';
+import {
+    onNetServerSocket,
+    onServerRequestStart,
+    onServerResponseCreated,
+    onServerResponseFinish,
+} from '../diagnostics_channel/builtins';
 import type { IncomingHttpHeaders, OutgoingHttpHeader, OutgoingHttpHeaders, IncomingMessage, OutgoingMessage, ServerResponse, ListenOptions, Server, RequestListener, MessageSocket } from './types';
 import { IOpaque } from '../_internal/inject';
 import { STATUS_CODES } from './constants';
@@ -255,7 +261,22 @@ IncomingMessageImpl.prototype.setTimeout = function setTimeout(this: IncomingMes
 };
 
 IncomingMessageImpl.prototype.destroy = function destroy(this: IncomingMessageImpl, error?: Error): IncomingMessageImpl {
-    this.aborted = true;
+    // Node only marks/announces an abort when the message was still incomplete;
+    // destroying an already-complete message is just a teardown. cno set
+    // `aborted = true` unconditionally and never emitted 'aborted' at all, so
+    // `res.on('aborted')` — the documented way to notice a truncated response —
+    // never fired. OBSERVED: node ["data:4","aborted","close:complete=false"]
+    // vs cno ["data:4","close:complete=false"] (/d/tmp/ag-http/p1-basic.js T10).
+    //
+    // The `!this.aborted` half is load-bearing: the truncation path in
+    // http-client.ts::failResponse already announces the abort and *then* calls
+    // destroy(err), so emitting unconditionally here produced
+    // 'aborted->aborted->error->close' and broke
+    // tests/webapi/h1-truncation.test.ts.
+    if (!this.complete && !this.aborted) {
+        this.aborted = true;
+        this.emit('aborted');
+    }
     Readable.prototype.destroy.call(this, error);
     return this;
 };
@@ -793,6 +814,13 @@ export class ServerImpl extends NetServer implements Server {
         const socket = createAttachedSocket(tcp, { close: closeOwned });
         this._httpSocketByTcp.set(tcp, socket);
         this.trackHttpSocket(socket);
+        // In Node http.Server extends net.Server, so every accepted HTTP
+        // connection also publishes net.server.socket. cno's HTTP server is
+        // backed by native core rather than net.Server, so this is the
+        // equivalent point: once per new connection, not per keep-alive request.
+        if (onNetServerSocket.hasSubscribers) {
+            onNetServerSocket.publish({ socket });
+        }
         return socket;
     }
 
@@ -815,6 +843,13 @@ export class ServerImpl extends NetServer implements Server {
             : null;
         const { incoming, response } = createServerRequestObjects(nodeSocket);
         applyCoreServerRequest(incoming, req);
+        // Node publishes http.server.response.created from the ServerResponse
+        // constructor, at which point the paired IncomingMessage already carries
+        // its method/url. cno fills those in via applyCoreServerRequest, so the
+        // publish belongs here — before it, subscribers would see a blank request.
+        if (onServerResponseCreated.hasSubscribers) {
+            onServerResponseCreated.publish({ request: incoming, response });
+        }
         if (incoming.method === 'CONNECT') {
             if (this.listenerCount('connect') <= 0) {
                 res.close();
@@ -841,6 +876,19 @@ export class ServerImpl extends NetServer implements Server {
         );
 
         const adapter = new NodeResponseAdapter(response, res, serveHook, requestId, requestUrl, incoming.method === 'HEAD');
+
+        // Node publishes http.server.request.start immediately before the request
+        // listener runs, and http.server.response.finish from the response's
+        // 'finish' handler. Both payloads carry the same four keys.
+        if (onServerRequestStart.hasSubscribers) {
+            onServerRequestStart.publish({ request: incoming, response, socket: nodeSocket, server: this });
+        }
+        if (onServerResponseFinish.hasSubscribers) {
+            response.once('finish', () => {
+                onServerResponseFinish.publish({ request: incoming, response, socket: nodeSocket, server: this });
+            });
+        }
+
         await dispatchServerRequest({
             listener: this._requestListener,
             incoming,
@@ -883,6 +931,18 @@ export class ServerImpl extends NetServer implements Server {
     }
 
     private _createNativeServer(hostname: string, port: number | undefined, handler: (req: HttpRequest, res: HttpResponse) => Promise<void>): HttpServer {
+        // maxHeaderSize / maxHeadersCount / maxConnections were accepted here and
+        // never forwarded, so the core server always used its own defaults: an
+        // 8 KB request head sailed through `maxHeaderSize: 2048` with 200 OK
+        // while node answered 431, and `server.maxConnections = 1` served a
+        // second concurrent connection that node reset. The enforcement paths
+        // are live in the core server (http/src/h1.ts:484 for the size,
+        // http/src/server.ts:199 for the connection count) — a 20 KB head is
+        // refused at the hardcoded 16384 default — so only the plumbing was
+        // missing. maxConnections is inherited from net.Server, which applies it
+        // itself on its own accept path (cno/src/node/net/mod.ts:1319); this is
+        // the native-HTTP equivalent.
+        const configuredMaxConnections = (this as unknown as { maxConnections?: number }).maxConnections;
         return createHttpServer(handler, {
             port: port ?? 0,
             hostname,
@@ -893,6 +953,18 @@ export class ServerImpl extends NetServer implements Server {
                     : Number.MAX_SAFE_INTEGER
             ),
             requestTimeout: this.requestTimeout,
+            ...(typeof this._options.maxHeaderSize === 'number' && this._options.maxHeaderSize > 0
+                ? { maxHeaderSize: this._options.maxHeaderSize }
+                : {}),
+            // Node leaves maxHeadersCount null by default and does not itself
+            // enforce it (measured: 200 headers still got 200 OK on v24.18), so
+            // only forward a value the caller explicitly set.
+            ...(typeof this.maxHeadersCount === 'number' && this.maxHeadersCount > 0
+                ? { maxHeadersCount: this.maxHeadersCount }
+                : {}),
+            ...(typeof configuredMaxConnections === 'number' && configuredMaxConnections > 0
+                ? { maxConnections: configuredMaxConnections }
+                : {}),
         });
     }
 
@@ -947,14 +1019,58 @@ export function createServer(options: ServerOptions | RequestListener, requestLi
     return new ServerImpl(options, requestListener);
 }
 
+/**
+ * Node's `ERR_INVALID_HTTP_TOKEN` / `ERR_INVALID_CHAR` / `ERR_UNESCAPED_CHARACTERS`.
+ * cno threw bare TypeErrors with no `code`, so the documented way to branch on
+ * these failures (`if (err.code === 'ERR_INVALID_CHAR')`) never matched.
+ */
+function httpValidationError(code: string, message: string): TypeError & { code: string } {
+    return Object.assign(new TypeError(message), { code });
+}
+
+/** RFC 7230 token. */
+const HTTP_TOKEN_RE = /^[\^_`a-zA-Z\-0-9!#$%&'*+.|~]+$/;
+/** Node's INVALID_PATH_REGEX: anything outside 0x21-0xff, so SP and CR/LF included. */
+const INVALID_REQUEST_PATH_RE = /[^!-ÿ]/;
+
 export function validateHeaderName(name: string): void {
-    if (!/^[\^_`a-zA-Z\-0-9!#$%&'*+.|~]+$/.test(name)) {
-        throw new TypeError(`Header name "${name}" contains invalid characters`);
+    if (typeof name !== 'string' || !HTTP_TOKEN_RE.test(name)) {
+        throw httpValidationError('ERR_INVALID_HTTP_TOKEN', `Header name must be a valid HTTP token ["${name}"]`);
     }
 }
 
 export function validateHeaderValue(name: string, value: string): void {
     if (/[\x00-\x08\x0a-\x1f\x7f]/.test(value)) {
-        throw new TypeError(`Invalid character in header content ["${name}"]`);
+        throw httpValidationError('ERR_INVALID_CHAR', `Invalid character in header content ["${name}"]`);
+    }
+}
+
+/**
+ * Reject a non-token method before it can reach the wire.
+ *
+ * cno performed no method validation at all, so `http.request({method:'BAD
+ * METHOD'})` serialised `BAD METHOD /x HTTP/1.1` and sent it — OBSERVED on a raw
+ * sink in /d/tmp/ag-http/p2-inject.js, where node throws
+ * ERR_INVALID_HTTP_TOKEN synchronously. A malformed request line is exactly the
+ * input that makes a peer and an intermediary disagree about where the method
+ * ends, so being more permissive than node here is the wrong direction.
+ */
+export function validateRequestMethod(method: string): void {
+    if (typeof method !== 'string' || !HTTP_TOKEN_RE.test(method)) {
+        throw httpValidationError('ERR_INVALID_HTTP_TOKEN', `Method must be a valid HTTP token ["${method}"]`);
+    }
+}
+
+/**
+ * Reject an unescaped path before it can reach the wire.
+ *
+ * Same story as the method: `path:'/he llo'` went out as
+ * `GET /he llo HTTP/1.1`. CRLF in a path *was* already caught, but only
+ * asynchronously as a request 'error', so a try/catch around http.request()
+ * — which is where node reports it — missed it entirely.
+ */
+export function validateRequestPath(path: string): void {
+    if (typeof path === 'string' && INVALID_REQUEST_PATH_RE.test(path)) {
+        throw httpValidationError('ERR_UNESCAPED_CHARACTERS', 'Request path contains unescaped characters');
     }
 }

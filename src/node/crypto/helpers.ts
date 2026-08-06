@@ -10,9 +10,42 @@ import type { BinaryInput, KeyInput, KeyObject, KeyWithOptions } from './types';
 import { concatChunks as concatBuffers } from '../_internal/buffer';
 export { concatBuffers };
 
+const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
+const typedArrayBufferGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')?.get;
+const typedArrayByteOffsetGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteOffset')?.get;
+const typedArrayByteLengthGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteLength')?.get;
+const dataViewBufferGetter = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer')?.get;
+const dataViewByteOffsetGetter = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset')?.get;
+const dataViewByteLengthGetter = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength')?.get;
+const arrayBufferByteLengthGetter = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength')?.get;
+const arrayBufferSlice = ArrayBuffer.prototype.slice;
+const uint8ArraySet = Uint8Array.prototype.set;
+
 export const kKeyData = Symbol('cno.node.crypto.keyData');
 export const kKeyFormat = Symbol('cno.node.crypto.keyFormat');
 export type KeyFormat = 'raw' | 'pem' | 'der';
+
+function applySlot<T>(getter: ((this: unknown) => T) | undefined, value: object): T {
+    if (!getter) throw new TypeError('Required BufferSource slot is unavailable');
+    return Reflect.apply(getter, value, []);
+}
+
+function viewSlots(value: unknown): { buffer: ArrayBufferLike; byteOffset: number; byteLength: number } | null {
+    if (!value || typeof value !== 'object') return null;
+    const dataView = engine.isDataView(value);
+    const bufferGetter = dataView ? dataViewBufferGetter : typedArrayBufferGetter;
+    try {
+        return {
+            buffer: applySlot(bufferGetter, value),
+            byteOffset: applySlot(dataView ? dataViewByteOffsetGetter : typedArrayByteOffsetGetter, value),
+            byteLength: applySlot(dataView ? dataViewByteLengthGetter : typedArrayByteLengthGetter, value),
+        };
+    } catch { return null; }
+}
+
+function isBufferSource(value: unknown): value is ArrayBuffer | ArrayBufferView {
+    return engine.isArrayBuffer(value) || viewSlots(value) !== null;
+}
 
 export function toBuffer(data: BinaryInput, encoding: string = 'utf8'): Uint8Array {
     if (typeof data === 'string') {
@@ -23,22 +56,23 @@ export function toBuffer(data: BinaryInput, encoding: string = 'utf8'): Uint8Arr
         }
         return engine.encodeString(data);
     }
-    if (data instanceof ArrayBuffer) {
-        return new Uint8Array(data);
-    }
-    if (ArrayBuffer.isView(data)) {
-        return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-    }
+    if (engine.isArrayBuffer(data)) return new Uint8Array(data as ArrayBuffer);
+    const view = viewSlots(data);
+    if (view) return new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
     throw new TypeError('The input must be a string, ArrayBuffer, or ArrayBufferView');
 }
 
 export function toExactArrayBuffer(data: Uint8Array): ArrayBuffer {
-    if (data.buffer instanceof ArrayBuffer) {
-        if (data.byteOffset === 0 && data.byteLength === data.buffer.byteLength) return data.buffer;
-        return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+    const view = viewSlots(data);
+    if (!view) throw new TypeError('The input must be a Uint8Array');
+    if (engine.isArrayBuffer(view.buffer)) {
+        const buffer = view.buffer as ArrayBuffer;
+        const bufferLength = applySlot(arrayBufferByteLengthGetter, buffer);
+        if (view.byteOffset === 0 && view.byteLength === bufferLength) return buffer;
+        return Reflect.apply(arrayBufferSlice, buffer, [view.byteOffset, view.byteOffset + view.byteLength]);
     }
-    const copy = new Uint8Array(data.byteLength);
-    copy.set(data);
+    const copy = new Uint8Array(view.byteLength);
+    Reflect.apply(uint8ArraySet, copy, [new Uint8Array(view.buffer, view.byteOffset, view.byteLength)]);
     return copy.buffer;
 }
 
@@ -82,24 +116,49 @@ export function getKeyBytes(input: KeyInput): Uint8Array {
     if (isKeyObject(input)) {
         return input[kKeyData];
     }
-    if (typeof input === 'string' || input instanceof ArrayBuffer || ArrayBuffer.isView(input)) {
+    if (typeof input === 'string' || isBufferSource(input)) {
         return toBuffer(input);
     }
     throw new TypeError('The key must be a KeyObject, string, ArrayBuffer, or ArrayBufferView');
 }
 
-export function readKeyOptions(input: KeyInput | KeyWithOptions): { key: Uint8Array; dsaEncoding: 'der' | 'ieee-p1363' } {
-    if (input && typeof input === 'object' && !isKeyObject(input) && !(input instanceof Uint8Array) && !(input instanceof ArrayBuffer) && 'key' in input) {
-        const opts = input as KeyWithOptions;
+export function readKeyOptions(input: KeyInput | KeyWithOptions): { key: Uint8Array; dsaEncoding: 'der' | 'ieee-p1363'; padding?: number } {
+    if (input && typeof input === 'object' && !isKeyObject(input) && !isBufferSource(input) && 'key' in input) {
+        const opts = input as KeyWithOptions & { padding?: number };
         return {
             key: getKeyBytes(opts.key),
             dsaEncoding: opts.dsaEncoding === 'ieee-p1363' ? 'ieee-p1363' : 'der',
+            padding: typeof opts.padding === 'number' ? opts.padding : undefined,
         };
     }
     return {
         key: getKeyBytes(input as KeyInput),
         dsaEncoding: 'der',
     };
+}
+
+/**
+ * The native sign/verify entry points (`crypto.signSha256` and friends) take no
+ * padding argument — they always use PKCS#1 v1.5. So a caller asking for PSS was
+ * silently served the legacy scheme, and measured on the 17:41 binary a PKCS1
+ * signature VERIFIED TRUE against an explicit PSS request, where real Node
+ * v24.18.0 returns false. That is a padding-scheme downgrade, and silently
+ * accepting it is worse than not supporting PSS at all: the caller believes it
+ * opted in.
+ *
+ * Until the native layer accepts a padding parameter, fail loudly instead. Node's
+ * own error for an unsupported padding is ERR_CRYPTO_INVALID_PADDING-shaped, so
+ * mirror that rather than inventing a code.
+ */
+export function rejectUnsupportedPadding(padding: number | undefined, fn: 'sign' | 'verify'): void {
+    // 1 = RSA_PKCS1_PADDING, which is what the native layer actually does.
+    if (padding === undefined || padding === 1) return;
+    const err = new Error(
+        `crypto.${fn}: padding ${padding} is not supported by this build (only RSA_PKCS1_PADDING). `
+        + 'Requesting PSS would otherwise be silently downgraded to PKCS#1 v1.5.',
+    ) as Error & { code?: string };
+    err.code = 'ERR_CRYPTO_INVALID_PADDING';
+    throw err;
 }
 
 export function detectEcCoordinateSize(bytes: Uint8Array): number | undefined {

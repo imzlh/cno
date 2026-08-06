@@ -10,7 +10,10 @@ import { isTransportDisconnectError } from './errno';
 import type { OutgoingHttpHeaders } from '../http/types';
 import { STATUS_CODES } from '../http/constants';
 
-type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
+// Body chunks may legitimately be backed by a SharedArrayBuffer (a user can
+// pass such a view to res.write); verified to write correctly, so the alias
+// must not narrow to ArrayBuffer.
+type Uint8Array = globalThis.Uint8Array<ArrayBufferLike>;
 type HeaderInput = OutgoingHttpHeaders | readonly string[];
 
 function reasonPhrase(code: number, explicit?: string): string {
@@ -471,7 +474,7 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
     end(chunk?: unknown, encodingOrCb?: BufferEncoding | (() => void), cb?: () => void): TResponse {
         let callback: (() => void) | undefined;
         if (typeof chunk === 'function') {
-            callback = chunk;
+            callback = chunk as () => void;
             chunk = undefined;
         } else if (typeof encodingOrCb === 'function') {
             callback = encodingOrCb;

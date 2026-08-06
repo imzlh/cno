@@ -84,174 +84,133 @@ export function isBuffer(value: unknown): value is Uint8Array {
 
 // Formatting
 
-function formatNumber(value: unknown): string {
-    if (typeof value === 'bigint') return `${value}n`;
-    if (typeof value === 'symbol') return 'NaN';
-    return String(Number(value));
+export function format(first?: unknown, ...args: unknown[]): string {
+    if (arguments.length === 0) return '';
+    return formatWithOptionsInternal(undefined, [first, ...args]);
 }
 
-function formatInteger(value: unknown): string {
-    if (typeof value === 'bigint') return `${value}n`;
-    if (typeof value === 'symbol') return 'NaN';
-    return String(parseInt(String(value), 10));
+export function formatWithOptions(inspectOptions: InspectOptions, first?: unknown, ...args: unknown[]): string {
+    if (typeof inspectOptions !== 'object' || inspectOptions === null) {
+        throw new TypeError('The "inspectOptions" argument must be of type object.');
+    }
+    if (arguments.length === 1) return '';
+    return formatWithOptionsInternal(inspectOptions, [first, ...args]);
 }
 
-export function format(format?: unknown, ...args: unknown[]): string {
-    if (format === undefined) {
-        return '';
-    }
+function formatWithOptionsInternal(inspectOptions: InspectOptions | undefined, args: unknown[]): string {
+    const opts = inspectOptions ?? {};
+    const first = args[0];
+    let a = 0;
+    let str = '';
+    let join = '';
 
-    // If first arg is not a string, inspect it and remaining args
-    if (typeof format !== 'string') {
-        const parts = [format, ...args].map(a => inspect(a));
-        return parts.join(' ');
-    }
+    if (typeof first === 'string') {
+        if (args.length === 1) return first;
+        let tempStr: string;
+        let lastPos = 0;
 
-    let result = '';
-    let argIndex = 0;
-    let i = 0;
-
-    while (i < format.length) {
-        if (format[i] === '%' && i + 1 < format.length) {
-            const specifier = format[i + 1];
-            i += 2;
-
-            if (specifier === '%') {
-                result += '%';
-                continue;
-            }
-
-            // If no more args, keep the specifier literal
-            if (argIndex >= args.length) {
-                result += '%' + specifier;
-                continue;
-            }
-
-            switch (specifier) {
-                case 's':
-                    result += String(args[argIndex++]);
-                    break;
-                case 'd':
-                    result += formatNumber(args[argIndex++]);
-                    break;
-                case 'i':
-                    result += formatInteger(args[argIndex++]);
-                    break;
-                case 'f':
-                    result += parseFloat(String(args[argIndex++]));
-                    break;
-                case 'j':
-                    try {
-                        result += JSON.stringify(args[argIndex++]);
-                    } catch {
-                        result += '[Circular]';
+        for (let i = 0; i < first.length - 1; i++) {
+            if (first.charCodeAt(i) === 37) { // '%'
+                const nextChar = first.charCodeAt(++i);
+                if (a + 1 !== args.length) {
+                    switch (nextChar) {
+                        case 115: { // 's'
+                            const tempArg = args[++a];
+                            if (typeof tempArg === 'number') {
+                                tempStr = formatNumberNoColor(tempArg, opts);
+                            } else if (typeof tempArg === 'bigint') {
+                                tempStr = formatBigIntNoColor(tempArg, opts);
+                            } else if (
+                                typeof tempArg !== 'object' || tempArg === null || !hasBuiltInToString(tempArg)
+                            ) {
+                                tempStr = String(tempArg);
+                            } else {
+                                tempStr = inspect(tempArg, { ...opts, depth: 0, colors: false, compact: 3 });
+                            }
+                            break;
+                        }
+                        case 106: // 'j'
+                            tempStr = tryStringify(args[++a]);
+                            break;
+                        case 100: { // 'd'
+                            const tempNum = args[++a];
+                            if (typeof tempNum === 'bigint') tempStr = formatBigIntNoColor(tempNum, opts);
+                            else if (typeof tempNum === 'symbol') tempStr = 'NaN';
+                            else tempStr = formatNumberNoColor(Number(tempNum), opts);
+                            break;
+                        }
+                        case 79: // 'O'
+                            tempStr = inspect(args[++a], opts);
+                            break;
+                        case 111: // 'o'
+                            tempStr = inspect(args[++a], {
+                                ...opts,
+                                showHidden: true,
+                                showProxy: true,
+                                depth: 4,
+                            });
+                            break;
+                        case 105: { // 'i'
+                            const tempInteger = args[++a];
+                            if (typeof tempInteger === 'bigint') tempStr = formatBigIntNoColor(tempInteger, opts);
+                            else if (typeof tempInteger === 'symbol') tempStr = 'NaN';
+                            // No radix: Node uses Number.parseInt, so '0x10' is 16.
+                            else tempStr = formatNumberNoColor(parseInt(tempInteger as string), opts);
+                            break;
+                        }
+                        case 102: { // 'f'
+                            const tempFloat = args[++a];
+                            if (typeof tempFloat === 'symbol') tempStr = 'NaN';
+                            else tempStr = formatNumberNoColor(parseFloat(tempFloat as string), opts);
+                            break;
+                        }
+                        case 99: // 'c'
+                            a += 1;
+                            tempStr = '';
+                            break;
+                        case 37: // '%'
+                            str += first.slice(lastPos, i);
+                            lastPos = i + 1;
+                            continue;
+                        default:
+                            continue;
                     }
-                    break;
-                case 'o':
-                case 'O':
-                    result += inspect(args[argIndex++], {
-                        depth: specifier === 'O' ? Infinity : 4,
-                        showHidden: specifier === 'o',
-                    });
-                    break;
-                default:
-                    result += '%' + specifier;
-                    break;
+                    if (lastPos !== i - 1) str += first.slice(lastPos, i - 1);
+                    str += tempStr;
+                    lastPos = i + 1;
+                } else if (nextChar === 37) {
+                    str += first.slice(lastPos, i);
+                    lastPos = i + 1;
+                }
             }
-        } else {
-            result += format[i++];
+        }
+        if (lastPos !== 0) {
+            a++;
+            join = ' ';
+            if (lastPos < first.length) str += first.slice(lastPos);
         }
     }
 
-    // Append remaining arguments
-    while (argIndex < args.length) {
-        result += ' ' + inspect(args[argIndex++]);
+    while (a < args.length) {
+        const value = args[a];
+        str += join;
+        str += typeof value !== 'string' ? inspect(value, opts) : value;
+        join = ' ';
+        a++;
     }
-
-    return result;
+    return str;
 }
 
-export function formatWithOptions(inspectOptions: InspectOptions, format?: unknown, ...args: unknown[]): string {
-    if (format === undefined) {
-        return '';
-    }
-
-    const inspectOpts: InspectOptions = {
-        colors: inspectOptions.colors,
-        depth: inspectOptions.depth ?? undefined,
-        showHidden: inspectOptions.showHidden,
-        maxArrayLength: inspectOptions.maxArrayLength,
-        maxStringLength: inspectOptions.maxStringLength,
-        breakLength: inspectOptions.breakLength,
-        compact: inspectOptions.compact,
-        sorted: inspectOptions.sorted,
-    };
-
-    if (typeof format !== 'string') {
-        const result = console.inspect(format, inspectOpts);
-        if (args.length > 0) {
-            return result + ' ' + args.map(a => console.inspect(a, inspectOpts)).join(' ');
+function tryStringify(arg: unknown): string {
+    try {
+        const res = JSON.stringify(arg);
+        return res === undefined ? 'undefined' : res;
+    } catch (err) {
+        if (err instanceof TypeError && /circular|cyclic/i.test(err.message)) {
+            return '[Circular]';
         }
-        return result;
+        throw err;
     }
-
-    let result = '';
-    let argIndex = 0;
-    let i = 0;
-    while (i < format.length) {
-        if (format[i] === '%' && i + 1 < format.length) {
-            const specifier = format[i + 1];
-            i += 2;
-            if (specifier === '%') {
-                result += '%';
-                continue;
-            }
-            if (argIndex >= args.length) {
-                result += '%' + specifier;
-                continue;
-            }
-            switch (specifier) {
-                case 's':
-                    result += String(args[argIndex++]);
-                    break;
-                case 'd':
-                    result += formatNumber(args[argIndex++]);
-                    break;
-                case 'i':
-                    result += formatInteger(args[argIndex++]);
-                    break;
-                case 'f':
-                    result += parseFloat(String(args[argIndex++]));
-                    break;
-                case 'j':
-                    try {
-                        result += JSON.stringify(args[argIndex++]);
-                    } catch {
-                        result += '[Circular]';
-                    }
-                    break;
-                case 'o':
-                case 'O':
-                    result += console.inspect(args[argIndex++], {
-                        ...inspectOpts,
-                        depth: specifier === 'O' ? Infinity : inspectOpts.depth,
-                        showHidden: specifier === 'o' ? true : inspectOpts.showHidden,
-                    });
-                    break;
-                default:
-                    result += '%' + specifier;
-                    break;
-            }
-        } else {
-            result += format[i++];
-        }
-    }
-
-    while (argIndex < args.length) {
-        result += ' ' + console.inspect(args[argIndex++], inspectOpts);
-    }
-
-    return result;
 }
 
 // VT control characters
@@ -327,22 +286,38 @@ const ANSI_STYLE_CLOSE: Record<string, string> = {
 };
 
 export function styleText(format: string | string[], text: string, options?: { validateStream?: boolean }): string {
+    if (typeof text !== 'string') {
+        throw invalidArgType('text', 'string', text);
+    }
     const formats = Array.isArray(format) ? format : [format];
     const validate = options?.validateStream !== false;
+    let skipColorize = false;
     if (validate) {
         try {
-            if (os.guessHandle(os.STDOUT_FILENO) !== 'tty') return text;
+            skipColorize = os.guessHandle(os.STDOUT_FILENO) !== 'tty';
         } catch {}
     }
-    let out = text;
-    for (let i = 0; i < formats.length; i++) {
-        const name = formats[i];
-        if (name === undefined) continue;
-        const open = ANSI_STYLE_OPEN[name];
-        const close = ANSI_STYLE_CLOSE[name];
-        if (open && close) out = `${open}${out}${close}`;
+
+    // Opens accumulate in order; closes are prepended so they unwind in
+    // reverse, which is what Node emits for a multi-style array.
+    let openCodes = '';
+    let closeCodes = '';
+    for (const name of formats) {
+        if (name === 'none') continue;
+        const open = ANSI_STYLE_OPEN[name as string];
+        const close = ANSI_STYLE_CLOSE[name as string];
+        if (open === undefined || close === undefined) {
+            const err = new TypeError(
+                `The argument 'format' must be one of: ${Object.keys(ANSI_STYLE_OPEN).join(', ')}. Received ${JSON.stringify(name)}`,
+            ) as TypeError & { code?: string };
+            err.code = 'ERR_INVALID_ARG_VALUE';
+            throw err;
+        }
+        openCodes += open;
+        closeCodes = close + closeCodes;
     }
-    return out;
+    if (skipColorize) return text;
+    return `${openCodes}${text}${closeCodes}`;
 }
 
 export function debuglog(section: string, callback?: (fn: (...args: unknown[]) => void) => void): (...args: unknown[]) => void {
@@ -390,73 +365,50 @@ export function isDeepStrictEqual(a: unknown, b: unknown): boolean {
 
 // inspect
 
-export interface InspectOptions {
-    showHidden?: boolean;
-    depth?: number | null;
-    colors?: boolean;
-    customInspect?: boolean;
-    showProxy?: boolean;
-    maxArrayLength?: number | null;
-    maxStringLength?: number | null;
-    breakLength?: number;
-    compact?: boolean | number;
-    sorted?: boolean | ((a: string, b: string) => number);
-    getters?: boolean | 'get' | 'set';
-    numericSeparator?: boolean;
-}
-
-const defaultInspectOptions: InspectOptions = {
-    showHidden: false,
-    depth: 2,
-    colors: false,
-    customInspect: true,
-    showProxy: false,
-    maxArrayLength: 100,
-    maxStringLength: 10000,
-    breakLength: 80,
-    compact: true,
-    sorted: false,
-    getters: false,
-    numericSeparator: false,
-};
-
-export function inspect(object: unknown, options?: InspectOptions): string {
-    const opts = options ?? defaultInspectOptions;
-    return console.inspect(object, {
-        colors: opts.colors,
-        depth: opts.depth ?? undefined,
-        showHidden: opts.showHidden,
-        maxArrayLength: opts.maxArrayLength,
-        maxStringLength: opts.maxStringLength,
-        breakLength: opts.breakLength,
-        compact: opts.compact,
-        sorted: opts.sorted,
-    });
-}
-
-inspect.defaultOptions = defaultInspectOptions;
-inspect.custom = Symbol.for('nodejs.util.inspect.custom');
+export type { InspectOptions } from './inspect';
+export { inspect } from './inspect';
+// Myers line diff + assert's inspect option set. `assert` imports these to build
+// Node-style `+ actual` / `- expected` messages; in Node this machinery also
+// lives under util (internal/util/diff).
+export {
+    diff,
+    inspectDiff,
+    inspectForAssert,
+    kOperations,
+    myersDiff,
+    printMyersDiff,
+} from './diff';
+export type { DiffEntry, DiffOperation } from './diff';
+import { inspect, defaultInspectOptions, formatNumberNoColor, formatBigIntNoColor, hasBuiltInToString } from './inspect';
+import type { InspectOptions } from './inspect';
 
 // Inheritance
 
 export function inherits(constructor: InheritableFunction, superConstructor: InheritableFunction): void {
     if (constructor === undefined || constructor === null) {
-        throw new TypeError('The constructor to inherit from must be non-null');
+        throw invalidArgType('ctor', 'function', constructor);
     }
 
     if (superConstructor === undefined || superConstructor === null) {
-        throw new TypeError('The super constructor to inherit from must be non-null');
+        throw invalidArgType('superCtor', 'function', superConstructor);
     }
 
     if (typeof superConstructor !== 'function') {
-        throw new TypeError('The super constructor must be a function');
+        throw invalidArgType('superCtor', 'function', superConstructor);
+    }
+
+    if (superConstructor.prototype === undefined) {
+        throw invalidArgType('superCtor.prototype', 'object', superConstructor.prototype);
     }
 
     Object.setPrototypeOf(constructor.prototype, superConstructor.prototype);
+    // Node leaves super_ writable and configurable; locking it makes a second
+    // inherits() call on the same constructor throw.
     Object.defineProperty(constructor, 'super_', {
         value: superConstructor,
-        writable: false,
-        configurable: false,
+        writable: true,
+        enumerable: false,
+        configurable: true,
     });
 }
 
@@ -466,9 +418,29 @@ export function deprecate<T extends AnyCallable>(fn: T, message: string, code?: 
     let warned = false;
 
     const deprecated = function (this: ThisParameterType<T>, ...args: Parameters<T>): ReturnType<T> {
-        if (!warned) {
+        // Read the global lazily: a static `../process` import from util would cycle.
+        const proc = (globalThis as { process?: object }).process;
+        // Node checks noDeprecation SYNCHRONOUSLY here, before emitWarning, and does
+        // NOT consume the once-flag when suppressed — a later call with the flag
+        // cleared still warns. Verified against v24.18 (emitWarning spy 0 then 1).
+        const suppressed = proc !== undefined && proc !== null &&
+            Boolean(Reflect.get(proc, 'noDeprecation'));
+        if (!warned && !suppressed) {
             warned = true;
-            if (code) {
+            // Routing through process.emitWarning is what makes process.on('warning')
+            // fire and what gives the warning its DeprecationWarning name/code.
+            // A bare console.warn bypasses both.
+            const emit = proc === undefined || proc === null
+                ? undefined
+                : (Reflect.get(proc, 'emitWarning') as unknown);
+            if (typeof emit === 'function') {
+                Reflect.apply(emit as (...a: unknown[]) => unknown, proc as object, [
+                    message,
+                    code === undefined
+                        ? { type: 'DeprecationWarning' }
+                        : { type: 'DeprecationWarning', code },
+                ]);
+            } else if (code !== undefined) {
                 console.warn(`[${code}] DeprecationWarning: ${message}`);
             } else {
                 console.warn(`DeprecationWarning: ${message}`);
@@ -477,7 +449,16 @@ export function deprecate<T extends AnyCallable>(fn: T, message: string, code?: 
         return Reflect.apply(fn, this, args) as ReturnType<T>;
     } as T;
 
-    Object.defineProperty(deprecated, 'name', { value: fn.name });
+    // Wrapping a constructor must keep its prototype, or `new wrapped()` yields an
+    // object that is not `instanceof` the original and has none of its methods.
+    const proto = (fn as unknown as { prototype?: unknown }).prototype;
+    if (proto !== undefined && proto !== null) {
+        try {
+            (deprecated as unknown as { prototype: unknown }).prototype = proto;
+        } catch { /* a frozen wrapper cannot carry the prototype; keep the wrapper usable */ }
+    }
+
+    Object.defineProperty(deprecated, 'name', { value: 'deprecated' });
     Object.defineProperty(deprecated, 'length', { value: fn.length });
 
     return deprecated;
@@ -487,7 +468,7 @@ export function deprecate<T extends AnyCallable>(fn: T, message: string, code?: 
 
 export function callbackify<T, F extends (...args: never[]) => Promise<T>>(fn: F): (...args: unknown[]) => void {
     if (typeof fn !== 'function') {
-        throw new TypeError('The "original" argument must be of type function');
+        throw invalidArgType('original', 'function', fn);
     }
 
     return function (this: unknown, ...args: unknown[]) {
@@ -496,9 +477,9 @@ export function callbackify<T, F extends (...args: never[]) => Promise<T>>(fn: F
             throw new TypeError('Callback must be a function');
         }
 
-        Reflect.apply(fn, this, args).then(
-            (result) => callback(null, result),
-            (err) => {
+        (Reflect.apply(fn, this, args) as Promise<T>).then(
+            (result: T) => callback(null, result),
+            (err: unknown) => {
                 if (err) {
                     callback(err);
                     return;
@@ -515,17 +496,26 @@ export function callbackify<T, F extends (...args: never[]) => Promise<T>>(fn: F
 
 // promisify
 
-export interface PromisifyInterface {
+interface PromisifyInterface {
     __promisify__: AnyCallable;
 }
 
 const kCustomPromisifyArgs = Symbol.for('nodejs.util.promisify.customArgs');
 
+/** Node tags these argument-validation failures with a `code`; callers match on it. */
+function invalidArgType(name: string, expected: string, actual: unknown): TypeError {
+    const err = new TypeError(
+        `The "${name}" argument must be of type ${expected}. Received ${typeof actual}`,
+    ) as TypeError & { code?: string };
+    err.code = 'ERR_INVALID_ARG_TYPE';
+    return err;
+}
+
 export function promisify<T>(fn: AnyCallable): (...args: unknown[]) => Promise<T> {
     const customSymbol = Symbol.for('nodejs.util.promisify.custom');
 
     if (typeof fn !== 'function') {
-        throw new TypeError('The "original" argument must be of type Function');
+        throw invalidArgType('original', 'function', fn);
     }
 
     // Check for existing custom promisify implementation
@@ -561,7 +551,10 @@ export function promisify<T>(fn: AnyCallable): (...args: unknown[]) => Promise<T
         });
     };
 
-    // Copy the custom symbol if it exists on the original
+    // Inherit the original's prototype, then copy every own descriptor so
+    // `name`, `length` and any attached metadata survive promisification.
+    Object.setPrototypeOf(promisified, Object.getPrototypeOf(fn));
+
     Object.defineProperty(promisified, customSymbol, {
         value: promisified,
         writable: false,
@@ -569,7 +562,10 @@ export function promisify<T>(fn: AnyCallable): (...args: unknown[]) => Promise<T
         configurable: true,
     });
 
-    return promisified;
+    return Object.defineProperties(
+        promisified,
+        Object.getOwnPropertyDescriptors(fn),
+    ) as (...args: unknown[]) => Promise<T>;
 }
 
 promisify.custom = Symbol.for('nodejs.util.promisify.custom');
@@ -584,11 +580,22 @@ export const TextDecoder = globalThis.TextDecoder ?? NativeTextDecoder;
 
 // getSystemErrorMap / getSystemErrorName
 
+/** Deprecated in Node but still shipped, and still called by older npm packages. */
+export function _extend(target: Record<PropertyKey, unknown>, source: unknown): Record<PropertyKey, unknown> {
+    if (source === null || typeof source !== 'object') return target;
+    const keys = Object.keys(source);
+    for (let i = 0; i < keys.length; i++) {
+        target[keys[i]!] = (source as Record<string, unknown>)[keys[i]!];
+    }
+    return target;
+}
+
 export function getSystemErrorMap(): Map<number, [string, string]> {
     const errMod = import.meta.use('error');
     const map = new Map<number, [string, string]>();
     for (const [name, code] of Object.entries(errMod.errno)) {
-        if (name === 'OK' || name === 'UNKNOWN') continue;
+        // Node keeps UNKNOWN (-4094) in the map; only OK (0) is absent.
+        if (name === 'OK') continue;
         if (typeof code !== 'number') continue;
         const message = errMod.strerror(code).replace(new RegExp(`^${name}:\\s*`), '');
         map.set(code, [name, message]);
@@ -606,14 +613,16 @@ function validateSystemErrorCode(err: unknown): number {
     return err;
 }
 
-export function getSystemErrorName(err: number): string | undefined {
+export function getSystemErrorName(err: number): string {
     const entry = getSystemErrorMap().get(validateSystemErrorCode(err));
-    return entry?.[0];
+    // Node never returns undefined here — unmapped codes get a synthetic name.
+    return entry ? entry[0] : `Unknown system error ${err}`;
 }
 
-export function getSystemErrorMessage(err: number): string | undefined {
+export function getSystemErrorMessage(err: number): string {
     const entry = getSystemErrorMap().get(validateSystemErrorCode(err));
-    return entry?.[1];
+    // Matches libuv's uv_strerror fallback, which Node surfaces verbatim.
+    return entry ? entry[1] : `Unknown system error ${err}`;
 }
 
 type ParseArgsOption = {
@@ -760,13 +769,34 @@ export function parseArgs(options: {
         }
 
         if (arg.startsWith('-') && arg.length > 1) {
-            const rawShort = arg.slice(1);
-            const eq = rawShort.indexOf('=');
-            const short = eq === -1 ? rawShort : rawShort.slice(0, eq);
-            const name = shorts.get(short) ?? short;
-            const rawName = eq === -1 ? arg : `-${short}`;
-            const inlineValue = eq === -1 ? undefined : rawShort.slice(eq + 1);
-            const consumed = readOption(name, rawName, i, inlineValue);
+            const firstShort = arg.charAt(1);
+            // Node applies no '=' splitting to short options: `-a=1` with a
+            // string type yields the value "=1".
+            if (arg.length > 2) {
+                const firstName = shorts.get(firstShort) ?? firstShort;
+                if (defs[firstName]?.type === 'string') {
+                    // `-fVALUE`
+                    const consumed = readOption(firstName, `-${firstShort}`, i, arg.slice(2));
+                    if (consumed) i += consumed;
+                    continue;
+                }
+                // Short group: expand `-abc` to `-a -b -c`, stopping at a
+                // string-typed option, whose remainder becomes its value.
+                let stop = false;
+                for (let k = 1; k < arg.length && !stop; k++) {
+                    const ch = arg.charAt(k);
+                    const chName = shorts.get(ch) ?? ch;
+                    if (defs[chName]?.type === 'string' && k !== arg.length - 1) {
+                        readOption(chName, `-${ch}`, i, arg.slice(k + 1));
+                        stop = true;
+                    } else {
+                        readOption(chName, `-${ch}`, i, undefined);
+                    }
+                }
+                continue;
+            }
+            const name = shorts.get(firstShort) ?? firstShort;
+            const consumed = readOption(name, arg, i, undefined);
             if (consumed) i += consumed;
             continue;
         }
@@ -1202,6 +1232,7 @@ export default {
     getSystemErrorMap,
     getSystemErrorName,
     getSystemErrorMessage,
+    _extend,
     parseArgs,
     MIMEParams,
     MIMEType,
@@ -1209,4 +1240,10 @@ export default {
     transferableAbortSignal,
     aborted,
     parseEnv,
+};
+
+// `export type` (not `export interface`) so `export * from './mod'`
+// cannot materialise these as undefined runtime exports.
+export type {
+    PromisifyInterface,
 };

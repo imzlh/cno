@@ -1,5 +1,6 @@
 import { requireQuic } from "../quic-native";
 import { bytesToArrayBuffer, toOwnedBytes } from "../utils/bytes";
+import { withSystemCaCerts } from "../utils/ca-certs";
 
 const DEFAULT_ALPN = "cno-quic";
 
@@ -403,6 +404,8 @@ class QuicEndpointImpl implements Deno.QuicEndpoint {
     readonly addr: Deno.NetAddr;
     socket?: CModuleExternalQuic.Socket;
     alpn = DEFAULT_ALPN;
+    /** Native sockets bake in role/ALPN/trust at construction — reuse must match. */
+    role?: "client" | "server";
     #connections = new Set<QuicConnImpl>();
     #closed = false;
 
@@ -429,6 +432,7 @@ class QuicEndpointImpl implements Deno.QuicEndpoint {
             transport: nativeTransport(options),
         });
         this.socket.onerror = (message: string) => this.fail(message);
+        this.role = "server";
         return new QuicListenerImpl(this, this.socket);
     }
 
@@ -466,17 +470,37 @@ function connectQuic(options: Deno.ConnectQuicOptions<boolean>): Promise<Deno.Qu
     else if (options.endpoint instanceof QuicEndpointImpl) endpoint = options.endpoint;
     else throw new TypeError("endpoint must be a Deno.QuicEndpoint created by this runtime");
     endpoint.ensureOpen();
-    endpoint.alpn = firstAlpn(options.alpnProtocols);
     const nativeQuic = requireQuic();
-    endpoint.socket ??= new nativeQuic.Socket({
-        host: endpoint.addr.hostname,
-        port: endpoint.addr.port,
-        alpn: endpoint.alpn,
-        transport: nativeTransport(options),
-        verifyPeer: true,
-        caCerts: options.caCerts,
-    });
-    endpoint.socket.onerror = (message: string) => endpoint.fail(message);
+    const alpn = firstAlpn(options.alpnProtocols);
+    // A native Socket bakes in its role, ALPN and trust store at construction.
+    // A server socket has no verify_certificate at all, so reusing one for a
+    // client handshake would skip chain *and* signature verification entirely.
+    if (endpoint.socket && endpoint.role !== "client") {
+        throw new Error("QUIC endpoint is already in use as a server; use a separate endpoint to connect");
+    }
+    if (endpoint.socket && endpoint.alpn !== alpn) {
+        throw new Error(
+            `QUIC endpoint is already connected with ALPN ${JSON.stringify(endpoint.alpn)}; ` +
+            `reuse cannot renegotiate to ${JSON.stringify(alpn)}`,
+        );
+    }
+    if (endpoint.socket && options.caCerts?.length) {
+        throw new Error("QUIC endpoint is already connected; caCerts cannot be changed on reuse");
+    }
+    if (!endpoint.socket) {
+        endpoint.alpn = alpn;
+        endpoint.socket = new nativeQuic.Socket({
+            host: endpoint.addr.hostname,
+            port: endpoint.addr.port,
+            alpn: endpoint.alpn,
+            transport: nativeTransport(options),
+            verifyPeer: true,
+            // OpenSSL's default verify paths are empty on Windows — merge the OS store.
+            caCerts: withSystemCaCerts(options.caCerts),
+        });
+        endpoint.role = "client";
+        endpoint.socket.onerror = (message: string) => endpoint.fail(message);
+    }
     const nativeConn = endpoint.socket.connect(
         options.hostname,
         options.port,

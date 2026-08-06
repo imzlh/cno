@@ -303,3 +303,51 @@ interface NodeRequireExtensions {
 /** Present when type-checking polyfill sources that reference host process. */
 declare var process: NodeJS.Process;
 declare var require: NodeRequire;
+
+/**
+ * Global timer functions. `lib.dom` is intentionally not loaded, so these are
+ * declared here to match what cno/src/webapi/basic.ts installs on globalThis.
+ * The shapes are the members common to both handle implementations:
+ * webapi `TimeoutOrInterval`/`Immediate` (which `extends Number`) and the
+ * node:timers classes in cno/src/node/timers/mod.ts (which do not).
+ */
+declare namespace NodeJS {
+    interface Timeout {
+        readonly _onTimeout: ((...args: any[]) => void) | null;
+        close(): this;
+        ref(): this;
+        unref(): this;
+        hasRef(): boolean;
+        refresh(): this;
+        [Symbol.toPrimitive](): number;
+        [Symbol.dispose](): void;
+        readonly __cno_timer_id: number;
+    }
+
+    interface Immediate {
+        readonly _onImmediate: (...args: any[]) => void;
+        close(): this;
+        ref(): this;
+        unref(): this;
+        hasRef(): boolean;
+        [Symbol.dispose](): void;
+    }
+}
+
+declare function setTimeout(
+    callback: (...args: any[]) => void,
+    delay?: number,
+    ...args: any[]
+): NodeJS.Timeout;
+declare function clearTimeout(timeout?: NodeJS.Timeout | number): void;
+declare function setInterval(
+    callback: (...args: any[]) => void,
+    delay?: number,
+    ...args: any[]
+): NodeJS.Timeout;
+declare function clearInterval(interval?: NodeJS.Timeout | number): void;
+declare function setImmediate(
+    callback: (...args: any[]) => void,
+    ...args: any[]
+): NodeJS.Immediate;
+declare function clearImmediate(immediate?: NodeJS.Immediate | number): void;

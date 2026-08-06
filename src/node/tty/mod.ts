@@ -17,6 +17,8 @@ type TTYRef = { stream: CModuleStreams.TTY; owned: boolean };
 
 const RESIZE_POLL_MS = 250;
 
+const isWindows = os.uname().sysname === 'Windows_NT';
+
 const { readBufSize: READ_BUF_SIZE } = getTierLimits();
 
 function validateFd(fd: number): void {
@@ -84,6 +86,121 @@ function ansiForMoveCursor(dx: number, dy: number): string {
     return code;
 }
 
+const COLORS_2 = 1;
+const COLORS_16 = 4;
+const COLORS_256 = 8;
+const COLORS_16m = 24;
+
+/** Exact TERM matches Node recognises (internal/tty.js TERM_ENVS). */
+const TERM_ENVS: Record<string, number> = {
+    eterm: COLORS_16, cons25: COLORS_16, console: COLORS_16, cygwin: COLORS_16,
+    dtterm: COLORS_16, gnome: COLORS_16, hurd: COLORS_16, jfbterm: COLORS_16,
+    konsole: COLORS_16, kterm: COLORS_16, mlterm: COLORS_16, mosh: COLORS_16m,
+    putty: COLORS_16, st: COLORS_16, 'rxvt-unicode-24bit': COLORS_16m,
+    terminator: COLORS_16m,
+};
+
+const TERM_ENVS_REG_EXP = [
+    /ansi/, /color/, /linux/, /^con[0-9]*x[0-9]/, /^rxvt/, /^screen/, /^xterm/, /^vt100/,
+];
+
+const CI_SIGNS = ['APPVEYOR', 'BUILDKITE', 'CIRCLECI', 'DRONE', 'GITHUB_ACTIONS', 'GITLAB_CI', 'TRAVIS'];
+
+let osReleaseParts: string[] | undefined;
+
+function envDefined(env: Record<string, string> | undefined, key: string): boolean {
+    return envValue(env, key) !== undefined;
+}
+
+/** Mirrors Node's internal/tty.js getColorDepth, including the win32 branch. */
+function computeColorDepth(env?: Record<string, string>): number {
+    const forceColor = envValue(env, 'FORCE_COLOR');
+    if (forceColor !== undefined) {
+        switch (forceColor) {
+            case '':
+            case '1':
+            case 'true': return COLORS_16;
+            case '2': return COLORS_256;
+            case '3': return COLORS_16m;
+            default: return COLORS_2;
+        }
+    }
+
+    const noColor = envValue(env, 'NO_COLOR');
+    if (envDefined(env, 'NODE_DISABLE_COLORS')
+        || (noColor !== undefined && noColor !== '')
+        || envValue(env, 'TERM') === 'dumb') {
+        return COLORS_2;
+    }
+
+    if (isWindows) {
+        // Windows 10 build 10586 added 256 colors, 14931 added truecolor.
+        // TERM is deliberately not consulted here — Node does not either.
+        osReleaseParts ??= os.uname().release.split('.');
+        if (Number(osReleaseParts[0]) >= 10) {
+            const build = Number(osReleaseParts[2]);
+            if (build >= 14931) return COLORS_16m;
+            if (build >= 10586) return COLORS_256;
+        }
+        return COLORS_16;
+    }
+
+    if (envDefined(env, 'TMUX')) return COLORS_256;
+
+    if (envValue(env, 'CI')) {
+        if (CI_SIGNS.some(sign => envDefined(env, sign)) || envValue(env, 'CI_NAME') === 'codeship') {
+            return COLORS_256;
+        }
+        return COLORS_2;
+    }
+
+    if (envDefined(env, 'TEAMCITY_VERSION')) {
+        const version = envValue(env, 'TEAMCITY_VERSION') ?? '';
+        return /^(9\.(0*[1-9]\d*)\.|\d{2,}\.)/.test(version) ? COLORS_16 : COLORS_2;
+    }
+
+    switch (envValue(env, 'TERM_PROGRAM')) {
+        case 'iTerm.app': {
+            const ver = envValue(env, 'TERM_PROGRAM_VERSION') ?? '';
+            return Number(ver.split('.')[0]) >= 3 ? COLORS_16m : COLORS_256;
+        }
+        case 'HyperTerm':
+        case 'MacTerm':
+            return COLORS_16m;
+        case 'Apple_Terminal':
+            return COLORS_256;
+    }
+
+    const term = envValue(env, 'TERM');
+    if (term) {
+        if (/^xterm-256/.test(term)) return COLORS_256;
+        const termEnv = term.toLowerCase();
+        for (const re of TERM_ENVS_REG_EXP) {
+            if (re.test(termEnv)) return COLORS_16;
+        }
+        const exact = TERM_ENVS[termEnv];
+        if (exact) return exact;
+    }
+
+    if (envDefined(env, 'COLORTERM')) return COLORS_16;
+
+    return COLORS_2;
+}
+
+function validateColorCount(count: unknown): number {
+    if (typeof count !== 'number' || !Number.isInteger(count)) {
+        const e = new TypeError(`The "count" argument must be of type number. Received ${typeof count}`);
+        Reflect.set(e, 'code', 'ERR_INVALID_ARG_TYPE');
+        throw e;
+    }
+    if (count < 2) {
+        const e = new RangeError(`The value of "count" is out of range. It must be >= 2 && <= ${Number.MAX_SAFE_INTEGER}. Received ${count}`);
+        Reflect.set(e, 'code', 'ERR_OUT_OF_RANGE');
+        throw e;
+    }
+    return count;
+}
+
 export function isatty(fd: number): boolean {
     if (!Number.isInteger(fd) || fd < 0) return false;
     try {
@@ -98,7 +215,7 @@ export class ReadStream extends Readable {
     bytesRead = 0;
     private handle: CModuleStreams.TTY;
     private owned = false;
-    private closed = false;
+    private ttyClosed = false;
     private retryTimer = 0;
     private readPending = false;
     readonly isTTY: boolean = true;
@@ -138,8 +255,8 @@ export class ReadStream extends Readable {
     }
 
     override destroy(error?: Error | null): this {
-        if (this.closed) return this;
-        this.closed = true;
+        if (this.ttyClosed) return this;
+        this.ttyClosed = true;
         if (this.retryTimer) {
             timers.clearTimeout(this.retryTimer);
             this.retryTimer = 0;
@@ -149,10 +266,10 @@ export class ReadStream extends Readable {
     }
 
     private retryRead(): void {
-        if (this.closed || this.retryTimer) return;
+        if (this.ttyClosed || this.retryTimer) return;
         this.retryTimer = timers.setTimeout(() => {
             this.retryTimer = 0;
-            if (!this.closed) this._readAndResolve();
+            if (!this.ttyClosed) this._readAndResolve();
         }, 1);
     }
 
@@ -167,7 +284,7 @@ export class ReadStream extends Readable {
             const buf = new Uint8Array(size || READ_BUF_SIZE);
             const n = await this.handle.read(buf);
             this.readPending = false;
-            if (this.closed) return;
+            if (this.ttyClosed) return;
             if (!n) {
                 this.push(null);
                 return;
@@ -193,7 +310,7 @@ export class WriteStream extends Writable {
     private owned = false;
     private currentSize: Size;
     private resizeTimer = 0;
-    private closed = false;
+    private ttyClosed = false;
 
     constructor(fd: number, options?: WritableOptions) {
         validateFd(fd);
@@ -248,34 +365,17 @@ export class WriteStream extends Writable {
     }
 
     getColorDepth(env?: Record<string, string>): number {
-        if (!this.isTTY) return 1;
-        const forceColor = envValue(env, 'FORCE_COLOR');
-        if (forceColor === '0') return 1;
-        if (forceColor === '1' || forceColor === '') return 4;
-        if (forceColor === '2') return 8;
-        if (forceColor === '3') return 24;
-        if (envValue(env, 'NO_COLOR') !== undefined) return 1;
-
-        const colorTerm = envValue(env, 'COLORTERM') ?? '';
-        if (/truecolor|24bit/i.test(colorTerm)) return 24;
-
-        const term = envValue(env, 'TERM') ?? '';
-        if (term === 'dumb') return 1;
-        if (/truecolor|24bit/i.test(term)) return 24;
-        if (/256(color)?/i.test(term)) return 8;
-        if (/screen|^xterm|^vt100|^vt220|^rxvt|color|ansi|cygwin|linux/i.test(term)) return 4;
-        if (envValue(env, 'CI')) return 4;
-        return 4;
+        return computeColorDepth(env);
     }
 
     hasColors(count?: number | Record<string, string>, env?: Record<string, string>): boolean {
-        if (!this.isTTY) return false;
-        if (typeof count === 'object') {
+        if (env === undefined && typeof count === 'object' && count !== null) {
             env = count;
             count = undefined;
         }
-        if (count === undefined) return true;
-        return (1 << this.getColorDepth(env)) >= count;
+        // Node defaults to 16 here; returning true unconditionally ignored NO_COLOR.
+        const want = validateColorCount(count === undefined ? 16 : count);
+        return 2 ** this.getColorDepth(env) >= want;
     }
 
     getWindowSize(): [number, number] {
@@ -299,8 +399,8 @@ export class WriteStream extends Writable {
     }
 
     override destroy(error?: Error | null): this {
-        if (this.closed) return this;
-        this.closed = true;
+        if (this.ttyClosed) return this;
+        this.ttyClosed = true;
         this.stopResizePolling();
         if (this.owned) { this.handle.close(); }
         return super.destroy(error);

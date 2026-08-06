@@ -21,6 +21,7 @@ import {
     getAddressFamily,
     getDefaultLookupOrder,
     getDefaultServers,
+    hintFlags,
     isAddressAnswer,
     normalizeLookupError,
     normalizeLookupOptions,
@@ -62,9 +63,13 @@ export const NOTINITIALIZED = 'ENOTINITIALIZED';
 export const LOADIPHLPAPI = 'ELOADIPHLPAPI';
 export const ADDRGETNETWORKPARAMS = 'EADDRGETNETWORKPARAMS';
 export const CANCELLED = 'ECANCELLED';
-export const V4MAPPED = 8;
-export const ALL = 16;
-export const ADDRCONFIG = 32;
+/**
+ * Platform-correct getaddrinfo hint flags — see `hintFlags` in ./_internal.
+ * Node exports the platform's own AI_* values, so these differ on Windows.
+ */
+export const V4MAPPED = hintFlags.V4MAPPED;
+export const ALL = hintFlags.ALL;
+export const ADDRCONFIG = hintFlags.ADDRCONFIG;
 
 export interface ResolveOptions {
     ttl?: boolean;
@@ -103,7 +108,10 @@ type QuerySource = (hostname: string, rrtype: Rrtype) => Promise<CModuleDNS.DNSA
 
 function assertCallback(callback: unknown): asserts callback is (...args: unknown[]) => void {
     if (typeof callback !== 'function') {
-        throw new TypeError('The "callback" argument must be of type function');
+        throw Object.assign(
+            new TypeError(`The "callback" argument must be of type function. Received ${String(callback)}`),
+            { code: 'ERR_INVALID_ARG_TYPE' },
+        );
     }
 }
 
@@ -125,12 +133,15 @@ function completeResolve(
         answers => {
             const result = shapeAnswers(rrtype, answers);
             if (rrtype === 'SOA' && result === null) {
-                callback(createDnsError(NODATA, 'querySoa', hostname), null);
+                callback(createDnsError(NODATA, 'querySoa', hostname));
             } else {
                 callback(null, result);
             }
         },
-        error => callback(error, null),
+        // Node invokes the callback with the error alone on failure, so the
+        // callback observes arguments.length === 1. Passing an explicit null
+        // second argument makes it 2 and breaks arity-sensitive wrappers.
+        error => callback(error),
     );
 }
 
@@ -157,7 +168,7 @@ function resolveAddress(
                 ? addresses.map(answer => ({ address: answer.address, ttl: answer.ttl }))
                 : addresses.map(answer => answer.address));
         },
-        error => callback(error, null),
+        error => callback(error),
     );
 }
 
@@ -172,10 +183,16 @@ export function lookup(hostname: unknown, options?: unknown, callback?: unknown)
         options = undefined;
     }
     if (hostname && typeof hostname !== 'string') {
-        throw new TypeError(`The "hostname" argument must be of type string. Received ${String(hostname)}`);
+        throw Object.assign(
+            new TypeError(`The "hostname" argument must be of type string. Received type ${typeof hostname} (${String(hostname)})`),
+            { code: 'ERR_INVALID_ARG_TYPE' },
+        );
     }
     if (typeof hostname === 'string' && hostname.includes('\0')) {
-        throw new TypeError('The "hostname" argument must be a string without null bytes');
+        throw Object.assign(
+            new TypeError('The "hostname" argument must be a string without null bytes'),
+            { code: 'ERR_INVALID_ARG_VALUE' },
+        );
     }
     assertCallback(callback);
     const normalized = normalizeLookupOptions(options, getDefaultLookupOrder(), true);
@@ -188,7 +205,10 @@ export function lookup(hostname: unknown, options?: unknown, callback?: unknown)
         return;
     }
     if (typeof hostname !== 'string') {
-        throw new TypeError(`The "hostname" argument must be of type string. Received ${String(hostname)}`);
+        throw Object.assign(
+            new TypeError(`The "hostname" argument must be of type string. Received type ${typeof hostname} (${String(hostname)})`),
+            { code: 'ERR_INVALID_ARG_TYPE' },
+        );
     }
     const matchedFamily = getAddressFamily(hostname);
     if (matchedFamily !== 0) {
@@ -376,6 +396,14 @@ export function lookupService(address: string, port: number, callback: unknown):
     );
 }
 
+// lookupService's callback is (err, hostname, service), so util.promisify must
+// fold the two values into { hostname, service } rather than resolving to the
+// hostname alone.
+Object.defineProperty(lookupService, Symbol.for('nodejs.util.promisify.customArgs'), {
+    value: ['hostname', 'service'],
+    enumerable: false,
+});
+
 export class Resolver {
     private readonly resolver: ResolverQuery;
 
@@ -393,6 +421,15 @@ export class Resolver {
 
     setServers(servers: string[]): void {
         this.resolver.setServers(servers);
+    }
+
+    /**
+     * Node binds the resolver's outgoing socket to these addresses. cno's DNS
+     * queries do not expose a source-address knob, so the values are validated
+     * and recorded for API parity without affecting routing.
+     */
+    setLocalAddress(ipv4?: string, ipv6?: string): void {
+        this.resolver.setLocalAddress(ipv4, ipv6);
     }
 
     private query = (hostname: string, rrtype: Rrtype): Promise<CModuleDNS.DNSAnswer[]> => this.resolver.query(hostname, rrtype);

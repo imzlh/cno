@@ -1,31 +1,38 @@
 const enabledCounts = new Map<string, number>();
 
-export interface CreateTracingOptions {
+export type CreateTracingOptions = {
     categories: string[];
-}
+};
 
-export interface Tracing {
+export type Tracing = {
     readonly categories: string;
     readonly enabled: boolean;
     enable(): void;
     disable(): void;
+};
+
+/** Node stamps ERR_INVALID_ARG_TYPE on these; callers branch on .code. */
+function invalidArgType(message: string): TypeError {
+    return Object.assign(new TypeError(message), { code: 'ERR_INVALID_ARG_TYPE' });
 }
 
 function validateCategories(options: unknown): string[] {
     if (options === null || typeof options !== 'object') {
-        throw new TypeError('The "options" argument must be of type object');
+        throw invalidArgType('The "options" argument must be of type object');
     }
 
     const categories = (options as { categories?: unknown }).categories;
     if (!Array.isArray(categories)) {
-        throw new TypeError('The "options.categories" property must be an instance of Array');
+        throw invalidArgType('The "options.categories" property must be an instance of Array');
     }
     if (categories.length === 0) {
-        throw new TypeError('At least one category is required');
+        throw Object.assign(new TypeError('At least one category is required'), {
+            code: 'ERR_TRACE_EVENTS_CATEGORY_REQUIRED',
+        });
     }
     for (let i = 0; i < categories.length; i++) {
         if (typeof categories[i] !== 'string') {
-            throw new TypeError(`The "options.categories[${i}]" property must be of type string`);
+            throw invalidArgType(`The "options.categories[${i}]" property must be of type string`);
         }
     }
     return categories;

@@ -86,6 +86,51 @@ export function normalizeHeaderValue(value: unknown): string | undefined {
     return String(value);
 }
 
+/**
+ * Node's duplicate-header merge rules for an *incoming* message's `headers`
+ * object (`headersDistinct` always keeps every value, so it is unaffected).
+ *
+ * Measured against node v24 with a raw peer sending the same name twice
+ * (/d/tmp/ag-http/p12-dup.js). Node has three behaviours, not one:
+ *   - `set-cookie`  -> array of every value
+ *   - the discard list below -> FIRST value wins, later copies dropped
+ *   - `cookie`      -> joined with "; "
+ *   - everything else -> joined with ", "
+ * cno previously turned *every* duplicate into an array, so 28 of the 30 names
+ * probed disagreed with node: `res.headers['content-type']` came back as
+ * ["A","B"] where node gives "A", and `x-custom` as ["A","B"] where node gives
+ * "A, B". Any consumer calling .split()/.toLowerCase()/.includes() on a header
+ * value hit "not a function" only when a duplicate happened to arrive, which is
+ * exactly the input a caller never tests with.
+ */
+const SINGLE_VALUE_HEADERS = new Set([
+    'age', 'authorization', 'content-length', 'content-type', 'etag', 'expires',
+    'from', 'host', 'if-modified-since', 'if-unmodified-since', 'last-modified',
+    'location', 'max-forwards', 'proxy-authorization', 'referer', 'retry-after',
+    'server', 'user-agent',
+]);
+
+export function mergeIncomingHeader(
+    target: Record<string, string | string[] | undefined>,
+    lowerName: string,
+    value: string,
+): void {
+    const existing = target[lowerName];
+    if (existing === undefined) {
+        target[lowerName] = lowerName === 'set-cookie' ? [value] : value;
+        return;
+    }
+    if (lowerName === 'set-cookie') {
+        if (Array.isArray(existing)) existing.push(value);
+        else target[lowerName] = [existing, value];
+        return;
+    }
+    // First value wins; a later duplicate is discarded outright.
+    if (SINGLE_VALUE_HEADERS.has(lowerName)) return;
+    const separator = lowerName === 'cookie' ? '; ' : ', ';
+    target[lowerName] = `${Array.isArray(existing) ? existing.join(separator) : existing}${separator}${value}`;
+}
+
 export function normalizeHeaderRecord(headers: object): Record<string, string> {
     const out: Record<string, string> = {};
     for (const [key, value] of Object.entries(headers)) {
@@ -97,8 +142,7 @@ export function normalizeHeaderRecord(headers: object): Record<string, string> {
 
 export function headerEntriesToRecord(headers: Iterable<[string, string]>): Record<string, string> {
     const out: Record<string, string> = {};
-    for (const [key, value] of headers) out[key] = value;
-    return out;
+    for (const [key, value] of headers) out[key] = value;    return out;
 }
 
 export function toUint8Array(chunk: unknown, encodeString: (value: string) => Uint8Array): Uint8Array {
@@ -191,13 +235,7 @@ export function setupResponseParser<T extends ResponseParserMessage>(ctx: Respon
         const targetHeaders = (responseStarted ? res.trailers : currentHeaders) as HeaderMap;
         const targetDistinct = (responseStarted ? res.trailersDistinct : currentHeadersDistinct) as Record<string, string[]>;
         const targetRaw = responseStarted ? res.rawTrailers : currentRawHeaders;
-        const existing = targetHeaders[lowerField];
-        if (existing) {
-            if (Array.isArray(existing)) existing.push(currentHeaderValue);
-            else targetHeaders[lowerField] = [existing, currentHeaderValue];
-        } else {
-            targetHeaders[lowerField] = currentHeaderValue;
-        }
+        mergeIncomingHeader(targetHeaders as Record<string, string | string[] | undefined>, lowerField, currentHeaderValue);
         targetRaw.push(currentHeaderField, currentHeaderValue);
         (targetDistinct[lowerField] ??= []).push(currentHeaderValue);
         currentHeaderField = '';

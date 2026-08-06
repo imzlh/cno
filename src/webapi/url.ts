@@ -2,11 +2,52 @@
 // Full implementation of URL and URLSearchParams, supports special path formats
 
 import { Blob, blobBytesSymbol } from './formdata';
+import { sanitizeSurrogates } from '../utils/bytes';
+
+const textMod = import.meta.use('text');
+const utf8Encoder = new textMod.Encoder('utf-8');
+
+/**
+ * Percent-decode to bytes, then UTF-8 decode. The spec percent-decodes a byte
+ * sequence and substitutes U+FFFD for malformed input; `String.fromCharCode`
+ * per byte would instead hand back Latin-1 characters, and
+ * `engine.decodeString` would leak WTF-8 lone surrogates.
+ */
+const percentDecodeUtf8 = (str: string): string => {
+    const source = utf8Encoder.encode(sanitizeSurrogates(str));
+    const out = new Uint8Array(source.length);
+    let length = 0;
+    for (let i = 0; i < source.length;) {
+        // '%' followed by two hex digits — all ASCII, so a byte scan is safe.
+        if (source[i] === 0x25 && i + 2 < source.length) {
+            const hi = hexValue(source[i + 1]!);
+            const lo = hexValue(source[i + 2]!);
+            if (hi >= 0 && lo >= 0) {
+                out[length++] = (hi << 4) | lo;
+                i += 3;
+                continue;
+            }
+        }
+        out[length++] = source[i]!;
+        i++;
+    }
+    return new textMod.Decoder().decode(out.subarray(0, length));
+};
+
+const hexValue = (byte: number): number => {
+    if (byte >= 0x30 && byte <= 0x39) return byte - 0x30;
+    if (byte >= 0x41 && byte <= 0x46) return byte - 0x41 + 10;
+    if (byte >= 0x61 && byte <= 0x66) return byte - 0x61 + 10;
+    return -1;
+};
 
 // ==================== Utility Functions ====================
 
 const USERINFO_ENCODE_SET = /[^\w.~!$&'()*+,;=:-]/g;
 const PATH_ENCODE_SET = /[^\w.~!$&'()*+,;=:@\/%-]/g;
+// Backslash is a separator only for special schemes. In a hierarchical
+// non-special URL it is ordinary path data and serializes literally.
+const NON_SPECIAL_PATH_ENCODE_SET = /[^\w.~!$&'()*+,;=:@\/%\\-]/g;
 const FRAGMENT_ENCODE_SET = /[^\w.~!$&'()*+,;=:@\/?%-]/g;
 const objectUrlStore = new Map<string, Blob>();
 let objectUrlCounter = 0;
@@ -64,14 +105,16 @@ const percentDecode = (str: string): string => {
     try {
         return decodeURIComponent(str);
     } catch {
-        return str.replace(/%([0-9A-Fa-f]{2})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+        return percentDecodeUtf8(str);
     }
 };
 
 const URL_TEXT_ENCODE_SET = /[^\x21-\x7E]/;
 
+// Lone surrogates make encodeURIComponent throw; the URL spec UTF-8-encodes
+// them as U+FFFD instead.
 const formUrlEncode = (str: string): string => {
-    return encodeURIComponent(str)
+    return encodeURIComponent(sanitizeSurrogates(str))
         .replace(/[!'()~]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`)
         .replace(/%20/g, '+');
 };
@@ -81,7 +124,8 @@ const formUrlDecode = (str: string): string => {
     try {
         return decodeURIComponent(normalized);
     } catch {
-        return percentDecode(str.replace(/\+/g, ' '));
+        // Malformed UTF-8 in the escapes — decode to bytes and substitute U+FFFD.
+        return percentDecodeUtf8(str.replace(/\+/g, ' '));
     }
 };
 
@@ -91,9 +135,53 @@ const isIterable = (value: unknown): value is Iterable<unknown> => {
     return typeof iterator === 'function';
 };
 
+/** `C:` / `c|` — a normalized Windows drive letter as a single path segment. */
+const isWindowsDriveSegment = (segment: string | undefined): segment is string =>
+    typeof segment === 'string' && /^[a-zA-Z][:|]$/.test(segment);
+
+/**
+ * Dot-segment classification, per the WHATWG URL path state.
+ *
+ * A single-dot segment is `.` or `%2e`; a double-dot segment is `..`, `.%2e`,
+ * `%2e.` or `%2e%2e` — all ASCII case-insensitive. EVERYTHING else, including
+ * the empty string, is an ordinary segment that must be preserved verbatim.
+ * Treating `''` as a dot segment collapsed `/prefix//key.txt` to
+ * `/prefix/key.txt` and `//x` to `/x`, which for an S3-style object key or any
+ * server that distinguishes `//` names a different resource. The empty segment
+ * is also what carries a trailing slash: `/a/b/` splits to `['a','b','']`.
+ *
+ * Compared with `toLowerCase` (never `toLocaleLowerCase`) against literal
+ * ASCII, so the result does not depend on the host locale.
+ */
+const SINGLE_DOT_SEGMENTS = new Set(['.', '%2e']);
+const DOUBLE_DOT_SEGMENTS = new Set(['..', '.%2e', '%2e.', '%2e%2e']);
+
+/** 0 = ordinary segment, 1 = single-dot, 2 = double-dot. */
+const dotSegmentKind = (segment: string): number => {
+    // Every dot form is at most 6 characters, so longer segments skip the
+    // lowercasing allocation entirely.
+    if (segment.length === 0 || segment.length > 6) return 0;
+    const lower = segment.toLowerCase();
+    if (DOUBLE_DOT_SEGMENTS.has(lower)) return 2;
+    if (SINGLE_DOT_SEGMENTS.has(lower)) return 1;
+    return 0;
+};
+
 function requireArguments(name: string, actual: number, required: number): void {
     if (actual >= required) return;
     throw new TypeError(`${name} requires at least ${required} argument${required === 1 ? '' : 's'}`);
+}
+
+/**
+ * URL parse failures must carry `code: 'ERR_INVALID_URL'` like Node's, or every
+ * `catch (e) { if (e.code === 'ERR_INVALID_URL') ... }` in the wild silently
+ * takes the wrong branch. Node also exposes the offending input as `.input`.
+ */
+function invalidUrl(message: string, input?: string): TypeError {
+    const err = new TypeError(message) as TypeError & { code?: string; input?: string };
+    err.code = 'ERR_INVALID_URL';
+    if (input !== undefined) err.input = input;
+    return err;
 }
 
 const normalizeWindowsPath = (path: string): string => {
@@ -346,6 +434,12 @@ class URL implements globalThis.URL {
     #host = '';
     #port = '';
     #path: string[] = [];
+    /**
+     * "Cannot-be-a-base" URLs (`data:`, `mailto:`, `blob:` — any non-special
+     * scheme not followed by `//`) keep an opaque path: one verbatim string that
+     * is never split, normalized, or given a leading `/`.
+     */
+    #opaquePath: string | null = null;
     #hasQuery = false;
     #query: string | null = null;
     #fragment = '';
@@ -380,7 +474,18 @@ class URL implements globalThis.URL {
     }
 
     #parse(input: string, base?: string | globalThis.URL): void {
-        input = String(input).trim();
+        // Spec order: strip leading/trailing C0-controls-and-space, then remove
+        // ALL tab/LF/CR from anywhere in the input.
+        //
+        // JS `.trim()` is wrong in both directions here: it strips Unicode spaces
+        // the spec keeps (`#a ` must survive as `#a%C2%A0`, not become `#a`)
+        // and keeps C0 controls the spec strips (`#a\u0000` must become `#a`).
+        // And without the tab/LF/CR removal, `ht\ttp://x` throws where Node
+        // parses it as `http://x/`.
+        input = String(input)
+            .replace(/^[\u0000- ]+/, '')
+            .replace(/[\u0000- ]+$/, '')
+            .replace(/[\t\n\r]/g, '');
 
         // Standard URL parsing
         const baseUrl = base ? (typeof base === 'string' ? new URL(base) : base as URL) : null;
@@ -416,6 +521,12 @@ class URL implements globalThis.URL {
 
         // Parse scheme
         const schemeMatch = input.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):/);
+        // Track whether the scheme came from the input or was inherited from the
+        // base. The opaque-path branch below must only fire for a scheme spelled
+        // out in the input: with an inherited scheme the spec is still in a
+        // relative state, so `new URL('/a','git://base/x')` keeps the base's
+        // authority (`git://base/a`) rather than becoming an opaque `git:/a`.
+        const schemeFromInput = schemeMatch !== null;
         if (schemeMatch) {
             this.#scheme = schemeMatch[1].toLowerCase();
             input = input.slice(schemeMatch[0].length);
@@ -425,21 +536,74 @@ class URL implements globalThis.URL {
         } else if (baseUrl) {
             this.#scheme = baseUrl.#scheme;
         } else {
-            throw new TypeError('Invalid URL: no scheme');
+            throw invalidUrl('Invalid URL: no scheme');
         }
 
         // Special scheme handling
         const isSpecial = this.#scheme in SPECIAL_SCHEMES;
 
+        // A non-special scheme has an opaque path only when what follows the
+        // scheme does NOT start with `/`. Per WHATWG, `/` enters "path or
+        // authority state" and builds a list path, so `foo:/a/b` is a valid
+        // base: `new URL('./x','foo:/a/b')` is `foo:/a/x`, not an error.
+        // Testing for `//` instead misclassified every path-absolute
+        // non-special URL — which is every `pack:/…` `import.meta.url`.
+        // Only fires for a scheme spelled out in the input; an inherited scheme
+        // means we are resolving a relative reference, which is not opaque.
+        if (!isSpecial && schemeFromInput && !input.startsWith('/')) {
+            this.#opaquePath = input;
+            if (this.#query !== null) {
+                this.#searchParams._replaceFromQuery(this.#query);
+            }
+            return;
+        }
+
+        // Relative reference against a base with an OPAQUE path: per the spec's
+        // "no scheme state", ONLY a fragment-only reference is valid — anything
+        // else is a parse failure. Node and Deno both throw for './x', '../x',
+        // '/x', 'x', '?q' and even ''.
+        //
+        // The previous predicate tested `this.#fragment === null`, which is dead
+        // code: #fragment initializes to '' and is only ever assigned a string,
+        // so the guard never fired. That let '' and '?q' fall through to the
+        // verbatim-copy branch below and silently produce
+        // `data:text/plain,hello` / `data:text/plain,hello?q` where both oracles
+        // throw. Test the explicit #hasFragment / #hasQuery flags instead.
+        if (!isSpecial && !schemeFromInput && baseUrl !== null && baseUrl.#opaquePath !== null) {
+            if (input !== '' || this.#hasQuery || !this.#hasFragment) {
+                throw invalidUrl('Invalid URL');
+            }
+            // Fragment-only against an opaque base keeps the base path verbatim.
+            this.#opaquePath = baseUrl.#opaquePath;
+            if (this.#query === null && baseUrl.#hasQuery) {
+                this.#query = baseUrl.#query;
+                this.#hasQuery = true;
+            }
+            if (this.#query !== null) {
+                this.#searchParams._replaceFromQuery(this.#query);
+            }
+            return;
+        }
+
         // Parse authority
         if (input.startsWith('//')) {
             input = input.slice(2);
 
-            const authorityEnd = input.search(/[/?#]/);
+            const authorityEnd = input.search(isSpecial ? /[/?#\\]/ : /[/?#]/);
             const authority = authorityEnd === -1 ? input : input.slice(0, authorityEnd);
-            input = authorityEnd === -1 ? '' : input.slice(authorityEnd);
+            const rest = authorityEnd === -1 ? '' : input.slice(authorityEnd);
 
-            this.#parseAuthority(authority);
+            // "file host state": a Windows drive letter is never a host — it starts
+            // the path (`file://C:/x` is `file:///C:/x`), and `localhost` drops.
+            if (this.#scheme === 'file' && isWindowsDriveLetter(authority)) {
+                input = '/' + authority + rest;
+            } else {
+                input = rest;
+                this.#parseAuthority(authority);
+                if (this.#scheme === 'file' && this.#host.toLowerCase() === 'localhost') {
+                    this.#host = '';
+                }
+            }
         } else if (baseUrl && this.#scheme === baseUrl.#scheme) {
             this.#username = baseUrl.#username;
             this.#password = baseUrl.#password;
@@ -507,7 +671,7 @@ class URL implements globalThis.URL {
             // IPv6
             const endBracket = authority.indexOf(']');
             if (endBracket === -1) {
-                throw new TypeError('Invalid URL: unclosed IPv6 address');
+                throw invalidUrl('Invalid URL: unclosed IPv6 address');
             }
             this.#host = authority.slice(0, endBracket + 1).toLowerCase();
             authority = authority.slice(endBracket + 1);
@@ -527,7 +691,7 @@ class URL implements globalThis.URL {
             if (portStr && /^\d+$/.test(portStr)) {
                 const port = parseInt(portStr, 10);
                 if (port > 65535) {
-                    throw new TypeError('Invalid URL: invalid port');
+                    throw invalidUrl('Invalid URL: invalid port');
                 }
                 // Only set when non-default port
                 const defaultPort = SPECIAL_SCHEMES[this.#scheme];
@@ -535,42 +699,81 @@ class URL implements globalThis.URL {
                     this.#port = String(port);
                 }
             } else if (portStr) {
-                throw new TypeError('Invalid URL: invalid port');
+                throw invalidUrl('Invalid URL: invalid port');
             }
         }
     }
 
     #parsePath(path: string, isSpecial: boolean): void {
+        // Special schemes treat `\` as a path separator (query/fragment are already split off).
+        if (isSpecial) path = path.replace(/\\/g, '/');
+
         if (path.startsWith('/')) {
-            this.#path = [];
+            // An absolute reference resets the path — except that for `file:` the
+            // spec's path-start state PRESERVES a Windows drive letter from the
+            // base. Without this, `new URL('/x','file:///C:/dir/f.txt')` yields
+            // `file:///x` instead of Node's `file:///C:/x`, silently losing the
+            // drive on the Windows module-resolution path.
+            const baseDrive = this.#scheme === 'file' && isWindowsDriveSegment(this.#path[0])
+                ? this.#path[0]
+                : null;
+            this.#path = baseDrive !== null ? [baseDrive] : [];
             path = path.slice(1);
         }
 
         if (!path) return;
 
-        const trailingSlash = path.endsWith('/');
         const segments = path.split('/');
-        for (const segment of segments) {
-            if (segment === '' || segment === '.') {
-                continue;
-            }
-            if (segment === '..') {
-                if (isSpecial) {
-                    if (this.#path.length > 0 && this.#path[this.#path.length - 1] !== '..') {
-                        this.#path.pop();
-                    }
-                } else {
-                    this.#path.push('..');
+        for (let i = 0; i < segments.length; i++) {
+            const segment = segments[i]!;
+            // The spec's path state appends the empty string after a FINAL dot
+            // segment, because the separator the dot sat behind remains: a
+            // reference of `a/..` against `https://h/a/b` is `https://h/a/`,
+            // not `https://h/a`. Dropping it resolved every such reference one
+            // segment short. This is not a non-special quirk — it applies to
+            // `foo:/a/b` + '..' (=> `foo:/`) identically.
+            const isLast = i === segments.length - 1;
+            const kind = dotSegmentKind(segment);
+            if (kind === 2) {
+                // Spec "shorten a URL's path": pop a segment, for EVERY scheme.
+                // Specialness is not part of the rule. A non-special URL with a
+                // list path (`foo:/a/b`, which is every `pack:/…`) shortens
+                // exactly like a special one, so `new URL('../x','pack:/a/b')`
+                // is `pack:/x`. Pushing '..' verbatim instead produced
+                // `pack:/a/../x` — a garbage id that no manifest lookup matches.
+                // Only an OPAQUE path (`foo:a/b`) keeps '..' literally, and
+                // #parsePath is never reached for one.
+                //
+                // The one carve-out is the spec's own: shortening stops at a
+                // `file:` Windows drive letter, so `..` can never escape it
+                // (`file:///C:/a/b` + '../../x' stays `file:///C:/x`).
+                const onlyDrive = this.#scheme === 'file' && this.#path.length === 1
+                    && isWindowsDriveSegment(this.#path[0]);
+                if (this.#path.length > 0 && !onlyDrive) {
+                    this.#path.pop();
                 }
+                if (isLast) this.#path.push('');
+            } else if (kind === 1) {
+                if (isLast) this.#path.push('');
             } else {
+                // Ordinary segment — INCLUDING the empty string, which is both a
+                // meaningful `//` component and the carrier of a trailing slash.
                 this.#path.push(segment);
             }
         }
 
-        // Preserve trailing slash: /vip/ → ['vip', ''] → pathname '/vip/'
-        if (trailingSlash) {
-            this.#path.push('');
+        // A leading Windows drive letter normalizes `C|` to `C:`.
+        const first = this.#path[0];
+        if (this.#scheme === 'file' && first !== undefined && isWindowsDriveLetter(first) && first[1] === '|') {
+            this.#path[0] = first[0] + ':';
         }
+
+        // No trailing-slash fixup here on purpose. `/a/b/` splits to
+        // ['a','b',''] and that final empty segment is now pushed by the loop
+        // like any other, so the slash survives on its own. Re-pushing '' here
+        // as the old code did would double it to `/a/b//`. The dot-segment half
+        // of that old rule moved into the loop, where it can also see the
+        // percent-encoded forms (`a/%2e%2e` => `/a/`) the string compare missed.
     }
 
     // ==================== Getters ====================
@@ -582,7 +785,7 @@ class URL implements globalThis.URL {
     set href(value: string) {
         this.#scheme = ''; this.#host = ''; this.#port = '';
         this.#username = ''; this.#password = '';
-        this.#path = []; this.#query = null; this.#hasQuery = false; this.#fragment = '';
+        this.#path = []; this.#opaquePath = null; this.#query = null; this.#hasQuery = false; this.#fragment = '';
         this.#hasFragment = false;
         this.#parse(value);
     }
@@ -716,16 +919,23 @@ class URL implements globalThis.URL {
     }
 
     get pathname(): string {
+        // Opaque paths serialize verbatim — no leading '/', no re-encoding.
+        if (this.#opaquePath !== null) return this.#opaquePath;
+
         if (this.#scheme === 'file') {
             if (this.#path.length === 0) return '/';
             return percentEncode('/' + this.#path.join('/'), PATH_ENCODE_SET);
         }
 
         if (this.#path.length === 0) return '/';
-        return '/' + this.#path.map(p => percentEncode(p, PATH_ENCODE_SET)).join('/');
+        const encodeSet = this.#scheme in SPECIAL_SCHEMES ? PATH_ENCODE_SET : NON_SPECIAL_PATH_ENCODE_SET;
+        return '/' + this.#path.map(p => percentEncode(p, encodeSet)).join('/');
     }
 
     set pathname(value: string) {
+        // Spec: the pathname setter is a no-op on an opaque path.
+        if (this.#opaquePath !== null) return;
+
         if (this.#scheme === 'file') {
             this.#path = String(value).split('/').filter(p => p);
             return;

@@ -9,7 +9,7 @@ import { type ISocket } from "@cnojs/http/socket";
 import { Headers } from "./headers";
 import { assert } from "../utils/assert";
 import { buildRequest, connectHttp, readHeaders } from "../utils/http";
-import { bytesToArrayBuffer, concatChunks, toOwnedBytes } from "../utils/bytes";
+import { bytesToArrayBuffer, concatChunks, toOwnedBytes, sanitizeSurrogates } from "../utils/bytes";
 import { getTierLimits } from '../utils/memory-tier';
 import { captureUserNetworkCallFrames, getWebSocketHook, type NetworkCallFrame, type NetworkSource, type WSFrameInfo } from '../utils/network-hooks';
 import { CloseEvent, DOMException, ErrorEvent, MessageEvent } from "./events";
@@ -18,6 +18,20 @@ const engine = import.meta.use('engine');
 const algo = import.meta.use('algorithm');
 const crypto = import.meta.use('crypto');
 const timers = import.meta.use('timers');
+const textMod = import.meta.use('text');
+const failWebSocket = Symbol('cno.failWebSocket');
+const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
+const typedArrayBufferGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')?.get;
+const typedArrayByteOffsetGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteOffset')?.get;
+const typedArrayByteLengthGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteLength')?.get;
+const dataViewBufferGetter = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer')?.get;
+const dataViewByteOffsetGetter = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset')?.get;
+const dataViewByteLengthGetter = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength')?.get;
+const blobSizeGetter = Object.getOwnPropertyDescriptor(Blob.prototype, 'size')?.get;
+const blobArrayBuffer = Blob.prototype.arrayBuffer;
+
+/** RFC 6455 requires invalid UTF-8 to fail the connection with status 1007. */
+const decodeTextFrame = (payload: Uint8Array): string => new textMod.Decoder('utf-8', { fatal: true }).decode(payload);
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 type IWSSocket = Omit<ISocket, 'serverHandshake' | 'alpnProtocol' | 'read'>;
@@ -33,8 +47,41 @@ function emitWebSocketHookQuietly(callback: () => void): void {
     }
 }
 
-function toError(error: unknown, fallback = String(error)): Error {
-    return error instanceof Error ? error : new Error(fallback);
+function toError(error: unknown, fallback?: string): Error {
+    if (engine.isError(error)) return error as Error;
+    if (fallback !== undefined) return new Error(fallback);
+    try { return new Error(String(error)); } catch { return new Error('WebSocket operation failed'); }
+}
+
+function applySlotGetter<T>(getter: ((this: unknown) => T) | undefined, value: object): T {
+    if (!getter) throw new TypeError('Required WebSocket data slot is unavailable');
+    return Reflect.apply(getter, value, []);
+}
+
+function getBlobSize(value: unknown): number | undefined {
+    if (!value || typeof value !== 'object' || !blobSizeGetter) return undefined;
+    try { return Reflect.apply(blobSizeGetter, value, []); } catch { return undefined; }
+}
+
+function isArrayBufferView(value: unknown): value is ArrayBufferView {
+    if (!value || typeof value !== 'object') return false;
+    if (engine.isDataView(value)) return true;
+    if (!typedArrayBufferGetter) return false;
+    try { Reflect.apply(typedArrayBufferGetter, value, []); return true; } catch { return false; }
+}
+
+function viewBytes(value: ArrayBufferView): Uint8Array {
+    const isDataView = engine.isDataView(value);
+    const buffer = isDataView
+        ? applySlotGetter(dataViewBufferGetter, value)
+        : applySlotGetter(typedArrayBufferGetter, value);
+    const byteOffset = isDataView
+        ? applySlotGetter(dataViewByteOffsetGetter, value)
+        : applySlotGetter(typedArrayByteOffsetGetter, value);
+    const byteLength = isDataView
+        ? applySlotGetter(dataViewByteLengthGetter, value)
+        : applySlotGetter(typedArrayByteLengthGetter, value);
+    return toOwnedBytes(new Uint8Array(buffer, byteOffset, byteLength));
 }
 
 function closeConnectionQuietly(connection: { close(): void }): void {
@@ -94,9 +141,30 @@ function normalizeClientWebSocketUrl(input: string | URL): string {
     return url.href;
 }
 
-function validateProtocols(protocols?: string | string[]): string[] {
-    if (protocols === undefined) return [];
-    const list = (Array.isArray(protocols) ? protocols : [protocols]).map((protocol) => String(protocol));
+function validateProtocols(protocols?: unknown): string[] {
+    if (protocols === undefined || protocols === null) return [];
+    let raw: unknown[];
+    if (typeof protocols === 'string') {
+        raw = [protocols];
+    } else if (typeof protocols === 'object' || typeof protocols === 'function') {
+        const iterator = Reflect.get(protocols, Symbol.iterator);
+        if (typeof iterator !== 'function') return [];
+        raw = Array.from(protocols as Iterable<unknown>);
+    } else {
+        return [];
+    }
+    // WebIDL types `protocols` as `USVString or sequence<USVString>`, so a failed
+    // conversion to USVString is a TypeError, whereas a malformed or duplicated
+    // token below is a SyntaxError DOMException. `String(sym)` is the one ToString
+    // path that does NOT throw for a symbol -- it yields "Symbol(x)", which would
+    // then fall through to the token regex and surface as the wrong error type.
+    // Node v24 and Deno 2.9 both throw a plain TypeError here (OBSERVED).
+    const list = raw.map((protocol) => {
+        if (typeof protocol === 'symbol') {
+            throw new TypeError('Cannot convert a Symbol value to a string');
+        }
+        return String(protocol);
+    });
     const seen = new Set<string>();
     for (const protocol of list) {
         if (!/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(protocol)) {
@@ -110,17 +178,36 @@ function validateProtocols(protocols?: string | string[]): string[] {
     return list;
 }
 
-function validateCloseCode(code: number): void {
-    if (code === WebSocketCloseCode.NORMAL || (code >= 3000 && code <= 4999)) return;
+function normalizeCloseCode(value: unknown): number {
+    const code = Math.trunc(Number(value));
+    if (code === WebSocketCloseCode.NORMAL || (code >= 3000 && code <= 4999)) return code;
     throw new DOMException('The close code must be 1000 or in the range 3000 to 4999', 'InvalidAccessError');
 }
 
+function isValidReceivedCloseCode(code: number): boolean {
+    return code === 1000
+        || code === 1001
+        || code === 1002
+        || code === 1003
+        || (code >= 1007 && code <= 1014)
+        || (code >= 3000 && code <= 4999);
+}
+
 function encodeCloseReason(reason: string): Uint8Array {
-    const reasonBytes = reason ? engine.encodeString(reason) : new Uint8Array(0);
+    const reasonBytes = reason ? engine.encodeString(sanitizeSurrogates(reason)) : new Uint8Array(0);
     if (reasonBytes.byteLength > 123) {
         throw new DOMException('The close reason must not be longer than 123 bytes', 'SyntaxError');
     }
     return reasonBytes;
+}
+
+function responseHeaderValues(headers: Array<[string, string]>, name: string): string[] {
+    return headers.filter(([headerName]) => headerName === name).map(([, value]) => value.trim());
+}
+
+function responseHeaderHasToken(values: string[], token: string): boolean {
+    const expected = token.toLowerCase();
+    return values.some((value) => value.split(',').some((part) => part.trim().toLowerCase() === expected));
 }
 
 export enum OpCode {
@@ -166,24 +253,39 @@ const SEND_FRAGMENT_SIZE = MAX_BUFFERED_AMOUNT - 14;
 const { streamHighWaterMark: HIGH_WATER_MARK, hookPayloadCap } = getTierLimits();
 
 class SendQueue {
-    private queue: Array<{ data: Uint8Array; resolve: () => void; reject: (e: Error) => void }> = [];
+    private queue: Array<{ data: Uint8Array; bufferedBytes: number; resolve: () => void; reject: (e: Error) => void }> = [];
     private pending = false;
     private connection: IWSSocket | null;
     private isClient: boolean;
     private onClose: () => void;
     private _bufferedAmount = 0;
+    private queuedWireBytes = 0;
     get bufferedAmount() { return this._bufferedAmount; }
 
     constructor(connection: IWSSocket | null, isClient: boolean, onClose: () => void) {
         this.connection = connection; this.isClient = isClient; this.onClose = onClose;
     }
 
-    enqueue(data: Uint8Array): Promise<void> {
-        if (this._bufferedAmount + data.length > MAX_BUFFERED_AMOUNT)
+    reserveData(bytes: number): boolean {
+        if (this._bufferedAmount + bytes > MAX_BUFFERED_AMOUNT) return false;
+        this._bufferedAmount += bytes;
+        return true;
+    }
+
+    releaseData(bytes: number): void {
+        this._bufferedAmount = Math.max(0, this._bufferedAmount - bytes);
+    }
+
+    enqueue(data: Uint8Array, bufferedBytes = 0, precounted = false): Promise<void> {
+        if ((!precounted && this._bufferedAmount + bufferedBytes > MAX_BUFFERED_AMOUNT)
+            || this.queuedWireBytes + data.length > MAX_BUFFERED_AMOUNT) {
+            if (precounted) this.releaseData(bufferedBytes);
             return Promise.reject(new Error('WebSocket buffer is full'));
-        this._bufferedAmount += data.length;
+        }
+        if (!precounted) this._bufferedAmount += bufferedBytes;
+        this.queuedWireBytes += data.length;
         return new Promise((resolve, reject) => {
-            this.queue.push({ data, resolve, reject });
+            this.queue.push({ data, bufferedBytes, resolve, reject });
             if (this.connection) this.drain();
         });
     }
@@ -198,9 +300,11 @@ class SendQueue {
             if (!item) break;
             try {
                 await this.connection.write(item.data);
-                this._bufferedAmount -= item.data.length; item.resolve();
+                this._bufferedAmount -= item.bufferedBytes; item.resolve();
+                this.queuedWireBytes -= item.data.length;
             } catch (e) {
-                this._bufferedAmount -= item.data.length; item.reject(toError(e));
+                this._bufferedAmount -= item.bufferedBytes; item.reject(toError(e));
+                this.queuedWireBytes -= item.data.length;
                 this.connection = null; this.onClose(); this.flushQueue(new Error('Connection closed')); return;
             }
         }
@@ -251,7 +355,8 @@ class SendQueue {
         while (this.queue.length > 0) {
             const item = this.queue.shift();
             if (!item) break;
-            this._bufferedAmount -= item.data.length;
+            this._bufferedAmount -= item.bufferedBytes;
+            this.queuedWireBytes -= item.data.length;
             item.reject(error);
         }
     }
@@ -262,11 +367,11 @@ class SendQueue {
      * All fragments are pushed synchronously before drain() runs, so no other
      * concurrent send can interleave frames within this message.
      */
-	enqueueData(opcode: OpCode, payload: Uint8Array): Promise<void> {
+	enqueueData(opcode: OpCode, payload: Uint8Array, precounted = false): Promise<void> {
 		if (payload.length <= SEND_FRAGMENT_SIZE)
-            return this.enqueue(this.buildFrame(opcode, payload, true, this.isClient));
+            return this.enqueue(this.buildFrame(opcode, payload, true, this.isClient), payload.length, precounted);
 
-        if (this._bufferedAmount + payload.length > MAX_BUFFERED_AMOUNT)
+        if (!precounted && this._bufferedAmount + payload.length > MAX_BUFFERED_AMOUNT)
             return Promise.reject(new Error('WebSocket buffer is full'));
 
         // Push all frames synchronously — drain() runs asynchronously later, so
@@ -274,27 +379,39 @@ class SendQueue {
         const promises: Promise<void>[] = [];
         let offset = 0;
         let firstFrame = true;
+        const frames: Array<{ frame: Uint8Array; payloadLength: number }> = [];
+        let wireBytes = 0;
         while (offset < payload.length) {
             const end = Math.min(offset + SEND_FRAGMENT_SIZE, payload.length);
             const chunk = payload.subarray(offset, end);
             const fin = end === payload.length;
             const frameOpcode = firstFrame ? opcode : OpCode.CONTINUATION;
             const frame = this.buildFrame(frameOpcode, chunk, fin, this.isClient);
-            this._bufferedAmount += frame.length;
-            promises.push(new Promise((resolve, reject) => {
-                this.queue.push({ data: frame, resolve, reject });
-            }));
+            frames.push({ frame, payloadLength: chunk.length });
+            wireBytes += frame.length;
             offset = end;
             firstFrame = false;
         }
+        if (this.queuedWireBytes + wireBytes > MAX_BUFFERED_AMOUNT) {
+            if (precounted) this.releaseData(payload.length);
+            return Promise.reject(new Error('WebSocket buffer is full'));
+        }
+        if (!precounted) this._bufferedAmount += payload.length;
+        for (const { frame, payloadLength } of frames) {
+            this.queuedWireBytes += frame.length;
+            promises.push(new Promise((resolve, reject) => {
+                this.queue.push({ data: frame, bufferedBytes: payloadLength, resolve, reject });
+            }));
+        }
         if (this.connection) this.drain();
-        const lastPromise = promises[promises.length - 1];
-        return lastPromise ?? Promise.resolve();
+        // Observe every fragment promise. Returning only the final one leaves
+        // earlier write failures as unhandled rejections when the queue aborts.
+        return Promise.all(promises).then(() => undefined);
     }
 
     close(): void { this.connection = null; this.flushQueue(new Error('WebSocket closed')); }
     buildControlFrame(opcode: OpCode, payload: Uint8Array): Uint8Array { return this.buildFrame(opcode, payload, true, this.isClient); }
-    
+
     get [Symbol.toStringTag]() {
         return 'SendQueue';
     }
@@ -340,7 +457,14 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
     private closeCode: number = WebSocketCloseCode.NO_STATUS;
     private closeReason: string = '';
     private _closeTimer: number | null = null;
+    private _failed = false;
+    private _failureError: Error | null = null;
+    private _closeReceived = false;
+    private _closeSendPromise: Promise<void> | null = null;
+    private _openEventPending = false;
+    private _deferredReadFailure: Error | null = null;
     private sendQueue: SendQueue;
+    private dataSendChain: Promise<void> = Promise.resolve();
     private _netRequestId: string = '';
     private _serverMeta?: ServerWebSocketMeta;
     private _serverHandshakeEmitted = false;
@@ -354,6 +478,10 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
     get bufferedAmount(): number { return this.sendQueue.bufferedAmount; }
     get readyState(): WebSocketReadyState { return this._readyState; }
 
+    [failWebSocket](error: Error): void {
+        this.handleConnectionFailure(error);
+    }
+
     private emitOpen(): void {
         const event = new Event('open');
         this.dispatchEvent(event);
@@ -361,9 +489,14 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
     }
 
     private scheduleOpen(): void {
+        this._openEventPending = true;
         timers.setTimeout(() => {
-            if (this._readyState !== WebSocketReadyState.OPEN) return;
-            this.emitOpen();
+            this._openEventPending = false;
+            if (this._readyState === WebSocketReadyState.OPEN) this.emitOpen();
+            if (this._rxTotal > 0 && this._readyState !== WebSocketReadyState.CLOSED) this.processFrames();
+            const failure = this._deferredReadFailure;
+            this._deferredReadFailure = null;
+            if (failure && this._readyState !== WebSocketReadyState.CLOSED) this.handleConnectionFailure(failure);
         }, 0);
     }
 
@@ -372,14 +505,11 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
     constructor(connection: Promise<IWSSocket>, isServer: true, serverMeta?: ServerWebSocketMetaSource);
     constructor(urlOrConnection: string | URL | Promise<IWSSocket>, protocolsOrIsServer?: string | string[] | true, serverMeta?: ServerWebSocketMetaSource) {
         super();
-        if (typeof urlOrConnection === 'string' || urlOrConnection instanceof URL) {
-            this.url = normalizeClientWebSocketUrl(urlOrConnection); this.isClient = true;
-            this.sendQueue = new SendQueue(null, true, () => this.handleClose(WebSocketCloseCode.ABNORMAL, 'Connection closed'));
-            const protocols = validateProtocols(
-                typeof protocolsOrIsServer === 'string' || Array.isArray(protocolsOrIsServer)
-                    ? protocolsOrIsServer
-                    : undefined
-            );
+        const isServerConnection = protocolsOrIsServer === true && engine.isPromise(urlOrConnection);
+        if (!isServerConnection) {
+            this.url = normalizeClientWebSocketUrl(urlOrConnection as string | URL); this.isClient = true;
+            this.sendQueue = new SendQueue(null, true, () => this.handleConnectionFailure(new Error('Connection closed')));
+            const protocols = validateProtocols(protocolsOrIsServer === true ? undefined : protocolsOrIsServer);
             this.requestedProtocols = protocols;
             this.connectClient();
         } else {
@@ -399,20 +529,20 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
             this._serverMeta = syncServerMeta;
             this._netRequestId = syncServerMeta?.requestId ?? '';
             this._initiatorCallFrames = syncServerMeta?.callFrames;
-            this.sendQueue = new SendQueue(null, false, () => this.handleClose(WebSocketCloseCode.ABNORMAL, 'Connection closed'));
+            this.sendQueue = new SendQueue(null, false, () => this.handleConnectionFailure(new Error('Connection closed')));
             this._readyState = WebSocketReadyState.CONNECTING;
-            urlOrConnection.then(conn => {
+            (urlOrConnection as Promise<IWSSocket>).then(conn => {
                 serverMetaReady.then(() => {
-                if (this._readyState === WebSocketReadyState.CLOSED) return;
+                if (this._readyState !== WebSocketReadyState.CONNECTING) {
+                    closeConnectionQuietly(conn);
+                    return;
+                }
                 this._readyState = WebSocketReadyState.OPEN; this.connection = conn; this.sendQueue.setConnection(conn);
                 this.emitServerHandshakeEvents();
                 this.scheduleOpen();
                 this.startReceiving();
                 });
-            }).catch(err => {
-                this._readyState = WebSocketReadyState.CLOSED;
-                this.emitError(err instanceof Error ? err : new Error('Connection failed'));
-            });
+            }).catch(err => { this.handleConnectionFailure(toError(err, 'Connection failed')); });
         }
     }
 
@@ -427,17 +557,26 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
             }
 
             const connection = await connectHttp(url);
+            if (this._readyState !== WebSocketReadyState.CONNECTING) {
+                closeConnectionQuietly(connection.socket);
+                return;
+            }
             this.connection = connection.socket;
 
             await this.sendHandshake(url, connection.requestTarget, connection.proxyAuthorization);
             await this.receiveHandshake();
+            if (this._readyState !== WebSocketReadyState.CONNECTING) {
+                closeConnectionQuietly(connection.socket);
+                this.connection = null;
+                return;
+            }
 
             this._readyState = WebSocketReadyState.OPEN;
-            this.sendQueue = new SendQueue(this.connection, true, () => this.handleClose(WebSocketCloseCode.ABNORMAL, 'Connection closed'));
+            this.sendQueue = new SendQueue(this.connection, true, () => this.handleConnectionFailure(new Error('Connection closed')));
             this.scheduleOpen();
             this.startReceiving();
             this.startPingTimer();
-        } catch (err) { this._readyState = WebSocketReadyState.CLOSED; this.emitError(toError(err)); }
+        } catch (err) { this.handleConnectionFailure(toError(err)); }
     }
 
     private async sendHandshake(url: URL, requestTarget?: string, proxyAuthorization?: string): Promise<void> {
@@ -475,19 +614,33 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
         const { status, headers, leftover } = await readHeaders(this.connection, parser);
 
         if (status !== 101) throw new Error(`WebSocket handshake failed: ${status}`);
-        const upgrade = headers.find(([n]) => n === 'upgrade')?.[1]?.toLowerCase();
-        const connection = headers.find(([n]) => n === 'connection')?.[1]?.toLowerCase();
-        if (upgrade !== 'websocket' || !connection?.includes('upgrade')) throw new Error('Invalid WebSocket handshake response');
-        const accept = headers.find(([n]) => n === 'sec-websocket-accept')?.[1];
-        if (!accept) throw new Error('Missing Sec-WebSocket-Accept header');
-        if (accept !== this.computeAcceptKey(this._wsKey)) throw new Error('Invalid Sec-WebSocket-Accept header');
+        const upgrade = responseHeaderValues(headers, 'upgrade');
+        const connection = responseHeaderValues(headers, 'connection');
+        if (!responseHeaderHasToken(upgrade, 'websocket') || !responseHeaderHasToken(connection, 'upgrade')) {
+            throw new Error('Invalid WebSocket handshake response');
+        }
+        const accepts = responseHeaderValues(headers, 'sec-websocket-accept');
+        if (accepts.length === 0) throw new Error('Missing Sec-WebSocket-Accept header');
+        if (accepts.length !== 1 || accepts[0] !== this.computeAcceptKey(this._wsKey)) {
+            throw new Error('Invalid Sec-WebSocket-Accept header');
+        }
 
-        const negotiated = headers.find(([n]) => n === 'sec-websocket-protocol')?.[1]?.trim() ?? '';
+        const negotiatedHeaders = responseHeaderValues(headers, 'sec-websocket-protocol');
+        if (negotiatedHeaders.length > 1 || negotiatedHeaders[0]?.includes(',')) {
+            throw new Error('Server selected multiple WebSocket subprotocols');
+        }
+        const negotiated = negotiatedHeaders[0] ?? '';
         if (negotiated && !this.requestedProtocols.includes(negotiated)) {
             throw new Error('Server selected an unsupported WebSocket subprotocol');
         }
         this.protocol = negotiated;
-        this.extensions = headers.find(([n]) => n === 'sec-websocket-extensions')?.[1]?.trim() ?? '';
+        const extensions = responseHeaderValues(headers, 'sec-websocket-extensions');
+        if (extensions.length > 0) {
+            // This implementation never offers extensions, so the server cannot
+            // unilaterally activate one in its response.
+            throw new Error('Server selected an unsolicited WebSocket extension');
+        }
+        this.extensions = '';
 
         if (this._netRequestId) {
             const wsHook = getWebSocketHook();
@@ -514,17 +667,25 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
         if (!this.connection) return;
         const conn = this.connection;
         conn.onReadable(data => {
-            if (data === null) return this.handleClose(WebSocketCloseCode.ABNORMAL, 'Connection closed');
-            if (data.length === 0) return;
+            if (data === null) {
+                const failure = new Error('Connection closed');
+                if (this._openEventPending && this._readyState === WebSocketReadyState.OPEN) {
+                    this._deferredReadFailure = failure;
+                    return;
+                }
+                return this.handleConnectionFailure(failure);
+            }
+            if (data.length === 0 || this._closeReceived || this._readyState === WebSocketReadyState.CLOSED) return;
             this._rxChunks.push(data);
             this._rxTotal += data.length;
+            if (this._openEventPending && this._readyState === WebSocketReadyState.OPEN) return;
             this.processFrames();
         });
-        if (this._rxTotal > 0) queueMicrotask(() => this.processFrames());
+        if (this._rxTotal > 0 && !this._openEventPending) queueMicrotask(() => this.processFrames());
     }
 
     private processFrames(): void {
-        while (this._rxTotal > 0) {
+        while (this._rxTotal > 0 && !this._closeReceived && this._readyState !== WebSocketReadyState.CLOSED) {
             const frame = this.parseFrame();
             if (!frame) break;
             this.handleFrame(frame);
@@ -571,12 +732,32 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
         const masked = (byte2 & 0x80) !== 0;
         let payloadLength = byte2 & 0x7F;
         let offset = 2;
+        const isControl = (opcode & 0x08) !== 0;
+        const knownOpcode = opcode === OpCode.CONTINUATION
+            || opcode === OpCode.TEXT
+            || opcode === OpCode.BINARY
+            || opcode === OpCode.CLOSE
+            || opcode === OpCode.PING
+            || opcode === OpCode.PONG;
+
+        if ((byte1 & 0x70) !== 0 || !knownOpcode || (isControl && !fin) || masked === this.isClient) {
+            this.failConnection(WebSocketCloseCode.PROTOCOL_ERROR, 'Invalid WebSocket frame');
+            return null;
+        }
+        if (isControl && payloadLength > 125) {
+            this.failConnection(WebSocketCloseCode.PROTOCOL_ERROR, 'Invalid control frame');
+            return null;
+        }
 
         if (payloadLength === 126) {
             if (this._rxTotal < 4) return null;
             const lenHi = buffer[2], lenLo = buffer[3];
             if (lenHi === undefined || lenLo === undefined) return null;
             payloadLength = (lenHi << 8) | lenLo;
+            if (payloadLength < 126) {
+                this.failConnection(WebSocketCloseCode.PROTOCOL_ERROR, 'Non-minimal payload length');
+                return null;
+            }
             offset = 4;
         } else if (payloadLength === 127) {
             if (this._rxTotal < 10) return null;
@@ -586,10 +767,22 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
                 h0 === undefined || h1 === undefined || h2 === undefined || h3 === undefined
                 || h4 === undefined || h5 === undefined || h6 === undefined || h7 === undefined
             ) return null;
-            if ((h0 | h1 | h2 | h3) !== 0) { this.close(WebSocketCloseCode.MESSAGE_TOO_BIG, 'Frame payload too large'); return null; }
+            if ((h0 & 0x80) !== 0) {
+                this.failConnection(WebSocketCloseCode.PROTOCOL_ERROR, 'Invalid payload length');
+                return null;
+            }
+            if ((h0 | h1 | h2 | h3) !== 0) { this.failConnection(WebSocketCloseCode.MESSAGE_TOO_BIG, 'Frame payload too large'); return null; }
             payloadLength = h4 * 0x1000000 + h5 * 0x10000
                           + h6 * 0x100     + h7;
+            if (payloadLength <= 65535) {
+                this.failConnection(WebSocketCloseCode.PROTOCOL_ERROR, 'Non-minimal payload length');
+                return null;
+            }
             offset = 10;
+        }
+        if (payloadLength > MAX_BUFFERED_AMOUNT) {
+            this.failConnection(WebSocketCloseCode.MESSAGE_TOO_BIG, 'Frame payload too large');
+            return null;
         }
 
         let maskKey: Uint8Array | null = null;
@@ -624,17 +817,25 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
     private handleFrame(frame: WebSocketFrame): void {
         switch (frame.opcode) {
             case OpCode.TEXT: case OpCode.BINARY:
+                if (this.fragmentOpcode !== null) {
+                    this.failConnection(WebSocketCloseCode.PROTOCOL_ERROR, 'Expected continuation frame');
+                    return;
+                }
                 if (frame.fin) this.emitMessage(frame.opcode, frame.payload);
-                else { this.fragmentOpcode = frame.opcode; this.fragments = [frame.payload]; }
+                else {
+                    this.fragmentOpcode = frame.opcode;
+                    this.fragments = [frame.payload];
+                    this._fragmentBytes = frame.payload.length;
+                }
                 break;
             case OpCode.CONTINUATION:
                 if (this.fragmentOpcode === null) {
-                    this.close(WebSocketCloseCode.PROTOCOL_ERROR, 'Unexpected continuation frame');
+                    this.failConnection(WebSocketCloseCode.PROTOCOL_ERROR, 'Unexpected continuation frame');
                     return;
                 }
                 this._fragmentBytes = (this._fragmentBytes ?? 0) + frame.payload.length;
                 if (this._fragmentBytes > MAX_BUFFERED_AMOUNT) {
-                    this.close(WebSocketCloseCode.MESSAGE_TOO_BIG, 'Message too large');
+                    this.failConnection(WebSocketCloseCode.MESSAGE_TOO_BIG, 'Message too large');
                     return;
                 }
                 this.fragments.push(frame.payload);
@@ -649,7 +850,7 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
             case OpCode.CLOSE: this.handleCloseFrame(frame.payload); break;
             case OpCode.PING: this.sendPong(frame.payload); break;
             case OpCode.PONG: this.handlePong(); break;
-            default: this.close(WebSocketCloseCode.PROTOCOL_ERROR, 'Unknown opcode');
+            default: this.failConnection(WebSocketCloseCode.PROTOCOL_ERROR, 'Unknown opcode');
         }
     }
 
@@ -658,78 +859,241 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
             throw new DOMException('Sent before connected.', 'InvalidStateError');
         }
         if (this._readyState !== WebSocketReadyState.OPEN) return;
-        if (typeof data === 'string') {
-            this.sendFrame(OpCode.TEXT, engine.encodeString(data)).catch(() => { this.close(WebSocketCloseCode.ABNORMAL, 'Send failed'); });
-        } else if (data instanceof Blob) {
-            data.arrayBuffer().then(buf => { this.sendFrame(OpCode.BINARY, new Uint8Array(buf)).catch(() => { this.close(WebSocketCloseCode.ABNORMAL, 'Send failed'); }); })
-                .catch(() => { this.close(WebSocketCloseCode.ABNORMAL, 'Blob conversion failed'); });
+        const blobSize = getBlobSize(data);
+        if (blobSize !== undefined) {
+            this.queueData(OpCode.BINARY, blobSize, async () => {
+                const buffer = await Reflect.apply(blobArrayBuffer, data, []) as ArrayBuffer;
+                return new Uint8Array(buffer);
+            });
+        } else if (engine.isArrayBuffer(data)) {
+            const payload = toOwnedBytes(new Uint8Array(data as ArrayBuffer));
+            this.queueData(OpCode.BINARY, payload.length, () => payload);
+        } else if (isArrayBufferView(data)) {
+            const payload = viewBytes(data);
+            this.queueData(OpCode.BINARY, payload.length, () => payload);
         } else {
-            const payload: Uint8Array = data instanceof ArrayBuffer
-                ? new Uint8Array(data)
-                : toOwnedBytes(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
-            this.sendFrame(OpCode.BINARY, payload).catch(() => { this.close(WebSocketCloseCode.ABNORMAL, 'Send failed'); });
+            if (typeof data === 'symbol') throw new TypeError('Cannot convert a Symbol value to a string');
+            const text = sanitizeSurrogates(String(data));
+            // RFC 6455 text frames must be valid UTF-8, so WTF-8 is not an option.
+            const payload = engine.encodeString(text);
+            this.queueData(OpCode.TEXT, payload.length, () => payload);
         }
     }
 
-    private async sendFrame(opcode: OpCode, payload: Uint8Array): Promise<void> {
-        if (this._readyState !== WebSocketReadyState.OPEN) throw new Error('WebSocket is not open');
-        if (this._netRequestId && (opcode === OpCode.TEXT || opcode === OpCode.BINARY)) {
-            const wsHook = getWebSocketHook();
-            if (wsHook) {
-                const hookPayload = opcode === OpCode.TEXT
-                    ? engine.decodeString(payload)
-                    : hookBase64(payload);
-                const frame: WSFrameInfo = {
-                    source: this.isClient ? 'fetch' : 'serve',
-                    requestId: this._netRequestId, opcode, masked: this.isClient,
-                    payloadData: hookPayload,
-                    payloadLength: payload.byteLength, timestamp: wsTs(),
-                };
-                emitWebSocketHookQuietly(() => {
-                    wsHook.onFrameSent?.(frame);
-                });
-            }
+    private queueData(opcode: OpCode, byteLength: number, payload: () => Uint8Array | Promise<Uint8Array>): void {
+        if (!this.sendQueue.reserveData(byteLength)) {
+            queueMicrotask(() => this.handleConnectionFailure(new Error('WebSocket buffer is full')));
+            return;
         }
-        // Data frames may be fragmented; control frames (PING/PONG/CLOSE) must not.
+        const task = this.dataSendChain.then(async () => {
+            if (!this.canSendQueuedData()) {
+                this.sendQueue.releaseData(byteLength);
+                return;
+            }
+            let bytes: Uint8Array;
+            try { bytes = await payload(); }
+            catch (error) {
+                this.sendQueue.releaseData(byteLength);
+                if (!this.canSendQueuedData()) return;
+                throw toError(error, 'WebSocket data conversion failed');
+            }
+            if (!this.canSendQueuedData()) {
+                this.sendQueue.releaseData(byteLength);
+                return;
+            }
+            await this.sendFrame(opcode, bytes, true);
+        });
+        this.dataSendChain = task.catch(error => {
+            this.handleConnectionFailure(toError(error, 'WebSocket send failed'));
+        });
+    }
+
+    private canSendQueuedData(): boolean {
+        return !this._closeReceived && !this._failed
+            && (this._readyState === WebSocketReadyState.OPEN || this._readyState === WebSocketReadyState.CLOSING);
+    }
+
+    private async sendFrame(opcode: OpCode, payload: Uint8Array, precounted = false): Promise<void> {
+        // A CLOSE frame is sent *while* readyState is already CLOSING (RFC 6455
+        // §5.5.1 requires the closing handshake), so only data frames need OPEN.
         const isData = opcode === OpCode.TEXT || opcode === OpCode.BINARY;
-        if (isData) {
-            await this.sendQueue.enqueueData(opcode, payload);
-        } else {
-            await this.sendQueue.enqueue(this.sendQueue.buildControlFrame(opcode, payload));
+        const okState = opcode === OpCode.CLOSE
+            ? (this._readyState === WebSocketReadyState.OPEN || this._readyState === WebSocketReadyState.CLOSING)
+            : this._readyState === WebSocketReadyState.OPEN
+                || (isData && precounted && this._readyState === WebSocketReadyState.CLOSING
+                    && !this._closeReceived && !this._failed);
+        if (!okState) {
+            if (precounted) this.sendQueue.releaseData(payload.length);
+            throw new Error('WebSocket is not open');
+        }
+        let handedToQueue = false;
+        try {
+            if (this._netRequestId && (opcode === OpCode.TEXT || opcode === OpCode.BINARY)) {
+                const wsHook = getWebSocketHook();
+                if (wsHook) {
+                    const hookPayload = opcode === OpCode.TEXT
+                        ? decodeTextFrame(payload)
+                        : hookBase64(payload);
+                    const frame: WSFrameInfo = {
+                        source: this.isClient ? 'fetch' : 'serve',
+                        requestId: this._netRequestId, opcode, masked: this.isClient,
+                        payloadData: hookPayload,
+                        payloadLength: payload.byteLength, timestamp: wsTs(),
+                    };
+                    emitWebSocketHookQuietly(() => { wsHook.onFrameSent?.(frame); });
+                }
+            }
+            // Data frames may be fragmented; control frames (PING/PONG/CLOSE) must not.
+            const queued = isData
+                ? this.sendQueue.enqueueData(opcode, payload, precounted)
+                : this.sendQueue.enqueue(this.sendQueue.buildControlFrame(opcode, payload));
+            handedToQueue = true;
+            await queued;
+        } catch (error) {
+            if (precounted && !handedToQueue) this.sendQueue.releaseData(payload.length);
+            throw error;
         }
     }
 
     public close(code: number = WebSocketCloseCode.NORMAL, reason: string = ''): void {
-        validateCloseCode(code);
-        const reasonBytes = encodeCloseReason(reason);
+        const normalizedCode = normalizeCloseCode(code);
+        const normalizedReason = sanitizeSurrogates(String(reason));
+        const reasonBytes = encodeCloseReason(normalizedReason);
+        if (this._readyState === WebSocketReadyState.CONNECTING) {
+            this._readyState = WebSocketReadyState.CLOSING;
+            // Failing a connection queues the error/close tasks. It must not put
+            // a CLOSE frame into a send queue that has no socket yet.
+            timers.setTimeout(() => {
+                if (this._readyState === WebSocketReadyState.CLOSING) {
+                    this.handleConnectionFailure(new Error('WebSocket closed while connecting'));
+                }
+            }, 0);
+            return;
+        }
+        this.initiateClose(normalizedCode, normalizedReason, reasonBytes);
+    }
+
+    /** Protocol-generated close codes are not subject to the public API's code allow-list. */
+    private initiateClose(code: number, reason: string, reasonBytes = encodeCloseReason(reason)): void {
         if (this._readyState === WebSocketReadyState.CLOSING || this._readyState === WebSocketReadyState.CLOSED) return;
         this._readyState = WebSocketReadyState.CLOSING;
         const payload = new Uint8Array(2 + reasonBytes.length);
         payload[0] = (code >> 8) & 0xFF; payload[1] = code & 0xFF;
         if (reasonBytes.length > 0) payload.set(reasonBytes, 2);
-        this.sendFrame(OpCode.CLOSE, payload).then(() => {
-            this._closeTimer = timers.setTimeout(() => { this._closeTimer = null; this.handleClose(code, reason); }, 1000);
-        }).catch(() => { this.handleClose(code, reason); });
+        this.queueCloseFrame(payload).then(() => {
+            // A timeout means the peer never completed the closing handshake.
+            if (this._readyState === WebSocketReadyState.CLOSING) {
+                this._closeTimer = timers.setTimeout(() => {
+                    this._closeTimer = null;
+                    this.handleConnectionFailure(new Error('WebSocket closing handshake timed out'));
+                }, 1000);
+            }
+        }).catch(() => { this.handleConnectionFailure(new Error('WebSocket close frame could not be sent')); });
+    }
+
+    private queueCloseFrame(payload: Uint8Array): Promise<void> {
+        if (this._closeSendPromise) return this._closeSendPromise;
+        this._closeSendPromise = this.dataSendChain.then(() => {
+            if (this._readyState !== WebSocketReadyState.CLOSING) {
+                throw new Error('WebSocket is not closing');
+            }
+            return this.sendFrame(OpCode.CLOSE, payload);
+        });
+        return this._closeSendPromise;
+    }
+
+    private failConnection(code: number, reason: string): void {
+        // Once a frame has made the connection fail, none of the bytes already
+        // buffered beside it may be interpreted as a fresh frame. In particular,
+        // retaining a rejected header would parse it again when the peer's CLOSE
+        // response arrives and would abort an otherwise valid close handshake.
+        this._rxChunks = [];
+        this._rxOffset = 0;
+        this._rxTotal = 0;
+        this._failed = true;
+        const failure = this._failureError ?? new Error(reason || 'WebSocket protocol error');
+        this._failureError = failure;
+        if (this._readyState === WebSocketReadyState.OPEN) {
+            this._readyState = WebSocketReadyState.CLOSING;
+            const reasonBytes = encodeCloseReason(reason);
+            const payload = new Uint8Array(2 + reasonBytes.length);
+            payload[0] = (code >> 8) & 0xff;
+            payload[1] = code & 0xff;
+            payload.set(reasonBytes, 2);
+            const finish = () => this.handleConnectionFailure(failure);
+            this._closeTimer = timers.setTimeout(() => {
+                this._closeTimer = null;
+                finish();
+            }, 1000);
+            // The protocol close code is sent on the wire, but a failed WebSocket
+            // connection is exposed to script as the reserved code 1006.
+            this.sendFrame(OpCode.CLOSE, payload).then(finish, finish);
+        } else if (this._readyState === WebSocketReadyState.CLOSING) {
+            // A malformed peer frame cannot complete an in-flight close
+            // handshake. Do not let initiateClose() silently ignore it.
+            this.handleConnectionFailure(failure);
+        }
+    }
+
+    private handleConnectionFailure(error: Error): void {
+        if (this._readyState === WebSocketReadyState.CLOSED) return;
+        this.handleClose(WebSocketCloseCode.ABNORMAL, '', false, error);
     }
 
     private handleCloseFrame(payload: Uint8Array): void {
         let code = WebSocketCloseCode.NO_STATUS; let reason = '';
+        if (payload.length === 1) {
+            this.failConnection(WebSocketCloseCode.PROTOCOL_ERROR, 'Invalid close payload');
+            return;
+        }
         if (payload.length >= 2) {
             const codeHi = payload[0], codeLo = payload[1];
             if (codeHi !== undefined && codeLo !== undefined) code = (codeHi << 8) | codeLo;
-            if (payload.length > 2) reason = engine.decodeString(payload.slice(2));
+            if (!isValidReceivedCloseCode(code)) {
+                this.failConnection(WebSocketCloseCode.PROTOCOL_ERROR, 'Invalid close code');
+                return;
+            }
+            if (payload.length > 2) {
+                try {
+                    reason = decodeTextFrame(payload.slice(2));
+                } catch {
+                    this.failConnection(WebSocketCloseCode.INVALID_PAYLOAD, 'Invalid UTF-8');
+                    return;
+                }
+            }
         }
+        // RFC 6455: after receiving CLOSE, discard any further data. This also
+        // prevents a data frame coalesced after CLOSE in the same socket read
+        // from being delivered while the echo write is still pending.
+        this._closeReceived = true;
+        this._rxChunks = [];
+        this._rxOffset = 0;
+        this._rxTotal = 0;
         if (this._readyState === WebSocketReadyState.OPEN) {
-            const response = new Uint8Array(2);
-            response[0] = (code >> 8) & 0xFF;
-            response[1] = code & 0xFF;
-            this.sendFrame(OpCode.CLOSE, response).catch(() => {});
+            this._readyState = WebSocketReadyState.CLOSING;
+            // The echo must reach the wire before handleClose() destroys the
+            // socket, so tear down only after the write settles.
+            this.queueCloseFrame(payload)
+                .then(() => { this.handleClose(code, reason, true); })
+                .catch(() => { this.handleConnectionFailure(new Error('WebSocket close response could not be sent')); });
+            return;
         }
-        this.handleClose(code, reason);
+        if (this._failed) {
+            this.handleConnectionFailure(this._failureError ?? new Error('WebSocket protocol error'));
+        } else {
+            // CLOSING does not prove that our CLOSE reached the wire: it can
+            // still be queued behind application data when the peer's arrives.
+            this.queueCloseFrame(payload)
+                .then(() => { this.handleClose(code, reason, true); })
+                .catch(() => { this.handleConnectionFailure(new Error('WebSocket close response could not be sent')); });
+        }
     }
 
-    private handleClose(code: number, reason: string): void {
+    private handleClose(code: number, reason: string, cleanHandshake = false, failureError?: Error): void {
         if (this._readyState === WebSocketReadyState.CLOSED) return;
+        if (code === WebSocketCloseCode.ABNORMAL && !failureError) {
+            failureError = new Error(reason || 'WebSocket connection failed');
+        }
         if (this._closeTimer !== null) {
             timers.clearTimeout(this._closeTimer);
             this._closeTimer = null;
@@ -757,9 +1121,18 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
             this._netRequestId = '';
         }
 
-        const event = new CloseEvent('close', { code, reason, wasClean: code === WebSocketCloseCode.NORMAL }, true);
-        this.dispatchEvent(event);
-        this.onclose?.(event);
+        // wasClean reflects whether the closing handshake completed, not which
+        // code was used: close(3001) or a peer's 1001 is still a clean close.
+        // Message delivery and connection-close notifications use the same task
+        // queue. A data frame preceding CLOSE in one read must be observed first.
+        timers.setTimeout(() => {
+            if (failureError) {
+                try { this.emitError(failureError); } catch { /* event handlers cannot suppress close */ }
+            }
+            const event = new CloseEvent('close', { code, reason, wasClean: cleanHandshake }, true);
+            this.dispatchEvent(event);
+            this.onclose?.(event);
+        }, 0);
     }
 
     private sendPong(payload: Uint8Array): void {
@@ -779,7 +1152,7 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
             if (this._readyState === WebSocketReadyState.OPEN) {
                 this.sendFrame(OpCode.PING, new Uint8Array(0)).catch(() => {});
                 this.pongTimeout = timers.setTimeout(() => {
-                    this.close(WebSocketCloseCode.ABNORMAL, 'Ping timeout');
+                    this.handleConnectionFailure(new Error('WebSocket ping timed out'));
                 }, 5000);
             }
         }, 30000);
@@ -798,14 +1171,21 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
 
     private emitMessage(opcode: OpCode, payload: Uint8Array): void {
         let data: string | ArrayBuffer | Blob;
-        if (opcode === OpCode.TEXT) data = engine.decodeString(payload);
+        if (opcode === OpCode.TEXT) {
+            try {
+                data = decodeTextFrame(payload);
+            } catch {
+                this.failConnection(WebSocketCloseCode.INVALID_PAYLOAD, 'Invalid UTF-8');
+                return;
+            }
+        }
         else data = this.binaryType === 'arraybuffer' ? bytesToArrayBuffer(payload) : new Blob([payload]);
 
         if (this._netRequestId) {
             const wsHook = getWebSocketHook();
             if (wsHook) {
                 const hookPayload = opcode === OpCode.TEXT
-                    ? engine.decodeString(payload)
+                    ? decodeTextFrame(payload)
                     : hookBase64(payload);
                 const frame: WSFrameInfo = {
                     source: this.isClient ? 'fetch' : 'serve',
@@ -874,7 +1254,7 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
     ): void {
         super.removeEventListener(type, listener as EventListenerOrEventListenerObject | null, options);
     }
-    
+
     get [Symbol.toStringTag]() {
         return 'WebSocket';
     }
@@ -886,15 +1266,22 @@ export interface WebSocketStreamConnection { readable: ReadableStream<Uint8Array
 export class WebSocketStream {
     private ws: WebSocket;
     private readableController: ReadableStreamController<string | Uint8Array> | null = null;
+    private messageChain: Promise<void> = Promise.resolve();
+    private messageError: Error | null = null;
     private _openedResolve: (value: WebSocketStreamConnection) => void = () => {};
     private _openedReject: ((reason: Error) => void) | null = null;
     private _closedResolve: (value: { closeCode: number; reason: string }) => void = () => {};
+    private _closedReject: (reason: Error) => void = () => {};
     readonly opened: Promise<WebSocketStreamConnection>;
     readonly closed: Promise<{ closeCode: number; reason: string }>;
 
     constructor(url: string | URL, options?: WebSocketStreamOptions) {
         this.opened = new Promise((resolve, reject) => { this._openedResolve = resolve; this._openedReject = reject; });
-        this.closed = new Promise(resolve => { this._closedResolve = resolve; });
+        this.closed = new Promise((resolve, reject) => {
+            this._closedResolve = resolve;
+            this._closedReject = reject;
+        });
+        void this.closed.catch(() => {});
         this.ws = new WebSocket(typeof url === 'string' ? url : url.toString(), options?.protocols);
         this.ws.binaryType = 'arraybuffer';
         this.setupEventHandlers();
@@ -906,25 +1293,42 @@ export class WebSocketStream {
                 readable: this.createReadableStream(), writable: this.createWritableStream(),
                 extensions: this.ws.extensions, protocol: this.ws.protocol
             });
+            this._openedReject = null;
         });
-        this.ws.addEventListener('message', async (event: MessageEvent) => {
-            if (this.readableController) {
-                try {
-                    const data = event.data;
-                    if (typeof data === 'string') this.readableController.enqueue(engine.encodeString(data));
-                    else if (data instanceof ArrayBuffer) this.readableController.enqueue(new Uint8Array(data));
-                    else if (data instanceof Blob) this.readableController.enqueue(new Uint8Array(await data.arrayBuffer()));
-                } catch (err) {
-                    this.ws.close(WebSocketCloseCode.ABNORMAL, 'Message processing failed');
+        this.ws.addEventListener('message', (event: MessageEvent) => {
+            const data = event.data;
+            this.messageChain = this.messageChain.then(async () => {
+                const controller = this.readableController as unknown as { enqueue(chunk: string | Uint8Array): void } | null;
+                if (!controller || this.messageError) return;
+                if (typeof data === 'string') controller.enqueue(data);
+                else if (engine.isArrayBuffer(data)) controller.enqueue(new Uint8Array(data as ArrayBuffer));
+                else if (getBlobSize(data) !== undefined) {
+                    const buffer = await Reflect.apply(blobArrayBuffer, data, []) as ArrayBuffer;
+                    controller.enqueue(new Uint8Array(buffer));
                 }
-            }
+            }).catch(err => {
+                const error = toError(err, 'Message processing failed');
+                this.messageError = error;
+                if (this.readableController) {
+                    errorReadableControllerQuietly(this.readableController, error);
+                    this.readableController = null;
+                }
+                this.ws[failWebSocket](error);
+            });
         });
         this.ws.addEventListener('close', (e: globalThis.CloseEvent) => {
-            if (this.readableController) {
-                closeReadableControllerQuietly(this.readableController);
-                this.readableController = null;
-            }
-            this._closedResolve({ closeCode: e.code, reason: e.reason });
+            void this.messageChain.then(() => {
+                if (this.readableController) {
+                    if (this.messageError) errorReadableControllerQuietly(this.readableController, this.messageError);
+                    else closeReadableControllerQuietly(this.readableController);
+                    this.readableController = null;
+                }
+                if (this.messageError) this._closedReject(this.messageError);
+                else if (e.wasClean) this._closedResolve({ closeCode: e.code, reason: e.reason });
+                else this._closedReject(new Error('WebSocket connection closed abnormally'));
+                this._closedResolve = () => {};
+                this._closedReject = () => {};
+            });
         });
         this.ws.addEventListener('error', () => {
             const error = new Error('WebSocket connection failed');
@@ -975,7 +1379,7 @@ export class WebSocketStream {
             abort(reason) { self.close({ reason: String(reason) }); }
         }, { highWaterMark: HIGH_WATER_MARK });
     }
-    
+
     get [Symbol.toStringTag]() {
         return 'WebSocketStream';
     }

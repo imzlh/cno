@@ -114,11 +114,29 @@ const denoStdioNs: DenoStdioNamespace = {
     stderr: new Stderr(),
 
     consoleSize(){
-        for (const stream of [stdin, stdout, stderr]) {
+        // Output handles first, and skip a stream whose size query fails.
+        //
+        // GetConsoleScreenBufferInfo() fails with ERROR_INVALID_HANDLE
+        // (-> UV_EBADF) on a console *input* handle, so stdin can be a genuine
+        // TTY yet have no queryable size. libuv's uv_tty_init() does not catch
+        // this: GetNumberOfConsoleInputEvents() succeeds on fd 0, so it takes
+        // the "readable" branch and skips its own GetConsoleScreenBufferInfo
+        // validation -- the handle is accepted at construction and only fails
+        // here. Outside a PTY stdin is usually a pipe, so `isTTY` was false and
+        // the old stdin-first order happened to work; inside a ConPTY all three
+        // fds are ConDrv TTYs and stdin was picked, throwing EBADF even though
+        // stdout answers 120x40.
+        let lastError: unknown;
+        for (const stream of [stdout, stderr, stdin]) {
             if (!stream.isTTY) continue;
-            const size = stream.size;
-            return { rows: size.height, columns: size.width };
+            try {
+                const size = stream.size;
+                return { rows: size.height, columns: size.width };
+            } catch (e) {
+                lastError = e;
+            }
         }
+        if (lastError) throw lastError;
         throw new Error(
             'Could not get console size: stdin, stdout, and stderr are not connected to a terminal'
         );

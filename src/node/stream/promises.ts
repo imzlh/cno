@@ -1,6 +1,6 @@
 import { Stream, Readable, Writable, PassThrough, Transform } from './mod';
 
-type PipelineStreamArg = Stream | ((source: Readable) => Stream);
+type PipelineStreamArg = Stream | ((source: Readable) => unknown);
 type PipelineOptions = { signal?: AbortSignal };
 type WebClosedController = {
     _addClosedCallback(resolve: () => void, reject: (reason?: unknown) => void): void;
@@ -36,6 +36,17 @@ function isWritableLike(value: unknown): value is Writable {
         || !!value && typeof value === 'object' && '_writableState' in value;
 }
 
+function isNodeStreamLike(value: unknown): value is Stream {
+    return !!value && typeof value === 'object'
+        && ('_readableState' in value || '_writableState' in value);
+}
+
+function isIterableLike(value: unknown): value is AsyncIterable<unknown> | Iterable<unknown> {
+    if (!value || (typeof value !== 'object' && typeof value !== 'function')) return false;
+    return typeof Reflect.get(value, Symbol.asyncIterator) === 'function'
+        || typeof Reflect.get(value, Symbol.iterator) === 'function';
+}
+
 /**
  * Stream.pipeline — connects streams and returns a Promise that resolves when
  * the pipeline finishes or rejects on the first error. Properly handles
@@ -43,7 +54,7 @@ function isWritableLike(value: unknown): value is Writable {
  */
 export async function pipeline(
     ...streams: (PipelineStreamArg | PipelineOptions)[]
-): Promise<void> {
+): Promise<unknown> {
     // Extract the optional signal from the last arg
     let signal: AbortSignal | undefined;
     const args = streams.map(s => {
@@ -58,34 +69,114 @@ export async function pipeline(
         throw new TypeError('pipeline requires at least two streams');
     }
 
-    // Resolve transform functions into actual streams
+    // ── Error bookkeeping ─────────────────────────────────────────────────────
+    // Declared before the resolve loop so generator transforms can report the
+    // error they threw, which is authoritative: when a generator throws, the
+    // abandoned async iterator also tears the *source* down with an ABORT_ERR /
+    // premature-close, and that symptom must not mask the real cause.
     const resolved: Stream[] = [];
-    for (let i = 0; i < args.length; i++) {
-        const arg = args[i];
-        if (typeof arg === 'function') {
-            const prev = resolved[resolved.length - 1] as Readable;
-            resolved.push(arg(prev));
-        } else {
-            resolved.push(arg);
-        }
-    }
-
-    // Wire up error propagation: destroy all downstream on error
     const cleanup: (() => void)[] = [];
+    const errors: Error[] = [];
+    let settled = false;
+    let settle: ((err: Error) => void) | null = null;
+
     const destroyAll = (err?: Error) => {
         for (const s of resolved) {
             if (!s.destroyed) s.destroy(err);
         }
     };
+    const isWeakError = (err: unknown): boolean => {
+        const code = err && typeof err === 'object' ? Reflect.get(err, 'code') : undefined;
+        return code === 'ABORT_ERR' || code === 'ERR_STREAM_PREMATURE_CLOSE';
+    };
+    const bestError = (): Error => errors.find((e) => !isWeakError(e)) ?? errors[0];
+    const recordError = (err: Error) => {
+        errors.push(err);
+        if (settled) return;
+        if (isWeakError(err)) {
+            // Give a real error a chance to arrive before settling on a symptom.
+            queueMicrotask(() => {
+                if (settled) return;
+                const best = bestError();
+                destroyAll(best);
+                settle?.(best);
+            });
+            return;
+        }
+        destroyAll(err);
+        settle?.(err);
+    };
+
+    // Resolve transform functions into actual streams.
+    //
+    // A function may return either a stream (classic transform factory) or an
+    // iterable / async-iterable (generator transform, as in
+    // `pipeline(src, async function*(source) {...}, dest)`). The generator case
+    // *consumes* the previous stream itself, so the previous stream must not
+    // also be piped into the resulting stream — `pipeFromPrev` tracks that.
+    const pipeFromPrev: boolean[] = [];
+    let terminalPending: unknown;
+    let hasTerminalValue = false;
+
+    for (let i = 0; i < args.length; i++) {
+        const arg = args[i];
+        if (typeof arg !== 'function') {
+            resolved.push(arg);
+            pipeFromPrev.push(resolved.length > 1);
+            continue;
+        }
+
+        const prev = resolved[resolved.length - 1];
+        if (prev === undefined) {
+            throw new TypeError('The first argument to pipeline must be a stream or an iterable');
+        }
+        const returned = arg(prev as Readable);
+
+        if (isNodeStreamLike(returned)) {
+            resolved.push(returned);
+            pipeFromPrev.push(true);
+            continue;
+        }
+        if (isIterableLike(returned)) {
+            const source = returned;
+            const tracked = (async function* () {
+                try {
+                    yield* source as AsyncIterable<unknown>;
+                } catch (err) {
+                    recordError(err instanceof Error ? err : new Error(String(err)));
+                    throw err;
+                }
+            })();
+            // The generator already reads `prev`; splice its output in as a stream.
+            resolved.push(Readable.from(tracked, { objectMode: true }));
+            pipeFromPrev.push(false);
+            continue;
+        }
+        if (i === args.length - 1) {
+            // Final function may consume the source and resolve with any value.
+            // Awaited only after piping is wired up, so data can actually flow.
+            terminalPending = returned;
+            hasTerminalValue = true;
+            continue;
+        }
+        throw Object.assign(
+            new TypeError(`Expected AsyncIterable to be returned from the "transform[${i - 1}]" function`),
+            { code: 'ERR_INVALID_RETURN_VALUE' },
+        );
+    }
+
+    // Once the pipeline has settled, a late error must not become an unhandled
+    // 'error' event. These sinks are intentionally never removed.
+    for (const s of resolved) s.on('error', () => {});
 
     // Pipe consecutive streams
     for (let i = 0; i < resolved.length - 1; i++) {
         const src = resolved[i] as Readable;
         const dst = resolved[i + 1] as Writable;
-        src.pipe(dst);
+        if (pipeFromPrev[i + 1]) src.pipe(dst);
 
-        const onSrcError = (err: Error) => { destroyAll(err); };
-        const onDstError = (err: Error) => { destroyAll(err); };
+        const onSrcError = (err: Error) => { recordError(err); };
+        const onDstError = (err: Error) => { recordError(err); };
         src.on('error', onSrcError);
         dst.on('error', onDstError);
         cleanup.push(() => { src.removeListener('error', onSrcError); dst.removeListener('error', onDstError); });
@@ -105,11 +196,17 @@ export async function pipeline(
         cleanup.push(() => abortSignal.removeEventListener('abort', onAbort));
     }
 
+    // A trailing function that consumed the source itself owns completion.
+    if (hasTerminalValue) {
+        try {
+            return await terminalPending;
+        } finally {
+            for (const fn of cleanup) fn();
+        }
+    }
+
     return new Promise<void>((resolve, reject) => {
         const last = resolved[resolved.length - 1];
-
-        const onFinish = () => { doCleanup(); resolve(); };
-        const onError = (err: Error) => { doCleanup(); destroyAll(err); reject(err); };
 
         const doCleanup = () => {
             last.removeListener('finish', onFinish);
@@ -121,14 +218,39 @@ export async function pipeline(
             for (const fn of cleanup) fn();
         };
 
+        function onFinish() {
+            if (settled) return;
+            settled = true;
+            doCleanup();
+            resolve();
+        }
+        function onError(err: Error) { recordError(err); }
+
+        settle = (err: Error) => {
+            if (settled) return;
+            settled = true;
+            doCleanup();
+            reject(err);
+        };
+
         // The last stream could be a Writable (finish) or Readable (end)
         if (last instanceof Writable) {
             last.on('finish', onFinish);
         }
         if (last instanceof Readable) {
             last.on('end', onFinish);
+            // A generator-derived tail has no consumer, so nothing would pull
+            // data through it and 'end' would never fire. Drain it.
+            if (!(last instanceof Writable)) last.resume();
         }
         last.on('error', onError);
+
+        // An error may already have been recorded while wiring up the pipes.
+        if (errors.length > 0) {
+            const best = bestError();
+            destroyAll(best);
+            settle(best);
+        }
     });
 }
 

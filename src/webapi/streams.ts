@@ -3,10 +3,10 @@
  * State machine based design with proper pull timing
  */
 
-import { assert } from "../utils/assert";
 import { getMemoryTier } from "../utils/memory-tier";
 
 const zlib = import.meta.use('zlib');
+const transformReadableDefault = Symbol('transformReadableDefault');
 
 type ClosableHandle = { close?: () => void };
 
@@ -22,8 +22,19 @@ const extractHighWaterMark = (strategy: QueuingStrategy | undefined, defaultHWM:
     return validateHighWaterMark(strategy?.highWaterMark ?? defaultHWM);
 };
 
+// WebIDL converts the QueuingStrategy dictionary before the extract steps run, so a
+// present-but-not-callable `size` is a TypeError at construction rather than something
+// that blows up later on the first enqueue. `undefined` means "absent" and takes the
+// default; `null` is a failed callback conversion and throws, matching Node and Deno.
 const extractSizeAlgorithm = <T>(strategy: QueuingStrategy<T> | undefined): (chunk: T) => number => {
-    return strategy?.size ?? (() => 1);
+    const size = strategy?.size;
+    if (size === undefined) return () => 1;
+    if (typeof size !== 'function') {
+        throw new TypeError(
+            "Failed to read the 'size' property from 'QueuingStrategy': the provided value is not a function"
+        );
+    }
+    return size;
 };
 
 function closeHandle(handle: ClosableHandle | null): void {
@@ -66,18 +77,22 @@ class ReadableStreamController<R = unknown> implements globalThis.ReadableStream
     #backpressureBufferSize = 0;
     #maxBackpressureSize: number;
     #onEnqueue: (() => void) | null = null;
+    #onDequeue: (() => void) | null = null;
 
-    constructor(source: UnderlyingSource<R>, strategy: QueuingStrategy<R>) {
+    constructor(source: UnderlyingSource<R>, strategy: QueuingStrategy<R>, defaultHWM = 1) {
         this.#source = source;
         this.#sizeAlgorithm = extractSizeAlgorithm(strategy);
-        this.#highWaterMark = extractHighWaterMark(strategy, 1);
+        this.#highWaterMark = extractHighWaterMark(strategy, defaultHWM);
         const tier = getMemoryTier();
         this.#maxBackpressureSize = tier === 'low' ? 1 * 1024 * 1024 : tier === 'normal' ? 8 * 1024 * 1024 : 32 * 1024 * 1024;
     }
 
     get desiredSize(): number | null {
         if (this.#state === 'closed' || this.#state === 'errored') return null;
-        return this.#highWaterMark - this.#queueSize;
+        // The side buffer holds chunks past the HWM (see `enqueue`), so it must be
+        // charged here too: otherwise desiredSize floors at 0 and never reports the
+        // negative pressure the spec uses to tell a producer to stop.
+        return this.#highWaterMark - (this.#queueSize + this.#backpressureBufferSize);
     }
 
     enqueue(chunk: R): void {
@@ -101,9 +116,11 @@ class ReadableStreamController<R = unknown> implements globalThis.ReadableStream
         // stop producing (e.g. pause curl). Chunks must remain lossless;
         // transport-level backpressure is responsible for stopping growth.
         if (this.#queueSize >= this.#highWaterMark && this.#highWaterMark > 0) {
-            const size = this.#sizeAlgorithm(chunk);
+            const size = this.#sizeAlgorithm2(chunk);
             if (this.#backpressureBufferSize + size > this.#maxBackpressureSize) {
-                throw new TypeError('Backpressure buffer exceeded memory limit');
+                const err = new TypeError('Backpressure buffer exceeded memory limit');
+                this.error(err);
+                throw err;
             }
             this.#backpressureBuffer.push({ chunk, size });
             this.#backpressureBufferSize += size;
@@ -114,9 +131,29 @@ class ReadableStreamController<R = unknown> implements globalThis.ReadableStream
         }
 
         // Otherwise enqueue into the main queue.
-        const size = this.#sizeAlgorithm(chunk);
+        const size = this.#sizeAlgorithm2(chunk);
         this.#queue.push({ chunk, size });
         this.#queueSize += size;
+    }
+
+    // A throwing (or junk-returning) `size()` must error the stream before the
+    // throw escapes to the producer. Letting it propagate raw left the stream
+    // 'readable' with no queue and no producer, so every later read() and the
+    // `closed` promise stayed pending forever instead of rejecting.
+    #sizeAlgorithm2(chunk: R): number {
+        let size: number;
+        try {
+            size = Number(this.#sizeAlgorithm(chunk));
+        } catch (error) {
+            this.error(error);
+            throw error;
+        }
+        if (!Number.isFinite(size) || size < 0) {
+            const err = new RangeError('Chunk size must be a finite, non-negative number');
+            this.error(err);
+            throw err;
+        }
+        return size;
     }
 
     close(): void {
@@ -134,6 +171,8 @@ class ReadableStreamController<R = unknown> implements globalThis.ReadableStream
             this.#queue.push(entry);
             this.#queueSize += entry.size;
         }
+        // The bytes moved to #queue, so stop charging them to the side buffer too.
+        this.#backpressureBufferSize = 0;
 
         // If queue is empty, finish immediately — any pending reads get done:true.
         // (This handles the case where close() is called from inside pull()
@@ -211,6 +250,7 @@ class ReadableStreamController<R = unknown> implements globalThis.ReadableStream
 
             // Drain backpressure buffer now that queue has room.
             this.#drainBuffer();
+            this.#onDequeue?.();
 
             // Check if we should close after dequeueing
             if (this.#closeRequested && this.#queue.length === 0 && this.#pendingReads.length === 0) {
@@ -263,8 +303,9 @@ class ReadableStreamController<R = unknown> implements globalThis.ReadableStream
         if (!this.#started) return false;
         if (this.#closeRequested) return false;
         if (this.#pendingReads.length === 0) return false;
-        const desiredSize = this.desiredSize;
-        return desiredSize !== null && desiredSize > 0;
+        // A pending read is demand even when HWM is zero. TransformStream uses
+        // that zero default and would deadlock if pull were gated on desiredSize.
+        return true;
     }
 
     async #cancel(reason?: unknown): Promise<void> {
@@ -332,6 +373,7 @@ class ReadableStreamController<R = unknown> implements globalThis.ReadableStream
     get _backpressured() { return this.#backpressureBuffer.length > 0; }
 
     set _onEnqueueCallback(fn: (() => void) | null) { this.#onEnqueue = fn; }
+    set _onDequeueCallback(fn: (() => void) | null) { this.#onDequeue = fn; }
 
     _addPendingRead(resolve: (result: ReadableStreamReadResult<R>) => void, reject: (reason?: unknown) => void) {
         this.#pendingReads.push({ resolve, reject });
@@ -407,9 +449,18 @@ export class ReadableStream<R = unknown> implements globalThis.ReadableStream<R>
 
     constructor(
         source: UnderlyingSource<R> = {},
-        strategy: QueuingStrategy<R> = {}
+        strategy: QueuingStrategy<R> = {},
+        internalDefault?: typeof transformReadableDefault,
     ) {
-        this.#controller = new ReadableStreamController(source, strategy);
+        // `type` is a WebIDL enum: absent means a default stream, 'bytes' selects a byte
+        // stream, and anything else is a TypeError *after* ToString, so
+        // `{ toString: () => 'bytes' }` is accepted. Node and Deno both do this.
+        const type = (source as { type?: unknown } | null)?.type;
+        if (type !== undefined && String(type) !== 'bytes') {
+            throw new TypeError(`Invalid type: ${String(type)}`);
+        }
+        const defaultHWM = internalDefault === transformReadableDefault ? 0 : 1;
+        this.#controller = new ReadableStreamController(source, strategy, defaultHWM);
         void this.#controller._start();
     }
 
@@ -420,7 +471,17 @@ export class ReadableStream<R = unknown> implements globalThis.ReadableStream<R>
     getReader(options: { mode: 'byob' }): ReadableStreamBYOBReader;
     getReader(options?: ReadableStreamGetReaderOptions): ReadableStreamDefaultReader<R>;
     getReader(options?: ReadableStreamGetReaderOptions): ReadableStreamReader<R> {
-        assert(options?.mode != 'byob', "Byob mode is not supported");
+        // `mode` is a WebIDL enum: anything other than undefined/'byob' is a
+        // TypeError. 'byob' is unimplemented (no byte-stream controller), and requesting
+        // it is a TypeError too — the spec's own error for byob on a non-byte stream —
+        // not the bare Error that `assert` raises.
+        const mode = options?.mode;
+        if (mode !== undefined && mode !== 'byob') {
+            throw new TypeError(`Invalid mode: ${String(mode)}`);
+        }
+        if (mode === 'byob') {
+            throw new TypeError('Cannot get a BYOB reader for a non-byte stream');
+        }
         if (this.locked) {
             throw new TypeError('Stream is already locked');
         }
@@ -440,6 +501,14 @@ export class ReadableStream<R = unknown> implements globalThis.ReadableStream<R>
         transform: { writable: globalThis.WritableStream<R>; readable: globalThis.ReadableStream<T> },
         options?: { signal?: AbortSignal; preventClose?: boolean; preventAbort?: boolean; preventCancel?: boolean }
     ): globalThis.ReadableStream<T> {
+        // Validate the pair up front: without this, `pipeThrough({})` returns
+        // `undefined` instead of throwing, and the failure surfaces far away.
+        if (transform === null || typeof transform !== 'object') {
+            throw new TypeError('pipeThrough requires a { readable, writable } pair');
+        }
+        if (!(transform.writable instanceof WritableStream) || !(transform.readable instanceof ReadableStream)) {
+            throw new TypeError('pipeThrough requires a { readable, writable } pair');
+        }
         const pipePromise = this.pipeTo(transform.writable, options);
         void pipePromise.catch(() => {});
         return transform.readable;
@@ -672,22 +741,22 @@ export class ReadableStream<R = unknown> implements globalThis.ReadableStream<R>
             async return(value?: R): Promise<IteratorResult<R>> {
                 if (!finished) {
                     finished = true;
-                    try {
-                        if (!preventCancel) await reader.cancel();
-                    } finally {
-                        release();
-                    }
+                    // Release synchronously: `cancel()` captures the stream before
+                    // its first await, and QuickJS's for-await does not await this
+                    // method on `break`, so a release behind the await would leave
+                    // the stream locked for a whole macrotask.
+                    const cancelled = preventCancel ? undefined : reader.cancel();
+                    release();
+                    await cancelled;
                 }
                 return { value, done: true };
             },
             async throw(error?: unknown): Promise<IteratorResult<R>> {
                 if (!finished) {
                     finished = true;
-                    try {
-                        await reader.cancel(error);
-                    } finally {
-                        release();
-                    }
+                    const cancelled = reader.cancel(error);
+                    release();
+                    await cancelled;
                 }
                 throw error;
             },
@@ -816,6 +885,9 @@ class WritableStreamController<W = unknown> implements globalThis.WritableStream
     }
 
     async #write(chunk: W): Promise<void> {
+        // An errored/aborted stream must reject with its stored reason — a generic
+        // TypeError loses the cancel/abort cause the caller is branching on.
+        if (this.#state === 'errored') throw this.#storedError;
         if (this.#state !== 'writable') {
             throw new TypeError('Stream is not writable');
         }
@@ -826,7 +898,13 @@ class WritableStreamController<W = unknown> implements globalThis.WritableStream
 
         const operation = this.#operation.then(async () => {
             await this.#startPromise;
-            if (this.#state !== 'writable') throw this.#storedError ?? new TypeError('Stream is not writable');
+            // Only errored/closed may drop a chunk. 'closing' must NOT: a write
+            // accepted while writable is already queued ahead of the close
+            // request, and close() flips the state synchronously — re-checking
+            // for 'writable' here silently discarded every un-awaited write.
+            if (this.#state === 'errored' || this.#state === 'closed') {
+                throw this.#storedError ?? new TypeError('Stream is not writable');
+            }
             try {
                 await this.#sink.write?.(chunk, this);
             } catch (error) {
@@ -843,6 +921,8 @@ class WritableStreamController<W = unknown> implements globalThis.WritableStream
     }
 
     async #close(): Promise<void> {
+        // Unlike `write`, an errored stream reports an invalid-state TypeError here
+        // rather than the stored reason — verified against Node.
         if (this.#state !== 'writable') {
             throw new TypeError('Stream is not writable');
         }
@@ -1031,18 +1111,22 @@ class WritableStreamDefaultWriter<W = unknown> implements globalThis.WritableStr
         this.#stream = null;
     }
 
-    async write(chunk: W): Promise<void> {
-        if (!this.#stream) throw new TypeError('Writer is released');
+    write(chunk: W): Promise<void> {
+        if (!this.#stream) return Promise.reject(new TypeError('Writer is released'));
 
-        await this.ready;
+        // The chunk must be enqueued *now*, not after `ready` settles: `ready` and
+        // `desiredSize` are the backpressure signal, so gating the enqueue on them
+        // makes the queue accounting lag a microtask and `ready` never go pending.
+        // Ordering is still guaranteed — the controller serialises writes itself.
         const stream = this.#stream;
         const write = stream._controller._write(chunk);
+        void write.catch(() => {});
         const ready = Promise.withResolvers<void>();
         this.#readyPromise = ready.promise;
         this.#readyReject = ready.reject;
         void ready.promise.catch(() => {});
         stream._controller._addReadyCallback(ready.resolve, ready.reject);
-        await write;
+        return write;
     }
 }
 
@@ -1056,9 +1140,52 @@ export class TransformStream<I = unknown, O = unknown> implements globalThis.Tra
         writableStrategy: QueuingStrategy<I> = {},
         readableStrategy: QueuingStrategy<O> = {}
     ) {
-        let readableController: ReadableStreamDefaultController<O>;
+        // ReadableStream invokes source.start() synchronously before its first
+        // await, so this is assigned before the constructor reads it below.
+        let readableController!: ReadableStreamDefaultController<O>;
         let transformController: TransformStreamDefaultController<O>;
-        let writableRef: globalThis.WritableStream<I>;
+        let writableRef: WritableStream<I>;
+        let startError: unknown;
+        let started = false;
+        let backpressured = false;
+        let releaseBackpressure = () => {};
+        let backpressureChange = Promise.resolve();
+
+        const setBackpressure = (): void => {
+            if (backpressured) return;
+            backpressured = true;
+            const change = Promise.withResolvers<void>();
+            releaseBackpressure = change.resolve;
+            backpressureChange = change.promise;
+        };
+        const clearBackpressure = (): void => {
+            if (!backpressured) return;
+            backpressured = false;
+            releaseBackpressure();
+        };
+        const waitForBackpressure = (signal: AbortSignal): Promise<void> => {
+            if (!backpressured) return Promise.resolve();
+            if (signal.aborted) return Promise.reject(signal.reason);
+            return new Promise<void>((resolve, reject) => {
+                const onAbort = () => {
+                    signal.removeEventListener('abort', onAbort);
+                    reject(signal.reason);
+                };
+                signal.addEventListener('abort', onAbort, { once: true });
+                backpressureChange.then(() => {
+                    signal.removeEventListener('abort', onAbort);
+                    resolve();
+                });
+            });
+        };
+
+        // A byte-oriented TransformStream is not implementable here, and the spec
+        // requires a RangeError rather than silently ignoring the request.
+        for (const key of ['readableType', 'writableType'] as const) {
+            if (Reflect.get(transformer, key) !== undefined) {
+                throw new RangeError(`Invalid ${key}`);
+            }
+        }
 
         this.readable = new ReadableStream<O>({
             start(c) {
@@ -1066,56 +1193,157 @@ export class TransformStream<I = unknown, O = unknown> implements globalThis.Tra
                 transformController = {
                     get desiredSize() { return readableController.desiredSize; },
                     enqueue(chunk?: O) { readableController.enqueue(chunk as O); },
-                    error(reason?: unknown) { readableController.error(reason); },
-                    terminate() { readableController.close(); },
+                    error(reason?: unknown) {
+                        clearBackpressure();
+                        readableController.error(reason);
+                        writableRef?._controller.error(reason);
+                    },
+                    // Spec: terminate closes the readable AND errors the writable,
+                    // so a later write() rejects instead of being silently accepted.
+                    terminate() {
+                        clearBackpressure();
+                        readableController.close();
+                        writableRef?._controller.error(new TypeError('Stream is terminated'));
+                    },
                 };
-                return transformer.start?.(transformController);
+                started = true;
+                // ReadableStream swallows a start() rejection into its own error
+                // state; the TransformStream constructor must rethrow it instead.
+                try {
+                    return transformer.start?.(transformController);
+                } catch (error) {
+                    startError = error;
+                    throw error;
+                }
             },
+            pull() {
+                clearBackpressure();
+            },
+            // Error the writable through its internal controller: the public
+            // abort() rejects while a pipeTo writer holds the lock, which would
+            // strand the producer instead of propagating the cancel upstream.
             cancel: async (reason) => {
-                await writableRef.abort(reason);
+                clearBackpressure();
+                await writableRef._controller._abort(reason);
             }
-        }, readableStrategy) as globalThis.ReadableStream<O>;
+        }, readableStrategy, transformReadableDefault) as globalThis.ReadableStream<O>;
+        const readable = this.readable as ReadableStream<O>;
+        readable._controller._onDequeueCallback = () => {
+            if ((readableController.desiredSize ?? 0) > 0) clearBackpressure();
+        };
+        if ((readableController.desiredSize ?? 0) <= 0) setBackpressure();
 
-        this.writable = new WritableStream<I>({
-            write: async (chunk) => {
-                await transformer.transform?.(chunk, transformController);
+        const writable = new WritableStream<I>({
+            write: async (chunk, controller) => {
+                // No `transform` means the identity transform — the chunk must be
+                // enqueued, not dropped. And a throwing transform has to error the
+                // *readable* too: erroring only the writable leaves every consumer
+                // waiting on a read that can never settle.
+                try {
+                    await waitForBackpressure(controller.signal);
+                    if (controller.signal.aborted) throw controller.signal.reason;
+                    if (transformer.transform) await transformer.transform(chunk, transformController);
+                    else readableController.enqueue(chunk as unknown as O);
+                    if ((readableController.desiredSize ?? 0) <= 0) setBackpressure();
+                } catch (error) {
+                    readableController.error(error);
+                    throw error;
+                }
             },
             close: async () => {
-                await transformer.flush?.(transformController);
+                try {
+                    await transformer.flush?.(transformController);
+                } catch (error) {
+                    readableController.error(error);
+                    throw error;
+                }
                 readableController.close();
             },
             abort: async (reason) => {
+                clearBackpressure();
                 readableController.error(reason);
             }
-        }, writableStrategy) as globalThis.WritableStream<I>;
+        }, writableStrategy);
+        this.writable = writable as globalThis.WritableStream<I>;
 
-        writableRef = this.writable;
+        writableRef = writable;
+        if (started && startError !== undefined) throw startError;
     }
 }
 
 // QueuingStrategies
+// Per spec both members are *readonly attributes* on the prototype (not own data
+// properties and not a plain `size` method), `highWaterMark` is a required dictionary
+// member, and the accessors are brand-checked. `size` is one shared function per class:
+// Node and Deno both report `a.size === b.size` across instances.
+const countSizeFunction = function size(): number {
+    return 1;
+};
+const byteSizeFunction = function size(chunk: ArrayBufferView): number {
+    return chunk.byteLength;
+};
+
+// `highWaterMark` is an unrestricted double, so -1/NaN/Infinity are stored as-is here
+// and only rejected later by validateHighWaterMark when a stream actually uses them.
+const extractStrategyInit = (init: unknown, className: string): number => {
+    if (init === null || typeof init !== 'object') {
+        throw new TypeError(`Failed to construct '${className}': the 'init' argument must be an object`);
+    }
+    const highWaterMark = (init as { highWaterMark?: unknown }).highWaterMark;
+    if (highWaterMark === undefined) {
+        throw new TypeError(
+            `Failed to construct '${className}': required member 'highWaterMark' is undefined`
+        );
+    }
+    return Number(highWaterMark);
+};
+
 export class CountQueuingStrategy implements globalThis.CountQueuingStrategy {
-    highWaterMark: number;
+    #highWaterMark: number;
 
     constructor(init: { highWaterMark: number }) {
-        this.highWaterMark = init.highWaterMark;
+        this.#highWaterMark = extractStrategyInit(init, 'CountQueuingStrategy');
     }
 
-    size(): number {
-        return 1;
+    get highWaterMark(): number {
+        if (!(#highWaterMark in this)) throw new TypeError('Illegal invocation');
+        return this.#highWaterMark;
+    }
+
+    get size(): (chunk: unknown) => number {
+        if (!(#highWaterMark in this)) throw new TypeError('Illegal invocation');
+        return countSizeFunction;
     }
 }
 
 export class ByteLengthQueuingStrategy implements globalThis.ByteLengthQueuingStrategy {
-    highWaterMark: number;
+    #highWaterMark: number;
 
     constructor(init: { highWaterMark: number }) {
-        this.highWaterMark = init.highWaterMark;
+        this.#highWaterMark = extractStrategyInit(init, 'ByteLengthQueuingStrategy');
     }
 
-    size(chunk: ArrayBufferView): number {
-        return chunk.byteLength;
+    get highWaterMark(): number {
+        if (!(#highWaterMark in this)) throw new TypeError('Illegal invocation');
+        return this.#highWaterMark;
     }
+
+    get size(): (chunk: ArrayBufferView) => number {
+        if (!(#highWaterMark in this)) throw new TypeError('Illegal invocation');
+        return byteSizeFunction;
+    }
+}
+
+// WebIDL attributes are enumerable; class getters default to enumerable:false.
+for (const [Ctor, tag] of [
+    [CountQueuingStrategy, 'CountQueuingStrategy'],
+    [ByteLengthQueuingStrategy, 'ByteLengthQueuingStrategy']
+] as const) {
+    for (const key of ['highWaterMark', 'size'] as const) {
+        const descriptor = Object.getOwnPropertyDescriptor(Ctor.prototype, key);
+        if (descriptor) Object.defineProperty(Ctor.prototype, key, { ...descriptor, enumerable: true });
+    }
+    Object.defineProperty(Ctor.prototype, Symbol.toStringTag, { value: tag, configurable: true });
 }
 
 // TextEncoderStream
@@ -1127,30 +1355,52 @@ export class TextEncoderStream implements globalThis.TextEncoderStream {
     constructor() {
         const encoder = new TextEncoder();
         let controller: ReadableStreamDefaultController<Uint8Array<ArrayBuffer>>;
-        let writableRef: globalThis.WritableStream<string>;
+        let writableRef: WritableStream<string>;
+        // A surrogate pair may straddle a chunk boundary. Encoding each chunk
+        // independently turned both halves into U+FFFD and silently destroyed
+        // the character, so a trailing high surrogate is held for the next chunk.
+        let pendingHigh = '';
 
         this.readable = new ReadableStream<Uint8Array<ArrayBuffer>>({
             start(c) {
                 controller = c as ReadableStreamDefaultController<Uint8Array<ArrayBuffer>>;
             },
+            // Internal controller, not the public abort(): a pipeTo writer holds
+            // the lock, so abort() would throw and strand the producer.
             cancel(reason) {
-                return writableRef.abort(reason);
+                return writableRef._controller._abort(reason);
             }
         }) as globalThis.ReadableStream<Uint8Array<ArrayBuffer>>;
 
-        this.writable = new WritableStream<string>({
+        const writable = new WritableStream<string>({
             write(chunk) {
-                const encoded = encoder.encode(chunk);
-                controller.enqueue(encoded);
+                let s = pendingHigh + String(chunk);
+                pendingHigh = '';
+                // Hold back a lone trailing high surrogate; its low half, if any,
+                // arrives in the next chunk.
+                const last = s.charCodeAt(s.length - 1);
+                if (s.length > 0 && last >= 0xd800 && last <= 0xdbff) {
+                    pendingHigh = s.slice(-1);
+                    s = s.slice(0, -1);
+                }
+                if (s.length === 0) return;
+                controller.enqueue(encoder.encode(s));
             },
             close() {
+                // An unpaired high surrogate at end of stream is a replacement char.
+                if (pendingHigh) {
+                    const tail = encoder.encode(pendingHigh);
+                    pendingHigh = '';
+                    controller.enqueue(tail);
+                }
                 controller.close();
             },
             abort(reason) {
                 controller.error(reason);
             }
-        }) as globalThis.WritableStream<string>;
-        writableRef = this.writable;
+        });
+        this.writable = writable as globalThis.WritableStream<string>;
+        writableRef = writable;
     }
 }
 
@@ -1170,18 +1420,20 @@ export class TextDecoderStream implements globalThis.TextDecoderStream {
         this.encoding = this.decoder.encoding;
         this.fatal = this.decoder.fatal;
         this.ignoreBOM = this.decoder.ignoreBOM;
-        let writableRef: globalThis.WritableStream<AllowSharedBufferSource>;
+        let writableRef: WritableStream<AllowSharedBufferSource>;
 
         this.readable = new ReadableStream<string>({
             start: (c) => {
                 this.controller = c as ReadableStreamDefaultController<string>;
             },
+            // Internal controller, not the public abort(): a pipeTo writer holds
+            // the lock, so abort() would throw and strand the producer.
             cancel(reason) {
-                return writableRef.abort(reason);
+                return writableRef._controller._abort(reason);
             }
         }) as globalThis.ReadableStream<string>;
 
-        this.writable = new WritableStream<AllowSharedBufferSource>({
+        const writable = new WritableStream<AllowSharedBufferSource>({
             write: (chunk) => {
                 const decoded = this.decoder.decode(chunk, { stream: true });
                 if (decoded) {
@@ -1198,8 +1450,9 @@ export class TextDecoderStream implements globalThis.TextDecoderStream {
             abort: (reason) => {
                 this.controller?.error(reason);
             }
-        }) as globalThis.WritableStream<AllowSharedBufferSource>;
-        writableRef = this.writable;
+        });
+        this.writable = writable as globalThis.WritableStream<AllowSharedBufferSource>;
+        writableRef = writable;
     }
 }
 
@@ -1258,6 +1511,16 @@ export class CompressionStream implements globalThis.CompressionStream {
     }
 }
 
+// A finished inflate handle reports "already finished" rather than succeeding; both
+// mean the member completed, so only *other* failures indicate truncated input.
+const isAlreadyFinished = (error: unknown): boolean =>
+    error instanceof Error && /already finished/i.test(error.message);
+
+const asDecompressError = (error: unknown): TypeError =>
+    error instanceof TypeError
+        ? error
+        : new TypeError(error instanceof Error ? error.message : String(error));
+
 export class DecompressionStream implements globalThis.DecompressionStream {
     readonly readable: globalThis.ReadableStream<Uint8Array<ArrayBuffer>>;
     readonly writable: globalThis.WritableStream<BufferSource>;
@@ -1291,7 +1554,19 @@ export class DecompressionStream implements globalThis.DecompressionStream {
             write: (chunk) => {
                 if (!this.handle) throw new TypeError('DecompressionStream is closed');
                 if (chunk.byteLength > 0) this.wroteInput = true;
-                const output = this.handle.inflate(chunk);
+                let output: Uint8Array;
+                try {
+                    output = this.handle.inflate(chunk);
+                } catch (error) {
+                    // Corrupt input. The readable must be errored too: erroring only the
+                    // writable left every consumer of `readable` awaiting a chunk that
+                    // never arrived, so a garbage body hung instead of rejecting.
+                    const reason = asDecompressError(error);
+                    this.controller?.error(reason);
+                    closeHandle(this.handle as ClosableHandle | null);
+                    this.handle = null;
+                    throw reason;
+                }
                 if (output && output.byteLength > 0) {
                     this.controller?.enqueue(new Uint8Array(output));
                 }
@@ -1302,15 +1577,27 @@ export class DecompressionStream implements globalThis.DecompressionStream {
                     if (!this.wroteInput) {
                         throw new TypeError('corrupt gzip stream does not have a matching checksum');
                     }
+                    // `inflate()` returns partial output for input that stops mid-member
+                    // without reporting anything, so ask the handle to finish: only
+                    // success or "already finished" means the stream really ended.
+                    let tail: Uint8Array | undefined;
+                    try {
+                        tail = this.handle.finish();
+                    } catch (error) {
+                        if (!isAlreadyFinished(error)) {
+                            throw new TypeError('unexpected end of file');
+                        }
+                    }
+                    if (tail && tail.byteLength > 0) {
+                        this.controller?.enqueue(new Uint8Array(tail));
+                    }
                     this.controller?.close();
                 } catch (error) {
-                    if (error instanceof Error && error.message.includes('already finished')) {
+                    if (isAlreadyFinished(error)) {
                         this.controller?.close();
                         return;
                     }
-                    const reason = error instanceof TypeError
-                        ? error
-                        : new TypeError(error instanceof Error ? error.message : String(error));
+                    const reason = asDecompressError(error);
                     this.controller?.error(reason);
                     throw reason;
                 } finally {
@@ -1327,7 +1614,9 @@ export class DecompressionStream implements globalThis.DecompressionStream {
     }
 }
 
-// Export to global
+// Export to global. The reader/writer/controller constructors are part of the
+// observable surface (`instanceof`, `constructor.name`); only the BYOB trio is
+// absent because there is no byte-stream controller behind it.
 Object.assign(globalThis, {
     ReadableStream,
     WritableStream,
@@ -1337,5 +1626,9 @@ Object.assign(globalThis, {
     TextEncoderStream,
     TextDecoderStream,
     CompressionStream,
-    DecompressionStream
+    DecompressionStream,
+    ReadableStreamDefaultReader,
+    ReadableStreamDefaultController: ReadableStreamController,
+    WritableStreamDefaultWriter,
+    WritableStreamDefaultController: WritableStreamController
 });

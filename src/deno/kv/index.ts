@@ -85,6 +85,8 @@ async function openKv(path?: string): Promise<Deno.Kv> {
 
 Object.assign(Deno, {
     openKv,
+    Kv,
+    KvListIterator,
     KvU64,
     AtomicOperation,
 });

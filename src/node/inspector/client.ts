@@ -128,13 +128,20 @@ export class InspectorProtocolClient extends EventEmitter {
 				return Promise.resolve({})
 			case 'Runtime.evaluate': {
 				const expression = typeof params?.expression === 'string' ? params.expression : ''
-				const value = globalThis.eval(expression)
-				return Promise.resolve({
-					result: {
-						type: value === null ? 'object' : typeof value,
-						value,
-					},
-				})
+				try {
+					return Promise.resolve({ result: toRemoteObject(globalThis.eval(expression)) })
+				} catch (error) {
+					return Promise.resolve({
+						result: toRemoteObject(error),
+						exceptionDetails: {
+							exceptionId: 1,
+							text: 'Uncaught',
+							lineNumber: 0,
+							columnNumber: 0,
+							exception: toRemoteObject(error),
+						},
+					})
+				}
 			}
 			default:
 				throw protocolError({ code: -32601, message: `Unknown CDP method: ${method}` })
@@ -190,6 +197,46 @@ export class InspectorProtocolClient extends EventEmitter {
 
 function asError(error: unknown): Error {
 	return error instanceof Error ? error : new Error(String(error))
+}
+
+/** CDP requires a RemoteObject, not the live value — returning the value leaks
+ * a non-serialisable reference and misreports every non-primitive type. */
+function toRemoteObject(value: unknown): Record<string, unknown> {
+	if (value === null) return { type: 'object', subtype: 'null', value: null }
+	switch (typeof value) {
+		case 'undefined': return { type: 'undefined' }
+		case 'boolean': return { type: 'boolean', value }
+		case 'string': return { type: 'string', value }
+		case 'number':
+			return Number.isFinite(value)
+				? { type: 'number', value, description: String(value) }
+				: { type: 'number', unserializableValue: String(value), description: String(value) }
+		case 'bigint': return { type: 'bigint', unserializableValue: `${value}n`, description: `${value}n` }
+		case 'symbol': return { type: 'symbol', description: String(value) }
+		case 'function':
+			return { type: 'function', className: 'Function', description: safeDescribe(value) }
+	}
+	if (value instanceof Error) {
+		return { type: 'object', subtype: 'error', className: value.name, description: value.stack ?? String(value) }
+	}
+	const subtype = Array.isArray(value) ? 'array' : value instanceof Date ? 'date'
+		: value instanceof RegExp ? 'regexp' : value instanceof Map ? 'map'
+		: value instanceof Set ? 'set' : undefined
+	const out: Record<string, unknown> = {
+		type: 'object',
+		className: (value as object).constructor?.name ?? 'Object',
+		description: safeDescribe(value),
+	}
+	if (subtype) out.subtype = subtype
+	return out
+}
+
+function safeDescribe(value: unknown): string {
+	try {
+		return typeof value === 'function' ? String(value) : Object.prototype.toString.call(value)
+	} catch {
+		return 'Object'
+	}
 }
 
 type ProtocolError = Error & { code?: number; data?: unknown }

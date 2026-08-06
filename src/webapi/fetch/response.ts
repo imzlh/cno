@@ -1,7 +1,7 @@
 import { Headers } from "../headers";
 import { type NetworkCallFrame } from "../../utils/network-hooks";
 import { bytesToArrayBuffer } from "../../utils/bytes";
-import { BOUNDARY_RE, CHARSET_RE, Decoder, ensureFormDataContentType, engine, isBodyIterable, isNullBodyStatus, isReadableStreamLike, iterableBodyToStream, mergeChunks, parseMultipart, parseUrlEncoded, serializeBody, serializeFormData } from "./helpers";
+import { BOUNDARY_RE, Decoder, ensureFormDataContentType, engine, isBodyIterable, isNullBodyStatus, isReadableStreamLike, iterableBodyToStream, mergeChunks, parseMultipart, parseUrlEncoded, rememberRawGetReader, serializeBody, serializeFormData, teeUntracked } from "./helpers";
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 type ResponseBodySource = BodyInit | ReadableStream<Uint8Array> | Uint8Array | null;
@@ -15,6 +15,13 @@ function normalizeStatusText(value: unknown): string {
         if (code === 0x0a || code === 0x0d || code > 0xff) throw new TypeError('Invalid statusText');
     }
     return text;
+}
+
+/** `ResponseInit.status` is WebIDL `unsigned short`: ToUint16 first, then range-check. */
+function toUint16(value: unknown): number {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return 0;
+    return ((Math.trunc(number) % 65536) + 65536) % 65536;
 }
 
 function bodyContentType(body: unknown): string | undefined {
@@ -59,9 +66,9 @@ export class Response implements globalThis.Response {
             throw new TypeError('Response init must be an object');
         }
         const rawStatus = init?.status === undefined ? 200 : init.status;
-        const status = Number(rawStatus);
+        const status = toUint16(rawStatus);
         const allow101 = status === 101 && (init as InternalResponseInit | undefined)?.[allowSwitchingProtocols] === true;
-        if (!Number.isFinite(status) || Math.trunc(status) !== status || (!allow101 && status < 200) || status > 599) {
+        if ((!allow101 && status < 200) || status > 599) {
             throw new RangeError(`Invalid response status: ${rawStatus}`);
         }
         if (body !== undefined && body !== null && isNullBodyStatus(status)) {
@@ -123,6 +130,10 @@ export class Response implements globalThis.Response {
     private trackBodyStream(stream: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
         const markUsed = () => { this.bodyUsed = true; };
         const getReader = stream.getReader.bind(stream);
+        // Keep the unpatched method for clone(): tee() acquires its source reader
+        // through this public property, so without this the clone's pulls would run
+        // THIS response's markUsed. See rememberRawGetReader in ./helpers.
+        rememberRawGetReader(stream, getReader);
         stream.getReader = ((options?: ReadableStreamGetReaderOptions) => {
             const reader = getReader(options) as ReadableStreamDefaultReader<Uint8Array>;
             const read = reader.read.bind(reader);
@@ -149,7 +160,11 @@ export class Response implements globalThis.Response {
         if (this.bodyUsed) throw new TypeError('Already read');
         let clonedBody: ResponseBodySource = this._bodyBuffer;
         if (clonedBody === null && this.body) {
-            const [s1, s2] = this.body.tee();
+            // teeUntracked, not this.body.tee(): a tracked tee would attribute BOTH
+            // branches' pulls to this response, so reading the clone marked the
+            // original consumed and the original then threw "Already read" with its
+            // bytes intact. Each branch is tracked separately just below.
+            const [s1, s2] = teeUntracked(this.body);
             Object.defineProperty(this, 'body', {
                 value: this.trackBodyStream(s1),
                 writable: false,
@@ -203,17 +218,16 @@ export class Response implements globalThis.Response {
         throw new TypeError(`Unsupported content type for formData(): ${ct}`);
     }
     async json<T = unknown>(): Promise<T> { return JSON.parse(await this.text()); }
+    /** Spec: always UTF-8, regardless of the content-type charset (only XHR honours charset). */
     async text(): Promise<string> {
-        const buf = await this.arrayBuffer();
-        const ct = this.headers.get('content-type') ?? '';
-        const m = CHARSET_RE.exec(ct);
-        return new Decoder(m?.[1]).decode(buf);
+        return new Decoder().decode(await this.arrayBuffer());
     }
     static error(): Response {
         const r = new Response(null);
         Object.defineProperty(r, 'status', { value: 0 });
         Object.defineProperty(r, 'ok', { value: false });
         Object.defineProperty(r, 'type', { value: 'error' });
+        Headers.setGuard(r.headers, 'immutable');
         return r;
     }
 
@@ -224,6 +238,7 @@ export class Response implements globalThis.Response {
         const location = new URL(rawUrl).href;
         const r = new Response(null, { status, headers: { Location: location } });
         Object.defineProperty(r, 'type', { value: 'default' });
+        Headers.setGuard(r.headers, 'immutable');
         return r;
     }
 

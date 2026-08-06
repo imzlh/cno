@@ -23,7 +23,14 @@ export function wrapFSErr(e: unknown): unknown {
         case error.errno.EISDIR: return new errors.IsADirectory(e.message);
         case error.errno.ENOTDIR: return new errors.NotADirectory(e.message);
         case error.errno.EROFS: return new errors.PermissionDenied(e.message);
-        case error.errno.ENOTEMPTY: return new errors.AlreadyExists(e.message);
+        case error.errno.ENOTEMPTY:
+            // Real Deno has no dedicated error class for a non-empty directory:
+            // `Deno.remove` on one rejects with a plain Error carrying
+            // code 'ENOTEMPTY'. Mapping it to AlreadyExists would also
+            // rewrite .code to 'EEXIST' and break `err.code === 'ENOTEMPTY'`.
+            Reflect.set(e, 'name', 'Error');
+            Reflect.set(e, 'code', 'ENOTEMPTY');
+            return e;
         case error.errno.ELOOP: return new errors.FilesystemLoop(e.message);
         case error.errno.ENAMETOOLONG: return new errors.InvalidData(e.message);
         case error.errno.EFBIG: return new errors.InvalidData(e.message);

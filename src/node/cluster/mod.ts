@@ -1,4 +1,12 @@
+/**
+ * node:cluster — primary-side surface only. This is a STUB: fork() throws, so
+ * `workers` is always empty and no worker ever exists. Real forking needs
+ * handle passing over IPC (SCM_RIGHTS / WSADuplicateSocket), which the host
+ * IPC channel does not implement.
+ */
 import { EventEmitter } from '../events';
+
+const os = import.meta.use('os');
 
 export const SCHED_NONE = 1;
 export const SCHED_RR = 2;
@@ -7,7 +15,18 @@ export const isMaster = true;
 export const isPrimary = true;
 export const workers: Record<string, never> = {};
 export const settings: Record<string, unknown> = {};
-export let schedulingPolicy = SCHED_RR;
+
+// Node uses SCHED_RR everywhere except Windows (SCHED_NONE), and
+// NODE_CLUSTER_SCHED_POLICY (rr|none) overrides it. os.getenv throws when unset.
+function defaultSchedulingPolicy(): number {
+    let policy: string | undefined;
+    try { policy = os.getenv('NODE_CLUSTER_SCHED_POLICY'); } catch { /* unset */ }
+    if (policy === 'rr') return SCHED_RR;
+    if (policy === 'none') return SCHED_NONE;
+    return os.uname().sysname === 'Windows_NT' ? SCHED_NONE : SCHED_RR;
+}
+
+export let schedulingPolicy = defaultSchedulingPolicy();
 
 const cluster = new EventEmitter();
 
@@ -21,8 +40,27 @@ export const emit = cluster.emit.bind(cluster);
 export const listeners = cluster.listeners.bind(cluster);
 export const listenerCount = cluster.listenerCount.bind(cluster);
 
+/**
+ * Node exposes cluster.Worker as a constructor even in the primary. Nothing
+ * here can construct a live worker — the class exists so `instanceof` probes
+ * and prototype checks in npm packages do not throw on a missing export.
+ */
+export class Worker extends EventEmitter {
+    id = 0;
+    process: unknown = null;
+    exitedAfterDisconnect = false;
+
+    kill(_signal?: string): void {}
+    destroy(_signal?: string): void {}
+    disconnect(): this { return this; }
+    isDead(): boolean { return true; }
+    isConnected(): boolean { return false; }
+    send(_message: unknown, _sendHandle?: unknown, _callback?: unknown): boolean { return false; }
+}
+
 export function setupPrimary(options: Record<string, unknown> = {}): void {
     Object.assign(settings, options);
+    emit('setup', settings);
 }
 
 export const setupMaster = setupPrimary;
