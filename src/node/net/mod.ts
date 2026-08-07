@@ -1188,6 +1188,41 @@ Socket.prototype.destroy = function destroy(this: Socket, error?: Error): Socket
     return this;
 };
 
+/**
+ * An app write to an HTTP-owned socket facade is REFUSED — core owns the wire.
+ *
+ * That refusal must not be expressed as a stream fault. It used to be reported
+ * by handing an error to _write's callback, which was harmless only because the
+ * generic Writable merely emitted 'error' and left the stream alive. Now that a
+ * write error correctly destroys the stream (matching node), the same path tore
+ * down the live connection and the client saw ECONNRESET mid-response. So the
+ * refusal is intercepted before it reaches the writable machinery: the write
+ * callback gets ERR_SOCKET_HTTP_SERVER and 'error' is still emitted for
+ * compatibility, but the socket is neither errored nor destroyed.
+ */
+const duplexWrite = Duplex.prototype.write;
+Socket.prototype.write = function write(
+    this: Socket,
+    chunk: unknown,
+    encoding?: BufferEncoding | ((error?: Error | null) => void),
+    callback?: (error?: Error | null) => void,
+): boolean {
+    if (this._httpOwned && !this._destroyed) {
+        const cb = typeof encoding === 'function' ? encoding : callback;
+        const err = Object.assign(new Error('Socket is owned by the HTTP server'), {
+            code: 'ERR_SOCKET_HTTP_SERVER',
+            syscall: 'write',
+        });
+        // Callback first, then 'error' — the order the previous path produced.
+        queueMicrotask(() => {
+            if (cb) cb(err);
+            this.emit('error', err);
+        });
+        return false;
+    }
+    return duplexWrite.call(this, chunk, encoding, callback);
+};
+
 Object.defineProperty(Socket.prototype, 'constructor', {
     value: Socket,
     writable: true,

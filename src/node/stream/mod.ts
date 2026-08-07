@@ -143,6 +143,7 @@ function runStreamDestroy(
     stream: Stream,
     error: Error | null | undefined,
     states: Array<DestroyStateLike | undefined>,
+    afterEvents?: (error: Error | null) => void,
 ): void {
     const host = stream as DestroyHookHost;
     let settled = false;
@@ -163,6 +164,8 @@ function runStreamDestroy(
             }
             const emitClose = states.some(state => state?.emitClose);
             if (emitClose) stream.emit('close');
+            // node settles a pending end() callback after 'close', not before.
+            if (afterEvents) afterEvents(finalError);
         });
     };
 
@@ -1181,7 +1184,52 @@ type WritableState = {
     afterWriteScheduled: boolean;
     pendingDrain: boolean;
     closed: boolean;
+    /* Callbacks handed to end(); node settles them with the stream's error when
+     * one appears and with null on 'finish', so they cannot be armed on 'finish'
+     * alone — a stream that errors never emits it and the callback would park
+     * forever (a promisified end() hangs). */
+    endCallbacks: Array<(error?: Error | null) => void>;
+    /* Teardown for a failed write, run once the ENTIRE afterWrite queue has
+     * drained. It cannot be an element of that queue: with several buffered
+     * chunks each failing write appends its own entries, so a teardown sitting
+     * mid-array settled the end callback before the last write callback and
+     * produced w2>endcb>w3 where node drains w1>w2>w3 first. */
+    errorTeardown: (() => void) | null;
 };
+
+/**
+ * node's errorOrDestroy(): a stream error tears the stream down rather than
+ * merely announcing itself, which is what emits 'close' and releases the
+ * underlying resource. Emitting 'error' alone (as this did) left the stream
+ * alive — destroyed stayed false, 'close' never came, an fs WriteStream leaked
+ * its fd, and the still-writable stream accepted the next chunk and emitted a
+ * SECOND 'error'. Measured against node 24: destroy happens only under
+ * autoDestroy; with autoDestroy:false node emits 'error' and leaves the stream
+ * undestroyed.
+ */
+function writableErrorOrDestroy(stream: Writable, err: Error): void {
+    const state = stream._writableState;
+    if (state.destroyed) return;
+    stream.errored = err;
+    if (state.autoDestroy) {
+        stream.destroy(err);
+        return;
+    }
+    queueMicrotask(() => {
+        stream.emit('error', err);
+        /* Without a destroy there is no teardown to settle a pending end
+         * callback, so it is settled here — otherwise a _final error under
+         * autoDestroy:false parks a promisified end() forever. On the failed
+         * write path these are already settled, making this a no-op. */
+        settleEndCallbacks(stream, err);
+    });
+}
+
+/** Settle every pending end() callback exactly once. */
+function settleEndCallbacks(stream: Writable, error: Error | null): void {
+    const pending = stream._writableState.endCallbacks.splice(0);
+    for (const callback of pending) callback(error);
+}
 
 function maybeAutoDestroy(stream: Stream): void {
     if (stream.destroyed) return;
@@ -1225,8 +1273,20 @@ function queueSynchronousWriteCallbacks(stream: Writable, callbacks: Array<() =>
             stream.writableNeedDrain = false;
             stream.emit('drain');
         }
-        const pending = state.afterWriteCallbacks.splice(0);
-        for (const callback of pending) callback();
+        /* Drain to exhaustion: a callback may write again and append more. */
+        while (state.afterWriteCallbacks.length > 0) {
+            const pending = state.afterWriteCallbacks.splice(0);
+            for (const callback of pending) callback();
+        }
+        /* Teardown last, and deliberately NOT in a `finally`: measured against
+         * node 24, a write callback that THROWS leaves the stream undestroyed
+         * and an fs fd open. Running the teardown regardless would repair a leak
+         * node itself has, i.e. diverge. */
+        const teardown = state.errorTeardown;
+        if (teardown) {
+            state.errorTeardown = null;
+            teardown();
+        }
     });
 }
 
@@ -1292,6 +1352,8 @@ function initWritable(self: Writable, options?: WritableOptions | DuplexOptions)
         afterWriteScheduled: false,
         pendingDrain: false,
         closed: false,
+        endCallbacks: [],
+        errorTeardown: null,
     };
 
     if (options?.write) {
@@ -1410,10 +1472,22 @@ Writable.prototype._writeBuffered = function _writeBuffered(this: Writable): voi
             this.errored = err;
             this.writableAborted = true;
             this.writable = false;
+            /* Order measured against node 24: every write callback, then every
+             * end callback, then 'error', then 'close'. The teardown therefore
+             * runs after the WHOLE queue drains rather than as a member of it. */
             const callbacks = failedEntries.map((entry) => () => entry.callback(err));
-            if (synchronous) queueSynchronousWriteCallbacks(this, callbacks);
-            else for (const callback of callbacks) callback();
-            queueMicrotask(() => this.emit('error', err));
+            const teardown = () => {
+                settleEndCallbacks(this, err);
+                writableErrorOrDestroy(this, err);
+            };
+            if (synchronous) {
+                // First failure owns the teardown; later ones reuse its error.
+                state.errorTeardown ??= teardown;
+                queueSynchronousWriteCallbacks(this, callbacks);
+            } else {
+                for (const callback of callbacks) callback();
+                teardown();
+            }
             return;
         }
 
@@ -1461,9 +1535,18 @@ Writable.prototype._doFinal = function _doFinal(this: Writable): void {
         queueMicrotask(() => {
             state.finishScheduled = false;
             if (state.finished) return;
+            /* node's needFinish() requires !errored && !destroyed, so a stream
+             * that failed or was torn down NEVER emits 'finish'. Without this
+             * guard a failed fs WriteStream emitted error>close>finish and
+             * reported writableFinished:true — a false success signal — because
+             * the fs layer calls back cleanly once an open failure is already
+             * reported. */
+            if (state.destroyed || this.errored) return;
             state.finished = true;
             this.writableFinished = true;
             this.writable = false;
+            // node settles the end callback just BEFORE 'finish', not after.
+            settleEndCallbacks(this, null);
             this.emit('finish');
             maybeAutoDestroy(this);
         });
@@ -1475,7 +1558,12 @@ Writable.prototype._doFinal = function _doFinal(this: Writable): void {
             if (called) return;
             called = true;
             if (err) {
-                this.emit('error', err);
+                /* A _final error is a stream error: node destroys, which emits
+                 * 'error' then 'close' and only THEN settles the end callback
+                 * (measured: error>close>endcb:F). Note this is the opposite
+                 * order from a failed write, where node settles the end callback
+                 * BEFORE 'error' — so the two paths cannot share one helper. */
+                writableErrorOrDestroy(this, err);
             } else {
                 finish();
             }
@@ -1554,7 +1642,10 @@ Writable.prototype.end = function end(
         this.writableEnded = true;
 
         // Node hands the end callback an explicit `null` on the success path.
-        if (endCallback) this.once('finish', () => endCallback(null));
+        // Registering it here (rather than on 'finish') is what lets an error or
+        // a destroy settle it — a stream that fails never emits 'finish', so a
+        // 'finish'-only arm parks the callback forever.
+        if (endCallback) state.endCallbacks.push(endCallback);
 
         // Node: `.end()` fully uncorks regardless of nesting depth. Without this a
         // corked stream drops its buffer and never emits 'finish', so finished()
@@ -1584,7 +1675,7 @@ Writable.prototype.end = function end(
          * success (measured — a second end() over a slow write settles with
          * null once the first one completes). */
         if (err) deferTick(() => endCallback(err));
-        else this.once('finish', () => endCallback(null));
+        else state.endCallbacks.push(endCallback);
     }
 
     return this;
@@ -1616,7 +1707,15 @@ Writable.prototype.destroy = function destroy(this: Writable, error?: Error | nu
     this.writableAborted = !this.writableFinished;
     this.writable = false;
     if (error) this.errored = error;
-    runStreamDestroy(this, error, [state]);
+    /* A pending end callback must be settled by the teardown, with the destroy
+     * error when there is one. It used to be armed on 'finish', which a
+     * destroyed stream never emits: node reports error>close>endcb:<err>, while
+     * this reported endcb:null (a false success) or nothing at all. */
+    const hadEndCallbacks = state.endCallbacks.length > 0;
+    const settleError = error ?? createEndAfterDestroyError();
+    runStreamDestroy(this, error, [state], hadEndCallbacks
+        ? () => settleEndCallbacks(this, settleError)
+        : undefined);
     return this;
 };
 
