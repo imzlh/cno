@@ -821,16 +821,24 @@ function createParentPort(): MessagePort | null {
     // terminate()/close() carry no exit code, so the parent would otherwise see
     // pipe EOF and report 0 for every worker. Report it from the thread itself.
     //
-    // LIMITATION, MEASURED 2026-08-02: this listener never actually fires. A
-    // worker's process 'exit' event is not dispatched at all in cno -- probed
-    // with an explicit process.exit(6) AND with a natural drain after
-    // process.exitCode = 6, the worker-side listener ran in neither case (Node
-    // ran it in both). vm.c's tjs__lifecycle_drain() returns early for
-    // `qrt->is_worker`, so a worker gets no EV_EXIT on natural drain. The
-    // consequence is that `process.exitCode = N` inside a worker reports 0 to
-    // the parent where Node reports N. Reading process.exitCode here as a
-    // fallback was tried and removed again: it cannot help while the listener
-    // itself is never invoked, so it would only have been dead code.
+    // SCOPE, RE-MEASURED 2026-08-09 (this comment previously claimed the listener
+    // "never actually fires" -- that was measured on 2026-08-02 and is now only
+    // half true, so it is corrected here rather than left to mislead):
+    //   - explicit process.exit(N): the listener DOES fire and the parent reports
+    //     N. Verified for 42, 1 and 7 against node v24.18.0. The native exit
+    //     dispatches EV_EXIT and node/process/mod.ts's ensureEventBridge() turns
+    //     that into this 'exit' event.
+    //   - natural drain after `process.exitCode = N`: still dead. The parent
+    //     reports 0 where node reports N, because tjs__lifecycle_drain()
+    //     (circu.js/src/vm.c:948-955) returns early for qrt->is_worker, so a
+    //     worker receives no EV_EXIT on a natural drain at all. That one needs a
+    //     C fix and a rebuild.
+    //
+    // This listener only exists once the WORKER has imported node:worker_threads,
+    // which is why node/process/mod.ts installs an equivalent reporter of its own
+    // (installWorkerExitReporter) -- a worker whose whole body is
+    // `process.exit(42)` reported 0 before that was added. Both firing is
+    // harmless: _finish() ignores every record after the first.
     const host = processExitHost();
     if (host) {
         host.on('exit', (code?: unknown) => {

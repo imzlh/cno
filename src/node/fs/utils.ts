@@ -1291,7 +1291,8 @@ export function createFileHandle(fd: number, handle: CModuleAsyncFS.FileHandle) 
             await native('futimes', () => handle.utime(timeToUnixMs(atime, 'atime'), timeToUnixMs(mtime, 'mtime')));
         },
         async appendFile(data: string | Uint8Array | ArrayBuffer) {
-            await ensureOpen('write');
+            // 'writeFile', not 'appendFile' and not 'write' — measured v24.18.0.
+            await ensureOpen('writeFile');
             await writeAll(toUint8Array(data));
         },
         async readFile(options?: { encoding?: BufferEncoding | null; signal?: AbortSignal } | BufferEncoding) {
@@ -1315,7 +1316,10 @@ export function createFileHandle(fd: number, handle: CModuleAsyncFS.FileHandle) 
             return decodeBuffer(concatChunks(chunks), typeof options === 'string' ? options : options?.encoding);
         },
         async writeFile(data: string | Uint8Array | ArrayBuffer) {
-            await ensureOpen('write');
+            // Node reports 'writeFile' here, NOT 'write' — measured v24.18.0 on a
+            // closed handle. The FileHandle set of names is its own thing: node
+            // reports 'writeFile' for both writeFile() and appendFile().
+            await ensureOpen('writeFile');
             await writeAll(toUint8Array(data));
         },
         async readv(buffers: readonly ArrayBufferView[], position?: number | null) {

@@ -11,13 +11,29 @@ type TimerCallback = (...args: unknown[]) => void;
 // Node clamps every timer delay into [1, 2^31-1] and warns outside that range.
 const TIMEOUT_MAX = 2 ** 31 - 1;
 
+// Node's timers/promises rejects with an instance of a real `AbortError` class,
+// not a plain Error carrying `name = 'AbortError'`. Measured on v24.18.0:
+// `err.constructor.name` and `Object.getPrototypeOf(err).constructor.name` are
+// both 'AbortError', while a plain-Error version reports 'Error' for both. Code
+// that brands errors by constructor rather than by `.name` (a common pattern in
+// retry/cancellation wrappers) sees a different class and misroutes the error.
+// `name` and `code` stay OWN properties so `Object.getOwnPropertyNames` remains
+// cause+code+message+name+stack, exactly as Node reports it.
+class AbortError extends Error {
+    name: string;
+    code: string;
+    cause?: unknown;
+
+    constructor(reason?: unknown) {
+        super('The operation was aborted');
+        this.name = 'AbortError';
+        this.code = 'ABORT_ERR';
+        if (reason !== undefined) this.cause = reason;
+    }
+}
+
 function createAbortError(reason?: unknown): Error & { name: string; code: string; cause?: unknown } {
-    const error: Error & { name: string; code: string; cause?: unknown } = Object.assign(new Error('The operation was aborted'), {
-        name: 'AbortError',
-        code: 'ABORT_ERR',
-    });
-    if (reason !== undefined) error.cause = reason;
-    return error;
+    return new AbortError(reason);
 }
 
 function describeReceived(value: unknown): string {

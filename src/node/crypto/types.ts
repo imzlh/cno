@@ -13,10 +13,24 @@ export interface KeyExportOptions {
     format?: 'pem' | 'der' | 'jwk';
 }
 
+// Every type the native classifier can name. A narrower union here would be a
+// lie about the runtime value, not a constraint on it: the C switch reports the
+// key's actual algorithm, so anything it can return must appear in this type.
+export type AsymmetricKeyType =
+    | 'rsa'
+    | 'rsa-pss'
+    | 'ec'
+    | 'ed25519'
+    | 'ed448'
+    | 'x25519'
+    | 'x448'
+    | 'dsa'
+    | 'dh';
+
 export interface KeyObject {
     readonly type: 'private' | 'public' | 'secret';
-    readonly asymmetricKeyType?: 'rsa' | 'ec';
-    readonly asymmetricKeyDetails?: { namedCurve?: string; modulusLength?: number };
+    readonly asymmetricKeyType?: AsymmetricKeyType;
+    readonly asymmetricKeyDetails?: { namedCurve?: string; modulusLength?: number; publicExponent?: bigint };
     readonly symmetricKeySize?: number;
     export(options?: KeyExportOptions): Uint8Array | string | SecretJwk;
     readonly [Symbol.toStringTag]: 'KeyObject';

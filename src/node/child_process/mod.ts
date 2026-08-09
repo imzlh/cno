@@ -41,15 +41,32 @@ function stopPipeReadQuietly(pipe: CModuleStreams.Pipe): void {
     }
 }
 
+// True while a piped stdio Readable still owes an 'end'/'close'/'error'.
+function streamEndPending(stream: Readable | null): stream is Readable {
+    return !!stream && !stream.readableEnded && !stream.destroyed;
+}
+
 // Resolve once a piped stdio Readable has ended, closed, or errored.
 function waitStreamEnd(stream: Readable | null): Promise<void> {
-    if (!stream) return Promise.resolve();
-    if (stream.readableEnded || stream.destroyed) return Promise.resolve();
+    if (!streamEndPending(stream)) return Promise.resolve();
     return new Promise<void>((resolve) => {
         stream.once('end', resolve);
         stream.once('close', resolve);
         stream.once('error', resolve);
     });
+}
+
+// Node's `onexit` destroys the child's stdin unconditionally. There is nothing
+// to do when stdio was 'inherit'/'ignore' (no stream object exists at all), and
+// a second destroy must stay a no-op — teardown may never turn a child's exit
+// into a failure of the exit path itself.
+function destroyChildStdin(stream: Writable | null): void {
+    if (!stream || stream.destroyed) return;
+    try {
+        stream.destroy();
+    } catch {
+        // Best-effort: the pipe can already be tearing down underneath us.
+    }
 }
 
 // Type definitions
@@ -217,6 +234,21 @@ function stdioFdOf(value: unknown): number | undefined {
         if (typeof fd === 'number' && Number.isInteger(fd)) return fd;
     }
     return undefined;
+}
+
+// Node rejects a negative or NaN maxBuffer with ERR_OUT_OF_RANGE before the
+// child is ever spawned (validateMaxBuffer in node:child_process). Measured on
+// v24.18: -1 and NaN both throw a RangeError; 0 and Infinity are accepted and
+// mean "no limit". Silently ignoring a bad value instead lets a caller's typo
+// disable the cap and capture unbounded output.
+function validateMaxBuffer(maxBuffer: unknown): void {
+    if (maxBuffer === undefined || maxBuffer === null) return;
+    if (typeof maxBuffer !== 'number' || Number.isNaN(maxBuffer) || maxBuffer < 0) {
+        throw Object.assign(
+            new RangeError(`The value of "options.maxBuffer" is out of range. It must be a positive number. Received ${String(maxBuffer)}`),
+            { code: 'ERR_OUT_OF_RANGE' },
+        );
+    }
 }
 
 function validateStdio(stdio: SpawnOptions['stdio']): void {
@@ -615,7 +647,16 @@ function normalizeSpawnFailure(err: unknown, command: string, syscall: string, c
             : resolvesOnPath(command);
         if (!resolvable) return makeSpawnError(command, syscall, args);
     }
-    return asError(err, `${syscall} ${command}`, command);
+    // Fall-through: the native error already carries a usable code, so it is
+    // reported as-is. Node still attaches `spawnargs` here (measured v24.18: a
+    // bare-name ENOENT from async spawn has [code,errno,path,spawnargs,syscall]),
+    // and execa/cross-spawn read it when formatting a failure. Without this the
+    // key was present only on the pre-flighted path-like route.
+    const normalized = asError(err, `${syscall} ${command}`, command);
+    if (args && !Reflect.has(normalized, 'spawnargs')) {
+        Reflect.set(normalized, 'spawnargs', [...args]);
+    }
+    return normalized;
 }
 
 function flattenPrototype(target: object): void {
@@ -656,7 +697,7 @@ interface ChildProcessImpl extends ChildProcess {
     _ipcChannel: IPCChannel | null;
     _messageQueue: unknown[];
     _init(process: CModuleProcess.ChildProcess, command: string, args: string[], options: SpawnOptions): void;
-    _failSpawn(error: NodeJS.ErrnoException): void;
+    _failSpawn(error: NodeJS.ErrnoException, stdioKinds?: (string | undefined)[]): void;
     _createWritable(pipe: CModuleStreams.Pipe): Writable;
     _createReadable(pipe: CModuleStreams.Pipe): Readable;
     _createDuplex(pipe: CModuleStreams.Pipe): Duplex;
@@ -756,8 +797,93 @@ ChildProcessImpl.prototype._init = function _init(this: ChildProcessImpl, proces
 
 // Spawn never started: Node emits 'error', then 'close' with the UV errno as
 // the exit code, and no 'exit'. Without the 'close', exec()/promisify hang.
-ChildProcessImpl.prototype._failSpawn = function _failSpawn(this: ChildProcessImpl, error: NodeJS.ErrnoException): void {
+// A spawn that never started still hands back stream objects for every 'pipe'
+// slot in Node — it is not an all-or-nothing null. Measured on v24.18/Windows for
+// `spawn('<missing>', …)`:
+//   stdio 'pipe'                     -> stdin/stdout/stderr are all objects
+//   stdio 'ignore' / 'inherit'       -> all three null
+//   stdio ['pipe','ignore','inherit']-> stdin object, stdout null, stderr null
+//   stdio ['pipe','pipe','pipe','pipe'] -> fd 3 an object too, child.stdio.length 4
+// so the decision is PER SLOT. Returning null everywhere made the ordinary
+// `child.stdout.on('data', …)` wiring throw "cannot read property 'on' of null"
+// before the 'error' event could ever be delivered — which is precisely what
+// execa/cross-spawn-shaped code does.
+//
+// The streams must also SETTLE, or a stub would trade a TypeError for a hang.
+// Node's measured settle semantics on a failed spawn are reproduced exactly by:
+//   readable ended via push(null) -> finished() settles with NO error   (stdout/stderr)
+//   writable destroyed            -> finished() settles ERR_STREAM_PREMATURE_CLOSE (stdin)
+// (both verified identical in cno, so no dependency on any pending stream fix).
+// KNOWN FIDELITY GAP, deliberate: Node's child stdio streams are Sockets, i.e.
+// duplex in both directions even for stdout/stderr (`child.stdout.writable` is
+// true there), so on these stubs the opposite-direction properties read
+// `undefined` instead of a boolean. Making them Duplex is not assignable to
+// cno's own `Readable`/`Writable` slot types (Duplex lacks _readAndResolve/wrap),
+// and the settle semantics below — the part that prevents a hang — are already
+// byte-identical to Node either way, so the cosmetic property is not worth a cast.
+function makeFailedReadable(): Readable {
+    const readable = new Readable({
+        read() { /* EOF is pushed below, once. */ },
+    });
+    readable.push(null);
+    // Flowing, so 'end' then 'close' reach a listener attached synchronously by
+    // the caller on the same tick as the spawn call.
+    readable.resume();
+    return readable;
+}
+
+function makeFailedWritable(): Writable {
+    const writable = new Writable({
+        write(_chunk: unknown, _encoding: BufferEncoding, callback: (error?: Error | null) => void) {
+            callback();
+        },
+    });
+    // Destroyed rather than ended, which is what makes finished() settle with
+    // ERR_STREAM_PREMATURE_CLOSE exactly as Node's failed-spawn stdin does.
+    // Deferred so a synchronous `.on('close', …)` still observes it.
+    queueMicrotask(() => {
+        try { writable.destroy(); } catch { /* already gone */ }
+    });
+    return writable;
+}
+
+function makeFailedDuplex(): Duplex {
+    const duplex = new Duplex({
+        read() { /* EOF is pushed below, once. */ },
+        write(_chunk: unknown, _encoding: BufferEncoding, callback: (error?: Error | null) => void) {
+            callback();
+        },
+    });
+    duplex.push(null);
+    duplex.resume();
+    return duplex;
+}
+
+ChildProcessImpl.prototype._failSpawn = function _failSpawn(this: ChildProcessImpl, error: NodeJS.ErrnoException, stdioKinds?: (string | undefined)[]): void {
     const errno = typeof error.errno === 'number' ? error.errno : null;
+
+    // Build the 'pipe' slots before anything is emitted, so they exist by the
+    // time the caller returns from spawn() and can be wired up synchronously.
+    if (stdioKinds) {
+        const isPipe = (kind: string | undefined) => kind === 'pipe';
+        if (isPipe(stdioKinds[0])) {
+            this._stdin = makeFailedWritable();
+            this.stdin = this._stdin;
+        }
+        if (isPipe(stdioKinds[1])) {
+            this._stdout = makeFailedReadable();
+            this.stdout = this._stdout;
+        }
+        if (isPipe(stdioKinds[2])) {
+            this._stderr = makeFailedReadable();
+            this.stderr = this._stderr;
+        }
+        this.stdio = [this.stdin, this.stdout, this.stderr];
+        for (let fd = 3; fd < stdioKinds.length; fd++) {
+            this.stdio[fd] = isPipe(stdioKinds[fd]) ? makeFailedDuplex() : null;
+        }
+    }
+
     queueMicrotask(() => {
         this.emit('error', error);
         this._exitCode = errno;
@@ -773,6 +899,20 @@ ChildProcessImpl.prototype._createWritable = function _createWritable(this: Chil
         },
         async final(callback: (error?: Error | null) => void) {
             try { await pipe.shutdown(); } catch { try { pipe.close(); } catch {} } finally { callback(); }
+        },
+        // Node's child stdin is a socket, and destroying a socket closes its
+        // handle. Two things needed this hook:
+        //  1. `final()` is SKIPPED on the destroy path, so without it the native
+        //     pipe was never closed when stdin was destroyed rather than ended.
+        //  2. A Writable built with no `destroy` option has NO `_destroy` at all
+        //     (stream/mod.ts only assigns it from the option). execa's
+        //     `spyOnStdinDestroy` does `const {_destroy} = stdin` and then
+        //     `_destroy.call(...)`, so on every child it threw "cannot read
+        //     property 'call' of undefined" — which `runStreamDestroy` converts
+        //     into a spurious 'error' on the child's stdin.
+        destroy(error: Error | null, callback: (error?: Error | null) => void) {
+            try { pipe.close(); } catch { /* already closed by the exiting child */ }
+            callback(error);
         },
     });
 };
@@ -820,6 +960,18 @@ ChildProcessImpl.prototype._createDuplex = function _createDuplex(this: ChildPro
         async final(callback: (error?: Error | null) => void) {
             try { await pipe.shutdown(); } catch { try { pipe.close(); } catch {} } finally { callback(); }
         },
+        // Same two reasons as _createWritable's `destroy` hook, for the fd >= 3
+        // duplex streams: `final()` is SKIPPED on the destroy path, so the native
+        // pipe leaked whenever an extra stdio stream was destroyed rather than
+        // ended; and a Duplex built with no `destroy` option has NO `_destroy` at
+        // all, so the `const {_destroy} = stream` + `_destroy.call(...)` pattern
+        // (execa's spyOnStdinDestroy) threw "cannot read property 'call' of
+        // undefined". Measured: node's fd-3 stream has a `_destroy` function and
+        // settles 'close'; without this hook cno's never settled.
+        destroy(error: Error | null, callback: (error?: Error | null) => void) {
+            try { pipe.close(); } catch { /* already closed by the exiting child */ }
+            callback(error);
+        },
     });
 
     pipe.onread = (data: Uint8Array | null | undefined, err?: unknown) => {
@@ -850,13 +1002,33 @@ ChildProcessImpl.prototype._waitExit = async function _waitExit(this: ChildProce
         this._signalCode = info.term_signal;
         this.signalCode = info.term_signal;
 
+        // Node's `onexit` destroys the child's stdin BEFORE emitting 'exit', so a
+        // listener on 'exit' legitimately observes `stdin.destroyed === true`
+        // (measured v24.18). It is a destroy(), not an end(): `writableEnded`
+        // stays false and any unread pending write is discarded rather than
+        // flushed. Without this the Writable stayed alive forever, so
+        // `finished(child.stdin)` NEVER SETTLED — which is exactly the member of
+        // execa's Promise.all that made `await execa(...)` hang and then exit 0
+        // with no output. stdout/stderr are left alone: they reach EOF on their
+        // own and their `finished()` already resolved.
+        destroyChildStdin(this._stdin);
+
         this.emit('exit', this._exitCode, this._signalCode);
 
         // 'close' must wait for exit AND EOF/close of every piped stdio stream
-        // so exec/execFile don't see truncated stdout/stderr.
-        await Promise.all(
-            [this._stdout, this._stderr].map((stream) => waitStreamEnd(stream)),
-        );
+        // so exec/execFile don't see truncated stdout/stderr. stdin is NOT part
+        // of that set — Node only counts stdio indices > 0 toward `_closesNeeded`.
+        //
+        // Emitting synchronously when nothing is outstanding is load-bearing for
+        // event order, not just an optimization: `destroy()` defers stdin's
+        // 'close' by a tick, and Node's `maybeClose` runs synchronously inside
+        // the same `onexit` turn, which is why Node's order is child 'exit',
+        // child 'close', then stdin 'close'. An unconditional `await` here put
+        // the child's 'close' behind a microtask and inverted the last two.
+        const pending = [this._stdout, this._stderr].filter(streamEndPending);
+        if (pending.length > 0) {
+            await Promise.all(pending.map((stream) => waitStreamEnd(stream)));
+        }
         this.emit('close', this._exitCode, this._signalCode);
     } catch (err) {
         this.emit('error', err);
@@ -1201,9 +1373,18 @@ export function spawn(command: string, argsOrOptions?: string[] | SpawnOptions, 
     child.spawnfile = command;
     child.spawnargs = [command, ...args];
 
+    // The native slot values ('pipe'/'ignore'/'inherit'/…) are what decide
+    // whether a failed spawn still exposes a stream for that slot; see _failSpawn.
+    const failStdioKinds: (string | undefined)[] = [
+        spawnOpts.stdin as string | undefined,
+        spawnOpts.stdout as string | undefined,
+        spawnOpts.stderr as string | undefined,
+        ...((spawnOpts.stdioExtra ?? []) as (string | undefined)[]),
+    ];
+
     const immediateError = getImmediateSpawnError(command, 'spawn', opts.cwd, args);
     if (immediateError) {
-        child._failSpawn(immediateError);
+        child._failSpawn(immediateError, failStdioKinds);
         return child;
     }
 
@@ -1233,7 +1414,11 @@ export function spawn(command: string, argsOrOptions?: string[] | SpawnOptions, 
         process = proc.spawn([resolveCommandForCwd(command, opts.cwd), ...args], spawnOpts);
         child._init(process, command, args, opts);
     } catch (err) {
-        child._failSpawn(asError(err, `spawn ${command}`, command) as NodeJS.ErrnoException);
+        // Node's async spawn failure carries the same shape as the sync one,
+        // including `spawnargs` (measured v24.18: [code,errno,path,spawnargs,
+        // syscall] on both). `asError` takes no args and so silently dropped
+        // spawnargs, which execa/cross-spawn read when formatting a failure.
+        child._failSpawn(normalizeSpawnFailure(err, command, 'spawn', opts.cwd, args) as NodeJS.ErrnoException, failStdioKinds);
         return child;
     }
 
@@ -1519,6 +1704,7 @@ export function spawnSync(command: string, argsOrOptions?: string[] | SpawnOptio
 
     validateStdio(optsSource.stdio);
     validateStdioFdRedirects(optsSource.stdio);
+    validateMaxBuffer(optsSource.maxBuffer);
 
     // Node validates the encoding up front and throws ERR_UNKNOWN_ENCODING out of
     // spawnSync itself (measured on v24.18: `encoding:'bogus-enc'` throws, it is
@@ -1629,17 +1815,33 @@ export function spawnSync(command: string, argsOrOptions?: string[] | SpawnOptio
         let signal = result.signal;
         let error = result.error ? normalizeSpawnFailure(result.error, command, 'spawnSync', optsSource.cwd, args) : undefined;
 
-        // maxBuffer is enforced after the fact: spawnSync runs to completion in
-        // the C layer, so the child cannot be killed mid-stream as Node does.
-        // Output is still truncated and ENOBUFS reported, which is what callers
-        // branch on. The kill/SIGTERM part of Node's behaviour is unreachable.
+        // maxBuffer: the child cannot be killed mid-stream (spawnSync runs to
+        // completion in the C layer), but every observable field can still be
+        // made Node-exact because the full output is already in hand.
+        //
+        // Node's measured rule (v24.18/Windows) is NOT "truncate to maxBuffer":
+        // it reads 64KiB chunks and keeps everything read, including the chunk
+        // that crossed the limit, so
+        //     captured = min(totalLen, (floor(maxBuffer/65536)+1)*65536)
+        // Verified on mb=1000->65536, 10->65536, 65536->131072, 70000->131072,
+        // 100000->131072, default 1MiB->1114112 (=17*65536), and on the
+        // total-below-one-chunk case mb=1000/out=2000 -> 2000.
+        //
+        // Node also treats 0 as "no limit" rather than "capture nothing".
+        // (Range validation happens before the try — see validateMaxBuffer.)
         const maxBuffer = optsSource.maxBuffer;
-        if (error === undefined && typeof maxBuffer === 'number' && maxBuffer >= 0) {
-            const over = (value: Buffer | string | null | undefined) =>
-                value != null && (typeof value === 'string' ? value.length : value.byteLength) > maxBuffer;
+        // 0 and Infinity both mean unlimited, so neither enters the check below.
+        if (error === undefined && typeof maxBuffer === 'number' && maxBuffer > 0 && Number.isFinite(maxBuffer)) {
+            const CHUNK = 65536;
+            const lengthOf = (value: Buffer | string | null | undefined) =>
+                value == null ? 0 : (typeof value === 'string' ? value.length : value.byteLength);
+            const over = (value: Buffer | string | null | undefined) => lengthOf(value) > maxBuffer;
             if (over(stdout) || over(stderr)) {
+                const limit = (Math.floor(maxBuffer / CHUNK) + 1) * CHUNK;
                 const truncate = (value: Buffer | string | null | undefined) =>
-                    value == null ? value : (typeof value === 'string' ? value.slice(0, maxBuffer) : value.subarray(0, maxBuffer));
+                    value == null || lengthOf(value) <= limit
+                        ? value
+                        : (typeof value === 'string' ? value.slice(0, limit) : value.subarray(0, limit));
                 stdout = truncate(stdout);
                 stderr = truncate(stderr);
                 error = Object.assign(new Error(`spawnSync ${command} ENOBUFS`), {
@@ -1649,7 +1851,9 @@ export function spawnSync(command: string, argsOrOptions?: string[] | SpawnOptio
                     path: command,
                 });
                 status = null;
-                signal = null;
+                // Node kills the child once the limit is crossed, so the result
+                // reports the kill signal rather than a null signal.
+                signal = 'SIGTERM';
             }
         }
 
@@ -1681,7 +1885,12 @@ export function spawnSync(command: string, argsOrOptions?: string[] | SpawnOptio
 // e.status and e.stdout, so a bare Error breaks them.
 function throwSyncResult(result: SpawnSyncResult, cmd: string): never {
     const stderr = result.stderr ?? '';
-    const err = result.error ?? new Error(`Command failed: ${cmd}\n${String(stderr)}`);
+    // Node joins the stderr with a newline only when there IS stderr: measured on
+    // v24.18, a silent failure's message is exactly `Command failed: <cmd>` with
+    // NO trailing newline, while a noisy one is `Command failed: <cmd>\n<stderr>`.
+    // Appending unconditionally left a stray "\n" that broke exact-message checks.
+    const stderrText = String(stderr);
+    const err = result.error ?? new Error(`Command failed: ${cmd}${stderrText.length > 0 ? `\n${stderrText}` : ''}`);
     // Node does ObjectAssign(err, spawnSyncResult), and when the result carries an
     // `error` that error IS err — so the thrown object gets a self-referencing
     // `error` key. Measured on v24.18: present (and === err) for a spawn failure,

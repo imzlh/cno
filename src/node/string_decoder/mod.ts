@@ -15,6 +15,23 @@ type ByteView = globalThis.Uint8Array<ArrayBufferLike>;
 type NativeDecoder = InstanceType<typeof Decoder>;
 
 /** Canonical encoding name, or undefined when unknown (mirrors Node's normalizeEncoding). */
+/**
+ * Node inspects the rejected encoding rather than string-coercing it, so `{}`
+ * prints as `{}` and not `[object Object]`. Mirrors `describeEncoding` in
+ * `node/buffer/mod.ts`, which is not exported.
+ */
+function describeEncoding(encoding: unknown): string {
+    if (encoding === null) return 'null';
+    if (Array.isArray(encoding)) return encoding.length === 0 ? '[]' : `[ ${encoding.join(', ')} ]`;
+    if (typeof encoding === 'object') {
+        const keys = Object.keys(encoding as object);
+        return keys.length === 0
+            ? '{}'
+            : `{ ${keys.map((k) => `${k}: ${(encoding as Record<string, unknown>)[k]}`).join(', ')} }`;
+    }
+    return String(encoding);
+}
+
 function normalizeEncoding(encoding?: unknown): string | undefined {
     if (encoding === undefined || encoding === null || encoding === '') return 'utf8';
     if (typeof encoding !== 'string') return undefined;
@@ -157,7 +174,7 @@ export const StringDecoder: StringDecoderConstructor = function StringDecoder(th
     const target: StringDecoder = this;
     const normalized = normalizeEncoding(encoding);
     if (normalized === undefined) {
-        const err = new TypeError(`Unknown encoding: ${String(encoding)}`) as TypeError & { code?: string };
+        const err = new TypeError(`Unknown encoding: ${describeEncoding(encoding)}`) as TypeError & { code?: string };
         err.code = 'ERR_UNKNOWN_ENCODING';
         throw err;
     }

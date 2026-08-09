@@ -9,13 +9,13 @@ const engine = import.meta.use('engine');
 import { Buffer } from '../buffer';
 
 // Re-export types from types.ts
-export type { BinaryInput, KeyInput, KeyWithOptions, KeyExportOptions, SecretJwk, Hash, Hmac, Cipheriv, Decipheriv, CipherGCM, DecipherGCM, GcmEncryptResult, GcmDecryptResult, CipherInfo, Sign, Verify } from './types';
+export type { BinaryInput, KeyInput, KeyWithOptions, KeyExportOptions, SecretJwk, AsymmetricKeyType, Hash, Hmac, Cipheriv, Decipheriv, CipherGCM, DecipherGCM, GcmEncryptResult, GcmDecryptResult, CipherInfo, Sign, Verify } from './types';
 export type { ScryptOptions } from './random';
-import type { BinaryInput, KeyInput, KeyObject as KeyObjectShape, KeyWithOptions, KeyExportOptions, SecretJwk, Hash, Hmac, Cipheriv, Decipheriv, CipherGCM, DecipherGCM, GcmEncryptResult, GcmDecryptResult, CipherInfo, Sign, Verify } from './types';
+import type { BinaryInput, KeyInput, KeyObject as KeyObjectShape, KeyWithOptions, KeyExportOptions, SecretJwk, AsymmetricKeyType, Hash, Hmac, Cipheriv, Decipheriv, CipherGCM, DecipherGCM, GcmEncryptResult, GcmDecryptResult, CipherInfo, Sign, Verify } from './types';
 import { Transform, type TransformOptions } from '../stream';
 
 // Import helpers from helpers.ts
-import { toBuffer, toExactArrayBuffer, encodeOutput, concatBuffers, isGcmAlgorithm, normalizeHashAlgorithm, oneShotHmac, isSupportedHmacAlgorithm, readAsymmetricCipherArgs, readKeyOptions, rejectUnsupportedPadding, detectEcCoordinateSize, derToP1363, p1363ToDer, kKeyData, kKeyFormat, guessKeyFormat, isKeyObject, type KeyFormat } from './helpers';
+import { toBuffer, toExactArrayBuffer, encodeOutput, concatBuffers, isGcmAlgorithm, normalizeHashAlgorithm, oneShotHmac, isSupportedHmacAlgorithm, readAsymmetricCipherArgs, readKeyOptions, rejectUnsupportedPadding, classifyKeyForP1363, derToP1363, p1363ToDer, keyDetailsFromBytes, kKeyData, kKeyFormat, guessKeyFormat, isKeyObject, type KeyFormat } from './helpers';
 
 function assertCallback(callback: unknown): asserts callback is (...args: unknown[]) => void {
     if (typeof callback !== 'function') {
@@ -47,12 +47,12 @@ function resolveEcdhCurve(curve: string): EcdhCurve {
     return resolveCurve(curve);
 }
 
-function keyTypeFromPrivate(bytes: Uint8Array): 'rsa' | 'ec' {
-    return crypto.getPrivateKeyType(bytes) as 'rsa' | 'ec';
+function keyTypeFromPrivate(bytes: Uint8Array): AsymmetricKeyType {
+    return crypto.getPrivateKeyType(bytes) as AsymmetricKeyType;
 }
 
-function keyTypeFromPublic(bytes: Uint8Array): 'rsa' | 'ec' {
-    return crypto.getPublicKeyType(bytes) as 'rsa' | 'ec';
+function keyTypeFromPublic(bytes: Uint8Array): AsymmetricKeyType {
+    return crypto.getPublicKeyType(bytes) as AsymmetricKeyType;
 }
 
 type KeyInputWithFormat = { key: KeyInput; format?: 'pem' | 'der' };
@@ -108,12 +108,23 @@ function exportKeyObjectBytes(keyObject: KeyObject, format: 'pem' | 'der'): Uint
         : new Uint8Array(crypto.exportPublicKeyDer(keyObject[kKeyData]));
 }
 
+/**
+ * Sign side: convert the native DER signature to P1363 when the key is EC.
+ *
+ * Node ignores dsaEncoding for non-EC keys, so an RSA key must get its signature
+ * back untouched -- previously it was fed to the EC converter and threw
+ * `TypeError: Unable to determine EC key size`, where Node v24.18.0 returns a
+ * normal 128-byte PKCS#1 signature. The EC size now comes from the key's curve
+ * OID, so a PEM or DER EC key works too; it used to throw for all three curves
+ * because no raw byte length matched.
+ */
 function signatureToP1363(signature: ArrayBuffer, keyBytes: Uint8Array): ArrayBuffer {
-    const size = detectEcCoordinateSize(keyBytes);
-    if (!size) {
+    const shape = classifyKeyForP1363(keyBytes);
+    if (shape.kind === 'non-ec') return signature;
+    if (shape.kind === 'unknown') {
         throw new TypeError('Unable to determine EC key size for ieee-p1363 signature');
     }
-    return derToP1363(signature, size);
+    return derToP1363(signature, shape.coordinateSize);
 }
 
 function maybeEncodeSignatureForSign(signature: ArrayBuffer, keyInput: KeyInput | KeyWithOptions, outputEncoding?: string): Uint8Array | string {
@@ -122,10 +133,37 @@ function maybeEncodeSignatureForSign(signature: ArrayBuffer, keyInput: KeyInput 
     return outputEncoding ? encodeOutput(out, outputEncoding) : Buffer.from(new Uint8Array(out));
 }
 
-function normalizeSignatureForVerify(signature: BinaryInput, signatureEncoding: string | undefined, keyInput: KeyInput | KeyWithOptions): Uint8Array {
-    const { dsaEncoding } = readKeyOptions(keyInput);
+/**
+ * Verify side: turn a P1363 signature into DER, or report that it cannot be one.
+ *
+ * Returns null for "no signature of this shape can be valid for this key", which
+ * the callers turn into `false`. Node never throws for a malformed signature -- it
+ * returns false -- and the signature bytes come from the remote peer, so throwing
+ * here converted a failed verification into an uncaught exception (measured on 9
+ * of 9 malformed-length cases).
+ *
+ * The length is checked against the KEY's coordinate size, not inferred from the
+ * signature. Inferring it from the signature accepted a valid signature
+ * zero-extended to any even length -- measured TRUE in cno and FALSE in Node on
+ * 12 of 12 crafted cases across P-256/P-384/P-521. That is unbounded signature
+ * malleability: one valid signature yields arbitrarily many distinct accepted
+ * byte strings, which breaks any caller using signature bytes as a dedup or
+ * replay key.
+ */
+function normalizeSignatureForVerify(signature: BinaryInput, signatureEncoding: string | undefined, keyInput: KeyInput | KeyWithOptions): Uint8Array | null {
+    const { key, dsaEncoding } = readKeyOptions(keyInput);
     const sigBuf = toBuffer(signature, signatureEncoding);
-    return dsaEncoding === 'ieee-p1363' ? new Uint8Array(p1363ToDer(sigBuf)) : sigBuf;
+    if (dsaEncoding !== 'ieee-p1363') return sigBuf;
+
+    const shape = classifyKeyForP1363(key);
+    // Node ignores dsaEncoding for non-EC keys: hand the signature straight to
+    // the verifier instead of mangling a valid RSA signature into a false.
+    if (shape.kind === 'non-ec') return sigBuf;
+    if (shape.kind === 'ec' && sigBuf.length !== shape.coordinateSize * 2) return null;
+    // Unknown key shape: keep the old structural requirement, but report a bad
+    // length as an invalid signature rather than throwing.
+    if (sigBuf.length === 0 || sigBuf.length % 2 !== 0) return null;
+    return new Uint8Array(p1363ToDer(sigBuf));
 }
 
 function createDigestAlreadyCalledError(): Error {
@@ -186,13 +224,13 @@ function validateGcmAuthTagLength(length: number | undefined): number | undefine
 export class KeyObject implements KeyObjectShape {
     readonly [Symbol.toStringTag] = 'KeyObject' as const;
     readonly type: 'private' | 'public' | 'secret';
-    readonly asymmetricKeyType?: 'rsa' | 'ec';
-    readonly asymmetricKeyDetails?: { namedCurve?: string; modulusLength?: number };
+    readonly asymmetricKeyType?: AsymmetricKeyType;
+    readonly asymmetricKeyDetails?: { namedCurve?: string; modulusLength?: number; publicExponent?: bigint };
     readonly symmetricKeySize?: number;
     [kKeyData]: Uint8Array;
     [kKeyFormat]: KeyFormat;
 
-    constructor(type: 'private' | 'public' | 'secret', asymmetricKeyType: 'rsa' | 'ec' | undefined, data: BinaryInput, format: KeyFormat, details?: { namedCurve?: string; modulusLength?: number }) {
+    constructor(type: 'private' | 'public' | 'secret', asymmetricKeyType: AsymmetricKeyType | undefined, data: BinaryInput, format: KeyFormat, details?: { namedCurve?: string; modulusLength?: number; publicExponent?: bigint }) {
         this.type = type;
         this.asymmetricKeyType = asymmetricKeyType;
         this[kKeyData] = toBuffer(data);
@@ -1289,11 +1327,20 @@ export function createPrivateKey(input: KeyInput | { key: KeyInput; type?: strin
     }
 
     const { bytes, format } = normalizeKeySource(input);
-    return new KeyObject('private', keyTypeFromPrivate(bytes), bytes, format);
+    // Node reports asymmetricKeyDetails for parsed keys too, not just generated
+    // ones; jsonwebtoken reads .namedCurve off it to validate ES* algorithms.
+    return new KeyObject('private', keyTypeFromPrivate(bytes), bytes, format, keyDetailsFromBytes(bytes));
 }
 
 export function createSecretKey(key: BinaryInput): KeyObject {
     return new KeyObject('secret', undefined, key, 'raw');
+}
+
+// The C layer says "Unsupported key type" only when the key structure parsed
+// cleanly and just the algorithm was unclassified, so that error identifies the
+// real problem; "Failed to parse ..." means the bytes were not that structure.
+function isUnsupportedKeyType(error: unknown): boolean {
+    return error instanceof Error && error.message === 'Unsupported key type';
 }
 
 export function createPublicKey(input: KeyInput | { key: KeyInput; type?: string; format?: 'pem' | 'der' }): KeyObject {
@@ -1310,31 +1357,126 @@ export function createPublicKey(input: KeyInput | { key: KeyInput; type?: string
     }
 
     const source = normalizeKeySource(input);
+    let publicError: unknown;
     try {
-        return new KeyObject('public', keyTypeFromPublic(source.bytes), source.bytes, source.format);
-    } catch {
+        return new KeyObject('public', keyTypeFromPublic(source.bytes), source.bytes, source.format, keyDetailsFromBytes(source.bytes));
+    } catch (error) {
+        publicError = error;
+    }
+    // Node accepts a private key here and derives the public half, so the retry
+    // below is load-bearing. But it must not mask the first error: for a public
+    // key of an unsupported algorithm the retry reports "Failed to parse private
+    // key", which names the wrong key kind AND the wrong operation.
+    // Exactly one of the two attempts reports "Unsupported key type" -- the one
+    // whose structure actually parsed -- and that is the accurate diagnosis, so
+    // prefer it in whichever direction it appears.
+    try {
         const asym = keyTypeFromPrivate(source.bytes);
         const derived = new Uint8Array(crypto.derivePublicKeyDer(source.bytes));
-        return new KeyObject('public', asym, derived, 'der');
+        // Details come from the ORIGINAL private bytes: the derived SPKI is
+        // equivalent, but reading what we were handed avoids depending on the
+        // derivation preserving the algorithm parameters.
+        return new KeyObject('public', asym, derived, 'der', keyDetailsFromBytes(source.bytes));
+    } catch (privateError) {
+        throw isUnsupportedKeyType(privateError) ? privateError : publicError;
     }
 }
+
+type KeyEncodingSpec = { type?: 'spki' | 'pkcs8'; format?: 'pem' | 'der' | 'jwk' };
 
 type GenerateKeyPairOptions = {
     modulusLength?: number;
     namedCurve?: string;
     paramEncoding?: string;
+    publicKeyEncoding?: KeyEncodingSpec;
+    privateKeyEncoding?: KeyEncodingSpec;
 };
 
+/* ---------------------------------------------------------------------------
+ * RFC 8410 key generation (X25519, X448, Ed25519, Ed448).
+ *
+ * The native layer exposes keygen only for RSA and four EC curves, so there is
+ * no C entry point to call for these algorithms. It does not need one: for the
+ * RFC 8410 curves the private key IS a fixed-length string of uniform random
+ * bytes. There are no parameters to generate, no primality testing, and no
+ * validity condition to satisfy -- every byte string of the right length is a
+ * valid private key, because the algorithms clamp/hash the scalar internally.
+ *
+ * So a keypair is `randomBytes(seed)` wrapped in the PKCS#8 structure, and the
+ * public half comes from the *existing* generic native derive path, which
+ * already classifies and handles all nine key types. This is why the fix lives
+ * here and not in C.
+ *
+ * The seed lengths are the CurvePrivateKey sizes from RFC 8410 s.7, and the
+ * resulting DER was checked byte-for-byte against Node v24.18.0's own PKCS#8
+ * output for each of the four types.
+ * ------------------------------------------------------------------------- */
+const RFC8410_KEY_TYPES: Record<string, { oid: readonly number[]; seedLength: number }> = {
+    // OID content octets, i.e. 1.3.101.{110,111,112,113} minus the DER header.
+    x25519: { oid: [0x2b, 0x65, 0x6e], seedLength: 32 },
+    x448: { oid: [0x2b, 0x65, 0x6f], seedLength: 56 },
+    ed25519: { oid: [0x2b, 0x65, 0x70], seedLength: 32 },
+    ed448: { oid: [0x2b, 0x65, 0x71], seedLength: 57 },
+};
+
+function isRfc8410KeyType(type: string): boolean {
+    return Object.prototype.hasOwnProperty.call(RFC8410_KEY_TYPES, type);
+}
+
+/**
+ * Encode a OneAsymmetricKey (PKCS#8) for an RFC 8410 algorithm:
+ *
+ *   SEQUENCE {
+ *     INTEGER 0,                                  -- version
+ *     SEQUENCE { OBJECT IDENTIFIER algorithm },   -- no parameters, by RFC 8410
+ *     OCTET STRING {                              -- privateKey
+ *       OCTET STRING seed                         -- CurvePrivateKey
+ *     }
+ *   }
+ *
+ * The lengths are computed rather than transcribed so the encoding cannot drift
+ * from the seed length. Every length here is < 128, so DER short-form is
+ * correct; the assertion below is what keeps that assumption honest if a future
+ * curve with a larger seed is added to the table.
+ */
+function buildRfc8410Pkcs8(oid: readonly number[], seed: Uint8Array): Uint8Array {
+    const algorithm = [0x30, oid.length + 2, 0x06, oid.length, ...oid];
+    const curvePrivateKey = [0x04, seed.length, ...seed];
+    const privateKey = [0x04, curvePrivateKey.length, ...curvePrivateKey];
+    const body = [0x02, 0x01, 0x00, ...algorithm, ...privateKey];
+    if (body.length > 0x7f) {
+        throw new Error('RFC 8410 PKCS#8 body exceeds DER short-form length');
+    }
+    return new Uint8Array([0x30, body.length, ...body]);
+}
+
+function generateRfc8410KeyPair(type: string): { publicKey: KeyObject; privateKey: KeyObject } {
+    const spec = RFC8410_KEY_TYPES[type] as { oid: readonly number[]; seedLength: number };
+    const pkcs8 = buildRfc8410Pkcs8(spec.oid, randomBytes(spec.seedLength));
+    // Derive through the native path rather than deriving in JS: it is the same
+    // code that already produces SPKI for imported keys, so a generated key and
+    // an imported key cannot disagree about the public half.
+    const spki = new Uint8Array(crypto.derivePublicKeyDer(pkcs8));
+    // Node reports an empty details object for these types, not undefined.
+    return {
+        publicKey: new KeyObject('public', type as AsymmetricKeyType, spki, 'der', {}),
+        privateKey: new KeyObject('private', type as AsymmetricKeyType, pkcs8, 'der', {}),
+    };
+}
+
 // Node validates the key type and curve synchronously, even for the async form.
-function validateKeyPairArgs(type: string, options: GenerateKeyPairOptions): void {
+function validateKeyPairArgs(type: string, options: GenerateKeyPairOptions | undefined): void {
+    // Node ignores options entirely for these -- including a bogus namedCurve --
+    // and accepts the call with no options argument at all (measured on v24.18.0).
+    if (isRfc8410KeyType(type)) return;
     if (type === 'rsa') return;
     if (type === 'ec') {
-        if (options.paramEncoding === 'explicit') {
+        if (options?.paramEncoding === 'explicit') {
             throw new Error('Explicit EC parameter encoding is not supported');
         }
-        if (typeof options.namedCurve !== 'string') {
+        if (typeof options?.namedCurve !== 'string') {
             throw withCode(
-                new TypeError(`The "options.namedCurve" property must be of type string. Received ${options.namedCurve === undefined ? 'undefined' : typeof options.namedCurve}`),
+                new TypeError(`The "options.namedCurve" property must be of type string. Received ${options?.namedCurve === undefined ? 'undefined' : typeof options.namedCurve}`),
                 'ERR_INVALID_ARG_TYPE',
             );
         }
@@ -1347,19 +1489,30 @@ function validateKeyPairArgs(type: string, options: GenerateKeyPairOptions): voi
     );
 }
 
-function generateKeyPairSyncImpl(type: string, options: GenerateKeyPairOptions): { publicKey: KeyObject; privateKey: KeyObject } {
+function generateKeyPairSyncImpl(type: string, options: GenerateKeyPairOptions | undefined): { publicKey: KeyObject; privateKey: KeyObject } {
     validateKeyPairArgs(type, options);
+
+    if (isRfc8410KeyType(type)) {
+        return generateRfc8410KeyPair(type);
+    }
+
     if (type === 'rsa') {
-        const keyPair = crypto.generateRsaKey(options.modulusLength || 2048);
+        const modulusLength = options?.modulusLength || 2048;
+        const keyPair = crypto.generateRsaKey(modulusLength);
+        // Node reports details on generated RSA keys too. The C generator always
+        // uses F4, and reading the bytes back would only re-derive what we asked
+        // for, so state it directly.
+        const details = { modulusLength, publicExponent: 65537n };
         return {
-            publicKey: new KeyObject('public', 'rsa', keyPair.publicKey, 'pem'),
-            privateKey: new KeyObject('private', 'rsa', keyPair.privateKey, 'pem'),
+            publicKey: new KeyObject('public', 'rsa', keyPair.publicKey, 'pem', details),
+            privateKey: new KeyObject('private', 'rsa', keyPair.privateKey, 'pem', details),
         };
     }
 
     if (type === 'ec') {
         // validateKeyPairArgs already rejected a missing/unknown curve.
-        const curve = resolveCurve(options.namedCurve as string);
+        const namedCurve = (options as GenerateKeyPairOptions).namedCurve as string;
+        const curve = resolveCurve(namedCurve);
         let keyPair: CModuleCrypto.EcKeyPair;
 
         switch (curve) {
@@ -1369,8 +1522,8 @@ function generateKeyPairSyncImpl(type: string, options: GenerateKeyPairOptions):
         }
 
         return {
-            publicKey: new KeyObject('public', 'ec', keyPair.publicKey, 'raw', { namedCurve: options.namedCurve }),
-            privateKey: new KeyObject('private', 'ec', keyPair.privateKey, 'raw', { namedCurve: options.namedCurve }),
+            publicKey: new KeyObject('public', 'ec', keyPair.publicKey, 'raw', { namedCurve }),
+            privateKey: new KeyObject('private', 'ec', keyPair.privateKey, 'raw', { namedCurve }),
         };
     }
 
@@ -1380,15 +1533,63 @@ function generateKeyPairSyncImpl(type: string, options: GenerateKeyPairOptions):
     );
 }
 
-export function generateKeyPairSync(type: 'rsa', options: { modulusLength: number }): { publicKey: KeyObject; privateKey: KeyObject };
-export function generateKeyPairSync(type: 'ec', options: { namedCurve: string }): { publicKey: KeyObject; privateKey: KeyObject };
-export function generateKeyPairSync(type: string, options: GenerateKeyPairOptions): { publicKey: KeyObject; privateKey: KeyObject } {
-    return generateKeyPairSyncImpl(type, options);
+type Rfc8410KeyType = 'x25519' | 'x448' | 'ed25519' | 'ed448';
+
+/**
+ * Apply `publicKeyEncoding` / `privateKeyEncoding` to a generated pair.
+ *
+ * These options were accepted (they pass validation) and then ignored, so
+ * generateKeyPair always handed back KeyObjects. Node returns the ENCODED key
+ * whenever the corresponding spec is present -- a string for `format:'pem'`, a
+ * Buffer for `'der'` -- and each key is decided independently, so supplying only
+ * `publicKeyEncoding` yields a string public key beside a KeyObject private key.
+ *
+ * Ignoring them fails silently rather than loudly: `writeFileSync('key.pem', privateKey)`
+ * writes "[object Object]" and `String(privateKey)` is not a PEM, so the key
+ * cannot be read back -- measured as `createPrivateKey(String(generated))` ->
+ * "Failed to parse private key". Every library that persists a generated key
+ * takes this path.
+ */
+function encodeGeneratedKey(key: KeyObject, spec: KeyEncodingSpec | undefined): KeyObject | string | Uint8Array {
+    if (!spec || spec.format === undefined) return key;
+    if (spec.format === 'jwk') {
+        // Node returns a JWK object here. KeyObject.export already implements it,
+        // and its return type is deliberately not narrowed to the two byte forms.
+        return key.export({ format: 'jwk' }) as unknown as Uint8Array;
+    }
+    const type = spec.type ?? (key.type === 'private' ? 'pkcs8' : 'spki');
+    return key.export({ type, format: spec.format }) as string | Uint8Array;
 }
 
-export function generateKeyPair(type: 'rsa', options: { modulusLength: number }, callback: (err: Error | null, publicKey?: KeyObject, privateKey?: KeyObject) => void): void;
-export function generateKeyPair(type: 'ec', options: { namedCurve: string }, callback: (err: Error | null, publicKey?: KeyObject, privateKey?: KeyObject) => void): void;
-export function generateKeyPair(type: string, options: GenerateKeyPairOptions, callback: (err: Error | null, publicKey?: KeyObject, privateKey?: KeyObject) => void): void {
+export function generateKeyPairSync(type: 'rsa', options: { modulusLength: number }): { publicKey: KeyObject; privateKey: KeyObject };
+export function generateKeyPairSync(type: 'ec', options: { namedCurve: string }): { publicKey: KeyObject; privateKey: KeyObject };
+export function generateKeyPairSync(type: Rfc8410KeyType, options?: GenerateKeyPairOptions): { publicKey: KeyObject; privateKey: KeyObject };
+export function generateKeyPairSync(type: string, options?: GenerateKeyPairOptions): { publicKey: KeyObject; privateKey: KeyObject } {
+    const pair = generateKeyPairSyncImpl(type, options);
+    // The overloads above keep declaring KeyObject because callers that pass no
+    // encoding -- the common case, and every internal use -- still get one. The
+    // encoded forms are what node returns when an encoding IS supplied.
+    return {
+        publicKey: encodeGeneratedKey(pair.publicKey, options?.publicKeyEncoding) as KeyObject,
+        privateKey: encodeGeneratedKey(pair.privateKey, options?.privateKeyEncoding) as KeyObject,
+    };
+}
+
+type GenerateKeyPairCallback = (err: Error | null, publicKey?: KeyObject, privateKey?: KeyObject) => void;
+
+export function generateKeyPair(type: 'rsa', options: { modulusLength: number }, callback: GenerateKeyPairCallback): void;
+export function generateKeyPair(type: 'ec', options: { namedCurve: string }, callback: GenerateKeyPairCallback): void;
+export function generateKeyPair(type: Rfc8410KeyType, callback: GenerateKeyPairCallback): void;
+export function generateKeyPair(type: Rfc8410KeyType, options: GenerateKeyPairOptions | undefined, callback: GenerateKeyPairCallback): void;
+export function generateKeyPair(
+    type: string,
+    optionsOrCallback: GenerateKeyPairOptions | GenerateKeyPairCallback | undefined,
+    maybeCallback?: GenerateKeyPairCallback,
+): void {
+    // Node accepts generateKeyPair(type, callback) for the types that take no
+    // options, so the second argument has to be probed rather than assumed.
+    const callback = typeof optionsOrCallback === 'function' ? optionsOrCallback : maybeCallback;
+    const options = typeof optionsOrCallback === 'function' ? undefined : optionsOrCallback;
     assertCallback(callback);
     validateKeyPairArgs(type, options);
     queueMicrotask(() => {
@@ -1399,7 +1600,7 @@ export function generateKeyPair(type: string, options: GenerateKeyPairOptions, c
             callback(asError(err));
             return;
         }
-        callback(null, result.publicKey, result.privateKey);
+        callback(null, encodeGeneratedKey(result.publicKey, options?.publicKeyEncoding) as KeyObject, encodeGeneratedKey(result.privateKey, options?.privateKeyEncoding) as KeyObject);
     });
 }
 
@@ -1468,6 +1669,9 @@ export function createVerify(algorithm: string): Verify {
             const sigBuf = normalizeSignatureForVerify(signature, signatureEncoding, publicKey);
             const allData = concatBuffers(data);
             data = [];
+            // null means the signature cannot be valid for this key (wrong P1363
+            // length). Node returns false for that; it does not throw.
+            if (sigBuf === null) return false;
 
             switch (algorithm.toLowerCase()) {
                 case 'rsa-sha224':
@@ -1543,6 +1747,9 @@ export function verify(algorithm: string, data: BinaryInput, key: KeyInput | Key
     const { key: keyBuf, padding } = readKeyOptions(key);
     rejectUnsupportedPadding(padding, 'verify');
     const sigBuf = normalizeSignatureForVerify(signature, undefined, key);
+    // null means the signature cannot be valid for this key (wrong P1363
+    // length). Node returns false for that; it does not throw.
+    if (sigBuf === null) return false;
 
     switch (algorithm.toLowerCase()) {
         case 'rsa-sha224':

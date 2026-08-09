@@ -647,6 +647,23 @@ function parseImpl(path: string, windows: boolean): ParsedPath {
 
     const base = path.slice(start, end);
     const dir = start <= rootLength ? root : path.slice(0, start - 1);
+
+    // Node's posix.parse contradicts its own extname for exactly one shape:
+    // a single-slash-rooted path whose only component is '..' reports
+    // ext '.' / name '.', while extname('/..') is '' and win32.parse('/..')
+    // reports ext ''. Node's carve-out for "the component is exactly .."
+    // tests `startDot === startPart + 1`, but on `/..` the backward scan
+    // breaks at the root instead of at a separator, so startPart stays 0
+    // while the slice actually starts at 1 — and the carve-out misfires.
+    // Reproduced verbatim because callers diff against Node, not the spec.
+    // Only `/..` (+ trailing separators) qualifies: `//..`, `/a/..`, `..`
+    // and `/./..` all take the ordinary path.
+    const nodePosixDotDotQuirk = !windows && base === '..'
+        && root === '/' && start === rootLength;
+    if (nodePosixDotDotQuirk) {
+        return { root, dir, base, ext: '.', name: '.' };
+    }
+
     const ext = base ? extnameImpl(base, windows) : '';
     const name = ext ? base.slice(0, base.length - ext.length) : base;
 

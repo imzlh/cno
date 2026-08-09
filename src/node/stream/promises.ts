@@ -173,6 +173,28 @@ export async function pipeline(
     for (let i = 0; i < resolved.length - 1; i++) {
         const src = resolved[i] as Readable;
         const dst = resolved[i + 1] as Writable;
+
+        // Already-closed guards. Without these, pipeline() hangs exactly as
+        // finished() did: the completion listeners below are registered for
+        // events that already fired. Verified against node v24.18.0 —
+        // a destroyed destination takes precedence over a dead source.
+        if (dst.destroyed) {
+            recordError(Object.assign(new Error('Cannot pipe to a destroyed stream'), {
+                code: 'ERR_STREAM_UNABLE_TO_PIPE',
+            }));
+        } else if (
+            Reflect.get(src as object, 'closed') === true
+            && !src.readableEnded
+            && !src._readableState?.endEmitted
+        ) {
+            // A source that closed without reaching EOF can never deliver data,
+            // so the tail will never finish. A cleanly EOF-consumed source is
+            // *not* an error and must still resolve.
+            recordError(Object.assign(new Error('Premature close'), {
+                code: 'ERR_STREAM_PREMATURE_CLOSE',
+            }));
+        }
+
         if (pipeFromPrev[i + 1]) src.pipe(dst);
 
         const onSrcError = (err: Error) => { recordError(err); };
@@ -250,6 +272,23 @@ export async function pipeline(
             const best = bestError();
             destroyAll(best);
             settle(best);
+            return;
+        }
+
+        // Tail already closed: 'finish'/'end' fired before these listeners
+        // existed, so decide now rather than waiting forever. nextTick keeps
+        // ordering consistent with the live path; the `settled` guard makes it
+        // a no-op if a real event arrives first.
+        if (Reflect.get(last as object, 'closed') === true) {
+            process.nextTick(() => {
+                if (settled) return;
+                const tailDone = (last instanceof Writable && last.writableFinished)
+                    || (last instanceof Readable && (last.readableEnded || !!last._readableState?.endEmitted));
+                if (tailDone) onFinish();
+                else settle?.(Object.assign(new Error('Premature close'), {
+                    code: 'ERR_STREAM_PREMATURE_CLOSE',
+                }));
+            });
         }
     });
 }
@@ -320,10 +359,19 @@ export async function finished(
 
         const nodeReadable = readable && isReadableLike(stream);
         const nodeWritable = writable && isWritableLike(stream);
-        if (!nodeReadable && !nodeWritable) {
-            done(new TypeError('The "stream" argument must be a stream'));
+        if (!isNodeStreamLike(stream)) {
+            done(Object.assign(new TypeError('The "stream" argument must be a stream'), {
+                code: 'ERR_INVALID_ARG_TYPE',
+            }));
             return;
         }
+
+        // `readable:false` / `writable:false` narrow which side must finish; they
+        // do NOT mean "not a stream". Opting out of the only side a stream has
+        // leaves nothing to wait for, and node still waits for 'close' in that
+        // shape rather than resolving eagerly — so eager completion is gated on
+        // at least one side actually being watched.
+        const anyWatched = nodeReadable || nodeWritable;
 
         let readableDone = !nodeReadable || !!stream.readableEnded || !!stream._readableState?.endEmitted;
         let writableDone = !nodeWritable || !!stream.writableFinished || !!stream._writableState?.finished;
@@ -331,13 +379,14 @@ export async function finished(
         const maybeDone = () => {
             if (readableDone && writableDone) done();
         };
+        // Close-time synthesis. `error: false` suppresses the 'error' *listener*,
+        // but node still consults `stream.errored` here and rejects with it, so
+        // this deliberately ignores reportErrors — verified against node v24.18.0.
         const onClose = () => {
+            const errored = Reflect.get(stream as object, 'errored');
+            if (errored != null) { done(errored); return; }
             if (readableDone && writableDone) done();
-            else if (reportErrors) {
-                done(Object.assign(new Error('Premature close'), { code: 'ERR_STREAM_PREMATURE_CLOSE' }));
-            } else {
-                done();
-            }
+            else done(Object.assign(new Error('Premature close'), { code: 'ERR_STREAM_PREMATURE_CLOSE' }));
         };
 
         if (nodeReadable) on(stream, 'end', () => { readableDone = true; maybeDone(); });
@@ -349,6 +398,18 @@ export async function finished(
             done(Reflect.get(stream as object, 'errored'));
             return;
         }
-        maybeDone();
+        if (anyWatched) maybeDone();
+        if (settled) return;
+
+        // The already-closed check. Without this, a stream that closed before
+        // finished() was attached never settles: every listener above is
+        // registered for an event that has already fired. `closed` is set even
+        // under emitClose:false, so it is the reliable gate. Dispatched on
+        // nextTick — not synchronously — so ordering matches the not-yet-closed
+        // case, and the `settled` guard in done() makes it a no-op if a real
+        // 'close' arrives first.
+        if (Reflect.get(stream as object, 'closed') === true) {
+            process.nextTick(onClose);
+        }
     });
 }

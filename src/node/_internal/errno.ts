@@ -76,7 +76,10 @@ export function toErrnoException(
     const message = e.message || error.strerror(errnoValue) || 'Unknown error';
 
     const err: NodeErrnoError = new Error(message);
-    err.name = 'ErrnoException';
+    // Node does NOT set an own `name` on errno errors — measured v24.18.0, every
+    // fs/net/dns errno error has ownProps [code,errno,message,path?,syscall] and
+    // `name === 'Error'` inherited from the prototype. Setting an own 'ErrnoException'
+    // leaked into Object.keys/JSON round-trips and broke `e.name === 'Error'` checks.
     err.code = codeStr;
     err.errno = errnoValue;
     if (syscall) err.syscall = syscall;

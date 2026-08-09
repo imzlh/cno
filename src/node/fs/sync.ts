@@ -264,7 +264,10 @@ export function realpathSync(pathLike: PathLike, options?: { encoding?: BufferEn
 
 Reflect.set(realpathSync, 'native', function (pathLike: PathLike, options?: { encoding?: BufferEncoding | 'buffer' } | BufferEncoding) {
     const pathStr = pathToString(pathLike);
-    const resolved = wrapSync(() => fs.realpath(pathStr), 'realpathSync', pathStr);
+    // 'realpathNative', not 'realpathSync': node reports syscall 'realpath' from
+    // the .native entry point but 'lstat' from the plain one. Same native call
+    // here, so the name has to be selected per call site. See syscall-names.ts.
+    const resolved = wrapSync(() => fs.realpath(pathStr), 'realpathNative', pathStr);
     return encodePathResult(resolved, options);
 });
 

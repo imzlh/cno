@@ -4,7 +4,7 @@
  */
 
 import process from '../process';
-import { format as utilFormat, inspect as utilInspect } from '../util/mod';
+import { format as utilFormat, formatWithOptions as utilFormatWithOptions, inspect as utilInspect } from '../util/mod';
 
 const nativeConsole = import.meta.use('console');
 
@@ -25,7 +25,13 @@ interface ImportInspectOptions {
     breakLength?: number;
 }
 
-function buildOutput(args: unknown[]): string {
+function buildOutput(args: unknown[], inspectOptions?: ImportInspectOptions): string {
+    // Node formats every console message through the instance's inspectOptions
+    // (formatWithOptions), not a bare format() — otherwise `new Console({stdout,
+    // inspectOptions:{depth:0}}).log(o)` silently ignores depth/compact/sorted.
+    if (inspectOptions && Object.keys(inspectOptions).length > 0) {
+        return utilFormatWithOptions(inspectOptions as never, ...args);
+    }
     return utilFormat(...args);
 }
 
@@ -148,7 +154,7 @@ export class Console {
     }
 
     log(...args: unknown[]): void {
-        this._write(this._stdout, this._groupIndent + buildOutput(args));
+        this._write(this._stdout, this._groupIndent + buildOutput(args, this._inspectOptions));
     }
 
     format(...args: unknown[]): string {
@@ -156,19 +162,19 @@ export class Console {
     }
 
     info(...args: unknown[]): void {
-        this._write(this._stdout, this._groupIndent + buildOutput(args));
+        this._write(this._stdout, this._groupIndent + buildOutput(args, this._inspectOptions));
     }
 
     warn(...args: unknown[]): void {
-        this._write(this._stderr, this._groupIndent + buildOutput(args));
+        this._write(this._stderr, this._groupIndent + buildOutput(args, this._inspectOptions));
     }
 
     error(...args: unknown[]): void {
-        this._write(this._stderr, this._groupIndent + buildOutput(args));
+        this._write(this._stderr, this._groupIndent + buildOutput(args, this._inspectOptions));
     }
 
     debug(...args: unknown[]): void {
-        this._write(this._stdout, this._groupIndent + buildOutput(args));
+        this._write(this._stdout, this._groupIndent + buildOutput(args, this._inspectOptions));
     }
 
     dir(obj: unknown, options?: ImportInspectOptions): void {
@@ -222,7 +228,7 @@ export class Console {
             return;
         }
         const ms = performance.now() - start;
-        const extra = args.length ? ' ' + buildOutput(args) : '';
+        const extra = args.length ? ' ' + buildOutput(args, this._inspectOptions) : '';
         this.log(`${label}: ${formatDuration(ms)}${extra}`);
     }
 
@@ -270,7 +276,7 @@ export class Console {
         // Node emits one message: "Trace: <formatted>" plus the caller's frames.
         // slice(2) drops the Error header and this method's own frame.
         const stack = new Error().stack?.split('\n').slice(2).join('\n') ?? '';
-        const head = args.length ? `Trace: ${buildOutput(args)}` : 'Trace';
+        const head = args.length ? `Trace: ${buildOutput(args, this._inspectOptions)}` : 'Trace';
         this._write(this._stderr, this._groupIndent + (stack ? `${head}\n${stack}` : head));
     }
 
@@ -283,7 +289,7 @@ export class Console {
             : typeof args[0] === 'string'
                 ? [`Assertion failed: ${args[0]}`, ...args.slice(1)]
                 : ['Assertion failed', ...args];
-        this._write(this._stderr, this._groupIndent + buildOutput(parts));
+        this._write(this._stderr, this._groupIndent + buildOutput(parts, this._inspectOptions));
     }
 
     clear(): void {

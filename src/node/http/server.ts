@@ -298,6 +298,9 @@ export interface OutgoingMessageImpl extends OutgoingMessage {
     _requireHeadersNotSent(): void;
     _formatHeaders(): string;
     _sendHeaders(): void;
+    /** Legacy Node internals. Widely used by middleware; see the accessor below. */
+    _header: string | null;
+    _implicitHeader(): void;
 }
 
 export interface OutgoingMessageImplConstructor {
@@ -433,6 +436,54 @@ OutgoingMessageImpl.prototype.addTrailers = function addTrailers(this: OutgoingM
 OutgoingMessageImpl.prototype.flushHeaders = function flushHeaders(this: OutgoingMessageImpl): void {
     if (!this.headersSent) this._sendHeaders();
 };
+
+/*
+ * Legacy Node internals that real middleware reaches for directly.
+ *
+ * `compression`, `on-headers`, `express`'s res.sendFile path and several other
+ * widely-used packages open-code Node's own OutgoingMessage guard:
+ *
+ *     if (!this._header) { this._implicitHeader(); }
+ *
+ * Without `_implicitHeader` that throws "TypeError: not a function" from inside
+ * the middleware's res.write/res.end wrapper, before any head is emitted, so
+ * the client gets ZERO bytes and the request hangs until it times out --
+ * measured 2026-08-09 with express 4.21.2 + compression 1.7.5, where every
+ * response (including Accept-Encoding: identity, which does no zlib work at
+ * all) returned 0 bytes under cno and was byte-exact under Node v24.18.0.
+ *
+ * In Node, `_implicitHeader` sends the head with the current statusCode, which
+ * is exactly flushHeaders(); ServerResponseImpl overrides _sendHeaders to route
+ * through NodeResponseAdapter, so the subclass gets the right behaviour for
+ * free. `_header` is Node's pre-serialized head string, truthy only once the
+ * head is out -- expose it as an accessor over the existing state rather than a
+ * second copy that could drift out of sync.
+ */
+OutgoingMessageImpl.prototype._implicitHeader = function _implicitHeader(this: OutgoingMessageImpl): void {
+    this.flushHeaders();
+};
+
+Object.defineProperty(OutgoingMessageImpl.prototype, '_header', {
+    configurable: true,
+    enumerable: false,
+    get(this: OutgoingMessageImpl): string | null {
+        // Node exposes the serialized head; callers only test truthiness, but
+        // return the real bytes so anything that inspects it sees the head.
+        if (!this.headersSent) return null;
+        // statusCode/statusMessage belong to the ServerResponse subclass; a bare
+        // OutgoingMessage has no status line, so fall back to headers only.
+        const self = this as OutgoingMessageImpl & { statusCode?: number; statusMessage?: string };
+        const status = typeof self.statusCode === 'number'
+            ? `HTTP/1.1 ${self.statusCode} ${self.statusMessage || ''}\r\n`
+            : '';
+        return `${status}${this._formatHeaders()}\r\n`;
+    },
+    set(this: OutgoingMessageImpl, _value: string | null): void {
+        // Node allows `res._header = null` to reset. Setting it is not
+        // meaningful here because the head is derived from live state; accept
+        // and ignore rather than throwing inside third-party middleware.
+    },
+});
 
 OutgoingMessageImpl.prototype._formatHeaders = function _formatHeaders(this: OutgoingMessageImpl): string {
     let result = '';
@@ -665,6 +716,48 @@ class NodeResponseAdapter extends ServerResponseAdapter<ServerResponseImpl> {
             createHeadersSentError,
             createWriteAfterEndError,
         }, requestId, requestUrl, suppressBody);
+    }
+
+    /*
+     * Route the head through the response's OWN writeHead property.
+     *
+     * The base adapter emits the implicit head with `this.writeHead(...)` — its
+     * own method. Node reaches it via `this.writeHead(...)` on the *response
+     * instance*, so middleware that replaces `res.writeHead` sits in the path.
+     *
+     * The `on-headers` package works exactly that way, and it is a dependency of
+     * `compression`, `morgan` and `serve-static`. Measured 2026-08-09: under cno
+     * its listener never fired (node: fired), which cost two user-visible bugs
+     * at once — `compression` never installed its gzip stream (no
+     * Content-Encoding for any Accept-Encoding), and, because it defers the
+     * `drain` listener pipe() registers until that same callback, a piped 100KB
+     * file stalled after exactly 16384 bytes: a valid-looking truncated body,
+     * the shape of the originally reported express.static failure.
+     *
+     * bindServerResponseAdapter points response.writeHead at this very method,
+     * so re-dispatching would recurse; `inPublicWriteHead` breaks the cycle.
+     * Unpatched, the call lands here again and behaves exactly as before — only
+     * now any middleware wrapper runs first, as it does in Node.
+     */
+    private inPublicWriteHead = false;
+
+    override writeHead(
+        statusCode: number,
+        statusMessageOrHeaders?: string | OutgoingHttpHeaders | readonly string[],
+        headers?: OutgoingHttpHeaders | readonly string[],
+    ): ServerResponseImpl {
+        if (!this.inPublicWriteHead && typeof this.response.writeHead === 'function') {
+            // Re-dispatch through the instance property so any wrapper runs. When
+            // nothing is patched this is bindServerResponseAdapter's bound copy of
+            // this same method, which re-enters once and falls through to super.
+            this.inPublicWriteHead = true;
+            try {
+                return this.response.writeHead(statusCode, statusMessageOrHeaders as never, headers as never);
+            } finally {
+                this.inPublicWriteHead = false;
+            }
+        }
+        return super.writeHead(statusCode, statusMessageOrHeaders, headers);
     }
 }
 

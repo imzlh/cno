@@ -51,6 +51,11 @@ let _originalPromiseThen: Promise<unknown>['then'] | null = null;
 const _hooks: HookCallbacks[] = [];
 const _promiseStates = new WeakMap<Promise<unknown>, AsyncState>();
 const _handleStates = new Map<TimerHandle, AsyncState>();
+// Promises a *user* attached a reaction to, via the patched `Promise.prototype.then`
+// (`.catch`/`.finally` delegate to it). The bookkeeping branch installed below uses the
+// unpatched `originalThen`, so it never marks anything here. See the comment at the
+// bookkeeping branch for why this distinction is load-bearing.
+const _userHandled = new WeakSet<object>();
 
 function emitInit(state: AsyncState): void {
     for (const hook of _hooks) {
@@ -177,6 +182,9 @@ function installAsyncPatches(): void {
     const originalThen = Promise.prototype.then;
     _originalPromiseThen = originalThen;
     Promise.prototype.then = function(this: Promise<unknown>, onFulfilled?: unknown, onRejected?: unknown): Promise<unknown> {
+        // A user reaction on `this`. Only the patched entry point records this;
+        // the bookkeeping branch below calls `originalThen` directly.
+        _userHandled.add(this);
         const parentState = _promiseStates.get(this);
         const state = createState(
             'PROMISE',
@@ -191,6 +199,27 @@ function installAsyncPatches(): void {
         );
         state.resource = result;
         _promiseStates.set(result, state);
+        // Bookkeeping branch: observes `result` settling so `destroy`/`promiseResolve`
+        // hooks fire. Attaching it sets [[PromiseIsHandled]] on `result`, which would
+        // mask `result`'s own unhandled rejection — so the rejection arm re-throws to
+        // relocate the report onto the promise this `originalThen` returns.
+        //
+        // That promise is deliberately discarded, which is precisely the problem: an
+        // unconditional re-throw rejects a promise nobody can ever handle, manufacturing
+        // a *spurious* `unhandledRejection` for every rejecting `.then` hop — even when
+        // the user handled it. koa's `fnMiddleware(ctx).then(handleResponse).catch(onerror)`
+        // (koa/lib/application.js:186) hit this: the intermediate `.then` result rejects,
+        // the user's `.catch` handles it, and cno still reported `unhandledRejection`
+        // while node reported only `app.on('error')`. Deployments that install
+        // `process.on('unhandledRejection', () => process.exit(1))` died on handled errors.
+        //
+        // Deleting the re-throw is not the fix — it is load-bearing for the genuine case
+        // (`p.then(f)` with no handler anywhere would go silent, since the branch above
+        // already marked `result` handled). So decide at settle time instead: re-throw
+        // only if no user reaction was ever attached to `result`. Reaction jobs run at the
+        // microtask checkpoint, strictly after the synchronous turn that builds a chain,
+        // so a same-turn `.catch` is always recorded before this arm runs — and a handler
+        // attached in a later tick correctly still reports, matching node.
         originalThen.call(
             result,
             (value: unknown) => {
@@ -199,7 +228,7 @@ function installAsyncPatches(): void {
             },
             (error: unknown) => {
                 settleState(state);
-                throw error;
+                if (!_userHandled.has(result)) throw error;
             },
         );
         return result;

@@ -447,24 +447,42 @@ export function format(url: string | URL | UrlObject, options?: {
     }
 
     const protocol = normalizeProtocol(url.protocol);
-    // Node adds "//" only for an explicit `slashes` or a slashed protocol —
-    // a bare host on e.g. mailto: must NOT gain one.
-    const slashes = Boolean(url.slashes) || (protocol !== null && SLASHED_PROTOCOLS.has(protocol));
-    let out = protocol ?? '';
 
-    let host = url.host ?? null;
-    if (!host && url.hostname) {
-        host = formatHostname(String(url.hostname));
+    // Node builds the authority as a single unit: `auth` is only ever emitted
+    // as a prefix of a NON-EMPTY host, so `{protocol:'http:',auth:'u:p'}`
+    // formats as `http:` and drops the credentials entirely.
+    const auth = url.auth
+        ? `${encodeAuth(String(url.auth)).replace(UNSAFE_AUTH, encodeURIComponent)}@`
+        : '';
+    let host = '';
+    if (url.host) {
+        host = `${auth}${String(url.host)}`;
+    } else if (url.hostname) {
+        host = `${auth}${formatHostname(String(url.hostname))}`;
         if (url.port) host += `:${url.port}`;
     }
 
-    if (slashes) out += '//';
-    if (url.auth) out += `${encodeAuth(String(url.auth)).replace(UNSAFE_AUTH, encodeURIComponent)}@`;
-    if (host) out += host;
-
     let pathname = url.pathname ?? '';
-    if (pathname && host && !pathname.startsWith('/')) pathname = `/${pathname}`;
-    out += encodePathname(pathname);
+
+    // Node gates the "//" and the implied leading slash behind TWO conditions,
+    // not one: the protocol must want slashes, AND there must be something to
+    // separate (an explicit `slashes` flag or a real host). A slashed protocol
+    // with neither — `{protocol:'http:',pathname:'b'}` — stays `http:b`, and a
+    // bare host with no slashed protocol — `{host:'a',pathname:'b'}` — stays
+    // `ab`. Gating the leading slash on `host` alone produced `http://` and
+    // `a/b` for those.
+    if (Boolean(url.slashes) || (protocol !== null && SLASHED_PROTOCOLS.has(protocol))) {
+        if (url.slashes || host) {
+            if (pathname && !pathname.startsWith('/')) pathname = `/${pathname}`;
+            host = `//${host}`;
+        } else if (protocol === 'file:') {
+            // Node's carve-out tests `protocol` starting with "file"; among the
+            // slashed protocols that reach here, only `file:` qualifies.
+            host = '//';
+        }
+    }
+
+    let out = `${protocol ?? ''}${host}${encodePathname(pathname)}`;
 
     let search = url.search ?? null;
     if (!search && url.query && typeof url.query === 'object') {
@@ -1036,6 +1054,14 @@ export function urlToHttpOptions(url: URL): {
         throw new TypeError('The "url" argument must be an instance of URL');
     }
 
+    // `hostname` feeds straight into net.connect/dns, which want the bare
+    // address — Node strips the IPv6 brackets here, so `http://[::1]:8/` must
+    // yield `::1`, not `[::1]`. Passing the bracketed form through produced a
+    // hostname no resolver accepts.
+    const hostname = url.hostname.startsWith('[')
+        ? url.hostname.slice(1, -1)
+        : url.hostname;
+
     const options: {
         protocol?: string;
         hostname?: string;
@@ -1047,14 +1073,21 @@ export function urlToHttpOptions(url: URL): {
         port?: number;
         auth?: string;
     } = {
+        // Null prototype, like Node: these options objects are routinely built
+        // from untrusted URLs and then probed with `opts.foo`, so an inherited
+        // Object.prototype member must never answer for a missing option.
+        __proto__: null,
+        // Node spreads the URL first so a user subclass's own enumerable
+        // properties survive; every field below then overrides it.
+        ...url,
         protocol: url.protocol,
-        hostname: url.hostname,
+        hostname,
         hash: url.hash,
         search: url.search,
         pathname: url.pathname,
         path: `${url.pathname}${url.search}`,
         href: url.href,
-    };
+    } as never;
 
     if (url.port) options.port = Number(url.port);
     if (url.username || url.password) {

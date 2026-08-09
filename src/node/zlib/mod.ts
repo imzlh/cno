@@ -56,7 +56,7 @@ interface BrotliOptions {
 }
 
 type ZlibInput = string | ArrayBuffer | ArrayBufferView;
-type CompressCallback = (err: Error | null, result?: Buffer) => void;
+type CompressCallback = (err: Error | null, result?: Buffer | ZlibInfoResult) => void;
 
 // The native zlib handles are direction-specific: createDeflate/createGzip/
 // createDeflateRaw expose only `deflate` (plus `params`), while createInflate/
@@ -297,6 +297,59 @@ function checkMaxOutputLength(output: Buffer, options?: { maxOutputLength?: numb
     return output;
 }
 
+/**
+ * `{ info: true }` makes Node's one-shot helpers return `{ buffer, engine }` rather
+ * than a bare Buffer, where `engine` is an instance of the matching stream class
+ * carrying `bytesWritten` (the input byte count). Verified against v24.18.0:
+ * `gzipSync(35 bytes, {info:true})` yields `engine instanceof Gzip`,
+ * `engine.bytesWritten === 35`, and a plain-Object result.
+ */
+export interface ZlibInfoResult {
+    buffer: Buffer;
+    engine: NodeZlibTransform;
+}
+
+type OneShotKind = 'deflate' | 'deflateRaw' | 'gzip' | 'inflate' | 'inflateRaw' | 'gunzip' | 'unzip';
+
+/**
+ * Referenced lazily inside the function body: the stream constructors are declared
+ * further down this module, so a top-level table would hit their TDZ at load time.
+ */
+function newInfoEngine(kind: OneShotKind, opts?: ZlibOptions & TransformOptions): NodeZlibTransform {
+    switch (kind) {
+        case 'deflate': return new Deflate(opts) as unknown as NodeZlibTransform;
+        case 'deflateRaw': return new DeflateRaw(opts) as unknown as NodeZlibTransform;
+        case 'gzip': return new Gzip(opts) as unknown as NodeZlibTransform;
+        case 'inflate': return new Inflate(opts) as unknown as NodeZlibTransform;
+        case 'inflateRaw': return new InflateRaw(opts) as unknown as NodeZlibTransform;
+        case 'gunzip': return new Gunzip(opts) as unknown as NodeZlibTransform;
+        case 'unzip': return new Unzip(opts) as unknown as NodeZlibTransform;
+    }
+}
+
+/**
+ * Wrap a one-shot result per `options.info`. Node reports the *input* length as the
+ * engine's `bytesWritten`, and releases the native handle without destroying the
+ * engine (`closed`/`destroyed` stay false).
+ */
+function withInfo(
+    kind: OneShotKind,
+    output: Buffer,
+    inputLength: number,
+    options?: ZlibOptions,
+): Buffer | ZlibInfoResult {
+    if (options?.info !== true) return output;
+    const engine = newInfoEngine(kind, options as (ZlibOptions & TransformOptions) | undefined);
+    const state = zlibStreamStates.get(engine);
+    if (state) state.bytesWritten = inputLength;
+    // Node releases the native handle and leaves `_handle === null` on the returned
+    // engine, while `closed`/`destroyed` stay false. Match that shape: callers (and
+    // Node's own `zlib binding closed` guard) test `_handle` for null.
+    engine._handle.close?.();
+    (engine as { _handle: ZlibHandle | null })._handle = null;
+    return { buffer: output, engine };
+}
+
 // Error shaping: the native layer reports generic InternalErrors, so classify
 // them into Node's `{ code, errno }` zlib error surface here.
 
@@ -359,7 +412,7 @@ const supportsMultiMember = (kind: DecompressKind, input: Uint8Array): boolean =
  * `zlib.inflate()` silently returns partial output for truncated input and
  * drops trailing gzip members, so walk members explicitly instead.
  */
-function decompressSync(kind: DecompressKind, buffer: ZlibInput, options?: ZlibOptions): Buffer {
+function decompressSync(kind: DecompressKind, buffer: ZlibInput, options?: ZlibOptions): Buffer | ZlibInfoResult {
     validateOptions(options);
     const input = toUint8Array(buffer);
     const partialOk = (options?.finishFlush ?? FINISH) !== FINISH;
@@ -399,48 +452,68 @@ function decompressSync(kind: DecompressKind, buffer: ZlibInput, options?: ZlibO
         handle.reset();
     }
 
-    return checkMaxOutputLength(Buffer.concat(chunks), options);
+    return withInfo(kind, checkMaxOutputLength(Buffer.concat(chunks), options), input.byteLength, options);
 }
 
 // Sync compress/decompress
 
-export function deflateSync(buffer: ZlibInput, options?: ZlibOptions): Buffer {
+export function deflateSync(buffer: ZlibInput, options: ZlibOptions & { info: true }): ZlibInfoResult;
+export function deflateSync(buffer: ZlibInput, options?: ZlibOptions): Buffer;
+export function deflateSync(buffer: ZlibInput, options?: ZlibOptions): Buffer | ZlibInfoResult {
     validateOptions(options);
     const level = options?.level ?? zlib.DEFAULT_COMPRESSION;
-    return checkMaxOutputLength(Buffer.from(zlib.deflate(toUint8Array(buffer), level, orUndef(options?.strategy), orUndef(options?.memLevel))), options);
+    const input = toUint8Array(buffer);
+    const out = checkMaxOutputLength(Buffer.from(zlib.deflate(input, level, orUndef(options?.strategy), orUndef(options?.memLevel))), options);
+    return withInfo('deflate', out, input.byteLength, options);
 }
 
-export function deflateRawSync(buffer: ZlibInput, options?: ZlibOptions): Buffer {
+export function deflateRawSync(buffer: ZlibInput, options: ZlibOptions & { info: true }): ZlibInfoResult;
+export function deflateRawSync(buffer: ZlibInput, options?: ZlibOptions): Buffer;
+export function deflateRawSync(buffer: ZlibInput, options?: ZlibOptions): Buffer | ZlibInfoResult {
     validateOptions(options);
     const level = options?.level ?? zlib.DEFAULT_COMPRESSION;
-    return checkMaxOutputLength(Buffer.from(zlib.deflateRaw(toUint8Array(buffer), level, orUndef(options?.strategy), orUndef(options?.memLevel))), options);
+    const input = toUint8Array(buffer);
+    const out = checkMaxOutputLength(Buffer.from(zlib.deflateRaw(input, level, orUndef(options?.strategy), orUndef(options?.memLevel))), options);
+    return withInfo('deflateRaw', out, input.byteLength, options);
 }
 
-export function gzipSync(buffer: ZlibInput, options?: ZlibOptions): Buffer {
+export function gzipSync(buffer: ZlibInput, options: ZlibOptions & { info: true }): ZlibInfoResult;
+export function gzipSync(buffer: ZlibInput, options?: ZlibOptions): Buffer;
+export function gzipSync(buffer: ZlibInput, options?: ZlibOptions): Buffer | ZlibInfoResult {
     validateOptions(options);
     const level = options?.level ?? zlib.DEFAULT_COMPRESSION;
-    return checkMaxOutputLength(Buffer.from(zlib.gzip(toUint8Array(buffer), level, orUndef(options?.strategy), orUndef(options?.memLevel))), options);
+    const input = toUint8Array(buffer);
+    const out = checkMaxOutputLength(Buffer.from(zlib.gzip(input, level, orUndef(options?.strategy), orUndef(options?.memLevel))), options);
+    return withInfo('gzip', out, input.byteLength, options);
 }
 
-export function inflateSync(buffer: ZlibInput, options?: ZlibOptions): Buffer {
+export function inflateSync(buffer: ZlibInput, options: ZlibOptions & { info: true }): ZlibInfoResult;
+export function inflateSync(buffer: ZlibInput, options?: ZlibOptions): Buffer;
+export function inflateSync(buffer: ZlibInput, options?: ZlibOptions): Buffer | ZlibInfoResult {
     return decompressSync('inflate', buffer, options);
 }
 
-export function inflateRawSync(buffer: ZlibInput, options?: ZlibOptions): Buffer {
+export function inflateRawSync(buffer: ZlibInput, options: ZlibOptions & { info: true }): ZlibInfoResult;
+export function inflateRawSync(buffer: ZlibInput, options?: ZlibOptions): Buffer;
+export function inflateRawSync(buffer: ZlibInput, options?: ZlibOptions): Buffer | ZlibInfoResult {
     return decompressSync('inflateRaw', buffer, options);
 }
 
-export function gunzipSync(buffer: ZlibInput, options?: ZlibOptions): Buffer {
+export function gunzipSync(buffer: ZlibInput, options: ZlibOptions & { info: true }): ZlibInfoResult;
+export function gunzipSync(buffer: ZlibInput, options?: ZlibOptions): Buffer;
+export function gunzipSync(buffer: ZlibInput, options?: ZlibOptions): Buffer | ZlibInfoResult {
     return decompressSync('gunzip', buffer, options);
 }
 
-export function unzipSync(buffer: ZlibInput, options?: ZlibOptions): Buffer {
+export function unzipSync(buffer: ZlibInput, options: ZlibOptions & { info: true }): ZlibInfoResult;
+export function unzipSync(buffer: ZlibInput, options?: ZlibOptions): Buffer;
+export function unzipSync(buffer: ZlibInput, options?: ZlibOptions): Buffer | ZlibInfoResult {
     return decompressSync('unzip', buffer, options);
 }
 
 // Async compress/decompress (callback style)
 
-type SyncFn = (buf: ZlibInput, opts?: ZlibOptions | BrotliOptions) => Buffer;
+type SyncFn = (buf: ZlibInput, opts?: ZlibOptions | BrotliOptions) => Buffer | ZlibInfoResult;
 
 function wrapCallback(syncFn: SyncFn, validator: (options?: ZlibOptions | BrotliOptions) => void = validateOptions) {
     return function(buffer: ZlibInput, optionsOrCallback?: ZlibOptions | BrotliOptions | CompressCallback, callback?: CompressCallback) {
@@ -515,6 +588,9 @@ type ZlibStreamState = {
     finishFlush: number;
     maxOutputLength?: number;
     outputLength: number;
+    // Node counts every byte handed to the stream (uncompressed for compressors,
+    // compressed for decompressors) and exposes it as `bytesWritten`.
+    bytesWritten: number;
     // gzip members concatenate; track leftovers across chunk boundaries
     multiMember: boolean;
     autoDetect: boolean;
@@ -528,12 +604,24 @@ type ZlibStreamState = {
 const zlibStreamStates = new WeakMap<object, ZlibStreamState>();
 
 function configureZlibStream(stream: object, compress: boolean, options?: ZlibOptions, kind?: DecompressKind): void {
+    // Node's ZlibBase records the requested level/strategy on the stream itself;
+    // they are observable as `_level` / `_strategy` (v24.18.0 reports -1 / 0 by
+    // default), so mirror them rather than leaving them undefined.
+    Object.assign(stream, {
+        _level: options?.level ?? DEFAULT_COMPRESSION,
+        _strategy: options?.strategy ?? DEFAULT_STRATEGY,
+    });
     zlibStreamStates.set(stream, {
         compress,
         flush: options?.flush ?? NO_FLUSH,
         finishFlush: options?.finishFlush ?? FINISH,
-        maxOutputLength: options?.maxOutputLength,
+        // `maxOutputLength` is deliberately NOT carried onto streams: Node applies it
+        // only to the convenience methods (zlibBuffer/zlibBufferSync), and a stream
+        // created with it decompresses without limit. Verified against v24.18.0 —
+        // createGunzip({maxOutputLength:1}) emits the full 100000-byte payload.
+        maxOutputLength: undefined,
         outputLength: 0,
+        bytesWritten: 0,
         multiMember: kind === 'gunzip',
         autoDetect: kind === 'unzip',
     });
@@ -621,9 +709,13 @@ function _doTransform(stream: NodeZlibTransform, chunk: ZlibInput, cb: Transform
     try {
         const state = streamState(stream);
         const handle = stream._handle;
+        const input = toUint8Array(chunk);
+        // Node counts input bytes before processing, so a chunk that errors is
+        // still reflected in `bytesWritten`.
+        state.bytesWritten += input.byteLength;
         const output = isDeflateHandle(handle)
-            ? checkStreamOutput(stream, Buffer.from(handle.deflate(toUint8Array(chunk), state.flush)))
-            : inflateChunk(stream, state, handle, toUint8Array(chunk));
+            ? checkStreamOutput(stream, Buffer.from(handle.deflate(input, state.flush)))
+            : inflateChunk(stream, state, handle, input);
         cb(null, output.length > 0 ? output : undefined);
     } catch (err) { cb(asError(err)); }
 }
@@ -697,6 +789,7 @@ interface NodeZlibTransform extends Transform {
     reset(): void;
     params(level: number, strategy: number, callback?: () => void): this;
     close(callback?: () => void): void;
+    readonly bytesWritten: number;
 }
 
 function flushStream(this: NodeZlibTransform, kindOrCallback?: number | (() => void), callback?: () => void): NodeZlibTransform {
@@ -746,6 +839,15 @@ function installZlibMethods(prototype: NodeZlibTransform): void {
     prototype.reset = resetStream;
     prototype.params = paramsStream;
     prototype.close = closeStream;
+    // Node exposes `bytesWritten` on every zlib stream: the running total of bytes
+    // handed to the stream. `reset()` does not clear it (verified against v24.18.0).
+    Object.defineProperty(prototype, 'bytesWritten', {
+        get(this: NodeZlibTransform): number {
+            return zlibStreamStates.get(this)?.bytesWritten ?? 0;
+        },
+        configurable: true,
+        enumerable: false,
+    });
 }
 
 export interface Deflate extends NodeZlibTransform {
@@ -1230,7 +1332,13 @@ function configureBrotliStream(stream: object, options?: BrotliOptions): void {
     brotliStreamStates.set(stream, {
         flush: options?.flush ?? BROTLI_OPERATION_PROCESS,
         finishFlush: options?.finishFlush ?? BROTLI_OPERATION_FINISH,
-        maxOutputLength: options?.maxOutputLength,
+        // As with the zlib streams above, Node scopes `maxOutputLength` to the
+        // convenience methods only. Measured on v24.18.0:
+        // createBrotliDecompress({maxOutputLength:1}) emits all 100000 bytes,
+        // while brotliDecompressSync(..., {maxOutputLength:1}) throws
+        // ERR_BUFFER_TOO_LARGE. NOTE: not exercisable in this build, which has no
+        // system libbrotli, so these ctors throw before reaching here.
+        maxOutputLength: undefined,
         outputLength: 0,
     });
 }

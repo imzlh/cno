@@ -354,7 +354,12 @@ function copyOut(contextObject: Context, state: ContextState): void {
 
 function buildFunctionExpression(code: string, params: string[]): string {
     const args = params.join(', ');
-    return `(function(${args}) {\n${code}\n})`;
+    // The body must start on line 1 so reported lines match Node, which subtracts
+    // the wrapper offset inside V8. QuickJS has no such knob, so the header shares
+    // line 1 with the body: every line number now agrees with Node, and only the
+    // *column* of a line-1 frame is shifted by the header width. A leading newline
+    // here would instead shift every reported line by +1.
+    return `(function(${args}) {${code}\n})`;
 }
 
 /** Node reports the declared arity and an empty name on compiled functions. */

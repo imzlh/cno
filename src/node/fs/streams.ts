@@ -123,63 +123,130 @@ function asFsError(error: unknown, syscall: string, path?: string): Error {
     return toErrnoException(error, syscall, path) as Error;
 }
 
-export class ReadStream extends Readable {
-    bytesRead = 0;
+/**
+ * Is `value` an object already linked to `prototype`? That is node's test for
+ * "was I called with new / applied onto a real instance", and it must use
+ * isPrototypeOf rather than an exact-prototype check so ES5 subclasses -- whose
+ * instances sit one link further down -- are adopted too.
+ */
+function isFsConstructCallTarget(value: unknown, prototype: object): boolean {
+    return !!value
+        && (typeof value === 'object' || typeof value === 'function')
+        && prototype.isPrototypeOf(value as object);
+}
+
+/**
+ * The mutable view initReadStreamState writes through. The class declares these
+ * `private`/`readonly` for callers, but the shared init has to set them, and TS
+ * privates are not reachable through the public type.
+ */
+type ReadStreamInternals = {
     path: PathLike;
     pending: boolean;
     fd: number | null;
+    bytesRead: number;
+    flags: string | number;
+    mode?: Mode;
+    autoClose: boolean;
+    start?: number;
+    end?: number;
+    ownedHandle: { fd: number; close(): Promise<void> } | null;
+    handle: CModuleAsyncFS.FileHandle | null;
+    position: number | null;
+    openPromise: Promise<void> | null;
+    openFailed: boolean;
+    ensureOpen(): Promise<void>;
+};
 
-    private readonly flags: string | number;
+/**
+ * The Readable options ReadStream passes up. Split out of the constructor so the
+ * ES5-callable facade below can hand the same options to `Readable.call`.
+ */
+function readableOptionsFor(options: ReadStreamOptions) {
+    return {
+        highWaterMark: validateHighWaterMark(options.highWaterMark),
+        encoding: options.encoding,
+        emitClose: options.emitClose,
+        // Node ties 'close' emission and teardown to autoClose: with
+        // autoClose:false the stream is never auto-destroyed.
+        autoDestroy: options.autoClose !== false,
+    };
+}
+
+/**
+ * Everything the ReadStream constructor did after `super()`, against an explicit
+ * target rather than `this`.
+ *
+ * Extracting this is what lets `fs.ReadStream` be called without `new`. A class
+ * constructor cannot run against a caller-supplied object, and it cannot be
+ * faked by constructing an instance and copying its own properties across: the
+ * open kicked off below closes over the object it was given, so a copy leaves
+ * the caller's object with `handle` permanently null and the stream hangs with
+ * zero bytes and no 'end' -- a silent failure, worse than the throw it replaces.
+ * Running the init directly on the target keeps every callback pointed at the
+ * object the caller will actually read from.
+ */
+function initReadStreamState(self: ReadStream, path: PathLike, options: ReadStreamOptions): void {
+    const start = validatePosition('start', options.start);
+    const end = validatePosition('end', options.end);
+    if (start !== undefined && end !== undefined && start > end) {
+        outOfRange('start', `<= "end" (here: ${end})`, start);
+    }
+
+    const target = self as unknown as ReadStreamInternals;
+    target.path = path;
+    target.flags = options.flags ?? 'r';
+    target.mode = options.mode;
+    target.autoClose = options.autoClose !== false;
+    target.start = start;
+    target.end = end;
+    target.bytesRead = 0;
+    target.handle = null;
+    target.openPromise = null;
+    target.openFailed = false;
+    target.ownedHandle = isFileHandleLike(options.fd) ? options.fd : null;
+    target.fd = target.ownedHandle ? target.ownedHandle.fd : (options.fd as number | undefined) ?? null;
+    target.pending = target.fd === null;
+    // default to offset 0 when only `end` is given so the end bound applies
+    target.position = start ?? (end !== undefined ? 0 : null);
+
+    if (self.fd === null) {
+        void target.ensureOpen().catch((err: unknown) => {
+            target.openFailed = true;
+            if (!self.destroyed) self.destroy(asFsError(err, 'open', pathToString(self.path)));
+        });
+    } else {
+        queueMicrotask(() => {
+            if (self.destroyed) return;
+            self.emit('open', self.fd);
+            self.emit('ready');
+        });
+    }
+}
+
+class ReadStreamClass extends Readable {
+    bytesRead = 0;
+    // Definite assignment: every one of these is set by initReadStreamState via the
+    // ReadStreamInternals cast above, which TS cannot see through. Without the `!`
+    // each field reports TS2564 even though the constructor does initialize it.
+    path!: PathLike;
+    pending!: boolean;
+    fd!: number | null;
+
+    private readonly flags!: string | number;
     private readonly mode?: Mode;
-    private readonly autoClose: boolean;
+    private readonly autoClose!: boolean;
     private readonly start?: number;
     private readonly end?: number;
-    private readonly ownedHandle: { fd: number; close(): Promise<void> } | null;
+    private readonly ownedHandle!: { fd: number; close(): Promise<void> } | null;
     private handle: CModuleAsyncFS.FileHandle | null = null;
-    private position: number | null;
+    private position!: number | null;
     private openPromise: Promise<void> | null = null;
     private openFailed = false;
 
     constructor(path: PathLike, options: ReadStreamOptions = {}) {
-        const start = validatePosition('start', options.start);
-        const end = validatePosition('end', options.end);
-        if (start !== undefined && end !== undefined && start > end) {
-            outOfRange('start', `<= "end" (here: ${end})`, start);
-        }
-        const highWaterMark = validateHighWaterMark(options.highWaterMark);
-
-        super({
-            highWaterMark,
-            encoding: options.encoding,
-            emitClose: options.emitClose,
-            // Node ties 'close' emission and teardown to autoClose: with
-            // autoClose:false the stream is never auto-destroyed.
-            autoDestroy: options.autoClose !== false,
-        });
-        this.path = path;
-        this.flags = options.flags ?? 'r';
-        this.mode = options.mode;
-        this.autoClose = options.autoClose !== false;
-        this.start = start;
-        this.end = end;
-        this.ownedHandle = isFileHandleLike(options.fd) ? options.fd : null;
-        this.fd = this.ownedHandle ? this.ownedHandle.fd : (options.fd as number | undefined) ?? null;
-        this.pending = this.fd === null;
-        // default to offset 0 when only `end` is given so the end bound applies
-        this.position = start ?? (end !== undefined ? 0 : null);
-
-        if (this.fd === null) {
-            void this.ensureOpen().catch((err) => {
-                this.openFailed = true;
-                if (!this.destroyed) this.destroy(asFsError(err, 'open', pathToString(this.path)));
-            });
-        } else {
-            queueMicrotask(() => {
-                if (this.destroyed) return;
-                this.emit('open', this.fd);
-                this.emit('ready');
-            });
-        }
+        super(readableOptionsFor(options));
+        initReadStreamState(this, path, options);
     }
 
     close(callback?: (err?: NodeJS.ErrnoException | null) => void): void {
@@ -293,52 +360,142 @@ export class ReadStream extends Readable {
     }
 }
 
-export class WriteStream extends Writable {
-    bytesWritten = 0;
+/**
+ * `fs.ReadStream` must be callable WITHOUT `new`.
+ *
+ * Node's is an ES5-style constructor, so the ecosystem subclasses it the ES5 way.
+ * `graceful-fs` -- a transitive dependency of fs-extra, archiver, npm itself and
+ * thousands of packages -- does exactly this (graceful-fs.js:297):
+ *
+ *     function ReadStream (path, options) {
+ *       if (this instanceof ReadStream)
+ *         return fs$ReadStream.apply(this, arguments), this
+ *       else
+ *         return ReadStream.apply(Object.create(ReadStream.prototype), arguments)
+ *     }
+ *
+ * Against a `class`, that `.apply` throws "class constructors must be invoked
+ * with 'new'", which took out every `fs.createReadStream` routed through
+ * graceful-fs: `archiver` and `tar-stream` produced no output at all.
+ *
+ * Measured node v24.18.0 semantics, which this reproduces:
+ *   - `.apply(o, args)` where o is prototype-linked: initializes o IN PLACE
+ *     (12 own properties) and returns undefined -- callers use their own `this`.
+ *   - a bare call (`this` undefined): returns a fresh working instance.
+ *
+ * The prototype is the class's own object, so every method is inherited
+ * unchanged and `instanceof` holds for objects made either way.
+ */
+export type ReadStream = ReadStreamClass;
+
+type ReadStreamConstructor = {
+    new (path: PathLike, options?: ReadStreamOptions): ReadStream;
+    (path: PathLike, options?: ReadStreamOptions): ReadStream;
+    readonly prototype: ReadStream;
+};
+
+export const ReadStream = function ReadStream(this: unknown, path: PathLike, options: ReadStreamOptions = {}) {
+    const target = isFsConstructCallTarget(this, ReadStream.prototype)
+        ? (this as ReadStream)
+        : (Object.create(ReadStream.prototype) as ReadStream);
+    // Readable is itself ES5-callable and adopts a prototype-linked `this`, so
+    // this sets up readable state on `target` rather than a throwaway object.
+    (Readable as unknown as (this: unknown, options?: unknown) => void).call(target, readableOptionsFor(options));
+    initReadStreamState(target, path, options);
+    return target;
+} as unknown as ReadStreamConstructor;
+
+Object.setPrototypeOf(ReadStream, Readable);
+// Without this, `stream.constructor.name` reads 'ReadStreamClass' -- the internal
+// name leaks to anything that reports or switches on it, where node says
+// 'ReadStream'. The prototype's constructor is the class, not the facade.
+Object.defineProperty(ReadStreamClass, 'name', { value: 'ReadStream', configurable: true });
+Object.defineProperty(ReadStream, 'prototype', {
+    value: ReadStreamClass.prototype,
+    writable: false,
+    enumerable: false,
+    configurable: false,
+});
+
+/**
+ * WriteStream's counterparts to readableOptionsFor/initWriteStreamState. Same
+ * reason: `fs.WriteStream` has to be callable without `new`, because graceful-fs
+ * patches BOTH streams with the identical ES5 `.apply` idiom.
+ */
+function writableOptionsFor(options: WriteStreamOptions) {
+    return {
+        highWaterMark: validateHighWaterMark(options.highWaterMark),
+        emitClose: options.emitClose,
+        autoDestroy: options.autoClose !== false,
+    };
+}
+
+type WriteStreamInternals = {
     path: PathLike;
     pending: boolean;
     fd: number | null;
+    bytesWritten: number;
+    flags: string | number;
+    mode?: Mode;
+    autoClose: boolean;
+    ownedHandle: { fd: number; close(): Promise<void> } | null;
+    handle: CModuleAsyncFS.FileHandle | null;
+    position: number | null;
+    openPromise: Promise<void> | null;
+    openFailed: boolean;
+    ensureOpen(): Promise<void>;
+};
 
-    private readonly flags: string | number;
+function initWriteStreamState(self: WriteStream, path: PathLike, options: WriteStreamOptions): void {
+    const start = validatePosition('start', options.start);
+
+    const target = self as unknown as WriteStreamInternals;
+    target.path = path;
+    target.flags = options.flags ?? 'w';
+    target.mode = options.mode;
+    target.autoClose = options.autoClose !== false;
+    target.bytesWritten = 0;
+    target.handle = null;
+    target.openPromise = null;
+    target.openFailed = false;
+    target.ownedHandle = isFileHandleLike(options.fd) ? options.fd : null;
+    target.fd = target.ownedHandle ? target.ownedHandle.fd : (options.fd as number | undefined) ?? null;
+    target.pending = target.fd === null;
+    target.position = start ?? null;
+    if (options.encoding) self.setDefaultEncoding(options.encoding);
+
+    if (self.fd === null) {
+        void target.ensureOpen().catch((err: unknown) => {
+            target.openFailed = true;
+            if (!self.destroyed) self.destroy(asFsError(err, 'open', pathToString(self.path)));
+        });
+    } else {
+        queueMicrotask(() => {
+            if (self.destroyed) return;
+            self.emit('open', self.fd);
+            self.emit('ready');
+        });
+    }
+}
+
+class WriteStreamClass extends Writable {
+    bytesWritten = 0;
+    path!: PathLike;
+    pending!: boolean;
+    fd!: number | null;
+
+    private readonly flags!: string | number;
     private readonly mode?: Mode;
-    private readonly autoClose: boolean;
-    private readonly ownedHandle: { fd: number; close(): Promise<void> } | null;
+    private readonly autoClose!: boolean;
+    private readonly ownedHandle!: { fd: number; close(): Promise<void> } | null;
     private handle: CModuleAsyncFS.FileHandle | null = null;
-    private position: number | null;
+    private position!: number | null;
     private openPromise: Promise<void> | null = null;
     private openFailed = false;
 
     constructor(path: PathLike, options: WriteStreamOptions = {}) {
-        const start = validatePosition('start', options.start);
-        const highWaterMark = validateHighWaterMark(options.highWaterMark);
-
-        super({
-            highWaterMark,
-            emitClose: options.emitClose,
-            autoDestroy: options.autoClose !== false,
-        });
-        this.path = path;
-        this.flags = options.flags ?? 'w';
-        this.mode = options.mode;
-        this.autoClose = options.autoClose !== false;
-        this.ownedHandle = isFileHandleLike(options.fd) ? options.fd : null;
-        this.fd = this.ownedHandle ? this.ownedHandle.fd : (options.fd as number | undefined) ?? null;
-        this.pending = this.fd === null;
-        this.position = start ?? null;
-        if (options.encoding) this.setDefaultEncoding(options.encoding);
-
-        if (this.fd === null) {
-            void this.ensureOpen().catch((err) => {
-                this.openFailed = true;
-                if (!this.destroyed) this.destroy(asFsError(err, 'open', pathToString(this.path)));
-            });
-        } else {
-            queueMicrotask(() => {
-                if (this.destroyed) return;
-                this.emit('open', this.fd);
-                this.emit('ready');
-            });
-        }
+        super(writableOptionsFor(options));
+        initWriteStreamState(this, path, options);
     }
 
     close(callback?: (err?: NodeJS.ErrnoException | null) => void): void {
@@ -439,6 +596,33 @@ export class WriteStream extends Writable {
         if (this.position !== null) this.position += offset;
     }
 }
+
+/** ES5-callable `fs.WriteStream`; see the ReadStream facade above for why. */
+export type WriteStream = WriteStreamClass;
+
+type WriteStreamConstructor = {
+    new (path: PathLike, options?: WriteStreamOptions): WriteStream;
+    (path: PathLike, options?: WriteStreamOptions): WriteStream;
+    readonly prototype: WriteStream;
+};
+
+export const WriteStream = function WriteStream(this: unknown, path: PathLike, options: WriteStreamOptions = {}) {
+    const target = isFsConstructCallTarget(this, WriteStream.prototype)
+        ? (this as WriteStream)
+        : (Object.create(WriteStream.prototype) as WriteStream);
+    (Writable as unknown as (this: unknown, options?: unknown) => void).call(target, writableOptionsFor(options));
+    initWriteStreamState(target, path, options);
+    return target;
+} as unknown as WriteStreamConstructor;
+
+Object.setPrototypeOf(WriteStream, Writable);
+Object.defineProperty(WriteStreamClass, 'name', { value: 'WriteStream', configurable: true });
+Object.defineProperty(WriteStream, 'prototype', {
+    value: WriteStreamClass.prototype,
+    writable: false,
+    enumerable: false,
+    configurable: false,
+});
 
 export function createReadStream(path: PathLike, options?: ReadStreamOptions): ReadStream {
     return new ReadStream(path, options);

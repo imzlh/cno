@@ -49,6 +49,7 @@
  */
 
 import { toErrnoException } from '../_internal/errno';
+import { uvSyscall } from './syscall-names';
 
 const fs = import.meta.use('fs');
 const error = import.meta.use('error');
@@ -437,6 +438,37 @@ function rebuild(e: Error, code: number, syscall?: string, path?: string): Error
 }
 
 /**
+ * `toErrnoException`, then correct `syscall` to the libuv name node reports.
+ *
+ * Split out rather than folded into `_internal/errno` because that module is
+ * shared with net/dns/child_process, whose syscall names are already correct and
+ * follow different conventions (`spawn <cmd>`, `getaddrinfo`). Only `fs` needs
+ * the translation.
+ *
+ * The mapping runs *after* conversion because several libuv names depend on the
+ * resolved code, not just the API — see STEP_BY_CODE in `syscall-names.ts`
+ * (`readFile` is 'open' for ENOENT but 'read' for EISDIR).
+ *
+ * Guarded on `err.syscall === syscall`: only the JS name we just passed in is
+ * rewritten. A nested wrapper that already stamped a specific step (rm's inner
+ * 'lstat') is left alone, since `toErrnoException` returns an
+ * already-string-coded error untouched and its name is more precise than ours.
+ */
+function toFsErrnoException(
+    e: unknown,
+    syscall?: string,
+    path?: string,
+    dest?: string,
+): NodeJS.ErrnoException {
+    const err = toErrnoException(e, syscall, path, dest);
+    if (syscall !== undefined && err.syscall === syscall) {
+        const uv = uvSyscall(syscall, err.code);
+        if (uv !== undefined) err.syscall = uv;
+    }
+    return err;
+}
+
+/**
  * Drop-in replacement for `_internal/errno`'s toErrnoException for errors that
  * came out of the native *sync* fs module. Never use on asyncfs errors: those
  * already carry correct UV codes and a real EXDEV would be rewritten to EEXIST.
@@ -447,7 +479,7 @@ export function toSyncErrnoException(
     path?: string,
     dest?: string,
 ): NodeJS.ErrnoException {
-    return toErrnoException(fixSyncError(e, syscall, path, dest), syscall, path, dest);
+    return toFsErrnoException(fixSyncError(e, syscall, path, dest), syscall, path, dest);
 }
 
 /**
@@ -463,6 +495,56 @@ export function wrapSync<T>(
     try {
         return fn();
     } catch (e) {
-        throw toErrnoException(fixSyncError(e, syscall, path, dest), syscall, path, dest);
+        throw toFsErrnoException(fixSyncError(e, syscall, path, dest), syscall, path, dest);
     }
+}
+
+/**
+ * `syscall`-correcting wrapper for the **async** fs layers (callbacks, promises).
+ *
+ * Deliberately does NOT call `fixSyncError`: asyncfs goes through libuv and its
+ * errno values are already correct, so the numeric corrections would corrupt
+ * them (a genuine EXDEV would become EEXIST). Only the syscall name is fixed.
+ */
+export function toAsyncFsErrnoException(
+    e: unknown,
+    syscall?: string,
+    path?: string,
+    dest?: string,
+): NodeJS.ErrnoException {
+    return toFsErrnoException(e, syscall, path, dest);
+}
+
+/** Promise form of `toAsyncFsErrnoException`, mirroring `_internal/errno`'s wrapPromise. */
+export function wrapFsPromise<T>(
+    promise: Promise<T>,
+    syscall?: string,
+    path?: string,
+    dest?: string,
+): Promise<T> {
+    return promise.catch((e: unknown) => {
+        throw toFsErrnoException(e, syscall, path, dest);
+    });
+}
+
+/**
+ * `normalizeErrnoError` for the async fs layers: preserves ordinary JS errors but
+ * gives errno errors Node's shape *and* the libuv syscall name. Same reason
+ * `toAsyncFsErrnoException` exists — the `_internal` version is shared with
+ * modules whose syscall names must not be remapped.
+ */
+export function normalizeFsErrnoError(
+    e: unknown,
+    syscall?: string,
+    path?: string,
+    dest?: string,
+): Error {
+    if (e instanceof Error) {
+        const code = Reflect.get(e, 'code');
+        if (typeof code === 'number' || typeof code === 'string') {
+            return toFsErrnoException(e, syscall, path, dest);
+        }
+        return e;
+    }
+    return new Error(String(e));
 }

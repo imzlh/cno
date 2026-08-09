@@ -6,7 +6,7 @@ const engine = import.meta.use('engine');
 const crypto = import.meta.use('crypto');
 const algorithm = import.meta.use('algorithm');
 import { Buffer } from '../buffer';
-import type { BinaryInput, KeyInput, KeyObject, KeyWithOptions } from './types';
+import type { BinaryInput, KeyInput, KeyObject, KeyWithOptions, AsymmetricKeyType } from './types';
 import { concatChunks as concatBuffers } from '../_internal/buffer';
 export { concatBuffers };
 
@@ -100,7 +100,7 @@ export function encodeOutput(data: ArrayBuffer, encoding?: string): Buffer | str
 export function isKeyObject(value: unknown): value is KeyObject & {
     [kKeyData]: Uint8Array;
     [kKeyFormat]: KeyFormat;
-    asymmetricKeyType?: 'rsa' | 'ec';
+    asymmetricKeyType?: AsymmetricKeyType;
 } {
     return value !== null && typeof value === 'object'
         && Reflect.get(value, Symbol.toStringTag) === 'KeyObject'
@@ -178,26 +178,195 @@ export function detectEcCoordinateSize(bytes: Uint8Array): number | undefined {
     }
 }
 
-function readAsn1Length(bytes: Uint8Array, offset: number): { length: number; offset: number } {
-    const first = bytes[offset++];
-    if (first === undefined) {
-        throw new Error('Invalid DER length');
+/* ------------------------------------------------------------------------- *
+ * Key inspection for the ieee-p1363 signature paths
+ *
+ * The P1363 encoding is defined by the key's CURVE: the signature is exactly two
+ * fixed-width coordinates. So both directions of the conversion need the curve.
+ * A raw scalar or raw uncompressed point announces it by length, but a PEM or DER
+ * key does not, and the encoded key's byte length says nothing about the curve.
+ *
+ * Guessing instead of asking produced four measured divergences from Node
+ * v24.18.0:
+ *   - sign({ key: <PEM>, dsaEncoding: 'ieee-p1363' }) threw, because no raw
+ *     length matched (3/3 curves).
+ *   - verify() inferred `size = signature.length / 2` from the SIGNATURE, so a
+ *     valid signature zero-extended to any even length verified TRUE where Node
+ *     returns FALSE (12/12 crafted cases across P-256/P-384/P-521). Signature
+ *     malleability: one valid signature yields unboundedly many accepted byte
+ *     strings, which breaks anything using signature bytes as a dedup key.
+ *   - a malformed length threw where Node returns false (9/9 cases), turning a
+ *     remote peer's bad signature into an uncaught exception.
+ *   - RSA keys were dragged through the EC conversion, because dsaEncoding was
+ *     honoured for every key type; Node ignores it for non-EC keys (4/4 cases).
+ *
+ * So read the namedCurve OID out of the key structure. The walk below is
+ * STRUCTURAL, not a byte-scan for the OID pattern: a scan can match random key
+ * material -- a modulus, a coordinate, an encrypted blob -- and "the odds are
+ * tiny" is precisely the reasoning that produces this defect class.
+ * ------------------------------------------------------------------------- */
+
+// OID content octets (hex) -> EC coordinate size in bytes.
+const EC_CURVE_COORDINATE_SIZE = new Map<string, number>([
+    ['2a8648ce3d030107', 32], // prime256v1 / secp256r1 / P-256  1.2.840.10045.3.1.7
+    ['2b81040022', 48],       // secp384r1 / P-384               1.3.132.0.34
+    ['2b81040023', 66],       // secp521r1 / P-521               1.3.132.0.35
+    ['2b8104000a', 32],       // secp256k1                       1.3.132.0.10
+]);
+
+// Algorithms for which Node ignores dsaEncoding entirely.
+const NON_EC_ALGORITHM_OIDS = new Set<string>([
+    '2a864886f70d010101', // rsaEncryption   1.2.840.113549.1.1.1
+    '2a864886f70d01010a', // RSASSA-PSS      1.2.840.113549.1.1.10
+    '2b6570',             // Ed25519         1.3.101.112
+    '2b6571',             // Ed448           1.3.101.113
+    '2b656e',             // X25519          1.3.101.110
+    '2b656f',             // X448            1.3.101.111
+]);
+
+const HEX_DIGITS = '0123456789abcdef';
+
+function bytesToHex(bytes: Uint8Array): string {
+    let out = '';
+    for (let i = 0; i < bytes.length; i++) {
+        const byte = bytes[i] as number;
+        out += HEX_DIGITS[(byte >> 4) & 0x0f] + HEX_DIGITS[byte & 0x0f];
     }
+    return out;
+}
+
+/**
+ * Collect OBJECT IDENTIFIER contents by walking constructed nodes only.
+ *
+ * Primitive payloads (INTEGER, BIT STRING, OCTET STRING) are never re-parsed as
+ * TLV, so raw key material can never be mistaken for an OID. Every structure we
+ * care about carries the curve OID inside a constructed node:
+ *   SPKI    SEQUENCE { SEQUENCE { OID alg, OID curve }, BIT STRING }
+ *   PKCS8   SEQUENCE { INTEGER, SEQUENCE { OID alg, OID curve }, OCTET STRING }
+ *   SEC1    SEQUENCE { INTEGER, OCTET STRING, [0] { OID curve }, [1] { ... } }
+ */
+function collectDerOids(der: Uint8Array, out: string[], depth: number): void {
+    if (depth > 4) return;
+    let offset = 0;
+    while (offset < der.length && out.length < 16) {
+        const tag = der[offset++];
+        if (tag === undefined) return;
+        // High-tag-number form: bail out rather than guess at the encoding.
+        if ((tag & 0x1f) === 0x1f) return;
+        const parsed = readAsn1LengthOrUndefined(der, offset);
+        if (!parsed) return;
+        const end = parsed.offset + parsed.length;
+        if (end > der.length) return;
+        if (tag === 0x06) {
+            out.push(bytesToHex(der.subarray(parsed.offset, end)));
+        } else if ((tag & 0x20) !== 0) {
+            collectDerOids(der.subarray(parsed.offset, end), out, depth + 1);
+        }
+        offset = end;
+    }
+}
+
+/** PEM label plus decoded DER body, or undefined if these bytes are not PEM/DER. */
+function derFromKeyBytes(bytes: Uint8Array): { der: Uint8Array; label: string } | undefined {
+    if (bytes.length === 0) return undefined;
+    if (bytes[0] === 0x30) return { der: bytes, label: '' }; // already a DER SEQUENCE
+    if (bytes[0] !== 0x2d) return undefined;                 // not '-', so not PEM
+    let text: string;
+    try {
+        text = engine.decodeString(bytes);
+    } catch {
+        return undefined;
+    }
+    const header = /-----BEGIN ([A-Z0-9 ]+)-----/.exec(text);
+    if (!header) return undefined;
+    const bodyStart = (header.index as number) + header[0].length;
+    const footer = text.indexOf('-----END', bodyStart);
+    if (footer < 0) return undefined;
+    // Keep only base64 alphabet characters; line breaks and CRs are noise here.
+    const body = text.slice(bodyStart, footer).replace(/[^A-Za-z0-9+/=]/g, '');
+    if (body.length === 0) return undefined;
+    try {
+        return { der: algorithm.base64DecodeLoose(body), label: header[1] as string };
+    } catch {
+        return undefined;
+    }
+}
+
+export type P1363KeyShape =
+    | { kind: 'ec'; coordinateSize: number }
+    | { kind: 'non-ec' }
+    | { kind: 'unknown' };
+
+/**
+ * Classify key material for the ieee-p1363 paths: an EC key with a known
+ * coordinate size, a key type for which Node ignores dsaEncoding, or unknown.
+ *
+ * 'unknown' is deliberately distinct from 'non-ec' so callers can preserve the
+ * pre-existing behaviour for key shapes this function does not recognise rather
+ * than silently changing what they do.
+ */
+export function classifyKeyForP1363(keyBytes: Uint8Array): P1363KeyShape {
+    // Raw scalars and raw uncompressed points are self-describing by length.
+    const rawSize = detectEcCoordinateSize(keyBytes);
+    if (rawSize !== undefined) return { kind: 'ec', coordinateSize: rawSize };
+
+    const parsed = derFromKeyBytes(keyBytes);
+    if (!parsed) return { kind: 'unknown' };
+
+    const oids: string[] = [];
+    collectDerOids(parsed.der, oids, 0);
+    // Curve OIDs first: an EC key carries ecPublicKey AND the curve, so checking
+    // the curve before the algorithm list keeps the two from racing.
+    for (const oid of oids) {
+        const size = EC_CURVE_COORDINATE_SIZE.get(oid);
+        if (size !== undefined) return { kind: 'ec', coordinateSize: size };
+    }
+    for (const oid of oids) {
+        if (NON_EC_ALGORITHM_OIDS.has(oid)) return { kind: 'non-ec' };
+    }
+    // PKCS#1 carries no OID at all -- it is a bare SEQUENCE of INTEGERs -- so the
+    // PEM label is the only signal. Node accepts PKCS#1 input even though this
+    // build cannot export it.
+    if (parsed.label.indexOf('RSA') >= 0) return { kind: 'non-ec' };
+    return { kind: 'unknown' };
+}
+
+function readAsn1Length(bytes: Uint8Array, offset: number): { length: number; offset: number } {
+    const parsed = readAsn1LengthOrUndefined(bytes, offset);
+    if (!parsed) throw new Error('Invalid DER length');
+    return parsed;
+}
+
+/**
+ * Non-throwing DER length reader.
+ *
+ * `length = (length << 8) | byte` wraps to a NEGATIVE number for a 4-byte length
+ * whose top bit is set (0x84 FF FF FF FF read back as -1), and a negative length
+ * silently defeats every `end > bytes.length` bounds check downstream -- the
+ * comparison is simply false. Accumulate with multiplication instead, and reject
+ * any length that cannot fit in the buffer we were handed.
+ */
+function readAsn1LengthOrUndefined(bytes: Uint8Array, offset: number): { length: number; offset: number } | undefined {
+    const first = bytes[offset++];
+    if (first === undefined) return undefined;
     if ((first & 0x80) === 0) {
         return { length: first, offset };
     }
 
     const count = first & 0x7f;
+    // count === 0 is the indefinite form (illegal in DER); > 4 is beyond anything
+    // a key or signature needs and beyond what a JS number tracks exactly here.
     if (count === 0 || count > 4 || offset + count > bytes.length) {
-        throw new Error('Invalid DER length');
+        return undefined;
     }
 
     let length = 0;
     for (let i = 0; i < count; i++) {
         const byte = bytes[offset + i];
-        if (byte === undefined) throw new Error('Invalid DER length');
-        length = (length << 8) | byte;
+        if (byte === undefined) return undefined;
+        length = length * 256 + byte;
     }
+    if (length > bytes.length) return undefined;
     return { length, offset: offset + count };
 }
 
@@ -216,6 +385,11 @@ function writeAsn1Length(length: number): number[] {
 }
 
 function normalizeDerInteger(bytes: Uint8Array): Uint8Array {
+    // `bytes` is one fixed-width big-endian half of a P1363 signature -- a raw
+    // scalar, never a TLV. Do not special-case a leading 0x04 here: that is the
+    // uncompressed EC *point* prefix, which belongs to public keys, not to r/s.
+    // Skipping it drops a real high-order byte for the ~1-in-128 signature whose
+    // r or s happens to start with 0x04, and the rebuilt DER then fails to verify.
     let start = 0;
     while (start < bytes.length - 1 && bytes[start] === 0) {
         start++;
@@ -431,4 +605,122 @@ export function readAsymmetricCipherArgs(
     }
 
     throw new TypeError('Invalid key or options for asymmetric cipher');
+}
+
+/* ------------------------------------------------------------------------- *
+ * asymmetricKeyDetails for PARSED keys
+ *
+ * `createPrivateKey`/`createPublicKey` built KeyObjects with no details, so
+ * `asymmetricKeyDetails` was `undefined` for every key that came from a PEM or
+ * DER -- i.e. every key loaded from a file, which is how production keys are
+ * actually supplied. `jsonwebtoken` reads `.asymmetricKeyDetails.namedCurve` to
+ * check the curve against the algorithm, so ES256/ES384 signing crashed with
+ * "cannot read property 'namedCurve' of undefined" for a real .pem while
+ * working for a key generated in the same process.
+ *
+ * Node's exact shapes (measured, v24.18.0):
+ *   EC       { namedCurve: 'prime256v1' | 'secp384r1' | 'secp521r1' }
+ *   RSA      { modulusLength: <bits>, publicExponent: <BigInt> }
+ *   ed/x     {}          (present but empty)
+ *   secret   undefined
+ * ------------------------------------------------------------------------- */
+
+// OID content octets (hex) -> the curve name Node reports.
+const EC_CURVE_NAME = new Map<string, string>([
+    ['2a8648ce3d030107', 'prime256v1'],
+    ['2b81040022', 'secp384r1'],
+    ['2b81040023', 'secp521r1'],
+    ['2b8104000a', 'secp256k1'],
+]);
+
+const RSA_OIDS = new Set<string>(['2a864886f70d010101', '2a864886f70d01010a']);
+const RFC8410_OIDS = new Set<string>(['2b6570', '2b6571', '2b656e', '2b656f']);
+
+/**
+ * Walk to the first two INTEGERs of an RSA key body and report (modulus bits,
+ * exponent). Structural like `collectDerOids`: descend only constructed nodes,
+ * and follow the one OCTET STRING (PKCS#8) or BIT STRING (SPKI) that wraps the
+ * inner RSAPrivateKey/RSAPublicKey, never re-parsing arbitrary primitives.
+ */
+function readRsaIntegers(der: Uint8Array, depth: number): { modulusLength: number; publicExponent: bigint } | undefined {
+    if (depth > 4) return undefined;
+    let offset = 0;
+    const ints: Uint8Array[] = [];
+    while (offset < der.length) {
+        const tag = der[offset++];
+        if (tag === undefined) break;
+        if ((tag & 0x1f) === 0x1f) break;
+        const parsed = readAsn1LengthOrUndefined(der, offset);
+        if (!parsed) break;
+        const end = parsed.offset + parsed.length;
+        if (end > der.length) break;
+        const body = der.subarray(parsed.offset, end);
+        if (tag === 0x02) {
+            ints.push(body);
+            // PKCS#1 RSAPrivateKey leads with version 0; skip it.
+            if (ints.length >= 2 && !(ints.length === 2 && ints[0]?.length === 1 && ints[0][0] === 0)) break;
+        } else if (tag === 0x04 || tag === 0x03) {
+            // OCTET STRING (PKCS#8) / BIT STRING (SPKI, leading unused-bits byte).
+            const inner = tag === 0x03 ? body.subarray(1) : body;
+            const found = readRsaIntegers(inner, depth + 1);
+            if (found) return found;
+        } else if ((tag & 0x20) !== 0) {
+            const found = readRsaIntegers(body, depth + 1);
+            if (found) return found;
+        }
+        offset = end;
+    }
+    // Drop a leading version INTEGER of value 0, then take modulus + exponent.
+    const usable = (ints.length >= 3 && ints[0]?.length === 1 && ints[0][0] === 0) ? ints.slice(1) : ints;
+    const modulus = usable[0];
+    const exponent = usable[1];
+    if (!modulus || !exponent) return undefined;
+    // Strip DER's sign-padding zero before counting bits.
+    let i = 0;
+    while (i < modulus.length && modulus[i] === 0) i++;
+    const significant = modulus.subarray(i);
+    if (significant.length === 0) return undefined;
+    let exp = 0n;
+    for (const byte of exponent) exp = (exp << 8n) | BigInt(byte);
+    return { modulusLength: significant.length * 8, publicExponent: exp };
+}
+
+export type AsymmetricKeyDetails = { namedCurve?: string; modulusLength?: number; publicExponent?: bigint };
+
+/**
+ * Derive Node's `asymmetricKeyDetails` from encoded key material, or undefined
+ * when these bytes are not a key structure this build recognises.
+ */
+export function keyDetailsFromBytes(keyBytes: Uint8Array): AsymmetricKeyDetails | undefined {
+    // Structure BEFORE length. An ed25519/x25519 PKCS#8 is 48 bytes, which is
+    // also P-384's coordinate width, so trusting the raw-length probe first
+    // reported `namedCurve: 'secp384r1'` for an Ed25519 DER key. Only fall back
+    // to the length heuristic when these bytes are not a PEM/DER structure.
+    const parsed = derFromKeyBytes(keyBytes);
+    if (parsed) {
+        const oids: string[] = [];
+        collectDerOids(parsed.der, oids, 0);
+        for (const oid of oids) {
+            const name = EC_CURVE_NAME.get(oid);
+            if (name !== undefined) return { namedCurve: name };
+        }
+        for (const oid of oids) {
+            if (RFC8410_OIDS.has(oid)) return {};
+        }
+        for (const oid of oids) {
+            if (RSA_OIDS.has(oid)) return readRsaIntegers(parsed.der, 0);
+        }
+        // PKCS#1 carries no OID -- a bare SEQUENCE of INTEGERs -- so the PEM
+        // label is the only signal, matching classifyKeyForP1363.
+        if (parsed.label.indexOf('RSA') >= 0) return readRsaIntegers(parsed.der, 0);
+        return undefined;
+    }
+
+    const rawSize = detectEcCoordinateSize(keyBytes);
+    if (rawSize !== undefined) {
+        for (const [oid, name] of EC_CURVE_NAME) {
+            if (EC_CURVE_COORDINATE_SIZE.get(oid) === rawSize) return { namedCurve: name };
+        }
+    }
+    return undefined;
 }

@@ -90,6 +90,11 @@ function isUnsupportedSocketOption(error: unknown): boolean {
         .includes('Not implemented');
 }
 
+function isInvalidArgument(error: unknown): boolean {
+    return String(error && typeof error === 'object' && 'message' in error ? error.message : error)
+        .includes('EINVAL');
+}
+
 function setTcpNoDelay(tcp: CModuleStreams.TCP, enabled: boolean): void {
     try { tcp.setNoDelay(enabled); }
     catch (error) { if (!isUnsupportedSocketOption(error)) throw error; }
@@ -103,7 +108,17 @@ function keepAliveDelayToSeconds(delayMs: number): number {
 function setTcpKeepAlive(tcp: CModuleStreams.TCP, enabled: boolean, delayMs: number): void {
     const delay = enabled ? keepAliveDelayToSeconds(delayMs) : 0;
     try { tcp.setKeepAlive(enabled, delay); }
-    catch (error) { if (!isUnsupportedSocketOption(error)) throw error; }
+    catch (error) {
+        if (isUnsupportedSocketOption(error)) return;
+        // libuv rejects uv_tcp_keepalive(enable=1, delay=0) with EINVAL on
+        // Windows. Node hands the same 0 to the same libuv call and ignores its
+        // return value, so `socket.setKeepAlive()` / `setKeepAlive(true)` — both
+        // of which mean "delay 0" — are observable no-ops there rather than
+        // throws. Throwing breaks the single most common call form, so match
+        // node and swallow exactly that case.
+        if (enabled && delay === 0 && isInvalidArgument(error)) return;
+        throw error;
+    }
 }
 
 function stopPipeReadQuietly(pipe: CModuleStreams.Pipe): void {
@@ -305,9 +320,11 @@ export interface Socket extends Duplex {
     connecting: boolean;
     localAddress?: string;
     localPort?: number;
+    localFamily?: string;
     remoteAddress?: string;
     remotePort?: number;
     remoteFamily?: string;
+    readonly pending: boolean;
     timeout?: number;
     readyState: 'opening' | 'open' | 'readOnly' | 'writeOnly' | 'closed';
 
@@ -358,11 +375,32 @@ function normalizeFamily(value: unknown): 0 | 4 | 6 {
     throw new TypeError(`The "family" option must be 0, 4, 6, "IPv4", or "IPv6". Received ${String(value)}`);
 }
 
-function validatePort(value: unknown, name = 'port'): number {
-    if (typeof value !== 'number' || !Number.isInteger(value) || value < 0 || value > 65535) {
-        throw new RangeError(`The "${name}" argument must be an integer between 0 and 65535`);
+// Node's ERR_SOCKET_BAD_PORT text. Its `determineSpecificType` quotes strings and
+// reports the RAW value, so a numeric string stays `type string ('99999')` and is
+// NOT coerced to a number first. Measured v24.18.0.
+function badPortError(value: unknown, name: string): RangeError {
+    const shown = typeof value === 'string' ? `'${value}'` : String(value);
+    return Object.assign(
+        new RangeError(`${name} should be >= 0 and < 65536. Received type ${typeof value} (${shown}).`),
+        { code: 'ERR_SOCKET_BAD_PORT' },
+    );
+}
+
+function validatePort(value: unknown, name = 'Port'): number {
+    // Node's validatePort accepts a numeric string and returns `port | 0`, which is
+    // why `net.connect({ port: '8080' })` works there. undici passes the port through
+    // from URL parsing, where it is a string.
+    const bad = (typeof value !== 'number' && typeof value !== 'string')
+        || (typeof value === 'string' && value.trim().length === 0)
+        || +value !== (+value >>> 0)
+        || +value > 0xFFFF;
+    if (bad) {
+        // Was a bare RangeError with no `.code`: a package branching on
+        // `err.code === 'ERR_SOCKET_BAD_PORT'` saw undefined and fell through to
+        // whatever its generic handler did. Node's default `name` is 'Port'.
+        throw badPortError(value, name);
     }
-    return value;
+    return +value | 0;
 }
 
 function abortError(): Error & { code: string; name: string } {
@@ -506,6 +544,7 @@ Socket.fromHttpOwned = function fromHttpOwned(
     socket.readyState = 'open';
     socket.localAddress = localInfo.ip;
     socket.localPort = localInfo.port;
+    socket.localFamily = `IPv${localInfo.family}`;
     socket.remoteAddress = remoteInfo.ip;
     socket.remotePort = remoteInfo.port;
     socket.remoteFamily = `IPv${remoteInfo.family}`;
@@ -617,8 +656,12 @@ Socket.prototype.connect = function connect(
     let connectListener: (() => void) | undefined;
     let options: TcpNetConnectOpts | undefined;
 
-    if (typeof portOrPath === 'object') {
-        if ('path' in portOrPath) {
+    if (typeof portOrPath === 'object' && portOrPath !== null) {
+        // Node selects the pipe branch on `!!options.path`, so a key that is merely
+        // present with an undefined/null value stays TCP. undici builds its connect
+        // options as `{...options, port, host}`, which carries `path: undefined`.
+        const pipePath = (portOrPath as { path?: unknown }).path;
+        if (pipePath !== undefined && pipePath !== null && pipePath !== '') {
             if (portOrPath.signal?.aborted) {
                 queueMicrotask(() => this.destroy(abortError()));
                 return this;
@@ -626,7 +669,7 @@ Socket.prototype.connect = function connect(
             if (portOrPath.signal) {
                 portOrPath.signal.addEventListener('abort', () => this.destroy(abortError()), { once: true });
             }
-            return this.connect(portOrPath.path, typeof hostOrCb === 'function' ? hostOrCb : undefined);
+            return this.connect(pipePath as string, typeof hostOrCb === 'function' ? hostOrCb : undefined);
         }
         options = portOrPath;
         port = portOrPath.port;
@@ -703,8 +746,10 @@ Socket.prototype.connect = function connect(
         resolvedAddress = address;
         if (!isIPv4(host) && !isIPv6(host)) this.emit('lookup', null, address, family, host);
 
-        const localAddress = options?.localAddress;
-        const localPort = options?.localPort;
+        // Node gates the local bind on truthiness (`if (localAddress || localPort)`),
+        // so null/'' means "no bind". undici passes `localAddress: null`.
+        const localAddress = options?.localAddress || undefined;
+        const localPort = options?.localPort || undefined;
         if (localAddress !== undefined) {
             const localFamily = isIPv4(localAddress) ? 4 : isIPv6(localAddress) ? 6 : 0;
             if (!localFamily) throw Object.assign(new Error(`bind EINVAL ${localAddress}`), { code: 'EINVAL' });
@@ -733,6 +778,7 @@ Socket.prototype.connect = function connect(
         const localInfo = tcp.sockname;
         this.localAddress = localInfo.ip;
         this.localPort = localInfo.port;
+        this.localFamily = `IPv${localInfo.family}`;
 
         const remoteInfo = tcp.peername;
         this.remoteAddress = remoteInfo.ip;
@@ -884,6 +930,17 @@ Socket.prototype.address = function address(this: Socket): AddressInfo | {} {
     }
     return this._address || {};
 };
+
+// Node exposes `pending` as a prototype getter: true until the socket has a
+// handle and has finished connecting. It is documented API, and `undefined`
+// silently passes a falsy check while failing `=== false`.
+Object.defineProperty(Socket.prototype, 'pending', {
+    configurable: true,
+    enumerable: false,
+    get(this: Socket): boolean {
+        return !(this._tcp || this._stream || this._httpOwned) || this.connecting;
+    },
+});
 
 Socket.prototype.unref = function unref(this: Socket): Socket {
     this._refed = false;
@@ -1604,6 +1661,7 @@ Server.prototype._acceptLoop = function _acceptLoop(this: Server): Promise<void>
         const localInfo = (clientTcp as CModuleStreams.TCP).sockname;
         socket.localAddress = localInfo.ip;
         socket.localPort = localInfo.port;
+        socket.localFamily = `IPv${localInfo.family}`;
 
         const remoteInfo = (clientTcp as CModuleStreams.TCP).peername;
         socket.remoteAddress = remoteInfo.ip;

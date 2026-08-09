@@ -609,9 +609,14 @@ EventEmitter.prototype.removeListener = function removeListener(eventName: Event
     return this;
 };
 
-EventEmitter.prototype.off = function off(eventName: EventName, listener: AnyListener): EventEmitter {
-    return this.removeListener(eventName, listener);
-};
+// Node aliases `off` to the SAME function object as `removeListener`
+// (`EventEmitter.prototype.off === EventEmitter.prototype.removeListener` is
+// true on v24.18), it does not delegate. The difference is load-bearing: a
+// subclass that defines `removeListener(...) { return this.off(...) }` — the
+// pattern minipass/tar use — recurses forever against a delegating wrapper.
+// That surfaced as `Maximum call stack size exceeded` inside `off` and hung
+// `tar.c` until the 60s test timeout.
+EventEmitter.prototype.off = EventEmitter.prototype.removeListener;
 
 EventEmitter.prototype.removeAllListeners = function removeAllListeners(this: EventEmitter, ...args: [EventName?]): EventEmitter {
     this.ensureState();

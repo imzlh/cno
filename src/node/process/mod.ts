@@ -18,6 +18,12 @@ const streams = import.meta.use('streams');
 const console = import.meta.use('console');
 const errMod = import.meta.use('error');
 const napi = import.meta.use('nodeapi');
+// Module scope, not inside installWorkerExitReporter(): `import.meta.use` is a
+// static form the transformer rewrites, and a call in a function body (with its
+// return type referenced as `typeof import.meta.use`) failed to parse at all --
+// OBSERVED as `TransformError: process/mod: Unexpected token, expected "("`,
+// which surfaced on the parent as a worker 'error' event and exit code 1.
+const workerBinding = import.meta.use('worker');
 
 interface CnoProcessArgs {
     nodeArgv(): string[];
@@ -461,22 +467,95 @@ function resolveProcessEmitter(): ProcessEventEmitter {
 
 const processEE: ProcessEventEmitter = resolveProcessEmitter();
 type NextTickCallback = (...args: unknown[]) => void;
-const nextTickQueue: Array<{ callback: NextTickCallback; args: unknown[] }> = [];
-let nextTickScheduled = false;
+/* ------------------------------------------------------------------ *
+ * ONE nextTick queue per process, not one per copy of this file
+ * ------------------------------------------------------------------ *
+ *
+ * TWO copies of this module are live at once (see the emitter note above): the
+ * baked one and the $CTS_CACHE_DIR/node/process/mod.ts one. A module-scoped
+ * queue therefore gave each copy its own -- MEASURED: `import process` and
+ * `import * as ns` expose different nextTick functions
+ * (`proc.nextTick === procNS.nextTick` is false) and each used to drain its own
+ * array.
+ *
+ * That was survivable while the drain was scheduled with queueMicrotask, because
+ * each copy independently scheduled its own. It is NOT survivable with the
+ * native checkpoint below: engine.setNextTickDrain() is a SINGLE-SLOT setter
+ * that frees the previous function, so the second copy to load would EVICT the
+ * first copy's drain and silently orphan its queue -- every callback registered
+ * through the other facade would never run at all. This is the same single-slot
+ * trap the engine.onEvent() note further down describes.
+ *
+ * So the queue and its two flags live on a Symbol.for() slot and a copy that
+ * finds one already there ADOPTS it. One queue, one registration, and ordering
+ * that is consistent across both facades the way node's single queue is.
+ */
+const NEXT_TICK_SLOT = Symbol.for('cno.node.process.nextTickQueue.v1');
+
+type NextTickEntry = { callback: NextTickCallback; args: unknown[] };
+type NextTickState = {
+    queue: NextTickEntry[];
+    scheduled: boolean;
+    draining: boolean;
+    nativeInstalled: boolean;
+};
+
+function resolveNextTickState(): NextTickState {
+    const fresh: NextTickState = {
+        queue: [],
+        scheduled: false,
+        draining: false,
+        nativeInstalled: false,
+    };
+    try {
+        const slots = globalThis as unknown as Record<symbol, NextTickState | undefined>;
+        const existing = slots[NEXT_TICK_SLOT];
+        // Adopt only something that actually looks like the state, so an exotic
+        // global cannot wedge nextTick into a permanently unusable shape.
+        if (existing && Array.isArray(existing.queue)) return existing;
+        slots[NEXT_TICK_SLOT] = fresh;
+    } catch {
+        // Frozen or exotic globalThis: fall back to per-copy state. Degrades to
+        // the old per-copy behaviour rather than failing to schedule at all.
+    }
+    return fresh;
+}
+
+const tickState: NextTickState = resolveNextTickState();
+
+// Same array object every copy pushes into; the three use sites below are
+// ordinary array operations, so they need no further indirection.
+const nextTickQueue: NextTickEntry[] = tickState.queue;
 
 function drainNextTickQueue(): void {
-    nextTickScheduled = false;
-    while (nextTickQueue.length > 0) {
-        const batch = nextTickQueue.splice(0);
-        for (const { callback, args } of batch) {
-            try {
-                callback(...args);
-            } catch (error) {
-                handleUncaughtException(error);
+    // `scheduled` stays TRUE for the whole drain and is cleared in the finally,
+    // not on entry. A tick callback that queues another tick must not schedule a
+    // second drain -- the loop below already picks it up -- but the flag must
+    // still end up false, or the next nextTick() from a timer would see it set,
+    // return early, and never be drained at all.
+    tickState.draining = true;
+    try {
+        while (nextTickQueue.length > 0) {
+            const batch = nextTickQueue.splice(0);
+            for (const { callback, args } of batch) {
+                try {
+                    callback(...args);
+                } catch (error) {
+                    handleUncaughtException(error);
+                }
             }
         }
+    } finally {
+        tickState.draining = false;
+        tickState.scheduled = false;
     }
 }
+
+// Registered here, early in module evaluation, so a circular import that reaches
+// process.nextTick while this module is still evaluating cannot hit the TDZ of a
+// const declared further down. installNativeTickDrain() is a hoisted declaration;
+// see its comment block below for why the checkpoint has to come from C.
+const nativeTickDrain: boolean = installNativeTickDrain();
 
 function handleUncaughtException(error: unknown): void {
     processEE.emit('uncaughtExceptionMonitor', error, 'uncaughtException');
@@ -608,9 +687,67 @@ function ensureEventBridge(): void {
     }, 50);
 }
 
+/* ------------------------------------------------------------------ *
+ * process.nextTick priority
+ * ------------------------------------------------------------------ *
+ *
+ * Node keeps the nextTick queue at HIGHER priority than promise microtasks and
+ * drains it at the microtask checkpoint, so a nextTick callback runs before any
+ * pending promise continuation REGARDLESS of registration order. MEASURED on
+ * v24.18: registering `.then` first still yields nt>then, and queueMicrotask
+ * first still yields nt>qmt.
+ *
+ * queueMicrotask() cannot express that. It appends to the very FIFO the promise
+ * jobs use, so a drain scheduled from JS only won when it happened to be
+ * enqueued first -- `.then`-first produced then>nt here, and qmt-first produced
+ * qmt>nt. No JS primitive outranks queueMicrotask, so the checkpoint call has to
+ * come from C: engine.setNextTickDrain() hands this drain to
+ * tjs__execute_jobs(), which runs it before the pending-job loop and again after
+ * that loop is exhausted (circu.js/src/vm.c). engine.notifyNextTick() only
+ * raises the native "ticks are pending" flag so the checkpoint knows to call --
+ * cheap, and it also keeps the loop awake for a nextTick with no promise in
+ * sight, which JS_IsJobPending() cannot see.
+ *
+ * The queue, the argument handling and the uncaughtException semantics all stay
+ * here. C decides only WHEN to drain.
+ *
+ * The fallback matters: this file is served to the runtime as SOURCE, so it
+ * lands without a rebuild, while the C half does not. Against a binary that
+ * predates the hook, feature detection keeps the old queueMicrotask behaviour
+ * (FIFO ordering, as today) instead of dropping every callback on the floor.
+ */
+type NextTickEngineHook = {
+    setNextTickDrain?: (fn: () => void) => void;
+    notifyNextTick?: () => void;
+};
+
+function installNativeTickDrain(): boolean {
+    // Only the first copy to get here registers. A second registration would
+    // free this one and orphan the shared queue behind it.
+    if (tickState.nativeInstalled) return true;
+    try {
+        const hook = engine as unknown as NextTickEngineHook;
+        if (typeof hook.setNextTickDrain !== 'function') return false;
+        if (typeof hook.notifyNextTick !== 'function') return false;
+        hook.setNextTickDrain(drainNextTickQueue);
+        tickState.nativeInstalled = true;
+        return true;
+    } catch {
+        return false;
+    }
+}
+
 function scheduleNextTickDrain(): void {
-    if (nextTickScheduled) return;
-    nextTickScheduled = true;
+    if (tickState.scheduled) return;
+    tickState.scheduled = true;
+    if (nativeTickDrain) {
+        // Inside a drain the loop already sees the new entry; notifying again
+        // would only buy a redundant checkpoint crossing.
+        if (!tickState.draining) {
+            (engine as unknown as NextTickEngineHook).notifyNextTick!();
+        }
+        return;
+    }
     queueMicrotask(drainNextTickQueue);
 }
 
@@ -720,6 +857,51 @@ export function chdir(directory: string): void {
     }
 }
 
+/**
+ * Announce a worker's exit status to its parent, for workers that never import
+ * node:worker_threads.
+ *
+ * A worker's exit code otherwise reaches the parent by exactly one route: the
+ * process 'exit' listener installed by createParentPort() in
+ * node/worker_threads/mod.ts:834. That function only runs when the WORKER ITSELF
+ * imports node:worker_threads. MEASURED 2026-08-09 against node v24.18.0: a
+ * worker whose whole body is `process.exit(42)` reported code 0 to the parent's
+ * 'exit' event where node reports 42, so `process.exit(1)` to signal failure read
+ * as clean success to any pool that checks the code. Adding
+ * `require('node:worker_threads')` anywhere in the same worker made it report 42,
+ * which is what isolated "no reporter installed" from "code lost in transit".
+ *
+ * This is a processEE listener rather than a line inside exit() below, because
+ * that exit() is not what a worker calls: `require('node:process').exit`
+ * stringifies as `function exit() { [native code] }` (MEASURED), so the TS
+ * function is bypassed and a call placed there never ran. The native exit
+ * dispatches EV_EXIT, ensureEventBridge() turns that into processEE 'exit', and a
+ * listener therefore sees every code the native path carries. That is the same
+ * mechanism the worker_threads reporter already relies on.
+ *
+ * When worker_threads IS loaded both reporters fire and the parent receives two
+ * exit records. That is harmless: Worker._finish() (worker_threads/mod.ts:700-701)
+ * returns early once _exited is set, so the first record wins. No cross-module
+ * once-flag is needed for that reason.
+ *
+ * Deliberately NOT covering natural drain with `process.exitCode = N`: that needs
+ * an EV_EXIT a worker never receives, because tjs__lifecycle_drain()
+ * (circu.js/src/vm.c:948-955) returns early for qrt->is_worker. That is a C fix
+ * and stays reported rather than worked around here.
+ */
+function installWorkerExitReporter(): void {
+    if (!workerBinding?.isWorker || !workerBinding.pipe) return;
+    const pipe = workerBinding.pipe;
+    processEE.on('exit', (code?: unknown) => {
+        try {
+            pipe.postMessage({ __cno_node_worker_exit__: { code: typeof code === 'number' ? code : 0 } });
+        } catch {
+            // The pipe is already torn down; the parent falls back to 0 on EOF,
+            // i.e. the previous behaviour.
+        }
+    });
+}
+
 export function exit(code?: number): never {
     // Forward to the singleton's exit when this is the SECOND copy of the module
     // (same pattern as _setupIPC/send/disconnect below). `exitEmitted` is
@@ -755,6 +937,11 @@ export let _exiting: boolean = false;
 // EV_EXIT reaches emitProcessExit() and dies on a temporal-dead-zone error
 // instead of emitting 'exit'.
 ensureEventBridge();
+
+// Arm the worker exit-status reporter in the same breath as the bridge that
+// drives it: the reporter is a processEE 'exit' listener, and only a live bridge
+// turns a native EV_EXIT into that event.
+installWorkerExitReporter();
 
 export const execPath: string = os.exePath;
 

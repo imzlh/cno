@@ -241,6 +241,11 @@ export interface TlsConnectOptions extends TlsOptions {
     checkServerIdentity?: (servername: string, cert: PeerCertificate) => Error | undefined;
     enableTrace?: boolean;
     isServer?: boolean;
+    /**
+     * A context from `tls.createSecureContext()`. Its material takes precedence
+     * over the sibling top-level options, matching Node.
+     */
+    secureContext?: SecureContext;
     lookup?: (hostname: string, options: LookupOptions, callback: LookupCallback) => void;
     noDelay?: boolean;
     keepAlive?: boolean;
@@ -482,9 +487,22 @@ class JSStreamSocketWrapper extends Duplex {
 
 export class SecureContext {
     #context: CModuleSSL.Context;
+    /**
+     * The options this context was built from.
+     *
+     * `verify` / `verifyHostname` are per-connection decisions (they track
+     * `rejectUnauthorized` and `checkServerIdentity`) but the C layer stores them
+     * on the SSL_CTX, so a context built by `tls.createSecureContext()` cannot
+     * carry them. `tls.connect` therefore has to rebuild a context that combines
+     * the caller's material with the connection's verify decision — it needs the
+     * original options to do that, because the C context exposes no way to read
+     * the PEM back out or to change the verify mode after construction.
+     */
+    readonly sourceOptions: InternalSecureContextOptions | undefined;
 
     constructor(options?: InternalSecureContextOptions) {
         const opts: CModuleSSL.ContextOptions = {};
+        this.sourceOptions = options;
 
         if (options?.mode) opts.mode = options.mode;
         if (options?.key) {
@@ -521,6 +539,51 @@ export class SecureContext {
     }
 
     get context(): CModuleSSL.Context { return this.#context; }
+}
+
+/**
+ * Build the effective context for a connection, honouring a caller-supplied
+ * `secureContext`.
+ *
+ * `tls.connect` used to build its own context unconditionally and never read
+ * `options.secureContext`, so everything the caller configured through
+ * `tls.createSecureContext()` was silently discarded. That lost the caller's CA
+ * (a correct private CA reported UNABLE_TO_GET_ISSUER_CERT_LOCALLY) and — the
+ * security half — it also lost `minVersion`, so a client pinned to TLSv1.3 via a
+ * secureContext silently completed a TLSv1.2 handshake where Node refuses with
+ * ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION.
+ *
+ * The caller's context object cannot be used as-is: `verify`/`verifyHostname`
+ * live on the SSL_CTX and a context from `createSecureContext()` has neither, so
+ * reusing it would drop peer verification entirely and turn a fail-closed bug
+ * into a fail-open one. Rebuild instead, with the caller's material as the base
+ * and this connection's mode and verify decision applied on top.
+ *
+ * Node's precedence is that a supplied secureContext provides the context-level
+ * material and the sibling top-level options (ca/cert/key/ciphers/minVersion/…)
+ * are ignored, which is what taking `sourceOptions` as the base reproduces.
+ */
+function mergeSuppliedSecureContext(
+    supplied: SecureContext | undefined,
+    computed: InternalSecureContextOptions,
+): SecureContext {
+    if (!supplied) return new SecureContext(computed);
+    const base = supplied.sourceOptions;
+    // A context we cannot introspect (constructed elsewhere) is still better
+    // used than silently ignored, but it must not lose verification: fall back
+    // to the computed options in that case.
+    if (!base) return new SecureContext(computed);
+    return new SecureContext({
+        ...base,
+        // mode and the verify decision belong to this connection, not to the
+        // stored context — initTLSSocket builds server sockets through here too.
+        mode: computed.mode,
+        verify: computed.verify,
+        verifyHostname: computed.verifyHostname,
+        // ALPN is negotiated per connection, so a list passed to connect() still
+        // applies when the context did not carry one.
+        alpn: base.alpn ?? computed.alpn,
+    });
 }
 
 export function createSecureContext(options?: SecureContextOptions): SecureContext {
@@ -686,7 +749,12 @@ function initTLSSocket(self: TLSSocket, socket: Duplex | CModuleStreams.Stream, 
         verifyHostname: !self._isServer && !!self._servername && !options?.checkServerIdentity,
         alpn: normalizeAlpnProtocols(options?.ALPNProtocols),
     };
-    self._secureContextStore = options?.secureContext ?? new SecureContext(contextOptions);
+    // A caller-supplied context is honoured through the same merge tls.connect
+    // uses: reusing the object as-is would drop this connection's verify
+    // decision (verify/verifyHostname live on the SSL_CTX and a context from
+    // createSecureContext() carries neither), turning a missing-CA failure into
+    // an unverified connection.
+    self._secureContextStore = mergeSuppliedSecureContext(options?.secureContext, contextOptions);
 
     self._underlying = socket;
 
@@ -1637,7 +1705,7 @@ export function connect(
         }
     }
 
-    const secureContext = new SecureContext({
+    const secureContext = mergeSuppliedSecureContext(options.secureContext, {
         mode: 'client',
         verify: options.rejectUnauthorized ?? true,
         // See initTLSSocket: a caller-supplied checkServerIdentity replaces the

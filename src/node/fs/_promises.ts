@@ -3,7 +3,8 @@
  */
 
 
-import { matchesErrnoCode, normalizeErrnoError, wrapPromise } from '../_internal/errno';
+import { matchesErrnoCode } from '../_internal/errno';
+import { wrapFsPromise, normalizeFsErrnoError as normalizeErrnoError } from './errno-fix';
 import { getTierLimits } from '../_internal/memory';
 import { resolve } from '../path';
 import { copyPath, validateCopyOptions, type CopyOptions } from './copy';
@@ -17,9 +18,11 @@ import { nsfs, nsasfs, nsfswatch } from './syspath';
 const asfs = nsasfs;
 const fs = nsfs;
 
-// Helper: wrap asyncfs calls, auto-convert errno to ErrnoException
+// Helper: wrap asyncfs calls, auto-convert errno to ErrnoException.
+// `wrapFsPromise` also rewrites the JS API name to the libuv syscall name node
+// reports (readdir -> scandir, utimes -> utime); see fs/syscall-names.ts.
 function w<T>(promise: Promise<T>, syscall: string, path: string, dest?: string): Promise<T> {
-    return wrapPromise(promise, syscall, path, dest);
+    return wrapFsPromise(promise, syscall, path, dest);
 }
 
 // File read/write
@@ -279,10 +282,10 @@ export async function opendir(path: PathLike, options?: { encoding?: BufferEncod
     if (options?.recursive) {
         // Strict gate: opendir never descends into a junction or a directory
         // symlink, unlike recursive readdirSync (measured against v24.18.0).
-        const entries = await w(readDirEntries(pathStr, true, '', 'strict'), 'readdir', pathStr);
+        const entries = await w(readDirEntries(pathStr, true, '', 'strict'), 'opendir', pathStr);
         return createEagerAsyncDir(pathStr, entries);
     }
-    const dirHandle = await w(asfs.readDir(pathStr), 'readdir', pathStr);
+    const dirHandle = await w(asfs.readDir(pathStr), 'opendir', pathStr);
     return createAsyncDir(pathStr, dirHandle);
 }
 
@@ -345,13 +348,13 @@ export async function readlink(path: PathLike, options?: { encoding?: BufferEnco
 
 export async function realpath(pathLike: PathLike, options?: { encoding?: BufferEncoding | 'buffer' } | BufferEncoding): Promise<string | Buffer> {
     const pathStr = pathToString(pathLike);
-    const resolved = await w(asfs.realPath(pathStr), 'realpath', pathStr);
+    const resolved = await w(asfs.realPath(pathStr), 'realpathNative', pathStr);
     return encodePathResult(resolved, options);
 }
 
 Reflect.set(realpath, 'native', function (pathLike: PathLike, options?: { encoding?: BufferEncoding | 'buffer' } | BufferEncoding) {
     const pathStr = pathToString(pathLike);
-    return w(asfs.realPath(pathStr), 'realpath', pathStr).then(resolved => encodePathResult(resolved, options));
+    return w(asfs.realPath(pathStr), 'realpathNative', pathStr).then(resolved => encodePathResult(resolved, options));
 });
 
 // Permission operations
@@ -506,7 +509,7 @@ export async function lchmod(path: PathLike, mode: Mode): Promise<void> {
 export async function mkdtemp(prefix: string, options?: { encoding?: BufferEncoding | 'buffer' | null } | BufferEncoding): Promise<string | Buffer> {
     const dirPath = prefix + randomHex();
     const result = encodePathResult(dirPath, options);
-    await w(asfs.mkdir(dirPath), 'mkdir', dirPath);
+    await w(asfs.mkdir(dirPath), 'mkdtemp', dirPath);
     return result;
 }
 

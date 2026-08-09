@@ -364,6 +364,25 @@ Stream.prototype.pipe = function pipe<T extends Writable>(this: Stream, destinat
     destination.emit('pipe', this);
     src.resume?.();
 
+    // Source already at EOF: 'end' fired before this pipe existed, so `onEnd`
+    // above would never run and the destination would wait forever for an end
+    // that never comes. Node ends the destination in this shape (measured on
+    // v24.18.0), which is what lets pipeline() over a consumed source resolve.
+    // Deferred so 'pipe' is observed first and ordering matches the live path.
+    const alreadyEnded = (this as Stream & {
+        readableEnded?: boolean;
+        _readableState?: { endEmitted?: boolean };
+    }).readableEnded === true
+        || (this as Stream & {
+            _readableState?: { endEmitted?: boolean };
+        })._readableState?.endEmitted === true;
+    if (alreadyEnded) {
+        process.nextTick(() => {
+            if (this._pipedDestinations.indexOf(destination) === -1) return;
+            onEnd();
+        });
+    }
+
     return destination;
 };
 
@@ -1092,7 +1111,6 @@ Readable.prototype[Symbol.asyncIterator] = function asyncIterator(this: Readable
         async next() {
             const buffered = readable.read();
             if (buffered !== null) {
-                readable.pause();
                 return { done: false, value: buffered };
             }
             if (readable.readableEnded) {
@@ -1103,7 +1121,27 @@ Readable.prototype[Symbol.asyncIterator] = function asyncIterator(this: Readable
                 if (readable.errored) throw readable.errored;
                 return { done: true, value: undefined };
             }
+            // Node's createAsyncIterator waits on 'readable' and pulls with read();
+            // it never resumes. Resuming here would switch the stream to flowing mode
+            // and hand the data to any 'data' listener instead of this iterator, so a
+            // concurrent paused-mode reader (got's Request duplex, for one) would starve
+            // and observe a silently empty body.
+            const useDataEvents = readable.readableFlowing === true;
             return new Promise((resolve, reject) => {
+                const onReadable = () => {
+                    const chunk = readable.read();
+                    if (chunk !== null) {
+                        cleanup();
+                        resolve({ done: false, value: chunk });
+                        return;
+                    }
+                    // A 'readable' with an empty buffer means EOF is imminent; 'end'
+                    // settles it. Anything else is a spurious wakeup -- keep waiting.
+                    if (readable.readableEnded) {
+                        cleanup();
+                        resolve({ done: true, value: undefined });
+                    }
+                };
                 const onData = (chunk: unknown) => {
                     cleanup();
                     readable.pause();
@@ -1133,17 +1171,23 @@ Readable.prototype[Symbol.asyncIterator] = function asyncIterator(this: Readable
                     reject(Object.assign(new Error('Premature close'), { code: 'ERR_STREAM_PREMATURE_CLOSE' }));
                 };
                 const cleanup = () => {
+                    readable.off('readable', onReadable);
                     readable.off('data', onData);
                     readable.off('end', onEnd);
                     readable.off('error', onError);
                     readable.off('close', onClose);
                 };
 
-                readable.on('data', onData);
+                if (useDataEvents) {
+                    // The stream was handed to us already flowing; joining the 'data'
+                    // path is the only way to see those chunks.
+                    readable.on('data', onData);
+                } else {
+                    readable.on('readable', onReadable);
+                }
                 readable.on('end', onEnd);
                 readable.on('error', onError);
                 readable.on('close', onClose);
-                readable.resume();
             });
         },
         async return() {

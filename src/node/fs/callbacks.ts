@@ -3,8 +3,10 @@
  * All async operations support callback functions
  */
 import { toUint8Array, normalizeRwArgs, decodeBuffer, encodePathResult, toNodeStat, toNodeStatFs, toNodeDirentAsync, parseFlags, pathToString, splitPathOrFd, describeFd, removeRecursive, retryOnBusy, mkdirRecursive, modeToNumber, timeToUnixSeconds, timeToUnixMs, readFileFromFdSync, randomHex, createAsyncDir, createEagerAsyncDir, readDirEntries, validateOpendirOptions, validateReaddirOptions, validateFd, errorFromUnknown, assertCopyFileMode, makeAbortError, rmIsDirectoryError, writeAllHandle, writeAllSync, type PathLike, type TimeLike, type Mode } from './utils';
-import { toErrnoException } from '../_internal/errno';
-import { toSyncErrnoException } from './errno-fix';
+// `toAsyncFsErrnoException` is `toErrnoException` plus the JS-name -> libuv-name
+// correction for `err.syscall` (readdir -> scandir, utimes -> utime). Aliased so
+// every existing call site gets it; see fs/syscall-names.ts for why it is needed.
+import { toSyncErrnoException, toAsyncFsErrnoException as toErrnoException } from './errno-fix';
 import { getTierLimits } from '../_internal/memory';
 import { copyPath, validateCopyOptions, type CopyOptions } from './copy';
 import { globPaths, validateGlobOptions, validateGlobPatterns, type GlobOptions, type GlobResult } from './glob';
@@ -696,7 +698,9 @@ Reflect.set(realpath, 'native', function realpathNative(path: PathLike, options?
     const encodingOpt = typeof options === 'string' ? options : optionBag(options);
     asfs.realPath(pathStr).then(
         result => cb(null, encodePathResult(result, encodingOpt)),
-        err => cb(toErrnoException(err, 'realpath', pathStr))
+        // 'realpathNative': node reports syscall 'realpath' here but 'lstat' from
+        // the plain `fs.realpath`. See fs/syscall-names.ts.
+        err => cb(toErrnoException(err, 'realpathNative', pathStr))
     );
 });
 

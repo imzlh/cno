@@ -58,6 +58,8 @@ export interface ClientRequestState<TTransport extends ClientTransport = ClientT
     method: string;
     path: string;
     socket: TTransport | null;
+    /** Node exposes the IncomingMessage as `req.res` once the response arrives. */
+    res?: IncomingMessageImpl | null;
     writableEnded: boolean;
     writableFinished: boolean;
     finished: boolean;
@@ -145,6 +147,7 @@ export function initClientRequestState(self: ClientRequestState, cb?: (res: Inco
     self.path = '/';
 
     self.socket = null;
+    self.res = null;
     self._callback = cb || null;
     self._aborted = false;
     self._closeEmitted = false;
@@ -828,6 +831,12 @@ export function readResponse<TRequest extends ClientRequestState>(request: TRequ
         getHeaders: () => request.getHeaders(),
         onResponse: (response) => {
             (request as TRequest & { _response?: IncomingMessageImpl | null })._response = response;
+            // Node sets `req.res` before invoking the response callback. got's
+            // close-handler guard (core/index.js:1198 `Boolean(request.res)`) reads
+            // it to tell "closed after a response" from "closed with none"; leaving
+            // it unset made every completed request raise a bogus
+            // ReadError/ECONNRESET "The server aborted pending request".
+            request.res = response;
             request.emit('response', response);
             if (request._callback) request._callback(response);
         },
