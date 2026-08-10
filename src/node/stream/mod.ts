@@ -1108,18 +1108,29 @@ Readable.prototype[Symbol.asyncIterator] = function asyncIterator(this: Readable
         [Symbol.asyncIterator]() {
             return this;
         },
-        async next() {
+        next(): Promise<IteratorResult<unknown>> {
             const buffered = readable.read();
             if (buffered !== null) {
-                return { done: false, value: buffered };
+                return Promise.resolve({ done: false, value: buffered });
             }
             if (readable.readableEnded) {
-                return { done: true, value: undefined };
+                return Promise.resolve({ done: true, value: undefined });
             }
             // Already torn down: no further event will ever arrive.
             if (readable.destroyed) {
-                if (readable.errored) throw readable.errored;
-                return { done: true, value: undefined };
+                if (readable.errored) {
+                    const error = readable.errored;
+                    // read() can synchronously enter the destroyed state while
+                    // destroy(error) has only queued its 'error' event. The
+                    // iterator already reports that error through its rejected
+                    // next() result, but the deferred event still needs a
+                    // listener or EventEmitter will throw it a second time.
+                    const consumeDeferredError = () => {};
+                    readable.once('error', consumeDeferredError);
+                    deferTick(() => readable.off('error', consumeDeferredError));
+                    return Promise.reject(error);
+                }
+                return Promise.resolve({ done: true, value: undefined });
             }
             // Node's createAsyncIterator waits on 'readable' and pulls with read();
             // it never resumes. Resuming here would switch the stream to flowing mode

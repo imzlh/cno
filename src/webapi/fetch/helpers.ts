@@ -18,6 +18,9 @@ export const { Decoder } = import.meta.use("text");
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 type BodyIterable = Iterable<unknown> | AsyncIterable<unknown>;
 
+/** Internal capability used by fetch to disturb buffered Request bodies. */
+export const markRequestBodyUsed = Symbol('markRequestBodyUsed');
+
 async function closeFileQuietly(file: CModuleAsyncFS.FileHandle): Promise<void> {
     try {
         await file.close();
@@ -459,11 +462,11 @@ async function writeStreamToTempFile(stream: ReadableStream<Uint8Array>, signal?
 export async function prepareRequestBody(request: Request): Promise<PreparedRequestBody> {
     const buffered = request.getBufferedBody();
     if (buffered) {
-        request.bodyUsed = true;
+        request[markRequestBodyUsed]();
         return { kind: 'buffer', body: buffered };
     }
     if (!request.body) return { kind: 'none' };
-    request.bodyUsed = true;
+    request[markRequestBodyUsed]();
     const streamed = await writeStreamToTempFile(request.body, request.signal);
     return { kind: 'file', path: streamed.path, size: streamed.size };
 }
@@ -471,6 +474,18 @@ export async function prepareRequestBody(request: Request): Promise<PreparedRequ
 // ---------------------------------------------------------------------------
 // FormData serialization
 // ---------------------------------------------------------------------------
+
+function escapeMultipartParameter(value: string, normalizeLineFeeds: boolean): string {
+    let escaped = sanitizeSurrogates(value);
+    if (normalizeLineFeeds) escaped = escaped.replace(/\r\n|\r|\n/g, '\r\n');
+    /* Fetch's multipart serializer percent-encodes the three bytes that can
+     * terminate or escape a quoted Content-Disposition parameter. Leaving them
+     * literal permits a filename/key to inject arbitrary part headers. */
+    return escaped
+        .replace(/\r/g, '%0D')
+        .replace(/\n/g, '%0A')
+        .replace(/"/g, '%22');
+}
 
 export async function serializeFormData(fd: FormData, boundary: string = createMultipartBoundary()): Promise<Uint8Array> {
     const parts: Uint8Array[] = [];
@@ -480,9 +495,10 @@ export async function serializeFormData(fd: FormData, boundary: string = createM
         const entry = entries[i];
         if (entry === undefined) continue;
         const [key, value] = entry;
-        let header = `--${boundary}\r\nContent-Disposition: form-data; name="${key}"`;
+        const escapedName = escapeMultipartParameter(key, true);
+        let header = `--${boundary}\r\nContent-Disposition: form-data; name="${escapedName}"`;
         if (value instanceof Blob) {
-            const filename = blobFilename(value);
+            const filename = escapeMultipartParameter(blobFilename(value), false);
             header += `; filename="${filename}"\r\nContent-Type: ${value.type || 'application/octet-stream'}`;
         }
         header += '\r\n\r\n';

@@ -41,6 +41,14 @@ type WasmErrorLike = {
     message?: unknown;
     name?: unknown;
     code?: unknown;
+    /*
+     * The C layer tags every wasm error with the JS class it should surface as:
+     * tjs_throw_wasm_error() (circu.js/src/mod_wasm.c) throws a plain Error
+     * carrying `wasmError: "RuntimeError" | "CompileError" | "LinkError" |
+     * "RangeError" | "TypeError"`. It cannot set `name`, because the thrown
+     * object is a bare JS_NewError, so this marker is the only channel.
+     */
+    wasmError?: unknown;
 };
 
 function toArrayBuffer(source: BufferSource): ArrayBuffer {
@@ -54,28 +62,104 @@ function toArrayBuffer(source: BufferSource): ArrayBuffer {
 function toUint8Array(source: BufferSource): Uint8Array {
     if (source instanceof Uint8Array) return source;
     if (source instanceof ArrayBuffer) return new Uint8Array(source);
+    /*
+     * A non-BufferSource must raise a TypeError, not be reported as an invalid
+     * module. WebAssembly.validate('x') returning false claimed the argument was
+     * a well-formed-but-invalid module, hiding the caller's type error.
+     */
+    if (typeof source !== 'object' || source === null || !('buffer' in source)) {
+        throw new TypeError('first argument must be an ArrayBuffer or a typed array object');
+    }
     if (source.buffer instanceof SharedArrayBuffer)
         throw new TypeError('SharedArrayBuffer is not supported');
     return new Uint8Array(source.buffer, source.byteOffset, source.byteLength);
 }
 
+/*
+ * Re-throw a native wasm failure as the class the WebAssembly JS API specifies.
+ *
+ * The classification MUST come from the `wasmError` marker the C layer sets:
+ * tjs_throw_wasm_error() builds a bare Error, so `name` is always "Error" and
+ * `code` is absent. Reading only those left every trap surfacing as a plain
+ * Error, so `catch (e) { e instanceof WebAssembly.RuntimeError }` never matched
+ * and a trap was indistinguishable from an ordinary JS bug.
+ */
 function wrapWasmError<T>(fn: () => T): T {
     try {
         return fn();
     } catch (e: unknown) {
         const record = typeof e === 'object' && e !== null ? e as WasmErrorLike : undefined;
         const msg = typeof record?.message === 'string' ? record.message : String(e);
-        const name = String(record?.name || record?.code || '');
-        if (name.includes('Compile')) throw new CompileError(msg);
-        if (name.includes('Link')) throw new LinkError(msg);
-        if (name.includes('Runtime')) throw new RuntimeError(msg);
+        const tag = String(record?.wasmError || record?.name || record?.code || '');
+        if (tag.includes('Compile')) throw new CompileError(msg);
+        if (tag.includes('Link')) throw new LinkError(msg);
+        if (tag.includes('Runtime')) throw new RuntimeError(msg);
+        /* RangeError/TypeError are real JS classes; only re-wrap when the native
+         * side asked for them but could not construct them itself. */
+        if (tag === 'RangeError' && !(e instanceof RangeError)) throw new RangeError(msg);
+        if (tag === 'TypeError' && !(e instanceof TypeError)) throw new TypeError(msg);
         throw e;
     }
 }
 
-function requireCustomSection(module: CModuleWASM.Module, sectionName: string): ArrayBuffer {
+/*
+ * All custom sections with the given name, in module order.
+ *
+ * A name that is not present must yield an EMPTY array. Returning a
+ * zero-length ArrayBuffer instead made `customSections(m, 'nope').length` equal
+ * 1, so every presence test succeeded for every name.
+ */
+function customSectionsByName(module: CModuleWASM.Module, sectionName: string): ArrayBuffer[] {
     const section = wasm.moduleCustomSections(module, sectionName);
-    return section ?? new ArrayBuffer(0);
+    return Array.isArray(section) ? section : section ? [section] : [];
+}
+
+/*
+ * funcref bridging for Tables.
+ *
+ * The C layer represents a funcref table slot as a raw function index and
+ * documents "JS side wraps it" (mod_wasm.c tjs_wasm_tableget), but nothing did,
+ * so Table.get() returned a Number where the spec requires a callable. Worse,
+ * tjs_wasm_tableset coerces with JS_ToUint32, so a plain JS function became
+ * NaN -> 0 and silently aliased table slot 0 to function index 0 instead of
+ * being rejected.
+ *
+ * A wrapper carries its index under this symbol so set() can recover it.
+ */
+const FUNCREF_INDEX = Symbol('wasmFuncrefIndex');
+const FUNCREF_INSTANCE = Symbol('wasmFuncrefInstance');
+const funcrefCache = new WeakMap<CModuleWASM.Instance, Map<number, FuncrefWrapper>>();
+type FuncrefWrapper = WasmFunctionExport & {
+    [FUNCREF_INDEX]: number;
+    [FUNCREF_INSTANCE]: CModuleWASM.Instance;
+};
+
+/* The element type reaches this layer from two sources with different spellings:
+ * a JS-constructed Table uses the descriptor's "anyfunc" (the WebAssembly JS API
+ * name), while an imported/exported one is described by wasm.getTableInfo(),
+ * which reports WAMR's "funcref". Both denote a function table. */
+function isFuncrefElement(element: string): boolean {
+    return element === 'anyfunc' || element === 'funcref';
+}
+
+function wrapFuncref(instance: CModuleWASM.Instance, funcIndex: number): FuncrefWrapper {
+    let cache = funcrefCache.get(instance);
+    if (!cache) {
+        cache = new Map();
+        funcrefCache.set(instance, cache);
+    }
+    const cached = cache.get(funcIndex);
+    if (cached) return cached;
+    const fn = ((...args: CModuleWASM.WasmFunctionArgument[]) =>
+        wrapWasmError(() => wasm.callFuncByIndex(instance, funcIndex, ...args))) as FuncrefWrapper;
+    Object.defineProperty(fn, FUNCREF_INDEX, { value: funcIndex, enumerable: false });
+    Object.defineProperty(fn, FUNCREF_INSTANCE, { value: instance, enumerable: false });
+    cache.set(funcIndex, fn);
+    return fn;
+}
+
+function isFuncrefWrapper(v: unknown): v is FuncrefWrapper {
+    return typeof v === 'function' && typeof (v as FuncrefWrapper)[FUNCREF_INDEX] === 'number';
 }
 
 // Error Classes
@@ -131,7 +215,7 @@ class Module {
     }
 
     static customSections(module: Module, sectionName: string): ArrayBuffer[] {
-        return [requireCustomSection(module._native, sectionName)];
+        return customSectionsByName(module._native, sectionName);
     }
     
     get [Symbol.toStringTag]() {
@@ -148,10 +232,29 @@ class Memory {
     _maxPages: number | undefined;
 
     constructor(descriptor: { initial: number; maximum?: number; shared?: boolean }) {
+        /* `initial` is required by the JS API. Without this check `new
+         * Memory({})` produced a 0-page memory whose NaN-sized buffer surfaced
+         * much later as an unrelated failure. */
+        const rawInitial = descriptor !== null && typeof descriptor === 'object'
+            ? descriptor.initial
+            : undefined;
+        const initial = toWasmPageCount(rawInitial, 'initial');
+        const maximum = descriptor !== null && typeof descriptor === 'object'
+            ? toOptionalWasmPageCount(descriptor.maximum, 'maximum')
+            : undefined;
+        if (maximum !== undefined && maximum < initial) {
+            throw new RangeError('WebAssembly.Memory(): Property "maximum" is below the initial size');
+        }
+        if (descriptor?.shared === true) {
+            /* The native bridge currently exposes ArrayBuffer-backed memories
+             * only. Silently accepting shared:true would violate the API's
+             * SharedArrayBuffer/atomic semantics, so fail at construction. */
+            throw new TypeError('WebAssembly.Memory shared memories are not supported');
+        }
         this._instance = null;
-        this._buffer = new ArrayBuffer(descriptor.initial * 65536);
+        this._buffer = new ArrayBuffer(initial * 65536);
         this._cachedBuffer = this._buffer;
-        this._maxPages = descriptor.maximum;
+        this._maxPages = maximum;
     }
 
     private localBuffer(): ArrayBuffer {
@@ -169,16 +272,24 @@ class Memory {
     }
 
     grow(delta: number): number {
+        const pages = toWasmPageCount(delta, 'delta');
         const instance = this._instance;
         if (instance) {
-            const result = wrapWasmError(() => wasm.growMemory(instance, delta));
+            const result = wrapWasmError(() => wasm.growMemory(instance, pages));
             this._cachedBuffer = wasm.getMemoryBuffer(instance);
             return result;
         }
         const oldBuffer = this.localBuffer();
         const oldPages = oldBuffer.byteLength / 65536;
-        const newPages = oldPages + delta;
-        if (this._maxPages !== undefined && newPages > this._maxPages) return -1;
+        const newPages = oldPages + pages;
+        /* The JS API specifies a RangeError when the grow cannot be satisfied;
+         * returning -1 is the wasm `memory.grow` instruction's convention, not
+         * this method's, and made an over-max grow look like success to any
+         * caller that did not compare against -1. */
+        if (this._maxPages !== undefined && newPages > this._maxPages) {
+            throw new RangeError('failed to grow memory');
+        }
+        if (newPages > 65536) throw new RangeError('failed to grow memory');
         const newBuffer = new ArrayBuffer(newPages * 65536);
         new Uint8Array(newBuffer).set(new Uint8Array(oldBuffer));
         engine.detachArrayBuffer(oldBuffer);
@@ -192,10 +303,28 @@ class Memory {
     }
 }
 
+function toWasmPageCount(value: unknown, name: string): number {
+    if (typeof value === 'bigint') {
+        throw new TypeError(`WebAssembly.Memory(): Property '${name}' must be convertible to a valid number`);
+    }
+    const number = Number(value);
+    if (!Number.isFinite(number) || number < 0) {
+        throw new TypeError(`WebAssembly.Memory(): Property '${name}' must be non-negative and finite`);
+    }
+    const pages = Math.trunc(number);
+    if (pages > 65536) throw new RangeError(`WebAssembly.Memory(): Property '${name}' is too large`);
+    return pages;
+}
+
+function toOptionalWasmPageCount(value: unknown, name: string): number | undefined {
+    return value === undefined ? undefined : toWasmPageCount(value, name);
+}
+
 // Table
 
 const VALID_GLOBAL_TYPES = new Set(['i32', 'i64', 'f32', 'f64']);
 const VALID_ELEMENT_TYPES = new Set(['anyfunc', 'funcref', 'externref']);
+const MAX_TABLE_ELEMENTS = 10_000_000;
 
 class Table {
     _instance: CModuleWASM.Instance | null;
@@ -205,14 +334,24 @@ class Table {
     _maxSize: number | undefined;
 
     constructor(descriptor: { element: string; initial: number; maximum?: number }) {
-        if (!VALID_ELEMENT_TYPES.has(descriptor.element)) {
-            throw new TypeError(`Invalid table element type: '${descriptor.element}'`);
+        const element = descriptor !== null && typeof descriptor === 'object'
+            ? String(descriptor.element)
+            : '';
+        if (!VALID_ELEMENT_TYPES.has(element)) {
+            throw new TypeError(`Invalid table element type: '${element}'`);
+        }
+        const initial = toTableSize(descriptor.initial, 'initial');
+        const maximum = descriptor.maximum === undefined
+            ? undefined
+            : toTableSize(descriptor.maximum, 'maximum');
+        if (maximum !== undefined && maximum < initial) {
+            throw new RangeError('WebAssembly.Table(): Property "maximum" is below the initial size');
         }
         this._instance = null;
         this._name = null;
-        this._element = descriptor.element;
-        this._maxSize = descriptor.maximum;
-        this._array = new Array(descriptor.initial).fill(null);
+        this._element = element;
+        this._maxSize = maximum;
+        this._array = new Array(initial).fill(null);
     }
 
     private nativeBinding(): { instance: CModuleWASM.Instance; name: string } | null {
@@ -228,42 +367,82 @@ class Table {
     }
 
     get(index: number): CModuleWASM.WasmTableValue {
+        const tableIndex = toTableIndex(index);
         const native = this.nativeBinding();
         if (native) {
-            if (index >= wasm.tableSize(native.instance, native.name)) {
+            if (tableIndex >= wasm.tableSize(native.instance, native.name)) {
                 throw new RangeError('index out of bounds');
             }
-            return wasm.tableGet(native.instance, native.name, index);
+            const raw = wasm.tableGet(native.instance, native.name, tableIndex);
+            /* A funcref slot arrives as a raw function index; the spec requires a
+             * callable. externref slots and null pass through unchanged. */
+            if (isFuncrefElement(this._element) && typeof raw === 'number') {
+                return wrapFuncref(native.instance, raw) as unknown as CModuleWASM.WasmTableValue;
+            }
+            return raw;
         }
-        if (index >= this._array.length) {
+        if (tableIndex >= this._array.length) {
             throw new RangeError('index out of bounds');
         }
-        return this._array[index];
+        return this._array[tableIndex];
     }
 
     set(index: number, value: CModuleWASM.WasmTableValue): void {
+        const tableIndex = toTableIndex(index);
         const native = this.nativeBinding();
         if (native) {
-            if (index >= wasm.tableSize(native.instance, native.name)) {
+            if (tableIndex >= wasm.tableSize(native.instance, native.name)) {
                 throw new RangeError('index out of bounds');
             }
-            wasm.tableSet(native.instance, native.name, index, value);
+            let toStore = value;
+            if (isFuncrefElement(this._element) && value !== null) {
+                /* Only a wasm funcref may be stored. Without this check the C
+                 * layer's JS_ToUint32 turns any other value into 0 and silently
+                 * aliases the slot to function index 0. */
+                if (!isFuncrefWrapper(value)
+                    || value[FUNCREF_INSTANCE] !== native.instance) {
+                    throw new TypeError('Argument 1 must be null or a WebAssembly function');
+                }
+                toStore = (value as FuncrefWrapper)[FUNCREF_INDEX] as unknown as CModuleWASM.WasmTableValue;
+            }
+            wasm.tableSet(native.instance, native.name, tableIndex, toStore);
             return;
         }
-        if (index >= this._array.length) {
+        if (tableIndex >= this._array.length) {
             throw new RangeError('index out of bounds');
         }
-        this._array[index] = value;
+        if (isFuncrefElement(this._element) && value !== null && !isFuncrefWrapper(value)) {
+            throw new TypeError('Argument 1 must be null or a WebAssembly function');
+        }
+        this._array[tableIndex] = value;
     }
 
     grow(delta: number, init?: CModuleWASM.WasmTableValue): number {
+        const count = toTableSize(delta, 'delta');
+        const initialValue = arguments.length < 2 ? null : init;
         const native = this.nativeBinding();
-        if (native) return wasm.tableGrow(native.instance, native.name, delta);
+        if (native) {
+            if (isFuncrefElement(this._element) && initialValue !== null
+                && (!isFuncrefWrapper(initialValue) || initialValue[FUNCREF_INSTANCE] !== native.instance)) {
+                throw new TypeError('Argument 1 must be null or a WebAssembly function');
+            }
+            const grown = wasm.tableGrow(native.instance, native.name, count);
+            /* WAMR reports refusal as -1; the JS API specifies a RangeError. */
+            if (grown < 0) throw new RangeError('failed to grow table');
+            for (let i = 0; i < count; i++) this.set(grown + i, initialValue);
+            return grown;
+        }
         const oldLength = this._array.length;
-        const newLength = oldLength + delta;
-        if (this._maxSize !== undefined && newLength > this._maxSize) return -1;
-        for (let i = 0; i < delta; i++) {
-            this._array.push(init ?? null);
+        const newLength = oldLength + count;
+        if (this._maxSize !== undefined && newLength > this._maxSize) {
+            throw new RangeError('failed to grow table');
+        }
+        if (newLength > MAX_TABLE_ELEMENTS) throw new RangeError('failed to grow table');
+        if (isFuncrefElement(this._element) && initialValue !== null && !isFuncrefWrapper(initialValue)) {
+            throw new TypeError('Argument 1 must be null or a WebAssembly function');
+        }
+        for (let i = 0; i < count; i++) {
+            this._array.push(initialValue);
         }
         return oldLength;
     }
@@ -271,6 +450,26 @@ class Table {
     get [Symbol.toStringTag]() {
         return 'WebAssembly.Table';
     }
+}
+
+function toTableSize(value: unknown, name: string): number {
+    if (typeof value === 'bigint') throw new TypeError('Cannot convert a BigInt value to a number');
+    const number = Number(value);
+    if (!Number.isFinite(number) || number < 0) {
+        throw new TypeError(`WebAssembly.Table(): Property '${name}' must be non-negative and finite`);
+    }
+    const size = Math.trunc(number);
+    if (size > MAX_TABLE_ELEMENTS) throw new RangeError(`WebAssembly.Table(): Property '${name}' is too large`);
+    return size;
+}
+
+function toTableIndex(value: unknown): number {
+    if (typeof value === 'bigint') throw new TypeError('Cannot convert a BigInt value to a number');
+    const number = Number(value);
+    if (!Number.isFinite(number) || number < 0) throw new TypeError('table index must be non-negative and finite');
+    const index = Math.trunc(number);
+    if (index > 0xffffffff) throw new RangeError('index out of bounds');
+    return index;
 }
 
 // Global
@@ -291,7 +490,7 @@ class Global {
         this._name = null;
         this._type = descriptor.value;
         this._mutable = descriptor.mutable;
-        this._value = initialValue;
+        this._value = coerceGlobalValue(descriptor.value, initialValue);
     }
 
     private nativeBinding(): { instance: CModuleWASM.Instance; name: string } | null {
@@ -309,12 +508,13 @@ class Global {
     set value(newValue: CModuleWASM.WasmGlobalValue) {
         if (!this._mutable) throw new TypeError('Global is immutable');
         validateGlobalValue(this._type, newValue);
+        const coerced = coerceGlobalValue(this._type, newValue);
         const native = this.nativeBinding();
         if (native) {
-            wasm.setGlobal(native.instance, native.name, newValue);
+            wasm.setGlobal(native.instance, native.name, coerced);
             return;
         }
-        this._value = newValue;
+        this._value = coerced;
     }
 
     valueOf(): CModuleWASM.WasmGlobalValue {
@@ -329,9 +529,7 @@ class Global {
 function validateGlobalValue(type: string, value: CModuleWASM.WasmGlobalValue): void {
     switch (type) {
         case 'i32':
-            if (typeof value !== 'number' || !Number.isInteger(value)) {
-                throw new TypeError('Global value must be an integer for i32 type');
-            }
+            toWasmNumber(value);
             break;
         case 'i64':
             if (typeof value !== 'bigint') {
@@ -340,11 +538,33 @@ function validateGlobalValue(type: string, value: CModuleWASM.WasmGlobalValue): 
             break;
         case 'f32':
         case 'f64':
-            if (typeof value !== 'number') {
-                throw new TypeError('Global value must be a number for f32/f64 type');
-            }
+            toWasmNumber(value);
             break;
     }
+}
+
+/*
+ * Round an f32 global's value to f32 precision.
+ *
+ * A JS number is f64. Storing 0.1 in an f32 global and reading it back must
+ * yield 0.10000000149011612, the nearest f32; returning 0.1 unchanged reports a
+ * value the global cannot actually hold, and the discrepancy only surfaces once
+ * wasm reads the same global and disagrees with JS.
+ */
+function coerceGlobalValue(type: string, value: CModuleWASM.WasmGlobalValue): CModuleWASM.WasmGlobalValue {
+    if (type === 'i32') {
+        return toWasmNumber(value) | 0;
+    }
+    if (type === 'f32') return Math.fround(toWasmNumber(value));
+    if (type === 'f32' || type === 'f64') return toWasmNumber(value);
+    return value;
+}
+
+function toWasmNumber(value: unknown): number {
+    /* ToNumber, unlike Number(), rejects BigInt values for WebAssembly's
+     * numeric conversion. */
+    if (typeof value === 'bigint') throw new TypeError('Cannot convert a BigInt value to a number');
+    return Number(value);
 }
 
 // Instance
@@ -355,8 +575,17 @@ class Instance {
 
     constructor(module: Module, importObject?: WasmImportObject) {
         const nativeModule = module._native;
+        if (importObject !== undefined && (typeof importObject !== 'object' || importObject === null)) {
+            throw new TypeError('WebAssembly.Instance(): Argument 1 must be an object');
+        }
         if (importObject) {
             resolveImportObject(nativeModule, importObject);
+        } else if (requiresImportObject(nativeModule)) {
+            /* A module declaring non-WASI imports cannot be instantiated with no
+             * import object. Skipping resolution entirely linked it against
+             * nothing and produced a live Instance whose imported calls were
+             * unbound. */
+            throw new TypeError('WebAssembly.Instance(): Argument 1 must be an object');
         }
         this._instance = wrapWasmError(() => wasm.buildInstance(nativeModule));
         this._exports = createExports(this._instance, nativeModule);
@@ -373,6 +602,20 @@ class Instance {
 }
 
 // Import Resolution
+
+/*
+ * True when the module declares an import that an omitted import object cannot
+ * satisfy. WASI modules are exempt: the runtime supplies wasi_snapshot_preview1
+ * itself (see resolveImportObject), so they legitimately instantiate with none.
+ */
+function requiresImportObject(nativeModule: CModuleWASM.Module): boolean {
+    for (const imp of wasm.moduleImports(nativeModule)) {
+        if (imp.module !== 'wasi_snapshot_preview1' && imp.module !== 'wasi_unstable') {
+            return true;
+        }
+    }
+    return false;
+}
 
 function resolveImportObject(
     nativeModule: CModuleWASM.Module,
@@ -489,11 +732,15 @@ function createExports(
 
     for (const exp of exports) {
         switch (exp.kind) {
-            case 'function':
-                result[exp.name] = (...args: CModuleWASM.WasmFunctionArgument[]) => {
-                    return wrapWasmError(() => instance.callFunction(exp.name, ...args));
-                };
+            case 'function': {
+                const idx = wasm.getFuncIndex(instance, exp.name);
+                const fn = typeof idx === 'number' && idx >= 0
+                    ? wrapFuncref(instance, idx)
+                    : ((...args: CModuleWASM.WasmFunctionArgument[]) =>
+                        wrapWasmError(() => instance.callFunction(exp.name, ...args))) as WasmFunctionExport;
+                result[exp.name] = fn;
                 break;
+            }
             case 'memory': {
                 const mem: Memory = Object.create(Memory.prototype);
                 mem._instance = instance;

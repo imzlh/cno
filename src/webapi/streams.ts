@@ -613,6 +613,10 @@ export class ReadableStream<R = unknown> implements globalThis.ReadableStream<R>
         const cancelReasons: [unknown, unknown] = [undefined, undefined];
         const branchCanceled: [boolean, boolean] = [false, false];
         const cancelResult = Promise.withResolvers<void>();
+        /* The tee algorithm's cancel promise is rejected when the source errors
+         * even if neither branch ever calls cancel(). Mark that internal promise
+         * handled; branch readers still receive the original stream error. */
+        void cancelResult.promise.catch(() => {});
         let cancelSettled = false;
 
         const resolveCancel = (): void => {
@@ -772,6 +776,11 @@ export class ReadableStream<R = unknown> implements globalThis.ReadableStream<R>
     get _controller() { return this.#controller; }
     _releaseLock() { this.#reader = null; }
 }
+
+Object.defineProperty(ReadableStream.prototype, Symbol.toStringTag, {
+    value: 'ReadableStream',
+    configurable: true,
+});
 
 // ReadableStreamDefaultReader
 class ReadableStreamDefaultReader<R = unknown> implements globalThis.ReadableStreamDefaultReader<R> {

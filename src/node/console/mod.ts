@@ -8,7 +8,7 @@ import { format as utilFormat, formatWithOptions as utilFormatWithOptions, inspe
 
 const nativeConsole = import.meta.use('console');
 
-export interface ConsoleOptions {
+interface ConsoleOptions {
     stdout: NodeJS.WritableStream;
     stderr?: NodeJS.WritableStream;
     ignoreErrors?: boolean;
@@ -87,36 +87,94 @@ function makeConsoleWriteCallback(stream: {
 
 function absorbStreamError(): void { /* intentionally empty */ }
 
-export class Console {
-    private _stdout: NodeJS.WritableStream;
-    private _stderr: NodeJS.WritableStream;
-    private _ignoreErrors: boolean;
-    private _groupIndent: string;
-    private _groupIndentation: number;
-    private _timers: Map<string, number>;
-    private _counters: Map<string, number>;
-    private _inspectOptions: ImportInspectOptions;
+/**
+ * Node binds these onto each instance as own enumerable properties, so
+ * `Object.keys(c)`, `{...c}` and `const {log} = c` all behave. `profile`,
+ * `profileEnd`, `timeStamp` and `format` deliberately stay prototype-only,
+ * matching node's own list.
+ */
+const BOUND_CONSOLE_METHODS = [
+    'log', 'warn', 'dir', 'time', 'timeEnd', 'timeLog', 'trace', 'assert',
+    'clear', 'count', 'countReset', 'group', 'groupEnd', 'table', 'debug',
+    'info', 'dirxml', 'error', 'groupCollapsed',
+] as const;
+
+/** Node: a stream must look writable or the constructor throws. */
+function validateConsoleStream(stream: unknown, name: string): void {
+    if (stream === null || stream === undefined ||
+        (typeof stream !== 'object' && typeof stream !== 'function') ||
+        typeof (stream as { write?: unknown }).write !== 'function') {
+        const err = new TypeError(
+            `Console expects a writable stream instance for ${name}`,
+        ) as TypeError & { code?: string };
+        err.code = 'ERR_CONSOLE_WRITABLE_STREAM';
+        throw err;
+    }
+}
+
+class ConsoleImpl {
+    private _stdout!: NodeJS.WritableStream;
+    private _stderr!: NodeJS.WritableStream;
+    private _ignoreErrors!: boolean;
+    private _groupIndent!: string;
+    private _groupIndentation!: number;
+    private _timers!: Map<string, number>;
+    private _counters!: Map<string, number>;
+    private _inspectOptions!: ImportInspectOptions;
 
     constructor(stdout: NodeJS.WritableStream, stderr?: NodeJS.WritableStream, ignoreErrors?: boolean);
     constructor(options: ConsoleOptions);
     constructor(stdoutOrOptions: NodeJS.WritableStream | ConsoleOptions, stderr?: NodeJS.WritableStream, ignoreErrors?: boolean) {
-        if (typeof stdoutOrOptions === 'object' && 'stdout' in stdoutOrOptions) {
+        let outStream: NodeJS.WritableStream;
+        let errStream: NodeJS.WritableStream;
+        let ignore: boolean;
+        let indentation: number;
+        let inspectOptions: ImportInspectOptions;
+
+        if (typeof stdoutOrOptions === 'object' && stdoutOrOptions !== null && 'stdout' in stdoutOrOptions) {
             const opts = stdoutOrOptions;
-            this._stdout = opts.stdout;
-            this._stderr = opts.stderr ?? opts.stdout;
-            this._ignoreErrors = opts.ignoreErrors ?? true;
-            this._groupIndentation = opts.groupIndentation ?? 2;
-            this._inspectOptions = opts.inspectOptions ?? {};
+            outStream = opts.stdout;
+            errStream = opts.stderr ?? opts.stdout;
+            ignore = opts.ignoreErrors ?? true;
+            indentation = opts.groupIndentation ?? 2;
+            inspectOptions = opts.inspectOptions ?? {};
         } else {
-            this._stdout = stdoutOrOptions as NodeJS.WritableStream;
-            this._stderr = stderr ?? this._stdout;
-            this._ignoreErrors = ignoreErrors ?? true;
-            this._groupIndentation = 2;
-            this._inspectOptions = {};
+            outStream = stdoutOrOptions as NodeJS.WritableStream;
+            errStream = stderr ?? outStream;
+            ignore = ignoreErrors ?? true;
+            indentation = 2;
+            inspectOptions = {};
         }
-        this._groupIndent = '';
-        this._timers = new Map();
-        this._counters = new Map();
+
+        // Node validates before any assignment, so a bad stream never yields a
+        // half-built Console that throws later at the first write instead.
+        validateConsoleStream(outStream, 'stdout');
+        if (errStream !== outStream) validateConsoleStream(errStream, 'stderr');
+
+        // Internals are non-enumerable so Object.keys()/spread show node's method
+        // set rather than cno's private fields.
+        const hide = (key: string, value: unknown): void => {
+            Object.defineProperty(this, key, {
+                value, writable: true, enumerable: false, configurable: true,
+            });
+        };
+        hide('_stdout', outStream);
+        hide('_stderr', errStream);
+        hide('_ignoreErrors', ignore);
+        hide('_groupIndentation', indentation);
+        hide('_inspectOptions', inspectOptions);
+        hide('_groupIndent', '');
+        hide('_timers', new Map<string, number>());
+        hide('_counters', new Map<string, number>());
+
+        for (const name of BOUND_CONSOLE_METHODS) {
+            const fn = (this as unknown as Record<string, unknown>)[name];
+            if (typeof fn !== 'function') continue;
+            Object.defineProperty(this, name, {
+                value: (fn as (...a: unknown[]) => unknown).bind(this),
+                writable: true, enumerable: true, configurable: true,
+            });
+        }
     }
 
     private _write(stream: NodeJS.WritableStream, data: string): void {
@@ -302,6 +360,31 @@ export class Console {
 
     timeStamp(_label?: string): void {}
 }
+
+/*
+ * Node exposes Console as a constructable *and* callable function. An ES class
+ * cannot be called directly (its constructor throws before its body runs), so
+ * the compatibility branch must live in a Proxy apply trap. Keeping the class
+ * as the proxy target preserves `instanceof`, the prototype methods, and the
+ * normal `new Console(...)` path.
+ */
+interface ConsoleConstructor {
+    new (stdout: NodeJS.WritableStream, stderr?: NodeJS.WritableStream, ignoreErrors?: boolean): ConsoleImpl;
+    new (options: ConsoleOptions): ConsoleImpl;
+    (stdout: NodeJS.WritableStream, stderr?: NodeJS.WritableStream, ignoreErrors?: boolean): ConsoleImpl;
+    (options: ConsoleOptions): ConsoleImpl;
+    readonly prototype: ConsoleImpl;
+}
+
+const consoleConstructor = new Proxy(ConsoleImpl, {
+    apply(target, _thisArg, args) {
+        return Reflect.construct(target, args);
+    },
+}) as unknown as ConsoleConstructor;
+Object.defineProperty(consoleConstructor, 'name', { value: 'Console', configurable: true });
+
+export type Console = ConsoleImpl;
+export const Console = consoleConstructor;
 
 const TABLE_CHARS = {
     topLeft: '┌', topRight: '┐', bottomLeft: '└', bottomRight: '┘',

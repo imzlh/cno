@@ -8,7 +8,11 @@ import { IPCChannel, type IPCSerialization } from '../ipc_channel';
 import { stdout, stderr, stdin } from './streams';
 import { hrtime, memoryUsage, cpuUsage, resourceUsage } from './metrics';
 import { normalizeErrnoError } from '../_internal/errno';
-import { loadEnvFile as loadDotenvFile } from '../_internal/envfile';
+import {
+    loadNodeEnvFile,
+    resolveEnvFilePath,
+    type EnvFilePath,
+} from '../_internal/envfile';
 
 const os = import.meta.use('os');
 const engine = import.meta.use('engine');
@@ -38,6 +42,9 @@ type ProcessOsModule = typeof os & {
 };
 
 const processOs = os as ProcessOsModule;
+const nativeUmask = processOs.umask;
+const emulatedUmaskBits = os.uname().sysname === 'Windows_NT' ? 0o600 : 0o777;
+let emulatedUmask = os.uname().sysname === 'Windows_NT' ? 0 : 0o022;
 
 // argv shapes come from cno/src/utils/args via the os shared namespace — node
 // modules must not import across the node/ boundary (AGENT.md). Read once here;
@@ -67,20 +74,39 @@ function unsetEnvQuietly(name: string): void {
     }
 }
 
-function readUmask(): number {
-    try {
-        return processOs.umask?.() ?? 0o022;
-    } catch {
-        return 0o022;
-    }
+function codeError<T extends Error>(error: T, code: string): T {
+    Reflect.set(error, 'code', code);
+    return error;
 }
 
-function writeUmask(mask: number): void {
-    try {
-        processOs.umask?.(mask);
-    } catch {
-        // Some hosts do not expose a writable umask.
+function normalizeUmask(mask: unknown): number {
+    let value: number;
+    if (typeof mask === 'string') {
+        if (!/^[0-7]+$/.test(mask)) {
+            throw codeError(new TypeError(
+                `The argument 'mask' must be a 32-bit unsigned integer or an octal string. Received '${mask}'`,
+            ), 'ERR_INVALID_ARG_VALUE');
+        }
+        value = Number.parseInt(mask, 8);
+    } else if (typeof mask !== 'number') {
+        throw codeError(new TypeError(
+            `The "mask" argument must be of type number. Received ${String(mask)}`,
+        ), 'ERR_INVALID_ARG_TYPE');
+    } else {
+        value = mask;
     }
+
+    if (!Number.isInteger(value)) {
+        throw codeError(new RangeError(
+            `The value of "mask" is out of range. It must be an integer. Received ${String(value)}`,
+        ), 'ERR_OUT_OF_RANGE');
+    }
+    if (value < 0 || value > 0xffff_ffff) {
+        throw codeError(new RangeError(
+            `The value of "mask" is out of range. It must be >= 0 && <= 4294967295. Received ${String(value)}`,
+        ), 'ERR_OUT_OF_RANGE');
+    }
+    return value;
 }
 
 function processGroups(): number[] {
@@ -91,12 +117,32 @@ function processGroups(): number[] {
     }
 }
 
-function normalizeSignal(signal?: string | number): CModuleProcess.Signal | number | undefined {
-    if (signal === undefined || typeof signal === 'number') return signal;
+function normalizeKillPid(pid: unknown): number {
+    if (typeof pid === 'boolean') return pid ? 1 : 0;
+    if (typeof pid === 'string') {
+        if (pid === '') return 0;
+        if (/^[+-]?\d+$/.test(pid)) return Number(pid);
+    } else if (typeof pid === 'number' && Number.isInteger(pid) && Number.isFinite(pid)) {
+        return pid;
+    }
+    throw codeError(new TypeError(
+        `The "pid" argument must be of type number. Received ${String(pid)}`,
+    ), 'ERR_INVALID_ARG_TYPE');
+}
+
+function normalizeSignal(signal?: string | number | null): CModuleProcess.Signal | number | undefined {
+    if (signal === undefined || signal === null || signal === '') return undefined;
+    if (typeof signal === 'number') {
+        // Signal 0 is a liveness probe. Preserve it for the native binding;
+        // passing `undefined` would select the default terminating signal.
+        if (signal === 0) return 0;
+        if (Number.isNaN(signal)) return undefined;
+        if (Number.isInteger(signal)) return signal;
+        throw codeError(new TypeError(`Unknown signal: ${String(signal)}`), 'ERR_UNKNOWN_SIGNAL');
+    }
     const signals = sig?.signals;
-    if (!signals) return signal as CModuleProcess.Signal;
-    if (typeof signals[signal] === 'number') return signal as CModuleProcess.Signal;
-    return signal as CModuleProcess.Signal;
+    if (signals && typeof signals[signal] === 'number') return signals[signal];
+    throw codeError(new TypeError(`Unknown signal: ${signal}`), 'ERR_UNKNOWN_SIGNAL');
 }
 
 // Signal handling
@@ -467,6 +513,65 @@ function resolveProcessEmitter(): ProcessEventEmitter {
 
 const processEE: ProcessEventEmitter = resolveProcessEmitter();
 type NextTickCallback = (...args: unknown[]) => void;
+type UncaughtCaptureCallback = (error: Error) => void;
+type UncaughtCaptureState = {
+    callback: UncaughtCaptureCallback | null;
+    dispatchInstalled: boolean;
+    listenerInstalled: boolean;
+    listener: () => void;
+    rawEmit: ProcessEventEmitter['emit'] | null;
+};
+const UNCAUGHT_CAPTURE_SLOT = Symbol.for('cno.node.process.uncaughtCapture.v1');
+
+function resolveUncaughtCaptureState(): UncaughtCaptureState {
+    const fresh: UncaughtCaptureState = {
+        callback: null,
+        dispatchInstalled: false,
+        listenerInstalled: false,
+        listener: () => void 0,
+        rawEmit: null,
+    };
+    try {
+        const slots = globalThis as unknown as Record<symbol, UncaughtCaptureState | undefined>;
+        const existing = slots[UNCAUGHT_CAPTURE_SLOT];
+        if (existing && 'callback' in existing) return existing;
+        slots[UNCAUGHT_CAPTURE_SLOT] = fresh;
+    } catch { /* frozen globalThis falls back to per-copy state */ }
+    return fresh;
+}
+
+const uncaughtCaptureState = resolveUncaughtCaptureState();
+
+function installUncaughtCaptureDispatch(): void {
+    if (uncaughtCaptureState.dispatchInstalled) return;
+    const emit = processEE.emit;
+    uncaughtCaptureState.rawEmit = emit;
+    Reflect.set(processEE, 'emit', function (event: string | symbol, ...args: unknown[]): boolean {
+        if (event === 'uncaughtException' && uncaughtCaptureState.callback) {
+            Reflect.apply(uncaughtCaptureState.callback, undefined, [args[0]]);
+            return true;
+        }
+        return Reflect.apply(emit, processEE, [event, ...args]);
+    });
+    uncaughtCaptureState.dispatchInstalled = true;
+}
+
+function syncUncaughtCaptureListener(): void {
+    if (uncaughtCaptureState.callback && !uncaughtCaptureState.listenerInstalled) {
+        processEE.prependListener('uncaughtException', uncaughtCaptureState.listener);
+        uncaughtCaptureState.listenerInstalled = true;
+    } else if (!uncaughtCaptureState.callback && uncaughtCaptureState.listenerInstalled) {
+        processEE.off('uncaughtException', uncaughtCaptureState.listener);
+        uncaughtCaptureState.listenerInstalled = false;
+    }
+}
+
+installUncaughtCaptureDispatch();
+
+function emitUserProcessEvent(event: string | symbol, ...args: unknown[]): boolean {
+    const emit = uncaughtCaptureState.rawEmit ?? processEE.emit;
+    return Reflect.apply(emit, processEE, [event, ...args]);
+}
 /* ------------------------------------------------------------------ *
  * ONE nextTick queue per process, not one per copy of this file
  * ------------------------------------------------------------------ *
@@ -559,6 +664,10 @@ const nativeTickDrain: boolean = installNativeTickDrain();
 
 function handleUncaughtException(error: unknown): void {
     processEE.emit('uncaughtExceptionMonitor', error, 'uncaughtException');
+    if (uncaughtCaptureState.callback) {
+        Reflect.apply(uncaughtCaptureState.callback, undefined, [error]);
+        return;
+    }
     if (processEE.listenerCount('uncaughtException') > 0) {
         processEE.emit('uncaughtException', error, 'uncaughtException');
         return;
@@ -661,6 +770,15 @@ function ensureEventBridge(): void {
 
         if (name === ET.JOB_EXCEPTION) {
             processEE.emit('uncaughtExceptionMonitor', data, 'uncaughtException');
+            if (uncaughtCaptureState.callback) {
+                try {
+                    Reflect.apply(uncaughtCaptureState.callback, undefined, [data]);
+                } catch {
+                    return undefined;
+                }
+                ctx.handled = true;
+                return true;
+            }
             if (processEE.listenerCount('uncaughtException') === 0) {
                 // No handler: leave the outcome exactly as it was. Do NOT call
                 // handleUncaughtException() — it rethrows, and the mux swallows
@@ -1034,7 +1152,7 @@ export const off = (event: string | symbol, listener: ProcessListener): ProcessE
 export const once = (event: string | symbol, listener: ProcessListener): ProcessEventEmitter =>
     processEE.once(event, listener);
 export const emit = (event: string | symbol, ...args: unknown[]): boolean =>
-    processEE.emit(event, ...args);
+    emitUserProcessEvent(event, ...args);
 export const addListener = on;
 export const removeListener = off;
 export const removeAllListeners = (event?: string | symbol): ProcessEventEmitter =>
@@ -1492,11 +1610,12 @@ export const setegid: (() => void) | undefined = hasCredentialApi ? setegidImpl 
 export const setgroups: (() => void) | undefined = hasCredentialApi ? setgroupsImpl : undefined;
 
 export function umask(mask?: number | string): number {
-    const prev = readUmask();
-    if (mask !== undefined) {
-        writeUmask(typeof mask === 'string' ? parseInt(mask, 8) : mask);
-    }
-    return prev;
+    const value = mask === undefined ? undefined : normalizeUmask(mask);
+    if (nativeUmask) return Reflect.apply(nativeUmask, processOs, value === undefined ? [] : [value]);
+
+    const previous = emulatedUmask;
+    if (value !== undefined) emulatedUmask = value & emulatedUmaskBits;
+    return previous;
 }
 
 export function nextTick(callback: NextTickCallback, ...args: unknown[]): void {
@@ -1511,9 +1630,9 @@ export let connected: boolean = false;
 
 export let channel: IPCChannel | null = null;
 
-export function kill(pid: number, signal?: string | number): boolean {
+export function kill(pid: number, signal?: string | number | null): boolean {
     try {
-        proc.kill(pid, normalizeSignal(signal));
+        proc.kill(normalizeKillPid(pid), normalizeSignal(signal));
     } catch (e) {
         throw normalizeErrnoError(e, 'kill');
     }
@@ -1564,6 +1683,11 @@ export function getActiveResourcesInfo(): string[] {
 }
 
 export function getBuiltinModule(id: string): NodeJS.Module | undefined {
+    if (typeof id !== 'string') {
+        throw codeError(new TypeError(
+            `The "id" argument must be of type string. Received ${String(id)}`,
+        ), 'ERR_INVALID_ARG_TYPE');
+    }
     try {
         return require(id) as NodeJS.Module;
     } catch {
@@ -1591,20 +1715,62 @@ export const throwDeprecation: boolean = false;
 export const traceDeprecation: boolean = false;
 export let noDeprecation: boolean | undefined = undefined;
 
-export function ref(maybeRefable: unknown): void { }
+export function ref(maybeRefable: unknown): void {
+    if (maybeRefable === null || maybeRefable === undefined) return;
+    const method = Reflect.get(Object(maybeRefable), 'ref');
+    if (typeof method === 'function') Reflect.apply(method, maybeRefable, []);
+}
 
-export function unref(maybeRefable: unknown): void { }
+export function unref(maybeRefable: unknown): void {
+    if (maybeRefable === null || maybeRefable === undefined) return;
+    const method = Reflect.get(Object(maybeRefable), 'unref');
+    if (typeof method === 'function') Reflect.apply(method, maybeRefable, []);
+}
 
 export function loadEnvFile(path?: string | URL): void {
-    const loaded = loadDotenvFile(path ?? '.env');
-    if (loaded === null) {
-        throw new Error(`Failed to load env file: ${path === undefined ? '.env' : String(path)}`);
+    const input: unknown = path;
+    let normalized: EnvFilePath;
+    if (input === undefined || input === null) {
+        normalized = '.env';
+    } else if (typeof input === 'string' || input instanceof Uint8Array) {
+        normalized = input;
+    } else if (input instanceof URL) {
+        if (input.protocol !== 'file:') {
+            throw codeError(new TypeError('The URL must be of scheme file'), 'ERR_INVALID_URL_SCHEME');
+        }
+        normalized = input;
+    } else {
+        throw codeError(new TypeError(
+            `The "path" argument must be of type string or an instance of Buffer or URL. Received ${String(input)}`,
+        ), 'ERR_INVALID_ARG_TYPE');
+    }
+
+    const errorPath = input === undefined || input === null ? '.env' : resolveEnvFilePath(normalized);
+    try {
+        loadNodeEnvFile(normalized);
+    } catch (e) {
+        const error = normalizeErrnoError(e, 'open', errorPath);
+        const code = Reflect.get(error, 'code');
+        const errno = Reflect.get(error, 'errno');
+        if (typeof code === 'string' && typeof errno === 'number') {
+            const detail = errMod.strerror(errno).replace(new RegExp(`^${code}:\\s*`), '');
+            error.message = `${code}: ${detail}, open '${errorPath}'`;
+        }
+        throw error;
     }
 }
 
-export const sourceMapsEnabled: boolean = true;
+export let sourceMapsEnabled: boolean = true;
 
-export function setSourceMapsEnabled(value: boolean): void { }
+export function setSourceMapsEnabled(value: boolean): void {
+    if (typeof value !== 'boolean') {
+        throw codeError(new TypeError(
+            `The "enabled" argument must be of type boolean. Received ${String(value)}`,
+        ), 'ERR_INVALID_ARG_TYPE');
+    }
+    sourceMapsEnabled = value;
+    Reflect.set(processDefault, 'sourceMapsEnabled', value);
+}
 
 export const domain: null = null;
 
@@ -1683,8 +1849,12 @@ export function threadCpuUsage(previousValue?: NodeJS.CpuUsage): NodeJS.CpuUsage
 }
 
 export function constrainedMemory(): number {
-    const mem = os.memoryUsage();
-    return mem["os.total"] || 0;
+    try {
+        const constrained = os.memoryUsage()['os.constrained'];
+        return typeof constrained === 'number' && constrained > 0 ? constrained : 0;
+    } catch {
+        return 0;
+    }
 }
 
 export function availableMemory(): number {
@@ -1692,10 +1862,23 @@ export function availableMemory(): number {
     return mem["os.free"] || 0;
 }
 
-export function setUncaughtExceptionCaptureCallback(cb: ((err: Error) => void) | null): void { }
+export function setUncaughtExceptionCaptureCallback(cb: ((err: Error) => void) | null): void {
+    if (cb !== null && typeof cb !== 'function') {
+        throw codeError(new TypeError(
+            `The "fn" argument must be of type function or null. Received ${String(cb)}`,
+        ), 'ERR_INVALID_ARG_TYPE');
+    }
+    if (cb !== null && uncaughtCaptureState.callback !== null) {
+        throw codeError(new Error(
+            '`process.setupUncaughtExceptionCapture()` was called while a capture callback was already active',
+        ), 'ERR_UNCAUGHT_EXCEPTION_CAPTURE_ALREADY_SET');
+    }
+    uncaughtCaptureState.callback = cb;
+    syncUncaughtCaptureListener();
+}
 
 export function hasUncaughtExceptionCaptureCallback(): boolean {
-    return false;
+    return uncaughtCaptureState.callback !== null;
 }
 
 export const traceProcessWarnings: boolean = false;
@@ -1797,6 +1980,18 @@ if (!existingProcessDefault && hasCredentialApi) Object.assign(processDefault, {
 if (existingProcessDefault) {
     Reflect.set(processDefault, 'versions', versions);
     Reflect.set(processDefault, 'report', report);
+    Reflect.set(processDefault, 'umask', umask);
+    Reflect.set(processDefault, 'getBuiltinModule', getBuiltinModule);
+    Reflect.set(processDefault, 'loadEnvFile', loadEnvFile);
+    Reflect.set(processDefault, 'ref', ref);
+    Reflect.set(processDefault, 'unref', unref);
+    Reflect.set(processDefault, 'setSourceMapsEnabled', setSourceMapsEnabled);
+    Reflect.set(processDefault, 'sourceMapsEnabled', sourceMapsEnabled);
+    Reflect.set(processDefault, 'kill', kill);
+    Reflect.set(processDefault, 'setUncaughtExceptionCaptureCallback', setUncaughtExceptionCaptureCallback);
+    Reflect.set(processDefault, 'hasUncaughtExceptionCaptureCallback', hasUncaughtExceptionCaptureCallback);
+    Reflect.set(processDefault, 'emit', emit);
+    Reflect.set(processDefault, 'constrainedMemory', constrainedMemory);
     // The named export was this copy's own proxy while globalThis.process.env
     // stayed the first copy's — identity-only, but `process.env === env` is a
     // documented Node invariant. Derive it from the live singleton.

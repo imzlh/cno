@@ -3,7 +3,7 @@ import pkg from "../../../package.json";
 import { getFetchHook, getUserAgentOverride, getExtraHTTPHeaders, getFetchInterceptHook, captureUserNetworkCallFrames, getCurlInitHook, type NetworkCallFrame } from "../../utils/network-hooks";
 import { type HttpClient } from "../../deno/07_http";
 import { Request } from "./request";
-import { Response } from "./response";
+import { Response, setResponseMetadata } from "./response";
 import { abortError, asyncfs, attachCurlDebugTrace, buildConnectionInfo, compressionAcceptEncoding, curlMod, engine, getCurlPool, isCurlTimeoutError, isNullBodyStatus, maxPendingBodyBytes, os, parseHeaders, prepareRequestBody, rawHeadersToHeaders, streamHighWaterMark, throwIfAborted, timeoutError, toCurlBody, truncateHookPostData } from "./helpers";
 import { isLocalFetchProtocol, loadLocalProtocol } from "./protocols";
 
@@ -170,7 +170,7 @@ export async function performFetch(request: Request, url: URL): Promise<Response
             status: localResponse.status,
             headers: localResponse.headers,
         });
-        Object.defineProperty(response, 'url', { value: localResponse.url });
+        setResponseMetadata(response, { url: localResponse.url, type: 'basic' });
         return response;
     }
     const preparedBody = await prepareRequestBody(request);
@@ -578,8 +578,11 @@ export async function performFetch(request: Request, url: URL): Promise<Response
 
         const result = new Response(bodyStream, { status, headers: responseHeaders });
         const finalUrl = readFinalUrl(curl, url.href);
-        Object.defineProperty(result, 'url', { value: finalUrl });
-        Object.defineProperty(result, 'redirected', { value: didRedirect || isRedirect || finalUrl !== url.href });
+        setResponseMetadata(result, {
+            url: finalUrl,
+            redirected: didRedirect || finalUrl !== url.href,
+            type: 'basic',
+        });
         return result;
     } catch (err) {
         abortCurl();

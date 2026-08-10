@@ -274,7 +274,23 @@ function utf8PrefixLength(bytes: Uint8Array, max: number): number {
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
-export const kMaxLength = 0xFFFFFFFF;           // 4 GiB - 1
+// `kMaxLength` is the largest size a single Buffer/ArrayBuffer can actually
+// reach, and it is enforced by the engine, not by policy: QuickJS's array
+// buffer constructor rejects `len > INT32_MAX` outright
+// (`deps/quickjs/quickjs.c`, "invalid array buffer length"), and its
+// `JSArrayBuffer` stores the length in an `int byte_length` field, so 2 GiB - 1
+// is structural. Measured on this engine: `Buffer.alloc`/`allocUnsafe`/
+// `new ArrayBuffer`/`new Uint8Array` all succeed at exactly 2147483647 and all
+// throw at 2147483648, with a ceiling-sized buffer still live — a hard cap, not
+// memory pressure.
+//
+// Node advertises `Number.MAX_SAFE_INTEGER` here, but node does not honour that
+// either: `Buffer.alloc(buffer.kMaxLength)` throws "Array buffer allocation
+// failed" on node v24 too. Node's number is an argument-validation bound. Ours
+// is that bound *and* an allocability promise, which is the stronger and more
+// useful contract: `if (n <= kMaxLength) Buffer.alloc(n)` is a guard that works
+// here, whereas against node's value it always passes and then throws.
+export const kMaxLength = 0x7FFFFFFF;            // 2 GiB - 1 (INT32_MAX)
 export const kStringMaxLength = 0x1FFFFFE8;      // (1 << 29) - 24
 export const constants = Object.freeze({
     MAX_LENGTH: kMaxLength,
@@ -1241,11 +1257,20 @@ function concatMemberError(list: readonly Uint8Array[], fallback: unknown): unkn
 
 function assertSize(size: number): void {
     if (typeof size !== 'number') invalidArgType('size', 'number', size);
-    // Node reports ERR_OUT_OF_RANGE against MAX_SAFE_INTEGER here (the
-    // kMaxLength check happens later, on allocation), and NaN lands in the same
-    // branch. Fractional sizes are accepted and truncated by the allocator.
-    if (Number.isNaN(size) || size < 0 || size > Number.MAX_SAFE_INTEGER) {
-        outOfRange('size', `>= 0 && <= ${Number.MAX_SAFE_INTEGER}`, size);
+    // Node validates against `kMaxLength` here (`validateNumber(size, 'size', 0,
+    // kMaxLength)`), and NaN lands in the same branch. Fractional sizes are
+    // accepted and truncated by the allocator.
+    //
+    // In node the bound and MAX_SAFE_INTEGER coincide, so the two readings are
+    // indistinguishable there; here they do not, and validating against
+    // `kMaxLength` is both the node-faithful choice and the useful one. Without
+    // it, a size above the engine's INT32_MAX ceiling escapes to QuickJS's array
+    // buffer constructor and surfaces as a bare `RangeError: invalid array
+    // buffer length` carrying no `code`, so a caller cannot catch it by code the
+    // way it would on node. Genuine allocation failure *below* the ceiling still
+    // comes from the engine, as on node.
+    if (Number.isNaN(size) || size < 0 || size > kMaxLength) {
+        outOfRange('size', `>= 0 && <= ${kMaxLength}`, size);
     }
 }
 

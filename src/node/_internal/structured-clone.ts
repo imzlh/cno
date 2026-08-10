@@ -47,6 +47,8 @@ const sharedArrayBufferByteLengthGetter = typeof SharedArrayBuffer === 'function
 const objectToString = Object.prototype.toString;
 const objectPrototype = Object.prototype;
 const arrayPrototype = Array.prototype;
+const objectGetPrototypeOf = Object.getPrototypeOf;
+const objectHasOwn = Object.prototype.hasOwnProperty;
 // ArrayBuffer.isView is slot-based and never throws, so it replaces a try/catch probe
 // outright. Guarded because it is the only non-throwing view predicate available and a
 // host without it must keep the old path.
@@ -63,11 +65,11 @@ const arrayBufferIsView = typeof ArrayBuffer.isView === 'function' ? ArrayBuffer
 // `Object.prototype.toString` answers the same question from internal slots, but only
 // when @@toStringTag is absent: @@toStringTag is user-settable, so
 // `{[Symbol.toStringTag]:'Map'}` reports `[object Map]` while being an ordinary object.
-// So the gate is `Symbol.toStringTag in value` FIRST -- a [[HasProperty]], which does not
-// invoke getters -- and `toString` runs only when that is false. That ordering is
-// load-bearing for FIDELITY, not just speed: Node never reads @@toStringTag (measured: a
-// spoofed tag getter records zero hits, and a throwing tag getter does not surface), so
-// calling toString unconditionally would run user code Node never runs.
+// So the gate checks the chain's own properties first (without invoking getters), and
+// `toString` runs only when no tag is present. A Proxy in that chain is detected and sent
+// through the old probes instead: a raw `in` check would invoke its `has` trap, while Node
+// never runs that user code during cloning. That ordering is load-bearing for FIDELITY,
+// not just speed: a spoofed tag getter must never surface.
 //
 // When the gate says "no @@toStringTag anywhere in the chain", the tag is derived purely
 // from internal slots and is authoritative for the boxed primitives -- it even survives
@@ -104,8 +106,19 @@ const TAG_BOOLEAN = '[object Boolean]';
 // Two `hasOwnProperty` calls measured 6.6us per object against 43.4us for reinstating the
 // two throwing probes, so the robust version is also the cheap one.
 function tagDispatchIsSound(): boolean {
-    return Object.prototype.hasOwnProperty.call(BigInt.prototype, Symbol.toStringTag)
-        && Object.prototype.hasOwnProperty.call(Symbol.prototype, Symbol.toStringTag);
+    return objectHasOwn.call(BigInt.prototype, Symbol.toStringTag)
+        && objectHasOwn.call(Symbol.prototype, Symbol.toStringTag);
+}
+
+/** Return false/true, or undefined when checking the chain could hit a Proxy. */
+function tagPropertyState(value: object): boolean | undefined {
+    let current: object | null = value;
+    while (current !== null) {
+        if (engine.isProxy(current)) return undefined;
+        if (objectHasOwn.call(current, Symbol.toStringTag)) return true;
+        current = objectGetPrototypeOf(current);
+    }
+    return false;
 }
 
 type TransferInput = readonly unknown[] | StructuredSerializeOptions | undefined;
@@ -803,7 +816,8 @@ function cloneValue<T, TPort extends object, TPortClone extends object>(
     // predicates below that are cheap and non-throwing (`engine.*`, `ArrayBuffer.isView`)
     // simply run unconditionally.
     let plainTag: string | undefined;
-    if (!(Symbol.toStringTag in value) && tagDispatchIsSound()) {
+    const tagState = tagPropertyState(value);
+    if (tagState === false && tagDispatchIsSound()) {
         plainTag = Reflect.apply(objectToString, value, []) as string;
     }
 

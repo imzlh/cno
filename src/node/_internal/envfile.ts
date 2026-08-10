@@ -3,6 +3,7 @@ const fs = import.meta.use('fs');
 const engine = import.meta.use('engine');
 
 export type EnvWarn = (message: string) => void;
+export type EnvFilePath = string | URL | Uint8Array;
 
 function safeGetEnv(name: string): string | undefined {
     try {
@@ -19,16 +20,20 @@ function pathFromUrl(url: URL): string {
     return decodeURIComponent(raw);
 }
 
-function pathFromStringOrUrl(path: string | URL): string {
-    return path instanceof URL ? pathFromUrl(path) : path;
+function pathFromStringOrUrl(path: EnvFilePath): string {
+    if (path instanceof URL) return pathFromUrl(path);
+    return path instanceof Uint8Array ? engine.decodeString(path) : path;
 }
 
-function resolveCwdPath(path: string | URL): string {
+export function resolveEnvFilePath(path: EnvFilePath): string {
     const value = pathFromStringOrUrl(path);
+    const isWindows = os.uname().sysname === 'Windows_NT';
+    if (/^[A-Za-z]:[\\/]/.test(value)) return isWindows ? value.replace(/\//g, '\\') : value;
     if (/^[a-z][a-z0-9+\-.]*:/i.test(value) && !value.startsWith('/')) return value;
     const normalized = value.replace(/\\/g, '/');
     if (normalized.startsWith('/')) return normalized;
-    return `${os.cwd}/${normalized}`;
+    const resolved = `${os.cwd}/${normalized}`;
+    return isWindows ? resolved.replace(/\//g, '\\') : resolved;
 }
 
 function expandEnv(value: string, vars: Record<string, string>): string {
@@ -88,9 +93,66 @@ function applyVars(vars: Record<string, string>): void {
     for (const key of Object.keys(vars)) os.setenv(key, vars[key]!);
 }
 
+function quotedValueEnd(value: string, quote: string): number {
+    for (let i = 0; i < value.length; i++) {
+        if (value[i] !== quote) continue;
+        let escapes = 0;
+        for (let j = i - 1; j >= 0 && value[j] === '\\'; j--) escapes++;
+        if (quote === "'" || escapes % 2 === 0) return i;
+    }
+    return -1;
+}
+
+function parseNodeEnvText(text: string): Record<string, string> {
+    const vars: Record<string, string> = {};
+    const lines = text.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').split('\n');
+    for (let i = 0; i < lines.length; i++) {
+        let raw = lines[i]!;
+        if (/^\s*export\s+/.test(raw)) raw = raw.replace(/^\s*export\s+/, '');
+        const match = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/.exec(raw);
+        if (!match) continue;
+
+        let value = match[2] ?? '';
+        const quote = value[0];
+        if (quote === '"' || quote === "'" || quote === '`') {
+            value = value.slice(1);
+            let end = quotedValueEnd(value, quote);
+            while (end === -1 && i + 1 < lines.length) {
+                value += `\n${lines[++i]}`;
+                end = quotedValueEnd(value, quote);
+            }
+            if (end !== -1) value = value.slice(0, end);
+            if (quote === '"') {
+                value = value.replace(/\\n/g, '\n').replace(/\\r/g, '\r')
+                    .replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+            }
+        } else {
+            const comment = value.indexOf('#');
+            if (comment !== -1) value = value.slice(0, comment);
+            value = value.trim();
+        }
+        vars[match[1]!] = value;
+    }
+    return vars;
+}
+
+function applyNodeVars(vars: Record<string, string>): void {
+    for (const key of Object.keys(vars)) {
+        if (safeGetEnv(key) === undefined) os.setenv(key, vars[key]!);
+    }
+}
+
+export function loadNodeEnvFile(path: EnvFilePath = '.env'): Record<string, string> {
+    const resolved = resolveEnvFilePath(path);
+    const text = engine.decodeString(fs.readFile(resolved));
+    const parsed = parseNodeEnvText(text);
+    applyNodeVars(parsed);
+    return parsed;
+}
+
 export function loadEnvFile(path: string | URL = '.env', warn?: EnvWarn, base: Record<string, string> = {}): Record<string, string> | null {
     const displayPath = pathFromStringOrUrl(path);
-    const resolved = resolveCwdPath(path);
+    const resolved = resolveEnvFilePath(path);
     try {
         const text = engine.decodeString(fs.readFile(resolved));
         const parsed = parseEnvText(text, displayPath, base, warn);

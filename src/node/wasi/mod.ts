@@ -7,6 +7,7 @@ const wasm = import.meta.use('wasm');
 const os = import.meta.use('os');
 const syncfs = import.meta.use('fs');
 const engine = import.meta.use('engine');
+const isWindowsHost = os.uname().sysname === 'Windows_NT';
 
 export interface WASIOptions {
     version?: string;
@@ -22,8 +23,17 @@ export interface WASIOptions {
 const WASI_MODULE = 'wasi_snapshot_preview1';
 type WasiBinding = (...args: never[]) => number;
 
+/*
+ * Build the error node throws for a given code. node uses TypeError for the
+ * argument-validation codes (ERR_INVALID_ARG_TYPE / ERR_INVALID_ARG_VALUE) and a
+ * plain Error for state codes like ERR_WASI_ALREADY_STARTED, so a caller writing
+ * `catch (e) { if (e instanceof TypeError) ... }` needs the same split.
+ */
 function createWasiError(code: string, message: string): Error & { code: string } {
-    return Object.assign(new Error(message), { code });
+    const err = code === 'ERR_INVALID_ARG_TYPE' || code === 'ERR_INVALID_ARG_VALUE'
+        ? new TypeError(message)
+        : new Error(message);
+    return Object.assign(err, { code });
 }
 
 function errorInfo(error: unknown): { code?: unknown; message?: unknown } {
@@ -43,6 +53,13 @@ function isReturnOnExit(error: unknown): boolean {
     return typeof info.message === 'string' && info.message.includes('exit');
 }
 
+/* WASI preview1 filetype enum. Directory is 3 and regular_file is 4; 2 is
+ * character_device. Using 2/3 for directory/file reported every regular file as
+ * a directory to the guest. */
+const WASI_FILETYPE_UNKNOWN = 0;
+const WASI_FILETYPE_DIRECTORY = 3;
+const WASI_FILETYPE_REGULAR_FILE = 4;
+
 /* WASI errnos used by the path-resolution guard. */
 const WASI_EBADF = 8;
 const WASI_ENOENT = 44;
@@ -52,10 +69,13 @@ const WASI_ENOTCAPABLE = 76;
 const FIRST_PREOPEN_FD = 3;
 
 function isAbsolutePath(p: string): boolean {
-    /* POSIX root, Windows drive letter, and UNC/backslash-root forms. */
+    /* POSIX root, Windows drive-qualified/drive-relative, and UNC forms. A
+     * drive-relative path such as C:secret is resolved against that drive's
+     * process cwd on Windows, so it is just as capable of escaping a preopen as
+     * C:\\secret and must not reach the host filesystem. */
     return p.startsWith('/')
         || p.startsWith('\\')
-        || /^[A-Za-z]:[\\/]/.test(p);
+        || /^[A-Za-z]:/.test(p);
 }
 
 /*
@@ -115,8 +135,10 @@ function canonicalisePrefix(p: string): string | null {
 }
 
 function normaliseForCompare(p: string): string {
-    /* Windows paths are case-insensitive and mix separators. */
-    return p.replace(/[\\/]+/g, '/').replace(/\/+$/, '').toLowerCase();
+    const normalised = p.replace(/[\\/]+/g, '/').replace(/\/+$/, '');
+    /* Windows paths are case-insensitive; POSIX paths are not. Lowercasing on
+     * POSIX could grant /jail access to a distinct /JAIL directory. */
+    return isWindowsHost ? normalised.toLowerCase() : normalised;
 }
 
 /*
@@ -143,6 +165,12 @@ export class WASI {
     private _started = false;
     /* dirfd -> { guest mount name, host directory }. Populated from _preopens. */
     private _preopenFds = new Map<number, { guestName: string; hostPath: string }>();
+    /* Guest fd -> host fd. Host fd numbers cannot be exposed directly: the host
+     * may return 3 for the first open while guest fd 3 is already a preopened
+     * directory. Keeping the namespaces separate prevents both capability
+     * confusion and accidental operations on arbitrary process descriptors. */
+    private _openFds = new Map<number, number>();
+    private _nextGuestFd = FIRST_PREOPEN_FD;
     public wasiImport: Record<string, WasiBinding>;
 
     private _bindMemory(instance: WebAssembly.Instance): void {
@@ -186,32 +214,60 @@ export class WASI {
     }
 
     private _startFallback(instance: WebAssembly.Instance): number {
-        try {
-            const startFn = instance.exports._start;
-            if (typeof startFn === 'function') {
-                try {
-                    startFn();
-                } catch (e: unknown) {
-                    if (this._returnOnExit && isReturnOnExit(e)) {
-                        const code = errorInfo(e).code;
-                        return typeof code === 'number' ? code : 0;
-                    }
-                    throw e;
+        const startFn = instance.exports._start;
+        if (typeof startFn === 'function') {
+            try {
+                startFn();
+            } catch (e: unknown) {
+                if (this._returnOnExit && isReturnOnExit(e)) {
+                    const code = errorInfo(e).code;
+                    return typeof code === 'number' ? code : 0;
                 }
+                throw e;
             }
-            return 0;
-        } catch {
-            return 0;
         }
+        return 0;
+    }
+
+    private _allocateGuestFd(hostFd: number): number {
+        let guestFd = this._nextGuestFd;
+        while (this._preopenFds.has(guestFd) || this._openFds.has(guestFd)) guestFd++;
+        this._nextGuestFd = guestFd + 1;
+        this._openFds.set(guestFd, hostFd);
+        return guestFd;
+    }
+
+    private _hostFdForRead(fd: number): number | undefined {
+        if (fd === 0) return this._stdin;
+        return this._openFds.get(fd);
+    }
+
+    private _hostFdForWrite(fd: number): number | undefined {
+        if (fd === 1) return this._stdout;
+        if (fd === 2) return this._stderr;
+        return this._openFds.get(fd);
+    }
+
+    private _isGrantedFd(fd: number): boolean {
+        return fd >= 0 && (fd <= 2 || this._preopenFds.has(fd) || this._openFds.has(fd));
     }
 
     private _closeFd(fd: number): number {
-        if (fd <= 2) return 0;
+        if (fd >= 0 && fd <= 2) return 0;
+        /* Only close a fd this instance actually handed out. syncfs.close() on an
+         * arbitrary integer reaches the UCRT _close(), which asserts on an
+         * out-of-range handle in a Debug build and is undefined behaviour in a
+         * Release one -- measured: fd_close(9999) printed
+         * "close.cpp(55) : Assertion failed: (fh >= 0 && ...)". */
+        const hostFd = this._openFds.get(fd);
+        if (hostFd === undefined) return WASI_EBADF;
         try {
-            syncfs.close(fd);
+            syncfs.close(hostFd);
+            this._openFds.delete(fd);
             return 0;
         } catch {
-            return 8;
+            this._openFds.delete(fd);
+            return WASI_EBADF;
         }
     }
 
@@ -234,6 +290,7 @@ export class WASI {
                 this._preopenFds.set(fd, { guestName, hostPath: this._preopens[guestName] });
                 fd++;
             }
+            this._nextGuestFd = fd;
         }
         this._returnOnExit = options?.returnOnExit ?? false;
         this._stdin = options?.stdin ?? os.STDIN_FILENO;
@@ -256,12 +313,25 @@ export class WASI {
         if (this._started) {
             throw createWasiError('ERR_WASI_ALREADY_STARTED', 'WASI instance has already started');
         }
-        this._started = true;
         if (!isWebAssemblyInstance(instance)) {
             throw createWasiError('ERR_INVALID_ARG_TYPE', 'The "instance" argument must be an instance of WebAssembly.Instance.');
         }
+        /* node validates the command-module contract before running anything:
+         * the instance must export a memory, and `_start` must be a function.
+         * Without these, a reactor module (no `_start`) reached callFunction and
+         * surfaced as the ordinary returnOnExit code 1 -- indistinguishable from
+         * a guest that really did exit 1. */
+        if (!(instance.exports.memory instanceof WebAssembly.Memory)) {
+            throw createWasiError('ERR_INVALID_ARG_TYPE', '"instance.exports.memory" property must be a WebAssembly.Memory object');
+        }
+        if (typeof instance.exports._start !== 'function') {
+            throw createWasiError('ERR_INVALID_ARG_TYPE', 'The "instance.exports._start" property must be of type function.');
+        }
         this._bindMemory(instance);
         const nativeInstance = this._getNativeInstance(instance);
+        /* Validation failures do not consume a WASI object. Mark it started only
+         * after the complete command-module contract and memory binding succeed. */
+        this._started = true;
         if (!nativeInstance) {
             return this._startFallback(instance);
         }
@@ -269,9 +339,9 @@ export class WASI {
             nativeInstance.callFunction('_start');
             return 0;
         } catch (e: unknown) {
-            if (this._returnOnExit) {
+            if (this._returnOnExit && isReturnOnExit(e)) {
                 const code = errorInfo(e).code;
-                return typeof code === 'number' ? code : 1;
+                return typeof code === 'number' ? code : 0;
             }
             throw e;
         }
@@ -284,16 +354,23 @@ export class WASI {
         if (!isWebAssemblyInstance(instance)) {
             throw createWasiError('ERR_INVALID_ARG_TYPE', 'The "instance" argument must be an instance of WebAssembly.Instance.');
         }
+        if (!(instance.exports.memory instanceof WebAssembly.Memory)) {
+            throw createWasiError('ERR_INVALID_ARG_TYPE', '"instance.exports.memory" property must be a WebAssembly.Memory object');
+        }
+        if (instance.exports._initialize !== undefined && typeof instance.exports._initialize !== 'function') {
+            throw createWasiError('ERR_INVALID_ARG_TYPE', 'The "instance.exports._initialize" property must be of type function.');
+        }
         this._bindMemory(instance);
         const nativeInstance = this._getNativeInstance(instance);
+        this._started = true;
         if (!nativeInstance) {
             const initFn = instance.exports._initialize;
             if (typeof initFn === 'function') initFn();
             return;
         }
-        try {
+        if (typeof instance.exports._initialize === 'function') {
             nativeInstance.callFunction('_initialize');
-        } catch {}
+        }
     }
 
     getImportObject(): Record<string, Record<string, WasiBinding>> {
@@ -312,60 +389,88 @@ export class WASI {
         const bindings: Record<string, WasiBinding> = {};
 
         bindings.fd_write = (fd: number, iovsPtr: number, iovsLen: number, nwrittenPtr: number): number => {
+            const hostFd = this._hostFdForWrite(fd);
+            if (hostFd === undefined) return WASI_EBADF;
             let written = 0;
-            for (let i = 0; i < iovsLen; i++) {
-                const ptr = this._u32(iovsPtr + i * 8);
-                const len = this._u32(iovsPtr + i * 8 + 4);
-                const data = this._bytes(ptr, len);
-                if (fd === 1 || fd === 2) {
-                    const target = fd === 1 ? this._stdout : this._stderr;
-                    syncfs.write(target, data);
-                } else {
-                    syncfs.write(fd, data);
+            try {
+                for (let i = 0; i < iovsLen; i++) {
+                    const ptr = this._u32(iovsPtr + i * 8);
+                    const len = this._u32(iovsPtr + i * 8 + 4);
+                    const data = this._bytes(ptr, len);
+                    syncfs.write(hostFd, data);
+                    written += len;
                 }
-                written += len;
+                this._wu32(nwrittenPtr, written);
+                return 0;
+            } catch {
+                return WASI_EBADF;
             }
-            this._wu32(nwrittenPtr, written);
-            return 0;
         };
         bindings.fd_read = (fd: number, iovsPtr: number, iovsLen: number, nreadPtr: number): number => {
+            const hostFd = this._hostFdForRead(fd);
+            if (hostFd === undefined) return WASI_EBADF;
             let totalRead = 0;
             const buf = new Uint8Array(65536);
-            for (let i = 0; i < iovsLen; i++) {
-                const ptr = this._u32(iovsPtr + i * 8);
-                const len = this._u32(iovsPtr + i * 8 + 4);
-                const targetBuf = buf.length >= len ? buf.subarray(0, len) : new Uint8Array(len);
-                const n = syncfs.read(fd, targetBuf);
-                if (n > 0) {
-                    this._bytes(ptr, n).set(targetBuf.subarray(0, n));
-                    totalRead += n;
+            /* fd 0 is the guest's stdin and must be served from the configured
+             * host descriptor, exactly as fd_write maps 1/2 onto _stdout and
+             * _stderr. Reading the raw fd 0 instead ignored options.stdin
+             * entirely: a redirected stdin returned 0 bytes with errno 0, so the
+             * guest saw a silent EOF rather than the data. */
+            try {
+                for (let i = 0; i < iovsLen; i++) {
+                    const ptr = this._u32(iovsPtr + i * 8);
+                    const len = this._u32(iovsPtr + i * 8 + 4);
+                    const targetBuf = buf.length >= len ? buf.subarray(0, len) : new Uint8Array(len);
+                    const n = syncfs.read(hostFd, targetBuf);
+                    if (n > 0) {
+                        this._bytes(ptr, n).set(targetBuf.subarray(0, n));
+                        totalRead += n;
+                    }
+                    if (n < len) break;
                 }
-                if (n < len) break;
+                this._wu32(nreadPtr, totalRead);
+                return 0;
+            } catch {
+                return WASI_EBADF;
             }
-            this._wu32(nreadPtr, totalRead);
-            return 0;
         };
         bindings.fd_close = (fd: number): number => {
             return this._closeFd(fd);
         };
-        bindings.fd_seek = (_fd: number, _offset: number | bigint, _whence: number, _newoffsetPtr: number): number => {
-            return 52; // ENOSYS
+        bindings.fd_seek = (fd: number, _offset: number | bigint, _whence: number, _newoffsetPtr: number): number => {
+            return this._isGrantedFd(fd) ? 52 : WASI_EBADF; // ENOSYS
         };
         bindings.fd_fdstat_get = (fd: number, statPtr: number): number => {
+            if (fd < 0) return WASI_EBADF;
             const memory = this._memoryView();
-            let filetype = 4;
-            if (fd > 2) {
+            /* A fd the guest was never granted must be EBADF. Returning 0 for
+             * every fd told the guest an arbitrary descriptor was open and left
+             * the stat buffer holding whatever was already in memory. */
+            let filetype: number;
+            if (fd <= 2) {
+                const hostFd = fd === 0 ? this._stdin : fd === 1 ? this._stdout : this._stderr;
                 try {
-                    const st = syncfs.fstat(fd);
-                    filetype = st.isDirectory ? 2 : 3;
-                } catch { filetype = 4; }
+                    const st = syncfs.fstat(hostFd);
+                    filetype = st.isDirectory
+                        ? WASI_FILETYPE_DIRECTORY
+                        : st.isFile ? WASI_FILETYPE_REGULAR_FILE : WASI_FILETYPE_UNKNOWN;
+                } catch { return WASI_EBADF; }
+            } else if (this._preopenFds.has(fd)) {
+                filetype = WASI_FILETYPE_DIRECTORY;
+            } else {
+                const hostFd = this._openFds.get(fd);
+                if (hostFd === undefined) return WASI_EBADF;
+                try {
+                    const st = syncfs.fstat(hostFd);
+                    filetype = st.isDirectory ? WASI_FILETYPE_DIRECTORY : WASI_FILETYPE_REGULAR_FILE;
+                } catch { return WASI_EBADF; }
             }
             memory.setUint8(statPtr, filetype);
             memory.setUint16(statPtr + 2, 0, true);
             return 0;
         };
         bindings.fd_fdstat_set_flags = (fd: number, flags: number): number => {
-            return 0; // no-op, acceptable for basic WASI
+            return this._isGrantedFd(fd) ? 0 : WASI_EBADF; // no-op for granted fds
         };
         bindings.environ_get = (environPtr: number, environBufPtr: number): number => {
             let offset = environBufPtr;
@@ -430,8 +535,15 @@ export class WASI {
                 if (oflags & 4) flag |= syncfs.OPEN_EXCL; // EXCLUSIVE
                 if (oflags & 8) flag |= syncfs.OPEN_TRUNC; // TRUNCATE
                 if (fdflags & 1) flag = syncfs.OPEN_APPEND | syncfs.OPEN_CREAT; // APPEND
-                const fd = syncfs.open(resolved.path, flag);
-                this._wu32(fdPtr, fd);
+                const hostFd = syncfs.open(resolved.path, flag);
+                const guestFd = this._allocateGuestFd(hostFd);
+                try {
+                    this._wu32(fdPtr, guestFd);
+                } catch (e) {
+                    this._openFds.delete(guestFd);
+                    try { syncfs.close(hostFd); } catch {}
+                    throw e;
+                }
                 return 0;
             } catch { return WASI_ENOENT; }
         };
@@ -444,7 +556,9 @@ export class WASI {
                 const memory = this._memoryView();
                 memory.setBigUint64(statPtr, BigInt(st.dev), true);
                 memory.setBigUint64(statPtr + 8, BigInt(st.ino), true);
-                memory.setUint8(statPtr + 16, st.isDirectory ? 2 : st.isFile ? 3 : 4); // filetype
+                memory.setUint8(statPtr + 16, st.isDirectory
+                    ? WASI_FILETYPE_DIRECTORY
+                    : st.isFile ? WASI_FILETYPE_REGULAR_FILE : WASI_FILETYPE_UNKNOWN); // filetype
                 memory.setBigUint64(statPtr + 24, BigInt(st.nlink), true);
                 memory.setBigUint64(statPtr + 32, BigInt(st.size), true);
                 memory.setBigUint64(statPtr + 40, BigInt(st.atim.getTime()) * 1000000n, true);

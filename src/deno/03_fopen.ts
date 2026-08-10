@@ -46,10 +46,17 @@ const toEpochMilliseconds = (t: number | bigint | Date) => {
 
 const seekPosition = (size: number, current: number, offset: number | bigint, whence: Deno.SeekMode): number => {
     const off = Number(offset);
-    if (whence === Deno.SeekMode.Start) return Math.max(0, off);
-    if (whence === Deno.SeekMode.Current) return Math.max(0, current + off);
-    if (whence === Deno.SeekMode.End) return Math.max(0, size + off);
-    throw new TypeError("Invalid seek mode");
+    let target: number;
+    if (whence === Deno.SeekMode.Start) target = off;
+    else if (whence === Deno.SeekMode.Current) target = current + off;
+    else if (whence === Deno.SeekMode.End) target = size + off;
+    else throw new TypeError("Invalid seek mode");
+
+    /* Deno rejects a seek that would place the cursor before byte zero. Do not
+     * clamp: clamping silently moves the cursor and can make a subsequent write
+     * overwrite the beginning of an otherwise unrelated file. */
+    if (target < 0) throw new Error("Cannot seek before the beginning of the file");
+    return target;
 };
 
 function assertUint8Array(value: unknown): asserts value is Uint8Array<ArrayBuffer> {

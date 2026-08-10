@@ -6,7 +6,13 @@ import { BOUNDARY_RE, Decoder, ensureFormDataContentType, engine, isBodyIterable
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 type ResponseBodySource = BodyInit | ReadableStream<Uint8Array> | Uint8Array | null;
 const allowSwitchingProtocols = Symbol('cno.response.switchingProtocols');
+const setResponseMetadataToken = Symbol('cno.response.setMetadata');
 type InternalResponseInit = ResponseInit & { [allowSwitchingProtocols]?: boolean };
+export interface InternalResponseMetadata {
+    type?: ResponseType;
+    url?: string;
+    redirected?: boolean;
+}
 
 function normalizeStatusText(value: unknown): string {
     const text = String(value);
@@ -50,16 +56,26 @@ export function getResponseInitiatorCallFrames(
 }
 
 export class Response implements globalThis.Response {
-    public readonly type: ResponseType;
-    public readonly url: string;
-    public readonly redirected: boolean;
-    public readonly status: number;
-    public readonly ok: boolean;
-    public readonly statusText: string;
-    public readonly headers: Headers;
-    public readonly body: ReadableStream<Uint8Array> | null;
-    public bodyUsed: boolean = false;
-    private _bodyBuffer: Uint8Array | null = null;
+    #type: ResponseType = 'default';
+    #url = '';
+    #redirected = false;
+    #status = 200;
+    #ok = true;
+    #statusText = '';
+    #headers!: Headers;
+    #body: ReadableStream<Uint8Array> | null = null;
+    #bodyUsed = false;
+    #bodyBuffer: Uint8Array | null = null;
+
+    get type(): ResponseType { return this.#type; }
+    get url(): string { return this.#url; }
+    get redirected(): boolean { return this.#redirected; }
+    get status(): number { return this.#status; }
+    get ok(): boolean { return this.#ok; }
+    get statusText(): string { return this.#statusText; }
+    get headers(): Headers { return this.#headers; }
+    get body(): ReadableStream<Uint8Array> | null { return this.#body; }
+    get bodyUsed(): boolean { return this.#bodyUsed; }
 
     constructor(body?: unknown, init?: ResponseInit) {
         if (init !== undefined && init !== null && typeof init !== 'object') {
@@ -74,17 +90,14 @@ export class Response implements globalThis.Response {
         if (body !== undefined && body !== null && isNullBodyStatus(status)) {
             throw new TypeError(`Response with status ${status} cannot have body`);
         }
-        this.status = status;
-        this.statusText = init?.statusText === undefined ? '' : normalizeStatusText(init.statusText);
-        this.ok = this.status >= 200 && this.status < 300;
-        this.type = 'default';
-        this.url = '';
-        this.redirected = false;
-        this.headers = new Headers(init?.headers);
+        this.#status = status;
+        this.#statusText = init?.statusText === undefined ? '' : normalizeStatusText(init.statusText);
+        this.#ok = status >= 200 && status < 300;
+        this.#headers = new Headers(init?.headers);
         const inferredType = bodyContentType(body);
-        if (inferredType && !this.headers.has('content-type')) this.headers.set('content-type', inferredType);
-        const formDataBoundary = body instanceof FormData ? ensureFormDataContentType(this.headers) : undefined;
-        this.body = (body !== undefined && body !== null) ? this.trackBodyStream(this.createBodyStream(body, formDataBoundary)) : null;
+        if (inferredType && !this.#headers.has('content-type')) this.#headers.set('content-type', inferredType);
+        const formDataBoundary = body instanceof FormData ? ensureFormDataContentType(this.#headers) : undefined;
+        this.#body = (body !== undefined && body !== null) ? this.trackBodyStream(this.createBodyStream(body, formDataBoundary)) : null;
     }
 
     private createBodyStream(bodyInit: unknown, formDataBoundary?: string): ReadableStream<Uint8Array> {
@@ -128,7 +141,7 @@ export class Response implements globalThis.Response {
     }
 
     private trackBodyStream(stream: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
-        const markUsed = () => { this.bodyUsed = true; };
+        const markUsed = () => { this.#bodyUsed = true; };
         const getReader = stream.getReader.bind(stream);
         // Keep the unpatched method for clone(): tee() acquires its source reader
         // through this public property, so without this the clone's pulls would run
@@ -157,38 +170,39 @@ export class Response implements globalThis.Response {
     }
 
     clone(): Response {
-        if (this.bodyUsed) throw new TypeError('Already read');
-        let clonedBody: ResponseBodySource = this._bodyBuffer;
-        if (clonedBody === null && this.body) {
+        if (this.#bodyUsed) throw new TypeError('Already read');
+        let clonedBody: ResponseBodySource = this.#bodyBuffer;
+        if (clonedBody === null && this.#body) {
             // teeUntracked, not this.body.tee(): a tracked tee would attribute BOTH
             // branches' pulls to this response, so reading the clone marked the
             // original consumed and the original then threw "Already read" with its
             // bytes intact. Each branch is tracked separately just below.
-            const [s1, s2] = teeUntracked(this.body);
-            Object.defineProperty(this, 'body', {
-                value: this.trackBodyStream(s1),
-                writable: false,
-                configurable: true,
-            });
+            const [s1, s2] = teeUntracked(this.#body);
+            this.#body = this.trackBodyStream(s1);
             clonedBody = s2;
         }
-        const r = new Response(clonedBody, { status: this.status, statusText: this.statusText, headers: this.headers });
-        Object.defineProperty(r, 'type', { value: this.type });
-        Object.defineProperty(r, 'url', { value: this.url });
-        Object.defineProperty(r, 'redirected', { value: this.redirected });
-        Object.defineProperty(r, 'ok', { value: this.ok });
+        const r = new Response(clonedBody, {
+            status: this.#status === 0 ? 200 : this.#status,
+            statusText: this.#statusText,
+            headers: this.#headers,
+        });
+        r.#status = this.#status;
+        r.#ok = this.#ok;
+        r.#type = this.#type;
+        r.#url = this.#url;
+        r.#redirected = this.#redirected;
         setResponseInitiatorCallFrames(r, getResponseInitiatorCallFrames(this));
         return r;
     }
 
     async bytes(): Promise<Uint8Array> {
-        if (this.bodyUsed) throw new TypeError('Already read');
-        this.bodyUsed = true;
-        if (this._bodyBuffer) return this._bodyBuffer;
-        if (!this.body) return new Uint8Array(0);
+        if (this.#bodyUsed) throw new TypeError('Already read');
+        this.#bodyUsed = true;
+        if (this.#bodyBuffer) return this.#bodyBuffer;
+        if (!this.#body) return new Uint8Array(0);
 
         const chunks: Uint8Array[] = [];
-        const reader = this.body.getReader();
+        const reader = this.#body.getReader();
         try {
             while (true) {
                 const { done, value } = await reader.read();
@@ -199,8 +213,8 @@ export class Response implements globalThis.Response {
         } finally {
             reader.releaseLock();
         }
-        this._bodyBuffer = mergeChunks(chunks);
-        return this._bodyBuffer;
+        this.#bodyBuffer = mergeChunks(chunks);
+        return this.#bodyBuffer;
     }
     arrayBuffer(): Promise<ArrayBuffer> { return this.bytes().then(bytesToArrayBuffer); }
     async blob(): Promise<Blob> { return new Blob([await this.arrayBuffer()], { type: this.headers.get('content-type') || '' }); }
@@ -224,9 +238,9 @@ export class Response implements globalThis.Response {
     }
     static error(): Response {
         const r = new Response(null);
-        Object.defineProperty(r, 'status', { value: 0 });
-        Object.defineProperty(r, 'ok', { value: false });
-        Object.defineProperty(r, 'type', { value: 'error' });
+        r.#status = 0;
+        r.#ok = false;
+        r.#type = 'error';
         Headers.setGuard(r.headers, 'immutable');
         return r;
     }
@@ -237,7 +251,6 @@ export class Response implements globalThis.Response {
         if (!/^[A-Za-z][A-Za-z\d+.-]*:/.test(rawUrl)) throw new TypeError(`Failed to parse URL from ${rawUrl}`);
         const location = new URL(rawUrl).href;
         const r = new Response(null, { status, headers: { Location: location } });
-        Object.defineProperty(r, 'type', { value: 'default' });
         Headers.setGuard(r.headers, 'immutable');
         return r;
     }
@@ -249,6 +262,18 @@ export class Response implements globalThis.Response {
         if (!headers.has('content-type')) headers.set('content-type', 'application/json');
         return new Response(body, { ...init, headers });
     }
+
+    [setResponseMetadataToken](metadata: InternalResponseMetadata): void {
+        if (metadata.type !== undefined) this.#type = metadata.type;
+        if (metadata.url !== undefined) this.#url = metadata.url;
+        if (metadata.redirected !== undefined) this.#redirected = metadata.redirected;
+    }
+
+    get [Symbol.toStringTag](): string { return 'Response'; }
+}
+
+export function setResponseMetadata(response: Response, metadata: InternalResponseMetadata): void {
+    response[setResponseMetadataToken](metadata);
 }
 
 export function createSwitchingProtocolsResponse(init: ResponseInit): Response {

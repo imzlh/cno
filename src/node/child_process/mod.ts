@@ -251,6 +251,19 @@ function validateMaxBuffer(maxBuffer: unknown): void {
     }
 }
 
+// Node validates timeout eagerly for both async and sync entry points. A bad
+// value must not silently disable the only deadline guarding a child process.
+function validateTimeout(timeout: unknown): void {
+    if (timeout === undefined || timeout === null) return;
+    if (typeof timeout !== 'number' || !Number.isInteger(timeout) || timeout < 0) {
+        const received = typeof timeout === 'string' ? `'${timeout}'` : String(timeout);
+        throw Object.assign(
+            new RangeError(`The value of "timeout" is out of range. It must be an unsigned integer. Received ${received}`),
+            { code: 'ERR_OUT_OF_RANGE' },
+        );
+    }
+}
+
 function validateStdio(stdio: SpawnOptions['stdio']): void {
     if (stdio === undefined) return;
     if (!Array.isArray(stdio)) {
@@ -1301,6 +1314,7 @@ export function spawn(command: string, argsOrOptions?: string[] | SpawnOptions, 
     // spawned. Previously every unknown value fell through to 'inherit'.
     validateStdio(opts.stdio);
     validateStdioFdRedirects(opts.stdio);
+    validateTimeout(opts.timeout);
 
     // CVE-2024-27980: refuse a direct .bat/.cmd spawn (see isBatchFileCommand).
     // Must precede the shell rewrite, which would turn `command` into cmd.exe.
@@ -1705,6 +1719,7 @@ export function spawnSync(command: string, argsOrOptions?: string[] | SpawnOptio
     validateStdio(optsSource.stdio);
     validateStdioFdRedirects(optsSource.stdio);
     validateMaxBuffer(optsSource.maxBuffer);
+    validateTimeout(optsSource.timeout);
 
     // Node validates the encoding up front and throws ERR_UNKNOWN_ENCODING out of
     // spawnSync itself (measured on v24.18: `encoding:'bogus-enc'` throws, it is

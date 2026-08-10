@@ -151,50 +151,19 @@ function sqliteError(e: unknown): unknown {
     return Object.defineProperties(e, shape);
 }
 
-/** 2**63, exactly representable as a double: the int64 magnitude ceiling. */
-const INT64_ABS_LIMIT = 9223372036854775808;
-
-/**
- * Could this number have come out of an INTEGER column? Every int64 lies within
- * ±2**63, so a larger integral double (1e300 and friends) must be a REAL and is
- * left alone. The binding does not expose sqlite3_column_type, so the column's
- * declared affinity is genuinely unavailable here.
- */
-function isPlausibleInt64(value: number): boolean {
-    return Number.isInteger(value) && Math.abs(value) <= INT64_ABS_LIMIT;
-}
-
-/**
- * Default (readBigInts off) path. Node throws ERR_OUT_OF_RANGE for any INTEGER
- * column outside ±2**53 — including -2**63, which is exactly representable as a
- * double but still not a safe integer.
- */
-function isUnsafeInt64(value: number): boolean {
-    return !Number.isSafeInteger(value) && isPlausibleInt64(value);
-}
-
-/**
- * readBigInts path: the value whose double *cannot* be the int64 that was
- * stored, because the C binding reads int64 through JS_NewInt64 and narrows to
- * double. -2**63 is the one unsafe magnitude that survives exactly (INT64_MIN),
- * so it is excluded; a positive 2**63 cannot be a valid int64 at all and is
- * therefore a rounded-up INT64_MAX.
- */
-function isCorruptInt64(value: number): boolean {
-    return isUnsafeInt64(value) && value !== -INT64_ABS_LIMIT;
-}
-
-function throwOutOfRange(value: number): never {
+function throwOutOfRange(value: unknown): never {
     throw Object.assign(
         new RangeError(`Value is too large to be represented as a JavaScript number: ${value}`),
         { code: 'ERR_OUT_OF_RANGE' },
     );
 }
 
-function optionalBoolean(options: Record<string, unknown>, name: string): boolean {
-    const value = options[name];
+function optionalBoolean(options: object, name: string): boolean {
+    const value = Reflect.get(options, name);
     if (value !== undefined && typeof value !== 'boolean') {
-        throw new TypeError(`The "options.${name}" argument must be of type boolean`);
+        throw Object.assign(new TypeError(`The "options.${name}" argument must be of type boolean.`), {
+            code: 'ERR_INVALID_ARG_TYPE',
+        });
     }
     return value === true;
 }
@@ -278,6 +247,15 @@ function scanNamedParameters(sql: string): Set<string> {
     return params;
 }
 
+/** True only for statements that can produce result rows, so metadata never steps
+ *  DML. `WITH` is included only when it does not wrap an INSERT/UPDATE/DELETE. */
+function canYieldRows(sql: string): boolean {
+    const s = sql.replace(/^\s*(?:--[^\n]*\n|\/\*[\s\S]*?\*\/|\s)+/g, '').trimStart().toUpperCase();
+    if (/^(SELECT|VALUES|PRAGMA|EXPLAIN)\b/.test(s)) return true;
+    if (/^WITH\b/.test(s)) return !/\b(INSERT|UPDATE|DELETE)\b/.test(s);
+    return false;
+}
+
 export class StatementSync {
     private returnArrays = false;
     private readBigInts = false;
@@ -312,12 +290,14 @@ export class StatementSync {
     run(...anonymousParameters: unknown[]): RunResult {
         this.assertUsable();
         runStmt(this.stmt, this.normalizeParams(paramsFrom(anonymousParameters)));
-        const rowid = nativeCall(() => this.db.raw().lastInsertRowid());
+        const rowid = nativeCall(() => this.db.raw().lastInsertRowid(this.readBigInts));
         return {
             changes: nativeCall(() => this.db.raw().changes()),
             // Same narrowing as convertCell: only an exact integer may be widened.
             lastInsertRowid: this.readBigInts
-                ? (Number.isSafeInteger(rowid) ? BigInt(rowid) : throwOutOfRange(rowid))
+                ? (typeof rowid === 'bigint'
+                    ? rowid
+                    : Number.isSafeInteger(rowid) ? BigInt(rowid) : throwOutOfRange(rowid))
                 : rowid,
         };
     }
@@ -343,26 +323,72 @@ export class StatementSync {
 
     columns(): StatementColumnMetadata[] {
         this.assertUsable();
-        const row = this.get();
-        if (!row) return [];
-        const names = Array.isArray(row) ? row.map((_, index: number) => String(index)) : Object.keys(row);
-        return names.map(name => ({ name }));
+        // Metadata must never execute the statement: deriving it via this.get()
+        // stepped the statement, so `prepare('DELETE FROM t').columns()` deleted
+        // every row. The native `columnNames()` added for this is NOT in the
+        // shipped binary yet (grep -a on build/stage/cno.exe: 0 hits, while
+        // `prepare` gives 19), so calling it unconditionally throws
+        // "TypeError: not a function" and regresses columns() from destructive to
+        // broken. Prefer it when present, and otherwise fall back to a non-
+        // stepping shape: Node returns [] for statements that cannot yield rows,
+        // which is what a DML statement is.
+        const stmt = this.stmt as unknown as {
+            columnNames?: () => string[];
+            step?: () => unknown;
+            reset?: () => void;
+        };
+        if (typeof stmt.columnNames === 'function') {
+            return stmt.columnNames().map(name => ({ name }));
+        }
+        // Fallback for the shipped binary. Only a statement that can yield rows is
+        // stepped, and it is immediately reset, so the cursor is rewound and no DML
+        // side effect can occur. DML is never stepped at all: Node returns [] for
+        // statements with no result columns, so that path is node-correct rather
+        // than merely safe.
+        if (!canYieldRows(this.sourceSQL)) return [];
+        const first = this.get();
+        try {
+            return first === undefined ? [] : Object.keys(first as object).map(name => ({ name }));
+        } finally {
+            stmt.reset?.();
+        }
     }
 
     setReadBigInts(enabled: boolean): void {
-        this.readBigInts = !!enabled;
+        if (typeof enabled !== 'boolean') {
+            throw Object.assign(new TypeError('The "readBigInts" argument must be a boolean.'), {
+                code: 'ERR_INVALID_ARG_TYPE',
+            });
+        }
+        this.readBigInts = enabled;
+        nativeCall(() => this.stmt.setReadBigInts(enabled));
     }
 
     setReturnArrays(enabled: boolean): void {
-        this.returnArrays = !!enabled;
+        if (typeof enabled !== 'boolean') {
+            throw Object.assign(new TypeError('The "returnArrays" argument must be a boolean.'), {
+                code: 'ERR_INVALID_ARG_TYPE',
+            });
+        }
+        this.returnArrays = enabled;
     }
 
     setAllowBareNamedParameters(enabled: boolean): void {
-        this.allowBareNamedParameters = !!enabled;
+        if (typeof enabled !== 'boolean') {
+            throw Object.assign(new TypeError('The "allowBareNamedParameters" argument must be a boolean.'), {
+                code: 'ERR_INVALID_ARG_TYPE',
+            });
+        }
+        this.allowBareNamedParameters = enabled;
     }
 
     setAllowUnknownNamedParameters(enabled: boolean): void {
-        this.allowUnknownNamedParameters = !!enabled;
+        if (typeof enabled !== 'boolean') {
+            throw Object.assign(new TypeError('The "enabled" argument must be a boolean.'), {
+                code: 'ERR_INVALID_ARG_TYPE',
+            });
+        }
+        this.allowUnknownNamedParameters = enabled;
     }
 
     get expandedSQL(): string {
@@ -378,44 +404,17 @@ export class StatementSync {
     }
 
     private convertCell(value: unknown): unknown {
-        // Forward-compatible with the proposed mod_sqlite3.c fix (see the
-        // DIVERGENCE note below): once the binding hands large int64 columns to
-        // TS as a BigInt instead of a narrowed double, this is the branch that
-        // keeps parity — without it, readBigInts=false would start returning
-        // BigInts where Node throws.
         if (typeof value === 'bigint') {
             if (this.readBigInts) return value;
             if (value >= BigInt(Number.MIN_SAFE_INTEGER) && value <= BigInt(Number.MAX_SAFE_INTEGER)) {
                 return Number(value);
             }
-            throwOutOfRange(value as unknown as number);
+            throwOutOfRange(value);
         }
-        if (typeof value !== 'number') return value;
-        if (!this.readBigInts) {
-            if (isUnsafeInt64(value)) throwOutOfRange(value);
-            return value;
-        }
-        // DIVERGENCE, deliberate: Node returns the exact BigInt here because its
-        // binding never narrows through a double. cno's does, so for a value
-        // past 2**53 the low bits are already gone and BigInt() would mint a
-        // confidently wrong number (measured: INT64_MAX read back as ...808).
-        // Throwing is the only honest option until mod_sqlite3.c hands TS the
-        // int64 unnarrowed; a loud RangeError beats silent corruption.
-        if (isCorruptInt64(value)) throwOutOfRange(value);
-        return isPlausibleInt64(value) ? BigInt(value) : value;
+        return value;
     }
 
     private convertRow(row: SqliteRow): SqliteRow {
-        // The range check has to run even when readBigInts is off — that is the
-        // path Node throws ERR_OUT_OF_RANGE on — so this can no longer early-out.
-        if (!this.readBigInts) {
-            if (Array.isArray(row)) {
-                for (const value of row) this.convertCell(value);
-            } else if (row && typeof row === 'object') {
-                for (const key of Object.keys(row)) this.convertCell(row[key]);
-            }
-            return row;
-        }
         if (Array.isArray(row)) return row.map(value => this.convertCell(value));
         if (!row || typeof row !== 'object') return row;
 
@@ -474,10 +473,14 @@ export class StatementSync {
 export class DatabaseSync {
     private handle: Sqlite3Handle | null = null;
     private readonly dbPath: string;
+    private readonly allowExtension: boolean;
+    private extensionLoadingEnabled: boolean;
     private mainLocation: string | null = null;
 
     constructor(location: DatabaseLocation, options: DatabaseSyncOptions = {}) {
         this.dbPath = normalizeLocation(location);
+        this.allowExtension = optionalBoolean(options, 'allowExtension');
+        this.extensionLoadingEnabled = this.allowExtension;
         if (options.open === false) return;
         this.open(options.readOnly ? native.O_READONLY : DEFAULT_FLAGS);
         if (options.enableForeignKeyConstraints !== false) {
@@ -635,10 +638,32 @@ export class DatabaseSync {
         unsupported('DatabaseSync.applyChangeset');
     }
 
-    enableLoadExtension(_allow: boolean): void {}
+    enableLoadExtension(allow: boolean): void {
+        if (typeof allow !== 'boolean') {
+            throw Object.assign(new TypeError('The "allow" argument must be a boolean.'), {
+                code: 'ERR_INVALID_ARG_TYPE',
+            });
+        }
+        this.raw();
+        if (allow && !this.allowExtension) {
+            throw Object.assign(new Error('Cannot enable extension loading because it was disabled at database creation.'), {
+                code: 'ERR_INVALID_STATE',
+            });
+        }
+        this.extensionLoadingEnabled = allow;
+    }
 
     loadExtension(path: string, entryPoint?: string): void {
-        nativeCall(() => this.raw().loadExtension(path, entryPoint));
+        const handle = this.raw();
+        if (!this.extensionLoadingEnabled) {
+            throw Object.assign(new Error('extension loading is not allowed'), { code: 'ERR_INVALID_STATE' });
+        }
+        if (typeof handle.loadExtension !== 'function') {
+            throw Object.assign(new Error('SQLite extension loading is not available in this runtime build'), {
+                code: 'ERR_FEATURE_UNAVAILABLE_ON_PLATFORM',
+            });
+        }
+        nativeCall(() => handle.loadExtension(path, entryPoint));
     }
 
     raw(): Sqlite3Handle {

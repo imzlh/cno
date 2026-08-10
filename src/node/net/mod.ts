@@ -468,7 +468,7 @@ type NativeReadResult = Uint8Array<ArrayBuffer> | null | undefined;
 type NativeReadError = CModuleError.Error | undefined;
 
 function initSocket(self: Socket, options?: SocketConstructorOpts): void {
-    Duplex.call(self, { allowHalfOpen: options?.allowHalfOpen });
+    Duplex.call(self, { allowHalfOpen: options?.allowHalfOpen ?? false });
 
     self._tcp = null;
     self._stream = null;
@@ -1308,6 +1308,8 @@ export interface Server extends EventEmitter {
 
     maxConnections?: number;
     connections: number;
+    allowHalfOpen: boolean;
+    pauseOnConnect: boolean;
     readonly listening: boolean;
 
     listen(port?: number, hostname?: string, backlog?: number, listeningListener?: () => void): this;
@@ -1343,6 +1345,12 @@ function initServer(self: Server, options?: ServerOpts | ((socket: Socket) => vo
     self._maxConnections = 0;
     self._allowHalfOpen = false;
     self._pauseOnConnect = false;
+    // Node mirrors both onto the Server as public readable properties. They were
+    // `undefined` here, which reads as "not half-open" only by accident and
+    // fails an `=== false` check. Set alongside the private flags so the two can
+    // never drift, including on the createServer(cb) and no-options paths.
+    self.allowHalfOpen = false;
+    self.pauseOnConnect = false;
     self._keepAlive = false;
     self._keepAliveDelay = 0;
     self._noDelay = false;
@@ -1364,6 +1372,8 @@ function initServer(self: Server, options?: ServerOpts | ((socket: Socket) => vo
         self._keepAlive = options.keepAlive ?? false;
         self._keepAliveDelay = options.keepAliveInitialDelay ?? 0;
         self._noDelay = options.noDelay ?? false;
+        self.allowHalfOpen = self._allowHalfOpen;
+        self.pauseOnConnect = self._pauseOnConnect;
         if (options.signal) {
             const closeOnAbort = () => {
                 if (self._listening) self.close();
@@ -1502,7 +1512,14 @@ Server.prototype.listen = function listen(
     const explicitPipePath = forcePipePath;
     forcePipePath = false;
 
-    if (portOrPathOrOptions === undefined || portOrPathOrOptions === null) {
+    if (typeof portOrPathOrOptions === 'function') {
+        // listen(cb): Node's normalizeArgs peels a leading callback and binds an
+        // ephemeral port. cno previously fell through to the object/path branch,
+        // which DID listen but never registered the callback — the server came
+        // up while the caller's readiness handler silently never ran.
+        listeningListener = portOrPathOrOptions as () => void;
+        portOrPathOrOptions = 0;
+    } else if (portOrPathOrOptions === undefined || portOrPathOrOptions === null) {
         portOrPathOrOptions = 0;
     } else if (
         typeof portOrPathOrOptions === 'string'
@@ -1848,33 +1865,92 @@ function parseIpv6(address: string): bigint | null {
 }
 
 function parseBlockListAddress(address: string, type?: string): { family: BlockListFamily; value: bigint; normalized: string } {
-    const requested = type?.toLowerCase();
-    if (requested !== undefined && requested !== 'ipv4' && requested !== 'ipv6') {
-        throw new TypeError('The "type" argument must be either "ipv4" or "ipv6"');
+    // Node's `type` parameter DEFAULTS TO 'ipv4' — it does not auto-detect the
+    // family. Measured on node v24.18.0: addAddress('::1') with no type throws
+    // ERR_INVALID_ADDRESS, and check('::1') with no type is false even when a
+    // matching IPv6 rule exists. cno auto-detected, which silently installed
+    // rules node rejects and answered true where node answers false.
+    if (type !== undefined && typeof type !== 'string') {
+        const received = type === null ? 'null' : `type ${typeof type} (${String(type)})`;
+        throw Object.assign(
+            new TypeError(`The "family" argument must be of type string. Received ${received}`),
+            { code: 'ERR_INVALID_ARG_TYPE' },
+        );
+    }
+    const requested = (type ?? 'ipv4').toLowerCase();
+    if (requested !== 'ipv4' && requested !== 'ipv6') {
+        throw Object.assign(
+            new TypeError('The "type" argument must be either "ipv4" or "ipv6"'),
+            { code: 'ERR_INVALID_ARG_VALUE' },
+        );
     }
 
-    const text = String(address);
+    if (typeof address !== 'string') {
+        const received = address === null ? 'null' : `type ${typeof address} (${String(address)})`;
+        throw Object.assign(
+            new TypeError(`The "address" argument must be of type string. Received ${received}`),
+            { code: 'ERR_INVALID_ARG_TYPE' },
+        );
+    }
+    const text = address;
     const ipv4 = parseIpv4(text);
     if (ipv4 !== null) {
-        if (requested === 'ipv6') throw new TypeError('Address family mismatch');
+        if (requested === 'ipv6') throw invalidAddressError();
         return { family: 'ipv4', value: ipv4, normalized: text };
     }
 
     const ipv6 = parseIpv6(text);
     if (ipv6 !== null) {
-        if (requested === 'ipv4') throw new TypeError('Address family mismatch');
+        if (requested === 'ipv4') throw invalidAddressError();
         return { family: 'ipv6', value: ipv6, normalized: text.toLowerCase() };
     }
 
-    throw new TypeError('Invalid IP address');
+    throw invalidAddressError();
 }
 
 function blockListMaxBits(family: BlockListFamily): number {
     return family === 'ipv4' ? 32 : 128;
 }
 
+// Node tags both of these; a bare TypeError/RangeError leaves callers that
+// branch on err.code unable to tell a bad address from any other failure.
+function invalidAddressError(): TypeError {
+    return Object.assign(new TypeError('Invalid IP address'), { code: 'ERR_INVALID_ADDRESS' });
+}
+
 function blockListLabel(family: BlockListFamily): string {
     return family === 'ipv4' ? 'IPv4' : 'IPv6';
+}
+
+// An IPv4-mapped IPv6 address is exactly the ::ffff:0:0/96 prefix. Measured
+// against node v24.18.0: rules are stored verbatim (`bl.rules` keeps the family
+// and spelling it was given), and the mapped/plain equivalence is resolved at
+// CHECK time, in BOTH directions:
+//   addAddress('1.2.3.4')            + check('::ffff:1.2.3.4','ipv6') -> true
+//   addAddress('::ffff:1.2.3.4','ipv6') + check('1.2.3.4','ipv4')     -> true
+// and identically for addRange and addSubnet, including the range edges. A
+// *pure* v6 rule (2001:db8::1) checked with a v4 address stays false, so the
+// equivalence applies only to the mapped prefix and must not be widened.
+// BlockList exists solely for access control, so a miss here is a bypass: a
+// blocked IPv4 peer reconnecting over IPv6 presents the mapped form.
+const V4_MAPPED_LOW = 0xffff00000000n;
+const V4_MAPPED_HIGH = 0xffffffffffffn;
+
+/**
+ * Every (family, value) pair a checked address must be tested under: itself,
+ * plus its counterpart across the v4-mapped boundary when one exists.
+ */
+function blockListCandidates(
+    family: BlockListFamily,
+    value: bigint,
+): Array<{ family: BlockListFamily; value: bigint }> {
+    if (family === 'ipv4') {
+        return [{ family, value }, { family: 'ipv6', value: V4_MAPPED_LOW | value }];
+    }
+    if (value >= V4_MAPPED_LOW && value <= V4_MAPPED_HIGH) {
+        return [{ family, value }, { family: 'ipv4', value: value & 0xffffffffn }];
+    }
+    return [{ family, value }];
 }
 
 export class BlockList {
@@ -1893,8 +1969,13 @@ export class BlockList {
     addRange(start: string, end: string, type?: string): void {
         const from = parseBlockListAddress(start, type);
         const to = parseBlockListAddress(end, type);
-        if (from.family !== to.family) throw new TypeError('Address family mismatch');
-        if (from.value > to.value) throw new RangeError('Start address must be less than or equal to end address');
+        if (from.family !== to.family) throw invalidAddressError();
+        if (from.value > to.value) {
+            throw Object.assign(
+                new RangeError('Start address must be less than or equal to end address'),
+                { code: 'ERR_INVALID_ARG_VALUE' },
+            );
+        }
         this.#rules.push({
             family: from.family,
             start: from.value,
@@ -1923,9 +2004,22 @@ export class BlockList {
     }
 
     check(address: string, type?: string): boolean {
-        const parsed = parseBlockListAddress(address, type);
+        // Node returns false for an address it cannot parse rather than throwing
+        // — a check() that throws turns a deny-list miss into a crash at the
+        // call site, so the failure mode matters.
+        let parsed;
+        try {
+            parsed = parseBlockListAddress(address, type);
+        } catch {
+            return false;
+        }
+        const candidates = blockListCandidates(parsed.family, parsed.value);
         return this.#rules.some((rule) =>
-            rule.family === parsed.family && parsed.value >= rule.start && parsed.value <= rule.end
+            candidates.some((candidate) =>
+                rule.family === candidate.family
+                && candidate.value >= rule.start
+                && candidate.value <= rule.end
+            )
         );
     }
 

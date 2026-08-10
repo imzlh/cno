@@ -234,10 +234,17 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
             this.response.setHeader('Date', new Date().toUTCString());
         }
 
+        const req = (this.response as { req?: { headers?: Record<string, unknown>; httpVersion?: string } }).req;
+        const requestVersion = String(req?.httpVersion ?? '1.1');
+        const http10 = requestVersion === '1.0' || requestVersion === '0.9';
+        const hasLength = this.response.hasHeader('content-length');
+        const hasTransferEncoding = this.response.hasHeader('transfer-encoding');
+
         if (
             !this.shouldSuppressBody() &&
-            !this.response.hasHeader('content-length') &&
-            !this.response.hasHeader('transfer-encoding')
+            !hasLength &&
+            !hasTransferEncoding &&
+            !http10
         ) {
             this.response.chunkedEncoding = true;
             this.response.setHeader('Transfer-Encoding', 'chunked');
@@ -245,9 +252,11 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
 
         // Node: Keep-Alive: timeout=5 when the connection will stay open.
         const resConn = String(this.response.getHeader?.('connection') ?? '').toLowerCase();
-        const req = (this.response as { req?: { headers?: Record<string, unknown> } }).req;
         const reqConn = String(req?.headers?.['connection'] ?? '').toLowerCase();
-        const closing = resConn === 'close' || reqConn === 'close';
+        // HTTP/1.0 has no chunked framing. An unframed response must close the
+        // connection even when the peer asks for keep-alive, or the peer has no
+        // reliable end-of-body marker and waits forever.
+        const closing = resConn === 'close' || reqConn === 'close' || (http10 && !hasLength && !hasTransferEncoding);
         if (!closing && this.response.shouldKeepAlive !== false && !this.response.hasHeader('keep-alive')) {
             this.response.setHeader('Keep-Alive', 'timeout=5');
         }

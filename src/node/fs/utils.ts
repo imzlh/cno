@@ -1219,7 +1219,7 @@ export function createFileHandle(fd: number, handle: CModuleAsyncFS.FileHandle) 
         return total;
     }
 
-    return {
+    const fileHandle = {
         fd,
         __proto__: FileHandle.prototype,
         async read(
@@ -1230,15 +1230,21 @@ export function createFileHandle(fd: number, handle: CModuleAsyncFS.FileHandle) 
         ) {
             await ensureOpen('read');
             // Node also accepts `read()` (fresh 16 KiB buffer) and `read({buffer,offset,length,position})`.
+            // The fresh buffer must be a Buffer, not a bare Uint8Array: measured against
+            // v24.18.0, `(await fh.read()).buffer` is a Buffer, so the idiomatic
+            // `buffer.toString('utf8', 0, bytesRead)` decoded the bytes. A Uint8Array
+            // inherits Array.prototype.toString instead, which returned the
+            // comma-joined decimal bytes ("65,66,67,6...") rather than "ABCDEFGHIJ" —
+            // a wrong answer with no error — and left `readUInt8` undefined.
             let target: ArrayBufferView;
             let opts: unknown = offset, len: unknown = length, pos: unknown = position;
             if (bufferOrOptions === undefined || bufferOrOptions === null) {
-                target = new Uint8Array(16384);
+                target = Buffer.alloc(16384);
             } else if (ArrayBuffer.isView(bufferOrOptions)) {
                 target = bufferOrOptions;
             } else {
                 const o = bufferOrOptions;
-                target = o.buffer ?? new Uint8Array(16384);
+                target = o.buffer ?? Buffer.alloc(16384);
                 opts = o.offset; len = o.length; pos = o.position;
             }
             const norm = normalizeRwArgs(target, opts, len, pos);
@@ -1271,6 +1277,15 @@ export function createFileHandle(fd: number, handle: CModuleAsyncFS.FileHandle) 
             if (closed) return;
             closed = true;
             await native('close', () => handle.close());
+            // Node sets `fd` to -1 once closed. Leaving the real descriptor in place
+            // is not cosmetic: `fd !== -1` reads as a live handle, and the stale value
+            // reaches a real syscall. Measured consequence — `fh.createReadStream()`
+            // on a closed handle HUNG indefinitely (no 'data', 'end' or 'error'),
+            // after leaking a debug-CRT assertion to stderr
+            // (`read.cpp(381): Assertion failed: _osfile(fh) & FOPEN`), where node
+            // throws RangeError/ERR_OUT_OF_RANGE synchronously from the stream
+            // constructor's fd validation — before any syscall is issued.
+            fileHandle.fd = -1;
         },
         async stat(options?: { bigint?: boolean }) {
             await ensureOpen('fstat');
@@ -1357,6 +1372,7 @@ export function createFileHandle(fd: number, handle: CModuleAsyncFS.FileHandle) 
         },
         [Symbol.asyncDispose]() { return closed ? Promise.resolve() : this.close(); },
     };
+    return fileHandle;
 }
 
 // Shared fs helpers
