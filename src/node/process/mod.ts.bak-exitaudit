@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Node.js process module
  * Provides current Node.js process information and control
  */
@@ -207,7 +207,6 @@ function shouldRefIpcForProcessEvent(event: string | symbol): boolean {
  */
 function needsEventBridge(event: string | symbol): boolean {
     return event === 'exit' ||
-        event === 'beforeExit' ||
         event === 'uncaughtException' ||
         event === 'uncaughtExceptionMonitor';
 }
@@ -717,110 +716,15 @@ function eventMux(): MuxRegistry | null {
 /** Node fires 'exit' exactly once. Both paths that can emit it go through here. */
 let exitEmitted = false;
 
-/**
- * True while a teardown dispatch ('beforeExit' or 'exit') is running.
- *
- * Published on a `Symbol.for()` slot because the reader lives in the CLI entry
- * (src/main.ts), which this module must not import — the dependency runs the
- * other way.
- *
- * It exists because assigning `process.exitCode` has a side effect over there:
- * the setter wrapper arms a deferred-exit poll, and that poll is a ref'd timer.
- * The C counts a fresh ref'd handle as "a listener queued work" and gives the
- * loop another pass, so an assignment made FROM a 'beforeExit' listener re-armed
- * the poll, re-triggered the drain, and re-fired the listener, which assigned
- * again — an unbounded spin (OBSERVED: `beforeExit` firing forever, 13s of CPU
- * and no exit, where node fires once and exits 9). Guarding the arm with this
- * flag keeps the poll for the paths that need it and removes it from the one
- * window where the assignment is itself part of teardown.
- */
-const IN_TEARDOWN_SLOT = Symbol.for('cno.runtime.inTeardown');
-
-function withTeardownFlag<T>(fn: () => T): T {
-    const g = globalThis as unknown as Record<symbol, unknown>;
-    const previous = g[IN_TEARDOWN_SLOT];
-    try {
-        g[IN_TEARDOWN_SLOT] = true;
-    } catch {
-        // Exotic global: the flag is an optimisation, so run the dispatch anyway.
-        return fn();
-    }
-    try {
-        return fn();
-    } finally {
-        // Restored, not cleared: 'beforeExit' and 'exit' can nest (an 'exit'
-        // listener assigning a code runs inside the outer dispatch).
-        try { g[IN_TEARDOWN_SLOT] = previous; } catch { /* as above */ }
-    }
-}
-
 function emitProcessExit(code: number): void {
     if (exitEmitted) return;
     exitEmitted = true;
     _exiting = true;
     try {
-        withTeardownFlag(() => processEE.emit('exit', code));
+        processEE.emit('exit', code);
     } catch {
         // A listener threw. Node prints and still exits; swallowing here keeps
         // teardown going rather than losing the exit path entirely.
-    }
-}
-
-/**
- * Native id of EV_BEFORE_EXIT.
- *
- * Read from the runtime enum rather than written as `EventType.BEFORE_EXIT`
- * (the pattern webapi/index.ts:109 already uses for EV_BEFORE_UNLOAD): the
- * generated typings for the engine module do not carry the member, and reading
- * it keeps this file working against a core that predates the event — an absent
- * member yields -1, which no dispatch can equal, so the branch is simply dead
- * instead of throwing.
- */
-function beforeExitEventId(): number {
-    try {
-        const v = (engine.EventType as unknown as Record<string, unknown>)?.BEFORE_EXIT;
-        return typeof v === 'number' ? v : -1;
-    } catch {
-        return -1;
-    }
-}
-
-/**
- * Node's 'beforeExit'. Unlike 'exit' this has NO once-flag: node re-fires it on
- * every drain for as long as a listener keeps queueing work, and the C drives
- * that by re-dispatching EV_BEFORE_EXIT (circu.js/src/vm.c).
- *
- * A listener throw is deliberately NOT caught. Node reports it as an uncaught
- * error and exits 1 while still firing 'exit' (OBSERVED v24.18.0); the C
- * reproduces that only if the exception reaches its JS_IsException check, and
- * event-mux.ts re-throws for this id for the same reason.
- */
-function emitBeforeExit(code: number): void {
-    // 'exit' has already fired: teardown is past the point where node would ask.
-    if (exitEmitted) return;
-    if (processEE.listenerCount('beforeExit') === 0) return;
-    withTeardownFlag(() => processEE.emit('beforeExit', code));
-}
-
-/**
- * Push `process.exitCode` into the runtime so a natural drain can return it.
- *
- * `exitCode` is a module-scoped `let` that nothing native could read: on a
- * natural drain TJS_Run returned its own untouched field, so a code assigned
- * from an 'exit' or 'beforeExit' listener was lost (OBSERVED: rc 0 where node
- * v24.18.0 exits with the assigned value).
- *
- * Guarded on the binding existing: this file is refreshed by `cno setup` and can
- * therefore run against an older core that has no os.setExitCode, where the
- * pre-existing deferred-exit watcher in the CLI entry remains the only path.
- */
-function pushExitCodeToRuntime(value: number | undefined): void {
-    const setExitCode = (os as unknown as Record<string, unknown>).setExitCode;
-    if (typeof setExitCode !== 'function') return;
-    try {
-        (setExitCode as (v?: number) => void)(value);
-    } catch {
-        // Never let bookkeeping break an assignment the user made.
     }
 }
 
@@ -861,13 +765,6 @@ function ensureEventBridge(): void {
             // EV_EXIT carries the status as an int (mod_os.c:87, vm.c:282).
             emitProcessExit(typeof data === 'number' ? data : (exitCode ?? 0));
             // Return value is freed and ignored by the C for this event.
-            return undefined;
-        }
-
-        if (name === beforeExitEventId()) {
-            // Carries the status the run would exit with right now, which is what
-            // node passes its listener (OBSERVED: 3 with `process.exitCode = 3`).
-            emitBeforeExit(typeof data === 'number' ? data : (exitCode ?? 0));
             return undefined;
         }
 
@@ -2107,13 +2004,7 @@ if (!existingProcessDefault) Object.defineProperties(processDefault, {
         enumerable: true,
         configurable: true,
         get: () => exitCode,
-        set: (value: unknown) => {
-            exitCode = normalizeExitCodeValue(value);
-            // Also push it into the runtime: a natural drain resolves its status
-            // from there, so an assignment made during teardown ('exit' or
-            // 'beforeExit') would otherwise be dropped.
-            pushExitCodeToRuntime(exitCode);
-        },
+        set: (value: unknown) => { exitCode = normalizeExitCodeValue(value); },
     },
     _exiting: {
         enumerable: true,

@@ -325,26 +325,34 @@ export class StatementSync {
         this.assertUsable();
         // Metadata must never execute the statement: deriving it via this.get()
         // stepped the statement, so `prepare('DELETE FROM t').columns()` deleted
-        // every row. The native `columnNames()` added for this is NOT in the
-        // shipped binary yet (grep -a on build/stage/cno.exe: 0 hits, while
-        // `prepare` gives 19), so calling it unconditionally throws
-        // "TypeError: not a function" and regresses columns() from destructive to
-        // broken. Prefer it when present, and otherwise fall back to a non-
-        // stepping shape: Node returns [] for statements that cannot yield rows,
-        // which is what a DML statement is.
+        // every row. Three paths, best first:
+        //   1. native `columnMetadata()` -- Node's full five-key shape.
+        //   2. native `columnNames()` -- names only; the other four fields are
+        //      not derivable from a name and must NOT be guessed from the SQL.
+        //   3. no native accessor -- a non-stepping fallback (see below).
+        // Paths 2 and 3 exist because a binary without the newer natives must
+        // degrade rather than throw "TypeError: not a function".
         const stmt = this.stmt as unknown as {
+            columnMetadata?: () => StatementColumnMetadata[];
             columnNames?: () => string[];
             step?: () => unknown;
             reset?: () => void;
         };
+        if (typeof stmt.columnMetadata === 'function') {
+            return stmt.columnMetadata();
+        }
         if (typeof stmt.columnNames === 'function') {
+            // DIVERGENCE: Node also reports `column`, `database`, `table` and
+            // `type`. They come from sqlite3_column_origin_name/table_name/
+            // database_name/decltype, none of which is reachable from JS on this
+            // path, so the keys are omitted rather than filled with a null that
+            // would assert "this column has no declared type" untruthfully.
             return stmt.columnNames().map(name => ({ name }));
         }
-        // Fallback for the shipped binary. Only a statement that can yield rows is
-        // stepped, and it is immediately reset, so the cursor is rewound and no DML
-        // side effect can occur. DML is never stepped at all: Node returns [] for
-        // statements with no result columns, so that path is node-correct rather
-        // than merely safe.
+        // Only a statement that can yield rows is stepped, and it is immediately
+        // reset, so the cursor is rewound and no DML side effect can occur. DML is
+        // never stepped at all: Node returns [] for statements with no result
+        // columns, so that path is node-correct rather than merely safe.
         if (!canYieldRows(this.sourceSQL)) return [];
         const first = this.get();
         try {

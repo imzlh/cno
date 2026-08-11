@@ -1,8 +1,9 @@
-/**
+﻿/**
  * Node.js crypto module - random, pbkdf2, hkdf functions
  */
 
 const crypto = import.meta.use('crypto');
+const algorithm = import.meta.use('algorithm');
 import { normalizeHashAlgorithm, oneShotHmac, toBuffer } from './helpers';
 import { Buffer } from '../buffer';
 import type { BinaryInput } from './types';
@@ -507,4 +508,93 @@ export function hkdfSha512(
     info?: BinaryInput,
 ): ArrayBuffer {
     return crypto.hkdfSha512(toBuffer(ikm), keylen, salt ? toBuffer(salt) : undefined, info ? toBuffer(info) : undefined);
+}
+
+// randomBytes
+
+function parseRandomBytesSize(size: number): number {
+    if (typeof size !== 'number') {
+        throw withCode(
+            new TypeError(`The "size" argument must be of type number. Received type ${typeof size}`),
+            'ERR_INVALID_ARG_TYPE',
+        );
+    }
+    if (!Number.isFinite(size) || size < 0 || size > 0x7fffffff) {
+        throw withCode(
+            new RangeError(`The value of "size" is out of range. It must be >= 0 && <= 2147483647. Received ${size}`),
+            'ERR_OUT_OF_RANGE',
+        );
+    }
+    return Math.trunc(size);
+}
+
+export function randomBytes(size: number): Buffer;
+export function randomBytes(size: number, callback: (err: Error | null, buf: Buffer) => void): void;
+export function randomBytes(size: number, callback?: (err: Error | null, buf: Buffer) => void): Buffer | void {
+    const length = parseRandomBytesSize(size);
+    if (callback !== undefined && typeof callback !== 'function') {
+        throw withCode(
+            new TypeError(`The "callback" argument must be of type function. Received type ${typeof callback}`),
+            'ERR_INVALID_ARG_TYPE',
+        );
+    }
+
+    if (callback !== undefined) {
+        queueMicrotask(() => {
+            let result: Buffer;
+            try {
+                result = Buffer.allocUnsafe(length);
+                crypto.randomFill(result);
+            } catch (err) {
+                callback(asError(err), Buffer.alloc(0));
+                return;
+            }
+            callback(null, result);
+        });
+        return;
+    }
+
+    const result = Buffer.allocUnsafe(length);
+    crypto.randomFill(result);
+    return result;
+}
+
+export const pseudoRandomBytes = randomBytes;
+
+function toTimingSafeEqualBytes(value: ArrayBufferView | ArrayBuffer, name: string): Uint8Array {
+    if (value instanceof ArrayBuffer) {
+        return new Uint8Array(value);
+    }
+    if (ArrayBuffer.isView(value)) {
+        return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+    }
+    throw withCode(
+        new TypeError(`The "${name}" argument must be an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received ${typeof value}`),
+        'ERR_INVALID_ARG_TYPE',
+    );
+}
+
+export function timingSafeEqual(a: ArrayBufferView | ArrayBuffer, b: ArrayBufferView | ArrayBuffer): boolean {
+    const left = toTimingSafeEqualBytes(a, 'buf1');
+    const right = toTimingSafeEqualBytes(b, 'buf2');
+    if (left.byteLength !== right.byteLength) {
+        throw withCode(
+            new RangeError('Input buffers must have the same byte length'),
+            'ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH',
+        );
+    }
+    // algorithm.bytesEqual is a constant-time XOR accumulate in C (no early exit).
+    return algorithm.bytesEqual(left, right);
+}
+
+// Web Crypto API compat (Node.js 17+)
+export function getRandomValues<T extends ArrayBufferView>(array: T): T {
+    if (!ArrayBuffer.isView(array) || array instanceof DataView || array instanceof Float32Array || array instanceof Float64Array) {
+        throw new DOMException('The data argument must be an integer-type TypedArray', 'TypeMismatchError');
+    }
+    if (array.byteLength > 65536) {
+        throw new DOMException('The requested length exceeds 65,536 bytes', 'QuotaExceededError');
+    }
+    crypto.randomFill(array);
+    return array;
 }
