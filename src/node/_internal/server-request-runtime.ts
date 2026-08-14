@@ -13,6 +13,8 @@ export interface RuntimeAdapter<TResponse extends RuntimeResponse> {
     flushHeaders: TResponse['flushHeaders'];
     write: TResponse['write'];
     end: TResponse['end'];
+    writeProcessingContinue: TResponse['writeProcessingContinue'];
+    writeEarlyHints: TResponse['writeEarlyHints'];
     abort?(err: unknown): void;
     readonly isAborted?: boolean;
     readonly isFinished?: boolean;
@@ -27,6 +29,8 @@ interface RuntimeResponse {
     flushHeaders(): void;
     write(chunk: unknown, encodingOrCb?: BufferEncoding | WriteCallback, cb?: WriteCallback): boolean;
     end(chunk?: unknown, encodingOrCb?: BufferEncoding | (() => void), cb?: () => void): this;
+    writeProcessingContinue(): void;
+    writeEarlyHints(hints: Record<string, string | string[]>, callback?: () => void): void;
     on(event: string | symbol, listener: (...args: unknown[]) => void): this;
     off(event: string | symbol, listener: (...args: unknown[]) => void): this;
 }
@@ -163,6 +167,8 @@ function bindServerResponseAdapter<TResponse extends RuntimeResponse>(response: 
     response.flushHeaders = adapter.flushHeaders.bind(adapter) as TResponse['flushHeaders'];
     response.write = adapter.write.bind(adapter) as TResponse['write'];
     response.end = adapter.end.bind(adapter) as typeof response.end;
+    response.writeProcessingContinue = adapter.writeProcessingContinue.bind(adapter) as TResponse['writeProcessingContinue'];
+    response.writeEarlyHints = adapter.writeEarlyHints.bind(adapter) as TResponse['writeEarlyHints'];
 }
 
 export async function runServerRequest<TIncoming, TResponse extends RuntimeResponse>(

@@ -11,6 +11,7 @@ import { getTierLimits } from '../_internal/memory';
 import { copyPath, validateCopyOptions, type CopyOptions } from './copy';
 import { globPaths, validateGlobOptions, validateGlobPatterns, type GlobOptions, type GlobResult } from './glob';
 import { readvSync, writevSync } from './sync';
+import { Buffer } from '../buffer';
 
 import { nsfs, nsasfs } from './syspath';
 const fs = nsfs;

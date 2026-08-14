@@ -158,10 +158,15 @@ export async function connectDirectTcp(url: URL, tls?: TlsOptions): Promise<TcpS
     const isSecure = url.protocol === 'https:' || url.protocol === 'wss:';
     const port = url.port ? parseInt(url.port) : (isSecure ? 443 : 80);
     const socket = await openTcp(url.hostname, port);
-    if (isSecure) {
-        await socket.clientHandshake(createClientTlsContext(['http/1.1'], tls, url.hostname), url.hostname);
+    try {
+        if (isSecure) {
+            await socket.clientHandshake(createClientTlsContext(['http/1.1'], tls, url.hostname), url.hostname);
+        }
+        return socket;
+    } catch (err) {
+        socket.close();
+        throw err;
     }
-    return socket;
 }
 
 export async function connectHttp(url: URL): Promise<RawConnection> {
@@ -206,6 +211,10 @@ export function readHeaders(socket: IHttpSocket, parser: HttpResponseParser): Pr
         const settle = (fn: 'resolve' | 'reject', value: HttpResponseHead | unknown) => {
             if (settled) return;
             settled = true;
+            if (fn === 'reject') {
+                try { socket.stopReading(); } catch { /* already stopped */ }
+                try { socket.close(); } catch { /* already closed */ }
+            }
             if (fn === 'resolve') resolve(value as HttpResponseHead);
             else reject(value);
         };
@@ -222,14 +231,18 @@ export function readHeaders(socket: IHttpSocket, parser: HttpResponseParser): Pr
                 settle('reject', new Error('Connection closed while reading headers'));
                 return;
             }
-            const result = parser.feed(data);
-            if (head && !settled) {
-                socket.stopReading();
-                const consumed = Number(result?.bytesConsumed ?? data.byteLength);
-                if (Number.isFinite(consumed) && consumed >= 0 && consumed < data.byteLength) {
-                    head.leftover = data.subarray(consumed);
+            try {
+                const result = parser.feed(data);
+                if (head && !settled) {
+                    socket.stopReading();
+                    const consumed = Number(result?.bytesConsumed ?? data.byteLength);
+                    if (Number.isFinite(consumed) && consumed >= 0 && consumed < data.byteLength) {
+                        head.leftover = data.subarray(consumed);
+                    }
+                    settle('resolve', head);
                 }
-                settle('resolve', head);
+            } catch (err) {
+                settle('reject', err);
             }
         }, err => {
             settle('reject', err);

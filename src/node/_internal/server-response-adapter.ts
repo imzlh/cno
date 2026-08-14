@@ -9,6 +9,7 @@ import {
 import { isTransportDisconnectError } from './errno';
 import type { OutgoingHttpHeaders } from '../http/types';
 import { STATUS_CODES } from '../http/constants';
+import { connectionTokens } from '@cnojs/http/h1-frame';
 
 // Body chunks may legitimately be backed by a SharedArrayBuffer (a user can
 // pass such a view to res.write); verified to write correctly, so the alias
@@ -40,6 +41,7 @@ export interface ResponseAdapterTarget {
     headersSent: boolean;
     hasHeader(name: string): boolean;
     setHeader(name: string, value: OutgoingHttpHeaders[string]): unknown;
+    removeHeader?(name: string): unknown;
     getHeader?(name: string): OutgoingHttpHeaders[string] | undefined;
     getHeaders(): OutgoingHttpHeaders;
     emit(event: string | symbol, ...args: unknown[]): boolean;
@@ -70,11 +72,14 @@ export interface ResponseAdapterServeHook {
 
 export interface ResponseAdapterCloseSource {
     once(event: 'close', listener: () => void): unknown;
+    off?(event: 'close', listener: () => void): unknown;
+    removeListener?(event: 'close', listener: () => void): unknown;
 }
 
 export interface ResponseAdapterTransport<TResponse extends ResponseAdapterTarget> {
     closeSource?: ResponseAdapterCloseSource | null;
     writeHead(response: TResponse, headers: Array<[string, string]>): Promise<void>;
+    writeInformational?(response: TResponse, status: number, statusText: string, headers: Array<[string, string]>): Promise<void>;
     writeBody(response: TResponse, data: Uint8Array): Promise<void>;
     finish(response: TResponse): Promise<void>;
     abort?(response: TResponse, error: Error): void;
@@ -137,6 +142,9 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
     private terminalError: Error | null = null;
     private pendingBytes = 0;
     private needDrain = false;
+    private bodyBytes = 0;
+    private declaredContentLength: number | null = null;
+    private closeListener: (() => void) | null = null;
 
     constructor(
         response: TResponse,
@@ -154,11 +162,31 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
         this.requestId = requestId;
         this.requestUrl = requestUrl;
         this.suppressBody = suppressBody;
-        this.transport.closeSource?.once('close', () => {
-            if (this.terminal !== 'open') return;
-            // Peer closed while we still owed bytes — normal HTTP abort path.
-            this.enterAborted(disconnectError('socket closed before response finished'));
-        });
+        const closeSource = this.transport.closeSource;
+        if (closeSource) {
+            const onClose = () => {
+                this.closeListener = null;
+                if (this.terminal !== 'open') return;
+                // Peer closed while we still owed bytes — normal HTTP abort path.
+                this.enterAborted(disconnectError('socket closed before response finished'));
+            };
+            this.closeListener = onClose;
+            closeSource.once('close', onClose);
+        }
+    }
+
+    /** Do not retain one completed response adapter per keep-alive request. */
+    private removeCloseListener(): void {
+        const source = this.transport.closeSource;
+        const listener = this.closeListener;
+        if (!source || !listener) return;
+        this.closeListener = null;
+        try {
+            if (typeof source.off === 'function') source.off('close', listener);
+            else source.removeListener?.('close', listener);
+        } catch {
+            // The transport may already be tearing down.
+        }
     }
 
     /** True when the peer left or a write fault already ended the stream. */
@@ -237,8 +265,18 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
         const req = (this.response as { req?: { headers?: Record<string, unknown>; httpVersion?: string } }).req;
         const requestVersion = String(req?.httpVersion ?? '1.1');
         const http10 = requestVersion === '1.0' || requestVersion === '0.9';
-        const hasLength = this.response.hasHeader('content-length');
-        const hasTransferEncoding = this.response.hasHeader('transfer-encoding');
+        let hasLength = this.response.hasHeader('content-length');
+        let hasTransferEncoding = this.response.hasHeader('transfer-encoding');
+        if (this.helpers.isBodyForbiddenStatus(this.response.statusCode)) {
+            this.response.removeHeader?.('transfer-encoding');
+            this.response.removeHeader?.('content-encoding');
+            hasTransferEncoding = false;
+        }
+        if (this.response.statusCode === 205) {
+            this.response.setHeader('Content-Length', '0');
+            hasLength = true;
+            hasTransferEncoding = false;
+        }
 
         if (
             !this.shouldSuppressBody() &&
@@ -256,9 +294,36 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
         // HTTP/1.0 has no chunked framing. An unframed response must close the
         // connection even when the peer asks for keep-alive, or the peer has no
         // reliable end-of-body marker and waits forever.
-        const closing = resConn === 'close' || reqConn === 'close' || (http10 && !hasLength && !hasTransferEncoding);
+        const closing = connectionTokens(resConn).includes('close')
+            || connectionTokens(reqConn).includes('close')
+            || (http10 && !hasLength && !hasTransferEncoding);
         if (!closing && this.response.shouldKeepAlive !== false && !this.response.hasHeader('keep-alive')) {
             this.response.setHeader('Keep-Alive', 'timeout=5');
+        }
+
+        this.declaredContentLength = null;
+        if (!this.shouldSuppressBody()) {
+            const transfer = this.response.getHeader?.('transfer-encoding');
+            const transferValues = Array.isArray(transfer)
+                ? transfer
+                : transfer === undefined ? [] : [transfer];
+            if (transferValues.length > 1
+                || (transferValues.length === 1 && String(transferValues[0]).trim().toLowerCase() !== 'chunked')) {
+                throw new Error('unsupported Transfer-Encoding');
+            }
+            const value = this.response.getHeader?.('content-length');
+            const values = Array.isArray(value) ? value : value === undefined ? [] : [value];
+            if (values.length > 1) throw new Error('invalid Content-Length');
+            if (values.length === 1) {
+                const text = String(values[0]).trim();
+                if (!/^\d+$/.test(text) || !Number.isSafeInteger(Number(text))) {
+                    throw new Error('invalid Content-Length');
+                }
+                if (this.response.hasHeader('transfer-encoding')) {
+                    throw new Error('Content-Length cannot be combined with Transfer-Encoding');
+                }
+                this.declaredContentLength = Number(text);
+            }
         }
     }
 
@@ -272,6 +337,26 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
             }
         }
         return allHeaders;
+    }
+
+    private collectInterimHeaders(input?: HeaderInput): Array<[string, string]> {
+        if (!input) return [];
+        const out: Array<[string, string]> = [];
+        if (Array.isArray(input)) {
+            for (let i = 0; i < input.length; i += 2) {
+                out.push([String(input[i]), String(input[i + 1])]);
+            }
+            return out;
+        }
+        for (const [key, value] of Object.entries(input)) {
+            if (value === undefined) continue;
+            if (Array.isArray(value)) {
+                for (const item of value) out.push([key, String(item)]);
+            } else {
+                out.push([key, String(value)]);
+            }
+        }
+        return out;
     }
 
     private markWritableEnded(): void {
@@ -300,6 +385,7 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
     private enterAborted(err: Error): void {
         if (this.terminal !== 'open') return;
         this.terminal = 'aborted';
+        this.removeCloseListener();
         this.terminalError = err;
         this.markWritableEnded();
         this.abortTransportQuietly(err);
@@ -323,6 +409,7 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
             return;
         }
         this.terminal = 'failed';
+        this.removeCloseListener();
         this.terminalError = err;
         this.markWritableEnded();
         this.abortTransportQuietly(err);
@@ -372,6 +459,14 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
             this.needDrain = false;
             this.response.emit('drain');
         }
+    }
+
+    private async writeBody(data: Uint8Array): Promise<void> {
+        if (this.declaredContentLength !== null && this.bodyBytes + data.byteLength > this.declaredContentLength) {
+            throw new Error('response body exceeds Content-Length');
+        }
+        await this.transport.writeBody(this.response, data);
+        this.bodyBytes += data.byteLength;
     }
 
     writeHead(
@@ -424,6 +519,32 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
         return this.response;
     }
 
+    private writeInterim(status: number, headers?: HeaderInput, callback?: () => void): void {
+        if (this.headWritten || this.response.headersSent) {
+            callback?.();
+            return;
+        }
+        const transport = this.transport.writeInformational;
+        if (!transport) {
+            this.fail(new Error('informational responses are not supported by this transport'));
+            callback?.();
+            return;
+        }
+        this.enqueue(
+            () => transport(this.response, status, reasonPhrase(status), this.collectInterimHeaders(headers)),
+            () => callback?.(),
+            err => this.fail(err),
+        );
+    }
+
+    writeProcessingContinue(): void {
+        this.writeInterim(100);
+    }
+
+    writeEarlyHints(hints: Record<string, string | string[]>, callback?: () => void): void {
+        this.writeInterim(103, hints, callback);
+    }
+
     flushHeaders(): void {
         if (this.response.headersSent) return;
         this.ensureImplicitHeaders();
@@ -441,7 +562,7 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
         if (this.response.writableEnded) {
             const err = this.helpers.createWriteAfterEndError();
             callback?.(err);
-            if (!callback) queueMicrotask(() => emitResponseErrorQuietly(this.response, err));
+            queueMicrotask(() => emitResponseErrorQuietly(this.response, err));
             return false;
         }
         if (!this.response.headersSent) {
@@ -460,7 +581,7 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
             this.enqueue(
                 async () => {
                     try { this.serveHook?.onData?.({ requestId: this.requestId, timestamp: nodeTs(), data }); } catch {}
-                    await this.transport.writeBody(this.response, data);
+                    await this.writeBody(data);
                 },
                 () => {
                     this.settleWrite(data.byteLength);
@@ -530,7 +651,11 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
                     const encodeString = encodeStringForEncoding(encoding);
                     const data = chunk instanceof Uint8Array ? chunk : toUint8Array(chunk, encodeString);
                     try { this.serveHook?.onData?.({ requestId: this.requestId, timestamp: nodeTs(), data }); } catch {}
-                    await this.transport.writeBody(this.response, data);
+                    await this.writeBody(data);
+                }
+                if (!this.shouldSuppressBody() && this.declaredContentLength !== null
+                    && this.bodyBytes !== this.declaredContentLength) {
+                    throw new Error('response body does not match Content-Length');
                 }
                 await this.transport.finish(this.response);
             },
@@ -541,6 +666,7 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
                     return;
                 }
                 this.terminal = 'finished';
+                this.removeCloseListener();
                 this.response.finished = true;
                 this.response.writableFinished = true;
                 emitServeFinishedQuietly(this.serveHook, { requestId: this.requestId, timestamp: nodeTs(), success: true });

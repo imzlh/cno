@@ -109,8 +109,8 @@ export interface OutgoingMessage extends Writable {
     shouldKeepAlive: boolean;
     useChunkedEncodingByDefault: boolean;
     setTimeout(msecs: number, callback?: () => void): this;
-    setHeader(name: string, value: number | string | readonly string[]): this;
-    setHeaders(headers: Headers | Map<string, number | string | readonly string[]>): this;
+    setHeader(name: string, value: OutgoingHttpHeader): this;
+    setHeaders(headers: Headers | Map<string, OutgoingHttpHeader>): this;
     appendHeader(name: string, value: string | readonly string[]): this;
     getHeader(name: string): OutgoingHttpHeader | undefined;
     getHeaders(): OutgoingHttpHeaders;

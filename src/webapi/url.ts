@@ -937,7 +937,8 @@ class URL implements globalThis.URL {
         if (this.#opaquePath !== null) return;
 
         if (this.#scheme === 'file') {
-            this.#path = String(value).split('/').filter(p => p);
+            this.#path = [];
+            this.#parsePath(String(value).replace(/\\/g, '/'), true);
             return;
         }
 

@@ -21,14 +21,6 @@ type BodyIterable = Iterable<unknown> | AsyncIterable<unknown>;
 /** Internal capability used by fetch to disturb buffered Request bodies. */
 export const markRequestBodyUsed = Symbol('markRequestBodyUsed');
 
-async function closeFileQuietly(file: CModuleAsyncFS.FileHandle): Promise<void> {
-    try {
-        await file.close();
-    } catch {
-        // Keep the original body serialization error visible.
-    }
-}
-
 // Pre-compiled regexes (avoid recompilation in hot paths).
 export const HTTP_LINE_RE = /^HTTP\//i;
 export const TIMEOUT_ERR_RE = /\b(timed?\s*out|timeout)\b/i;
@@ -427,36 +419,24 @@ export function toCurlBody(body: globalThis.Uint8Array<ArrayBufferLike>): Uint8A
 
 export type PreparedRequestBody =
     | { kind: 'none' }
-    | { kind: 'buffer'; body: Uint8Array }
-    | { kind: 'file'; path: string; size: number };
+    | { kind: 'buffer'; body: Uint8Array };
 
-async function writeStreamToTempFile(stream: ReadableStream<Uint8Array>, signal?: AbortSignal): Promise<{ path: string; size: number }> {
-    const path = `${os.tmpDir}/fetch-body-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.tmp`;
-    const file = await asyncfs.open(path, 'w');
+async function readStreamBody(stream: ReadableStream<Uint8Array>, signal?: AbortSignal): Promise<Uint8Array> {
     const reader = stream.getReader();
-    let size = 0;
+    const chunks: Uint8Array[] = [];
     try {
         while (true) {
             throwIfAborted(signal);
             const { done, value } = await reader.read();
             if (done) break;
-            let written = 0;
-            size += value.byteLength;
-            while (written < value.byteLength) {
-                const n = await file.write(value.subarray(written));
-                if (n == null) throw new Error('Failed to write temporary request body');
-                written += n;
-            }
+            chunks.push(value);
         }
-    } catch (err) {
-        await closeFileQuietly(file);
-        await asyncfs.unlink(path).catch(() => {});
-        throw err;
     } finally {
         reader.releaseLock();
     }
-    await file.close();
-    return { path, size };
+    if (chunks.length === 0) return new Uint8Array(0);
+    if (chunks.length === 1) return chunks[0]!;
+    return toOwnedBytes(algorithm.bytesConcat(chunks));
 }
 
 export async function prepareRequestBody(request: Request): Promise<PreparedRequestBody> {
@@ -467,8 +447,7 @@ export async function prepareRequestBody(request: Request): Promise<PreparedRequ
     }
     if (!request.body) return { kind: 'none' };
     request[markRequestBodyUsed]();
-    const streamed = await writeStreamToTempFile(request.body, request.signal);
-    return { kind: 'file', path: streamed.path, size: streamed.size };
+    return { kind: 'buffer', body: await readStreamBody(request.body, request.signal) };
 }
 
 // ---------------------------------------------------------------------------

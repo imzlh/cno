@@ -14,7 +14,7 @@ export interface Args {
 // Single source of truth for the CLI vocabulary. cno-cli imports this instead
 // of keeping its own copy, so the two parsers can never drift.
 export const SUBCOMMANDS = [
-    'run', 'task', 'eval', 'cache', 'pack', 'repl', 'exec',
+    'run', 'serve', 'task', 'eval', 'cache', 'pack', 'repl', 'exec',
     'test', 'setup', 'help', 'version',
 ] as const;
 export type Subcommand = typeof SUBCOMMANDS[number];

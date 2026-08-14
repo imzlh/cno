@@ -1,7 +1,6 @@
 const asyncfs = import.meta.use('asyncfs');
 const dns = import.meta.use('dns');
 const engine = import.meta.use('engine');
-const fs = import.meta.use('fs');
 const algorithm = import.meta.use('algorithm');
 const os = import.meta.use('os');
 const timers = import.meta.use('timers');
@@ -49,10 +48,11 @@ export interface ClientRequestOptions {
 }
 
 type ClientTransport = Socket | TLSSocket;
+type ClientEventListener = { bivarianceHack(...args: unknown[]): unknown }['bivarianceHack'];
 
 export interface ClientRequestState<TTransport extends ClientTransport = ClientTransport> {
     aborted: boolean;
-    destroyed?: boolean;
+    destroyed: boolean;
     host: string;
     protocol: string;
     method: string;
@@ -94,10 +94,10 @@ export interface ClientRequestState<TTransport extends ClientTransport = ClientT
     getHeaders(): OutgoingHttpHeaders;
     _formatHeaders(): string;
     _implicitHeader(): void;
-    emit(event: string | symbol, ...args: unknown[]): boolean;
-    once(event: string | symbol, listener: (...args: unknown[]) => void): this;
-    on(event: string | symbol, listener: (...args: unknown[]) => void): this;
-    off(event: string | symbol, listener: (...args: unknown[]) => void): this;
+    emit<E extends string | symbol>(event: E, ...args: unknown[]): boolean;
+    once<E extends string | symbol>(event: E, listener: ClientEventListener): this;
+    on<E extends string | symbol>(event: E, listener: ClientEventListener): this;
+    off<E extends string | symbol>(event: E, listener: ClientEventListener): this;
 }
 
 export interface ClientHooks<TRequest extends ClientRequestState = ClientRequestState> {
@@ -350,20 +350,16 @@ async function connectSocket(host: string, port: number): Promise<Socket> {
     return socket;
 }
 
-let systemCaPath: string | null | undefined = undefined;
+let systemCaPem: string | null | undefined = undefined;
 
 /**
- * Locate a platform CA bundle on disk, returning its **file path**.
+ * Locate a platform CA bundle, returning PEM text when available.
  *
- * NOT PEM text. Feeding this to `tls.connect({ ca })` — which takes PEM —
- * throws "SSL_CTX_load_verify_locations_pem" and broke every https request that
- * carried no explicit `ca`. Both former callers were removed for that reason;
- * `tls`'s SecureContext already falls back to the platform trust store when `ca`
- * is absent, so prefer leaving `ca` undefined. Read the file first if a path is
- * genuinely what you need.
+ * `tls` falls back to the platform trust store when `ca` is absent. This helper
+ * never creates a temporary certificate file for Windows certificate export.
  */
 export async function getSystemCa(): Promise<string | null> {
-    if (systemCaPath !== undefined) return systemCaPath;
+    if (systemCaPem !== undefined) return systemCaPem;
     const sysname = os.uname().sysname;
     const candidates: string[] = sysname === 'Linux' ? [
         '/etc/ssl/certs/ca-certificates.crt',
@@ -382,26 +378,22 @@ export async function getSystemCa(): Promise<string | null> {
     for (const candidate of candidates) {
         try {
             if ((await asyncfs.stat(candidate)).isFile) {
-                systemCaPath = candidate;
-                return candidate;
+                const pem = await asyncfs.readFile(candidate, { encoding: 'utf8' });
+                systemCaPem = pem;
+                return pem;
             }
         } catch {}
     }
 
     if (sysname === 'Windows_NT') {
-        const tmpDir = os.tmpDir || 'C:\\Windows\\Temp';
-        const tmp = `${tmpDir}\\cno-ca-bundle.pem`;
         try {
             const certs = win32!.exportCerts();
-            if (certs?.length) {
-                await fs.writeFile(tmp, engine.encodeString(certs.join('\n')));
-                systemCaPath = tmp;
-                return tmp;
-            }
+            if (certs?.length) systemCaPem = certs.join('\n');
         } catch {}
+        return systemCaPem;
     }
 
-    systemCaPath = null;
+    systemCaPem = null;
     return null;
 }
 
@@ -416,11 +408,7 @@ export async function connectSecureTransport<TRequest extends ClientRequestState
     const port = resolvePort(request._options.port, fallbackPort);
     const lookupHost = hostForLookup(request.host);
     const rejectUnauthorized = request._options.rejectUnauthorized ?? true;
-    // getSystemCa() returns a FILE PATH, but `ca` is PEM text: passing the path
-    // made the SecureContext constructor throw
-    // "SSL_CTX_load_verify_locations_pem", so every https request that did not
-    // carry an explicit `ca` failed before it reached the wire. tls's own
-    // SecureContext already falls back to the platform trust store when `ca` is
+    // tls's SecureContext falls back to the platform trust store when `ca` is
     // absent, so leave it undefined and let that path run.
     const ca = request._options.ca;
 
@@ -572,7 +560,9 @@ export function connectRequestWithAgent<TRequest extends ClientRequestState>(req
         applyConnectedRequestOptions(request, hooks);
         const agentOptions = {
             ...request._options,
-            host: request._options.host ?? request.host,
+            // Use the effective host for the Agent pool identity. URL requests
+            // commonly provide `hostname` without an explicit `host`.
+            host: request.host,
             hostname: request._options.hostname ?? request.host,
         };
         const transport = await new Promise<RequestTransport<TRequest>>((resolve, reject) => {

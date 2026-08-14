@@ -92,7 +92,7 @@ export interface ClientRequestImpl extends ClientRequest, ClientRequestState<Soc
     _callback: ((res: IncomingMessageImpl) => void) | null;
     _aborted: boolean;
     _timeoutId: number | null;
-    _requestBody: Uint8Array[];
+    _requestBody: ClientRequestState<Socket>['_requestBody'];
     _bodySent: boolean;
     _socketAssigned: boolean;
     _response: IncomingMessageImpl | null;
@@ -248,7 +248,7 @@ ClientRequestImpl.prototype._cleanup = function _cleanup(this: ClientRequestImpl
 
     if (canKeepAlive) {
         releaseRequestTransport(this);
-        agent.freeSocket(transport, this._options);
+        agent.freeSocket(transport, { ...this._options, host: this.host });
         this._tcp = null;
         // The keep-alive branch deliberately skips cleanupRequest (the socket is
         // being returned to the pool, not destroyed), so it has to emit the
@@ -400,7 +400,7 @@ export class Agent extends EventEmitter {
         const port = typeof options.port === 'string' ? parseInt(options.port) : options.port || this.defaultPort;
         const host = options.hostname || options.host || 'localhost';
 
-        socket.connect(port, host, () => callback(null, socket)).on('error', (err) => callback(err, socket));
+        socket.connect(port, host, () => callback(null, socket)).on('error', (err) => callback(err instanceof Error ? err : new Error(String(err)), socket));
         return socket;
     }
 
@@ -409,7 +409,7 @@ export class Agent extends EventEmitter {
         const oncreate = (err: Error | null, socket?: Socket | null) => {
             if (done) return;
             done = true;
-            callback(err, socket);
+            callback(err, socket ?? undefined);
         };
         const socket = this.createConnection(options, oncreate);
         if (!socket || done) return;
@@ -418,7 +418,7 @@ export class Agent extends EventEmitter {
             return;
         }
         socket.once('connect', () => oncreate(null, socket));
-        socket.once('error', (err) => oncreate(err, socket));
+        socket.once('error', (err) => oncreate(err instanceof Error ? err : new Error(String(err)), socket));
     }
 
     getName(options: ClientRequestArgs): string {

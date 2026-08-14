@@ -1,7 +1,10 @@
 /**
  * Node.js async_hooks module
- * Minimal JS-level async context tracking for promises and common timers.
+ * Async context tracking using the native engine.promiseHook for promises,
+ * with JS-level wrappers for timers and microtasks.
  */
+
+import { addPromiseHook, PromiseState } from '../_internal/promise-hook';
 
 export type AsyncId = number;
 export type TriggerAsyncId = number;
@@ -25,9 +28,6 @@ export interface AsyncResourceOptions {
 }
 
 type StoreMap = Map<AsyncLocalStorage<unknown>, unknown>;
-type Thenable<T = unknown> = {
-    then(onFulfilled?: (value: T) => unknown, onRejected?: (reason: unknown) => unknown): unknown;
-};
 type TimerHandle = unknown;
 type AnyCallable = (...args: unknown[]) => unknown;
 
@@ -37,7 +37,6 @@ interface AsyncState {
     triggerId: TriggerAsyncId;
     resource: object;
     stores: StoreMap;
-    settled: boolean;
 }
 
 let _nextId = 2;
@@ -45,17 +44,12 @@ let _currentId: AsyncId = 1;
 let _currentTriggerId: TriggerAsyncId = 0;
 let _currentStores: StoreMap = new Map();
 let _currentResource: object = {};
-let _patched = false;
-let _originalPromiseThen: Promise<unknown>['then'] | null = null;
+let _timersPatchInstalled = false;
 
 const _hooks: HookCallbacks[] = [];
 const _promiseStates = new WeakMap<Promise<unknown>, AsyncState>();
 const _handleStates = new Map<TimerHandle, AsyncState>();
-// Promises a *user* attached a reaction to, via the patched `Promise.prototype.then`
-// (`.catch`/`.finally` delegate to it). The bookkeeping branch installed below uses the
-// unpatched `originalThen`, so it never marks anything here. See the comment at the
-// bookkeeping branch for why this distinction is load-bearing.
-const _userHandled = new WeakSet<object>();
+let _promiseHookStop: (() => void) | null = null;
 
 function emitInit(state: AsyncState): void {
     for (const hook of _hooks) {
@@ -103,24 +97,9 @@ function createState(
         triggerId,
         resource,
         stores,
-        settled: false,
     };
     emitInit(state);
     return state;
-}
-
-function settleState(state: AsyncState): void {
-    if (state.settled) return;
-    state.settled = true;
-    if (state.type === 'PROMISE') {
-        emitPromiseResolve(state.id);
-    }
-    emitDestroy(state.id);
-}
-
-function isThenable(value: unknown): value is Thenable {
-    return !!value && (typeof value === 'object' || typeof value === 'function')
-        && typeof Reflect.get(value, 'then') === 'function';
 }
 
 function isCallable(value: unknown): value is AnyCallable {
@@ -144,7 +123,7 @@ function runInState<T>(state: AsyncState, callback: AnyCallable, thisArg: unknow
 
     _currentId = state.id;
     _currentTriggerId = state.triggerId;
-    _currentStores = snapshotStoresFrom(state.stores);
+    _currentStores = new Map(state.stores);
     _currentResource = state.resource;
     emitBefore(state.id);
 
@@ -159,87 +138,97 @@ function runInState<T>(state: AsyncState, callback: AnyCallable, thisArg: unknow
     }
 }
 
-function snapshotStoresFrom(stores: StoreMap): StoreMap {
-    return new Map(stores);
-}
-
 function wrapCallback<T>(callback: T, state: AsyncState, finalize = false): T {
     if (!isCallable(callback)) return callback;
     const wrapped = function(this: unknown, ...args: unknown[]) {
         try {
             return runInState(state, callback, this, args);
         } finally {
-            if (finalize) settleState(state);
+            if (finalize) {
+                emitPromiseResolve(state.id);
+                emitDestroy(state.id);
+            }
         }
     };
     return wrapped as T;
 }
 
-function installAsyncPatches(): void {
-    if (_patched) return;
-    _patched = true;
+function installPromiseHook(): void {
+    if (_promiseHookStop) return;
+    _promiseHookStop = addPromiseHook((nativeState, promise, parent) => {
+        switch (nativeState) {
+            case PromiseState.CONSTRUCT: {
+                const parentState = parent ? _promiseStates.get(parent) : undefined;
+                const state = createState(
+                    'PROMISE',
+                    parentState?.id ?? _currentId,
+                    promise,
+                    parentState ? new Map(parentState.stores) : snapshotStores(),
+                );
+                _promiseStates.set(promise, state);
+                break;
+            }
+            case PromiseState.BEFORE_THEN: {
+                const state = _promiseStates.get(promise);
+                if (state) {
+                    const prevId = _currentId;
+                    const prevTriggerId = _currentTriggerId;
+                    const prevStores = _currentStores;
+                    const prevResource = _currentResource;
+                    _currentId = state.id;
+                    _currentTriggerId = state.triggerId;
+                    _currentStores = new Map(state.stores);
+                    _currentResource = state.resource;
+                    emitBefore(state.id);
+                    // Restore will happen in AFTER_THEN
+                    _currentId = prevId;
+                    _currentTriggerId = prevTriggerId;
+                    _currentStores = prevStores;
+                    _currentResource = prevResource;
+                }
+                break;
+            }
+            case PromiseState.AFTER_THEN: {
+                const state = _promiseStates.get(promise);
+                if (state) {
+                    emitAfter(state.id);
+                }
+                break;
+            }
+            case PromiseState.FULFILLED: {
+                const state = _promiseStates.get(promise);
+                if (state) {
+                    emitPromiseResolve(state.id);
+                    emitDestroy(state.id);
+                    _promiseStates.delete(promise);
+                }
+                break;
+            }
+        }
+    });
+}
 
-    const originalThen = Promise.prototype.then;
-    _originalPromiseThen = originalThen;
-    Promise.prototype.then = function(this: Promise<unknown>, onFulfilled?: unknown, onRejected?: unknown): Promise<unknown> {
-        // A user reaction on `this`. Only the patched entry point records this;
-        // the bookkeeping branch below calls `originalThen` directly.
-        _userHandled.add(this);
-        const parentState = _promiseStates.get(this);
-        const state = createState(
-            'PROMISE',
-            parentState?.id ?? _currentId,
-            this,
-            parentState ? snapshotStoresFrom(parentState.stores) : snapshotStores(),
-        );
-        const result = originalThen.call(
-            this,
-            wrapCallback(onFulfilled, state),
-            wrapCallback(onRejected, state),
-        );
-        state.resource = result;
-        _promiseStates.set(result, state);
-        // Bookkeeping branch: observes `result` settling so `destroy`/`promiseResolve`
-        // hooks fire. Attaching it sets [[PromiseIsHandled]] on `result`, which would
-        // mask `result`'s own unhandled rejection — so the rejection arm re-throws to
-        // relocate the report onto the promise this `originalThen` returns.
-        //
-        // That promise is deliberately discarded, which is precisely the problem: an
-        // unconditional re-throw rejects a promise nobody can ever handle, manufacturing
-        // a *spurious* `unhandledRejection` for every rejecting `.then` hop — even when
-        // the user handled it. koa's `fnMiddleware(ctx).then(handleResponse).catch(onerror)`
-        // (koa/lib/application.js:186) hit this: the intermediate `.then` result rejects,
-        // the user's `.catch` handles it, and cno still reported `unhandledRejection`
-        // while node reported only `app.on('error')`. Deployments that install
-        // `process.on('unhandledRejection', () => process.exit(1))` died on handled errors.
-        //
-        // Deleting the re-throw is not the fix — it is load-bearing for the genuine case
-        // (`p.then(f)` with no handler anywhere would go silent, since the branch above
-        // already marked `result` handled). So decide at settle time instead: re-throw
-        // only if no user reaction was ever attached to `result`. Reaction jobs run at the
-        // microtask checkpoint, strictly after the synchronous turn that builds a chain,
-        // so a same-turn `.catch` is always recorded before this arm runs — and a handler
-        // attached in a later tick correctly still reports, matching node.
-        originalThen.call(
-            result,
-            (value: unknown) => {
-                settleState(state);
-                return value;
-            },
-            (error: unknown) => {
-                settleState(state);
-                if (!_userHandled.has(result)) throw error;
-            },
-        );
-        return result;
-    };
+function uninstallPromiseHook(): void {
+    if (!_promiseHookStop) return;
+    if (_hooks.length > 0) return;
+    _promiseHookStop();
+    _promiseHookStop = null;
+}
+
+function installTimersPatches(): void {
+    if (_timersPatchInstalled) return;
+    _timersPatchInstalled = true;
 
     const queueMicrotaskFn = getGlobalFunction('queueMicrotask');
     if (queueMicrotaskFn) {
         const originalQueueMicrotask = queueMicrotaskFn.bind(globalThis);
-        setGlobalFunction('queueMicrotask', function(callback: () => void): void {
+        setGlobalFunction('queueMicrotask', function(callback: any): void {
+            if (!isCallable(callback)) {
+                originalQueueMicrotask(callback);
+                return;
+            }
             const state = createState('Microtask');
-            originalQueueMicrotask(wrapCallback(callback, state, true));
+            originalQueueMicrotask(wrapCallback(callback as AnyCallable, state, true) as () => void);
         });
     }
 
@@ -249,9 +238,9 @@ function installAsyncPatches(): void {
         const clearTimeoutFn = getGlobalFunction('clearTimeout');
         const originalClearTimeout = clearTimeoutFn ? clearTimeoutFn.bind(globalThis) : null;
 
-        setGlobalFunction('setTimeout', function(callback: unknown, delay?: number, ...args: unknown[]) {
+        setGlobalFunction('setTimeout', function(callback: unknown, delay?: any, ...args: unknown[]) {
             if (!isCallable(callback)) {
-                return originalSetTimeout(callback, delay, ...args);
+                return originalSetTimeout(callback as AnyCallable, delay, ...args);
             }
             const state = createState('Timeout');
             let handle: TimerHandle;
@@ -260,10 +249,10 @@ function installAsyncPatches(): void {
                     return runInState(state, callback, this, innerArgs);
                 } finally {
                     _handleStates.delete(handle);
-                    settleState(state);
+                    emitDestroy(state.id);
                 }
             };
-            handle = originalSetTimeout(wrapped, delay, ...args);
+            handle = originalSetTimeout(wrapped as AnyCallable, delay, ...args);
             _handleStates.set(handle, state);
             return handle;
         });
@@ -273,7 +262,7 @@ function installAsyncPatches(): void {
                 const state = _handleStates.get(handle);
                 if (state) {
                     _handleStates.delete(handle);
-                    settleState(state);
+                    emitDestroy(state.id);
                 }
                 originalClearTimeout(handle);
             });
@@ -288,7 +277,7 @@ function installAsyncPatches(): void {
 
         setGlobalFunction('setImmediate', function(callback: unknown, ...args: unknown[]) {
             if (!isCallable(callback)) {
-                return originalSetImmediate(callback, ...args);
+                return originalSetImmediate(callback as AnyCallable, ...args);
             }
             const state = createState('Immediate');
             let handle: TimerHandle;
@@ -297,24 +286,13 @@ function installAsyncPatches(): void {
                     return runInState(state, callback, this, innerArgs);
                 } finally {
                     _handleStates.delete(handle);
-                    settleState(state);
+                    emitDestroy(state.id);
                 }
             };
-            handle = originalSetImmediate(wrapped, ...args);
+            handle = originalSetImmediate(wrapped as AnyCallable, ...args);
             _handleStates.set(handle, state);
             return handle;
         });
-
-        if (originalClearImmediate) {
-            setGlobalFunction('clearImmediate', function(handle: TimerHandle): void {
-                const state = _handleStates.get(handle);
-                if (state) {
-                    _handleStates.delete(handle);
-                    settleState(state);
-                }
-                originalClearImmediate(handle);
-            });
-        }
     }
 
     const setIntervalFn = getGlobalFunction('setInterval');
@@ -323,15 +301,15 @@ function installAsyncPatches(): void {
         const clearIntervalFn = getGlobalFunction('clearInterval');
         const originalClearInterval = clearIntervalFn ? clearIntervalFn.bind(globalThis) : null;
 
-        setGlobalFunction('setInterval', function(callback: unknown, delay?: number, ...args: unknown[]) {
+        setGlobalFunction('setInterval', function(callback: unknown, delay?: any, ...args: unknown[]) {
             if (!isCallable(callback)) {
-                return originalSetInterval(callback, delay, ...args);
+                return originalSetInterval(callback as AnyCallable, delay, ...args);
             }
             const state = createState('Interval');
             const wrapped = function(this: unknown, ...innerArgs: unknown[]) {
                 return runInState(state, callback, this, innerArgs);
             };
-            const handle = originalSetInterval(wrapped, delay, ...args);
+            const handle = originalSetInterval(wrapped as AnyCallable, delay, ...args);
             _handleStates.set(handle, state);
             return handle;
         });
@@ -341,7 +319,7 @@ function installAsyncPatches(): void {
                 const state = _handleStates.get(handle);
                 if (state) {
                     _handleStates.delete(handle);
-                    settleState(state);
+                    emitDestroy(state.id);
                 }
                 originalClearInterval(handle);
             });
@@ -352,13 +330,15 @@ function installAsyncPatches(): void {
 export function createHook(callbacks: HookCallbacks): AsyncHook {
     const hook: AsyncHook = {
         enable() {
-            installAsyncPatches();
+            installPromiseHook();
+            installTimersPatches();
             if (!_hooks.includes(callbacks)) _hooks.push(callbacks);
             return hook;
         },
         disable() {
             const idx = _hooks.indexOf(callbacks);
             if (idx !== -1) _hooks.splice(idx, 1);
+            uninstallPromiseHook();
             return hook;
         },
     };
@@ -389,7 +369,6 @@ export class AsyncResource {
                 { code: 'ERR_INVALID_ARG_TYPE' },
             );
         }
-        // Node accepts either a numeric triggerAsyncId or an options object.
         const trigger = typeof triggerAsyncId === 'object' && triggerAsyncId !== null
             ? triggerAsyncId.triggerAsyncId
             : triggerAsyncId;
@@ -418,7 +397,7 @@ export class AsyncResource {
     }
 
     emitDestroy(): this {
-        settleState(this._asyncState);
+        emitDestroy(this._asyncState.id);
         return this;
     }
 
@@ -434,73 +413,37 @@ export class AsyncResource {
 export class AsyncLocalStorage<T = unknown> {
     run<R, A extends unknown[]>(store: T, callback: (...args: A) => R, ...args: A): R {
         const prevStores = _currentStores;
-        _currentStores = snapshotStoresFrom(_currentStores);
+        _currentStores = new Map(_currentStores);
         _currentStores.set(this, store);
-        let result: R;
         try {
-            result = callback(...args);
-        } catch (error) {
+            return callback(...args);
+        } finally {
             _currentStores = prevStores;
-            throw error;
         }
-        if (isThenable(result) && _originalPromiseThen) {
-            return this._handleAsyncResult(result, prevStores) as R;
-        }
-        _currentStores = prevStores;
-        return result;
     }
 
     exit<R, A extends unknown[]>(callback: (...args: A) => R, ...args: A): R {
         const prevStores = _currentStores;
-        _currentStores = snapshotStoresFrom(_currentStores);
+        _currentStores = new Map(_currentStores);
         _currentStores.delete(this);
-        let result: R;
         try {
-            result = callback(...args);
-        } catch (error) {
+            return callback(...args);
+        } finally {
             _currentStores = prevStores;
-            throw error;
         }
-        if (isThenable(result) && _originalPromiseThen) {
-            return this._handleAsyncResult(result, prevStores) as R;
-        }
-        _currentStores = prevStores;
-        return result;
-    }
-
-    private _handleAsyncResult(result: Thenable, prevStores: StoreMap): unknown {
-        const { promise: outer, resolve: resolveOuter, reject: rejectOuter } = Promise.withResolvers<unknown>();
-        const outerState = createState('PROMISE', _currentId, outer, snapshotStoresFrom(prevStores));
-        _promiseStates.set(outer, outerState);
-        const originalPromiseThen = _originalPromiseThen;
-        if (!originalPromiseThen) return outer;
-        originalPromiseThen.call(
-            result,
-            (value: unknown) => {
-                _currentStores = prevStores;
-                settleState(outerState);
-                resolveOuter(value);
-            },
-            (reason: unknown) => {
-                _currentStores = prevStores;
-                settleState(outerState);
-                rejectOuter(reason);
-            },
-        );
-        return outer;
     }
 
     getStore(): T | undefined {
-        return _currentStores.get(this);
+        return _currentStores.get(this) as T | undefined;
     }
 
     enterWith(store: T): void {
-        _currentStores = snapshotStoresFrom(_currentStores);
+        _currentStores = new Map(_currentStores);
         _currentStores.set(this, store);
     }
 
     disable(): void {
-        _currentStores = snapshotStoresFrom(_currentStores);
+        _currentStores = new Map(_currentStores);
         _currentStores.delete(this);
     }
 
@@ -508,13 +451,11 @@ export class AsyncLocalStorage<T = unknown> {
         this.disable();
     }
 
-    static snapshot(): <R, A extends unknown[]>(fn: (...args: A) => R, ...args: A) => R;
-    static snapshot<T extends (...args: unknown[]) => unknown>(fn: T, _options?: { __proto__: null }): (...args: Parameters<T>) => ReturnType<T>;
     static snapshot<T extends (...args: unknown[]) => unknown>(fn?: T, _options?: { __proto__: null }): (...args: unknown[]) => unknown {
         const stores = snapshotStores();
         return (...args: unknown[]) => {
             const prevStores = _currentStores;
-            _currentStores = snapshotStoresFrom(stores);
+            _currentStores = new Map(stores);
             try {
                 if (fn) return fn(...args);
                 const callback = args[0];
@@ -529,7 +470,7 @@ export class AsyncLocalStorage<T = unknown> {
         const stores = snapshotStores();
         return (function(this: unknown, ...args: Parameters<T>) {
             const prevStores = _currentStores;
-            _currentStores = snapshotStoresFrom(stores);
+            _currentStores = new Map(stores);
             try {
                 return fn.apply(this, args);
             } finally {
@@ -538,5 +479,3 @@ export class AsyncLocalStorage<T = unknown> {
         }) as T;
     }
 }
-
-installAsyncPatches();

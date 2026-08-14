@@ -23,10 +23,12 @@ import {
     connectRequestWithAgent,
     connectSecureTransport,
     destroyRequest,
+    emitRequestClose,
     endRequest,
     initClientRequestState,
     mergeUrlOptions,
     normalizeRequestOptions,
+    releaseRequestTransport,
     setRequestTimeout,
     writeRequest,
     formatClientRequestHeader,
@@ -46,6 +48,7 @@ import {
 } from '../http/server';
 import { Agent as HttpAgent } from '../http/client';
 import type { ClientRequestArgs } from '../http/client';
+import type { Socket } from '../net';
 import type { ListenOptions as NetListenOptions } from '../net';
 import {
     getNodeServeHook,
@@ -143,6 +146,11 @@ class TlsResponseAdapter extends ServerResponseAdapter<ServerResponseImpl> {
                     headers,
                 ));
             },
+            writeInformational: async (res, status, statusText, headers) => {
+                await responseTurn;
+                const ver = `${res.req?.httpVersionMajor ?? 1}.${res.req?.httpVersionMinor ?? 1}`;
+                await writeTlsChunk(socket, encodeResponseHead(ver, status, statusText, headers));
+            },
             writeBody: async (res, data) => {
                 await responseTurn;
                 if (res.chunkedEncoding) {
@@ -161,6 +169,9 @@ class TlsResponseAdapter extends ServerResponseAdapter<ServerResponseImpl> {
                         await endTlsSocket(socket);
                     }
                 } finally {
+                    if (res.socket) {
+                        res.detachSocket(res.socket);
+                    }
                     releaseTurn();
                 }
             },
@@ -211,6 +222,7 @@ export interface Server extends EventEmitter {
     _requestListener: HttpsRequestListener | null;
     _timeout: number;
     _timeoutCallback: ((socket: TLSSocket) => void) | null;
+    _httpsConnections: Set<HttpsConnectionState>;
 
     listen(port?: number, hostname?: string, backlog?: number, listeningListener?: () => void): this;
     listen(port?: number, hostname?: string, listeningListener?: () => void): this;
@@ -220,11 +232,19 @@ export interface Server extends EventEmitter {
     listen(handle: unknown, backlog?: number, listeningListener?: () => void): this;
 
     close(callback?: (err?: Error) => void): this;
+    closeAllConnections(): void;
+    closeIdleConnections(): void;
     address(): { address: string; family: string; port: number } | string | null;
     readonly listening: boolean;
     ref(): this;
     unref(): this;
     setTimeout(msecs: number, callback?: (socket: TLSSocket) => void): this;
+}
+
+interface HttpsConnectionState {
+    socket: TLSSocket;
+    activeRequests: number;
+    draining: boolean;
 }
 
 export interface ServerConstructor {
@@ -301,8 +321,18 @@ function dispatchHttpsServerRequest(
     });
 }
 
+function maybeCloseHttpsConnection(state: HttpsConnectionState): void {
+    if (state.draining && state.activeRequests === 0) {
+        try { state.socket.destroy(); } catch { /* already closed */ }
+    }
+}
+
 function handleHttpsServerConnection(self: Server, tlsSocket: TLSSocket): void {
     if (!self._requestListener) return;
+
+    const state: HttpsConnectionState = { socket: tlsSocket, activeRequests: 0, draining: false };
+    self._httpsConnections.add(state);
+    tlsSocket.once('close', () => self._httpsConnections.delete(state));
 
     const serveHook = getNodeServeHook();
     const responses = new WeakMap<IncomingMessageImpl, ServerResponseImpl>();
@@ -337,7 +367,14 @@ function handleHttpsServerConnection(self: Server, tlsSocket: TLSSocket): void {
                 onServerResponseCreated.publish({ request: incoming, response });
             }
 
-            dispatchHttpsServerRequest(self, tlsSocket, incoming, response, serveHook, meta, currentResponseTurn, releaseResponseTurn);
+            state.activeRequests++;
+            void dispatchHttpsServerRequest(
+                self, tlsSocket, incoming, response, serveHook, meta,
+                currentResponseTurn, releaseResponseTurn,
+            ).finally(() => {
+                state.activeRequests--;
+                maybeCloseHttpsConnection(state);
+            });
         },
         onParseError: (err) => {
             self.emit('clientError', err, tlsSocket);
@@ -360,6 +397,7 @@ function initServer(
     self._requestListener = null;
     self._timeout = 0;
     self._timeoutCallback = null;
+    self._httpsConnections = new Set();
 
     const normalized = normalizeServerOptions(optionsOrListener, requestListener);
     const options = normalized.options;
@@ -394,8 +432,34 @@ Server.prototype.listen = function listen(this: Server, ...args: ServerListenArg
 };
 
 Server.prototype.close = function close(this: Server, callback?: (err?: Error) => void): Server {
-    this._tlsServer.close(callback);
+    for (const state of this._httpsConnections) {
+        state.draining = true;
+        maybeCloseHttpsConnection(state);
+    }
+    // A TLS handshake that has not emitted `secureConnection` has no HTTP
+    // state to drain; close it so server.close cannot wait indefinitely.
+    for (const socket of this._tlsServer._connections) {
+        if (![...this._httpsConnections].some(state => state.socket === socket)) {
+            try { socket.destroy(); } catch { /* already closed */ }
+        }
+    }
+    this._tlsServer.closeGracefully(callback);
     return this;
+};
+
+Server.prototype.closeAllConnections = function closeAllConnections(this: Server): void {
+    for (const state of this._httpsConnections) {
+        try { state.socket.destroy(); } catch { /* already closed */ }
+    }
+    this._httpsConnections.clear();
+};
+
+Server.prototype.closeIdleConnections = function closeIdleConnections(this: Server): void {
+    for (const state of this._httpsConnections) {
+        if (state.activeRequests === 0) {
+            try { state.socket.destroy(); } catch { /* already closed */ }
+        }
+    }
 };
 
 Server.prototype.address = function address(this: Server): { address: string; family: string; port: number } | string | null {
@@ -537,7 +601,7 @@ interface HttpsClientRequest extends OutgoingMessageImpl, ClientRequestState<TLS
     _callback: ((res: IncomingMessageImpl) => void) | null;
     _aborted: boolean;
     _timeoutId: number | null;
-    _requestBody: Uint8Array[];
+    _requestBody: ClientRequestState<TLSSocket>['_requestBody'];
     _bodySent: boolean;
     _tcp: CModuleStreams.TCP | null;
     _requestId: string;
@@ -682,6 +746,26 @@ HttpsClientRequest.prototype.setTimeout = function setTimeout(this: HttpsClientR
 };
 
 HttpsClientRequest.prototype._cleanup = function _cleanup(this: HttpsClientRequest): void {
+    const transport = this._transport;
+    const agent = this.agent;
+    const canKeepAlive = !!transport
+        && !this._aborted
+        && this._response?.complete
+        && agent
+        && typeof agent === 'object'
+        && agent.options.keepAlive
+        && String(this._response.headers.connection ?? '').toLowerCase() !== 'close'
+        && String(this.getHeader('connection') ?? '').toLowerCase() !== 'close';
+
+    if (canKeepAlive) {
+        releaseRequestTransport(this);
+        agent.freeSocket(transport as unknown as Socket, { ...this._options, host: this.host });
+        this._tlsSocket = null;
+        this._tcp = null;
+        queueMicrotask(() => emitRequestClose(this));
+        return;
+    }
+
     cleanupRequest(this);
     this._tlsSocket = null;
     this._tcp = null;

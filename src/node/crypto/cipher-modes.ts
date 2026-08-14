@@ -5,7 +5,7 @@
 
 const crypto = import.meta.use('crypto');
 import type { BinaryInput, KeyInput } from './types';
-import { toBuffer, toExactArrayBuffer, encodeOutput, concatBuffers, kKeyData, isKeyObject } from './helpers';
+import { toBuffer, toExactArrayBuffer, encodeOutput, concatBuffers, getKeyBytes, kKeyData, isKeyObject } from './helpers';
 import { createInvalidIvError, createInvalidKeyLengthError, createUnknownCipherError, createAuthenticationFailedError, createCipherInvalidStateError, withCode } from './errors';
 
 // createCipher / createDecipher
@@ -45,9 +45,11 @@ export const GCM_KEY_LENGTHS: Record<string, number> = {
 };
 
 export function toCipherKey(key: KeyInput): Uint8Array {
-    if (!isKeyObject(key)) return toBuffer(key);
-    if (key.type !== 'secret') throw new TypeError(`Invalid key object type ${key.type}, expected secret`);
-    return key[kKeyData];
+    if (isKeyObject(key)) {
+        if (key.type !== 'secret') throw new TypeError(`Invalid key object type ${key.type}, expected secret`);
+        return key[kKeyData];
+    }
+    return getKeyBytes(key);
 }
 
 export function getEcbFns(algorithm: string): EcbFns {

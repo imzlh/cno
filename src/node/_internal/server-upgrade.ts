@@ -9,6 +9,11 @@ export interface UpgradeEmitter {
     emit(event: 'error', error: unknown): boolean;
 }
 
+export interface UpgradeResult {
+    handled: boolean;
+    upgraded: boolean;
+}
+
 export function isUpgradeRequest(incoming: IncomingMessageImpl): boolean {
     const connectionHeader = String(incoming.headers['connection'] ?? '').toLowerCase();
     return connectionHeader.split(',').some((token) => token.trim() === 'upgrade')
@@ -19,11 +24,15 @@ export function emitNodeServerUpgrade(
     emitter: UpgradeEmitter,
     response: HttpResponse,
     incoming: IncomingMessageImpl,
-): boolean {
-    if (!isUpgradeRequest(incoming) || emitter.listenerCount('upgrade') <= 0) return false;
+): UpgradeResult {
+    if (!isUpgradeRequest(incoming) || emitter.listenerCount('upgrade') <= 0) {
+        return { handled: false, upgraded: false };
+    }
 
+    let upgraded = false;
     try {
         const handle = (response as HttpResponse & { upgrade(): UpgradeHandle }).upgrade();
+        upgraded = true;
         const upgradeSocket = Socket.fromUpgradeHandle(handle);
         // Node passes any already-buffered post-header bytes as `head`.
         // The core handle replays them through the read pump, so we
@@ -33,5 +42,5 @@ export function emitNodeServerUpgrade(
         emitter.emit('error', err);
     }
 
-    return true;
+    return { handled: true, upgraded };
 }

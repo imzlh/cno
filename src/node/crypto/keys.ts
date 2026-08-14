@@ -1,4 +1,4 @@
-﻿/**
+/**
  * KeyObject plus the import/export surface: createPrivateKey, createPublicKey,
  * createSecretKey, and the PEM/DER normalisation they share.
  */
@@ -8,7 +8,7 @@ const algorithm = import.meta.use('algorithm');
 const engine = import.meta.use('engine');
 import { Buffer } from '../buffer';
 import type { BinaryInput, KeyInput, KeyObject as KeyObjectShape, KeyExportOptions, SecretJwk, AsymmetricKeyType } from './types';
-import { toBuffer, keyDetailsFromBytes, kKeyData, kKeyFormat, guessKeyFormat, isKeyObject, type KeyFormat } from './helpers';
+import { getKeyBytes, toBuffer, keyDetailsFromBytes, kKeyData, kKeyFormat, guessKeyFormat, isKeyObject, type KeyFormat } from './helpers';
 
 export function keyTypeFromPrivate(bytes: Uint8Array): AsymmetricKeyType {
     return crypto.getPrivateKeyType(bytes) as AsymmetricKeyType;
@@ -40,7 +40,7 @@ export function normalizeKeySource(input: KeyInput | { key: KeyInput; format?: '
         };
     }
     return {
-        bytes: toBuffer(source),
+        bytes: getKeyBytes(source),
         format: guessKeyFormat(source, isKeyInputWithFormat(input) ? input.format : undefined),
     };
 }

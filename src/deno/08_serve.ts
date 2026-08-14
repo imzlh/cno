@@ -98,6 +98,18 @@ function errorMessage(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
 }
 
+function reportServeError(error: unknown, url: string, phase = 'request'): void {
+    try {
+        console.error(`Deno.serve ${phase} error${url ? ` for ${url}` : ''}:`, error);
+    } catch {
+        // Diagnostics must never change the response or accept-loop behavior.
+    }
+}
+
+function isBodylessStatus(status: number): boolean {
+    return (status >= 100 && status < 200) || status === 204 || status === 205 || status === 304;
+}
+
 function emitServeHookQuietly(callback: () => void): void {
     try {
         callback();
@@ -158,7 +170,7 @@ function createWebRequest(coreReq: HttpRequest, connInfo: { hostname: string; po
     const url = new URL(coreReq.url, base);
     const bodyPoll = coreReq.body;
 
-    return new Request(url.toString(), {
+    const init: RequestInit & { duplex?: 'half' } = {
         method: coreReq.method,
         headers,
         body: bodyPoll ? new ReadableStream({
@@ -168,7 +180,11 @@ function createWebRequest(coreReq: HttpRequest, connInfo: { hostname: string; po
                 else        ctrl.enqueue(res);
             }
         }) : null
-    });
+    };
+    // cno's Request implementation follows the Fetch streaming-upload rule:
+    // a ReadableStream body must explicitly opt into half-duplex handling.
+    if (bodyPoll) init.duplex = 'half';
+    return new Request(url.toString(), init);
 }
 
 /**
@@ -183,6 +199,7 @@ class ResponseAdapter {
     private url: string;
     private requestHeaders: Array<[string, string]>;
     private requestCallFrames?: NetworkCallFrame[];
+    private declaredContentLength: number | null = null;
 
     constructor(coreRes: HttpResponse, method: string, httpVersion: string, requestId: string, url: string, requestHeaders: Array<[string, string]>, requestCallFrames?: NetworkCallFrame[]) {
         this.coreRes = coreRes;
@@ -211,22 +228,25 @@ class ResponseAdapter {
         const contentLength = getHeader('content-length');
         const transferEncoding = getHeader('transfer-encoding');
 
-        const noBodyStatusCodes = [204, 205, 304];
-        if (noBodyStatusCodes.includes(res.status)) {
+        if (isBodylessStatus(res.status)) {
             assert(!res.body, `Status ${res.status} must not have a response body`);
             assert(!contentLength || contentLength === '0', `Status ${res.status} must not have Content-Length or it must be 0`);
+            assert(!transferEncoding, `Status ${res.status} must not use Transfer-Encoding`);
             return;
         }
 
         if (contentLength) {
-            const length = parseInt(contentLength, 10);
-            assert(!isNaN(length), `Invalid Content-Length: ${contentLength}`);
-            assert(length >= 0, `Content-Length must be non-negative: ${length}`);
-            if (length > 0) assert(res.body, "Body must exist if Content-Length > 0");
+            const value = contentLength.trim();
+            assert(/^\d+$/.test(value), `Invalid Content-Length: ${contentLength}`);
+            const length = Number(value);
+            assert(Number.isSafeInteger(length), `Invalid Content-Length: ${contentLength}`);
+            if (length > 0) assert(res.body || this.method === 'HEAD', "Body must exist if Content-Length > 0");
+            this.declaredContentLength = length;
         }
 
-        if (transferEncoding && transferEncoding.toLowerCase() === 'chunked') {
-            assert(!contentLength, 'Transfer-Encoding: chunked and Content-Length cannot coexist');
+        if (transferEncoding) {
+            assert(!contentLength, 'Transfer-Encoding and Content-Length cannot coexist');
+            assert(transferEncoding.trim().toLowerCase() === 'chunked', 'Unsupported Transfer-Encoding');
         }
 
         void contentType;
@@ -240,12 +260,13 @@ class ResponseAdapter {
         }
 
         const headers2 = new Headers(response.headers);
-        const noBodyStatus = [204, 205, 304].includes(response.status);
+        const noBodyStatus = isBodylessStatus(response.status);
         const isHead = this.method === 'HEAD';
         const hasBody = response.body !== null && !noBodyStatus && !isHead;
         const hasContentLength = headers2.has('content-length');
         const hasTransferEncoding = headers2.has('transfer-encoding');
         const isHttp2 = this.httpVersion === '2.0';
+        let bodyBytes = 0;
 
         if (isHttp2) {
             headers2.delete('transfer-encoding');
@@ -282,7 +303,14 @@ class ResponseAdapter {
                             serveHook.onData?.({ requestId: this.requestId, data: value, timestamp: serveTs() });
                         });
                     }
+                    bodyBytes += value.byteLength;
+                    if (this.declaredContentLength !== null) {
+                        assert(bodyBytes <= this.declaredContentLength, 'Response body exceeds Content-Length');
+                    }
                     await this.coreRes.write(value);
+                }
+                if (!isHead && !noBodyStatus && this.declaredContentLength !== null) {
+                    assert(bodyBytes === this.declaredContentLength, 'Response body does not match Content-Length');
                 }
             } catch (err) {
                 const message = errorMessage(err);
@@ -515,6 +543,9 @@ function serve(
                     // Peer left mid-response. Adapter already closed + onFinished; never onError/500.
                 } else {
                     // Give user code the same error-recovery hook Deno.serve exposes.
+                    if (typeof options.onError !== 'function') {
+                        reportServeError(error, requestUrl);
+                    }
                     try {
                         if (serveHook && requestId && !requestReported) {
                             serveHook.onRequest?.({
@@ -542,7 +573,10 @@ function serve(
                         const adapter = new ResponseAdapter(res, req.method, req.httpVersion, requestId, requestUrl, req.headers, requestEntryCallFrames);
                         adapter.verify(errorResponse);
                         await adapter.sendResponse(errorResponse);
-                    } catch {
+                    } catch (recoveryError) {
+                        if (!isServePeerDisconnect(recoveryError)) {
+                            reportServeError(recoveryError, requestUrl, 'error handler');
+                        }
                         // Keep the connection failure isolated from the accept loop.
                     }
                 }
@@ -679,6 +713,7 @@ function createWebSocketFromISocket(conn: Promise<ISocket>): globalThis.WebSocke
 /* ------------------------------------------------------------------ */
 
 Object.assign(Deno, wrapFSns({
-    serve: serve as typeof Deno.serve,
+    // @ts-ignore - serve cast
+    serve,
     upgradeWebSocket
 }));

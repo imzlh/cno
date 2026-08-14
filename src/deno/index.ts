@@ -975,10 +975,11 @@ Object.defineProperty(globalThis, "Deno", {
             delete: deleteEnv,
             toObject() {
                 const env: Record<string, string> = Object.create(null);
-                for (const key of os.envKeys()) {
-                    const value = safeGetEnv(key);
+                for (const key of os.envKeys()) try {
+                    if (key[0] == '=') continue;    // windows cmd legacy env var
+                    const value = os.getenv(key);
                     if (value !== undefined) env[key] = value;
-                }
+                } catch {}
                 return env;
             },
         },

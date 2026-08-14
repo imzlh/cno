@@ -7,12 +7,12 @@ const engine = import.meta.use('engine');
 const os = import.meta.use('os');
 const algorithm = import.meta.use('algorithm');
 import { concatChunks } from '../_internal/buffer';
+import { addPromiseHook, PromiseState } from '../_internal/promise-hook';
 
 const WIRE_VERSION = 1;
 const HEADER_BYTES = Uint8Array.from([0x43, 0x54, 0x53, 0x56, 0x38, WIRE_VERSION]);
 type HookCallable = (...args: never[]) => unknown;
 type UnknownCallable = (...args: unknown[]) => unknown;
-type NativeHook = (state: number, promise: Promise<unknown>, parent?: Promise<unknown>) => void;
 
 let cachedFlags = '';
 
@@ -86,66 +86,37 @@ function invokeHookSet<T extends (...args: never[]) => unknown>(hooks: Set<T>, .
     for (const hook of hooks) Reflect.apply(hook, undefined, args);
 }
 
-// engine.PromiseState — CONSTRUCT / BEFORE_THEN / AFTER_THEN / FULFILLED.
-const STATE_CONSTRUCT = 0;
-const STATE_BEFORE = 1;
-const STATE_AFTER = 2;
-const STATE_SETTLED = 3;
+let sharedHookStop: (() => void) | null = null;
 
-let dispatcher: NativeHook | null = null;
-let previousHook: NativeHook | null = null;
-
-function readNativeHook(): NativeHook | null {
-    const existing: unknown = engine.promiseHook();
-    return typeof existing === 'function' ? (existing as NativeHook) : null;
-}
-
-/**
- * Dispatches through the native `engine.promiseHook` (single-slot, so the
- * previous hook is chained). Replacing `globalThis.Promise` with a subclass
- * cannot work: `Promise.prototype.then` species-constructs the result, so the
- * subclass constructor re-enters itself unboundedly.
- */
-function installPromiseHookDispatcher(): void {
-    if (dispatcher) return;
-    previousHook = readNativeHook();
-    dispatcher = (state: number, promise: Promise<unknown>, parent?: Promise<unknown>) => {
-        if (previousHook) {
-            try {
-                previousHook(state, promise, parent);
-            } catch {
-                // a foreign hook must not break ours
-            }
-        }
+function installSharedHook(): void {
+    if (sharedHookStop) return;
+    sharedHookStop = addPromiseHook((state, promise, parent) => {
         switch (state) {
-            case STATE_CONSTRUCT: return invokeHookSet(initHooks, promise, parent);
-            case STATE_BEFORE: return invokeHookSet(beforeHooks, promise);
-            case STATE_AFTER: return invokeHookSet(afterHooks, promise);
-            case STATE_SETTLED: return invokeHookSet(settledHooks, promise);
+            case PromiseState.CONSTRUCT: return invokeHookSet(initHooks, promise, parent);
+            case PromiseState.BEFORE_THEN: return invokeHookSet(beforeHooks, promise);
+            case PromiseState.AFTER_THEN: return invokeHookSet(afterHooks, promise);
+            case PromiseState.FULFILLED: return invokeHookSet(settledHooks, promise);
         }
-    };
-    engine.promiseHook(dispatcher);
+    });
 }
 
-function uninstallPromiseHookDispatcher(): void {
-    if (!dispatcher) return;
+function uninstallSharedHook(): void {
+    if (!sharedHookStop) return;
     if (initHooks.size || beforeHooks.size || afterHooks.size || settledHooks.size) return;
-    dispatcher = null;
-    // The native slot holds exactly one hook; hand it back to whoever had it.
-    engine.promiseHook(previousHook ?? (() => {}));
-    previousHook = null;
+    sharedHookStop();
+    sharedHookStop = null;
 }
 
 function addHook<T extends HookCallable>(name: string, target: Set<T>, callback: T): () => void {
     ensureHookCallback(name, callback);
-    installPromiseHookDispatcher();
+    installSharedHook();
     target.add(callback);
     let stopped = false;
     return () => {
         if (stopped) return;
         stopped = true;
         target.delete(callback);
-        uninstallPromiseHookDispatcher();
+        uninstallSharedHook();
     };
 }
 

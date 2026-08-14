@@ -317,7 +317,7 @@ export function aes256GcmDecrypt(
 
 // Encryption/Decryption - one-shot
 
-export function cipheriv(algorithm: string, key: ArrayBuffer | Uint8Array, iv: ArrayBuffer | Uint8Array, data: ArrayBuffer | Uint8Array, outputEncoding?: string): ArrayBuffer | string {
+export function cipheriv(algorithm: string, key: ArrayBuffer | Uint8Array, iv: ArrayBuffer | Uint8Array, data: ArrayBuffer | Uint8Array, outputEncoding?: string): Uint8Array | string {
     const keyBuf = toBuffer(key);
     const ivBuf = toBuffer(iv);
     const dataBuf = toBuffer(data);
@@ -337,7 +337,7 @@ export function cipheriv(algorithm: string, key: ArrayBuffer | Uint8Array, iv: A
     return encodeOutput(result, outputEncoding);
 }
 
-export function decipheriv(algorithm: string, key: ArrayBuffer | Uint8Array, iv: ArrayBuffer | Uint8Array, data: ArrayBuffer | Uint8Array, outputEncoding?: string): ArrayBuffer | string {
+export function decipheriv(algorithm: string, key: ArrayBuffer | Uint8Array, iv: ArrayBuffer | Uint8Array, data: ArrayBuffer | Uint8Array, outputEncoding?: string): Uint8Array | string {
     const keyBuf = toBuffer(key);
     const ivBuf = toBuffer(iv);
     const dataBuf = toBuffer(data);

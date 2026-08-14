@@ -4,7 +4,7 @@ import { getFetchHook, getUserAgentOverride, getExtraHTTPHeaders, getFetchInterc
 import { type HttpClient } from "../../deno/07_http";
 import { Request } from "./request";
 import { Response, setResponseMetadata } from "./response";
-import { abortError, asyncfs, attachCurlDebugTrace, buildConnectionInfo, compressionAcceptEncoding, curlMod, engine, getCurlPool, isCurlTimeoutError, isNullBodyStatus, maxPendingBodyBytes, os, parseHeaders, prepareRequestBody, rawHeadersToHeaders, streamHighWaterMark, throwIfAborted, timeoutError, toCurlBody, truncateHookPostData } from "./helpers";
+import { abortError, attachCurlDebugTrace, buildConnectionInfo, compressionAcceptEncoding, curlMod, engine, getCurlPool, isCurlTimeoutError, isNullBodyStatus, maxPendingBodyBytes, parseHeaders, prepareRequestBody, rawHeadersToHeaders, streamHighWaterMark, throwIfAborted, timeoutError, toCurlBody, truncateHookPostData } from "./helpers";
 import { isLocalFetchProtocol, loadLocalProtocol } from "./protocols";
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
@@ -13,6 +13,7 @@ type RequestInput = ConstructorParameters<typeof Request>[0];
 type FetchStreamController = ReadableStreamDefaultController<Uint8Array> & {
     _backpressured?: boolean;
     _onEnqueueCallback?: (() => void) | null;
+    _onDequeueCallback?: (() => void) | null;
 };
 type BodyTerminal = { type: 'close' } | { type: 'error'; error: unknown };
 
@@ -40,23 +41,14 @@ function getCurlProxyType(protocol: string): CurlProxyType {
     throw new Error(`Unsupported proxy protocol: ${protocol}`);
 }
 
+function isFollowedRedirect(status: number, rawHeaders: string): boolean {
+    if (status !== 301 && status !== 302 && status !== 303 && status !== 307 && status !== 308) return false;
+    return parseHeaders(rawHeaders).some(([name, value]) => name === 'location' && value.length > 0);
+}
+
 function getEffectiveUrl(curl: CModuleCURL.CURL, fallback: string): string {
     const value = curl.getInfo(curlMod.CURLINFO_EFFECTIVE_URL);
     return typeof value === 'string' && value.length > 0 ? value : fallback;
-}
-
-async function closeFileQuietly(file: CModuleAsyncFS.FileHandle): Promise<void> {
-    try {
-        await file.close();
-    } catch {
-        // Preserve the original body/temp-file error.
-    }
-}
-
-function unlinkTempFileQuietly(path: string): void {
-    asyncfs.unlink(path).catch(() => {
-        // Temp-file cleanup is best-effort after curl has consumed it.
-    });
 }
 
 function abortCurlQuietly(curl: CModuleCURL.CURL): void {
@@ -98,52 +90,27 @@ function toRequestInput(input: unknown): RequestInput {
     return String(input);
 }
 
-/** Write a PEM string to a temp file and return its path. */
-async function writeTempPem(name: string, pem: string) {
-    const path = `${os.tmpDir}/ca-${name}-${Math.random().toString(36).slice(2, 8)}.pem`;
-    const f = await asyncfs.open(path, 'w');
-    try {
-        await f.write(engine.encodeString(pem));
-    } catch (err) {
-        await closeFileQuietly(f);
-        await asyncfs.unlink(path).catch(() => {});
-        throw err;
-    }
-    await f.close();
-    return path;
-}
+/** Apply Deno.HttpClient proxy + mTLS settings without touching the filesystem. */
+function applyClientToCurl(curl: CModuleCURL.CURL, client: HttpClient, url: URL): void {
+    const proxyUrl = client.shouldUseProxy(url) ? client.getProxyUrl() : null;
+    if (proxyUrl) curl.setProxy(proxyUrl.href, getCurlProxyType(proxyUrl.protocol));
 
-/** Apply Deno.HttpClient proxy + mTLS settings to a curl handle. Returns temp PEM paths to delete after use. */
-async function applyClientToCurl(curl: CModuleCURL.CURL, client: HttpClient, url: URL): Promise<string[]> {
-    const tempFiles: string[] = [];
-    try {
-        const proxyUrl = client.shouldUseProxy(url) ? client.getProxyUrl() : null;
-        if (proxyUrl) {
-            curl.setProxy(proxyUrl.href, getCurlProxyType(proxyUrl.protocol));
-        }
-        // mTLS: HttpClient stores PEM strings; curl needs file paths.
-        const opts = client.options;
-        if (opts.caCerts?.length) {
-            const caPem = opts.caCerts.join('\n');
-            const p = await writeTempPem('ca', caPem);
-            tempFiles.push(p);
-            curl.setCABundle(p);
-        }
-        if (opts.cert) {
-            const p = await writeTempPem('cert', opts.cert);
-            tempFiles.push(p);
-            curl.setOpt(curlMod.CURLOPT_SSLCERT, p);
-        }
-        if (opts.key) {
-            const p = await writeTempPem('key', opts.key);
-            tempFiles.push(p);
-            curl.setOpt(curlMod.CURLOPT_SSLKEY, p);
-        }
-    } catch (err) {
-        for (const p of tempFiles) unlinkTempFileQuietly(p);
-        throw err;
+    const opts = client.options;
+    if (opts.caCerts?.length) {
+        const option = curlMod.CURLOPT_CAINFO_BLOB;
+        if (typeof option !== 'number') throw new Error('custom CA certificates require libcurl with CAINFO_BLOB support');
+        curl.setOpt(option, engine.encodeString(opts.caCerts.join('\n')));
     }
-    return tempFiles;
+    if (opts.cert) {
+        const option = curlMod.CURLOPT_SSLCERT_BLOB;
+        if (typeof option !== 'number') throw new Error('client certificates require libcurl with SSLCERT_BLOB support');
+        curl.setOpt(option, engine.encodeString(opts.cert));
+    }
+    if (opts.key) {
+        const option = curlMod.CURLOPT_SSLKEY_BLOB;
+        if (typeof option !== 'number') throw new Error('client keys require libcurl with SSLKEY_BLOB support');
+        curl.setOpt(option, engine.encodeString(opts.key));
+    }
 }
 
 const CURL_INTERNAL_HEADERS = [
@@ -183,19 +150,9 @@ export async function performFetch(request: Request, url: URL): Promise<Response
     // If a Deno.HttpClient is attached, apply its proxy/SSL config to curl
     // instead of reimplementing HTTP on a raw socket.
     const client = (await import('../../deno/07_http')).getRequestClient(request);
-    let tempPemFiles: string[] = [];
-    let tempBodyFile: string | null = preparedBody.kind === 'file' ? preparedBody.path : null;
     if (client) {
-        tempPemFiles = await applyClientToCurl(curl, client, url);
+        applyClientToCurl(curl, client, url);
     }
-    const cleanupTempFiles = () => {
-        for (const p of tempPemFiles) unlinkTempFileQuietly(p);
-        tempPemFiles.length = 0;
-        if (tempBodyFile) {
-            unlinkTempFileQuietly(tempBodyFile);
-            tempBodyFile = null;
-        }
-    };
     const abortCurl = () => {
         abortCurlQuietly(curl);
     };
@@ -263,14 +220,6 @@ export async function performFetch(request: Request, url: URL): Promise<Response
 
     if (preparedBody.kind === 'buffer' && body && body.length > 0) {
         curl.setBody(toCurlBody(body));
-    } else if (preparedBody.kind === 'file') {
-        curl.setUploadFile(preparedBody.path);
-        if (request.method === 'POST') {
-            curl.setMethod('POST');
-            curl.setOpt(curlMod.CURLOPT_POSTFIELDSIZE_LARGE, preparedBody.size);
-        } else if (request.method !== 'PUT') {
-            curl.setMethod(request.method);
-        }
     }
 
     // AbortSignal directly cancels the underlying curl request
@@ -284,7 +233,6 @@ export async function performFetch(request: Request, url: URL): Promise<Response
         };
         if (request.signal.aborted) {
             abortCurl();
-            cleanupTempFiles();
             throw abortError(request.signal);
         }
         request.signal.addEventListener('abort', abortHandler, { once: true });
@@ -353,6 +301,10 @@ export async function performFetch(request: Request, url: URL): Promise<Response
             }
         }
         syncCurlBackpressure();
+        if (bodyTerminal?.type === 'close' && pendingBodyChunks.length === 0 && !bodyCanceled) {
+            streamController._onDequeueCallback = null;
+            streamController.close();
+        }
     };
 
     const enqueueBodyChunk = (chunk: Uint8Array): void => {
@@ -375,22 +327,23 @@ export async function performFetch(request: Request, url: URL): Promise<Response
     const closeBody = () => {
         if (bodyCanceled || bodyTerminal) return;
         resumeCurlRecv();
+        bodyTerminal = { type: 'close' };
         if (!streamController) {
-            bodyTerminal = { type: 'close' };
             return;
         }
         flushPendingBodyChunks();
-        streamController.close();
-        bodyTerminal = { type: 'close' };
     };
 
     const errorBody = (error: unknown) => {
         if (bodyCanceled || bodyTerminal) return;
         resumeCurlRecv();
+        pendingBodyChunks.length = 0;
+        pendingBodySize = 0;
         if (!streamController) {
             bodyTerminal = { type: 'error', error };
             return;
         }
+        streamController._onDequeueCallback = null;
         streamController.error(error);
         bodyTerminal = { type: 'error', error };
     };
@@ -399,10 +352,15 @@ export async function performFetch(request: Request, url: URL): Promise<Response
         const fetchController = controller as FetchStreamController;
         streamController = fetchController;
         fetchController._onEnqueueCallback = syncCurlBackpressure;
-        flushPendingBodyChunks();
-        if (bodyTerminal?.type === 'close') controller.close();
-        else if (bodyTerminal?.type === 'error') controller.error(bodyTerminal.error);
-        else syncCurlBackpressure();
+        fetchController._onDequeueCallback = flushPendingBodyChunks;
+        if (bodyTerminal?.type === 'error') {
+            pendingBodyChunks.length = 0;
+            pendingBodySize = 0;
+            controller.error(bodyTerminal.error);
+        } else {
+            flushPendingBodyChunks();
+            syncCurlBackpressure();
+        }
     };
 
     const followingRedirects = request.redirect !== 'error' && request.redirect !== 'manual';
@@ -410,7 +368,7 @@ export async function performFetch(request: Request, url: URL): Promise<Response
     let waitingForFinalHeaders = false; // true between a redirect hop and the final onHeadersComplete
 
     curl.onHeadersComplete((status, headers) => {
-        const isRedirectStatus = status >= 300 && status < 400;
+        const isRedirectStatus = isFollowedRedirect(status, headers);
 
         // When curl follows redirects, onHeadersComplete fires for each hop.
         // Skip intermediate redirect responses entirely — the netHook and
@@ -481,7 +439,6 @@ export async function performFetch(request: Request, url: URL): Promise<Response
                 removeAbortHandler();
                 abortCurl();
                 inFlightFetchFrames.delete(headersDone.promise);
-                cleanupTempFiles();
                 const resHeaders = new Headers();
                 for (const [k, v] of result.responseHeaders) resHeaders.set(k, v);
                 return new Response(result.body, { status: result.responseCode, headers: resHeaders });
@@ -490,7 +447,6 @@ export async function performFetch(request: Request, url: URL): Promise<Response
                 removeAbortHandler();
                 abortCurl();
                 inFlightFetchFrames.delete(headersDone.promise);
-                cleanupTempFiles();
                 throw new TypeError(`Request blocked: ${result.reason}`);
             }
             // action === 'continue': apply modifications to the already-configured curl handle
@@ -537,15 +493,7 @@ export async function performFetch(request: Request, url: URL): Promise<Response
     ).finally(() => {
         inFlightFetchFrames.delete(headersDone.promise);
         removeAbortHandler();
-        cleanupTempFiles();
         curlRecvPaused = false;
-        // Keep pre-read body chunks alive until a reader attaches. Clearing them
-        // here races with lazy consumers like response.text()/json().
-        if (streamController) {
-            pendingBodyChunks.length = 0;
-            pendingBodySize = 0;
-            streamController = null;
-        }
     });
 
     try {
@@ -553,7 +501,7 @@ export async function performFetch(request: Request, url: URL): Promise<Response
         throwIfAborted(request.signal);
 
         const responseHeaders = rawHeadersToHeaders(rawHeaders);
-        const isRedirect = status >= 300 && status < 400;
+        const isRedirect = isFollowedRedirect(status, rawHeaders);
 
         if (request.redirect === 'error' && isRedirect) {
             abortCurl();
@@ -570,6 +518,7 @@ export async function performFetch(request: Request, url: URL): Promise<Response
             },
             cancel() {
                 bodyCanceled = true;
+                if (streamController) streamController._onDequeueCallback = null;
                 pendingBodyChunks.length = 0;
                 pendingBodySize = 0;
                 abortCurl();

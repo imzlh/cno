@@ -2,7 +2,6 @@
  * fs module internal utility functions
  */
 
-import type { StatFsOptions } from 'fs';
 import path from '../path';
 const { dirname, join } = path;
 import { fileURLToPath } from '../url';
@@ -25,6 +24,7 @@ const nativeError = import.meta.use('error');
 export type PathLike = string | URL | Buffer;
 export type TimeLike = string | number | Date;
 export type Mode = number | string;
+export interface StatFsOptions { bigint?: boolean; }
 
 export function modeToNumber(mode: Mode): number;
 export function modeToNumber(mode?: Mode): number | undefined;
@@ -69,6 +69,10 @@ export function timeToUnixMs(time: TimeLike, name = 'time'): number {
 
 export function errorFromUnknown(error: unknown): Error {
     return error instanceof Error ? error : new Error(String(error));
+}
+
+export function errorCode(error: unknown): unknown {
+    return error !== null && typeof error === 'object' ? Reflect.get(error, 'code') : undefined;
 }
 
 export function rmIsDirectoryError(path: string): NodeJS.ErrnoException {
@@ -141,7 +145,7 @@ export function toUint8Array(data: string | Uint8Array | ArrayBuffer, encoding?:
             case 'ucs2':
             case 'ucs-2': {
                 const u16 = engine.encodeU16String(data);
-                return new Uint8Array(u16.buffer, u16.byteOffset, u16.byteLength);
+                return arrayBufferBackedBytes(new Uint8Array(u16.buffer, u16.byteOffset, u16.byteLength));
             }
             case 'latin1':
             case 'binary':
@@ -233,6 +237,7 @@ export function normalizeRwArgs(
 
 export function decodeBuffer(buffer: Uint8Array<ArrayBuffer>, encoding: BufferEncoding): string;
 export function decodeBuffer(buffer: Uint8Array<ArrayBuffer>, encoding?: 'buffer' | null): Buffer;
+export function decodeBuffer(buffer: Uint8Array<ArrayBuffer>, encoding?: BufferEncoding | 'buffer' | null): string | Buffer;
 export function decodeBuffer(buffer: Uint8Array<ArrayBuffer>, encoding?: BufferEncoding | 'buffer' | null): string | Buffer {
     if (!encoding || encoding === 'buffer') return Buffer.from(buffer);
     const normalized = String(encoding).toLowerCase();
@@ -271,7 +276,7 @@ export function decodeBuffer(buffer: Uint8Array<ArrayBuffer>, encoding?: BufferE
 
 export function encodePathResult(
     pathStr: string,
-    options?: { encoding?: BufferEncoding | 'buffer' | null } | BufferEncoding,
+    options?: { encoding?: BufferEncoding | 'buffer' | null } | BufferEncoding | 'buffer',
 ): string | Buffer {
     const encoding = typeof options === 'string' ? options : options?.encoding;
     if (encoding == null) return pathStr;
@@ -434,7 +439,7 @@ type StatValue = number | bigint;
 /** POSIX file-type mask; the host may not export S_IFMT on CModuleFS. */
 const S_IFMT_BITS = fs.S_IFMT ?? 0o170000;
 
-type NativeStats = CModuleFS.Stats | CModuleAsyncFS.Stats;
+type NativeStats = CModuleFS.Stats | CModuleAsyncFS.StatResult;
 
 export class Stats {
     dev: StatValue;
@@ -547,6 +552,8 @@ export class StatFs {
         this.ffree = convert(stat.ffree);
     }
 }
+
+export type StatsFs = StatFs;
 
 export function toNodeStatFs(stat: StatFsInput, options?: StatFsOptions): import('fs').StatsFs {
     return new StatFs(stat, options?.bigint === true) as import('fs').StatsFs;
@@ -1344,7 +1351,7 @@ export function createFileHandle(fd: number, handle: CModuleAsyncFS.FileHandle) 
             let currentPosition = position;
             for (const buffer of buffers) {
                 if (!ArrayBuffer.isView(buffer)) throw new TypeError('The "buffers" argument must be an ArrayBufferView[]');
-                const chunk = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+                const chunk = arrayBufferBackedBytes(new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength));
                 if (chunk.byteLength === 0) continue;
                 const read = currentPosition == null
                     ? await native('readv', () => handle.read(chunk))
@@ -1363,7 +1370,7 @@ export function createFileHandle(fd: number, handle: CModuleAsyncFS.FileHandle) 
             let currentPosition = position;
             for (const buffer of buffers) {
                 if (!ArrayBuffer.isView(buffer)) throw new TypeError('The "buffers" argument must be an ArrayBufferView[]');
-                const chunk = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+                const chunk = arrayBufferBackedBytes(new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength));
                 const written = await writeAll(arrayBufferBackedBytes(chunk), currentPosition);
                 bytesWritten += written;
                 if (currentPosition != null) currentPosition += written;

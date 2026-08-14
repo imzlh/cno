@@ -284,7 +284,7 @@ export class AssertionError extends Error {
     expected: unknown;
     generatedMessage: boolean;
     code: 'ERR_ASSERTION' = 'ERR_ASSERTION';
-    operator: string;
+    operator: string = '';
 
     constructor(options: AssertionErrorOptions = {}) {
         // Auto-generate a message from actual/operator/expected when none is
@@ -878,9 +878,9 @@ export class CallTracker {
         let exact: number;
         if (typeof fn === 'number') {
             exact = fn;
-            callback = (0, function () {}) as AssertCallable;
+            callback = function () {} as AssertCallable;
         } else {
-            callback = fn ?? ((0, function () {}) as AssertCallable);
+            callback = fn ?? (function () {} as AssertCallable);
             exact = num;
         }
 

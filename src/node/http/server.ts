@@ -42,6 +42,8 @@ type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 export interface ServerSocketLike {
     setTimeout?(msecs: number, callback?: () => void): unknown;
     once(event: 'close', listener: () => void): unknown;
+    off?(event: 'close', listener: () => void): unknown;
+    removeListener?(event: 'close', listener: () => void): unknown;
 }
 
 function normalizeListenHost(host: string): string {
@@ -59,7 +61,7 @@ function normalizeListenHost(host: string): string {
 }
 
 export function isBodyForbiddenStatus(statusCode: number): boolean {
-    return (statusCode >= 100 && statusCode < 200) || statusCode === 204 || statusCode === 304;
+    return (statusCode >= 100 && statusCode < 200) || statusCode === 204 || statusCode === 205 || statusCode === 304;
 }
 
 export function createHeadersSentError(message = 'Cannot write headers after they are sent to the client'): Error & { code: string } {
@@ -354,7 +356,7 @@ OutgoingMessageImpl.prototype._requireHeadersNotSent = function _requireHeadersN
     if (this.headersSent) throw createHeadersSentError('Cannot set headers after they are sent to the client');
 };
 
-OutgoingMessageImpl.prototype.setHeader = function setHeader(this: OutgoingMessageImpl, name: string, value: number | string | readonly string[]): OutgoingMessageImpl {
+OutgoingMessageImpl.prototype.setHeader = function setHeader(this: OutgoingMessageImpl, name: string, value: OutgoingHttpHeader): OutgoingMessageImpl {
     this._requireHeadersNotSent();
     validateHeaderName(name);
     const key = name.toLowerCase();
@@ -368,7 +370,7 @@ OutgoingMessageImpl.prototype.setHeader = function setHeader(this: OutgoingMessa
     return this;
 };
 
-OutgoingMessageImpl.prototype.setHeaders = function setHeaders(this: OutgoingMessageImpl, headers: Headers | Map<string, number | string | readonly string[]>): OutgoingMessageImpl {
+OutgoingMessageImpl.prototype.setHeaders = function setHeaders(this: OutgoingMessageImpl, headers: Headers | Map<string, OutgoingHttpHeader>): OutgoingMessageImpl {
     this._requireHeadersNotSent();
     for (const [key, value] of headers) {
         this.setHeader(key, value);
@@ -514,6 +516,7 @@ export interface ServerResponseImpl extends OutgoingMessageImpl, ServerResponse 
     req: IncomingMessage | null;
     _ended: boolean;
     _bodyLength: number;
+    _socketCloseListener: (() => void) | null;
     assignSocket(socket: ServerSocketLike): void;
     detachSocket(socket: ServerSocketLike): void;
 }
@@ -534,6 +537,7 @@ function initServerResponse(self: ServerResponseImpl): void {
 
     self._ended = false;
     self._bodyLength = 0;
+    self._socketCloseListener = null;
 }
 
 function statusMessageFor(code: number, explicit?: string): string {
@@ -551,14 +555,28 @@ Object.setPrototypeOf(ServerResponseImpl, OutgoingMessageImpl);
 ServerResponseImpl.prototype = Object.create(OutgoingMessageImpl.prototype);
 
 ServerResponseImpl.prototype.assignSocket = function assignSocket(this: ServerResponseImpl, socket: ServerSocketLike): void {
+    if (this.socket) this.detachSocket(this.socket as ServerSocketLike);
     this.socket = socket as MessageSocket;
-    socket.once('close', () => {
-        this.socket = null;
-    });
+    const onClose = () => {
+        if (this.socket === socket) this.socket = null;
+        this._socketCloseListener = null;
+    };
+    this._socketCloseListener = onClose;
+    socket.once('close', onClose);
 };
 
 ServerResponseImpl.prototype.detachSocket = function detachSocket(this: ServerResponseImpl, socket: ServerSocketLike): void {
-    this.socket = null;
+    const listener = this._socketCloseListener;
+    if (listener && socket) {
+        try {
+            if (typeof socket.off === 'function') socket.off('close', listener);
+            else socket.removeListener?.('close', listener);
+        } catch {
+            // The socket may already be tearing down.
+        }
+    }
+    if (this.socket === socket) this.socket = null;
+    this._socketCloseListener = null;
 };
 
 ServerResponseImpl.prototype.writeHead = function writeHead(
@@ -702,11 +720,15 @@ class NodeResponseAdapter extends ServerResponseAdapter<ServerResponseImpl> {
             closeSource: response.socket,
             normalizeError: normalizeErrnoError,
             writeHead: (res, headers) => coreResponse.writeHead(res.statusCode, res.statusMessage, headers),
+            writeInformational: (_res, status, statusText, headers) => coreResponse.writeHead(status, statusText, headers),
             writeBody: async (_res, data) => {
                 await coreResponse.write(data);
             },
             finish: async () => {
                 await coreResponse.end();
+                if (response.socket) {
+                    response.detachSocket(response.socket as ServerSocketLike);
+                }
             },
             abort: () => {
                 try { coreResponse.close(); } catch { /* already closed */ }
@@ -843,8 +865,13 @@ export class ServerImpl extends NetServer implements Server {
     private _options: ServerOptions;
     private _requestListener: RequestListener;
     private _httpConnections: Set<Socket> = new Set();
+    private _httpActiveSockets: Set<Socket> = new Set();
+    private _httpUpgradedSockets: Set<Socket> = new Set();
     /** One Node facade per native TCP (keep-alive reuses it). */
     private _httpSocketByTcp = new WeakMap<object, Socket>();
+    private _httpClosePromise: Promise<void> | null = null;
+    private _httpCloseCallbacks: Array<(err?: Error) => void> = [];
+    private _httpDeferredClose: (() => void) | null = null;
 
     constructor(options: ServerOptions | RequestListener, requestListener?: RequestListener) {
         super();
@@ -873,14 +900,20 @@ export class ServerImpl extends NetServer implements Server {
 
     closeAllConnections(): void {
         for (const socket of [...this._httpConnections]) {
+            if (this._httpUpgradedSockets.has(socket)) continue;
             socket.destroy();
         }
-        this._httpConnections.clear();
+        this._httpActiveSockets.clear();
+        if (this._httpDeferredClose) this._httpDeferredClose();
     }
 
     closeIdleConnections(): void {
-        // Core does not expose idle-only sockets yet. Do not stop the listener:
-        // Node's closeIdleConnections() never closes the server itself.
+        // Keep the listener open; only sockets with no active HTTP handler are idle.
+        for (const socket of [...this._httpConnections]) {
+            if (!this._httpUpgradedSockets.has(socket) && !this._httpActiveSockets.has(socket)) {
+                socket.destroy();
+            }
+        }
     }
 
     private trackHttpSocket(socket: Socket): void {
@@ -888,7 +921,21 @@ export class ServerImpl extends NetServer implements Server {
         this._httpConnections.add(socket);
         socket.once('close', () => {
             this._httpConnections.delete(socket);
+            this._httpUpgradedSockets.delete(socket);
+            this.releaseActiveHttpSocket(socket);
         });
+    }
+
+    private markHttpSocketUpgraded(socket: Socket | null): void {
+        if (socket) this._httpUpgradedSockets.add(socket);
+    }
+
+    private releaseActiveHttpSocket(socket: Socket | null): void {
+        if (!socket) return;
+        this._httpActiveSockets.delete(socket);
+        if (this._httpDeferredClose && this._httpActiveSockets.size === 0) {
+            this._httpDeferredClose();
+        }
     }
 
     /**
@@ -934,6 +981,7 @@ export class ServerImpl extends NetServer implements Server {
         const nodeSocket = typeof rawTcp === 'object' && rawTcp !== null
             ? this.socketForCoreRequest(rawTcp as CModuleStreams.TCP, res)
             : null;
+        if (nodeSocket) this._httpActiveSockets.add(nodeSocket);
         const { incoming, response } = createServerRequestObjects(nodeSocket);
         applyCoreServerRequest(incoming, req);
         // Node publishes http.server.response.created from the ServerResponse
@@ -946,17 +994,25 @@ export class ServerImpl extends NetServer implements Server {
         if (incoming.method === 'CONNECT') {
             if (this.listenerCount('connect') <= 0) {
                 res.close();
+                this.releaseActiveHttpSocket(nodeSocket);
                 return;
             }
             try {
                 const connectSocket = Socket.fromUpgradeHandle(res.upgrade());
+                this.markHttpSocketUpgraded(nodeSocket);
                 this.emit('connect', incoming, connectSocket, new Uint8Array(0));
             } catch (err) {
                 this.emit('error', err);
             }
+            this.releaseActiveHttpSocket(nodeSocket);
             return;
         }
-        if (emitNodeServerUpgrade(this, res, incoming)) return;
+        const upgradeResult = emitNodeServerUpgrade(this, res, incoming);
+        if (upgradeResult.handled) {
+            if (upgradeResult.upgraded) this.markHttpSocketUpgraded(nodeSocket);
+            this.releaseActiveHttpSocket(nodeSocket);
+            return;
+        }
 
         pumpIncomingRequestBody(
             incoming,
@@ -982,25 +1038,29 @@ export class ServerImpl extends NetServer implements Server {
             });
         }
 
-        await dispatchServerRequest({
-            listener: this._requestListener,
-            incoming,
-            response,
-            adapter,
-            serveHook,
-            requestId,
-            timestamp: requestStartTime,
-            url: requestUrl,
-            method: req.method,
-            headers: requestHeaders,
-            postData: undefined,
-            callFrames: requestCallFrames,
-            // Peer abort is not a server fault; never promote it to server 'error'.
-            onError: (err) => {
-                if (isTransportDisconnectError(err)) return;
-                this.emit('error', err);
-            },
-        });
+        try {
+            await dispatchServerRequest({
+                listener: this._requestListener,
+                incoming,
+                response,
+                adapter,
+                serveHook,
+                requestId,
+                timestamp: requestStartTime,
+                url: requestUrl,
+                method: req.method,
+                headers: requestHeaders,
+                postData: undefined,
+                callFrames: requestCallFrames,
+                // Peer abort is not a server fault; never promote it to server 'error'.
+                onError: (err) => {
+                    if (isTransportDisconnectError(err)) return;
+                    this.emit('error', err);
+                },
+            });
+        } finally {
+            this.releaseActiveHttpSocket(nodeSocket);
+        }
     }
 
     private _handleNativeRequestError(err: Error, tcpSock: { socket?: unknown } | undefined): void {
@@ -1077,7 +1137,7 @@ export class ServerImpl extends NetServer implements Server {
         this._listening = true;
         this.listening = true;
         this._httpServer.acceptLoop().catch((err: unknown) => {
-            if (this._listening) this.emit('error', err);
+            if (this._listening && !this._httpClosePromise) this.emit('error', err);
         });
         queueMicrotask(() => {
             if (!this._listening) return;
@@ -1089,14 +1149,67 @@ export class ServerImpl extends NetServer implements Server {
     }
 
     close(callback?: (err?: Error) => void): this {
+        if (callback) this._httpCloseCallbacks.push(callback);
+        if (this._httpClosePromise) return this;
         if (!this._listening) {
-            callback?.(new Error('Server is not running'));
+            const error = Object.assign(new Error('Server is not running'), {
+                code: 'ERR_SERVER_NOT_RUNNING',
+            });
+            if (callback) queueMicrotask(() => {
+                const callbacks = this._httpCloseCallbacks.splice(0);
+                for (const cb of callbacks) cb(error);
+            });
             return this;
         }
 
-        this._httpServer?.close();
-        super.close(callback);
+        // Node marks the public listening state false as soon as close starts;
+        // the callback/event still wait for active HTTP requests to drain.
         this.listening = false;
+        const core = this._httpServer;
+        const gracefulClose = core ? Reflect.get(core, 'closeGracefully') : null;
+        const forceClose = core ? Reflect.get(core, 'shutdown') : null;
+        const invoke = (method: unknown): Promise<void> => {
+            if (typeof method !== 'function') return Promise.resolve();
+            return Promise.resolve().then(() => method.call(core)).then(() => undefined);
+        };
+        if (typeof gracefulClose === 'function') {
+            this._httpClosePromise = invoke(gracefulClose);
+        } else if (typeof forceClose === 'function' && this._httpActiveSockets.size > 0) {
+            // Older embedded cores expose only shutdown(). Defer that destructive
+            // operation until the facade's active request set has drained.
+            const listener = core ? Reflect.get(core, 'listener') : null;
+            const stopAccepting = listener && Reflect.get(listener, 'close');
+            if (typeof stopAccepting === 'function') {
+                try { stopAccepting.call(listener); } catch { /* already closed */ }
+            }
+            this._httpClosePromise = new Promise<void>((resolve, reject) => {
+                this._httpDeferredClose = () => {
+                    this._httpDeferredClose = null;
+                    invoke(forceClose).then(resolve, reject);
+                };
+            });
+        } else {
+            this._httpClosePromise = invoke(forceClose);
+        }
+        void this._httpClosePromise.then(() => {
+            this._httpServer = null;
+            this._listening = false;
+            this.listening = false;
+            const callbacks = this._httpCloseCallbacks.splice(0);
+            this._httpClosePromise = null;
+            // The native HTTP server owns the listener; this facade never calls
+            // net.Server.listen(), so delegating to super.close() would run the
+            // unrelated net.Server close state machine a second time.
+            this.emit('close');
+            for (const cb of callbacks) cb();
+        }, (err: unknown) => {
+            this._httpClosePromise = null;
+            const error = err instanceof Error ? err : new Error(String(err));
+            const callbacks = this._httpCloseCallbacks.splice(0);
+            this._listening = false;
+            this.listening = false;
+            for (const cb of callbacks) cb(error);
+        });
         return this;
     }
 

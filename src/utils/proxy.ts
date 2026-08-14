@@ -376,28 +376,33 @@ export async function connectViaProxy(url: URL, config: ProxyConfig, tls?: TlsOp
     if (shouldBypassProxy(url, config.noProxy)) return { socket: await connectDirectTcp(url, tls) };
     const proxy = new URL(config.url);
     let socket = await openTcp(normalizeHost(proxy.hostname), proxyPort(config, proxy));
-    if (config.type === 'https') socket = await startTls(socket, normalizeHost(proxy.hostname), tls);
-    const secureTarget = url.protocol === 'https:' || url.protocol === 'wss:';
-    if ((config.type === 'http' || config.type === 'https') && !secureTarget) {
-        return {
-            socket,
-            requestTarget: absoluteRequestTarget(url),
-            proxyAuthorization: proxyAuthorization(config),
-        };
+    try {
+        if (config.type === 'https') socket = await startTls(socket, normalizeHost(proxy.hostname), tls);
+        const secureTarget = url.protocol === 'https:' || url.protocol === 'wss:';
+        if ((config.type === 'http' || config.type === 'https') && !secureTarget) {
+            return {
+                socket,
+                requestTarget: absoluteRequestTarget(url),
+                proxyAuthorization: proxyAuthorization(config),
+            };
+        }
+        let leftover: Uint8Array | null = null;
+        if (config.type === 'http' || config.type === 'https') leftover = await httpConnect(socket, url, config);
+        else if (config.type === 'socks5' || config.type === 'socks5h') await socks5Connect(socket, url, config);
+        else await socks4Connect(socket, url, config);
+        if (secureTarget) {
+            const hostname = normalizeHost(url.hostname);
+            socket = config.type === 'https'
+                ? await startNestedTls(socket, hostname, leftover, tls)
+                : await startTls(prependTunnelBytes(socket, leftover), hostname, tls);
+        } else {
+            socket = prependTunnelBytes(socket, leftover);
+        }
+        return { socket };
+    } catch (err) {
+        socket.close();
+        throw err;
     }
-    let leftover: Uint8Array | null = null;
-    if (config.type === 'http' || config.type === 'https') leftover = await httpConnect(socket, url, config);
-    else if (config.type === 'socks5' || config.type === 'socks5h') await socks5Connect(socket, url, config);
-    else await socks4Connect(socket, url, config);
-    if (secureTarget) {
-        const hostname = normalizeHost(url.hostname);
-        socket = config.type === 'https'
-            ? await startNestedTls(socket, hostname, leftover, tls)
-            : await startTls(prependTunnelBytes(socket, leftover), hostname, tls);
-    } else {
-        socket = prependTunnelBytes(socket, leftover);
-    }
-    return { socket };
 }
 
 export function createProxyConnector(getConfig: (url: URL) => ProxyConfig | null, tls?: TlsOptions): RawConnectionHook {

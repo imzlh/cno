@@ -4,6 +4,7 @@ import type { SingleByteEncoding } from "../utils/bytes";
 import { arrayBufferBackedBytes, decodeSingleByte, sanitizeSurrogates, utf8Decode, utf8PendingTail } from "../utils/bytes";
 import { DOMException } from "./events";
 import { messagePortTransferHooks } from "./messaging";
+import { stdin, stdout } from "../utils/stdio";
 
 type TimerOptions = { signal?: AbortSignal };
 
@@ -471,20 +472,19 @@ globalThis.alert = function(msg) {
 
 globalThis.prompt = function(msg) {
     const promptStr = msg != null ? String(msg) + ' ' : '? ';
-    const { stdin: _stdin, stdout: _stdout } = streams as StreamsWithStdio;
-    const stdin = _stdin.__stream as CModuleStreams.TTY, stdout = _stdout.__stream;
 
-    if (!_stdin.isTTY) {
+    if (!stdin.isTTY) {
         return null;    // note: deno doesn't support prompt() when not in TTY
     }
 
     // If another subsystem (like the REPL) already owns the TTY in raw mode,
     // stop its read loop before changing modes to avoid libuv continuing to
     // deliver raw key events on the old read watcher.
-    const prevMode: number = stdin.mode;
-    const reading = !!stdin.onread;
-    if (reading) stdin.stopRead();
-    stdin.mode = streams.TTY_MODE_NORMAL;
+    const rawstdin = stdin.__stream as CModuleStreams.TTY;
+    const prevMode: number = rawstdin.mode;
+    const reading = !!rawstdin.onread;
+    if (reading) rawstdin.stopRead();
+    rawstdin.mode = streams.TTY_MODE_NORMAL;
     stdout.writeSync(engine.encodeString(promptStr));
 
     const chunk = new Uint8Array(4096);
@@ -493,7 +493,7 @@ globalThis.prompt = function(msg) {
         while (true) {
             // Read through the Stream wrapper: on POSIX it flips the fd to
             // blocking so a raw readSync doesn't EAGAIN on an empty TTY.
-            const n = _stdin.readSync(chunk);
+            const n = stdin.readSync(chunk);
             if (!n) break;
             line += engine.decodeString(chunk.subarray(0, n));
             // Normal mode delivers a full line ending with \n
@@ -502,8 +502,8 @@ globalThis.prompt = function(msg) {
         }
         return line.replace(/\r?\n$/, '') || null;
     } finally {
-        stdin.mode = prevMode;
-        if (reading) stdin.startRead();
+        rawstdin.mode = prevMode;
+        if (reading) rawstdin.startRead();
     }
 }
 

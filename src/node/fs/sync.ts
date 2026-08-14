@@ -2,12 +2,13 @@
  * Node.js fs module - sync operations
  */
 
-import { Dir, toUint8Array, normalizeRwArgs, decodeBuffer, encodePathResult, toNodeStat, toNodeStatFs, toNodeDirent, parseFlags, pathToString, splitPathOrFd, describeFd, removeRecursiveSync, mkdirRecursiveSync, modeToNumber, timeToUnixSeconds, timeToUnixMs, readFileFromFdSync, randomHex, readDirEntriesSync, validateOpendirOptions, validateReaddirOptions, validateFd, assertCopyFileMode, rmIsDirectoryError, writeAllSync, type PathLike, type TimeLike, type Mode } from './utils';
+import { Dir, toUint8Array, normalizeRwArgs, decodeBuffer, encodePathResult, toNodeStat, toNodeStatFs, toNodeDirent, parseFlags, pathToString, splitPathOrFd, describeFd, removeRecursiveSync, mkdirRecursiveSync, modeToNumber, timeToUnixSeconds, timeToUnixMs, readFileFromFdSync, randomHex, readDirEntriesSync, validateOpendirOptions, validateReaddirOptions, validateFd, assertCopyFileMode, rmIsDirectoryError, writeAllSync, errorCode, type PathLike, type TimeLike, type Mode } from './utils';
 import { wrapSync } from './errno-fix';
 import { getTierLimits } from '../_internal/memory';
 import { resolve } from '../path';
 import { copyPathSync, validateCopyOptions, type CopySyncOptions } from './copy';
 import { globPathsSync, type GlobOptions, type GlobResult } from './glob';
+import { Buffer } from '../buffer';
 
 const { readBufSize: READ_BUF_SIZE } = getTierLimits();
 
@@ -96,7 +97,7 @@ export function statSync(path: PathLike, options?: { bigint?: boolean; throwIfNo
         const st = wrapSync(() => fs.stat(pathStr), 'statSync', pathStr);
         return toNodeStat(st, options);
     } catch (err) {
-        if (options?.throwIfNoEntry === false && Reflect.get(err, 'code') === 'ENOENT') return undefined;
+        if (options?.throwIfNoEntry === false && errorCode(err) === 'ENOENT') return undefined;
         throw err;
     }
 }
@@ -107,7 +108,7 @@ export function lstatSync(path: PathLike, options?: { bigint?: boolean; throwIfN
         const st = wrapSync(() => fs.lstat(pathStr), 'lstatSync', pathStr);
         return toNodeStat(st, options);
     } catch (err) {
-        if (options?.throwIfNoEntry === false && Reflect.get(err, 'code') === 'ENOENT') return undefined;
+        if (options?.throwIfNoEntry === false && errorCode(err) === 'ENOENT') return undefined;
         throw err;
     }
 }
@@ -161,7 +162,7 @@ export function rmSync(path: PathLike, options?: { force?: boolean; recursive?: 
     try {
         stats = wrapSync(() => fs.lstat(pathStr), 'rmSync', pathStr);
     } catch (err) {
-        if (options?.force && Reflect.get(err, 'code') === 'ENOENT') return;
+        if (options?.force && errorCode(err) === 'ENOENT') return;
         throw err;
     }
 

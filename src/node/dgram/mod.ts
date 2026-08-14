@@ -508,7 +508,7 @@ function initSocket(self: Socket, type: 'udp4' | 'udp6', reuseAddr?: boolean, ip
     self.type = type;
     self._reuseAddr = reuseAddr ?? false;
     self._ipv6Only = ipv6Only ?? false;
-    self.isIPv6 = type === 'udp6';
+    Object.defineProperty(self, 'isIPv6', { value: type === 'udp6', enumerable: true });
 }
 
 export const Socket: SocketConstructor = function Socket(this: unknown, type: 'udp4' | 'udp6', reuseAddr?: boolean, ipv6Only?: boolean) {
@@ -646,18 +646,23 @@ Socket.prototype._startRecv = async function _startRecv(this: Socket): Promise<v
     }
 };
 
-Socket.prototype.send = function send(this: Socket, msg: string | Uint8Array | Array<string | Uint8Array>, port: number, addressOrCallback?: string | ((error: Error | null, bytes?: number) => void), callback?: (error: Error | null, bytes?: number) => void): void {
+Socket.prototype.send = function send(this: Socket, msg: string | Uint8Array | Array<string | Uint8Array>, ...args: unknown[]): void {
     healthCheck(this);
-    const args: unknown[] = Array.prototype.slice.call(arguments, 1);
     this._doSend(normalizeSendArgs(this, msg, args));
 };
+
+type SendCallback = (error: Error | null, bytes?: number) => void;
+
+function isSendCallback(value: unknown): value is SendCallback {
+    return typeof value === 'function';
+}
 
 interface SendRequest {
     data: Uint8Array;
     port?: number;
     address?: string;
     connected?: boolean;
-    callback?: (error: Error | null, bytes?: number) => void;
+    callback?: SendCallback;
 }
 
 function normalizeSendArgs(
@@ -681,7 +686,7 @@ function normalizeSendArgs(
 
     let address = socket._remoteAddress?.address
         ?? (socket._type === 'udp6' ? '::1' : '127.0.0.1');
-    let callback: ((error: Error | null, bytes?: number) => void) | undefined;
+    let callback: SendCallback | undefined;
     let data: Uint8Array;
     let port: number;
 
@@ -704,8 +709,8 @@ function normalizeSendArgs(
         port = args[2];
         if (typeof args[3] === 'string') {
             address = args[3];
-            if (typeof args[4] === 'function') callback = args[4];
-        } else if (typeof args[3] === 'function') {
+            if (isSendCallback(args[4])) callback = args[4];
+        } else if (isSendCallback(args[3])) {
             callback = args[3];
         } else if (args[3] !== undefined) {
             validateAddress(args[3]);
@@ -727,18 +732,18 @@ function normalizeSendArgs(
         typeof args[2] !== 'number'
     ) {
         data = checkSendBounds(data, args[0], args[1]);
-        return { data, connected: true, callback: typeof args[2] === 'function' ? args[2] : undefined };
+        return { data, connected: true, callback: isSendCallback(args[2]) ? args[2] : undefined };
     }
 
     if (connected && (args[0] === undefined || typeof args[0] === 'function')) {
-        return { data, connected: true, callback: typeof args[0] === 'function' ? args[0] : undefined };
+        return { data, connected: true, callback: isSendCallback(args[0]) ? args[0] : undefined };
     }
 
-    port = args[0];
+    port = validateSendPort(args[0]);
     if (typeof args[1] === 'string') {
         address = args[1];
-        if (typeof args[2] === 'function') callback = args[2];
-    } else if (typeof args[1] === 'function') {
+        if (isSendCallback(args[2])) callback = args[2];
+    } else if (isSendCallback(args[1])) {
         callback = args[1];
     } else if (args[1] !== undefined) {
         validateAddress(args[1]);
@@ -746,7 +751,6 @@ function normalizeSendArgs(
         callback = undefined;
     }
 
-    port = validateSendPort(port);
     validateAddress(address);
     return { data, port, address, callback };
 }
@@ -956,11 +960,13 @@ Socket.prototype.dropMembership = function dropMembership(this: Socket, multicas
 
 Socket.prototype.addSourceSpecificMembership = function addSourceSpecificMembership(this: Socket, _sourceAddress: string, _groupAddress: string, _multicastInterface?: string): void {
     // MCAST_JOIN_SOURCE_GROUP - C layer doesn't expose this constant
-    process.emitWarning?.('dgram.addSourceSpecificMembership() is not fully supported in this runtime', 'UnsupportedWarning');
+    const emitWarning = Reflect.get(process, 'emitWarning');
+    if (typeof emitWarning === 'function') Reflect.apply(emitWarning, process, ['dgram.addSourceSpecificMembership() is not fully supported in this runtime', 'UnsupportedWarning']);
 };
 
 Socket.prototype.dropSourceSpecificMembership = function dropSourceSpecificMembership(this: Socket, _sourceAddress: string, _groupAddress: string, _multicastInterface?: string): void {
-    process.emitWarning?.('dgram.dropSourceSpecificMembership() is not fully supported in this runtime', 'UnsupportedWarning');
+    const emitWarning = Reflect.get(process, 'emitWarning');
+    if (typeof emitWarning === 'function') Reflect.apply(emitWarning, process, ['dgram.dropSourceSpecificMembership() is not fully supported in this runtime', 'UnsupportedWarning']);
 };
 
 /**

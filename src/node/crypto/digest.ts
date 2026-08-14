@@ -4,7 +4,7 @@ const crypto = import.meta.use('crypto');
 import { Buffer } from '../buffer';
 import { Transform, type TransformOptions } from '../stream';
 import type { BinaryInput, Hash, Hmac, KeyInput } from './types';
-import { toBuffer, toExactArrayBuffer, encodeOutput, concatBuffers, normalizeHashAlgorithm, oneShotHmac, isSupportedHmacAlgorithm, kKeyData, isKeyObject } from './helpers';
+import { toBuffer, toExactArrayBuffer, encodeOutput, concatBuffers, normalizeHashAlgorithm, oneShotHmac, isSupportedHmacAlgorithm, getKeyBytes } from './helpers';
 import { createDigestAlreadyCalledError, withCode, asError } from './errors';
 
 type DigestState = {
@@ -120,7 +120,7 @@ export function createHash(algorithm: string, options?: TransformOptions & { out
 
 // hash - one-shot hash
 
-export function hash(algorithm: string, data: ArrayBuffer | Uint8Array | string, outputEncoding: string = 'hex'): ArrayBuffer | string {
+export function hash(algorithm: string, data: ArrayBuffer | Uint8Array | string, outputEncoding: string = 'hex'): Uint8Array | string {
     const buf = toBuffer(data);
     let result: ArrayBuffer;
 
@@ -198,7 +198,7 @@ class HmacImpl extends Transform implements Hmac {
 // createHmac
 
 export function createHmac(algorithm: string, key: KeyInput, options?: TransformOptions): Hmac {
-    const keyBuf = isKeyObject(key) ? key[kKeyData] : toBuffer(key);
+    const keyBuf = getKeyBytes(key);
     const a = normalizeHashAlgorithm(algorithm);
     if (!isSupportedHmacAlgorithm(a)) throw new Error(`Unsupported HMAC algorithm: ${algorithm}`);
 
@@ -228,7 +228,7 @@ export function createHmac(algorithm: string, key: KeyInput, options?: Transform
 
 // hmac - one-shot HMAC
 
-export function hmac(algorithm: string, key: ArrayBuffer | Uint8Array | string, data: ArrayBuffer | Uint8Array | string, outputEncoding?: string): ArrayBuffer | string {
+export function hmac(algorithm: string, key: ArrayBuffer | Uint8Array | string, data: ArrayBuffer | Uint8Array | string, outputEncoding?: string): Uint8Array | string {
     const keyBuf = toBuffer(key);
     const dataBuf = toBuffer(data);
     const result = oneShotHmac(algorithm, keyBuf, dataBuf);

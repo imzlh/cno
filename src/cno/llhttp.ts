@@ -126,6 +126,7 @@ class StreamingParser<T extends HttpStreamMessage> implements CNO.StreamingHttpP
     #statusCode = 0;
     #statusText = '';
     #headerField = '';
+    #headerValue: string | null = null;
     #headers = new Headers();
     #httpMajor = 1;
     #httpMinor = 1;
@@ -150,6 +151,7 @@ class StreamingParser<T extends HttpStreamMessage> implements CNO.StreamingHttpP
         this.#statusCode = 0;
         this.#statusText = '';
         this.#headerField = '';
+        this.#headerValue = null;
         this.#headers = new Headers();
         this.#httpMajor = 1;
         this.#httpMinor = 1;
@@ -169,15 +171,16 @@ class StreamingParser<T extends HttpStreamMessage> implements CNO.StreamingHttpP
         }
 
         this.#parser.onHeaderField = (buf, off, len) => {
-            this.#headerField = decode(buf, off, len);
+            if (this.#headerValue !== null) this.#commitHeader();
+            this.#headerField += decode(buf, off, len);
         };
 
         this.#parser.onHeaderValue = (buf, off, len) => {
-            const value = decode(buf, off, len);
-            this.#headers.append(this.#headerField, value);
+            this.#headerValue = (this.#headerValue ?? '') + decode(buf, off, len);
         };
 
         this.#parser.onHeadersComplete = () => {
+            this.#commitHeader();
             const s = this.#parser.state;
             this.#httpMajor = s.httpMajor;
             this.#httpMinor = s.httpMinor;
@@ -251,6 +254,13 @@ class StreamingParser<T extends HttpStreamMessage> implements CNO.StreamingHttpP
         };
     }
 
+    #commitHeader(): void {
+        if (this.#headerValue === null) return;
+        this.#headers.append(this.#headerField, this.#headerValue);
+        this.#headerField = '';
+        this.#headerValue = null;
+    }
+
     feed(data: Uint8Array | ArrayBuffer): void {
         const buf = data instanceof ArrayBuffer ? new Uint8Array(data) : data;
         const result = this.#parser.execute(buf);
@@ -309,9 +319,20 @@ function parseRequest(data: Uint8Array | ArrayBuffer): CNO.HttpRequestMessage {
 
     const parser = new http.Parser(http.REQUEST);
     parser.onUrl = (b, off, len) => { url += decode(b, off, len); };
-    parser.onHeaderField = (b, off, len) => { headerField = decode(b, off, len); };
-    parser.onHeaderValue = (b, off, len) => { headers.append(headerField, decode(b, off, len)); };
+    let headerValue: string | null = null;
+    parser.onHeaderField = (b, off, len) => {
+        if (headerValue !== null) {
+            headers.append(headerField, headerValue);
+            headerField = ''; headerValue = null;
+        }
+        headerField += decode(b, off, len);
+    };
+    parser.onHeaderValue = (b, off, len) => { headerValue = (headerValue ?? '') + decode(b, off, len); };
     parser.onHeadersComplete = () => {
+        if (headerValue !== null) {
+            headers.append(headerField, headerValue);
+            headerField = ''; headerValue = null;
+        }
         const s = parser.state;
         method = METHODS[s.method] ?? 'GET';
         upgrade = s.upgrade;
@@ -347,9 +368,20 @@ function parseResponse(data: Uint8Array | ArrayBuffer): CNO.HttpResponseMessage 
 
     const parser = new http.Parser(http.RESPONSE);
     parser.onStatus = (b, off, len) => { statusText += decode(b, off, len); };
-    parser.onHeaderField = (b, off, len) => { headerField = decode(b, off, len); };
-    parser.onHeaderValue = (b, off, len) => { headers.append(headerField, decode(b, off, len)); };
+    let headerValue: string | null = null;
+    parser.onHeaderField = (b, off, len) => {
+        if (headerValue !== null) {
+            headers.append(headerField, headerValue);
+            headerField = ''; headerValue = null;
+        }
+        headerField += decode(b, off, len);
+    };
+    parser.onHeaderValue = (b, off, len) => { headerValue = (headerValue ?? '') + decode(b, off, len); };
     parser.onHeadersComplete = () => {
+        if (headerValue !== null) {
+            headers.append(headerField, headerValue);
+            headerField = ''; headerValue = null;
+        }
         const s = parser.state;
         statusCode = s.status;
         keepAlive = s.keepAlive;

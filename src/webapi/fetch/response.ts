@@ -14,6 +14,21 @@ export interface InternalResponseMetadata {
     redirected?: boolean;
 }
 
+interface ResponseState {
+    type: ResponseType;
+    url: string;
+    redirected: boolean;
+    status: number;
+    ok: boolean;
+    statusText: string;
+    headers: Headers;
+    body: ReadableStream<Uint8Array> | null;
+    bodyUsed: boolean;
+    bodyBuffer: Uint8Array | null;
+}
+
+const responseState = Symbol('cno.response.state');
+
 function normalizeStatusText(value: unknown): string {
     const text = String(value);
     for (let i = 0; i < text.length; i++) {
@@ -56,26 +71,17 @@ export function getResponseInitiatorCallFrames(
 }
 
 export class Response implements globalThis.Response {
-    #type: ResponseType = 'default';
-    #url = '';
-    #redirected = false;
-    #status = 200;
-    #ok = true;
-    #statusText = '';
-    #headers!: Headers;
-    #body: ReadableStream<Uint8Array> | null = null;
-    #bodyUsed = false;
-    #bodyBuffer: Uint8Array | null = null;
+    declare [responseState]: ResponseState;
 
-    get type(): ResponseType { return this.#type; }
-    get url(): string { return this.#url; }
-    get redirected(): boolean { return this.#redirected; }
-    get status(): number { return this.#status; }
-    get ok(): boolean { return this.#ok; }
-    get statusText(): string { return this.#statusText; }
-    get headers(): Headers { return this.#headers; }
-    get body(): ReadableStream<Uint8Array> | null { return this.#body; }
-    get bodyUsed(): boolean { return this.#bodyUsed; }
+    get type(): ResponseType { return this[responseState].type; }
+    get url(): string { return this[responseState].url; }
+    get redirected(): boolean { return this[responseState].redirected; }
+    get status(): number { return this[responseState].status; }
+    get ok(): boolean { return this[responseState].ok; }
+    get statusText(): string { return this[responseState].statusText; }
+    get headers(): Headers { return this[responseState].headers; }
+    get body(): ReadableStream<Uint8Array> | null { return this[responseState].body; }
+    get bodyUsed(): boolean { return this[responseState].bodyUsed; }
 
     constructor(body?: unknown, init?: ResponseInit) {
         if (init !== undefined && init !== null && typeof init !== 'object') {
@@ -90,14 +96,25 @@ export class Response implements globalThis.Response {
         if (body !== undefined && body !== null && isNullBodyStatus(status)) {
             throw new TypeError(`Response with status ${status} cannot have body`);
         }
-        this.#status = status;
-        this.#statusText = init?.statusText === undefined ? '' : normalizeStatusText(init.statusText);
-        this.#ok = status >= 200 && status < 300;
-        this.#headers = new Headers(init?.headers);
+        const state: ResponseState = {
+            type: 'default',
+            url: '',
+            redirected: false,
+            status,
+            ok: status >= 200 && status < 300,
+            statusText: init?.statusText === undefined ? '' : normalizeStatusText(init.statusText),
+            headers: new Headers(init?.headers),
+            body: null,
+            bodyUsed: false,
+            bodyBuffer: null,
+        };
+        // Fetch wrappers commonly proxy responses. A non-enumerable data slot is
+        // forwarded by Proxy while native #private fields reject the proxy receiver.
+        Object.defineProperty(this, responseState, { value: state });
         const inferredType = bodyContentType(body);
-        if (inferredType && !this.#headers.has('content-type')) this.#headers.set('content-type', inferredType);
-        const formDataBoundary = body instanceof FormData ? ensureFormDataContentType(this.#headers) : undefined;
-        this.#body = (body !== undefined && body !== null) ? this.trackBodyStream(this.createBodyStream(body, formDataBoundary)) : null;
+        if (inferredType && !state.headers.has('content-type')) state.headers.set('content-type', inferredType);
+        const formDataBoundary = body instanceof FormData ? ensureFormDataContentType(state.headers) : undefined;
+        state.body = (body !== undefined && body !== null) ? this.trackBodyStream(this.createBodyStream(body, formDataBoundary)) : null;
     }
 
     private createBodyStream(bodyInit: unknown, formDataBoundary?: string): ReadableStream<Uint8Array> {
@@ -141,7 +158,7 @@ export class Response implements globalThis.Response {
     }
 
     private trackBodyStream(stream: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
-        const markUsed = () => { this.#bodyUsed = true; };
+        const markUsed = () => { this[responseState].bodyUsed = true; };
         const getReader = stream.getReader.bind(stream);
         // Keep the unpatched method for clone(): tee() acquires its source reader
         // through this public property, so without this the clone's pulls would run
@@ -170,39 +187,42 @@ export class Response implements globalThis.Response {
     }
 
     clone(): Response {
-        if (this.#bodyUsed) throw new TypeError('Already read');
-        let clonedBody: ResponseBodySource = this.#bodyBuffer;
-        if (clonedBody === null && this.#body) {
+        const state = this[responseState];
+        if (state.bodyUsed) throw new TypeError('Already read');
+        let clonedBody: ResponseBodySource = state.bodyBuffer;
+        if (clonedBody === null && state.body) {
             // teeUntracked, not this.body.tee(): a tracked tee would attribute BOTH
             // branches' pulls to this response, so reading the clone marked the
             // original consumed and the original then threw "Already read" with its
             // bytes intact. Each branch is tracked separately just below.
-            const [s1, s2] = teeUntracked(this.#body);
-            this.#body = this.trackBodyStream(s1);
+            const [s1, s2] = teeUntracked(state.body);
+            state.body = this.trackBodyStream(s1);
             clonedBody = s2;
         }
         const r = new Response(clonedBody, {
-            status: this.#status === 0 ? 200 : this.#status,
-            statusText: this.#statusText,
-            headers: this.#headers,
+            status: state.status === 0 ? 200 : state.status,
+            statusText: state.statusText,
+            headers: state.headers,
         });
-        r.#status = this.#status;
-        r.#ok = this.#ok;
-        r.#type = this.#type;
-        r.#url = this.#url;
-        r.#redirected = this.#redirected;
+        const clonedState = r[responseState];
+        clonedState.status = state.status;
+        clonedState.ok = state.ok;
+        clonedState.type = state.type;
+        clonedState.url = state.url;
+        clonedState.redirected = state.redirected;
         setResponseInitiatorCallFrames(r, getResponseInitiatorCallFrames(this));
         return r;
     }
 
     async bytes(): Promise<Uint8Array> {
-        if (this.#bodyUsed) throw new TypeError('Already read');
-        this.#bodyUsed = true;
-        if (this.#bodyBuffer) return this.#bodyBuffer;
-        if (!this.#body) return new Uint8Array(0);
+        const state = this[responseState];
+        if (state.bodyUsed) throw new TypeError('Already read');
+        state.bodyUsed = true;
+        if (state.bodyBuffer) return state.bodyBuffer;
+        if (!state.body) return new Uint8Array(0);
 
         const chunks: Uint8Array[] = [];
-        const reader = this.#body.getReader();
+        const reader = state.body.getReader();
         try {
             while (true) {
                 const { done, value } = await reader.read();
@@ -213,8 +233,8 @@ export class Response implements globalThis.Response {
         } finally {
             reader.releaseLock();
         }
-        this.#bodyBuffer = mergeChunks(chunks);
-        return this.#bodyBuffer;
+        state.bodyBuffer = mergeChunks(chunks);
+        return state.bodyBuffer;
     }
     arrayBuffer(): Promise<ArrayBuffer> { return this.bytes().then(bytesToArrayBuffer); }
     async blob(): Promise<Blob> { return new Blob([await this.arrayBuffer()], { type: this.headers.get('content-type') || '' }); }
@@ -238,9 +258,10 @@ export class Response implements globalThis.Response {
     }
     static error(): Response {
         const r = new Response(null);
-        r.#status = 0;
-        r.#ok = false;
-        r.#type = 'error';
+        const state = r[responseState];
+        state.status = 0;
+        state.ok = false;
+        state.type = 'error';
         Headers.setGuard(r.headers, 'immutable');
         return r;
     }
@@ -264,9 +285,10 @@ export class Response implements globalThis.Response {
     }
 
     [setResponseMetadataToken](metadata: InternalResponseMetadata): void {
-        if (metadata.type !== undefined) this.#type = metadata.type;
-        if (metadata.url !== undefined) this.#url = metadata.url;
-        if (metadata.redirected !== undefined) this.#redirected = metadata.redirected;
+        const state = this[responseState];
+        if (metadata.type !== undefined) state.type = metadata.type;
+        if (metadata.url !== undefined) state.url = metadata.url;
+        if (metadata.redirected !== undefined) state.redirected = metadata.redirected;
     }
 
     get [Symbol.toStringTag](): string { return 'Response'; }

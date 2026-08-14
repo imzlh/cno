@@ -107,7 +107,7 @@ export function isKeyObject(value: unknown): value is KeyObject & {
         && kKeyData in value;
 }
 
-export function guessKeyFormat(input: BinaryInput, explicit?: 'pem' | 'der'): KeyFormat {
+export function guessKeyFormat(input: KeyInput, explicit?: 'pem' | 'der'): KeyFormat {
     if (explicit) return explicit;
     return typeof input === 'string' ? 'pem' : 'der';
 }

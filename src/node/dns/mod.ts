@@ -133,7 +133,7 @@ function completeResolve(
         answers => {
             const result = shapeAnswers(rrtype, answers);
             if (rrtype === 'SOA' && result === null) {
-                callback(createDnsError(NODATA, 'querySoa', hostname));
+                callback(createDnsError(NODATA, 'querySoa', hostname), null);
             } else {
                 callback(null, result);
             }
@@ -141,7 +141,7 @@ function completeResolve(
         // Node invokes the callback with the error alone on failure, so the
         // callback observes arguments.length === 1. Passing an explicit null
         // second argument makes it 2 and breaks arity-sensitive wrappers.
-        error => callback(error),
+        error => callback(error, null),
     );
 }
 
