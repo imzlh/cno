@@ -1169,13 +1169,14 @@ export const execPath: string = os.exePath;
 export let title: string = 'node';
 
 export const version: string = 'v24.1.0';
-// Keep node:process Node-shaped. The Deno identity is exposed by Deno.version;
-// putting it in process.versions makes Node packages select native-Deno paths.
+// version info
 type CnoProcessVersions = NodeJS.ProcessVersions & {
     typescript: string;
+    deno: string;
 };
 
 const llhttpVersion = engine.versions.llhttp ?? '9.2.1';
+const cnoDenoVersion = '2.9.3';
 
 export const versions: CnoProcessVersions = {
     node: '24.1.0',
@@ -1196,6 +1197,7 @@ export const versions: CnoProcessVersions = {
     nghttp2: '1.62.1',
     acorn: '8.14.0',
     typescript: '5.9.2',
+    deno: cnoDenoVersion,
 };
 
 export const config: NodeJS.ProcessConfig = {

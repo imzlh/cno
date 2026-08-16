@@ -1,0 +1,18 @@
+# dotenv environment variable files
+.env
+.env.development.local
+.env.test.local
+.env.production.local
+.env.local
+
+# Fresh build directory
+_fresh/
+# npm + other dependencies
+node_modules/
+vendor/
+tmp-vite-entry.mjs
+vite.config.ts.timestamp-*
+
+# Local Deno KV database
+.quietline-kv.sqlite3*
+.deno

@@ -908,7 +908,18 @@ export function parseFlags(flag?: string | number): CModuleFS.OpenFlags | string
 // Path handling
 
 export function pathToString(path: string | URL | Uint8Array): string {
-    if (typeof path === 'string') return path;
+    if (typeof path === 'string') {
+        // process file URL
+        if (/^file:\/\//i.test(path)) {
+            const localPath = fileURLToPath(path);
+            return localPath;
+        }
+        // process Windows absolute path
+        if (process.platform === 'win32' && /^\/[A-Za-z]{1,2}:[\\/]/.test(path)) {
+            return path.slice(1);
+        }
+        return path;
+    }
     if (path == null) {
         throw Object.assign(
             new TypeError('The "path" argument must be of type string or an instance of Buffer or URL.'),
