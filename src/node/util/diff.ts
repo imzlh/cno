@@ -237,10 +237,9 @@ function isSimpleDiff(
 
 /** Node's getStackedDiff: two stacked lines plus a `^` column indicator. */
 function getStackedDiff(actual: string, expected: string): { message: string } {
-    const isStringComparison = typeof actual === 'string' && typeof expected === 'string';
     let message = `\n+ ${actual}\n- ${expected}`;
     const stringsLen = actual.length + expected.length;
-    const showIndicator = isStringComparison && stringsLen <= 80;
+    const showIndicator = stringsLen <= 80;
 
     if (showIndicator) {
         let indicatorIdx = -1;

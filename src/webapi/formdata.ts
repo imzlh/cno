@@ -1,6 +1,7 @@
 import { malloc } from "../utils/malloc";
 import { Buffer } from "node-buffer";
 import { bytesToArrayBuffer, sanitizeSurrogates } from "../utils/bytes";
+import { basename } from "../utils/path";
 
 const engine = import.meta.use('engine');
 const textMod = import.meta.use('text');
@@ -11,7 +12,7 @@ const fs = import.meta.use('fs');
 type FormDataEntryValue = globalThis.File | string;
 type BlobPartSnapshot = Blob | Uint8Array<ArrayBuffer> | ArrayBuffer | string;
 
-const nativeLineEnding = os.uname().sysname === 'Windows_NT' ? '\r\n' : '\n';
+const nativeLineEnding = os.platform === 'windows' || os.platform === 'win32' ? '\r\n' : '\n';
 
 function requireArguments(name: string, actual: number, required: number): void {
     if (actual >= required) return;
@@ -301,7 +302,7 @@ class File extends Blob implements globalThis.File {
         name?: string;
     }): Promise<File> {
         const buffer = await asfs.readFile(path);
-        const fileName = options?.name ?? path.split('/').pop() ?? 'file';
+        const fileName = (options?.name ?? basename(path)) || 'file';
 
         let lastModified = Date.now();
         try {
@@ -331,7 +332,7 @@ class File extends Blob implements globalThis.File {
         type?: string;
         name?: string;
     }): globalThis.File {
-        const fileName = options?.name ?? path.split('/').pop() ?? 'file';
+        const fileName = (options?.name ?? basename(path)) || 'file';
         const file = new File(
             [],
             fileName,

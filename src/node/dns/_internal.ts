@@ -3,9 +3,6 @@
  */
 
 const dns = import.meta.use('dns');
-const engine = import.meta.use('engine');
-const fs = import.meta.use('fs');
-const os = import.meta.use('os');
 const timers = import.meta.use('timers');
 const uverror = import.meta.use('error');
 
@@ -126,21 +123,7 @@ export interface ResolverOptions {
 const DNS_QUERY_TIMEOUT_MS = 2000;
 const DEFAULT_RESOLVER_TRIES = 4;
 
-/**
- * getaddrinfo hint flags are platform ABI values, not portable constants:
- * Windows/Darwin use AI_ALL=0x100, AI_ADDRCONFIG=0x400, AI_V4MAPPED=0x800,
- * while glibc uses 0x10 / 0x20 / 0x08. Node exports the platform's numbers, so
- * the accepted hint mask has to follow the platform too.
- */
-export const hintFlags = (() => {
-    const sysname = os.uname().sysname;
-    if (sysname === 'Windows_NT' || sysname === 'Darwin') {
-        return { V4MAPPED: 0x0800, ALL: 0x0100, ADDRCONFIG: 0x0400 };
-    }
-    return { V4MAPPED: 8, ALL: 16, ADDRCONFIG: 32 };
-})();
-
-const VALID_HINTS = hintFlags.V4MAPPED | hintFlags.ALL | hintFlags.ADDRCONFIG;
+const VALID_HINTS = dns.V4MAPPED | dns.ALL | dns.ADDRCONFIG;
 const RETRYABLE_DNS_CODES = new Set([
     'ETIMEOUT', 'EAI_AGAIN', 'ESERVFAIL', 'ECONNREFUSED', 'ECONNRESET',
     'EHOSTUNREACH', 'ENETUNREACH', 'EADDRNOTAVAIL', 'EIO', 'EBADRESP',
@@ -405,27 +388,7 @@ export function normalizeServers(servers: unknown): string[] {
     return servers.map(normalizeServer);
 }
 
-export function getSystemServers(): string[] {
-    try {
-        const source = engine.decodeString(fs.readFile('/etc/resolv.conf'));
-        const servers: string[] = [];
-        for (const line of source.split(/\r?\n/)) {
-            const match = /^\s*nameserver\s+(\S+)/.exec(line);
-            if (!match) continue;
-            try {
-                servers.push(normalizeServer(match[1]));
-            } catch {
-                // Ignore resolver entries this implementation cannot address.
-            }
-        }
-        if (servers.length > 0) return servers;
-    } catch {
-        // Windows and restricted environments may not expose resolv.conf.
-    }
-    return ['8.8.8.8', '8.8.4.4'];
-}
-
-let defaultServers = getSystemServers();
+let defaultServers = (dns as any).__default_dnssrv as string[];
 let defaultResultOrder: DefaultResultOrder = 'verbatim';
 
 export function getDefaultServers(): string[] {
@@ -548,7 +511,7 @@ export function queryDns(
     options?: number | ResolverOptions,
 ): AbortableDnsQuery {
     validateHostname(hostname);
-    const endpoints = (servers.length > 0 ? servers : getSystemServers()).map(parseServer);
+    const endpoints = (servers.length > 0 ? servers : defaultServers).map(parseServer);
     const config = normalizeQueryOptions(options);
     const syscall = dnsSyscall(rrtype);
     let settled = false;

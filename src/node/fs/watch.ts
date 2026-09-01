@@ -61,12 +61,17 @@ function normalizeError(err: unknown): Error {
 export class FSWatcher extends EventEmitter<WatchEvents> {
     private watcher: CModuleFSWatch.FsWatcher | null = null;
     private closed = false;
+    private abortSignal: AbortSignal | null = null;
+    private abortHandler: (() => void) | null = null;
 
     constructor(private readonly options: WatchOptions = {}) {
         super();
         const signal = options.signal;
         if (signal) {
-            signal.addEventListener('abort', () => this.close(), { once: true });
+            const abortHandler = () => this.close();
+            this.abortSignal = signal;
+            this.abortHandler = abortHandler;
+            signal.addEventListener('abort', abortHandler, { once: true });
             if (signal.aborted) this.close();
         }
     }
@@ -92,6 +97,11 @@ export class FSWatcher extends EventEmitter<WatchEvents> {
     close(): void {
         if (this.closed) return;
         this.closed = true;
+        const signal = this.abortSignal;
+        const abortHandler = this.abortHandler;
+        this.abortSignal = null;
+        this.abortHandler = null;
+        if (signal && abortHandler) signal.removeEventListener('abort', abortHandler);
         const watcher = this.watcher;
         this.watcher = null;
         if (!watcher) {
@@ -138,6 +148,10 @@ export function watch(
         watcher.attach(nativeWatcher);
     } catch (err) {
         // fswatch throws a numeric UV code; Node callers match on 'ENOENT'.
+        // The FSWatcher registers its signal listener before native creation.
+        // Tear it down when creation fails, otherwise a long-lived signal keeps
+        // the failed watcher (and its closure) reachable forever.
+        watcher.close();
         throw toErrnoException(err, 'watch', pathStr);
     }
 

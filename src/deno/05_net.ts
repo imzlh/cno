@@ -10,8 +10,11 @@ const udp = import.meta.use('udp');
 const windows = import.meta.use('win32');
 const timers = import.meta.use('timers');
 const error = import.meta.use('error');
+const algo = import.meta.use('algorithm');
 
 import { dnsCache } from '@cnojs/http/dns-cache';
+import { errors } from "./01_errors";
+import { systemDnsServers } from "../utils/osdns";
 
 const DEFAULT_TCP_KEEPALIVE_INITIAL_DELAY = 60;
 
@@ -76,28 +79,30 @@ class Conn<T extends Deno.Addr = Deno.Addr> implements Deno.Conn<T> {
     }
 
     protected assertUsable(): void {
-        if (this.$consumed) throw new Deno.errors.BadResource('Connection has been consumed');
+        if (this.$consumed) throw new errors.BadResource('Connection has been consumed');
     }
 
     @wrap
-    read(p: Uint8Array): Promise<number | null> {
+    async read(p: Uint8Array): Promise<number | null> {
         this.assertUsable();
         this.$readOps++;
-        return this.pipe.read(p)
-            .then(n => n === 0 ? null : n)
-            .finally(() => {
-                this.$readOps--;
-            });
+        try {
+            const n = await this.pipe.read(p);
+            return n === 0 ? null : n;
+        } finally {
+            this.$readOps--;
+        }
     }
 
     @wrap
-    write(p: Uint8Array): Promise<number> {
+    async write(p: Uint8Array): Promise<number> {
         this.assertUsable();
         this.$writeOps++;
-        return this.pipe.write(p)
-            .finally(() => {
-                this.$writeOps--;
-            });
+        try {
+            return await this.pipe.write(p);
+        } finally {
+            this.$writeOps--;
+        }
     }
 
     @wrap
@@ -145,7 +150,7 @@ class Conn<T extends Deno.Addr = Deno.Addr> implements Deno.Conn<T> {
     [symbolTakePipe]() {
         this.assertUsable();
         if (this.$readOps > 0 || this.$writeOps > 0 || this.$readable.locked || this.$writable.locked) {
-            throw new Deno.errors.Busy('Connection is in use');
+            throw new errors.Busy('Connection is in use');
         }
         this.$consumed = true;
         return this.pipe;
@@ -166,12 +171,6 @@ type ListenRuntimeOptions =
     | (Deno.TcpListenOptions & { transport?: 'tcp' })
     | (Deno.UnixListenOptions & { transport: 'unix' })
     | (Deno.VsockListenOptions & { transport: 'vsock' });
-type ListenTlsRuntimeOptions = Deno.ListenTlsOptions & Deno.TlsCertifiedKeyPem & {
-    keyFormat?: string;
-};
-type ListenDatagramRuntimeOptions =
-    | (Deno.UdpListenOptions & { transport: 'udp' })
-    | (Deno.UnixListenDatagramOptions & { transport: 'unixpacket' });
 
 function denoConnect(options: Deno.ConnectOptions): Promise<Deno.TcpConn>;
 function denoConnect(options: Deno.UnixConnectOptions): Promise<Deno.UnixConn>;
@@ -186,8 +185,18 @@ async function denoConnect(options: ConnectRuntimeOptions): Promise<Deno.TcpConn
             await unix.connect(options.path);
             return new UnixConn(unix, options.path);
         default:
-            throw new Deno.errors.NotSupported(`Unsupported transport: ${options.transport}`);
+            throw new errors.NotSupported(`Unsupported transport: ${options.transport}`);
     }
+}
+
+function validateListenPort(port: unknown, defaultPort: number): number {
+    const value = port ?? defaultPort;
+    const numericPort = Number(value);
+    if (!Number.isInteger(numericPort))
+        throw new TypeError(`Invalid port: ${value}`);
+    if (numericPort < 0 || numericPort > 65535)
+        throw new RangeError(`Invalid port (out of range): ${value}`);
+    return numericPort;
 }
 
 function denoListen(opt: Deno.TcpListenOptions & { transport?: 'tcp' }): Deno.TcpListener;
@@ -202,7 +211,7 @@ function denoListen(opt: ListenRuntimeOptions): Deno.TcpListener | Deno.UnixList
             const tcp = new stream.TCP(isV4 ? os.AF_INET : os.AF_INET6);
             tcp.bind({
                 ip: bindHost,
-                port: opt.port ?? 80
+                port: validateListenPort(opt.port, 80)
             })
             tcp.listen(opt.tcpBacklog);
             return new TcpListener(tcp, true, addrinfo2deno(tcp.sockname));
@@ -215,7 +224,7 @@ function denoListen(opt: ListenRuntimeOptions): Deno.TcpListener | Deno.UnixList
                 transport: 'unix'
             });
         default:
-            throw new Deno.errors.NotSupported(`Unsupported transport: ${opt.transport}`);
+            throw new errors.NotSupported(`Unsupported transport: ${opt.transport}`);
     }
 }
 
@@ -391,12 +400,12 @@ class TlsConn implements Deno.TlsConn {
 
     private wakeReadWaiters(): void {
         const waiters = this.$readWaiters.splice(0);
-        for (const waiter of waiters) waiter.resolve();
+        waiters.forEach(waiter => waiter.resolve());
     }
 
     private wakeTlsWaiters(): void {
         const waiters = this.$tlsWaiters.splice(0);
-        for (const waiter of waiters) waiter.resolve();
+        waiters.forEach(waiter => waiter.resolve());
     }
 
     private wakeWaiters(): void {
@@ -559,16 +568,16 @@ class UdpDatagramConn implements Deno.DatagramConn {
     ) { }
 
     joinMulticastV4(): Promise<Deno.MulticastV4Membership> {
-        return Promise.reject(new Deno.errors.NotSupported('UDP multicast is not supported'));
+        return Promise.reject(new errors.NotSupported('UDP multicast is not supported'));
     }
 
     joinMulticastV6(): Promise<Deno.MulticastV6Membership> {
-        return Promise.reject(new Deno.errors.NotSupported('UDP multicast is not supported'));
+        return Promise.reject(new errors.NotSupported('UDP multicast is not supported'));
     }
 
     @wrap
     async receive(p?: Uint8Array): Promise<[Uint8Array<ArrayBuffer>, Deno.Addr]> {
-        if (this.$closed) throw new Deno.errors.BadResource('Datagram socket has been closed');
+        if (this.$closed) throw new errors.BadResource('Datagram socket has been closed');
         const buf = p ?? new Uint8Array(65536);
         const { nread, addr } = await this.handle.recv(buf);
         const data = new Uint8Array(nread);
@@ -578,8 +587,8 @@ class UdpDatagramConn implements Deno.DatagramConn {
 
     @wrap
     send(p: Uint8Array, addr: Deno.Addr): Promise<number> {
-        if (this.$closed) throw new Deno.errors.BadResource('Datagram socket has been closed');
-        if (addr.transport !== 'udp') throw new Deno.errors.NotSupported(`Unsupported datagram transport: ${addr.transport}`);
+        if (this.$closed) throw new errors.BadResource('Datagram socket has been closed');
+        if (addr.transport !== 'udp') throw new errors.NotSupported(`Unsupported datagram transport: ${addr.transport}`);
         return this.handle.send(p, { ip: addr.hostname, port: addr.port });
     }
 
@@ -635,11 +644,11 @@ class Listener implements Deno.Listener {
     @wrap
     async accept(): Promise<Deno.Conn<Deno.Addr>> {
         if (this.$acceptPromise) {
-            throw new Deno.errors.Busy('Listener already in use');
+            throw new errors.Busy('Listener already in use');
         }
         let conn = this.$acceptQueue.shift();
         if (!conn) {
-            if (this.$closed) throw new Deno.errors.BadResource('Listener has been closed');
+            if (this.$closed) throw new errors.BadResource('Listener has been closed');
             this.$acceptPromise = Promise.withResolvers();
             const acceptPromise = this.$acceptPromise;
             try {
@@ -658,7 +667,7 @@ class Listener implements Deno.Listener {
         this.$closed = true;
         const pending = this.$acceptPromise;
         this.$acceptPromise = undefined;
-        if (pending) pending.reject(new Deno.errors.BadResource('Listener has been closed'));
+        if (pending) pending.reject(new errors.BadResource('Listener has been closed'));
         for (const conn of this.$acceptQueue.splice(0)) {
             closeStreamQuietly(conn);
         }
@@ -685,7 +694,7 @@ class Listener implements Deno.Listener {
                     const conn = await this.accept();
                     yield conn;
                 } catch (e) {
-                    if (this.$closed && e instanceof Deno.errors.BadResource) return;
+                    if (this.$closed && e instanceof errors.BadResource) return;
                     throw e;
                 }
             }
@@ -809,40 +818,11 @@ async function withTimeoutAbort<T>(
 }
 
 let systemCaPemCache: string | null | undefined;
-let systemDnsServerCache: string | null | undefined;
-
-function firstIPv4DnsServer(value: unknown): string | undefined {
-    const servers = Array.isArray(value) ? value : typeof value === 'string' ? value.split(/[\s,;]+/) : [];
-    return servers.find(server => typeof server === 'string' && server && !server.includes(':'));
-}
-
-function systemDnsServer(): string | undefined {
-    if (systemDnsServerCache !== undefined) return systemDnsServerCache ?? undefined;
-    systemDnsServerCache = null;
-    if (os.uname().sysname === 'Windows_NT' && windows) {
-        for (const name of ['NameServer', 'DhcpNameServer']) {
-            try {
-                const server = firstIPv4DnsServer(windows.readRegistry(
-                    windows.HKLM,
-                    'SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters',
-                    name,
-                ));
-                if (server) {
-                    systemDnsServerCache = server;
-                    break;
-                }
-            } catch {
-                // Keep falling back through the available registry values.
-            }
-        }
-    }
-    return systemDnsServerCache ?? undefined;
-}
 
 function systemCaPem(): string | undefined {
     if (systemCaPemCache !== undefined) return systemCaPemCache ?? undefined;
     systemCaPemCache = null;
-    if (os.uname().sysname === 'Windows_NT') {
+    if (os.platform === 'win32') {
         try {
             const certs = windows?.exportCerts();
             if (certs?.length) systemCaPemCache = certs.join('\n');
@@ -987,7 +967,7 @@ class TcpListener extends Listener implements Deno.TcpListener {
                     const conn = await this.accept();
                     yield conn;
                 } catch (e) {
-                    if (this.$closed && e instanceof Deno.errors.BadResource) return;
+                    if (this.$closed && e instanceof errors.BadResource) return;
                     throw e;
                 }
             }
@@ -1015,7 +995,7 @@ class UnixListener extends Listener implements Deno.UnixListener {
                     const conn = await this.accept();
                     yield conn;
                 } catch (e) {
-                    if (this.$closed && e instanceof Deno.errors.BadResource) return;
+                    if (this.$closed && e instanceof errors.BadResource) return;
                     throw e;
                 }
             }
@@ -1049,7 +1029,7 @@ class TlsListener extends Listener implements Deno.TlsListener {
                     const conn = await this.accept();
                     yield conn;
                 } catch (e) {
-                    if (this.$closed && e instanceof Deno.errors.BadResource) return;
+                    if (this.$closed && e instanceof errors.BadResource) return;
                     throw e;
                 }
             }
@@ -1072,6 +1052,8 @@ function countBits(value: number): number {
     }
     return count;
 }
+
+
 
 function ipv4PrefixLength(netmask: string): number {
     const octets = netmask.split('.').map(Number);
@@ -1120,7 +1102,7 @@ const denoNetNs = {
             if (port !== undefined && (port <= 0 || port > 65535))
                 throw new RangeError('Invalid DNS nameServer port');
         } else {
-            server = systemDnsServer();
+            server = systemDnsServers()[0];
         }
 
         const typeMap: Record<string, number> = {
@@ -1140,8 +1122,35 @@ const denoNetNs = {
         const nativeType = typeMap[type];
         if (!nativeType) throw new Error(`Unsupported DNS record type: ${type}`);
 
-        const request = dns.query(query, nativeType, server, port);
-        const info = await withTimeoutAbort(request, 5000, opt?.signal, () => request.abort?.());
+        if (!opt?.nameServer && (type === 'A' || type === 'AAAA')) {
+            try {
+                const addresses = await withTimeoutAbort(
+                    dns.resolve(query, { family: type === 'A' ? os.AF_INET : os.AF_INET6 }),
+                    5000,
+                    opt?.signal,
+                );
+                if (addresses.length === 0) throw new errors.NotFound(`No ${type} records found for ${query}`);
+                return addresses.map(address => address.ip);
+            } catch (cause) {
+                const code = (cause as { code?: string })?.code;
+                if (code === 'ENOTFOUND' || code === 'EAI_NONAME' || code === 'EAI_NODATA') {
+                    throw new errors.NotFound(`No ${type} records found for ${query}`);
+                }
+                throw cause;
+            }
+        }
+
+        let info: CModuleDNS.DNSAnswer[];
+        try {
+            const request = dns.query(query, nativeType, server, port);
+            info = await withTimeoutAbort(request, 5000, opt?.signal, () => request.abort?.());
+        } catch (cause) {
+            const code = (cause as { code?: string })?.code;
+            if (code === 'ENOTFOUND' || code === 'ENODATA') {
+                throw new errors.NotFound(`No ${type} records found for ${query}`);
+            }
+            throw cause;
+        }
         switch (type) {
             case 'A':
             case 'AAAA':
@@ -1232,7 +1241,7 @@ const denoNetNs = {
         const tcp = new stream.TCP(isV4 ? os.AF_INET : os.AF_INET6);
         tcp.bind({
             ip: bindHost,
-            port: opt.port ?? 443
+            port: validateListenPort(opt.port, 443)
         })
         tcp.listen(opt.tcpBacklog);
         const ctx = new ssl.Context({
@@ -1248,7 +1257,7 @@ const denoNetNs = {
     async startTls(conn: Deno.TcpConn, opt?: Deno.StartTlsOptions) {
         const takePipe = Reflect.get(conn, symbolTakePipe) as TakePipe | undefined;
         const pipe = takePipe?.call(conn) as CModuleStreams.TCP | undefined;
-        if (!pipe) throw new Deno.errors.BadResource('Connection is not a TCP connection');
+        if (!pipe) throw new errors.BadResource('Connection is not a TCP connection');
         const hostname = opt?.hostname ? normalizeHostname(opt.hostname) : '127.0.0.1';
         const sslctx = new ssl.Context({
             alpn: opt?.alpnProtocols,
@@ -1275,9 +1284,9 @@ const denoNetNs = {
                 return new UdpDatagramConn(socket, addrinfo2deno(socket.getsockname(), 'udp'));
             }
             case 'unixpacket':
-                throw new Deno.errors.NotSupported('Unix packet datagrams are not supported');
+                throw new errors.NotSupported('Unix packet datagrams are not supported');
             default:
-                throw new Deno.errors.NotSupported('Unsupported datagram transport');
+                throw new errors.NotSupported('Unsupported datagram transport');
         }
     }
 };

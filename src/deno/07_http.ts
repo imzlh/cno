@@ -5,10 +5,10 @@ const os = import.meta.use('os');
 const crypto = import.meta.use('crypto');
 const error = import.meta.use('error');
 
-import { wrapFsClassDec as wrap } from '../utils/wrap';
-import { dnsCache } from '@cnojs/http/dns-cache';
 import type { DnsAddressType } from '@cnojs/http/dns-cache';
-import type { FetchConnectionInfo } from '../utils/network-hooks';
+import { dnsCache } from '@cnojs/http/dns-cache';
+import { wrapFsClassDec as wrap } from '../utils/wrap';
+import { shouldBypassProxy } from '../utils/proxy';
 
 const preferIPv4 = (addrs: DnsAddressType[]): DnsAddressType =>
     addrs.find(addr => addr.family === 4) ?? addrs[0];
@@ -19,60 +19,6 @@ function safeGetEnv(name: string): string | null {
     } catch {
         return null;
     }
-}
-
-function normalizeNoProxyHost(host: string): string {
-    return host.trim().toLowerCase().replace(/^\[(.*)\]$/, '$1');
-}
-
-function splitNoProxyHostPort(entry: string): { host: string; port: string | null } {
-    const trimmed = entry.trim();
-    if (!trimmed) return { host: '', port: null };
-    try {
-        const url = new URL(trimmed.includes('://') ? trimmed : `http://${trimmed}`);
-        return {
-            host: normalizeNoProxyHost(url.hostname),
-            port: url.port || null,
-        };
-    } catch {
-        const index = trimmed.lastIndexOf(':');
-        if (index > 0 && trimmed.indexOf(':') === index) {
-            return {
-                host: normalizeNoProxyHost(trimmed.slice(0, index)),
-                port: trimmed.slice(index + 1) || null,
-            };
-        }
-        return { host: normalizeNoProxyHost(trimmed), port: null };
-    }
-}
-
-function noProxyMatches(url: URL, noProxy: string | null): boolean {
-    if (!noProxy) return false;
-    const host = normalizeNoProxyHost(url.hostname);
-    const port = url.port || (url.protocol === 'https:' ? '443' : url.protocol === 'http:' ? '80' : '');
-
-    for (const rawEntry of noProxy.split(',')) {
-        const entry = rawEntry.trim().toLowerCase();
-        if (!entry) continue;
-        if (entry === '*') return true;
-
-        const { host: ruleHost, port: rulePort } = splitNoProxyHostPort(entry);
-        if (!ruleHost) continue;
-        if (rulePort && rulePort !== port) continue;
-
-        if (ruleHost.startsWith('*.')) {
-            const suffix = ruleHost.slice(1);
-            if (host.endsWith(suffix)) return true;
-            continue;
-        }
-        if (ruleHost.startsWith('.')) {
-            const bare = ruleHost.slice(1);
-            if (host === bare || host.endsWith(ruleHost)) return true;
-            continue;
-        }
-        if (host === ruleHost) return true;
-    }
-    return false;
 }
 
 function hostForUrl(hostname: string): string {
@@ -212,7 +158,7 @@ export class HttpClient {
     shouldUseProxy(url: URL): boolean {
         if (!this.options.proxy) return false;
         const noProxy = safeGetEnv('NO_PROXY') ?? safeGetEnv('no_proxy');
-        return !noProxyMatches(url, noProxy);
+        return !shouldBypassProxy(url, noProxy);
     }
 
     /**

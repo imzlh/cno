@@ -3,21 +3,21 @@
  */
 
 const sqlite3 = import.meta.use('sqlite3');
-const fs = import.meta.use('fs');
 import { getMemoryTier } from '../../utils/memory-tier';
-import { toPosixPath } from '../../utils/path';
+import { dirname } from '../../utils/path';
+import { ensureDirectorySync } from '../../utils/fs-path';
 
 import {
-    RawKey,
+    type AtomicDbOperation,
     InternalEntry,
-    serializeValue,
-    deserializeValue,
-    generateVersionstamp,
+    RawKey,
     compareRawKeys,
     cursorToRawKey,
     deserializeLegacyKey,
+    deserializeValue,
+    generateVersionstamp,
     serializeKey,
-    rawKeyToCursor,
+    serializeValue
 } from './types';
 import { KvU64, MAX_U64, isKvU64 } from './u64';
 
@@ -39,17 +39,11 @@ const GET_SQL = `SELECT key, value, versionstamp, expire_at FROM kv_entries WHER
 const SET_SQL = `INSERT OR REPLACE INTO kv_entries (key, value, versionstamp, expire_at, created_at) VALUES (?, ?, ?, ?, strftime('%s', 'now') * 1000)`;
 const DELETE_SQL = `DELETE FROM kv_entries WHERE key = ?`;
 const COUNT_SQL = `SELECT COUNT(*) as count FROM kv_entries WHERE key >= ? AND key < ?`;
-const CLEANUP_SQL = `DELETE FROM kv_entries WHERE expire_at IS NOT NULL AND expire_at < ?`;
+const CLEANUP_SQL = `DELETE FROM kv_entries WHERE expire_at IS NOT NULL AND expire_at <= ?`;
 const DELETE_PREFIX_SQL = `DELETE FROM kv_entries WHERE key >= ? AND key < ?`;
 const LIST_SQL = `SELECT key, value, versionstamp, expire_at FROM kv_entries WHERE key >= ? AND key < ? AND (expire_at IS NULL OR expire_at > ?) ORDER BY key ASC LIMIT ?`;
 const LIST_REVERSE_SQL = `SELECT key, value, versionstamp, expire_at FROM kv_entries WHERE key >= ? AND key < ? AND (expire_at IS NULL OR expire_at > ?) ORDER BY key DESC LIMIT ?`;
 const SQLITE_CACHE_SIZE_KIB = getMemoryTier() === 'low' ? -512 : getMemoryTier() === 'normal' ? -4096 : -16384;
-
-type AtomicDbOperation =
-    | { type: 'check'; key: RawKey; versionstamp: string | null }
-    | { type: 'set'; key: RawKey; value: Uint8Array; expireIn?: number }
-    | { type: 'delete'; key: RawKey }
-    | { type: 'sum' | 'max' | 'min'; key: RawKey; operand: bigint };
 
 function isLegacyKeyRow(row: CModuleSQLite3.SqliteRow): row is CModuleSQLite3.SqliteRow & { key: string } {
     return typeof row.key === 'string';
@@ -92,73 +86,9 @@ function readNumber(row: CModuleSQLite3.SqliteRow, column: string): number {
     throw new TypeError(`Expected number column: ${column}`);
 }
 
-/**
- * Split a path into a filesystem root that already exists and the segments that
- * may need creating.
- *
- * The root is never passed to mkdir. On Windows a bare drive spec is not a
- * creatable directory: `mkdir("C:")` fails EACCES and `mkdir("C:/")` fails
- * EACCES, so treating "C:" as an ordinary segment made every absolute path
- * fail to open. `fs.exists("C:")` also reports false, so an exists() guard is
- * not enough on its own.
- *
- * Handles: verbatim (`//?/D:/...`, `//./...`), UNC (`//server/share/...`),
- * drive-absolute (`C:/...`), drive-relative (`C:foo` -> root "C:"),
- * POSIX absolute (`/...`) and relative paths.
- */
-function splitMkdirPath(posix: string): { root: string; parts: string[] } {
-    const split = (rest: string): string[] => rest.split('/').filter(Boolean);
-
-    // Verbatim / device namespace: \\?\D:\x, \\?\UNC\server\share\x, \\.\pipe\x
-    const verbatim = posix.match(/^\/\/[?.]\//);
-    if (verbatim) {
-        const body = posix.slice(verbatim[0].length);
-        const unc = body.match(/^UNC\/[^/]+\/[^/]+/i);
-        if (unc) {
-            return { root: `${verbatim[0]}${unc[0]}/`, parts: split(body.slice(unc[0].length)) };
-        }
-        const drive = body.match(/^[a-zA-Z]:(?:\/|$)/);
-        if (drive) {
-            return { root: `${verbatim[0]}${drive[0].replace(/\/?$/, '/')}`, parts: split(body.slice(drive[0].length)) };
-        }
-        // Unknown device path: do not attempt to create anything under it.
-        return { root: posix, parts: [] };
-    }
-
-    // UNC share root: //server/share is not creatable.
-    const unc = posix.match(/^\/\/[^/]+\/[^/]+/);
-    if (unc) {
-        return { root: `${unc[0]}/`, parts: split(posix.slice(unc[0].length)) };
-    }
-
-    const drive = posix.match(/^[a-zA-Z]:(?:\/|$)/);
-    if (drive) {
-        // "C:/x" -> root "C:/". Keep the trailing slash so the first segment is
-        // anchored at the drive root rather than the drive's current directory.
-        return { root: drive[0].replace(/\/?$/, '/'), parts: split(posix.slice(drive[0].length)) };
-    }
-
-    // Drive-relative, e.g. "C:foo" means "foo relative to CWD on C:".
-    const driveRelative = posix.match(/^[a-zA-Z]:/);
-    if (driveRelative) {
-        return { root: driveRelative[0], parts: split(posix.slice(driveRelative[0].length)) };
-    }
-
-    if (posix.startsWith('/')) return { root: '/', parts: split(posix) };
-    return { root: '', parts: split(posix) };
-}
-
-/** True when path is a directory right now (used after a losing mkdir race). */
-function isExistingDir(path: string): boolean {
-    try {
-        return fs.stat(path).isDirectory;
-    } catch {
-        return false;
-    }
-}
-
 export class KvDatabase {
     private db: CModuleSQLite3.Sqlite3Handle | null = null;
+    private openPromise: Promise<void> | null = null;
     private path: string;
     private isMemory: boolean;
     private cleanupTimer: ReturnType<typeof setInterval> | null = null;
@@ -176,46 +106,42 @@ export class KvDatabase {
     }
 
     async open(): Promise<void> {
+        if (this.db) return;
+        if (this.openPromise) return this.openPromise;
+
+        const openPromise = this.openOnce();
+        this.openPromise = openPromise;
+        try {
+            await openPromise;
+        } finally {
+            if (this.openPromise === openPromise) this.openPromise = null;
+        }
+    }
+
+    private async openOnce(): Promise<void> {
         if (!this.isMemory) {
-            const posixPath = toPosixPath(this.path);
-            const dir = posixPath.substring(0, posixPath.lastIndexOf('/')) || '.';
-            this.mkdirRecursive(dir);
+            const dir = dirname(this.path);
+            if (dir !== '.') ensureDirectorySync(dir, 0o755);
         }
 
         const flags = sqlite3.O_CREATE | sqlite3.O_READWRITE;
-        this.db = sqlite3.open(this.path, flags);
+        const db = sqlite3.open(this.path, flags);
+        this.db = db;
 
-        this.db.exec('PRAGMA journal_mode = WAL');
-        this.db.exec('PRAGMA synchronous = NORMAL');
-        this.db.exec(`PRAGMA cache_size = ${SQLITE_CACHE_SIZE_KIB}`);
-        this.db.exec('PRAGMA temp_store = MEMORY');
+        try {
+            db.exec('PRAGMA journal_mode = WAL');
+            db.exec('PRAGMA synchronous = NORMAL');
+            db.exec(`PRAGMA cache_size = ${SQLITE_CACHE_SIZE_KIB}`);
+            db.exec('PRAGMA temp_store = MEMORY');
 
-        this.db.exec(CREATE_TABLE_SQL);
-        this.migrateLegacyKeys();
-        this.cleanup();
+            db.exec(CREATE_TABLE_SQL);
+            this.migrateLegacyKeys();
+            this.cleanup();
 
-        this.cleanupTimer = setInterval(() => this.cleanup(), 60000);
-    }
-
-    private mkdirRecursive(path: string): void {
-        if (!path || path === '.') return;
-
-        const { root, parts } = splitMkdirPath(toPosixPath(path));
-        // `root` is a filesystem root (drive, UNC share, verbatim prefix or "/").
-        // It always already exists and must never be passed to mkdir: on Windows
-        // `mkdir("C:")` fails with EACCES, which used to make every absolute path
-        // unopenable.
-        let current = root;
-
-        for (const part of parts) {
-            current = current === '' || current.endsWith('/') ? `${current}${part}` : `${current}/${part}`;
-            if (fs.exists(current)) continue;
-            try {
-                fs.mkdir(current, 0o755);
-            } catch (e) {
-                // Tolerate a concurrent creator, but only if a directory is there now.
-                if (!isExistingDir(current)) throw e;
-            }
+            this.cleanupTimer = setInterval(() => this.cleanup(), 60000);
+        } catch (error) {
+            this.close();
+            throw error;
         }
     }
 
@@ -273,27 +199,42 @@ export class KvDatabase {
         try {
             const db = this.getDb();
             const stmt = db.prepare(`SELECT key, value, versionstamp, expire_at, created_at FROM kv_entries`);
-            const rows = stmt.all();
-            stmt.finalize();
+            let rows: CModuleSQLite3.SqliteRow[];
+            try {
+                rows = stmt.all();
+            } finally {
+                stmt.finalize();
+            }
 
             const legacyRows = rows.filter(isLegacyKeyRow);
             if (!legacyRows.length) return;
 
             db.exec('BEGIN IMMEDIATE');
+            let del: CModuleSQLite3.Sqlite3Stmt | null = null;
+            let ins: CModuleSQLite3.Sqlite3Stmt | null = null;
             try {
-                const del = db.prepare(`DELETE FROM kv_entries WHERE key = ?`);
-                const ins = db.prepare(`INSERT OR REPLACE INTO kv_entries (key, value, versionstamp, expire_at, created_at) VALUES (?, ?, ?, ?, ?)`);
+                del = db.prepare(`DELETE FROM kv_entries WHERE key = ?`);
+                ins = db.prepare(`INSERT OR REPLACE INTO kv_entries (key, value, versionstamp, expire_at, created_at) VALUES (?, ?, ?, ?, ?)`);
                 for (const row of legacyRows) {
                     const key = serializeKey(deserializeLegacyKey(row.key));
                     del.run([row.key]);
                     ins.run([key, row.value, row.versionstamp, row.expire_at, row.created_at]);
                 }
-                del.finalize();
-                ins.finalize();
                 db.exec('COMMIT');
             } catch (error) {
                 rollbackQuietly(db);
                 throw error;
+            } finally {
+                try {
+                    del?.finalize();
+                } catch {
+                    // Preserve the migration result when statement cleanup fails.
+                }
+                try {
+                    ins?.finalize();
+                } catch {
+                    // Preserve the migration result when statement cleanup fails.
+                }
             }
         } catch {
             // Ignore migration failures and continue with existing data.
@@ -316,7 +257,7 @@ export class KvDatabase {
 
         const row = rows[0];
         const expireAt = readNullableNumber(row, 'expire_at');
-        if (expireAt !== null && expireAt < Date.now()) return null;
+        if (expireAt !== null && expireAt <= Date.now()) return null;
 
         return {
             key: readBlob(row, 'key'),
@@ -327,7 +268,7 @@ export class KvDatabase {
     }
 
     set(rawKey: RawKey, value: Uint8Array, expireIn?: number, versionstamp = generateVersionstamp()): string {
-        const expireAt = expireIn ? Date.now() + expireIn : null;
+        const expireAt = expireIn === undefined ? null : Date.now() + expireIn;
 
         const stmt = this.getStmt(SET_SQL);
         stmt.run([rawKey, value, versionstamp, expireAt]);
@@ -413,7 +354,7 @@ export class KvDatabase {
                         break;
                     }
                     case 'set': {
-                        const expireAt = op.expireIn ? Date.now() + op.expireIn : null;
+                        const expireAt = op.expireIn === undefined ? null : Date.now() + op.expireIn;
                         setStmt.run([op.key, op.value, mutationVersionstamp, expireAt]);
                         finalVersionstamp = mutationVersionstamp;
                         break;

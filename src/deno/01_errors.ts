@@ -1,4 +1,5 @@
 // Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2026 iz
 
 type DenoErrorOptions = { cause?: unknown };
 

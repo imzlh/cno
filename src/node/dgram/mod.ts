@@ -13,6 +13,7 @@ const timers = import.meta.use('timers');
 import { EventEmitter } from '../events';
 import { Buffer } from '../buffer';
 import { toErrnoException } from '../_internal/errno';
+import { flattenPrototype } from '../_internal/prototype';
 import { lookup as dnsLookup } from '../dns';
 
 /*
@@ -111,23 +112,6 @@ export interface SocketOptions {
 }
 
 // Socket class
-
-function flattenPrototype(target: object): void {
-    const parent = Object.getPrototypeOf(target);
-    if (!parent || parent === Object.prototype) return;
-
-    for (const key of Object.getOwnPropertyNames(parent)) {
-        if (key === 'constructor' || Object.prototype.hasOwnProperty.call(target, key)) continue;
-        const descriptor = Object.getOwnPropertyDescriptor(parent, key);
-        if (descriptor) Object.defineProperty(target, key, descriptor);
-    }
-
-    for (const key of Object.getOwnPropertySymbols(parent)) {
-        if (Object.prototype.hasOwnProperty.call(target, key)) continue;
-        const descriptor = Object.getOwnPropertyDescriptor(parent, key);
-        if (descriptor) Object.defineProperty(target, key, descriptor);
-    }
-}
 
 function validateSocketType(type: unknown): asserts type is 'udp4' | 'udp6' {
     if (type !== 'udp4' && type !== 'udp6') {

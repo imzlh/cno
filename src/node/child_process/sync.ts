@@ -3,17 +3,14 @@
  */
 
 const proc = import.meta.use('process');
-const os = import.meta.use('os');
 const nativeError = import.meta.use('error');
 
 import { Buffer } from '../buffer';
 import { buildShellInvocation, decodeOutput } from './_shared';
 import {
-    findShellRedirectVarTarget,
     getImmediateSpawnError,
     isBatchFileCommand,
     makeBatchFileError,
-    makeSyncShellRedirectError,
     normalizeEnv,
     normalizeInput,
     normalizeSpawnFailure,
@@ -69,27 +66,12 @@ export function spawnSync(command: string, argsOrOptions?: string[] | SpawnOptio
         };
     }
 
-    let shellEnv: Record<string, string> | undefined;
+    let shellVerbatim = false;
     if (optsSource.shell) {
-        const joinedForCheck = args.length > 0 ? `${command} ${args.join(' ')}` : command;
-        const invocation = buildShellInvocation(command, args, optsSource.shell, true);
+        const invocation = buildShellInvocation(command, args, optsSource.shell);
         command = invocation.command;
         args = invocation.args;
-        shellEnv = invocation.env;
-        // Gated on invocation.env so this only ever fires on the env-var branch
-        // it describes (Windows + cmd + a quoted command). Reported through
-        // `error` rather than thrown, matching the CVE-2024-27980 refusal above,
-        // so execSync/execFileSync rethrow it via throwSyncResult.
-        if (shellEnv) {
-            const target = findShellRedirectVarTarget(joinedForCheck);
-            if (target !== undefined) {
-                return {
-                    error: makeSyncShellRedirectError(target, joinedForCheck),
-                    status: null,
-                    signal: null,
-                };
-            }
-        }
+        shellVerbatim = invocation.verbatim === true;
     }
 
     const syncEnv = normalizeEnv(optsSource.env);
@@ -107,13 +89,8 @@ export function spawnSync(command: string, argsOrOptions?: string[] | SpawnOptio
         background: optsSource.windowsHide === true,
         input: normalizeInput(optsSource.input),
     };
-    // NOTE: argv0 / windowsVerbatimArguments are deliberately NOT forwarded here.
-    // The sync native entry point (mod_process.c tjs_spawn_sync) never reads
-    // either property — only the async tjs_spawn does — so passing them would be
-    // silently inert. Reported as a C gap rather than faked here.
-
-    if (shellEnv) {
-        opts.env = { ...(opts.env ?? os.environ()), ...shellEnv };
+    if (optsSource.windowsVerbatimArguments === true || shellVerbatim) {
+        Reflect.set(opts, 'windowsVerbatimArguments', true);
     }
 
     if (optsSource.stdio) {

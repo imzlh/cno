@@ -18,15 +18,13 @@ export const settings: Record<string, unknown> = {};
 
 // Node uses SCHED_RR everywhere except Windows (SCHED_NONE), and
 // NODE_CLUSTER_SCHED_POLICY (rr|none) overrides it. os.getenv throws when unset.
-function defaultSchedulingPolicy(): number {
-    let policy: string | undefined;
-    try { policy = os.getenv('NODE_CLUSTER_SCHED_POLICY'); } catch { /* unset */ }
-    if (policy === 'rr') return SCHED_RR;
-    if (policy === 'none') return SCHED_NONE;
-    return os.uname().sysname === 'Windows_NT' ? SCHED_NONE : SCHED_RR;
-}
-
-export let schedulingPolicy = defaultSchedulingPolicy();
+let policy: string | undefined;
+try { policy = os.getenv('NODE_CLUSTER_SCHED_POLICY'); } catch { /* unset */ }
+export let schedulingPolicy = policy === 'rr'
+    ? SCHED_RR
+    : policy === 'none'
+      ? SCHED_NONE
+      : os.uname().sysname === 'Windows_NT' ? SCHED_NONE : SCHED_RR;
 
 const cluster = new EventEmitter();
 

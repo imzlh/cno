@@ -424,7 +424,7 @@ class DenoHttpServer implements Deno.HttpServer<Deno.Addr> {
     }
 
     async shutdown(): Promise<void> {
-        await this.server.shutdown();
+        await this.server.closeGracefully();
         this.finishedResolve();
     }
 

@@ -59,9 +59,7 @@ export function isArrayBufferView(value: unknown): value is ArrayBufferView {
     return hasArrayBufferViewSlot(value);
 }
 
-type AsyncCallable = (...args: unknown[]) => Promise<unknown>;
-
-export function isAsyncFunction(value: unknown): value is AsyncCallable {
+export function isAsyncFunction(value: unknown): value is (...args: unknown[]) => Promise<unknown> {
     return engine.isAsyncFunction(value);
 }
 

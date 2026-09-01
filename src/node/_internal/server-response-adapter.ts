@@ -7,6 +7,7 @@ import {
     toUint8Array,
 } from './network-debug';
 import { isTransportDisconnectError } from './errno';
+import { createWriteAfterEndError } from '../stream/_shared';
 import type { OutgoingHttpHeaders } from '../http/types';
 import { STATUS_CODES } from '../http/constants';
 import { connectionTokens } from '@cnojs/http/h1-frame';
@@ -86,10 +87,14 @@ export interface ResponseAdapterTransport<TResponse extends ResponseAdapterTarge
     normalizeError?(err: unknown): Error;
 }
 
-interface ResponseAdapterHelpers {
-    isBodyForbiddenStatus(statusCode: number): boolean;
-    createHeadersSentError(): Error & { code: string };
-    createWriteAfterEndError(): Error & { code: string };
+export function isBodyForbiddenStatus(statusCode: number): boolean {
+    return (statusCode >= 100 && statusCode < 200) || statusCode === 204 || statusCode === 205 || statusCode === 304;
+}
+
+export function createHeadersSentError(message = 'Cannot write headers after they are sent to the client'): Error & { code: string } {
+    return Object.assign(new Error(message), {
+        code: 'ERR_HTTP_HEADERS_SENT',
+    });
 }
 
 /** open → finished | aborted (peer gone) | failed (real fault) */
@@ -132,7 +137,6 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
     protected readonly response: TResponse;
     private readonly transport: ResponseAdapterTransport<TResponse>;
     private readonly serveHook: ResponseAdapterServeHook | null | undefined;
-    private readonly helpers: ResponseAdapterHelpers;
     private readonly requestId: string;
     private readonly requestUrl: string;
     private readonly suppressBody: boolean;
@@ -150,7 +154,6 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
         response: TResponse,
         transport: ResponseAdapterTransport<TResponse>,
         serveHook: ResponseAdapterServeHook | null | undefined,
-        helpers: ResponseAdapterHelpers,
         requestId: string,
         requestUrl: string,
         suppressBody = false,
@@ -158,7 +161,6 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
         this.response = response;
         this.transport = transport;
         this.serveHook = serveHook;
-        this.helpers = helpers;
         this.requestId = requestId;
         this.requestUrl = requestUrl;
         this.suppressBody = suppressBody;
@@ -189,30 +191,13 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
         }
     }
 
-    /** True when the peer left or a write fault already ended the stream. */
-    get isClosed(): boolean {
-        return this.terminal !== 'open' && this.terminal !== 'finished';
-    }
-
-    get isFinished(): boolean {
-        return this.terminal === 'finished';
-    }
-
     get isAborted(): boolean {
         return this.terminal === 'aborted';
-    }
-
-    get lastError(): Error | null {
-        return this.terminalError;
     }
 
     private normalize(err: unknown): Error {
         return this.transport.normalizeError?.(err)
             ?? (err instanceof Error ? err : new Error(String(err)));
-    }
-
-    private closedWriteError(): Error {
-        return this.terminalError ?? disconnectError('socket closed before response write completed');
     }
 
     /**
@@ -227,7 +212,7 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
     ): void {
         const run = async () => {
             if (this.terminal !== 'open') {
-                onErr?.(this.closedWriteError());
+                onErr?.(this.terminalError ?? disconnectError('socket closed before response write completed'));
                 return;
             }
             try {
@@ -241,7 +226,7 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
     }
 
     private shouldSuppressBody(): boolean {
-        return this.suppressBody || this.helpers.isBodyForbiddenStatus(this.response.statusCode);
+        return this.suppressBody || isBodyForbiddenStatus(this.response.statusCode);
     }
 
     private normalizeHeadersInput(headers?: HeaderInput): void {
@@ -267,7 +252,7 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
         const http10 = requestVersion === '1.0' || requestVersion === '0.9';
         let hasLength = this.response.hasHeader('content-length');
         let hasTransferEncoding = this.response.hasHeader('transfer-encoding');
-        if (this.helpers.isBodyForbiddenStatus(this.response.statusCode)) {
+        if (isBodyForbiddenStatus(this.response.statusCode)) {
             this.response.removeHeader?.('transfer-encoding');
             this.response.removeHeader?.('content-encoding');
             hasTransferEncoding = false;
@@ -325,38 +310,6 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
                 this.declaredContentLength = Number(text);
             }
         }
-    }
-
-    private collectHeaders(): Array<[string, string]> {
-        const allHeaders: Array<[string, string]> = [];
-        for (const [key, value] of Object.entries(this.response.getHeaders())) {
-            if (Array.isArray(value)) {
-                for (const item of value) allHeaders.push([key, String(item)]);
-            } else {
-                allHeaders.push([key, String(value)]);
-            }
-        }
-        return allHeaders;
-    }
-
-    private collectInterimHeaders(input?: HeaderInput): Array<[string, string]> {
-        if (!input) return [];
-        const out: Array<[string, string]> = [];
-        if (Array.isArray(input)) {
-            for (let i = 0; i < input.length; i += 2) {
-                out.push([String(input[i]), String(input[i + 1])]);
-            }
-            return out;
-        }
-        for (const [key, value] of Object.entries(input)) {
-            if (value === undefined) continue;
-            if (Array.isArray(value)) {
-                for (const item of value) out.push([key, String(item)]);
-            } else {
-                out.push([key, String(value)]);
-            }
-        }
-        return out;
     }
 
     private markWritableEnded(): void {
@@ -475,7 +428,7 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
         headers?: HeaderInput,
     ): TResponse {
         if (this.headWritten || this.response.headersSent) {
-            throw this.helpers.createHeadersSentError();
+            throw createHeadersSentError();
         }
 
         this.response.statusCode = statusCode;
@@ -495,7 +448,14 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
 
         this.ensureImplicitHeaders();
 
-        const outHeaders = this.collectHeaders();
+        const outHeaders: Array<[string, string]> = [];
+        for (const [key, value] of Object.entries(this.response.getHeaders())) {
+            if (Array.isArray(value)) {
+                for (const item of value) outHeaders.push([key, String(item)]);
+            } else {
+                outHeaders.push([key, String(value)]);
+            }
+        }
         this.response.headersSent = true;
         this.headWritten = true;
 
@@ -531,8 +491,25 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
             return;
         }
         this.enqueue(
-            () => transport(this.response, status, reasonPhrase(status), this.collectInterimHeaders(headers)),
-            () => callback?.(),
+            () => {
+                const outHeaders: Array<[string, string]> = [];
+                if (Array.isArray(headers)) {
+                    for (let i = 0; i < headers.length; i += 2) {
+                        outHeaders.push([String(headers[i]), String(headers[i + 1])]);
+                    }
+                } else if (headers) {
+                    for (const [key, value] of Object.entries(headers)) {
+                        if (value === undefined) continue;
+                        if (Array.isArray(value)) {
+                            for (const item of value) outHeaders.push([key, String(item)]);
+                        } else {
+                            outHeaders.push([key, String(value)]);
+                        }
+                    }
+                }
+                return transport(this.response, status, reasonPhrase(status), outHeaders);
+            },
+            callback,
             err => this.fail(err),
         );
     }
@@ -560,7 +537,7 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
         const callback = typeof encodingOrCb === 'function' ? encodingOrCb : cb;
         const encoding = typeof encodingOrCb === 'string' ? encodingOrCb : undefined;
         if (this.response.writableEnded) {
-            const err = this.helpers.createWriteAfterEndError();
+            const err = createWriteAfterEndError();
             callback?.(err);
             queueMicrotask(() => emitResponseErrorQuietly(this.response, err));
             return false;

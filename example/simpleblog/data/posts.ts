@@ -33,6 +33,8 @@ export interface PostInput {
 
 export interface ListPostOptions {
   includeDrafts?: boolean;
+  query?: string;
+  category?: string;
 }
 
 export class StorageUnavailableError extends Error {
@@ -58,6 +60,7 @@ export class PostNotFoundError extends Error {
 
 const POST_PREFIX: Deno.KvKey = ["posts"];
 const SEEDED_KEY: Deno.KvKey = ["meta", "posts-seeded-v1"];
+const SEED_VERSION = 2;
 
 export const seedPosts: Post[] = [
   {
@@ -136,6 +139,44 @@ export const seedPosts: Post[] = [
     createdAt: "2026-07-05T11:15:00.000Z",
     updatedAt: "2026-07-08T12:00:00.000Z",
   },
+  {
+    id: "seed-finish-line",
+    slug: "give-the-work-a-finish-line",
+    title: "Give the work a finish line",
+    category: "Practice",
+    excerpt:
+      "A simple way to stop polishing by accident and decide when a piece is ready to leave the desk.",
+    body:
+      "Most unfinished work is not waiting for one more brilliant idea. It is waiting for a decision. Without a clear finish line, every small improvement feels responsible, and the project quietly grows a second life.\n\nThe finish line is a promise about scope, not a claim of perfection. It says what this version will do, what it will leave for later, and which details are important enough to receive another afternoon.\n\n## Name the last useful change\n\nBefore opening the file again, write down the one change that would make the work more useful to another person. If you cannot name it, the next edit is probably serving your nerves rather than the work.\n\nThen make the change and run through the edges: the empty state, the awkward input, the sentence that wraps badly, and the way back home. Finishing is often a short list of small acts of consideration.\n\n> A finished piece can still be improved. An unfinished piece cannot be met by anyone else.\n\nPut the date on the work, send it out, and keep a note of what you learn. The next version will have a better starting point because this one was allowed to exist.",
+    image:
+      "https://images.unsplash.com/photo-1455390582262-044cdead277a?auto=format&fit=crop&w=1400&q=84",
+    imageAlt: "A notebook open beside a pen on a wooden desk",
+    read: "7 min read",
+    publishedAt: "2026-08-14T12:00:00.000Z",
+    status: "published",
+    featured: false,
+    createdAt: "2026-08-12T09:00:00.000Z",
+    updatedAt: "2026-08-14T12:00:00.000Z",
+  },
+  {
+    id: "seed-slow-tools",
+    slug: "the-useful-edge-of-a-slow-tool",
+    title: "The useful edge of a slow tool",
+    category: "Tools",
+    excerpt:
+      "Why a little friction can protect attention, improve judgment, and make the result feel more like yours.",
+    body:
+      "Fast tools are good at removing distance between an idea and its first shape. That is a gift, but it can also make every impulse look ready. When the cost of trying something is nearly zero, we need another way to notice what is worth keeping.\n\nA slower tool adds a small pause. It might be a paper notebook, a camera with one lens, or an editor that does not offer a suggestion for every sentence. The pause gives the mind time to compare an idea with the reason it arrived.\n\n## Keep one deliberate constraint\n\nChoose a limit that protects the part of the work you care about. Use one typeface. Write without notifications. Take one photograph before reviewing the last one. Constraints make trade-offs visible, which is where taste becomes practical.\n\nThe goal is not nostalgia or inconvenience for its own sake. A good constraint should make the next decision clearer, not merely make the process longer.\n\n> The best tool is sometimes the one that leaves a little room for your judgment to catch up.\n\nWhen the work is done, notice which friction helped and which only got in the way. Keep the first kind. It is a quiet feature worth carrying into the next project.",
+    image:
+      "https://images.unsplash.com/photo-1517842645767-c639042777db?auto=format&fit=crop&w=1400&q=84",
+    imageAlt: "A fountain pen and notebook on a light desk",
+    read: "6 min read",
+    publishedAt: "2026-08-06T12:00:00.000Z",
+    status: "published",
+    featured: false,
+    createdAt: "2026-08-04T10:30:00.000Z",
+    updatedAt: "2026-08-06T12:00:00.000Z",
+  },
 ];
 
 let kvPromise: Promise<Deno.Kv | null> | undefined;
@@ -153,16 +194,31 @@ function isPost(value: unknown): value is Post {
     (post.status === "draft" || post.status === "published");
 }
 
+export function isPublicPost(post: Post): boolean {
+  return post.status === "published" &&
+    Number.isFinite(Date.parse(post.publishedAt)) &&
+    Date.parse(post.publishedAt) <= Date.now();
+}
+
 async function seedKv(kv: Deno.Kv): Promise<void> {
-  const seeded = await kv.get<boolean>(SEEDED_KEY);
-  if (seeded.value) return;
+  const seeded = await kv.get<number | boolean>(SEEDED_KEY);
+  if (seeded.value === SEED_VERSION) return;
 
   let operation = kv.atomic().check(seeded);
   for (const post of seedPosts) {
-    operation = operation.set(postKey(post.slug), post);
+    const existing = await kv.get<Post>(postKey(post.slug));
+    if (!isPost(existing.value)) {
+      operation = operation.set(postKey(post.slug), post);
+    }
   }
-  operation = operation.set(SEEDED_KEY, true);
-  await operation.commit();
+  operation = operation.set(SEEDED_KEY, SEED_VERSION);
+  const result = await operation.commit();
+  if (!result.ok) {
+    const current = await kv.get<number | boolean>(SEEDED_KEY);
+    if (current.value !== SEED_VERSION) {
+      throw new Error("Could not initialize the example posts.");
+    }
+  }
 }
 
 async function openPostKv(): Promise<Deno.Kv | null> {
@@ -182,6 +238,11 @@ async function openPostKv(): Promise<Deno.Kv | null> {
     })();
   }
   return await kvPromise;
+}
+
+// Other server routes share the same long-lived KV handle.
+export async function getAppKv(): Promise<Deno.Kv | null> {
+  return await openPostKv();
 }
 
 export async function isStorageAvailable(): Promise<boolean> {
@@ -210,8 +271,17 @@ export async function listPosts(
 
   const visiblePosts = options.includeDrafts
     ? posts
-    : posts.filter((post) => post.status === "published");
-  return sortNewestFirst(visiblePosts);
+    : posts.filter(isPublicPost);
+  const query = options.query?.trim().toLocaleLowerCase() ?? "";
+  const category = options.category?.trim().toLocaleLowerCase() ?? "";
+  return sortNewestFirst(visiblePosts).filter((post) => {
+    const matchesQuery = !query ||
+      [post.title, post.excerpt, post.body, post.category]
+        .join(" ").toLocaleLowerCase().includes(query);
+    const matchesCategory = !category ||
+      post.category.toLocaleLowerCase() === category;
+    return matchesQuery && matchesCategory;
+  });
 }
 
 export async function getPost(
@@ -224,7 +294,7 @@ export async function getPost(
     : seedPosts.find((item) => item.slug === slug) ?? null;
 
   if (!isPost(post)) return null;
-  if (!includeDrafts && post.status !== "published") return null;
+  if (!includeDrafts && !isPublicPost(post)) return null;
   return post;
 }
 
@@ -258,6 +328,21 @@ export async function savePost(
   };
 
   let operation = kv.atomic().set(postKey(post.slug), post);
+  if (post.featured) {
+    for await (const entry of kv.list<Post>({ prefix: POST_PREFIX })) {
+      if (
+        !isPost(entry.value) || entry.value.slug === post.slug ||
+        !entry.value.featured
+      ) {
+        continue;
+      }
+      operation = operation.set(postKey(entry.value.slug), {
+        ...entry.value,
+        featured: false,
+        updatedAt: now,
+      });
+    }
+  }
   if (sourceSlug !== post.slug) {
     operation = operation.delete(postKey(sourceSlug));
   }

@@ -6,7 +6,7 @@ import path from '../path';
 const { dirname, join } = path;
 import { fileURLToPath } from '../url';
 import { Buffer } from '../buffer';
-import { arrayBufferBackedBytes, concatChunks } from '../_internal/buffer';
+import { arrayBufferBackedBytes, base64ToBytes, concatChunks, hexToBytes } from '../_internal/buffer';
 import { toErrnoException } from '../_internal/errno';
 import { wrapSync } from './errno-fix';
 
@@ -153,10 +153,10 @@ export function toUint8Array(data: string | Uint8Array | ArrayBuffer, encoding?:
             case 'ascii':
                 return arrayBufferBackedBytes(algorithm.asciiEncodeLoose(data));
             case 'hex':
-                return arrayBufferBackedBytes(algorithm.hexDecodeLoose(data));
+                return arrayBufferBackedBytes(hexToBytes(data));
             case 'base64':
             case 'base64url':
-                return arrayBufferBackedBytes(algorithm.base64DecodeLoose(data));
+                return arrayBufferBackedBytes(base64ToBytes(data));
             default:
                 return arrayBufferBackedBytes(new text.Encoder(encoding ?? 'utf8').encode(data));
         }
@@ -524,9 +524,9 @@ export class BigIntStats extends Stats {
     }
 }
 
-export function toNodeStat(stat: NativeStats, options?: { bigint?: boolean }): import('fs').Stats {
-    if (options?.bigint === true) return new BigIntStats(stat) as unknown as import('fs').Stats;
-    return new Stats(stat) as import('fs').Stats;
+export function toNodeStat(stat: NativeStats, options?: { bigint?: boolean }): Stats {
+    if (options?.bigint === true) return new BigIntStats(stat) as unknown as Stats;
+    return new Stats(stat) as Stats;
 }
 
 type StatFsInput = CModuleFS.StatFsResult | CModuleAsyncFS.StatFsResult;
@@ -555,8 +555,8 @@ export class StatFs {
 
 export type StatsFs = StatFs;
 
-export function toNodeStatFs(stat: StatFsInput, options?: StatFsOptions): import('fs').StatsFs {
-    return new StatFs(stat, options?.bigint === true) as import('fs').StatsFs;
+export function toNodeStatFs(stat: StatFsInput, options?: StatFsOptions): StatsFs {
+    return new StatFs(stat, options?.bigint === true) as StatsFs;
 }
 
 // Dirent conversion — parentPath is the directory containing `name` (Node 20.12+).
@@ -809,12 +809,12 @@ export class Dir {
         );
     }
 
-    read(callback: (err: NodeJS.ErrnoException | null, dirent: import('fs').Dirent | null) => void): void;
-    read(): Promise<import('fs').Dirent | null>;
-    read(callback?: (err: NodeJS.ErrnoException | null, dirent: import('fs').Dirent | null) => void): Promise<import('fs').Dirent | null> | void {
+    read(callback: (err: NodeJS.ErrnoException | null, dirent: Dirent | null) => void): void;
+    read(): Promise<Dirent | null>;
+    read(callback?: (err: NodeJS.ErrnoException | null, dirent: Dirent | null) => void): Promise<Dirent | null> | void {
         if (callback) {
             queueMicrotask(() => {
-                let entry: import('fs').Dirent | null;
+                let entry: Dirent | null;
                 try {
                     entry = this.readSync();
                 } catch (err) {
@@ -828,7 +828,7 @@ export class Dir {
         return Promise.resolve().then(() => this.readSync());
     }
 
-    readSync(): import('fs').Dirent | null {
+    readSync(): Dirent | null {
         if (this.closed) throw dirClosedError();
         if (this.index >= this.entries.length) return null;
         const entry = this.entries[this.index++];
@@ -861,7 +861,7 @@ export class Dir {
         this.entries = [];
     }
 
-    [Symbol.asyncIterator](): AsyncIterableIterator<import('fs').Dirent> {
+    [Symbol.asyncIterator](): AsyncIterableIterator<Dirent> {
         const dir = this;
         return {
             async next() {
@@ -873,7 +873,7 @@ export class Dir {
                 await dir.close();
                 return { done: true, value: undefined };
             },
-        } as AsyncIterableIterator<import('fs').Dirent>;
+        } as AsyncIterableIterator<Dirent>;
     }
 }
 
@@ -1067,33 +1067,52 @@ export async function removeRecursive(targetPath: string): Promise<void> {
 // Recursive directory creation
 
 function splitMkdirPath(pathStr: string): { root: string; parts: string[] } {
-    const normalized = pathStr.replace(/\\/g, '/');
-    const uncMatch = normalized.match(/^\/\/[^/]+\/[^/]+/);
-    if (uncMatch) {
-        return {
-            root: uncMatch[0],
-            parts: normalized.slice(uncMatch[0].length).split('/').filter(Boolean),
-        };
+    const windows = process.platform === 'win32';
+    const normalized = windows ? pathStr.replace(/\\/g, '/') : pathStr;
+    const split = (rest: string): string[] => rest.split('/').filter(Boolean);
+
+    if (windows) {
+        const verbatim = normalized.match(/^\/\/([?.])\//);
+        if (verbatim) {
+            const prefix = verbatim[0];
+            const body = normalized.slice(prefix.length);
+            const unc = body.match(/^UNC\/[^/]+\/[^/]+/i);
+            if (unc) return { root: `${prefix}${unc[0]}/`, parts: split(body.slice(unc[0].length)) };
+            const drive = body.match(/^[A-Za-z]:(?:\/|$)/);
+            if (drive) return { root: `${prefix}${drive[0].replace(/\/?$/, '/')}`, parts: split(body.slice(drive[0].length)) };
+            return { root: normalized, parts: [] };
+        }
+
+        const unc = normalized.match(/^\/\/[^/]+\/[^/]+/);
+        if (unc) return { root: `${unc[0]}/`, parts: split(normalized.slice(unc[0].length)) };
+
+        const drive = normalized.match(/^[A-Za-z]:(?:\/|$)/);
+        if (drive) return { root: `${drive[0].replace(/\/?$/, '/')}`, parts: split(normalized.slice(drive[0].length)) };
+
+        const driveRelative = normalized.match(/^[A-Za-z]:/);
+        if (driveRelative) return { root: driveRelative[0], parts: split(normalized.slice(driveRelative[0].length)) };
     }
 
-    const driveMatch = normalized.match(/^[a-zA-Z]:(?:\/|$)/);
-    if (driveMatch) {
-        const root = driveMatch[0].endsWith('/') ? driveMatch[0] : `${driveMatch[0]}/`;
-        return {
-            root,
-            parts: normalized.slice(driveMatch[0].length).split('/').filter(Boolean),
-        };
-    }
-
-    return {
-        root: normalized.startsWith('/') ? '/' : '',
-        parts: normalized.slice(normalized.startsWith('/') ? 1 : 0).split('/').filter(Boolean),
-    };
+    if (normalized.startsWith('/')) return { root: '/', parts: split(normalized.slice(1)) };
+    return { root: '', parts: split(normalized) };
 }
 
-function appendPathPart(base: string, part: string): string {
+function appendMkdirPart(base: string, part: string): string {
     if (!base) return part;
-    return base.endsWith('/') ? `${base}${part}` : `${base}/${part}`;
+    if (process.platform === 'win32' && /^[A-Za-z]:$/.test(base)) return `${base}${part}`;
+    if (base.endsWith('/')) return `${base}${part}`;
+    return `${base}/${part}`;
+}
+
+function* mkdirPathParents(pathStr: string): Generator<string> {
+    const normalized = path.normalize(pathStr);
+    const { root, parts } = splitMkdirPath(normalized);
+    let current = root;
+    for (const part of parts) {
+        if (part === '.') continue;
+        current = appendMkdirPart(current, part);
+        if (part !== '..') yield current;
+    }
 }
 
 function enotdirError(current: string): NodeJS.ErrnoException {
@@ -1131,12 +1150,9 @@ async function isExistingDir(current: string): Promise<boolean> {
  * way in), so the return needs converting explicitly to match.
  */
 export function mkdirRecursiveSync(pathStr: string, mode?: number): string | undefined {
-    const { root, parts } = splitMkdirPath(pathStr);
-    let current = root;
     let firstCreated: string | undefined;
 
-    for (const part of parts) {
-        current = appendPathPart(current, part);
+    for (const current of mkdirPathParents(pathStr)) {
         if (fs.exists(current)) {
             if (!fs.stat(current).isDirectory) throw enotdirError(current);
             continue;
@@ -1153,12 +1169,9 @@ export function mkdirRecursiveSync(pathStr: string, mode?: number): string | und
 }
 
 export async function mkdirRecursive(pathStr: string, mode?: number): Promise<string | undefined> {
-    const { root, parts } = splitMkdirPath(pathStr);
-    let current = root;
     let firstCreated: string | undefined;
 
-    for (const part of parts) {
-        current = appendPathPart(current, part);
+    for (const current of mkdirPathParents(pathStr)) {
         try {
             const stat = await asfs.stat(current);
             if (!stat.isDirectory) throw enotdirError(current);
@@ -1406,14 +1419,14 @@ export function randomHex(): string {
 export function createAsyncDir(
     pathStr: string,
     dirHandle: CModuleAsyncFS.DirHandle,
-): import('fs').Dir {
+): Dir {
     let closed = false;
     let exhausted = false;
 
-    const dir: import('fs').Dir = {
+    const dir: Dir = {
         path: pathStr,
 
-        async read(): Promise<import('fs').Dirent | null> {
+        async read(): Promise<Dirent | null> {
             if (closed) throw dirClosedError();
             // Node keeps returning null once the directory is drained; the native
             // handle yields `undefined` from a second post-exhaustion `next()`,
@@ -1427,7 +1440,7 @@ export function createAsyncDir(
             return toNodeDirentAsync(result.value, pathStr);
         },
 
-        readSync(): import('fs').Dirent | null {
+        readSync(): Dirent | null {
             throw new Error('readSync is not supported in async opendir');
         },
 
@@ -1441,7 +1454,7 @@ export function createAsyncDir(
             throw new Error('closeSync is not supported in async opendir');
         },
 
-        [Symbol.asyncIterator](): AsyncIterableIterator<import('fs').Dirent> {
+        [Symbol.asyncIterator](): AsyncIterableIterator<Dirent> {
             return {
                 async next() {
                     const entry = await dir.read();
@@ -1452,9 +1465,9 @@ export function createAsyncDir(
                     await dir.close();
                     return { done: true, value: undefined };
                 },
-            } as AsyncIterableIterator<import('fs').Dirent>;
+            } as AsyncIterableIterator<Dirent>;
         },
-    } as import('fs').Dir;
+    } as Dir;
 
     return dir;
 }
@@ -1468,14 +1481,14 @@ export function createAsyncDir(
 export function createEagerAsyncDir(
     pathStr: string,
     entries: DirEntryWithParent[],
-): import('fs').Dir {
+): Dir {
     let closed = false;
     let index = 0;
 
-    const dir: import('fs').Dir = {
+    const dir: Dir = {
         path: pathStr,
 
-        async read(): Promise<import('fs').Dirent | null> {
+        async read(): Promise<Dirent | null> {
             if (closed) throw dirClosedError();
             if (index >= entries.length) return null;
             const entry = entries[index++];
@@ -1483,7 +1496,7 @@ export function createEagerAsyncDir(
             return toNodeDirentAsync(entry, entry.parentPath);
         },
 
-        readSync(): import('fs').Dirent | null {
+        readSync(): Dirent | null {
             throw new Error('readSync is not supported in async opendir');
         },
 
@@ -1497,7 +1510,7 @@ export function createEagerAsyncDir(
             throw new Error('closeSync is not supported in async opendir');
         },
 
-        [Symbol.asyncIterator](): AsyncIterableIterator<import('fs').Dirent> {
+        [Symbol.asyncIterator](): AsyncIterableIterator<Dirent> {
             return {
                 async next() {
                     const entry = await dir.read();
@@ -1508,9 +1521,9 @@ export function createEagerAsyncDir(
                     await dir.close();
                     return { done: true, value: undefined };
                 },
-            } as AsyncIterableIterator<import('fs').Dirent>;
+            } as AsyncIterableIterator<Dirent>;
         },
-    } as import('fs').Dir;
+    } as Dir;
 
     return dir;
 }

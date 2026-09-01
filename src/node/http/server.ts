@@ -1,11 +1,11 @@
 ﻿const http = import.meta.use('http');
 const text = import.meta.use('text');
 const engine = import.meta.use('engine');
-const dns = import.meta.use('dns');
-const os = import.meta.use('os');
 
 import { Readable, Writable } from '../stream';
+import { createWriteAfterEndError } from '../stream/_shared';
 import { Socket, Server as NetServer, AddressInfo, type HttpOwnedTransport } from '../net';
+import { normalizeTcpHost } from '../net/_shared';
 import type { HttpRequest, HttpResponse, Server as HttpServer } from '@cnojs/http/server';
 import {
     buildNodeServerUrl,
@@ -18,10 +18,18 @@ import {
     toUint8Array,
 } from '../_internal/network-debug';
 import { isTransportDisconnectError, normalizeErrnoError } from '../_internal/errno';
-import { viewToUint8Array } from '../_internal/buffer';
-import { ServerResponseAdapter, type ResponseAdapterServeHook } from '../_internal/server-response-adapter';
+import { arrayBufferBackedBytes, viewToUint8Array } from '../_internal/buffer';
+import {
+    createHeadersSentError,
+    isBodyForbiddenStatus,
+    ServerResponseAdapter,
+    type ResponseAdapterServeHook,
+} from '../_internal/server-response-adapter';
 import { dispatchServerRequest } from '../_internal/server-request-runtime';
-import { pumpIncomingRequestBody } from '../_internal/server-request-stream';
+import {
+    appendIncomingHeader,
+    pumpIncomingRequestBody,
+} from '../_internal/server-request-stream';
 import { emitNodeServerUpgrade } from '../_internal/server-upgrade';
 import {
     onNetServerSocket,
@@ -31,6 +39,7 @@ import {
 } from '../diagnostics_channel/builtins';
 import type { IncomingHttpHeaders, OutgoingHttpHeader, OutgoingHttpHeaders, IncomingMessage, OutgoingMessage, ServerResponse, ListenOptions, Server, RequestListener, MessageSocket } from './types';
 import { IOpaque } from '../_internal/inject';
+import { flattenPrototype } from '../_internal/prototype';
 import { STATUS_CODES } from './constants';
 export type { IncomingHttpHeaders, OutgoingHttpHeader, OutgoingHttpHeaders, IncomingMessage, OutgoingMessage, ServerResponse, ListenOptions, Server, RequestListener } from './types';
 type NativeHttpModule = typeof http & { __cno: IOpaque };
@@ -44,36 +53,6 @@ export interface ServerSocketLike {
     once(event: 'close', listener: () => void): unknown;
     off?(event: 'close', listener: () => void): unknown;
     removeListener?(event: 'close', listener: () => void): unknown;
-}
-
-function normalizeListenHost(host: string): string {
-    if (!host || host === '*') return '0.0.0.0';
-    if (host === 'localhost') {
-        try {
-            const resolved = dns.resolveSync?.(host, { family: os.AF_UNSPEC }) ?? [];
-            if (resolved.length > 0 && typeof resolved[0]?.ip === 'string') {
-                return resolved[0].ip;
-            }
-        } catch {}
-        return '127.0.0.1';
-    }
-    return host;
-}
-
-export function isBodyForbiddenStatus(statusCode: number): boolean {
-    return (statusCode >= 100 && statusCode < 200) || statusCode === 204 || statusCode === 205 || statusCode === 304;
-}
-
-export function createHeadersSentError(message = 'Cannot write headers after they are sent to the client'): Error & { code: string } {
-    return Object.assign(new Error(message), {
-        code: 'ERR_HTTP_HEADERS_SENT',
-    });
-}
-
-export function createWriteAfterEndError(): Error & { code: string } {
-    return Object.assign(new Error('write after end'), {
-        code: 'ERR_STREAM_WRITE_AFTER_END',
-    });
 }
 
 function toBodyChunkBytes(chunk: unknown, encodeString: (value: string) => Uint8Array): Uint8Array {
@@ -140,25 +119,6 @@ export function createAttachedSocket(
     return socket;
 }
 
-export function applyIncomingRequestLine(incoming: IncomingMessageImpl, method: string, url: string, httpVersion: string): void {
-    incoming.method = method;
-    incoming.url = url;
-    incoming.httpVersion = httpVersion;
-    const [major, minor] = httpVersion.split('.').map(Number);
-    incoming.httpVersionMajor = major;
-    incoming.httpVersionMinor = minor;
-}
-
-export function appendIncomingHeader(incoming: IncomingMessageImpl, key: string, value: string): void {
-    const lowerKey = key.toLowerCase();
-    incoming.headers[lowerKey as keyof IncomingHttpHeaders] = value;
-    incoming.rawHeaders.push(key, value);
-    if (!incoming.headersDistinct[lowerKey]) {
-        incoming.headersDistinct[lowerKey] = [];
-    }
-    incoming.headersDistinct[lowerKey]?.push(value);
-}
-
 export function createServerRequestObjects(
     socket: MessageSocket | null,
     timeout?: number,
@@ -176,7 +136,12 @@ export function createServerRequestObjects(
 }
 
 export function applyCoreServerRequest(incoming: IncomingMessageImpl, request: Pick<HttpRequest, 'method' | 'url' | 'httpVersion' | 'headers'>): void {
-    applyIncomingRequestLine(incoming, request.method, request.url, request.httpVersion);
+    incoming.method = request.method;
+    incoming.url = request.url;
+    incoming.httpVersion = request.httpVersion;
+    const [major = 1, minor = 1] = request.httpVersion.split('.').map(Number);
+    incoming.httpVersionMajor = major;
+    incoming.httpVersionMinor = minor;
     for (const [key, value] of request.headers) appendIncomingHeader(incoming, key, value);
 }
 
@@ -190,23 +155,6 @@ export { STATUS_CODES, METHODS } from './constants';
 // do `http.IncomingMessage.call(this)` + `util.inherits()` instead of
 // `class X extends http.IncomingMessage` (which ES6 class constructors reject
 // when invoked as a plain function).
-function flattenPrototype(target: object): void {
-    const parent = Object.getPrototypeOf(target);
-    if (!parent || parent === Object.prototype) return;
-
-    for (const key of Object.getOwnPropertyNames(parent)) {
-        if (key === 'constructor' || Object.prototype.hasOwnProperty.call(target, key)) continue;
-        const descriptor = Object.getOwnPropertyDescriptor(parent, key);
-        if (descriptor) Object.defineProperty(target, key, descriptor);
-    }
-
-    for (const key of Object.getOwnPropertySymbols(parent)) {
-        if (Object.prototype.hasOwnProperty.call(target, key)) continue;
-        const descriptor = Object.getOwnPropertyDescriptor(parent, key);
-        if (descriptor) Object.defineProperty(target, key, descriptor);
-    }
-}
-
 export interface IncomingMessageImpl extends IncomingMessage {}
 
 export interface IncomingMessageImplConstructor {
@@ -714,7 +662,7 @@ class NodeResponseAdapter extends ServerResponseAdapter<ServerResponseImpl> {
         serveHook: ReturnType<typeof getNodeServeHook>,
         requestId: string,
         requestUrl: string,
-        suppressBody = false,
+        suppressBody: boolean,
     ) {
         super(response, {
             closeSource: response.socket,
@@ -722,7 +670,7 @@ class NodeResponseAdapter extends ServerResponseAdapter<ServerResponseImpl> {
             writeHead: (res, headers) => coreResponse.writeHead(res.statusCode, res.statusMessage, headers),
             writeInformational: (_res, status, statusText, headers) => coreResponse.writeHead(status, statusText, headers),
             writeBody: async (_res, data) => {
-                await coreResponse.write(data);
+                await coreResponse.write(arrayBufferBackedBytes(toUint8Array(data, engine.encodeString)));
             },
             finish: async () => {
                 await coreResponse.end();
@@ -733,11 +681,7 @@ class NodeResponseAdapter extends ServerResponseAdapter<ServerResponseImpl> {
             abort: () => {
                 try { coreResponse.close(); } catch { /* already closed */ }
             },
-        }, serveHook as ResponseAdapterServeHook | null, {
-            isBodyForbiddenStatus,
-            createHeadersSentError,
-            createWriteAfterEndError,
-        }, requestId, requestUrl, suppressBody);
+        }, serveHook as ResponseAdapterServeHook | null, requestId, requestUrl, suppressBody);
     }
 
     /*
@@ -808,7 +752,6 @@ export interface ServerOptions {
 interface NormalizedServerListenArgs {
     port?: number;
     host: string;
-    backlog?: number;
     listener?: () => void;
 }
 
@@ -818,37 +761,20 @@ function normalizeServerListenArgs(
     arg3?: number | (() => void),
     arg4?: () => void,
 ): NormalizedServerListenArgs {
-    let port: number | undefined;
-    let host = '0.0.0.0';
-    let backlog: number | undefined;
-    let listener: (() => void) | undefined;
-
     if (typeof arg1 === 'object') {
-        const opts = arg1 as ListenOptions;
-        port = opts.port;
-        host = opts.host ?? host;
-        backlog = opts.backlog;
-        listener = arg2 as (() => void) | undefined;
-        return { port, host, backlog, listener };
+        return {
+            port: arg1.port,
+            host: arg1.host ?? '0.0.0.0',
+            listener: typeof arg2 === 'function' ? arg2 : undefined,
+        };
     }
 
-    port = typeof arg1 === 'number' ? arg1 : parseInt(arg1 ?? '0');
-    if (typeof arg2 === 'function') {
-        listener = arg2;
-    } else if (typeof arg2 === 'string') {
-        host = arg2;
-        if (typeof arg3 === 'function') {
-            listener = arg3;
-        } else if (typeof arg3 === 'number') {
-            backlog = arg3;
-            if (typeof arg4 === 'function') listener = arg4;
-        }
-    } else if (typeof arg2 === 'number') {
-        backlog = arg2;
-        if (typeof arg3 === 'function') listener = arg3;
-    }
-
-    return { port, host, backlog, listener };
+    const port = typeof arg1 === 'number' ? arg1 : parseInt(arg1 ?? '0');
+    const host = typeof arg2 === 'string' ? arg2 : '0.0.0.0';
+    const listener = [arg4, arg3, arg2].find(
+        (arg): arg is () => void => typeof arg === 'function',
+    );
+    return { port, host, listener };
 }
 
 export class ServerImpl extends NetServer implements Server {
@@ -943,15 +869,20 @@ export class ServerImpl extends NetServer implements Server {
      * same handle; destroy closes the HTTP connection via the current res.
      */
     private socketForCoreRequest(tcp: CModuleStreams.TCP, res: HttpResponse): Socket {
-        const closeOwned = () => {
-            try { res.close(); } catch { /* already closed */ }
-        };
         const existing = this._httpSocketByTcp.get(tcp);
-        if (existing && !existing.destroyed) {
-            existing._httpOwned = { close: closeOwned };
-            return existing;
-        }
-        const socket = createAttachedSocket(tcp, { close: closeOwned });
+        if (existing && !existing.destroyed) return existing;
+
+        const owned: HttpOwnedTransport = {
+            close: () => {
+                try { res.close(); } catch { /* already closed */ }
+            },
+        };
+        const socket = createAttachedSocket(tcp, owned);
+        res.onTerminalClose(() => {
+            if (socket._httpOwned !== owned) return;
+            socket._httpOwned = null;
+            socket.destroy();
+        });
         this._httpSocketByTcp.set(tcp, socket);
         this.trackHttpSocket(socket);
         // In Node http.Server extends net.Server, so every accepted HTTP
@@ -997,11 +928,15 @@ export class ServerImpl extends NetServer implements Server {
                 this.releaseActiveHttpSocket(nodeSocket);
                 return;
             }
+            let connectSocket: Socket | null = null;
             try {
-                const connectSocket = Socket.fromUpgradeHandle(res.upgrade());
+                connectSocket = Socket.fromUpgradeHandle(res.upgrade());
                 this.markHttpSocketUpgraded(nodeSocket);
                 this.emit('connect', incoming, connectSocket, new Uint8Array(0));
             } catch (err) {
+                // Once upgrade() succeeds, ownership has moved to the Node socket.
+                // Deterministically close it if the connect listener throws.
+                if (connectSocket && !connectSocket.destroyed) connectSocket.destroy();
                 this.emit('error', err);
             }
             this.releaseActiveHttpSocket(nodeSocket);
@@ -1125,7 +1060,7 @@ export class ServerImpl extends NetServer implements Server {
         // Capture call frames HERE — the user's code is on the stack.
         const listenEntryCallFrames = captureNodeNetworkCallFrames();
         const { port, host: rawHost, listener } = normalizeServerListenArgs(arg1, arg2, arg3, arg4);
-        const host = normalizeListenHost(rawHost);
+        const host = normalizeTcpHost(rawHost);
 
         const handler = async (req: HttpRequest, res: HttpResponse) => {
             await this._handleNativeRequest(req, res, host, listenEntryCallFrames);

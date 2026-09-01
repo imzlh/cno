@@ -15,6 +15,7 @@ const nativeDns = import.meta.use('dns');
 
 import type { EventEmitter } from '../events';
 import { normalizeErrnoError } from '../_internal/errno';
+export { flattenPrototype } from '../_internal/prototype';
 import type { Server, Socket, TcpNetConnectOpts, UpgradeHandle } from './types';
 
 export function normalizeTcpHost(host: string): string {
@@ -186,23 +187,6 @@ export function emitListeningAsync(server: Server): void {
 // parent's version (see stream/mod.ts's flattenPrototype for the incident
 // this guards against: Readable.prototype.on/once auto-resume overrides were
 // being clobbered by a naive flatten call, hanging every HTTP response body).
-export function flattenPrototype(target: object): void {
-    const parent = Object.getPrototypeOf(target);
-    if (!parent || parent === Object.prototype) return;
-
-    for (const key of Object.getOwnPropertyNames(parent)) {
-        if (key === 'constructor' || Object.prototype.hasOwnProperty.call(target, key)) continue;
-        const descriptor = Object.getOwnPropertyDescriptor(parent, key);
-        if (descriptor) Object.defineProperty(target, key, descriptor);
-    }
-
-    for (const key of Object.getOwnPropertySymbols(parent)) {
-        if (Object.prototype.hasOwnProperty.call(target, key)) continue;
-        const descriptor = Object.getOwnPropertyDescriptor(parent, key);
-        if (descriptor) Object.defineProperty(target, key, descriptor);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Port validation, address-family normalisation, and connect-time DNS
 // resolution. Internal to the net module — not re-exported from mod.ts.

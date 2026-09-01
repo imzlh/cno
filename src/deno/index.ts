@@ -1,5 +1,7 @@
 import packageJson from '../../package.json';
 import { buildDenoArgs } from "../utils/args";
+import { ensureDirectory } from "../utils/fs-path";
+import { basename, dirname, resolvePath, toFsPath } from "../utils/path";
 import { wrapFSErr } from "../utils/wrap";
 import { errors } from "./01_errors";
 
@@ -39,43 +41,16 @@ async function loadLifecycleMux(): Promise<LifecycleMux | null> {
 
 // ─── Snapshot helpers ────────────────────────────────────────────────────────
 
-async function mkdirQuietly(path: string): Promise<void> {
-    try {
-        await asyncfs.mkdir(path);
-    } catch {
-        // If the directory still cannot be used, opening the snapshot file fails.
-    }
-}
-
-/** Percent-decode, but keep malformed sequences literal like upstream Deno does. */
-function decodeUrlPathTolerant(raw: string): string {
-    try {
-        return decodeURIComponent(raw);
-    } catch {
-        return raw;
-    }
-}
-
-function urlToFsPath(url: string): string {
-    if (url.startsWith('file:///')) {
-        const raw = decodeUrlPathTolerant(url.slice(7)); // keep leading '/'
-        // On Windows: file:///C:/path → /C:/path → C:/path
-        if (/^\/[A-Za-z]:[\\/]/.test(raw)) return raw.slice(1).replace(/\//g, '\\');
-        return raw;
-    }
-    return url;
-}
-
 function pathFromStringOrUrl(path: string | URL): string {
     if (!(path instanceof URL)) return path;
     if (path.protocol !== 'file:') throw new TypeError('Expected a file URL');
-    return urlToFsPath(path.href);
+    return toFsPath(path);
 }
 
 function pathFromURL(url: URL): string {
     if (!(url instanceof URL)) throw new TypeError('Expected a URL');
     if (url.protocol !== 'file:') throw new TypeError('Expected a file URL');
-    return urlToFsPath(url.href);
+    return toFsPath(url);
 }
 
 function rethrowDenoFsError(error: unknown): never {
@@ -98,20 +73,30 @@ function denoChdir(dir: string | URL): void {
     }
 }
 
-function snapshotDir(fsPath: string, overrideDir?: string): string {
-    if (overrideDir) return overrideDir;
-    const sep = fsPath.includes('\\') ? '\\' : '/';
-    const lastSep = Math.max(fsPath.lastIndexOf('/'), fsPath.lastIndexOf('\\'));
-    const dir = lastSep < 0 ? '.' : fsPath.slice(0, lastSep);
-    return dir + sep + '__snapshots__';
+interface SnapshotPathOptions {
+    dir?: string;
+    path?: string;
 }
 
-function snapshotFile(fsPath: string, overrideDir?: string): string {
-    const dir = snapshotDir(fsPath, overrideDir);
-    const sep = dir.includes('\\') ? '\\' : '/';
-    const lastSep = Math.max(fsPath.lastIndexOf('/'), fsPath.lastIndexOf('\\'));
-    const base = lastSep < 0 ? fsPath : fsPath.slice(lastSep + 1);
-    return dir + sep + base + '.snap';
+function resolveSnapshotFile(fsPath: string, options?: SnapshotPathOptions): string {
+    const baseDir = dirname(fsPath);
+    if (options?.path !== undefined) {
+        return resolvePath(options.path, baseDir);
+    }
+
+    const snapshotDir = options?.dir === undefined
+        ? resolvePath('__snapshots__', baseDir)
+        : resolvePath(options.dir, baseDir);
+    return resolvePath(`${basename(fsPath)}.snap`, snapshotDir);
+}
+
+function snapshotOriginPath(origin: string): string {
+    if (!origin.startsWith('file:')) return origin;
+    try {
+        return toFsPath(new URL(origin));
+    } catch {
+        return origin;
+    }
 }
 
 // Per-file snapshot data: file path → { key → value }
@@ -142,8 +127,8 @@ async function loadSnapshots(file: string): Promise<Map<string, string>> {
 }
 
 async function saveSnapshots(file: string, map: Map<string, string>): Promise<void> {
-    const dir = snapshotDir(file);
-    await mkdirQuietly(dir);
+    const dir = dirname(file);
+    await ensureDirectory(dir);
     const parts: string[] = [];
     for (const [key, value] of map) {
         parts.push(`[${key}]\n${value}\n---`);
@@ -165,10 +150,12 @@ async function assertSnapshotImpl<T>(
     actual: T,
     origin: string,
     testName: string,
-    options?: { name?: string; dir?: string; msg?: string; serializer?: (v: T) => string }
+    options?: SnapshotPathOptions & { name?: string; msg?: string; serializer?: (v: T) => string }
 ): Promise<void> {
-    const fsPath = urlToFsPath(origin);
-    const snapFilePath = snapshotFile(fsPath, options?.dir);
+    // Test origins are often logical names, not file URLs. Only URL-valued
+    // filesystem arguments need URL decoding here.
+    const fsPath = snapshotOriginPath(origin);
+    const snapFilePath = resolveSnapshotFile(fsPath, options);
     const serialized = options?.serializer ? options.serializer(actual) : console.inspect(actual, { colors: false, depth: 10 });
 
     const counterKey = `${snapFilePath}\0${testName}`;
@@ -242,8 +229,24 @@ function toDenoArch(arch: string): string {
 function toDenoTarget(arch: string, os: string): string {
     const a = toDenoArch(arch);
     if (os === 'windows') return `${a}-pc-windows-msvc`;
-    if (os === 'darwin')   return `${a}-apple-darwin`;
+    if (os === 'darwin') return `${a}-apple-darwin`;
+    if (os === 'freebsd') return `${a}-unknown-freebsd`;
+    if (os === 'netbsd') return `${a}-unknown-netbsd`;
+    // Runtime uname data cannot reliably distinguish Linux glibc from musl.
     return `${a}-unknown-linux-gnu`;
+}
+
+function createDenoBuild(arch: string, os: string) {
+    const target = toDenoTarget(arch, os);
+    const [targetArch, vendor, targetOs, env] = target.split('-');
+    return Object.freeze({
+        target,
+        arch: targetArch,
+        os: targetOs,
+        vendor,
+        env,
+        standalone: false,
+    });
 }
 
 const signalMap: Record<string, Map<() => void, CModuleSignals.SignalHandler>> = {};
@@ -452,7 +455,7 @@ function createTestContext(name: string, origin: string, parent?: Deno.TestConte
         origin,
         parent,
         async assertSnapshot<T>(actual: T, options?: {
-            name?: string; dir?: string; msg?: string; serializer?: (v: T) => string;
+            name?: string; dir?: string; path?: string; msg?: string; serializer?: (v: T) => string;
         } | string): Promise<void> {
             const snapshotOptions = typeof options === 'string' ? { msg: options } : options;
             await assertSnapshotImpl(actual, origin, name, snapshotOptions);
@@ -966,8 +969,12 @@ function setDenoExitCode(value: unknown): void {
 Object.defineProperty(globalThis, "Deno", {
     value: {
         errors,
-        pid: os.pid,
-        ppid: os.ppid,
+        get pid() {
+            return os.pid;
+        },
+        get ppid() {
+            return os.ppid;
+        },
         env: {
             get: safeGetEnv,
             set: setEnv,
@@ -990,13 +997,7 @@ Object.defineProperty(globalThis, "Deno", {
         set exitCode(value: unknown) {
             setDenoExitCode(value);
         },
-        build: {
-            arch: toDenoArch(uname.machine),
-            os: toDenoSystemName(uname.sysname),
-            standalone: false,
-            target: toDenoTarget(uname.machine, toDenoSystemName(uname.sysname)),
-            vendor: "cno"
-        },
+        build: createDenoBuild(uname.machine, toDenoSystemName(uname.sysname)),
         version: {
             deno: packageJson.version,
             // note: this is not real!

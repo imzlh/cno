@@ -15,6 +15,7 @@
  */
 
 import { EventEmitter } from '../events';
+export { flattenPrototype } from '../_internal/prototype';
 import type {
     BaseStreamState,
     DestroyHookHost,
@@ -143,7 +144,7 @@ export function runStreamDestroy(
     finish(null);
 }
 
-const isWindows = os.uname().sysname === 'Windows_NT';
+const isWindows = os.platform == 'win32';
 let defaultByteHighWaterMark = isWindows ? 16 * 1024 : 64 * 1024;
 let defaultObjectHighWaterMark = 16;
 
@@ -154,23 +155,6 @@ export function defaultHighWaterMark(objectMode: boolean): number {
 function validateHighWaterMark(value: number): void {
     if (!Number.isInteger(value) || value < 0 || value > 0x3fffffff) {
         throw new RangeError('The value of "value" is out of range. It must be a non-negative integer.');
-    }
-}
-
-export function flattenPrototype(target: object): void {
-    const parent = Object.getPrototypeOf(target);
-    if (!parent || parent === Object.prototype) return;
-
-    for (const key of Object.getOwnPropertyNames(parent)) {
-        if (key === 'constructor' || Object.prototype.hasOwnProperty.call(target, key)) continue;
-        const descriptor = Object.getOwnPropertyDescriptor(parent, key);
-        if (descriptor) Object.defineProperty(target, key, descriptor);
-    }
-
-    for (const key of Object.getOwnPropertySymbols(parent)) {
-        if (Object.prototype.hasOwnProperty.call(target, key)) continue;
-        const descriptor = Object.getOwnPropertyDescriptor(parent, key);
-        if (descriptor) Object.defineProperty(target, key, descriptor);
     }
 }
 

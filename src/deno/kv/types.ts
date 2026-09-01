@@ -88,8 +88,20 @@ export interface KvQueueEntry {
     backoffSchedule?: number[];
 }
 
+export enum OP {
+    CHECK = 0,
+    SET,
+    DELETE,
+    SUM,
+    MAX,
+    MIN,
+    ENQUEUE
+}
+
 export const KV_QUEUE_PREFIX = '__kv_queue__';
 export const MAX_KV_DELAY = 30 * 24 * 60 * 60 * 1000;
+export const MAX_KV_KEY_BYTES = 2048;
+export const MAX_KV_VALUE_BYTES = 64 * 1024;
 export const DEFAULT_QUEUE_BACKOFF = [100, 200, 400, 800];
 export const COMMIT_VERSIONSTAMP_KEY = Symbol('Deno.Kv.commitVersionstamp');
 const KV_U64_VALUE_PREFIX = new Uint8Array([0x43, 0x4e, 0x4f, 0x4b, 0x56, 0x55, 0x36, 0x34, 0x00]);
@@ -161,6 +173,12 @@ export interface KvWatchOptions {
 }
 
 export type RawKey = Uint8Array<ArrayBuffer>;
+
+export type AtomicDbOperation =
+    | { type: 'check'; key: RawKey; versionstamp: string | null }
+    | { type: 'set'; key: RawKey; value: Uint8Array; expireIn?: number }
+    | { type: 'delete'; key: RawKey }
+    | { type: 'sum' | 'max' | 'min'; key: RawKey; operand: bigint };
 
 export interface InternalEntry {
     key: RawKey;
@@ -364,7 +382,11 @@ export function serializeKey(key: Deno.KvKey): RawKey {
             throw new TypeError(`Unsupported key part type: ${getKeyPartType(part)}`);
         }
     }
-    return new Uint8Array(out);
+    const encoded = new Uint8Array(out);
+    if (encoded.byteLength > MAX_KV_KEY_BYTES) {
+        throw new TypeError(`Key exceeds maximum serialized length of ${MAX_KV_KEY_BYTES} bytes`);
+    }
+    return encoded;
 }
 
 export function deserializeKey(rk: RawKey): Deno.KvKey {
@@ -434,13 +456,19 @@ const LEGACY_JSON_SERIALIZER = (_key: string, v: unknown): unknown => {
 };
 
 export function serializeValue(value: unknown): Uint8Array<ArrayBuffer> {
+    let encoded: Uint8Array<ArrayBuffer>;
     if (isKvU64(value)) {
-        return concatChunks([
+        encoded = concatChunks([
             KV_U64_VALUE_PREFIX,
             engine.encodeString(value.value.toString()),
         ]);
+    } else {
+        encoded = toOwnedBytes(bjson.encode(value));
     }
-    return toOwnedBytes(bjson.encode(value));
+    if (encoded.byteLength > MAX_KV_VALUE_BYTES) {
+        throw new TypeError(`Value exceeds maximum serialized length of ${MAX_KV_VALUE_BYTES} bytes`);
+    }
+    return encoded;
 }
 
 export function deserializeValue<T>(data: Uint8Array<ArrayBuffer>): T {
@@ -485,7 +513,7 @@ export function compareKeyPart(a: KvKeyPart, b: KvKeyPart): number {
         return a < b ? -1 : (a > b ? 1 : 0);
     }
     if (typeof a === 'string' && typeof b === 'string') {
-        return a.localeCompare(b);
+        return algorithm.bytesCompare(engine.encodeString(a), engine.encodeString(b));
     }
     if (a instanceof Uint8Array && b instanceof Uint8Array) {
         return algorithm.bytesCompare(a, b);

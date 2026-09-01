@@ -1,8 +1,8 @@
-import type { NetworkCallFrame, ServeHook } from '../../utils/network-hooks';
 import type { OutgoingHttpHeaders } from '../http/types';
 
 import { nodeTs } from './network-debug';
 import { isTransportDisconnectError } from './errno';
+import type { NetworkCallFrame, ServeHook } from './network-hooks';
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 type HeaderInput = OutgoingHttpHeaders | readonly string[];
@@ -17,8 +17,6 @@ export interface RuntimeAdapter<TResponse extends RuntimeResponse> {
     writeEarlyHints: TResponse['writeEarlyHints'];
     abort?(err: unknown): void;
     readonly isAborted?: boolean;
-    readonly isFinished?: boolean;
-    readonly lastError?: Error | null;
 }
 
 interface RuntimeResponse {
@@ -35,7 +33,7 @@ interface RuntimeResponse {
     off(event: string | symbol, listener: (...args: unknown[]) => void): this;
 }
 
-export interface RuntimeRequestMeta {
+interface RuntimeRequestMeta {
     requestId: string;
     timestamp: number;
     url: string;
@@ -45,18 +43,14 @@ export interface RuntimeRequestMeta {
     callFrames?: NetworkCallFrame[];
 }
 
-export interface RunServerRequestContext<TIncoming, TResponse extends RuntimeResponse> {
+export interface DispatchServerRequestContext<TIncoming, TResponse extends RuntimeResponse> extends RuntimeRequestMeta {
     listener: (req: TIncoming, res: TResponse) => unknown | Promise<unknown>;
     incoming: TIncoming;
     response: TResponse;
     adapter: RuntimeAdapter<TResponse>;
     serveHook?: ServeHook | null;
-    request: RuntimeRequestMeta;
     onError(err: unknown): void;
 }
-
-export interface DispatchServerRequestContext<TIncoming, TResponse extends RuntimeResponse>
-    extends Omit<RunServerRequestContext<TIncoming, TResponse>, 'request'>, RuntimeRequestMeta {}
 
 /**
  * Watch response terminal events. Disconnect is a normal end-of-stream, not a
@@ -171,10 +165,19 @@ function bindServerResponseAdapter<TResponse extends RuntimeResponse>(response: 
     response.writeEarlyHints = adapter.writeEarlyHints.bind(adapter) as TResponse['writeEarlyHints'];
 }
 
-export async function runServerRequest<TIncoming, TResponse extends RuntimeResponse>(
-    ctx: RunServerRequestContext<TIncoming, TResponse>
+export async function dispatchServerRequest<TIncoming, TResponse extends RuntimeResponse>(
+    ctx: DispatchServerRequestContext<TIncoming, TResponse>
 ): Promise<void> {
-    emitServeRequest(ctx.serveHook, ctx.request);
+    const request: RuntimeRequestMeta = {
+        requestId: ctx.requestId,
+        timestamp: ctx.timestamp,
+        url: ctx.url,
+        method: ctx.method,
+        headers: ctx.headers,
+        postData: ctx.postData,
+        callFrames: ctx.callFrames,
+    };
+    emitServeRequest(ctx.serveHook, request);
     bindServerResponseAdapter(ctx.response, ctx.adapter);
     const responseDone = observeServerResponse(ctx.response);
 
@@ -201,36 +204,14 @@ export async function runServerRequest<TIncoming, TResponse extends RuntimeRespo
         }
         if (!ctx.response.headersSent) {
             // No response terminal yet — report failure here, then try a 500.
-            emitServeFailure(ctx.serveHook, ctx.request, err);
+            emitServeFailure(ctx.serveHook, request, err);
             writeInternalServerErrorQuietly(ctx.response);
         } else if (!ctx.response.writableFinished) {
             // abort → enterFailed owns the single onFinished for this request.
             abortAdapterQuietly(ctx.adapter, err);
         } else {
-            emitServeFailure(ctx.serveHook, ctx.request, err);
+            emitServeFailure(ctx.serveHook, request, err);
         }
         ctx.onError(err);
     }
-}
-
-export function dispatchServerRequest<TIncoming, TResponse extends RuntimeResponse>(
-    ctx: DispatchServerRequestContext<TIncoming, TResponse>
-): Promise<void> {
-    return runServerRequest({
-        listener: ctx.listener,
-        incoming: ctx.incoming,
-        response: ctx.response,
-        adapter: ctx.adapter,
-        serveHook: ctx.serveHook,
-        request: {
-            requestId: ctx.requestId,
-            timestamp: ctx.timestamp,
-            url: ctx.url,
-            method: ctx.method,
-            headers: ctx.headers,
-            postData: ctx.postData,
-            callFrames: ctx.callFrames,
-        },
-        onError: ctx.onError,
-    });
 }

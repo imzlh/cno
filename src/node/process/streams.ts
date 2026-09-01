@@ -1,11 +1,11 @@
 /**
  * Standard stream implementations for the Node.js process module.
- * ProcessWriteStream / ProcessReadStream wrap the deno/04_stdio shared
+ * ProcessWriteStream / ProcessReadStream wrap the shared native streams
  * singletons into Node-compatible Writable/Readable streams.
  */
 
-import type { Stream as StdioStream } from '../../utils/stdio';
 import { getTierLimits } from '../_internal/memory';
+import type { NodeStdioStream as StdioStream } from '../_internal/stdio';
 import { Readable, Writable } from '../stream';
 
 const engine = import.meta.use('engine');

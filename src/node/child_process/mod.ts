@@ -1,24 +1,4 @@
-/**
- * Node.js child_process module — public surface.
- * Based on CModuleProcess implementation
- *
- * This file is a facade: the implementation lives in the sibling modules listed
- * below, and the export list here IS the public API. It is deliberately spelled
- * out name by name rather than using `export *`, because the submodules also
- * export internals to each other (pipe/stream helpers, stdio validators, command
- * resolution, spawn-error factories) and `export *` would silently publish those
- * as `node:child_process` exports.
- *
- *   types.ts     SpawnOptions / ExecOptions / ChildProcess / SpawnSyncResult, …
- *   _shared.ts   pipe + stdio-stream plumbing, transformSignal, decodeOutput,
- *                flattenPrototype, buildShellInvocation
- *   validate.ts  stdio / maxBuffer / timeout validation + native stdio converters
- *   command.ts   env normalisation, command resolution, spawn-error construction
- *   child.ts     ChildProcessImpl (the ChildProcess class) + failed-spawn stubs
- *   spawn.ts     spawn
- *   exec.ts      exec, execFile, fork, output collection
- *   sync.ts      spawnSync, execSync, execFileSync
- */
+// Keep public exports explicit: sibling modules also expose implementation helpers.
 
 import type { Buffer } from '../buffer';
 import { exec, execFile } from './exec';
@@ -34,10 +14,7 @@ export type {
     ExecSyncResult,
 } from './types';
 
-// `ChildProcess` is one name with two meanings (the interface and the class), as
-// it was before the split. child.ts re-exports the interface as a type alias
-// alongside the value, so this single line publishes both — listing it in the
-// `export type` block above as well would be a duplicate identifier.
+// This exports both the class and its same-named type alias.
 export { ChildProcess } from './child';
 
 export { spawn } from './spawn';

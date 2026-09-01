@@ -1,6 +1,6 @@
 import { Headers } from "../headers";
 import pkg from "../../../package.json";
-import { getFetchHook, getUserAgentOverride, getExtraHTTPHeaders, getFetchInterceptHook, captureUserNetworkCallFrames, getCurlInitHook, type NetworkCallFrame } from "../../utils/network-hooks";
+import { getFetchHook, getUserAgentOverride, getExtraHTTPHeaders, getFetchInterceptHook, captureUserNetworkCallFrames, getCurlInitHook, type NetworkCallFrame, type InterceptResult } from "../../utils/network-hooks";
 import { type HttpClient } from "../../deno/07_http";
 import { Request } from "./request";
 import { Response, setResponseMetadata } from "./response";
@@ -90,12 +90,32 @@ function toRequestInput(input: unknown): RequestInput {
     return String(input);
 }
 
+function clearCurlProxy(curl: CModuleCURL.CURL): void {
+    curl.setOpt(curlMod.CURLOPT_PROXY, null);
+    curl.setOpt(curlMod.CURLOPT_PROXYTYPE, curlMod.CURLPROXY_HTTP);
+    curl.setOpt(curlMod.CURLOPT_PROXYUSERNAME, null);
+    curl.setOpt(curlMod.CURLOPT_PROXYPASSWORD, null);
+    curl.setOpt(curlMod.CURLOPT_NOPROXY, null);
+}
+
 /** Apply Deno.HttpClient proxy + mTLS settings without touching the filesystem. */
 function applyClientToCurl(curl: CModuleCURL.CURL, client: HttpClient, url: URL): void {
-    const proxyUrl = client.shouldUseProxy(url) ? client.getProxyUrl() : null;
-    if (proxyUrl) curl.setProxy(proxyUrl.href, getCurlProxyType(proxyUrl.protocol));
-
     const opts = client.options;
+    const proxy = opts.proxy;
+    if (proxy) {
+        clearCurlProxy(curl);
+        if (client.shouldUseProxy(url)) {
+            const proxyUrl = client.getProxyUrl();
+            if (proxyUrl) {
+                curl.setProxy(proxyUrl.href, getCurlProxyType(proxyUrl.protocol));
+                if (proxy.basicAuth) {
+                    curl.setOpt(curlMod.CURLOPT_PROXYUSERNAME, proxy.basicAuth.username);
+                    curl.setOpt(curlMod.CURLOPT_PROXYPASSWORD, proxy.basicAuth.password);
+                }
+            }
+        }
+    }
+
     if (opts.caCerts?.length) {
         const option = curlMod.CURLOPT_CAINFO_BLOB;
         if (typeof option !== 'number') throw new Error('custom CA certificates require libcurl with CAINFO_BLOB support');
@@ -135,6 +155,7 @@ export async function performFetch(request: Request, url: URL): Promise<Response
     if (localResponse) {
         const response = new Response(localResponse.body, {
             status: localResponse.status,
+            statusText: localResponse.status === 200 ? 'OK' : '',
             headers: localResponse.headers,
         });
         setResponseMetadata(response, { url: localResponse.url, type: 'basic' });
@@ -145,14 +166,14 @@ export async function performFetch(request: Request, url: URL): Promise<Response
     throwIfAborted(request.signal);
 
     const curl = new curlMod.CURL(getCurlPool());
-    getCurlInitHook()?.(curl);
 
     // If a Deno.HttpClient is attached, apply its proxy/SSL config to curl
     // instead of reimplementing HTTP on a raw socket.
     const client = (await import('../../deno/07_http')).getRequestClient(request);
-    if (client) {
-        applyClientToCurl(curl, client, url);
-    }
+    const configureRequestNetwork = (target: URL) => {
+        getCurlInitHook()?.(curl, target);
+        if (client) applyClientToCurl(curl, client, target);
+    };
     const abortCurl = () => {
         abortCurlQuietly(curl);
     };
@@ -205,6 +226,7 @@ export async function performFetch(request: Request, url: URL): Promise<Response
     curl.setUrl(url.href)
         .setMethod(request.method)
         .setHeaders(objHeaders);
+    configureRequestNetwork(url);
     curl.setOpt(curlMod.CURLOPT_AUTOREFERER, 1);  // update Referer to the Location URL on each redirect hop
     curl.setAcceptEncoding(acceptEncoding);
     // Default timeouts (ms): bound a hung upstream so a single fetch can't block forever.
@@ -363,6 +385,18 @@ export async function performFetch(request: Request, url: URL): Promise<Response
         }
     };
 
+    // The interceptor runs before curl.perform(). If it rejects, there is no
+    // perform() finally block to release the global in-flight marker or the
+    // AbortSignal listener. Keep this cleanup idempotent so every early exit
+    // releases the request-owned state exactly once.
+    const cleanupBeforePerform = () => {
+        inFlightFetchFrames.delete(headersDone.promise);
+        removeAbortHandler();
+        pendingBodyChunks.length = 0;
+        pendingBodySize = 0;
+        abortCurl();
+    };
+
     const followingRedirects = request.redirect !== 'error' && request.redirect !== 'manual';
     let didRedirect = false;
     let waitingForFinalHeaders = false; // true between a redirect hop and the final onHeadersComplete
@@ -429,11 +463,17 @@ export async function performFetch(request: Request, url: URL): Promise<Response
     // modify/fulfill/fail it. Must happen after all curl options are configured
     // and after AbortSignal is wired, but before perform().
     if (interceptHook?.onRequest) {
-        const result = await interceptHook.onRequest({
-            requestId, url: url.href, method: request.method,
-            headers: objHeaders, postData: truncateHookPostData(body ?? null),
-            callFrames: reqCallFrames, resourceType: 'Fetch',
-        });
+        let result: InterceptResult | null;
+        try {
+            result = await interceptHook.onRequest({
+                requestId, url: url.href, method: request.method,
+                headers: objHeaders, postData: truncateHookPostData(body ?? null),
+                callFrames: reqCallFrames, resourceType: 'Fetch',
+            });
+        } catch (error) {
+            cleanupBeforePerform();
+            throw error;
+        }
         if (result) {
             if (result.action === 'fulfill') {
                 removeAbortHandler();
@@ -450,10 +490,18 @@ export async function performFetch(request: Request, url: URL): Promise<Response
                 throw new TypeError(`Request blocked: ${result.reason}`);
             }
             // action === 'continue': apply modifications to the already-configured curl handle
-            if (result.url) curl.setUrl(result.url);
-            if (result.method) curl.setMethod(result.method);
-            if (result.headers) curl.setHeaders(result.headers);
-            if (result.postData) curl.setBody(toCurlBody(result.postData));
+            try {
+                if (result.url) {
+                    curl.setUrl(result.url);
+                    configureRequestNetwork(new URL(result.url, url));
+                }
+                if (result.method) curl.setMethod(result.method);
+                if (result.headers) curl.setHeaders(result.headers);
+                if (result.postData) curl.setBody(toCurlBody(result.postData));
+            } catch (error) {
+                cleanupBeforePerform();
+                throw error;
+            }
         }
     }
 
@@ -469,32 +517,38 @@ export async function performFetch(request: Request, url: URL): Promise<Response
     }
 
     // perform() runs in background; we await headers independently
-    const performPromise = curl.perform().then(
-        () => {
-            closeBody();
-            if (netHook) {
-                const conn = buildConnectionInfo(curl, reqStartTime, curlTrace);
-                emitFetchHookQuietly(() => {
-                    netHook.onFinished?.({ requestId, success: true, connection: conn, timestamp: ts() });
-                });
+    let performPromise: Promise<unknown>;
+    try {
+        performPromise = curl.perform().then(
+            () => {
+                closeBody();
+                if (netHook) {
+                    const conn = buildConnectionInfo(curl, reqStartTime, curlTrace);
+                    emitFetchHookQuietly(() => {
+                        netHook.onFinished?.({ requestId, success: true, connection: conn, timestamp: ts() });
+                    });
+                }
+            },
+            (err: Error) => {
+                const fetchErr = isCurlTimeoutError(err) ? timeoutError() : err;
+                headersDone.reject(fetchErr);
+                errorBody(fetchErr);
+                if (netHook) {
+                    const conn = buildConnectionInfo(curl, reqStartTime, curlTrace);
+                    emitFetchHookQuietly(() => {
+                        netHook.onFinished?.({ requestId, success: false, errorText: fetchErr.message, connection: conn, timestamp: ts() });
+                    });
+                }
             }
-        },
-        (err: Error) => {
-            const fetchErr = isCurlTimeoutError(err) ? timeoutError() : err;
-            headersDone.reject(fetchErr);
-            errorBody(fetchErr);
-            if (netHook) {
-                const conn = buildConnectionInfo(curl, reqStartTime, curlTrace);
-                emitFetchHookQuietly(() => {
-                    netHook.onFinished?.({ requestId, success: false, errorText: fetchErr.message, connection: conn, timestamp: ts() });
-                });
-            }
-        }
-    ).finally(() => {
-        inFlightFetchFrames.delete(headersDone.promise);
-        removeAbortHandler();
-        curlRecvPaused = false;
-    });
+        ).finally(() => {
+            inFlightFetchFrames.delete(headersDone.promise);
+            removeAbortHandler();
+            curlRecvPaused = false;
+        });
+    } catch (error) {
+        cleanupBeforePerform();
+        throw error;
+    }
 
     try {
         const { status, headers: rawHeaders } = await headersDone.promise;

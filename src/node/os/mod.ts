@@ -442,57 +442,50 @@ export function endianness(): 'BE' | 'LE' {
     return new Uint8Array(buffer)[0] === 1 ? 'LE' : 'BE';
 }
 
-/** Node's `Received ...` clause for ERR_INVALID_ARG_TYPE. Verified against v24.18. */
-function receivedOf(actual: unknown): string {
-    if (actual === null) return 'null';
-    if (actual === undefined) return 'undefined';
-    const t = typeof actual;
-    if (t === 'string') return `type string ('${actual as string}')`;
-    if (t === 'number') return `type number (${Object.is(actual, -0) ? '-0' : String(actual)})`;
-    if (t === 'bigint') return `type bigint (${String(actual)}n)`;
-    if (t === 'boolean') return `type boolean (${String(actual)})`;
-    if (t === 'symbol') return `type symbol (${String(actual)})`;
-    if (t === 'function') return `function ${(actual as { name?: string }).name ?? ''}`;
-    if (t === 'object') {
-        if (Object.getPrototypeOf(actual) === null) return '[Object: null prototype] {}';
-        const ctor = (actual as object).constructor;
-        return `an instance of ${ctor && ctor.name ? ctor.name : 'Object'}`;
-    }
-    return `type ${t}`;
-}
-
-/**
- * Node groups an out-of-range integer's digits with `_` once |value| exceeds
- * 2**32, so `1e21` reports as `1e_+21`. Mirrors internal addNumericSeparator.
- */
-function addNumericSeparator(text: string): string {
-    let res = '';
-    let i = text.length;
-    const start = text[0] === '-' ? 1 : 0;
-    for (; i >= start + 4; i -= 3) res = `_${text.slice(i - 3, i)}${res}`;
-    return i === text.length ? text : `${text.slice(0, i)}${res}`;
-}
-
-function receivedNumber(value: number): string {
-    if (Object.is(value, -0)) return '-0';
-    const text = String(value);
-    return Number.isInteger(value) && Math.abs(value) > 2 ** 32
-        ? addNumericSeparator(text)
-        : text;
-}
-
 function outOfRange(name: string, reason: string, actual: number): RangeError {
+    const text = String(actual);
+    let received = text;
+    if (Object.is(actual, -0)) {
+        received = '-0';
+    } else if (Number.isInteger(actual) && Math.abs(actual) > 2 ** 32) {
+        received = '';
+        let i = text.length;
+        const start = text[0] === '-' ? 1 : 0;
+        for (; i >= start + 4; i -= 3) received = `_${text.slice(i - 3, i)}${received}`;
+        received = `${text.slice(0, i)}${received}`;
+    }
     const e = new RangeError(
         `The value of "${name}" is out of range. It must be ${reason}. `
-        + `Received ${receivedNumber(actual)}`,
+        + `Received ${received}`,
     ) as RangeError & { code?: string };
     e.code = 'ERR_OUT_OF_RANGE';
     return e;
 }
 
 function invalidArgType(name: string, actual: unknown): TypeError {
+    let received: string;
+    if (actual === null) {
+        received = 'null';
+    } else if (actual === undefined) {
+        received = 'undefined';
+    } else {
+        const t = typeof actual;
+        if (t === 'string') received = `type string ('${actual as string}')`;
+        else if (t === 'number') received = `type number (${Object.is(actual, -0) ? '-0' : String(actual)})`;
+        else if (t === 'bigint') received = `type bigint (${String(actual)}n)`;
+        else if (t === 'boolean') received = `type boolean (${String(actual)})`;
+        else if (t === 'symbol') received = `type symbol (${String(actual)})`;
+        else if (t === 'function') received = `function ${(actual as { name?: string }).name ?? ''}`;
+        else if (t === 'object') {
+            if (Object.getPrototypeOf(actual) === null) received = '[Object: null prototype] {}';
+            else {
+                const ctor = (actual as object).constructor;
+                received = `an instance of ${ctor && ctor.name ? ctor.name : 'Object'}`;
+            }
+        } else received = `type ${t}`;
+    }
     const e = new TypeError(
-        `The "${name}" argument must be of type number. Received ${receivedOf(actual)}`,
+        `The "${name}" argument must be of type number. Received ${received}`,
     ) as TypeError & { code?: string };
     e.code = 'ERR_INVALID_ARG_TYPE';
     return e;

@@ -6,6 +6,7 @@
 const console = import.meta.use('console');
 
 import { inspect } from '../util/inspect';
+import { flattenPrototype } from '../_internal/prototype';
 
 type EventArgs = unknown[];
 type EventMap<T> = Record<keyof T, EventArgs>;
@@ -347,23 +348,6 @@ function deleteEventKey(self: EventEmitter, eventName: EventName): void {
         self._eventsCount = 0;
     } else {
         delete self._events[eventName];
-    }
-}
-
-function flattenPrototype(target: object): void {
-    const parent = Object.getPrototypeOf(target);
-    if (!parent || parent === Object.prototype) return;
-
-    for (const key of Object.getOwnPropertyNames(parent)) {
-        if (key === 'constructor' || Object.prototype.hasOwnProperty.call(target, key)) continue;
-        const descriptor = Object.getOwnPropertyDescriptor(parent, key);
-        if (descriptor) Object.defineProperty(target, key, descriptor);
-    }
-
-    for (const key of Object.getOwnPropertySymbols(parent)) {
-        if (Object.prototype.hasOwnProperty.call(target, key)) continue;
-        const descriptor = Object.getOwnPropertyDescriptor(parent, key);
-        if (descriptor) Object.defineProperty(target, key, descriptor);
     }
 }
 

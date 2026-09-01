@@ -4,6 +4,7 @@
  */
 
 import { EventEmitter } from '../events';
+import { flattenPrototype } from '../_internal/prototype';
 import {
     TLSSocket,
     Server as TlsServer,
@@ -15,6 +16,7 @@ import {
 import type { TlsOptions, TlsServerOptions, PeerCertificate } from '../tls';
 import {
     applyRequestCommonOptions,
+    type AgentLike,
     type ClientHooks,
     type ClientRequestState,
     abortRequest,
@@ -27,6 +29,7 @@ import {
     endRequest,
     initClientRequestState,
     mergeUrlOptions,
+    normalizeClientRequestArgs,
     normalizeRequestOptions,
     releaseRequestTransport,
     setRequestTimeout,
@@ -35,10 +38,7 @@ import {
 } from '../_internal/http-client';
 import {
     createServerRequestObjects,
-    createHeadersSentError,
-    createWriteAfterEndError,
     IncomingMessageImpl,
-    isBodyForbiddenStatus,
     OutgoingMessageImpl,
     ServerResponseImpl,
     METHODS as HTTP_METHODS,
@@ -47,7 +47,7 @@ import {
     validateRequestPath,
 } from '../http/server';
 import { Agent as HttpAgent } from '../http/client';
-import type { ClientRequestArgs } from '../http/client';
+import type { AgentOptions, ClientRequestArgs } from '../http/client';
 import type { Socket } from '../net';
 import type { ListenOptions as NetListenOptions } from '../net';
 import {
@@ -56,6 +56,7 @@ import {
 } from '../_internal/network-debug';
 import { ServerResponseAdapter } from '../_internal/server-response-adapter';
 import { isTransportDisconnectError, normalizeErrnoError } from '../_internal/errno';
+import { arrayBufferBackedBytes } from '../_internal/buffer';
 import { dispatchServerRequest } from '../_internal/server-request-runtime';
 import { createServerRequestParser, type ParsedServerRequest } from '../_internal/server-request-parser';
 import {
@@ -73,23 +74,6 @@ import {
     encodeChunkedTrailer,
     shouldCloseAfterResponse,
 } from '@cnojs/http/h1-frame';
-
-function flattenPrototype(target: object): void {
-    const parent = Object.getPrototypeOf(target);
-    if (!parent || parent === Object.prototype) return;
-
-    for (const key of Object.getOwnPropertyNames(parent)) {
-        if (key === 'constructor' || Object.prototype.hasOwnProperty.call(target, key)) continue;
-        const descriptor = Object.getOwnPropertyDescriptor(parent, key);
-        if (descriptor) Object.defineProperty(target, key, descriptor);
-    }
-
-    for (const key of Object.getOwnPropertySymbols(parent)) {
-        if (Object.prototype.hasOwnProperty.call(target, key)) continue;
-        const descriptor = Object.getOwnPropertyDescriptor(parent, key);
-        if (descriptor) Object.defineProperty(target, key, descriptor);
-    }
-}
 
 function writeTlsChunk(socket: TLSSocket, data: Uint8Array): Promise<void> {
     return new Promise((resolve, reject) => {
@@ -153,11 +137,12 @@ class TlsResponseAdapter extends ServerResponseAdapter<ServerResponseImpl> {
             },
             writeBody: async (res, data) => {
                 await responseTurn;
+                const bytes = arrayBufferBackedBytes(data);
                 if (res.chunkedEncoding) {
-                    await writeTlsChunk(socket, encodeChunkedFrame(data));
+                    await writeTlsChunk(socket, encodeChunkedFrame(bytes));
                     return;
                 }
-                await writeTlsChunk(socket, data);
+                await writeTlsChunk(socket, bytes);
             },
             finish: async (res) => {
                 await responseTurn;
@@ -179,12 +164,8 @@ class TlsResponseAdapter extends ServerResponseAdapter<ServerResponseImpl> {
                 releaseTurn();
                 try { socket.destroy(); } catch { /* already closed */ }
             },
-            normalizeError: (err) => normalizeErrnoError(err),
-        }, serveHook, {
-            isBodyForbiddenStatus,
-            createHeadersSentError,
-            createWriteAfterEndError,
-        }, requestId, requestUrl, suppressBody);
+            normalizeError: normalizeErrnoError,
+        }, serveHook, requestId, requestUrl, suppressBody);
 
         if (closeAfterResponse && !response.hasHeader('connection')) {
             response.setHeader('Connection', 'close');
@@ -292,7 +273,7 @@ function dispatchHttpsServerRequest(
         responseTurn,
         releaseResponseTurn,
     );
-    // runServerRequest never rejects disconnects; only surface real faults.
+    // dispatchServerRequest never rejects disconnects; only surface real faults.
     if (onServerRequestStart.hasSubscribers) {
         onServerRequestStart.publish({ request: incoming, response, socket: tlsSocket, server: self });
     }
@@ -383,7 +364,7 @@ function handleHttpsServerConnection(self: Server, tlsSocket: TLSSocket): void {
     });
 
     tlsSocket.on('data', (chunk: Uint8Array) => {
-        parser.feed(chunk);
+        parser.feed(arrayBufferBackedBytes(chunk));
     });
 }
 
@@ -427,7 +408,12 @@ Object.setPrototypeOf(Server, EventEmitter);
 Server.prototype = Object.create(EventEmitter.prototype);
 
 Server.prototype.listen = function listen(this: Server, ...args: ServerListenArgs): Server {
-    this._tlsServer.listen(...args);
+    // Narrow the union tuple before forwarding so TypeScript can select a
+    // concrete TLS server overload while preserving every supported form.
+    const [first, ...rest] = args as [unknown, ...Array<string | number | (() => void)>];
+    if (typeof first === 'number') this._tlsServer.listen(first, ...rest as []);
+    else if (typeof first === 'string') this._tlsServer.listen(first, ...rest as []);
+    else this._tlsServer.listen(first as NetListenOptions, ...rest as []);
     return this;
 };
 
@@ -509,7 +495,7 @@ export function createServer(optionsOrListener?: HttpsServerOptions | HttpsReque
 
 // HTTPS Agent
 
-interface HttpsRequestOptions extends ClientRequestArgs {
+interface HttpsRequestOptions extends ClientRequestArgs, AgentOptions {
     ca?: TlsOptions['ca'];
     cert?: TlsOptions['cert'];
     key?: TlsOptions['key'];
@@ -522,7 +508,16 @@ export class Agent extends HttpAgent {
     defaultPort: number = 443;
     protocol: string = 'https:';
 
-    createConnection(options: HttpsRequestOptions, callback: (err: Error | null, socket: TLSSocket | null) => void): TLSSocket | null {
+    constructor(options?: HttpsRequestOptions) {
+        super(options);
+        // HttpAgent's public pool implementation is reused, but its declared
+        // connection factory is specialized to a plain Socket. Install the TLS
+        // factory at the runtime extension point instead of narrowing an
+        // inherited method, which is unsound under strict function variance.
+        this.createConnection = this.createTlsConnection as HttpAgent['createConnection'];
+    }
+
+    private createTlsConnection(options: HttpsRequestOptions, callback: (err: Error | null, socket: TLSSocket | null) => void): TLSSocket | null {
         // Node merges the agent's constructor options under the per-request
         // ones. Reading only `options` meant every TLS setting passed to
         // `new https.Agent({...})` — ca, cert, key, rejectUnauthorized,
@@ -562,6 +557,9 @@ export class Agent extends HttpAgent {
             // trust store when `ca` is absent.
             const tlsSocket = connectSecureSocket({
                 ...merged,
+                // ClientRequestArgs permits null for Node HTTP option parity,
+                // while the TLS connector accepts only a string or undefined.
+                path: merged.path ?? undefined,
                 port,
                 host,
                 servername,
@@ -589,11 +587,14 @@ export interface RequestOptions extends HttpsRequestOptions {}
 
 interface HttpsClientRequest extends OutgoingMessageImpl, ClientRequestState<TLSSocket> {
     aborted: boolean;
-    agent: Agent | boolean;
+    agent: HttpAgent | boolean;
     host: string;
     protocol: string;
     method: string;
     path: string;
+    // Narrows both bases: OutgoingMessage allows any MessageSocket, the shared
+    // client state is transport-generic; an https request is always TLS.
+    socket: TLSSocket | null;
     onSocket(socket: TLSSocket): void;
 
     _tlsSocket: TLSSocket | null;
@@ -604,6 +605,7 @@ interface HttpsClientRequest extends OutgoingMessageImpl, ClientRequestState<TLS
     _requestBody: ClientRequestState<TLSSocket>['_requestBody'];
     _bodySent: boolean;
     _tcp: CModuleStreams.TCP | null;
+    _response: IncomingMessageImpl | null;
     _requestId: string;
     _requestCallFrames: ClientRequestState<TLSSocket>['_requestCallFrames'];
     _abortHandler: (() => void) | null;
@@ -634,6 +636,7 @@ const HTTPS_CLIENT_HOOKS: ClientHooks<HttpsClientRequest> = {
     defaultUserAgent: '',
     requestIdPrefix: 'https-fetch',
     waitForSecureConnect: true,
+    createIncomingMessage: (socket) => new IncomingMessageImpl(socket),
     connect: (request) => connectSecureTransport(request, 443),
     onTransportAssigned: (request, transport) => {
         request._tlsSocket = transport as TLSSocket;
@@ -705,7 +708,7 @@ HttpsClientRequest.prototype = Object.create(OutgoingMessageImpl.prototype);
 
 HttpsClientRequest.prototype._connect = function _connect(this: HttpsClientRequest): Promise<void> {
     if (this.agent && typeof this.agent === 'object' && typeof this.agent.addRequest === 'function') {
-        return connectRequestWithAgent(this, HTTPS_CLIENT_HOOKS, this.agent);
+        return connectRequestWithAgent(this, HTTPS_CLIENT_HOOKS, this.agent as unknown as AgentLike<HttpsClientRequest>);
     }
     return connectRequest(this, HTTPS_CLIENT_HOOKS);
 };
@@ -786,10 +789,12 @@ export function request(
     optionsOrCallback?: RequestOptions | ((res: IncomingMessageImpl) => void),
     callback?: (res: IncomingMessageImpl) => void,
 ): HttpsClientRequest {
-    if ((typeof urlOrOptions === 'string' || urlOrOptions instanceof URL) && optionsOrCallback && typeof optionsOrCallback === 'object') {
-        return new HttpsClientRequest(mergeUrlOptions<RequestOptions>(urlOrOptions, optionsOrCallback), callback);
-    }
-    return new HttpsClientRequest(urlOrOptions, optionsOrCallback as ((res: IncomingMessageImpl) => void) | undefined);
+    const args = normalizeClientRequestArgs<RequestOptions, IncomingMessageImpl>(
+        urlOrOptions,
+        optionsOrCallback,
+        callback,
+    );
+    return new HttpsClientRequest(...args);
 }
 
 export function get(url: string | URL, options: RequestOptions, callback?: (res: IncomingMessageImpl) => void): HttpsClientRequest;

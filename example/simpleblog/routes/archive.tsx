@@ -6,20 +6,30 @@ import { define } from "../utils.ts";
 
 export const handler = define.handlers({
   async GET(ctx) {
-    const posts = await listPosts();
     const query = (ctx.url.searchParams.get("q") ?? "").trim();
     const category = (ctx.url.searchParams.get("category") ?? "").trim();
-    const queryLower = query.toLocaleLowerCase();
-    const filtered = posts.filter((post) => {
-      const matchesQuery = !queryLower ||
-        `${post.title} ${post.excerpt} ${post.category}`
-          .toLocaleLowerCase()
-          .includes(queryLower);
-      const matchesCategory = !category || post.category === category;
-      return matchesQuery && matchesCategory;
+    const requestedPage = Number(ctx.url.searchParams.get("page") ?? "1");
+    const pageNumber = Number.isInteger(requestedPage) && requestedPage > 0
+      ? requestedPage
+      : 1;
+    const pageSize = 6;
+    const allPosts = await listPosts({ query, category });
+    const posts = allPosts.slice(
+      (pageNumber - 1) * pageSize,
+      pageNumber * pageSize,
+    );
+    const categories = [
+      ...new Set((await listPosts()).map((post) => post.category)),
+    ].sort();
+    return page({
+      posts,
+      categories,
+      query,
+      category,
+      page: pageNumber,
+      pageCount: Math.max(1, Math.ceil(allPosts.length / pageSize)),
+      total: allPosts.length,
     });
-    const categories = [...new Set(posts.map((post) => post.category))].sort();
-    return page({ posts: filtered, categories, query, category });
   },
 });
 
@@ -76,8 +86,8 @@ export default define.page<typeof handler>(function Archive({ data, url }) {
 
           <section class="archive-list" aria-label="Published notes">
             <div class="archive-count">
-              <span>{String(data.posts.length).padStart(2, "0")}</span>
-              <span>{data.posts.length === 1 ? "note" : "notes"}</span>
+              <span>{String(data.total).padStart(2, "0")}</span>
+              <span>{data.total === 1 ? "note" : "notes"}</span>
             </div>
             {data.posts.length > 0
               ? data.posts.map((post, index) => (
@@ -123,6 +133,33 @@ export default define.page<typeof handler>(function Archive({ data, url }) {
                 </div>
               )}
           </section>
+          {data.pageCount > 1 && (
+            <nav class="archive-pagination" aria-label="Archive pages">
+              {data.page > 1 && (
+                <a
+                  href={`/archive?${new URLSearchParams({
+                    q: data.query,
+                    category: data.category,
+                    page: String(data.page - 1),
+                  })}`}
+                >
+                  <span aria-hidden="true">&lt;-</span> Newer notes
+                </a>
+              )}
+              <span>Page {data.page} of {data.pageCount}</span>
+              {data.page < data.pageCount && (
+                <a
+                  href={`/archive?${new URLSearchParams({
+                    q: data.query,
+                    category: data.category,
+                    page: String(data.page + 1),
+                  })}`}
+                >
+                  Older notes <span aria-hidden="true">-&gt;</span>
+                </a>
+              )}
+            </nav>
+          )}
         </main>
         <SiteFooter />
       </div>

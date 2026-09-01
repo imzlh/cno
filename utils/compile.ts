@@ -5,7 +5,8 @@
 // Clean:   compile.js --all --clean  # remove stale outputs first
 // @ts-nocheck - cts native
 import { transform } from "sucrase";
-import { join, normalize } from "../src/utils/path.ts";
+import { ensureDirectorySync } from "../src/utils/fs-path.ts";
+import { dirname, join, normalize, toPosixPath } from "../src/utils/path.ts";
 
 const os = import.meta.use('os');
 const fs = import.meta.use('fs');
@@ -21,31 +22,31 @@ engine.onEvent((e, r) => {
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-const nodeModulesDir = os.cwd + '/src/node';
-const dstBase = os.homeDir + '/.cts/node';
+const nodeModulesDir = join(os.cwd, 'src', 'node');
+const dstBase = join(os.homeDir, '.cts', 'node');
 
 function resolveNodeModule(specifier: string) {
     const name = specifier.startsWith('node:') ? specifier.slice(5) : specifier;
     if (!/[a-z]\/[a-z]/.test(name) && name != 'index') {
-        return `${nodeModulesDir}/${name}/index.ts`;
+        return join(nodeModulesDir, name, 'index.ts');
     } else {
-        return `${nodeModulesDir}/${name}.ts`;
+        return join(nodeModulesDir, `${name}.ts`);
     }
 }
 
 function joinPaths(base: string, path: string) {
-    base = base.replace('\\', '/');
-    path = path.replace('\\', '/');
-    if (base == 'index') return normalize(path);
+    base = toPosixPath(base);
+    path = toPosixPath(path);
+    if (base == 'index') return toPosixPath(normalize(path));
     base = base.includes('/') ? base.substring(0, base.lastIndexOf('/')) : base;
-    return join(base, path);
+    return toPosixPath(join(base, path));
 }
 
 // Walk directory recursively, yielding relative paths
 function* walkDir(dir: string, prefix = ''): Generator<string> {
     const entries = fs.readdir(dir);
     for (const name of entries) {
-        const full = dir + '/' + name;
+        const full = join(dir, name);
         const rel = prefix ? prefix + '/' + name : name;
         const st = fs.stat(full);
         if (st.isDirectory) {
@@ -58,12 +59,7 @@ function* walkDir(dir: string, prefix = ''): Generator<string> {
 
 // Ensure parent directory exists
 function mkdirp(dir: string) {
-    const parts = dir.replace(/\\/g, '/').split('/').filter(Boolean);
-    let cur = '';
-    for (const p of parts) {
-        cur += '/' + p;
-        try { fs.mkdir(cur, 0o755); } catch { /* exists */ }
-    }
+    ensureDirectorySync(dir, 0o755);
 }
 
 // ── Module loader (shared across all compilations) ─────────────────────────
@@ -128,7 +124,7 @@ function compileOne(src: string, name: string, dst: string): boolean {
         const compiled = new engine.Module(transformed.code, name).dump();
 
         // Ensure output directory exists
-        const dstDir = dst.substring(0, dst.lastIndexOf('/'));
+        const dstDir = dirname(dst);
         mkdirp(dstDir);
 
         fs.writeFile(dst, compiled);
@@ -147,7 +143,7 @@ function cleanStale(): number {
     try {
         const dstEntries = fs.readdir(dstBase);
         for (const entry of dstEntries) {
-            walkAndClean(dstBase + '/' + entry, nodeModulesDir + '/' + entry);
+            walkAndClean(join(dstBase, entry), join(nodeModulesDir, entry));
         }
     } catch { /* dstBase doesn't exist */ }
     return removed;
@@ -168,7 +164,7 @@ function cleanStale(): number {
             let dstEntries;
             try { dstEntries = fs.readdir(dstPath); } catch { return; }
             for (const e of dstEntries) {
-                walkAndClean(dstPath + '/' + e, srcPath + '/' + e);
+                walkAndClean(join(dstPath, e), join(srcPath, e));
             }
             // Remove empty directory
             try {
@@ -192,7 +188,7 @@ function cleanStale(): number {
             const st = fs.stat(path);
             if (st.isDirectory) {
                 for (const e of fs.readdir(path)) {
-                    rmrf(path + '/' + e);
+                    rmrf(join(path, e));
                 }
                 fs.rmdir(path);
             } else {
@@ -225,10 +221,10 @@ if (doAll) {
     let ok = 0, fail = 0;
 
     for (const rel of walkDir(nodeModulesDir)) {
-        const src = nodeModulesDir + '/' + rel;
+        const src = join(nodeModulesDir, rel);
         const baseName = rel.replace(/\.ts$/, '');
         const name = 'node:' + baseName.replace(/\/index$/, '');
-        const dst = dstBase + '/' + baseName + '.ts.jsc';
+        const dst = join(dstBase, `${baseName}.ts.jsc`);
 
         if (compileOne(src, name, dst)) {
             // Count as ok or skipped based on output

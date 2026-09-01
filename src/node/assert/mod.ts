@@ -13,12 +13,6 @@ import { inspectDiff, inspectForAssert } from '../util/diff';
 
 type PropertyRecord = Record<PropertyKey, unknown>;
 
-// Internal helpers to reduce boilerplate
-function msg(m?: unknown): string | undefined {
-    if (typeof m === 'string') return m;
-    return m instanceof Error ? m.message : undefined;
-}
-
 /**
  * Message extractor for the comparison assertions. When the caller supplies an
  * Error, Node throws *that instance* rather than wrapping it in an
@@ -134,24 +128,6 @@ const NEGATED_HEADERS: Record<string, string> = {
 };
 
 /**
- * `strictEqual` and `notStrictEqual` swap in a "reference-equal" wording when
- * both operands are objects, or both are functions — measured on Node v24.18.0.
- * A function compared against a plain object does NOT qualify, which is why this
- * cannot be a single isObjectLike() test.
- */
-function bothReferenceTypes(actual: unknown, expected: unknown): boolean {
-    const bothObjects = typeof actual === 'object' && actual !== null
-        && typeof expected === 'object' && expected !== null;
-    const bothFunctions = typeof actual === 'function' && typeof expected === 'function';
-    return bothObjects || bothFunctions;
-}
-
-/** As above, for the single operand the negated assertions report. */
-function isReferenceType(value: unknown): boolean {
-    return (typeof value === 'object' && value !== null) || typeof value === 'function';
-}
-
-/**
  * How the negated assertions attach their single rendered value.
  *
  * The strict forms inline it after the colon only when it is short and fits on
@@ -171,10 +147,6 @@ function attachNegatedValue(header: string, rendered: string, loose: boolean): s
  * The inspect options Node's assert uses, and the Myers-diff composer built to
  * match `createErrDiff`.
  */
-function isObjectLike(value: unknown): boolean {
-    return (typeof value === 'object' && value !== null) || typeof value === 'function';
-}
-
 function inspectForDiff(value: unknown): string {
     try {
         return inspectForAssert(value);
@@ -234,7 +206,8 @@ function buildGeneratedMessage(actual: unknown, expected: unknown, operator: str
     const negated = NEGATED_HEADERS[operator];
     if (negated) {
         // notStrictEqual on a reference type reports the reference, not the value.
-        const header = operator === 'notStrictEqual' && isReferenceType(actual)
+        const header = operator === 'notStrictEqual'
+            && ((typeof actual === 'object' && actual !== null) || typeof actual === 'function')
             ? 'Expected "actual" not to be reference-equal to "expected":'
             : negated;
         return attachNegatedValue(header, inspectForDiff(actual), operator === 'notDeepEqual');
@@ -247,7 +220,13 @@ function buildGeneratedMessage(actual: unknown, expected: unknown, operator: str
         return `${inspectForAssertion(actual)} ${operator || ''} ${inspectForAssertion(expected)}`.trim();
     }
 
-    if (operator === 'strictEqual' && bothReferenceTypes(actual, expected)) {
+    // `strictEqual` uses reference-equal wording when both operands are non-null
+    // objects or both are functions. A function and a plain object do not qualify.
+    if (operator === 'strictEqual' && (
+        (typeof actual === 'object' && actual !== null
+            && typeof expected === 'object' && expected !== null)
+        || (typeof actual === 'function' && typeof expected === 'function')
+    )) {
         // Structurally equal but a different reference: there is nothing to diff,
         // so say so outright rather than printing two identical blocks.
         if (_deepEqual(actual, expected, true)) {
@@ -480,10 +459,6 @@ function expectedErrorKeys(error: object): string[] {
     return keys;
 }
 
-function hasProperty(value: object | Function | undefined, key: string): boolean {
-    return value !== undefined && key in value;
-}
-
 function _checkError(err: unknown, error: AssertPredicate, message?: string | Error): void {
     if (typeof error === 'function') {
         const prototype = Reflect.get(error, 'prototype');
@@ -530,7 +505,7 @@ function _checkError(err: unknown, error: AssertPredicate, message?: string | Er
             : undefined;
         const expectedRecord = error as PropertyRecord;
         for (const key of keys) {
-            if (!hasProperty(actualRecord, key)) {
+            if (actualRecord === undefined || !(key in actualRecord)) {
                 throw new AssertionError({
                     actual: err,
                     expected: error,
@@ -887,8 +862,9 @@ export class CallTracker {
         const exp = {
             callback,
             exact,
-            // Node falls back to 'calls' for an anonymous function.
-            name: callback.name || 'calls',
+            // calls(exact) uses Node's fixed fallback even if the engine infers
+            // a name for the internally created placeholder function.
+            name: typeof fn === 'number' ? 'calls' : callback.name || 'calls',
             tracked: [] as TrackedCall[],
         } as CallExpectation;
 

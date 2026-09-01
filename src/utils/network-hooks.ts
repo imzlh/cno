@@ -20,10 +20,6 @@ export function getUserAgentOverride(): string | null { return _userAgentOverrid
 export function setExtraHTTPHeaders(headers: Record<string, string>): void { _extraHTTPHeaders = headers; }
 export function getExtraHTTPHeaders(): Record<string, string> { return _extraHTTPHeaders; }
 
-// ---- CurlInit hook (applied to every CURL handle before perform) -----------
-
-export { type CurlInitHook, setCurlInitHook, getCurlInitHook } from '../../../cts/src/utils/curl';
-
 // ---- Raw connection hook (SSE/WebSocket and similar long-lived clients) ---
 
 export interface RawConnection {
@@ -42,6 +38,20 @@ export function setRawConnectionHook(hook: RawConnectionHook | null): void {
 
 export function getRawConnectionHook(): RawConnectionHook | null {
     return rawConnectionHook;
+}
+
+// ---- CURL initialization hook ----------------------------------------------
+
+export type CurlInitHook = (handle: CModuleCURL.CURL, url: URL) => void;
+
+let curlInitHook: CurlInitHook | null = null;
+
+export function setCurlInitHook(hook: CurlInitHook | null): void {
+    curlInitHook = hook;
+}
+
+export function getCurlInitHook(): CurlInitHook | null {
+    return curlInitHook;
 }
 
 // ---- Fetch hooks -----------------------------------------------------------

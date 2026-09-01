@@ -17,7 +17,7 @@ type ParsedPath = {
     name: string;
 };
 
-type PathApi = {
+export type PathApi = {
     sep: '/' | '\\';
     delimiter: ':' | ';';
     _makeLong(path: string): string;
@@ -71,10 +71,6 @@ function assertString(value: unknown, name: string): string {
         );
     }
     return value;
-}
-
-function matchGlob(path: string, pattern: string, windows: boolean): boolean {
-    return matchGlobPattern(path, pattern, windows);
 }
 
 function assertPathObject(value: unknown): FormatInputPathObject {
@@ -191,8 +187,8 @@ function isWindowsPathSeparator(ch: string): boolean {
     return ch === '\\' || ch === '/';
 }
 
-function normalizeSlashes(path: string, windows: boolean): string {
-    return windows ? path.replace(/\//g, '\\') : path.replace(/\\/g, '/');
+function normalizeSlashes(path: string): string {
+    return path.replace(/\//g, '\\');
 }
 
 function splitPosixRoot(path: string): RootInfo {
@@ -270,29 +266,6 @@ function win32ParseRootEnd(path: string): number {
     }
 
     return 0;
-}
-
-function parseRoot(path: string, windows: boolean): string {
-    if (windows) return path.slice(0, win32ParseRootEnd(path));
-    return path.startsWith('/') ? '/' : '';
-}
-
-/**
- * Node's isAbsolute, per flavour and without any separator translation.
- *
- * posix must treat `\` as an ordinary character, so `posix.isAbsolute('\\a')`
- * is false — routing it through a normalizer that flips slashes reports true.
- * win32 accepts either separator, but a bare `C:` is drive-RELATIVE.
- */
-function isAbsoluteImpl(path: string, windows: boolean): boolean {
-    if (!windows) return path.startsWith('/');
-    const len = path.length;
-    if (len === 0) return false;
-    if (isWindowsPathSeparator(path.charAt(0))) return true;
-    return len > 2
-        && isWinDeviceRoot(path.charAt(0))
-        && path.charAt(1) === ':'
-        && isWindowsPathSeparator(path.charAt(2));
 }
 
 function splitSegments(path: string, windows: boolean): string[] {
@@ -420,10 +393,6 @@ function normalizeWin32(path: string): string {
         return tail;
     }
     return isAbsolute ? `${device}\\${tail}` : `${device}${tail}`;
-}
-
-function normalizeImpl(path: string, windows: boolean): string {
-    return windows ? normalizeWin32(path) : normalizePosix(path);
 }
 
 function dirnamePosix(path: string): string {
@@ -635,7 +604,9 @@ function extnameImpl(path: string, windows: boolean): string {
 function parseImpl(path: string, windows: boolean): ParsedPath {
     // Deliberately NOT normalized: Node reports root/dir/base with the caller's
     // own separators, so `win32.parse('/a/b/c.js').root` is '/', not '\'.
-    const root = parseRoot(path, windows);
+    const root = windows
+        ? path.slice(0, win32ParseRootEnd(path))
+        : path.startsWith('/') ? '/' : '';
     const rootLength = root.length;
     const isSeparator = windows ? isWindowsPathSeparator : (ch: string) => ch === '/';
 
@@ -762,7 +733,7 @@ function win32DriveCwd(device: string): string {
 
 /** Parse one win32 path segment the way Node's path.win32.resolve does. */
 function parseWin32ResolvePart(path: string): { device: string; isAbsolute: boolean; tail: string } {
-    const normalized = normalizeSlashes(path, true);
+    const normalized = normalizeSlashes(path);
     const len = normalized.length;
     let rootEnd = 0;
     let device = '';
@@ -1083,14 +1054,23 @@ function createPathApi(windows: boolean): PathApi {
             return formatImpl(assertPathObject(pathObject), sep);
         },
         isAbsolute(path) {
-            return isAbsoluteImpl(assertString(path, 'path'), windows);
+            const input = assertString(path, 'path');
+            if (!windows) return input.startsWith('/');
+            const len = input.length;
+            if (len === 0) return false;
+            if (isWindowsPathSeparator(input.charAt(0))) return true;
+            return len > 2
+                && isWinDeviceRoot(input.charAt(0))
+                && input.charAt(1) === ':'
+                && isWindowsPathSeparator(input.charAt(2));
         },
         join(...paths) {
             for (let i = 0; i < paths.length; i++) assertString(paths[i], 'path');
             return windows ? joinWin32(paths) : joinPosix(paths);
         },
         normalize(path) {
-            return normalizeImpl(assertString(path, 'path'), windows);
+            const input = assertString(path, 'path');
+            return windows ? normalizeWin32(input) : normalizePosix(input);
         },
         parse(path) {
             return parseImpl(assertString(path, 'path'), windows);
@@ -1107,7 +1087,7 @@ function createPathApi(windows: boolean): PathApi {
         matchesGlob(path, pattern) {
             assertString(path, 'path');
             assertString(pattern, 'pattern');
-            return matchGlob(path, pattern, windows);
+            return matchGlobPattern(path, pattern, windows);
         },
     };
 }

@@ -7,7 +7,7 @@ const crypto = import.meta.use('crypto');
 const algorithm = import.meta.use('algorithm');
 import { Buffer } from '../buffer';
 import type { BinaryInput, KeyInput, KeyObject, KeyWithOptions, AsymmetricKeyType } from './types';
-import { concatChunks as concatBuffers } from '../_internal/buffer';
+import { base64ToBytes, concatChunks as concatBuffers, hexToBytes } from '../_internal/buffer';
 export { concatBuffers };
 
 const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
@@ -49,8 +49,8 @@ function isBufferSource(value: unknown): value is ArrayBuffer | ArrayBufferView 
 
 export function toBuffer(data: BinaryInput, encoding: string = 'utf8'): Uint8Array {
     if (typeof data === 'string') {
-        if (encoding === 'hex') return algorithm.hexDecodeLoose(data);
-        if (encoding === 'base64' || encoding === 'base64url') return algorithm.base64DecodeLoose(data);
+        if (encoding === 'hex') return hexToBytes(data);
+        if (encoding === 'base64' || encoding === 'base64url') return base64ToBytes(data);
         if (encoding === 'latin1' || encoding === 'ascii' || encoding === 'binary') {
             return algorithm.latin1EncodeLoose(data);
         }

@@ -1,8 +1,3 @@
-/**
- * Node.js worker_threads module
- * Based on CModuleWorker implementation
- */
-
 import { EventEmitter } from '../events';
 import { PassThrough } from '../stream';
 import {
@@ -15,8 +10,8 @@ import {
 } from '../_internal/structured-clone';
 
 const wk = import.meta.use('worker');
-const error = import.meta.use('error');
 const osmod = import.meta.use('os');
+const error = import.meta.use('error');
 
 const INTERNAL_KEYS = new Set([
     '__cts_entry',
@@ -64,34 +59,13 @@ const untransferableObjects = new WeakSet<object>();
 const uncloneableObjects = new WeakSet<object>();
 const workerRegistry = new Map<number, Worker>();
 
-/**
- * Workers the process must not wait for at exit: either terminate() was asked
- * for and the join is still pending (the thread is wedged and will never reach
- * the stop async), or the user unref'd the worker, which in Node means "do not
- * hold the process open for this".
- *
- * This exists because the native teardown is unconditional. TJS_FreeRuntime
- * (circu.js/src/vm.c:492-506) walks every entry of qrt->workers and calls
- * tjs__worker_stop_and_join(), whose uv_thread_join (mod_worker.c:671) runs on
- * the main thread. A wedged worker never leaves that list — the only unlink is
- * list_del() in tjs_worker_finalizer (mod_worker.c:754), which is GC-driven and
- * cannot run while w->self_obj still self-references the wrapper, and that
- * reference is only dropped by worker_release_self() AFTER a successful join.
- * So the join is reached, blocks forever, and the process hangs after all JS
- * has finished (OBSERVED: "REACHED END" prints, then rc=124 at 8s).
- */
+// Native teardown synchronously joins every worker. Do not wait at exit for a
+// stopped or unref'd worker until pipe EOF proves it can be reaped.
 const abandonedWorkers = new Set<Worker>();
 let exitHookInstalled = false;
 let forcingExit = false;
 
-/**
- * The 'exit' event is dispatched from the natural-drain path in TJS_Run
- * (vm.c tjs__lifecycle_drain) BEFORE cli.c:82 calls TJS_FreeRuntime, so a
- * listener here still runs ahead of the blocking join. os.exit() is C exit()
- * (mod_os.c:89), which never returns to TJS_Run and therefore never reaches the
- * join at all — MEASURED as the only escape: with the forced exit rc=0 in
- * 776ms, with an otherwise identical listener that does not force it rc=124.
- */
+// Bypass native teardown when it would block on an abandoned worker.
 function installExitHook(): void {
     if (exitHookInstalled) return;
     const host = processExitHost();
@@ -118,14 +92,7 @@ function createReadyToken(threadId: number): string {
     return `${threadId}:${Date.now()}:${Math.random()}`;
 }
 
-/**
- * The parent's resolved runtime config, published on globalThis by `cno run`.
- * A worker re-derives its config from os.args, which does NOT carry the parent's
- * CLI flags, so without forwarding this a worker silently reverts to defaults:
- * OBSERVED `--no-oxc -C mycond` giving the worker enableOxc:true and no
- * conditions, and `--memory-limit` not applying at all. The webapi Worker
- * already forwards it (cno/src/webapi/worker.ts:261); this is the node path.
- */
+// Worker os.args omits the parent's CLI flags, so forward the resolved config.
 function currentRuntimeConfig(): unknown {
     try {
         return Reflect.get(globalThis, '__cno_worker_runtime_config');
@@ -150,37 +117,7 @@ function mbToBytes(value: unknown): number | undefined {
     return Math.floor(value) * 1024 * 1024;
 }
 
-/**
- * Fold a Worker's `resourceLimits` into the runtime config the worker actually
- * builds its JSRuntime from.
- *
- * `resourceLimits` used to be pure bookkeeping: it round-tripped to
- * `worker_threads.resourceLimits` for reporting and nothing consumed it.
- * OBSERVED (2026-08-03, file-based worker, cno/src/node polyfill path): with
- * `maxOldGenerationSizeMb: 8`, a worker retained 400_000 objects and exited 0,
- * while node v24.18 reported "Worker terminated due to reaching memory limit:
- * JS heap out of memory" and exited 1. Same class as --memory-limit allowing 4GB.
- *
- * Units: Node's keys (maxOldGenerationSizeMb, stackSizeMb) are MEGABYTES; cts's
- * memoryLimit/maxStackSize are BYTES (cts/src/config.ts TIER_MEM_LIMIT uses
- * 32 * 1024 * 1024, and parseSize returns bytes). Hence mbToBytes.
- *
- * Precedence is `min`, not "fill only when absent": createConfig always resolves
- * memoryLimit from the memory tier (cts/src/config.ts:353), so the parent's
- * published config is never actually unset and a fill-if-absent rule would leave
- * resourceLimits dead exactly as before. Taking the tighter of the two keeps an
- * explicit parent --memory-limit authoritative while letting a per-worker limit
- * bite, and can never WIDEN a cap the parent asked for.
- *
- * Semantics differ from V8's (old-generation heap vs a total allocation cap), the
- * same approximation already documented for --max-old-space-size in
- * src/commands/flags-config.ts. Capping near the requested value beats ignoring it.
- *
- * NOTE: this cannot help an `eval:` worker. src/main.ts:209-210 calls runEval()
- * without runFile()'s `config` argument, so an eval worker inherits no config at
- * all (see the KNOWN GAP test in tests/cts/resource-limits.test.ts). That file is
- * baked and needs a rebuild.
- */
+// Apply per-worker MB limits as byte caps without widening the parent config.
 function runtimeConfigWithResourceLimits(config: unknown, limits: Record<string, number>): unknown {
     const memBytes = mbToBytes(limits.maxOldGenerationSizeMb);
     const stackBytes = mbToBytes(limits.stackSizeMb);
@@ -229,8 +166,7 @@ function errorFromWorkerPayload(payload: WorkerErrorPayload): Error {
 }
 
 function isPipeEof(err: unknown): boolean {
-    if (!(err instanceof Error)) return false;
-    return Reflect.get(err, 'code') === error.errno.EOF;
+    return err instanceof Error && Reflect.get(err, 'code') === error.errno.EOF;
 }
 
 function isMessagePort(value: unknown): value is MessagePort {
@@ -286,13 +222,7 @@ function cloneForMessage<T>(value: T, transferList?: readonly unknown[]): Queued
     return { data, ports };
 }
 
-/**
- * A MessagePort is a thread-local object graph, so it cannot be serialized onto
- * the native pipe that connects two real threads. Detect it before any cloning
- * happens so the caller gets a synchronous DataCloneError instead of an
- * "unsupported object class" rejection from deep inside the pipe encoder, and so
- * nothing in the transfer list has been detached yet.
- */
+// Native thread pipes cannot serialize MessagePort; reject before cloning detaches transfers.
 function assertNoPortsAcrossThreads(value: unknown, transferList?: readonly unknown[]): void {
     for (const item of getTransferList(transferList)) {
         if (isMessagePort(item)) {
@@ -349,9 +279,7 @@ function schedulePortDispatch(port: MessagePort): void {
         port[dispatchQueuedSymbol] = false;
         if (!port[startedSymbol] || port[closedSymbol]) return;
 
-        // The queue is held by reference and close() no longer clears it, so a
-        // drain already in progress when the handler calls close() finishes
-        // delivering what had already arrived (matches Node).
+        // Preserve messages already captured by a drain when its handler closes the port.
         const queue = port[messageQueueSymbol];
         while (queue.length > 0) {
             const item = queue.shift();
@@ -379,10 +307,7 @@ function enqueuePortMessage(port: MessagePort, item: QueuedMessage): void {
     schedulePortDispatch(port);
 }
 
-/**
- * Emit 'close' on the check phase, matching Node's observed scheduling. Falls
- * back to a microtask if setImmediate is unavailable so the event is never lost.
- */
+/** Defer 'close' to the check phase, with a microtask fallback. */
 function deferPortClose(port: MessagePort): void {
     const emitClose = () => port.emit('close', { type: 'close' });
     const immediate: unknown = Reflect.get(globalThis, 'setImmediate');
@@ -428,8 +353,7 @@ export class MessagePort extends EventEmitter {
     [closedSymbol] = false;
     [messageQueueSymbol]: QueuedMessage[] = [];
     [dispatchQueuedSymbol] = false;
-    // Node reports hasRef() === false for a fresh port; it only holds the loop
-    // open once the port has been started.
+    // A port holds the loop only after start().
     [refedSymbol] = false;
     [pipeRefedSymbol] = true;
     __pipe?: CModuleWorker.MessagePipe;
@@ -474,14 +398,9 @@ export class MessagePort extends EventEmitter {
         const otherPort = this[otherPortSymbol];
         this[otherPortSymbol] = null;
         this.unref();
-        // Node defers the 'close' emit to the check phase (OBSERVED: it lands
-        // after setImmediate and before a 0ms timer), which has two visible
-        // consequences a synchronous emit gets wrong: messages already being
-        // drained when the handler calls close() still arrive BEFORE 'close',
-        // and a listener attached on the line after close() still fires.
+        // Keep messages already being drained ahead of the deferred close event.
         deferPortClose(this);
-        // Closing one end closes the entangled end too, and Node fires 'close'
-        // on both ports.
+        // Closing one end closes the entangled end too.
         if (otherPort && !otherPort[closedSymbol]) {
             if (otherPort[otherPortSymbol] === this) otherPort[otherPortSymbol] = null;
             otherPort.close();
@@ -507,7 +426,6 @@ export class MessagePort extends EventEmitter {
     start(): void {
         if (this[startedSymbol]) return;
         this[startedSymbol] = true;
-        // Starting a port makes it hold the loop open, as in Node.
         this[refedSymbol] = true;
         schedulePortDispatch(this);
     }
@@ -586,8 +504,7 @@ export class Worker extends EventEmitter {
     private _outgoingQueue: unknown[] = [];
     private _stdout: PassThrough | null = null;
     private _stderr: PassThrough | null = null;
-    // The native thread has been asked to stop but not yet joined. The join is
-    // deferred until pipe EOF proves the worker runtime is gone; see _reap().
+    // Wait for pipe EOF before synchronously joining the native worker.
     private _joinPending = false;
 
     constructor(filename: string | URL, options?: WorkerOptions) {
@@ -601,10 +518,6 @@ export class Worker extends EventEmitter {
         const entry = options?.eval
             ? `eval:${filename.toString()}`
             : filename.toString();
-        // Same guard postMessage() uses: a MessagePort is a thread-local object
-        // graph, so it cannot cross to a real thread. Without this the port was
-        // silently flattened into a plain object and the worker got something
-        // whose .postMessage was not a function.
         assertNoPortsAcrossThreads(options?.workerData, options?.transferList);
         const workerData = encodeStructuredCloneForPipe(cloneForTransfer(options?.workerData, options?.transferList));
 
@@ -621,6 +534,11 @@ export class Worker extends EventEmitter {
         if (options?.stdout) this._stdout = new PassThrough();
         if (options?.stderr) this._stderr = new PassThrough();
         this._port = wrapMessagePipe(this._native.messagePipe);
+        this._native.messagePipe.onclose = () => {
+            this._joinPending = true;
+            this._reap();
+            if (!this._exited) this._finish(undefined, 0);
+        };
         this._port.on('message', (data: unknown) => {
             if (isWorkerReadyMessage(data, this._readyToken)) {
                 this._ready = true;
@@ -633,9 +551,6 @@ export class Worker extends EventEmitter {
             }
             if (isWorkerExitMessage(data)) {
                 const code = data[NODE_WORKER_EXIT]?.code;
-                // The worker announced its exit, so its EOF is imminent. Mark
-                // the join as pending so that EOF reaps the thread instead of
-                // leaving the handle and its socket until process teardown.
                 this._joinPending = true;
                 this._finish(undefined, typeof code === 'number' ? code : 0);
                 return;
@@ -644,12 +559,9 @@ export class Worker extends EventEmitter {
         });
         this._port.on('messageerror', (err: unknown) => {
             if (isPipeEof(err)) {
-                // EOF means the worker runtime has torn its end of the
-                // socketpair down, i.e. the thread is on its way out. That is
-                // the only safe moment to join it, so reap first and only then
-                // decide whether this is also the worker's exit notification.
+                this._joinPending = true;
                 this._reap();
-                if (!this._exited) this._finish(undefined, 0);
+                if (!this._exited) this._finish(undefined, 1);
                 return;
             }
             if (this._exited) return;
@@ -676,24 +588,14 @@ export class Worker extends EventEmitter {
         }
     }
 
-    /**
-     * Join the native thread. Only safe once pipe EOF has proved the worker
-     * runtime is torn down: the native terminate() is a stop-and-JOIN, and
-     * joining a worker that is wedged (infinite loop, blocking Atomics.wait)
-     * blocks the parent's event loop thread forever — the whole process hangs,
-     * not just the returned promise.
-     */
     private _reap(): void {
         if (!this._joinPending) return;
         this._joinPending = false;
-        try {
-            this._native.terminate();
-        } catch {
-            // Already reaped or never started; nothing left to join.
-        }
-        // The thread is genuinely joined now, so teardown can safely wait for
-        // it and the exit hook must stop forcing an abrupt exit on its behalf.
+        this._native.terminate();
         abandonedWorkers.delete(this);
+        this._native.messagePipe.onmessage = undefined;
+        this._native.messagePipe.onmessageerror = undefined;
+        this._native.messagePipe.onclose = undefined;
         this._port.close();
     }
 
@@ -704,8 +606,7 @@ export class Worker extends EventEmitter {
         workerRegistry.delete(this.threadId);
         this._outgoingQueue = [];
         if (this._joinPending) {
-            // Keep the pipe readable (but not holding the loop open) so the
-            // pending EOF can still arrive and drive _reap().
+            // EOF drives the pending native join without keeping the loop alive.
             this._port.unref();
         } else {
             this._port.close();
@@ -715,10 +616,6 @@ export class Worker extends EventEmitter {
         this.emit('exit', code);
     }
 
-    /**
-     * Without this, a consumer waiting for 'end' on worker.stdout/stderr hangs
-     * forever once the worker is gone.
-     */
     private _closeStdio(): void {
         this._stdout?.end();
         this._stderr?.end();
@@ -729,35 +626,22 @@ export class Worker extends EventEmitter {
     }
 
     terminate(): Promise<number> {
-        // Node resolves with the exit code the worker actually reports, and a
-        // worker killed by terminate() exits with 1.
+        // Node reports a terminated worker with exit code 1.
         if (this._exited) return Promise.resolve(this._exitCode);
         this._exited = true;
         this._exitCode = 1;
         workerRegistry.delete(this.threadId);
         this._outgoingQueue = [];
 
-        // stop(), NOT the native terminate(): the latter is a stop-and-join and
-        // uv_thread_join runs on the parent's event loop thread. A worker that
-        // cannot reach the stop async — spinning in JS, parked in
-        // Atomics.wait, blocked in a syscall — never exits, so the join never
-        // returns and the entire parent process wedges (measured: no heartbeat,
-        // terminate() never even returns to JS, SIGKILL required). Node kills
-        // such a worker in ~15ms. Requesting the stop asynchronously keeps the
-        // parent responsive; the thread is joined later by _reap() once pipe EOF
-        // proves it is gone.
+        // Native terminate() joins synchronously; request a stop and join after
+        // EOF so an unresponsive worker cannot block the parent event loop.
         this._joinPending = true;
         this._native.stop();
-        // The thread may be wedged and thus unjoinable. Native teardown would
-        // still try to join it, so record it as something the process must not
-        // wait for; _reap() clears this once EOF proves the join is safe.
         markAbandoned(this);
-        // Keep the pipe readable but off the loop's ref count so the pending EOF
-        // can still drive _reap() without holding the process open.
+        // EOF can still drive _reap() without keeping the process open.
         this._port.unref();
         this._closeStdio();
-        // Defer, as the previous promise-chained implementation did, so a
-        // listener attached on the line after terminate() still sees 'exit'.
+        // Let immediately attached listeners observe 'exit'.
         return new Promise((resolve) => {
             queueMicrotask(() => {
                 this.emit('exit', 1);
@@ -769,17 +653,13 @@ export class Worker extends EventEmitter {
     ref(): void {
         this._refed = true;
         this._port.ref();
-        // Only a pending join can still make this worker unwaitable.
         if (!this._joinPending) abandonedWorkers.delete(this);
     }
 
     unref(): void {
         this._refed = false;
         this._port.unref();
-        // Node: an unref'd worker does not keep the process alive. cno's loop
-        // honours that (the loop drains), but native teardown still joins the
-        // thread, so an unref'd worker that never finishes hangs the process
-        // after all JS is done (OBSERVED rc=124 vs Node rc=0 in 413ms).
+        // Native teardown would otherwise join an unref'd worker after the loop drains.
         if (!this._exited) markAbandoned(this);
     }
 
@@ -817,35 +697,15 @@ function createParentPort(): MessagePort | null {
     if (typeof readyToken === 'string') {
         pipe.postMessage({ [NODE_WORKER_READY]: readyToken });
     }
-    // Nothing else reports the worker's exit status: the native layer's
-    // terminate()/close() carry no exit code, so the parent would otherwise see
-    // pipe EOF and report 0 for every worker. Report it from the thread itself.
-    //
-    // SCOPE, RE-MEASURED 2026-08-09 (this comment previously claimed the listener
-    // "never actually fires" -- that was measured on 2026-08-02 and is now only
-    // half true, so it is corrected here rather than left to mislead):
-    //   - explicit process.exit(N): the listener DOES fire and the parent reports
-    //     N. Verified for 42, 1 and 7 against node v24.18.0. The native exit
-    //     dispatches EV_EXIT and node/process/mod.ts's ensureEventBridge() turns
-    //     that into this 'exit' event.
-    //   - natural drain after `process.exitCode = N`: still dead. The parent
-    //     reports 0 where node reports N, because tjs__lifecycle_drain()
-    //     (circu.js/src/vm.c:948-955) returns early for qrt->is_worker, so a
-    //     worker receives no EV_EXIT on a natural drain at all. That one needs a
-    //     C fix and a rebuild.
-    //
-    // This listener only exists once the WORKER has imported node:worker_threads,
-    // which is why node/process/mod.ts installs an equivalent reporter of its own
-    // (installWorkerExitReporter) -- a worker whose whole body is
-    // `process.exit(42)` reported 0 before that was added. Both firing is
-    // harmless: _finish() ignores every record after the first.
+    // Native pipe EOF carries no exit status. process/mod.ts installs the same
+    // reporter for workers that do not import this module.
     const host = processExitHost();
     if (host) {
         host.on('exit', (code?: unknown) => {
             try {
                 pipe.postMessage({ [NODE_WORKER_EXIT]: { code: typeof code === 'number' ? code : 0 } });
             } catch {
-                // The pipe may already be torn down; the parent falls back to EOF.
+                // EOF is the fallback when the pipe is already closed.
             }
         });
     }

@@ -1,6 +1,3 @@
-// 04_stdio.ts — Deno.stdin/stdout/stderr facade over the shared stdio
-// singletons. The Stream class and singletons now live in utils/stdio.ts.
-
 import { stdin, stdout, stderr } from "../utils/stdio";
 
 const os = import.meta.use('os');
@@ -115,17 +112,6 @@ const denoStdioNs: DenoStdioNamespace = {
 
     consoleSize(){
         // Output handles first, and skip a stream whose size query fails.
-        //
-        // GetConsoleScreenBufferInfo() fails with ERROR_INVALID_HANDLE
-        // (-> UV_EBADF) on a console *input* handle, so stdin can be a genuine
-        // TTY yet have no queryable size. libuv's uv_tty_init() does not catch
-        // this: GetNumberOfConsoleInputEvents() succeeds on fd 0, so it takes
-        // the "readable" branch and skips its own GetConsoleScreenBufferInfo
-        // validation -- the handle is accepted at construction and only fails
-        // here. Outside a PTY stdin is usually a pipe, so `isTTY` was false and
-        // the old stdin-first order happened to work; inside a ConPTY all three
-        // fds are ConDrv TTYs and stdin was picked, throwing EBADF even though
-        // stdout answers 120x40.
         let lastError: unknown;
         for (const stream of [stdout, stderr, stdin]) {
             if (!stream.isTTY) continue;

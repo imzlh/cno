@@ -160,19 +160,3 @@ export function wrapPromise<T>(
         throw toErrnoException(e, syscall, path, dest);
     });
 }
-
-/**
- * Convert function call that may synchronously throw C module errno error to throw ErrnoException
- */
-export function wrapSync<T>(
-    fn: () => T,
-    syscall?: string,
-    path?: string,
-    dest?: string,
-): T {
-    try {
-        return fn();
-    } catch (e) {
-        throw toErrnoException(e, syscall, path, dest);
-    }
-}

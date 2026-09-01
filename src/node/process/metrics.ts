@@ -58,12 +58,11 @@ export function cpuUsage(previousValue?: NodeJS.CpuUsage): NodeJS.CpuUsage {
     if (cpus.length === 0) return { user: 0, system: 0 };
 
     // Aggregate across all cores
-    let totalUser = 0, totalNice = 0, totalSys = 0, totalIdle = 0;
+    let totalUser = 0, totalNice = 0, totalSys = 0;
     for (const cpu of cpus) {
         totalUser += cpu.times.user;
         totalNice += cpu.times.nice;
         totalSys += cpu.times.sys;
-        totalIdle += cpu.times.idle;
     }
 
     const current = {

@@ -64,10 +64,15 @@ function runCallbackWithoutLock<T>(cb: (lock: null) => T | PromiseLike<T>): Prom
     }
 }
 
+function deleteEmptyQueue(name: string, queue?: LockRequest[]): void {
+    if (!queue || queue.length === 0) queues.delete(name);
+}
+
 function processQueue(name: string) {
     const queue = queues.get(name);
     if (!queue?.length) {
         held.delete(name);
+        deleteEmptyQueue(name, queue);
         return;
     }
 
@@ -79,6 +84,7 @@ function processQueue(name: string) {
     }
     if (!queue.length) {
         held.delete(name);
+        deleteEmptyQueue(name, queue);
         return;
     }
 
@@ -242,6 +248,7 @@ export class LockManager {
                     if (queue) {
                         const idx = queue.indexOf(req);
                         if (idx !== -1) queue.splice(idx, 1);
+                        deleteEmptyQueue(name, queue);
                     }
                     settle('reject', signal.reason ?? new DOMException('Lock request aborted', 'AbortError'));
                 };

@@ -33,20 +33,20 @@ interface ImportInspectOptions {
     numericSeparator?: boolean;
 }
 
-/** Mirrors node's determineSpecificType() for argument-error messages. */
-function specificType(value: unknown): string {
-    if (value === null) return 'null';
-    if (value === undefined) return 'undefined';
-    if (Array.isArray(value)) return 'an instance of Array';
-    if (typeof value === 'function') return `function ${(value as { name?: string }).name ?? ''}`;
-    return `type ${typeof value} (${utilInspect(value)})`;
-}
-
 /** Node says "property" for a dotted path and "argument" otherwise. */
 function invalidArgType(name: string, expected: string, value: unknown): never {
     const kind = name.includes('.') ? 'property' : 'argument';
+    const received = value === null
+        ? 'null'
+        : value === undefined
+        ? 'undefined'
+        : Array.isArray(value)
+        ? 'an instance of Array'
+        : typeof value === 'function'
+        ? `function ${(value as { name?: string }).name ?? ''}`
+        : `type ${typeof value} (${utilInspect(value)})`;
     const err = new TypeError(
-        `The "${name}" ${kind} must be of type ${expected}. Received ${specificType(value)}`,
+        `The "${name}" ${kind} must be of type ${expected}. Received ${received}`,
     ) as TypeError & { code?: string };
     err.code = 'ERR_INVALID_ARG_TYPE';
     throw err;
@@ -97,12 +97,6 @@ function buildOutput(args: unknown[], inspectOptions?: ImportInspectOptions): st
     if (inspectOptions && Object.keys(inspectOptions).length > 0) {
         return utilFormatWithOptions(inspectOptions as never, ...args);
     }
-    return utilFormat(...args);
-}
-
-// The native console.format collapses `%%` even for a lone string argument,
-// where Node returns a single string argument unchanged. Delegate to util.
-function formatOutput(...args: unknown[]): string {
     return utilFormat(...args);
 }
 
@@ -328,7 +322,7 @@ class ConsoleImpl {
     }
 
     format(...args: unknown[]): string {
-        return formatOutput(...args);
+        return utilFormat(...args);
     }
 
     info(...args: unknown[]): void {
@@ -718,7 +712,7 @@ function forward(name: ConsoleMethod) {
 }
 
 export function format(...args: unknown[]): string {
-    return formatOutput(...args);
+    return utilFormat(...args);
 }
 
 export const log = forward('log');

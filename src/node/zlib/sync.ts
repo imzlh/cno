@@ -19,7 +19,6 @@ import {
     trailingIsPadding,
     truncatedError,
     validateOptions,
-    validateZlibInput,
     type BrotliOptions,
     type ZlibInput,
     type ZlibOptions,
@@ -235,9 +234,8 @@ export function wrapCallback(syncFn: SyncFn, validator: (options?: ZlibOptions |
         if (typeof cb !== 'function') {
             throw new TypeError('The "callback" argument must be of type function');
         }
-        validateZlibInput(buffer);
-        validator(opts);
         const input = new Uint8Array(toUint8Array(buffer));
+        validator(opts);
         queueMicrotask(() => {
             try { cb(null, syncFn(input, opts)); }
             catch (err) { cb(asError(err)); }

@@ -1,6 +1,6 @@
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
-export interface IncomingRequestStreamTarget {
+interface IncomingRequestStreamTarget {
     complete: boolean;
     aborted: boolean;
     errored?: unknown;
@@ -10,15 +10,32 @@ export interface IncomingRequestStreamTarget {
     listenerCount?(event: string): number;
 }
 
-type BodyReader = (() => Promise<Uint8Array | null>) | null | undefined;
-
-export function pushIncomingRequestChunk(target: IncomingRequestStreamTarget, chunk: Uint8Array): void {
-    target.push(chunk);
+export interface IncomingMessageTarget extends IncomingRequestStreamTarget {
+    httpVersion: string;
+    httpVersionMajor: number;
+    httpVersionMinor: number;
+    headers: Record<string, string | string[] | undefined>;
+    headersDistinct: Record<string, string[] | undefined>;
+    rawHeaders: string[];
+    trailers: Record<string, string | undefined>;
+    trailersDistinct: Record<string, string[] | undefined>;
+    rawTrailers: string[];
+    statusCode?: number;
+    statusMessage?: string;
 }
 
-export function completeIncomingRequest(target: IncomingRequestStreamTarget): void {
-    target.complete = true;
-    target.push(null);
+export interface IncomingRequestTarget extends IncomingMessageTarget {
+    method?: string;
+    url?: string;
+}
+
+type BodyReader = (() => Promise<Uint8Array | null>) | null | undefined;
+
+export function appendIncomingHeader(target: IncomingRequestTarget, key: string, value: string): void {
+    const lowerKey = key.toLowerCase();
+    target.headers[lowerKey] = value;
+    target.rawHeaders.push(key, value);
+    (target.headersDistinct[lowerKey] ??= []).push(value);
 }
 
 /**
@@ -30,8 +47,8 @@ export function completeIncomingRequest(target: IncomingRequestStreamTarget): vo
  * body never saw its 0-chunk (h1.ts bodyIncomplete). So a rejection here is a
  * fault, never a normal end-of-stream.
  *
- * This must therefore NOT call completeIncomingRequest(): doing so set
- * `complete = true` and pushed null, which fired 'end' and made a truncated upload
+ * This must therefore NOT mark the request complete or push null: doing so fired
+ * 'end' and made a truncated upload
  * observationally identical to a whole one. A handler that commits on 'end' then
  * stored a partial payload with no error anywhere. Measured against Node v24.18.0:
  * a peer sending 400 of a declared 1000 bytes yields no 'end', `complete === false`,
@@ -43,7 +60,7 @@ export function completeIncomingRequest(target: IncomingRequestStreamTarget): vo
  * unconditionally, so a handler that never attached one would take an unhandled
  * 'error' for a peer disconnect it cannot control.
  */
-export function failIncomingRequest(target: IncomingRequestStreamTarget, err: unknown): void {
+function failIncomingRequest(target: IncomingRequestStreamTarget, err: unknown): void {
     target.aborted = true;
     const error = err instanceof Error ? err : new Error(String(err));
     // Node sets `errored` whether or not anyone listens, so a handler can check it
@@ -63,7 +80,8 @@ export function failIncomingRequest(target: IncomingRequestStreamTarget, err: un
 
 export function pumpIncomingRequestBody(target: IncomingRequestStreamTarget, body: BodyReader): void {
     if (typeof body !== 'function') {
-        completeIncomingRequest(target);
+        target.complete = true;
+        target.push(null);
         return;
     }
 
@@ -72,9 +90,10 @@ export function pumpIncomingRequestBody(target: IncomingRequestStreamTarget, bod
             while (true) {
                 const chunk = await body();
                 if (chunk === null) break;
-                pushIncomingRequestChunk(target, chunk);
+                target.push(chunk);
             }
-            completeIncomingRequest(target);
+            target.complete = true;
+            target.push(null);
         } catch (err) {
             failIncomingRequest(target, err);
         }

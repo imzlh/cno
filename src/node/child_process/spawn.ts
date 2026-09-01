@@ -174,7 +174,9 @@ export function spawn(command: string, argsOrOptions?: string[] | SpawnOptions, 
 
     if (opts.signal) {
         const signal = opts.signal;
+        let closed = false;
         const onAbort = () => {
+            if (closed) return;
             child.kill(opts.killSignal ?? 'SIGTERM');
             // Node always builds its own AbortError and ignores signal.reason.
             child.emit('error', Object.assign(new Error('The operation was aborted'), {
@@ -182,6 +184,10 @@ export function spawn(command: string, argsOrOptions?: string[] | SpawnOptions, 
                 code: 'ABORT_ERR',
             }));
         };
+        child.once('close', () => {
+            closed = true;
+            signal.removeEventListener('abort', onAbort);
+        });
         // An already-aborted signal must kill immediately — 'abort' never fires again.
         if (signal.aborted) queueMicrotask(onAbort);
         else signal.addEventListener('abort', onAbort, { once: true });

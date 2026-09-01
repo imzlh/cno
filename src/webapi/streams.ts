@@ -1563,7 +1563,7 @@ export class DecompressionStream implements globalThis.DecompressionStream {
             write: (chunk) => {
                 if (!this.handle) throw new TypeError('DecompressionStream is closed');
                 if (chunk.byteLength > 0) this.wroteInput = true;
-                let output: Uint8Array;
+                let output: ArrayBuffer;
                 try {
                     output = this.handle.inflate(chunk);
                 } catch (error) {
@@ -1589,7 +1589,7 @@ export class DecompressionStream implements globalThis.DecompressionStream {
                     // `inflate()` returns partial output for input that stops mid-member
                     // without reporting anything, so ask the handle to finish: only
                     // success or "already finished" means the stream really ended.
-                    let tail: Uint8Array | undefined;
+                    let tail: ArrayBuffer | undefined;
                     try {
                         tail = this.handle.finish();
                     } catch (error) {

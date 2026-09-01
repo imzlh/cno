@@ -2,7 +2,7 @@
  * Node.js fs module - callback-style API
  * All async operations support callback functions
  */
-import { toUint8Array, normalizeRwArgs, decodeBuffer, encodePathResult, toNodeStat, toNodeStatFs, toNodeDirentAsync, parseFlags, pathToString, splitPathOrFd, describeFd, removeRecursive, retryOnBusy, mkdirRecursive, modeToNumber, timeToUnixSeconds, timeToUnixMs, readFileFromFdSync, randomHex, createAsyncDir, createEagerAsyncDir, readDirEntries, validateOpendirOptions, validateReaddirOptions, validateFd, errorFromUnknown, assertCopyFileMode, makeAbortError, rmIsDirectoryError, writeAllHandle, writeAllSync, type PathLike, type TimeLike, type Mode } from './utils';
+import { toUint8Array, normalizeRwArgs, decodeBuffer, encodePathResult, toNodeStat, toNodeStatFs, toNodeDirentAsync, parseFlags, pathToString, splitPathOrFd, describeFd, removeRecursive, retryOnBusy, mkdirRecursive, modeToNumber, timeToUnixSeconds, timeToUnixMs, readFileFromFdSync, randomHex, createAsyncDir, createEagerAsyncDir, readDirEntries, validateOpendirOptions, validateReaddirOptions, validateFd, errorFromUnknown, assertCopyFileMode, makeAbortError, rmIsDirectoryError, writeAllHandle, writeAllSync, type PathLike, type TimeLike, type Mode, type Stats, type StatsFs, type Dirent, type Dir } from './utils';
 // `toAsyncFsErrnoException` is `toErrnoException` plus the JS-name -> libuv-name
 // correction for `err.syscall` (readdir -> scandir, utimes -> utime). Aliased so
 // every existing call site gets it; see fs/syscall-names.ts for why it is needed.
@@ -18,10 +18,10 @@ const fs = nsfs;
 const asfs = nsasfs;
 const os = import.meta.use('os');
 /** Matches fs/constants.ts; see fchown for why this file needs it. */
-const isWindows = os.uname().sysname === 'Windows_NT';
+const isWindows = os.platform == 'win32';
 
 type NoParamCallback = (err: NodeJS.ErrnoException | null) => void;
-type OpendirCallback = (err: NodeJS.ErrnoException | null, dir?: import('fs').Dir) => void;
+type OpendirCallback = (err: NodeJS.ErrnoException | null, dir?: Dir) => void;
 type FsOptionBag = {
     encoding?: BufferEncoding | 'buffer' | null;
     flag?: string | number;
@@ -70,7 +70,7 @@ export function readFile(path: PathLike | number, options?: unknown, callback?: 
 
     const target = splitPathOrFd(path);
     const option = optionBag(options);
-    const encoding = typeof options === 'string' ? options : option.encoding;
+    const encoding = typeof options === 'string' ? options as BufferEncoding : option.encoding;
     const flag = option.flag;
     const signal = option.signal;
     assertCallback(callback);
@@ -164,7 +164,7 @@ export function writeFile(path: PathLike | number, data: string | Uint8Array | A
     const option = optionBag(options);
     const mode = modeToNumber(option.mode);
     const flag = option.flag !== undefined ? parseFlags(option.flag) : 'w';
-    const encoding = typeof options === 'string' ? options : option.encoding;
+    const encoding = typeof options === 'string' ? options as BufferEncoding : option.encoding;
     const buffer = toUint8Array(data, encoding);
     assertCallback(callback);
     if ('fd' in target) {
@@ -212,7 +212,7 @@ export function appendFile(path: PathLike | number, data: string | Uint8Array | 
     const option = optionBag(options);
     const mode = modeToNumber(option.mode);
     const flag = option.flag !== undefined ? parseFlags(option.flag) : 'a';
-    const encoding = typeof options === 'string' ? options : option.encoding;
+    const encoding = typeof options === 'string' ? options as BufferEncoding : option.encoding;
     const buffer = toUint8Array(data, encoding);
     assertCallback(callback);
     if ('fd' in target) {
@@ -260,11 +260,11 @@ Object.defineProperty(exists, Symbol.for('nodejs.util.promisify.custom'), {
     configurable: true,
 });
 
-export function stat(path: PathLike, callback: (err: NodeJS.ErrnoException | null, stats: import('fs').Stats) => void): void;
+export function stat(path: PathLike, callback: (err: NodeJS.ErrnoException | null, stats: Stats) => void): void;
 export function stat(
     path: PathLike,
     options: { bigint?: boolean; throwIfNoEntry?: boolean },
-    callback: (err: NodeJS.ErrnoException | null, stats: import('fs').Stats) => void
+    callback: (err: NodeJS.ErrnoException | null, stats: Stats) => void
 ): void;
 export function stat(path: PathLike, options?: unknown, callback?: unknown): void {
     if (typeof options === 'function') {
@@ -281,11 +281,11 @@ export function stat(path: PathLike, options?: unknown, callback?: unknown): voi
     );
 }
 
-export function lstat(path: PathLike, callback: (err: NodeJS.ErrnoException | null, stats: import('fs').Stats) => void): void;
+export function lstat(path: PathLike, callback: (err: NodeJS.ErrnoException | null, stats: Stats) => void): void;
 export function lstat(
     path: PathLike,
     options: { bigint?: boolean; throwIfNoEntry?: boolean },
-    callback: (err: NodeJS.ErrnoException | null, stats: import('fs').Stats) => void
+    callback: (err: NodeJS.ErrnoException | null, stats: Stats) => void
 ): void;
 export function lstat(path: PathLike, options?: unknown, callback?: unknown): void {
     if (typeof options === 'function') {
@@ -302,11 +302,11 @@ export function lstat(path: PathLike, options?: unknown, callback?: unknown): vo
     );
 }
 
-export function fstat(fd: number, callback: (err: NodeJS.ErrnoException | null, stats: import('fs').Stats) => void): void;
+export function fstat(fd: number, callback: (err: NodeJS.ErrnoException | null, stats: Stats) => void): void;
 export function fstat(
     fd: number,
     options: { bigint?: boolean },
-    callback: (err: NodeJS.ErrnoException | null, stats: import('fs').Stats) => void
+    callback: (err: NodeJS.ErrnoException | null, stats: Stats) => void
 ): void;
 export function fstat(fd: number, options?: unknown, callback?: unknown): void {
     if (typeof options === 'function') {
@@ -598,14 +598,16 @@ export function ftruncate(fd: number, len?: unknown, callback?: unknown): void {
         len = 0;
     }
     const size = numberOr(len, 0);
-    runFsCallback(callback, () => {
+    assertCallback(callback);
+    const cb = callback;
+    runFsCallback(cb, () => {
         try {
             fs.ftruncate(fd, size);
         } catch (err) {
-            callback(toSyncErrnoException(err, 'ftruncate', describeFd(fd)));
+            cb(toSyncErrnoException(err, 'ftruncate', describeFd(fd)));
             return;
         }
-        callback(null);
+        cb(null);
     });
 }
 
@@ -950,11 +952,13 @@ export function readv(fd: number, buffers: readonly ArrayBufferView[], position?
         position = null;
     }
     const readPosition = position === null || position === undefined ? null : numberOr(position, 0);
-    runFsCallback(callback, () => {
+    assertCallback(callback);
+    const cb = callback;
+    runFsCallback(cb, () => {
         try {
-            callback(null, readvSync(fd, buffers, readPosition), buffers);
+            cb(null, readvSync(fd, buffers, readPosition), buffers);
         } catch (err) {
-            callback(toSyncErrnoException(err, 'readv', describeFd(fd)), 0, buffers);
+            cb(toSyncErrnoException(err, 'readv', describeFd(fd)), 0, buffers);
         }
     });
 }
@@ -1030,11 +1034,13 @@ export function writev(fd: number, buffers: readonly ArrayBufferView[], position
         position = null;
     }
     const writePosition = position === null || position === undefined ? null : numberOr(position, 0);
-    runFsCallback(callback, () => {
+    assertCallback(callback);
+    const cb = callback;
+    runFsCallback(cb, () => {
         try {
-            callback(null, writevSync(fd, buffers, writePosition), buffers);
+            cb(null, writevSync(fd, buffers, writePosition), buffers);
         } catch (err) {
-            callback(toSyncErrnoException(err, 'writev', describeFd(fd)), 0, buffers);
+            cb(toSyncErrnoException(err, 'writev', describeFd(fd)), 0, buffers);
         }
     });
 }
@@ -1065,11 +1071,11 @@ export function fdatasync(fd: number, callback: NoParamCallback): void {
 
 // statfs - callback style
 
-export function statfs(path: PathLike, callback: (err: NodeJS.ErrnoException | null, stats: import('fs').StatsFs) => void): void;
+export function statfs(path: PathLike, callback: (err: NodeJS.ErrnoException | null, stats: StatsFs) => void): void;
 export function statfs(
     path: PathLike,
     options: { bigint?: boolean },
-    callback: (err: NodeJS.ErrnoException | null, stats: import('fs').StatsFs) => void
+    callback: (err: NodeJS.ErrnoException | null, stats: StatsFs) => void
 ): void;
 export function statfs(path: PathLike, options?: unknown, callback?: unknown): void {
     if (typeof options === 'function') {

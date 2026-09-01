@@ -146,7 +146,10 @@ export class Http2ServerRequest extends Readable {
     get connection(): unknown { return this.socket; }
 
     setTimeout(msecs: number, callback?: () => void): this {
-        if (!this._s.closed) this._s.stream.setTimeout?.(msecs, callback);
+        if (!this._s.closed) {
+            const setTimeout = Reflect.get(this._s.stream, 'setTimeout');
+            if (typeof setTimeout === 'function') setTimeout.call(this._s.stream, msecs, callback);
+        }
         return this;
     }
 

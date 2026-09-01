@@ -3,7 +3,7 @@
  * Connected to cts via cts.internal bridge (no direct cts imports)
  */
 
-import { fileURLToPath } from '../url';
+import { fileURLToPath, pathToFileURL } from '../url';
 import path from '../path';
 const { basename, dirname, isAbsolute: isAbsolutePath, join, resolve: resolvePath } = path;
 const os = import.meta.use('os');
@@ -14,7 +14,40 @@ type CtsInternal = {
     mkRequire: (parentPath: string, parentMod: unknown) => NodeJS.Require;
     preloadModule?: (id: string, parentPath: string) => unknown;
     builtinModules: string[];
-    cache: Map<string, unknown>;
+    cache: {
+        get(key: string): unknown;
+        has(key: string): boolean;
+        set(key: string, value: unknown): unknown;
+        delete(key: string): boolean;
+        keys(): IterableIterator<string>;
+    };
+    registerModuleHooks?: (hooks: { load?: LoadHook; resolve?: ResolveHook }) => { deregister(): void };
+    hasModuleResolveHooks?: () => boolean;
+    hasModuleLoadHooks?: () => boolean;
+    runModuleResolveHooks?: (
+        specifier: string,
+        context: ResolveContext,
+        terminal: (specifier: string, context: ResolveContext) => ResolveResult,
+    ) => ResolveResult;
+    runModuleLoadHooks?: (
+        url: string,
+        context: LoadContext,
+        terminal: (url: string, context: LoadContext) => LoadResult,
+    ) => LoadResult;
+    /** Identity bridge for the CJS loader's in-body require(). */
+    nodeModuleInterop?: {
+        getCache?: () => Record<string, unknown>;
+        getExtensions?: () => RequireExtensionMap;
+        setCache?: (value: Record<string, unknown>) => void;
+        setExtensions?: (value: RequireExtensionMap) => void;
+        replaceCache?: (value: Record<string, unknown>) => void;
+        resetCache?: (value?: Record<string, unknown>) => void;
+        replaceExtensions?: (value: RequireExtensionMap) => void;
+        resetExtensions?: () => void;
+        cacheIsDefault?: () => boolean;
+        extensionsAreDefault?: () => boolean;
+        defaultExtensions?: Record<string, unknown>;
+    };
 } & {
     specToLocalPath?: (specPath: string) => string | null;
 };
@@ -183,15 +216,18 @@ export function _nodeModulePaths(from: string): string[] {
     return out;
 }
 
-// `Module._cache = {}` / `Module._extensions = {}` are documented reset idioms;
-// keep the live refs in module scope so `_load` and `require.*` follow a swap.
-// Lazy: `_cache` is declared further down, so do not read it during module eval.
-let cacheRef: Record<string, unknown> | undefined;
 let extensionsRef: RequireExtensionMap | undefined;
-const _cacheRef = (): Record<string, unknown> => cacheRef ?? _cache;
 const _extensionsRef = (): RequireExtensionMap => extensionsRef ?? _extensionsStore;
-const setCacheRef = (value: Record<string, unknown>): void => { cacheRef = value; };
-const setExtensionsRef = (value: RequireExtensionMap): void => { extensionsRef = value; };
+const setExtensionsRef = (value: RequireExtensionMap): void => {
+    if (value === null || (typeof value !== 'object' && typeof value !== 'function')) {
+        throw new TypeError('Module._extensions must be an object');
+    }
+    const next = value === _extensions ? undefined : value;
+    const interop = getCtsInternal()?.nodeModuleInterop;
+    if (next === undefined) interop?.resetExtensions?.();
+    else interop?.replaceExtensions?.(next);
+    extensionsRef = next;
+};
 
 /** True only while the extension table is still exactly our three defaults. */
 function extensionsArePristine(): boolean {
@@ -218,7 +254,7 @@ let pristinePrototypeCompile: unknown;
  * older ts-node patches the latter, and neither shows up in the extension table.
  */
 function needsJsLoadPath(): boolean {
-    if (resolveHooks.length > 0 || loadHooks.length > 0) return true;
+    if (hasRegisteredResolveHooks() || hasRegisteredLoadHooks()) return true;
     if (!extensionsArePristine()) return true;
     if (pristineResolveFilename !== undefined && Module._resolveFilename !== pristineResolveFilename) return true;
     if (pristinePrototypeCompile !== undefined && Module.prototype._compile !== pristinePrototypeCompile) return true;
@@ -232,12 +268,18 @@ export function _resolveFilename(request: string, parent?: { filename?: string }
     if (!ctsInternal) return request;
     const parentPath = parent?.filename ?? '';
 
-    const terminal = (spec: string): ResolveResult => ({
-        url: toFileUrl(ctsInternal.mkRequire(parentPath, undefined).resolve(spec, options)),
-        shortCircuit: true,
-    });
-    if (resolveHooks.length === 0) return fromFileUrl(terminal(request).url);
-    const result = runResolveChain(request, { parentURL: toFileUrl(parentPath) }, terminal);
+    const context: ResolveContext = { parentURL: toFileUrl(parentPath) };
+    const terminal = (spec: string, nextContext: ResolveContext): ResolveResult => {
+        const nextParent = fromFileUrl(nextContext.parentURL ?? context.parentURL!);
+        return {
+            url: toFileUrl(ctsInternal.mkRequire(nextParent, undefined).resolve(spec, options)),
+            shortCircuit: true,
+        };
+    };
+    if (!hasRegisteredResolveHooks()) return fromFileUrl(terminal(request, context).url);
+    const result = ctsInternal.runModuleResolveHooks
+        ? ctsInternal.runModuleResolveHooks(request, context, terminal)
+        : runResolveChain(request, context, terminal);
     return fromFileUrl(result.url);
 }
 
@@ -287,19 +329,58 @@ export const builtinModules: string[] = new Proxy(builtinModulesTarget, {
 // paths, so translate both directions or Windows lookups always miss.
 const isWindowsHost = path.sep === '\\';
 const toCacheKey = (key: string): string => isWindowsHost ? key.replace(/\\/g, '/') : key;
-const toHostKey = (key: string): string => isWindowsHost ? key.replace(/\//g, '\\') : key;
-
+const toHostCacheKey = (key: string): string => isWindowsHost ? key.replace(/\//g, '\\') : key;
 const moduleCacheTarget: Record<string, unknown> = {};
+let defaultCacheDetached = false;
+
+function detachDefaultCache(): void {
+    if (defaultCacheDetached) return;
+    for (const key of Reflect.ownKeys(moduleCacheTarget)) {
+        Reflect.deleteProperty(moduleCacheTarget, key);
+    }
+    const cache = getCtsInternal()?.cache;
+    if (cache) {
+        for (const key of cache.keys()) {
+            Reflect.set(moduleCacheTarget, toHostCacheKey(key), cache.get(key));
+        }
+    }
+    defaultCacheDetached = true;
+}
+
 export const _cache: Record<string, unknown> = new Proxy(moduleCacheTarget, {
-    has: (_t, key) => typeof key === 'string' && (getCtsInternal()?.cache.has(toCacheKey(key)) ?? false),
-    get: (_t, key) => typeof key === 'string' ? getCtsInternal()?.cache.get(toCacheKey(key)) : undefined,
-    set: (_t, key, value) => { if (typeof key === 'string') getCtsInternal()?.cache.set(toCacheKey(key), value); return true; },
-    deleteProperty: (_t, key) => { if (typeof key === 'string') getCtsInternal()?.cache.delete(toCacheKey(key)); return true; },
-    ownKeys: () => {
-        const ctsInternal = getCtsInternal();
-        return ctsInternal ? [...ctsInternal.cache.keys()].map(toHostKey) : [];
+    has: (target, key) => {
+        if (typeof key !== 'string') return Reflect.has(target, key);
+        return defaultCacheDetached
+            ? Reflect.has(target, key)
+            : (getCtsInternal()?.cache.has(toCacheKey(key)) ?? false);
     },
-    getOwnPropertyDescriptor: (_t, key) => {
+    get: (target, key, receiver) => {
+        if (typeof key !== 'string') return Reflect.get(target, key, receiver);
+        return defaultCacheDetached
+            ? Reflect.get(target, key, receiver)
+            : getCtsInternal()?.cache.get(toCacheKey(key));
+    },
+    set: (target, key, value) => {
+        if (typeof key !== 'string') return Reflect.set(target, key, value);
+        if (defaultCacheDetached) return Reflect.set(target, key, value);
+        getCtsInternal()?.cache.set(toCacheKey(key), value);
+        return true;
+    },
+    deleteProperty: (target, key) => {
+        if (typeof key !== 'string') return Reflect.deleteProperty(target, key);
+        if (defaultCacheDetached) return Reflect.deleteProperty(target, key);
+        getCtsInternal()?.cache.delete(toCacheKey(key));
+        return true;
+    },
+    ownKeys: (target) => {
+        if (defaultCacheDetached) return Reflect.ownKeys(target);
+        const ctsInternal = getCtsInternal();
+        return ctsInternal
+            ? [...ctsInternal.cache.keys()].map(toHostCacheKey)
+            : [];
+    },
+    getOwnPropertyDescriptor: (target, key) => {
+        if (defaultCacheDetached) return Reflect.getOwnPropertyDescriptor(target, key);
         const ctsInternal = getCtsInternal();
         if (typeof key !== 'string') return undefined;
         const cacheKey = toCacheKey(key);
@@ -314,6 +395,28 @@ export const _cache: Record<string, unknown> = new Proxy(moduleCacheTarget, {
  * `_extensionsStore` is that object and `_load` dispatches through it.
  */
 export const _extensions: RequireExtensionMap = _extensionsStore;
+
+// A saved default cache object must become independent after replacement.  If
+// it is assigned back, use its current entries as the loader's default store.
+let cacheRef: Record<string, unknown> | undefined;
+const _cacheRef = (): Record<string, unknown> => cacheRef ?? _cache;
+const setCacheRef = (value: Record<string, unknown>): void => {
+    if (value === null || (typeof value !== 'object' && typeof value !== 'function')) {
+        throw new TypeError('Module._cache must be an object');
+    }
+    const next = value === _cache ? undefined : value;
+    const interop = getCtsInternal()?.nodeModuleInterop;
+    if (next === undefined) {
+        if (defaultCacheDetached) interop?.resetCache?.(moduleCacheTarget);
+        else interop?.resetCache?.();
+        cacheRef = undefined;
+        defaultCacheDetached = false;
+        return;
+    }
+    detachDefaultCache();
+    interop?.replaceCache?.(next);
+    cacheRef = next;
+};
 
 function readSource(filename: string): string {
     return engine.decodeString(fs.readFile(filename));
@@ -480,6 +583,14 @@ type LoadHook = (url: string, ctx: LoadContext, next: (u: string, c?: LoadContex
 const resolveHooks: ResolveHook[] = [];
 const loadHooks: LoadHook[] = [];
 
+function hasRegisteredResolveHooks(): boolean {
+    return getCtsInternal()?.hasModuleResolveHooks?.() ?? resolveHooks.length > 0;
+}
+
+function hasRegisteredLoadHooks(): boolean {
+    return getCtsInternal()?.hasModuleLoadHooks?.() ?? loadHooks.length > 0;
+}
+
 /**
  * Synchronous loader hooks. Node runs the most recently registered hook first
  * and each hook calls next() to reach the default behaviour, so the chain is
@@ -490,8 +601,12 @@ export function registerHooks(hooks: { load?: LoadHook; resolve?: ResolveHook })
     const load = hooks?.load;
     if (resolve) resolveHooks.push(resolve);
     if (load) loadHooks.push(load);
+    const ctsController = getCtsInternal()?.registerModuleHooks?.({ resolve, load });
+    let active = true;
     return {
         deregister: () => {
+            if (!active) return;
+            active = false;
             if (resolve) {
                 const i = resolveHooks.indexOf(resolve);
                 if (i !== -1) resolveHooks.splice(i, 1);
@@ -500,6 +615,7 @@ export function registerHooks(hooks: { load?: LoadHook; resolve?: ResolveHook })
                 const i = loadHooks.indexOf(load);
                 if (i !== -1) loadHooks.splice(i, 1);
             }
+            ctsController?.deregister();
         },
     };
 }
@@ -527,8 +643,7 @@ function runLoadChain(url: string, ctx: LoadContext, terminal: (u: string, c: Lo
 /** file: URL for a host path — hooks receive and return URLs, not paths. */
 function toFileUrl(p: string): string {
     if (p.startsWith('file:') || isBuiltin(p)) return p;
-    const normalized = p.replace(/\\/g, '/');
-    return `file://${normalized.startsWith('/') ? '' : '/'}${normalized}`;
+    return pathToFileURL(p).href;
 }
 
 function fromFileUrl(u: string): string {
@@ -676,12 +791,17 @@ export function _load(request: string, parent?: { filename?: string } | null, is
     mod.filename = filename;
     cache[filename] = mod;
     try {
-        if (loadHooks.length > 0) {
-            const result = runLoadChain(toFileUrl(filename), { format: formatForPath(filename) }, (u, c) => ({
+        if (hasRegisteredLoadHooks()) {
+            const context: LoadContext = { format: formatForPath(filename) };
+            const terminal = (u: string, c: LoadContext): LoadResult => ({
                 format: c.format ?? formatForPath(fromFileUrl(u)),
                 source: null,
                 shortCircuit: true,
-            }));
+            });
+            const ctsInternal = getCtsInternal();
+            const result = ctsInternal?.runModuleLoadHooks
+                ? ctsInternal.runModuleLoadHooks(toFileUrl(filename), context, terminal)
+                : runLoadChain(toFileUrl(filename), context, terminal);
             if (typeof result.source === 'string') {
                 if (result.format === 'json') mod.exports = JSON.parse(result.source);
                 else if (result.format === 'module') {
@@ -879,13 +999,37 @@ Object.defineProperty(Module, 'extensions', {
     configurable: true,
 });
 
+/**
+ * Connect the process-wide Node views to CTS' CJS loader.  The callbacks are
+ * intentionally live: Node permits replacing `Module._cache` or
+ * `Module._extensions`, and every `require()` created by CTS must observe the
+ * replacement just like `createRequire()` does.
+ */
+const ctsNodeModuleInterop = getCtsInternal()?.nodeModuleInterop;
+if (ctsNodeModuleInterop) {
+    ctsNodeModuleInterop.getCache = () => _cacheRef();
+    ctsNodeModuleInterop.getExtensions = () => _extensionsRef();
+    ctsNodeModuleInterop.setCache = (value) => setCacheRef(value);
+    ctsNodeModuleInterop.setExtensions = (value) => setExtensionsRef(value);
+    ctsNodeModuleInterop.cacheIsDefault = () => cacheRef === undefined;
+    ctsNodeModuleInterop.extensionsAreDefault = () => extensionsRef === undefined;
+    ctsNodeModuleInterop.defaultExtensions = {
+        '.js': defaultJsExtension,
+        '.json': defaultJsonExtension,
+        '.node': defaultNodeExtension,
+    };
+}
+
 // Baseline for patch detection. Must be read after the class body exists, and
 // after the statics are installed, or every load takes the JS path.
 pristineResolveFilename = Module._resolveFilename;
 pristinePrototypeCompile = Module.prototype._compile;
 
 Object.defineProperty(Module, 'builtinModules', {
-    get: () => getBuiltinModules(),
+    // Node exposes the same array through both `module.builtinModules` and
+    // `Module.builtinModules`.  Keep the prefix-only entries (node:test,
+    // node:sqlite, ...) and the live CTS-backed view on both paths.
+    get: () => builtinModules,
     enumerable: true,
     configurable: true,
 });

@@ -4,20 +4,9 @@
  */
 const ffi = import.meta.use('ffi');
 
-import {
-    ForeignFunction,
-    ForeignStatic,
-    ForeignLibraryInterface,
-    DynamicLibrary,
-    StaticForeignLibraryInterface,
-    NativeType,
-    NativeResultType,
-    PointerValue,
-    getTypeSize,
-    isForeignFunction,
-    isForeignStatic,
-} from './types';
 import { UnsafePointer, bufferSourceBytes, createPointerObject } from './pointer';
+import { getTypeSize, isForeignFunction, isForeignStatic } from './utils';
+import { toFsPath } from '../../utils/path';
 
 const nativeTypes = new Set([
     'u8', 'i8', 'u16', 'i16', 'u32', 'i32', 'u64', 'i64',
@@ -42,7 +31,7 @@ function validateNativeType(type: unknown, allowVoid: boolean): void {
     throw new TypeError(`Invalid native type: ${String(type)}`);
 }
 
-function validateForeignLibraryInterface(symbols: unknown): asserts symbols is ForeignLibraryInterface {
+function validateForeignLibraryInterface(symbols: unknown): asserts symbols is Deno.ForeignLibraryInterface {
     if (symbols === null || typeof symbols !== 'object') {
         throw new TypeError('DynamicLibrary symbols must be an object');
     }
@@ -75,30 +64,36 @@ function toBigIntArg(value: unknown): bigint {
     return BigInt(Number(value));
 }
 
-class DynamicLibraryImpl<S extends ForeignLibraryInterface> implements DynamicLibrary<S> {
+class DynamicLibrary<S extends Deno.ForeignLibraryInterface> implements Deno.DynamicLibrary<S> {
     private lib: CModuleFFI.UvLib;
-    private _symbols: StaticForeignLibraryInterface<S>;
+    private _symbols: Deno.StaticForeignLibraryInterface<S>;
     private closed = false;
     private cifCache = new Map<string, CModuleFFI.FfiCif>();
 
-    get symbols(): StaticForeignLibraryInterface<S> {
+    get symbols(): Deno.StaticForeignLibraryInterface<S> {
         return this._symbols;
     }
 
     constructor(filename: string | URL, symbolsDef: S) {
-        const path = typeof filename === 'string' ? filename : filename.pathname;
+        const path = toFsPath(filename);
         const native = ffi;
         this.lib = new native.UvLib(path);
-        this._symbols = this.createSymbols(symbolsDef);
+        try {
+            this._symbols = this.createSymbols(symbolsDef);
+        } catch (error) {
+            this.lib.close();
+            throw error;
+        }
     }
 
     close(): void {
         if (this.closed) return;
         this.closed = true;
+        this.lib.close();
         this.cifCache.clear();
     }
 
-    private createSymbols(def: S): StaticForeignLibraryInterface<S> {
+    private createSymbols(def: S): Deno.StaticForeignLibraryInterface<S> {
         const result: Partial<Record<keyof S, unknown>> = {};
         
         for (const [name, sym] of Object.entries(def)) {
@@ -122,10 +117,10 @@ class DynamicLibraryImpl<S extends ForeignLibraryInterface> implements DynamicLi
             }
         }
         
-        return result as StaticForeignLibraryInterface<S>;
+        return result as Deno.StaticForeignLibraryInterface<S>;
     }
 
-    private createFunction(symPtr: CModuleFFI.UvDlSym, def: ForeignFunction): (...args: unknown[]) => unknown {
+    private createFunction(symPtr: CModuleFFI.UvDlSym, def: Deno.ForeignFunction): (...args: unknown[]) => unknown {
         const cif = this.createCif(def.parameters, def.result);
         
         const fn = (...args: unknown[]): unknown => {
@@ -149,7 +144,7 @@ class DynamicLibraryImpl<S extends ForeignLibraryInterface> implements DynamicLi
         return fn;
     }
 
-    private createStatic(symPtr: CModuleFFI.UvDlSym, def: ForeignStatic): unknown {
+    private createStatic(symPtr: CModuleFFI.UvDlSym, def: Deno.ForeignStatic): unknown {
         const native = ffi;
         const size = getTypeSize(def.type);
         const buf = native.ptrToBuffer(symPtr.addr, size);
@@ -157,8 +152,8 @@ class DynamicLibraryImpl<S extends ForeignLibraryInterface> implements DynamicLi
     }
 
     private createCif(
-        parameters: readonly NativeType[],
-        result: NativeResultType
+        parameters: readonly Deno.NativeType[],
+        result: Deno.NativeResultType
     ): CModuleFFI.FfiCif {
         const cacheKey = `${this.typeCacheKey(result)}(${parameters.map(p => this.typeCacheKey(p)).join(',')})`;
         let cif = this.cifCache.get(cacheKey);
@@ -171,14 +166,14 @@ class DynamicLibraryImpl<S extends ForeignLibraryInterface> implements DynamicLi
         return cif;
     }
 
-    private typeCacheKey(type: NativeType | 'void'): string {
+    private typeCacheKey(type: Deno.NativeType | 'void'): string {
         return typeof type === 'string'
             ? type
             : `struct(${type.struct.map(member => this.typeCacheKey(member)).join(',')})`;
     }
 
     private toFfiType(
-        type: NativeType | 'void'
+        type: Deno.NativeType | 'void'
     ): CModuleFFI.FfiType {
         if (type === 'void') return ffi.type_void;
         if (typeof type !== 'string') {
@@ -188,7 +183,7 @@ class DynamicLibraryImpl<S extends ForeignLibraryInterface> implements DynamicLi
             }
         }
         
-        const typeMap: Record<Extract<NativeType, string>, keyof typeof ffi> = {
+        const typeMap: Record<Extract<Deno.NativeType, string>, keyof typeof ffi> = {
             'u8': 'type_uint8',
             'i8': 'type_sint8',
             'u16': 'type_uint16',
@@ -217,7 +212,7 @@ class DynamicLibraryImpl<S extends ForeignLibraryInterface> implements DynamicLi
 
     private toFfiArg(
         value: unknown,
-        type: NativeType
+        type: Deno.NativeType
     ): Uint8Array | bigint {
         if (typeof type === 'string') {
             switch (type) {
@@ -278,13 +273,13 @@ class DynamicLibraryImpl<S extends ForeignLibraryInterface> implements DynamicLi
                 case 'function': {
                     if (value === null) return 0n;
                     if (typeof value === 'object' && 'pointer' in value) {
-                        return UnsafePointer.value(value.pointer as PointerValue);
+                        return UnsafePointer.value(value.pointer as Deno.PointerValue);
                     }
                     if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {
                         const buf = bufferSourceBytes(value);
                         return ffi.getArrayBufPtr(buf);
                     }
-                    return UnsafePointer.value(value as PointerValue);
+                    return UnsafePointer.value(value as Deno.PointerValue);
                 }
             }
         }
@@ -297,30 +292,31 @@ class DynamicLibraryImpl<S extends ForeignLibraryInterface> implements DynamicLi
         return new Uint8Array(0);
     }
 
-    private fromFfiResult(buf: Uint8Array, type: NativeResultType): unknown {
+    private fromFfiResult(buf: Uint8Array, type: Deno.NativeResultType): unknown {
         if (type === 'void') return undefined;
         
         if (typeof type === 'string') {
+            const view = new DataView(buf.buffer, buf.byteOffset);
             switch (type) {
                 case 'u8': return buf[0];
                 case 'i8': return buf[0] > 127 ? buf[0] - 256 : buf[0];
-                case 'u16': return new DataView(buf.buffer, buf.byteOffset).getUint16(0, true);
-                case 'i16': return new DataView(buf.buffer, buf.byteOffset).getInt16(0, true);
-                case 'u32': return new DataView(buf.buffer, buf.byteOffset).getUint32(0, true);
-                case 'i32': return new DataView(buf.buffer, buf.byteOffset).getInt32(0, true);
-                case 'u64': return new DataView(buf.buffer, buf.byteOffset).getBigUint64(0, true);
-                case 'i64': return new DataView(buf.buffer, buf.byteOffset).getBigInt64(0, true);
-                case 'f32': return new DataView(buf.buffer, buf.byteOffset).getFloat32(0, true);
-                case 'f64': return new DataView(buf.buffer, buf.byteOffset).getFloat64(0, true);
+                case 'u16': return view.getUint16(0, true);
+                case 'i16': return view.getInt16(0, true);
+                case 'u32': return view.getUint32(0, true);
+                case 'i32': return view.getInt32(0, true);
+                case 'u64': return view.getBigUint64(0, true);
+                case 'i64': return view.getBigInt64(0, true);
+                case 'f32': return view.getFloat32(0, true);
+                case 'f64': return view.getFloat64(0, true);
                 case 'bool': return buf[0] !== 0;
                 case 'pointer':
                 case 'buffer':
                 case 'function': {
-                    const addr = new DataView(buf.buffer, buf.byteOffset).getBigUint64(0, true);
+                    const addr = view.getBigUint64(0, true);
                     return addr === 0n ? null : createPointerObject(addr);
                 }
-                case 'usize': return new DataView(buf.buffer, buf.byteOffset).getBigUint64(0, true);
-                case 'isize': return new DataView(buf.buffer, buf.byteOffset).getBigInt64(0, true);
+                case 'usize': return view.getBigUint64(0, true);
+                case 'isize': return view.getBigInt64(0, true);
             }
         }
         
@@ -332,12 +328,12 @@ class DynamicLibraryImpl<S extends ForeignLibraryInterface> implements DynamicLi
     }
 }
 
-export function dlopen<const S extends ForeignLibraryInterface>(
+export function dlopen<const S extends Deno.ForeignLibraryInterface>(
     filename: string | URL,
     symbols: S,
-): DynamicLibrary<S> {
+): Deno.DynamicLibrary<S> {
     validateForeignLibraryInterface(symbols);
-    return new DynamicLibraryImpl(filename, symbols);
+    return new DynamicLibrary(filename, symbols);
 }
 
-export { DynamicLibraryImpl };
+export { DynamicLibrary };

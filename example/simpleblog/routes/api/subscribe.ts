@@ -1,4 +1,5 @@
 import { define } from "../../utils.ts";
+import { saveSubscriber } from "../../data/subscribers.ts";
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -35,6 +36,20 @@ export const handler = define.handlers({
 
     const valid = email.length <= 254 && EMAIL_PATTERN.test(email);
     const accepted = valid || website.length > 0;
+
+    if (valid && !website) {
+      try {
+        await saveSubscriber(email);
+      } catch (error) {
+        console.error("Could not save subscriber:", error);
+        return contentType.includes("application/json")
+          ? Response.json(
+            { error: "Subscription is temporarily unavailable." },
+            { status: 503 },
+          )
+          : ctx.redirect("/?subscribed=error#newsletter", 303);
+      }
+    }
 
     if (contentType.includes("application/json")) {
       return accepted

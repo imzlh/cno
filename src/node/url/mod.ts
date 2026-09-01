@@ -1012,10 +1012,12 @@ export function pathToFileURL(filepath: string, options?: FileURLPathOptions): U
     }
 
     const windows = options?.windows ?? process.platform === 'win32';
+    const pathApi = windows ? path.win32 : path.posix;
+    if (!pathApi) throw new Error('path API is unavailable');
     // A UNC path is never run through resolve(); everything else is, which is
     // what supplies the current drive for `/tmp/x`, `C:a`, and relative paths.
     const isUnc = windows && filepath.startsWith('\\\\');
-    let resolved = isUnc ? filepath : (windows ? path.win32.resolve(filepath) : path.posix.resolve(filepath));
+    let resolved = isUnc ? filepath : pathApi.resolve(filepath);
 
     if (windows && resolved.startsWith('\\\\')) {
         // `\\?\` is a local-path prefix, not a server name — unlike `\\?\UNC\`.
@@ -1032,7 +1034,7 @@ export function pathToFileURL(filepath: string, options?: FileURLPathOptions): U
 
     // resolve() strips a trailing separator; Node puts it back.
     const last = filepath.charCodeAt(filepath.length - 1);
-    if ((last === 0x2f || (windows && last === 0x5c)) && !resolved.endsWith(path.sep)) resolved += '/';
+    if ((last === 0x2f || (windows && last === 0x5c)) && !resolved.endsWith(pathApi.sep)) resolved += '/';
 
     if (windows) resolved = resolved.replace(/\\/g, '/');
     if (!resolved.startsWith('/')) resolved = `/${resolved}`;

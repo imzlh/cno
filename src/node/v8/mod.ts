@@ -21,10 +21,6 @@ const beforeHooks = new Set<(promise: Promise<unknown>) => void>();
 const afterHooks = new Set<(promise: Promise<unknown>) => void>();
 const settledHooks = new Set<(promise: Promise<unknown>) => void>();
 
-function fnv1a32(input: string): number {
-    return algorithm.fnv1a32(engine.encodeString(input));
-}
-
 function assertArrayBufferView(value: unknown, name: string): asserts value is ArrayBufferView {
     if (!ArrayBuffer.isView(value)) {
         throw new TypeError(`${name} must be a TypedArray or a DataView`);
@@ -538,7 +534,7 @@ export function deserialize(buf: Buffer | Uint8Array): unknown {
 }
 
 export function cachedDataVersionTag(): number {
-    return fnv1a32(`${engine.versions.quickjs}:${cachedFlags}`);
+    return algorithm.fnv1a32(engine.encodeString(`${engine.versions.quickjs}:${cachedFlags}`));
 }
 
 export const startupSnapshot = {

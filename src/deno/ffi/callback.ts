@@ -3,15 +3,7 @@
  * UnsafeCallback class for passing JS functions to C code
  */
 
-import {
-    UnsafeCallbackDefinition,
-    NativeType,
-    NativeResultType,
-    PointerObject,
-    PointerValue,
-    UnsafeCallbackFunction,
-    getTypeSize,
-} from './types';
+import { getTypeSize } from './utils';
 import { UnsafePointer, createPointerObject } from './pointer';
 
 const ffi = import.meta.use('ffi');
@@ -21,18 +13,18 @@ interface CallbackInternal {
     closure: CModuleFFI.FfiClosure;
     refCount: number;
     closed: boolean;
-    definition: UnsafeCallbackDefinition;
-    callback: UnsafeCallbackFunction;
+    definition: Deno.UnsafeCallbackDefinition;
+    callback: Deno.UnsafeCallbackFunction;
 }
 
-const callbackRegistry = new Map<PointerObject, CallbackInternal>();
+const callbackRegistry = new Map<Deno.PointerObject, CallbackInternal>();
 
 export class UnsafeCallback<
-    const Definition extends UnsafeCallbackDefinition = UnsafeCallbackDefinition,
+    const Definition extends Deno.UnsafeCallbackDefinition = Deno.UnsafeCallbackDefinition,
 > {
-    readonly pointer: PointerObject<Definition>;
+    readonly pointer: Deno.PointerObject<Definition>;
     readonly definition: Definition;
-    readonly callback: UnsafeCallbackFunction<
+    readonly callback: Deno.UnsafeCallbackFunction<
         Definition['parameters'],
         Definition['result']
     >;
@@ -42,7 +34,7 @@ export class UnsafeCallback<
 
     constructor(
         definition: Definition,
-        callback: UnsafeCallbackFunction<
+        callback: Deno.UnsafeCallbackFunction<
             Definition['parameters'],
             Definition['result']
         >
@@ -68,10 +60,10 @@ export class UnsafeCallback<
     }
 
     static threadSafe<
-        Definition extends UnsafeCallbackDefinition = UnsafeCallbackDefinition,
+        Definition extends Deno.UnsafeCallbackDefinition = Deno.UnsafeCallbackDefinition,
     >(
         definition: Definition,
-        callback: UnsafeCallbackFunction<
+        callback: Deno.UnsafeCallbackFunction<
             Definition['parameters'],
             Definition['result']
         >,
@@ -105,8 +97,8 @@ export class UnsafeCallback<
     }
 
     private createCif(
-        parameters: readonly NativeType[],
-        result: NativeResultType
+        parameters: readonly Deno.NativeType[],
+        result: Deno.NativeResultType
     ): CModuleFFI.FfiCif {
         const cacheKey = `${this.typeCacheKey(result)}(${parameters.map(p => this.typeCacheKey(p)).join(',')})`;
         let cif = UnsafeCallback.cifCache.get(cacheKey);
@@ -119,13 +111,13 @@ export class UnsafeCallback<
         return cif;
     }
 
-    private typeCacheKey(type: NativeType | 'void'): string {
+    private typeCacheKey(type: Deno.NativeType | 'void'): string {
         return typeof type === 'string'
             ? type
             : `struct(${type.struct.map(member => this.typeCacheKey(member)).join(',')})`;
     }
 
-    private toFfiType(type: NativeType | 'void'): CModuleFFI.FfiType {
+    private toFfiType(type: Deno.NativeType | 'void'): CModuleFFI.FfiType {
         if (type === 'void') return ffi.type_void;
         if (typeof type !== 'string') {
             if ('struct' in type) {
@@ -134,7 +126,7 @@ export class UnsafeCallback<
             }
         }
         
-        const typeMap: Record<Extract<NativeType, string>, keyof typeof ffi> = {
+        const typeMap: Record<Extract<Deno.NativeType, string>, keyof typeof ffi> = {
             'u8': 'type_uint8',
             'i8': 'type_sint8',
             'u16': 'type_uint16',
@@ -162,8 +154,8 @@ export class UnsafeCallback<
     }
 
     private wrapCallback(
-        callback: UnsafeCallbackFunction,
-        definition: UnsafeCallbackDefinition
+        callback: Deno.UnsafeCallbackFunction,
+        definition: Deno.UnsafeCallbackDefinition
     ): (...args: ArrayBuffer[]) => Uint8Array {
         return (...args: ArrayBuffer[]): Uint8Array => {
             try {
@@ -173,38 +165,39 @@ export class UnsafeCallback<
                 return this.convertResult(result, definition.result);
             } catch (err) {
                 console.error('UnsafeCallback error:', err);
-                const size = definition.result === 'void' ? 0 : getTypeSize(definition.result as NativeType);
+                const size = definition.result === 'void' ? 0 : getTypeSize(definition.result as Deno.NativeType);
                 return new Uint8Array(size);
             }
         };
     }
 
-    private convertArgs(args: Uint8Array[], parameters: readonly NativeType[]): unknown[] {
+    private convertArgs(args: Uint8Array[], parameters: readonly Deno.NativeType[]): unknown[] {
         return parameters.map((type, i) => {
             const buf = args[i];
             if (buf === undefined) return null;
             
             if (typeof type === 'string') {
+                const view = new DataView(buf.buffer, buf.byteOffset);
                 switch (type) {
                     case 'u8': return buf[0];
                     case 'i8': return buf[0] > 127 ? buf[0] - 256 : buf[0];
-                    case 'u16': return new DataView(buf.buffer, buf.byteOffset).getUint16(0, true);
-                    case 'i16': return new DataView(buf.buffer, buf.byteOffset).getInt16(0, true);
-                    case 'u32': return new DataView(buf.buffer, buf.byteOffset).getUint32(0, true);
-                    case 'i32': return new DataView(buf.buffer, buf.byteOffset).getInt32(0, true);
-                    case 'u64': return new DataView(buf.buffer, buf.byteOffset).getBigUint64(0, true);
-                    case 'i64': return new DataView(buf.buffer, buf.byteOffset).getBigInt64(0, true);
-                    case 'f32': return new DataView(buf.buffer, buf.byteOffset).getFloat32(0, true);
-                    case 'f64': return new DataView(buf.buffer, buf.byteOffset).getFloat64(0, true);
+                    case 'u16': return view.getUint16(0, true);
+                    case 'i16': return view.getInt16(0, true);
+                    case 'u32': return view.getUint32(0, true);
+                    case 'i32': return view.getInt32(0, true);
+                    case 'u64': return view.getBigUint64(0, true);
+                    case 'i64': return view.getBigInt64(0, true);
+                    case 'f32': return view.getFloat32(0, true);
+                    case 'f64': return view.getFloat64(0, true);
                     case 'bool': return buf[0] !== 0;
                     case 'pointer':
                     case 'buffer':
                     case 'function': {
-                        const addr = new DataView(buf.buffer, buf.byteOffset).getBigUint64(0, true);
+                        const addr = view.getBigUint64(0, true);
                         return addr === 0n ? null : createPointerObject(addr);
                     }
-                    case 'usize': return new DataView(buf.buffer, buf.byteOffset).getBigUint64(0, true);
-                    case 'isize': return new DataView(buf.buffer, buf.byteOffset).getBigInt64(0, true);
+                    case 'usize': return view.getBigUint64(0, true);
+                    case 'isize': return view.getBigInt64(0, true);
                 }
             }
             
@@ -212,10 +205,10 @@ export class UnsafeCallback<
         });
     }
 
-    private convertResult(result: unknown, type: NativeResultType): Uint8Array {
+    private convertResult(result: unknown, type: Deno.NativeResultType): Uint8Array {
         if (type === 'void') return new Uint8Array(0);
         
-        const size = getTypeSize(type as NativeType);
+        const size = getTypeSize(type as Deno.NativeType);
         const buf = new ArrayBuffer(size);
         const view = new DataView(buf);
         
@@ -253,7 +246,7 @@ export class UnsafeCallback<
                 case 'pointer':
                 case 'buffer':
                 case 'function': {
-                    const addr = result === null ? 0n : UnsafePointer.value(result as PointerValue);
+                    const addr = result === null ? 0n : UnsafePointer.value(result as Deno.PointerValue);
                     view.setBigUint64(0, addr, true);
                     break;
                 }
@@ -266,7 +259,7 @@ export class UnsafeCallback<
     }
 }
 
-export function callRegisteredCallback(pointer: PointerValue, args: readonly unknown[]): { found: boolean; value?: unknown } {
+export function callRegisteredCallback(pointer: Deno.PointerValue, args: readonly unknown[]): { found: boolean; value?: unknown } {
     if (pointer === null) return { found: false };
     const internal = callbackRegistry.get(pointer);
     if (!internal || internal.closed) return { found: false };

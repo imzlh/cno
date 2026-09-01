@@ -74,7 +74,13 @@ export interface ChildProcess extends EventEmitter {
     readonly spawnfile: string;
     readonly killed: boolean;
     readonly connected: boolean;
+    channel?: { ref(): void; unref(): void } | null;
     kill(signal?: string | number): boolean;
+    disconnect(): void;
+    ref(): void;
+    unref(): void;
+    send(message: unknown, callback?: (error: Error | null) => void): boolean;
+    send(message: unknown, sendHandle?: unknown, options?: unknown, callback?: (error: Error | null) => void): boolean;
 }
 
 export type ExecCallback = (error: Error | null, stdout: string | Buffer, stderr: string | Buffer) => void;

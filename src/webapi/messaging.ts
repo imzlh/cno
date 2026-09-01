@@ -8,12 +8,35 @@ const messageQueueSymbol = Symbol('messageQueue');
 const dispatchQueuedSymbol = Symbol('dispatchQueued');
 const onMessageSymbol = Symbol('onmessage');
 const onMessageErrorSymbol = Symbol('onmessageerror');
+const disentangleListenersSymbol = Symbol('disentangleListeners');
 
 type QueuedMessage = { data: unknown; ports: MessagePort[] };
 type PortMessageHandler = (this: globalThis.MessagePort, ev: globalThis.MessageEvent) => unknown;
+type PortDisentangleListener = () => void;
 
 export function isMessagePort(value: unknown): value is MessagePort {
     return value instanceof MessagePort;
+}
+
+function notifyPortDisentangled(port: MessagePort): void {
+    const listeners = Array.from(port[disentangleListenersSymbol]);
+    port[disentangleListenersSymbol].clear();
+    for (const listener of listeners) {
+        try { listener(); } catch { /* close/disentangle notification is best-effort */ }
+    }
+}
+
+/** Internal lifecycle hook for owners that retain a transferred endpoint. */
+export function addMessagePortDisentangleListener(
+    port: MessagePort,
+    listener: PortDisentangleListener,
+): () => void {
+    if (port[closedSymbol]) {
+        try { listener(); } catch { /* close/disentangle notification is best-effort */ }
+        return () => {};
+    }
+    port[disentangleListenersSymbol].add(listener);
+    return () => port[disentangleListenersSymbol].delete(listener);
 }
 
 function createTransferredPort(port: MessagePort): MessagePort {
@@ -33,6 +56,9 @@ function commitTransferredPort(port: MessagePort, clone: MessagePort): void {
     port[otherPortSymbol] = null;
     port[closedSymbol] = true;
     port[messageQueueSymbol] = [];
+    // A transferred endpoint is closed synchronously. Notify owners that may
+    // retain it in a routing registry so the old entry cannot outlive the move.
+    notifyPortDisentangled(port);
 }
 
 export const messagePortTransferHooks = {
@@ -110,6 +136,7 @@ export class MessagePort extends EventTarget implements globalThis.MessagePort {
     [closedSymbol] = false;
     [messageQueueSymbol]: QueuedMessage[] = [];
     [dispatchQueuedSymbol] = false;
+    [disentangleListenersSymbol] = new Set<PortDisentangleListener>();
 
     constructor() {
         super();
@@ -152,9 +179,16 @@ export class MessagePort extends EventTarget implements globalThis.MessagePort {
     }
 
     close(): void {
+        if (this[closedSymbol]) return;
         this[closedSymbol] = true;
+        const otherPort = this[otherPortSymbol];
         this[otherPortSymbol] = null;
         this[messageQueueSymbol] = [];
+        notifyPortDisentangled(this);
+        if (otherPort?.[otherPortSymbol] === this) {
+            otherPort[otherPortSymbol] = null;
+            notifyPortDisentangled(otherPort);
+        }
     }
 
     addEventListener(type: string, listener: EventListenerOrEventListenerObject | null, options?: boolean | AddEventListenerOptions): void {

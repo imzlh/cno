@@ -8,30 +8,13 @@ const crypto = import.meta.use('crypto');
 const engine = import.meta.use('engine');
 const algorithm = import.meta.use('algorithm');
 import type { Buffer } from '../buffer';
-import { concatChunks, utf8DecodeReplace } from '../_internal/buffer';
+import { concatChunks, describeEncoding, utf8DecodeReplace } from '../_internal/buffer';
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 type ByteView = globalThis.Uint8Array<ArrayBufferLike>;
 type NativeDecoder = InstanceType<typeof Decoder>;
 
 /** Canonical encoding name, or undefined when unknown (mirrors Node's normalizeEncoding). */
-/**
- * Node inspects the rejected encoding rather than string-coercing it, so `{}`
- * prints as `{}` and not `[object Object]`. Mirrors `describeEncoding` in
- * `node/buffer/mod.ts`, which is not exported.
- */
-function describeEncoding(encoding: unknown): string {
-    if (encoding === null) return 'null';
-    if (Array.isArray(encoding)) return encoding.length === 0 ? '[]' : `[ ${encoding.join(', ')} ]`;
-    if (typeof encoding === 'object') {
-        const keys = Object.keys(encoding as object);
-        return keys.length === 0
-            ? '{}'
-            : `{ ${keys.map((k) => `${k}: ${(encoding as Record<string, unknown>)[k]}`).join(', ')} }`;
-    }
-    return String(encoding);
-}
-
 function normalizeEncoding(encoding?: unknown): string | undefined {
     if (encoding === undefined || encoding === null || encoding === '') return 'utf8';
     if (typeof encoding !== 'string') return undefined;
@@ -57,8 +40,6 @@ function isUtf8Encoding(encoding: string): boolean {
  * helper also fixes the native decoder's wrong error granularity. Correct here
  * because `utf8TrailingBytes` has already withheld any incomplete tail.
  */
-const decodeUtf8 = utf8DecodeReplace;
-
 function isUtf16Encoding(encoding: string): boolean {
     return encoding === 'utf16le' || encoding === 'ucs2' || encoding === 'ucs-2';
 }
@@ -273,8 +254,8 @@ StringDecoder.prototype.write = function write(this: StringDecoder, buf: Buffer 
             this._pending = bytes.subarray(bytes.byteLength - trailing);
             bytes = bytes.subarray(0, bytes.byteLength - trailing);
         }
-        // Malformed bytes need WHATWG replacement; see decodeUtf8.
-        return bytes.byteLength === 0 ? '' : decodeUtf8(bytes);
+        // Malformed bytes need WHATWG replacement.
+        return bytes.byteLength === 0 ? '' : utf8DecodeReplace(bytes);
     }
 
     if (bytes.byteLength === 0) return '';

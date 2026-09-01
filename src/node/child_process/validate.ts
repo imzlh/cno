@@ -1,22 +1,6 @@
-/**
- * Node.js child_process module - stdio / maxBuffer / timeout validation
- *
- * Everything that rejects a bad option before a child is spawned, plus the
- * StdioEntry -> native-slot converters. Internal to the module.
- */
-
 import type { NativeStdio, SpawnOptions, StdioEntry } from './types';
 
-// Node rejects an stdio entry it does not recognise instead of guessing. Without
-// this, `toNativeStdio` fell through to 'inherit' for every unknown value, so
-// `stdio: [{}, 'pipe', 'pipe']` (or `true`, or a typo'd mode string) silently
-// spawned with the child wired to the PARENT's console — output going somewhere
-// the caller never asked for, with no error at all. Node throws
-// ERR_INVALID_ARG_VALUE for those (measured on v24.18).
-//
-// Streams are accepted only via a numeric `fd`, which is how Node accepts an
-// fs.WriteStream; the caller-visible behaviour of a bare numeric fd is handled by
-// assertRedirectableFd below.
+// Reject unknown entries rather than silently inheriting stdio.
 export function stdioEntryIsValid(value: unknown): boolean {
     if (value === null || value === undefined) return true;
     if (typeof value === 'number') return Number.isInteger(value);
@@ -44,7 +28,6 @@ export function invalidStdioError(value: unknown): TypeError {
     );
 }
 
-// A stream is only usable if it exposes a real fd, matching Node.
 export function stdioFdOf(value: unknown): number | undefined {
     if (typeof value === 'number' && Number.isInteger(value)) return value;
     if (value !== null && typeof value === 'object') {
@@ -54,11 +37,7 @@ export function stdioFdOf(value: unknown): number | undefined {
     return undefined;
 }
 
-// Node rejects a negative or NaN maxBuffer with ERR_OUT_OF_RANGE before the
-// child is ever spawned (validateMaxBuffer in node:child_process). Measured on
-// v24.18: -1 and NaN both throw a RangeError; 0 and Infinity are accepted and
-// mean "no limit". Silently ignoring a bad value instead lets a caller's typo
-// disable the cap and capture unbounded output.
+// Reject invalid caps before spawning; zero and Infinity are unlimited.
 export function validateMaxBuffer(maxBuffer: unknown): void {
     if (maxBuffer === undefined || maxBuffer === null) return;
     if (typeof maxBuffer !== 'number' || Number.isNaN(maxBuffer) || maxBuffer < 0) {
@@ -69,8 +48,7 @@ export function validateMaxBuffer(maxBuffer: unknown): void {
     }
 }
 
-// Node validates timeout eagerly for both async and sync entry points. A bad
-// value must not silently disable the only deadline guarding a child process.
+// Validate before spawning so an invalid timeout cannot disable the deadline.
 export function validateTimeout(timeout: unknown): void {
     if (timeout === undefined || timeout === null) return;
     if (typeof timeout !== 'number' || !Number.isInteger(timeout) || timeout < 0) {
@@ -85,32 +63,25 @@ export function validateTimeout(timeout: unknown): void {
 export function validateStdio(stdio: SpawnOptions['stdio']): void {
     if (stdio === undefined) return;
     if (!Array.isArray(stdio)) {
-        // A bare 'ipc' string is rejected by Node too — 'ipc' is only meaningful as
-        // one slot of an array. Compared through unknown because the declared
-        // shorthand union does not include it.
+        // 'ipc' is valid only as an array slot.
         if (!stdioEntryIsValid(stdio) || (stdio as unknown) === 'ipc') throw invalidStdioError(stdio);
         return;
     }
+    let ipcCount = 0;
     for (const entry of stdio) {
-        // A stream with a usable fd is legal; anything else unrecognised is not.
-        if (stdioEntryIsValid(entry) || stdioFdOf(entry) !== undefined) continue;
-        throw invalidStdioError(entry);
+        if (!stdioEntryIsValid(entry) && stdioFdOf(entry) === undefined) {
+            throw invalidStdioError(entry);
+        }
+        if (entry === 'ipc' && ++ipcCount > 1) {
+            throw Object.assign(new Error('Child process can have only one IPC pipe'), {
+                code: 'ERR_IPC_ONE_PIPE',
+            });
+        }
     }
 }
 
-// The native layer cannot redirect fd 0/1/2 to an arbitrary descriptor: the
-// SETUP_STDIO macro (mod_process.c:752) runs JS_ToCString on the value, so a
-// number arrives as the string "5", misses the 'pipe'/'ignore' comparisons, and
-// lands in the else branch that inherits the SLOT's own default fd. The measured
-// result is that `stdio: ['ignore', fd, fd]` for an open log file wrote nothing
-// to the file and leaked the child's output to the parent's console instead
-// (Node writes it to the file). Extra fds are unaffected — setup_extra_stdio
-// handles numbers correctly.
-//
-// A number equal to its own slot index is the one case that is already correct
-// (`stdio: [0, 1, 2]` genuinely means "inherit the parent's 0/1/2"), so allow
-// that and refuse the rest loudly rather than sending bytes somewhere the caller
-// did not ask for. Reported as a C defect with a proposed diff.
+// Native spawn cannot redirect fd 0/1/2 to arbitrary descriptors. Reject them
+// rather than silently inheriting the parent's standard stream; extra fds work.
 export function assertRedirectableFd(value: unknown, slot: number): void {
     const fd = stdioFdOf(value);
     if (fd === undefined || fd === slot) return;
@@ -136,7 +107,7 @@ export function toNativeStdio(value: StdioEntry, fallback: NativeStdio = 'pipe')
     if (value === null || value === undefined) return fallback;
     if (typeof value === 'number') return value;
     if (value === 'pipe' || value === 'ignore' || value === 'inherit') return value;
-    // Node treats 'overlapped' as a pipe (Windows OVERLAPPED I/O hint only).
+    // Treat Node's Windows-only 'overlapped' mode as a pipe.
     if (value === 'overlapped') return 'pipe';
     return 'inherit';
 }

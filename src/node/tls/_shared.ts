@@ -8,18 +8,15 @@
  * ./context and ./socket can depend on it.
  */
 
-import { Socket as NetSocket } from '../net';
 import type { Duplex } from '../stream';
 import type { PromiseLikeResult, TlsCertInput, TlsKeyInput, TlsPemValue } from './types';
+export { flattenPrototype } from '../_internal/prototype';
 
 const engine = import.meta.use('engine');
 const os = import.meta.use('os');
 const fs = import.meta.use('fs');
 
-// The C layer hands back either an ArrayBuffer or a view into a larger one.
-// `Buffer.from(view)` treats a view as array-like and copies *elements*, dropping
-// byteOffset/byteLength — a session/ticket that is a window into a bigger buffer
-// would silently decode as the wrong bytes. Copy the exact window instead.
+// Preserve the exact byte window returned by the native layer.
 export function bufferFromRaw(raw: ArrayBuffer | ArrayBufferView): Buffer {
     return ArrayBuffer.isView(raw)
         ? Buffer.from(raw.buffer, raw.byteOffset, raw.byteLength)
@@ -76,18 +73,8 @@ export function isPromiseLikeResult(value: unknown): value is PromiseLikeResult 
     return !!value && typeof value === 'object' && 'then' in value;
 }
 
-// TODO: isGenericDuplexStream has no caller anywhere in the tree — it was
-// already unreferenced in the single-file version. Kept as-is rather than
-// deleted, since removing it is a separate cleanup, not part of this move.
-
 export function isSocketAddressStream(stream: Duplex | CModuleStreams.Stream): stream is CModuleStreams.TCP {
     return 'sockname' in stream;
-}
-
-function isGenericDuplexStream(stream: Duplex | CModuleStreams.Stream): boolean {
-    if (stream instanceof NetSocket || isSocketAddressStream(stream)) return false;
-    return typeof Reflect.get(stream, 'on') === 'function'
-        && typeof Reflect.get(stream, 'write') === 'function';
 }
 
 export function callStreamMethodQuietly(stream: CModuleStreams.Stream, method: 'ref' | 'unref'): void {
@@ -112,29 +99,6 @@ export function closeNativeStreamQuietly(stream: CModuleStreams.Stream): void {
         stream.close();
     } catch {
         // destroy() is best-effort once the TLS socket is already closing.
-    }
-}
-
-// Shared prototype helper (duplicated locally, same pattern as
-// events/mod.ts and stream/mod.ts). MUST skip keys the target already
-// defines as its own — overwriting an own override with the parent's
-// version here previously caused a production hang (headers sent, body
-// write silently dropped because a subclass override of a stream method
-// got clobbered).
-export function flattenPrototype(target: object): void {
-    const parent = Object.getPrototypeOf(target);
-    if (!parent || parent === Object.prototype) return;
-
-    for (const key of Object.getOwnPropertyNames(parent)) {
-        if (key === 'constructor' || Object.prototype.hasOwnProperty.call(target, key)) continue;
-        const descriptor = Object.getOwnPropertyDescriptor(parent, key);
-        if (descriptor) Object.defineProperty(target, key, descriptor);
-    }
-
-    for (const key of Object.getOwnPropertySymbols(parent)) {
-        if (Object.prototype.hasOwnProperty.call(target, key)) continue;
-        const descriptor = Object.getOwnPropertyDescriptor(parent, key);
-        if (descriptor) Object.defineProperty(target, key, descriptor);
     }
 }
 
@@ -266,8 +230,6 @@ export function setDefaultCACertificates(certs: string[]): void {
         }
     }
     defaultCACertificates = [...certs];
-    // Without this the override flag stayed false forever, so
-    // effectiveDefaultCACertificates() would keep returning the system store
-    // and silently ignore the caller's replacement set.
+    // Explicit defaults replace, rather than extend, the system store.
     defaultCAOverridden = true;
 }

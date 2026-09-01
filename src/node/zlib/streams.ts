@@ -13,6 +13,8 @@
  */
 
 import { Transform, TransformOptions } from '../stream';
+import { flattenPrototype } from '../_internal/prototype';
+export { flattenPrototype };
 import {
     asError,
     corruptError,
@@ -21,7 +23,6 @@ import {
     FINISH,
     hasErrorCode,
     hasGzipMagic,
-    isAllZeros,
     isAlreadyFinished,
     NO_FLUSH,
     SYNC_FLUSH,
@@ -81,23 +82,6 @@ export type { TransformCallback, ZlibStreamCtor };
 type DecompressKind = 'inflate' | 'inflateRaw' | 'gunzip' | 'unzip';
 
 export type { DecompressKind };
-export function flattenPrototype(target: object): void {
-    const parent = Object.getPrototypeOf(target);
-    if (!parent || parent === Object.prototype) return;
-
-    for (const key of Object.getOwnPropertyNames(parent)) {
-        if (key === 'constructor' || Object.prototype.hasOwnProperty.call(target, key)) continue;
-        const descriptor = Object.getOwnPropertyDescriptor(parent, key);
-        if (descriptor) Object.defineProperty(target, key, descriptor);
-    }
-
-    for (const key of Object.getOwnPropertySymbols(parent)) {
-        if (Object.prototype.hasOwnProperty.call(target, key)) continue;
-        const descriptor = Object.getOwnPropertyDescriptor(parent, key);
-        if (descriptor) Object.defineProperty(target, key, descriptor);
-    }
-}
-
 export function receiverOrCreate<T extends object>(receiver: T | undefined, prototype: object): T {
     const target: T = receiver && (typeof receiver === 'object' || typeof receiver === 'function')
         ? receiver
@@ -287,7 +271,7 @@ function _doFlush(stream: NodeZlibTransform, cb: TransformCallback) {
         if (!state.compress && state.pending && state.pending.length > 0) {
             const pending = state.pending;
             state.pending = undefined;
-            if (isAllZeros(pending)) { cb(null); return; }
+            if (pending.every((byte) => byte === 0)) { cb(null); return; }
             if (state.finishFlush === FINISH) throw truncatedError();
         }
         const handle = stream._handle;

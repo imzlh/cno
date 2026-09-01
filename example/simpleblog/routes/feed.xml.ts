@@ -1,4 +1,4 @@
-import { formatPostDate, listPosts } from "../data/posts.ts";
+import { listPosts } from "../data/posts.ts";
 import { define } from "../utils.ts";
 
 function escapeXml(value: string): string {
@@ -18,6 +18,12 @@ export const handler = define.handlers({
   async GET(ctx) {
     const posts = await listPosts();
     const origin = ctx.url.origin;
+    const latestUpdate = posts.reduce<string | null>((latest, post) => {
+      if (!latest || Date.parse(post.updatedAt) > Date.parse(latest)) {
+        return post.updatedAt;
+      }
+      return latest;
+    }, null);
     const items = posts.map((post) => {
       const link = `${origin}/article/${encodeURIComponent(post.slug)}`;
       return `
@@ -39,7 +45,11 @@ export const handler = define.handlers({
     <link>${escapeXml(origin)}</link>
     <description>Thoughtful notes on design, independent work, and the web.</description>
     <language>en</language>
-    <lastBuildDate>${new Date().toUTCString()}</lastBuildDate>
+    <lastBuildDate>${
+      latestUpdate
+        ? new Date(latestUpdate).toUTCString()
+        : new Date().toUTCString()
+    }</lastBuildDate>
     <atom:link href="${
       escapeXml(self)
     }" rel="self" type="application/rss+xml" />${items}

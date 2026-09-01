@@ -1,5 +1,6 @@
 import { assert } from "../utils/assert";
-import { dirname } from "../utils/path";
+import { ensureDirectorySync } from "../utils/fs-path";
+import { dirname, join } from "../utils/path";
 import { DOMException, StorageEvent } from "./events";
 
 const sqlite3 = import.meta.use('sqlite3');
@@ -116,74 +117,8 @@ class Storage {
      * Ensure storage directory exists
      */
     private ensureStorageDirectory() {
-        const dir = this.getDirectoryPath(this.options.path);
-        if (dir && dir !== '.' && !fs.exists(dir)) {
-            this.mkdirRecursive(dir);
-        }
-    }
-
-    /**
-     * Get directory path from file path
-     */
-    private getDirectoryPath(path: string): string {
-        if (path === ':memory:' || !path.includes('/')) {
-            return '';
-        }
-        const lastSlash = path.lastIndexOf('/');
-        return lastSlash > 0 ? path.substring(0, lastSlash) : '';
-    }
-
-    /**
-     * Create directory recursively.
-     *
-     * Seeds the loop with a non-creatable filesystem root rather than an empty
-     * prefix. The old version started from `''` and treated a Windows drive spec
-     * as an ordinary segment, so the first iteration called `mkdir('D:')`. That
-     * is not masked by the `exists` guard, because `fs.exists('D:')` is **false**
-     * while `fs.exists('D:/')` is true (measured). Normally hidden — `getDefaultPath`
-     * glues forward slashes onto `$HOME`, keeping the drive inside the first
-     * segment — but `CNO_STORAGE_DIR=D:/` reproduced it as
-     * `EEXIST: file already exists, path 'D:'`.
-     *
-     * Also normalizes backslashes: this split on `/` only, so a native Windows
-     * path arrived as one unsplittable segment.
-     */
-    private mkdirRecursive(path: string): void {
-        if (!path || path === '.') return;
-
-        const normalized = path.replace(/\\/g, '/');
-        // Drive-absolute (`D:/x`), drive-relative (`D:x`), UNC/verbatim (`//srv/share`),
-        // posix-absolute, or relative — each has a different uncreatable prefix.
-        let root = '';
-        let rest = normalized;
-        const drive = /^([a-zA-Z]:)(\/?)/.exec(normalized);
-        if (drive) {
-            root = drive[1] + (drive[2] ? '/' : '');
-            rest = normalized.slice(drive[0].length);
-        } else if (normalized.startsWith('//')) {
-            // Keep `//server/share` (or `//?/D:/`) intact; its parts are not creatable.
-            const seg = normalized.slice(2).split('/').filter(Boolean);
-            const keep = seg.slice(0, 2).join('/');
-            root = `//${keep}/`;
-            rest = normalized.slice(root.length);
-        } else if (normalized.startsWith('/')) {
-            root = '/';
-            rest = normalized.slice(1);
-        }
-
-        let current = root;
-        for (const part of rest.split('/').filter(p => p)) {
-            current += part;
-            if (!fs.exists(current)) {
-                try {
-                    fs.mkdir(current, 0o755);
-                } catch (e) {
-                    // Tolerate a lost race only when a directory really is there now.
-                    if (!fs.exists(current)) throw e;
-                }
-            }
-            current += '/';
-        }
+        const dir = dirname(this.options.path);
+        if (dir && dir !== '.') ensureDirectorySync(dir, 0o755);
     }
 
     /**
@@ -836,7 +771,7 @@ class StorageManager {
         };
         const writableRoot = (dir: string): boolean => {
             if (!dir) return false;
-            const probe = `${dir}/.cno-storage-probe-${os.pid}`;
+            const probe = join(dir, `.cno-storage-probe-${os.pid}`);
             try {
                 fs.writeFile(probe, new ArrayBuffer(0));
                 fs.unlink(probe);
@@ -849,8 +784,8 @@ class StorageManager {
         const hash = crypto.hexEncode(crypto.md5(engine.encodeString(cwd)));
         const preferred = getEnv('CNO_STORAGE_DIR') || getEnv('HOME') || os.tmpDir || cwd;
         const homeDir = writableRoot(preferred) ? preferred : (os.tmpDir || cwd);
-        const baseDir = `${homeDir}/.storage/${hash}`;
-        return `${baseDir}/${name}.db`;
+        const baseDir = join(homeDir, '.storage', hash);
+        return join(baseDir, `${name}.db`);
     }
 
     /**

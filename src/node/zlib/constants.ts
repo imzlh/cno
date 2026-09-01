@@ -315,11 +315,6 @@ export function toUint8Array(data: ZlibInput): Uint8Array {
     throw zlibInputTypeError(data);
 }
 
-export function validateZlibInput(data: ZlibInput): void {
-    if (typeof data === 'string' || data instanceof ArrayBuffer || ArrayBuffer.isView(data)) return;
-    throw zlibInputTypeError(data);
-}
-
 /**
  * null is a valid "use the default" for Node, but the native call needs
  * undefined. NaN passes Node's range check (all comparisons are false) yet the
@@ -415,8 +410,3 @@ export const hasGzipMagic = (data: Uint8Array): boolean => data.length >= 2 && d
  * decodes fine.
  */
 export const trailingIsPadding = (data: Uint8Array): boolean => data.length > 0 && data[0] === 0;
-
-export function isAllZeros(data: Uint8Array): boolean {
-    for (let i = 0; i < data.length; i++) if (data[i] !== 0) return false;
-    return true;
-}

@@ -82,7 +82,10 @@ export function warnOnce(flag: { fired: boolean }, message: string): void {
     if (flag.fired) return;
     flag.fired = true;
     try {
-        process.emitWarning(message, 'UnsupportedWarning');
+        const emitWarning = Reflect.get(process, 'emitWarning');
+        if (typeof emitWarning === 'function') {
+            emitWarning.call(process, message, 'UnsupportedWarning');
+        }
     } catch {
         /* emitWarning unavailable */
     }

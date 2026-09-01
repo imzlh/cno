@@ -1,5 +1,7 @@
 #!/usr/bin/env -S deno run -A --unstable-kv
 
+import { toFsPath } from "../src/utils/path.ts";
+
 const console = import.meta.use('console');
 type KvKeyPart = string | number | bigint | boolean | Uint8Array;
 type KvKey = readonly KvKeyPart[];
@@ -67,7 +69,7 @@ if (Deno.args[0] === HELPER_FLAG) {
 
 async function runMain(): Promise<void> {
   const options = parseArgs(Deno.args);
-  const scriptPath = fromFileUrl(new URL(import.meta.url));
+  const scriptPath = toFsPath(new URL(import.meta.url));
   const sourcePath = normalizeCnoKvPath(options.source);
 
   ensureFileExists(sourcePath, "source cno kv");
@@ -292,8 +294,8 @@ function detectCnoBin(): string {
   if (envBin) return envBin;
 
   const candidates = [
-    fromFileUrl(new URL("../../build/stage/cno.exe", import.meta.url)),
-    fromFileUrl(new URL("../../build/stage/cno", import.meta.url)),
+    toFsPath(new URL("../../build/stage/cno.exe", import.meta.url)),
+    toFsPath(new URL("../../build/stage/cno", import.meta.url)),
     "cno",
   ];
 
@@ -665,12 +667,4 @@ function formatKey(key: KvKey): string {
     if (value instanceof Uint8Array) return { type: "Uint8Array", value: Array.from(value) };
     return value;
   });
-}
-
-function fromFileUrl(url: URL): string {
-  const pathname = decodeURIComponent(url.pathname);
-  if (/^\/[a-zA-Z]:\//.test(pathname)) {
-    return pathname.slice(1).replace(/\//g, "\\");
-  }
-  return pathname;
 }

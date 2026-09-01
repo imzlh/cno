@@ -5,7 +5,14 @@ import {
     getTransferList,
     structuredCloneWithTransfer,
 } from "../node/_internal/structured-clone";
-import { MessagePort, closedSymbol, enqueueMessagePortMessage, isMessagePort, moveMessagePort } from "./messaging";
+import {
+    MessagePort,
+    addMessagePortDisentangleListener,
+    closedSymbol,
+    enqueueMessagePortMessage,
+    isMessagePort,
+    moveMessagePort,
+} from "./messaging";
 import {
     detachWorkerBroadcastPipe,
     handleBroadcastDelivery,
@@ -17,10 +24,84 @@ const worker = import.meta.use('worker');
 const crypto = import.meta.use('crypto');
 const os = import.meta.use('os');
 const timers = import.meta.use('timers');
+const error = import.meta.use('error');
 
 const PORT_PLACEHOLDER = '__cno_transferred_message_port__';
-const localPortEndpoints = new Map<string, MessagePort>();
-const remotePorts = new Map<string, MessagePort>();
+type LocalPortEndpoint = {
+    port: MessagePort;
+    pipe: CModuleWorker.MessagePipe;
+    listener: EventListener;
+    nativeClose: () => void;
+    removeDisentangleListener: () => void;
+};
+type RemotePortEndpoint = {
+    port: MessagePort;
+    pipe: CModuleWorker.MessagePipe;
+    nativeClose: () => void;
+    removeDisentangleListener: () => void;
+};
+
+// A transferred port is backed by a native MessagePipe. Keep the pipe in the
+// registry entry so worker shutdown can release every closure and queued port
+// belonging to that worker instead of retaining them in process-global maps.
+const localPortEndpoints = new Map<string, LocalPortEndpoint>();
+const remotePorts = new Map<string, RemotePortEndpoint>();
+
+type PipeRefState = {
+    message: boolean;
+    ports: number;
+    refed: boolean;
+};
+
+// A worker control pipe can be kept alive by either global `message`
+// listeners or transferred MessagePort endpoints. Track both reasons so
+// removing one kind of listener cannot accidentally unref the other.
+const pipeRefStates = new Map<CModuleWorker.MessagePipe, PipeRefState>();
+
+function pipeRefState(pipe: CModuleWorker.MessagePipe): PipeRefState {
+    let state = pipeRefStates.get(pipe);
+    if (!state) {
+        // Native MessagePipe handles start ref'ed.
+        state = { message: false, ports: 0, refed: true };
+        pipeRefStates.set(pipe, state);
+    }
+    return state;
+}
+
+function refreshPipeRef(pipe: CModuleWorker.MessagePipe, state = pipeRefState(pipe)): void {
+    const shouldRef = state.message || state.ports > 0;
+    if (state.refed === shouldRef) return;
+    state.refed = shouldRef;
+    try {
+        if (shouldRef) pipe.ref();
+        else pipe.unref();
+    } catch {
+        // The native handle may already be closing during runtime teardown.
+    }
+}
+
+function setMessagePipeRef(pipe: CModuleWorker.MessagePipe, refed: boolean): void {
+    const state = pipeRefState(pipe);
+    state.message = refed;
+    refreshPipeRef(pipe, state);
+}
+
+function retainPortPipe(pipe: CModuleWorker.MessagePipe): void {
+    const state = pipeRefState(pipe);
+    state.ports++;
+    refreshPipeRef(pipe, state);
+}
+
+function releasePortPipe(pipe: CModuleWorker.MessagePipe): void {
+    const state = pipeRefStates.get(pipe);
+    if (!state) return;
+    if (state.ports > 0) state.ports--;
+    refreshPipeRef(pipe, state);
+}
+
+function disposePipeRefState(pipe: CModuleWorker.MessagePipe): void {
+    pipeRefStates.delete(pipe);
+}
 type PortPlaceholder = { [PORT_PLACEHOLDER]: string };
 type MessagePipePayload = { data: unknown; transfer?: { ports?: string[] } };
 type RecordLike = Record<PropertyKey, unknown>;
@@ -62,6 +143,10 @@ function isClosedPort(port: MessagePort): boolean {
     return port[closedSymbol];
 }
 
+function isPipeEof(value: unknown): boolean {
+    return isRecord(value) && Reflect.get(value, 'code') === error.errno.EOF;
+}
+
 function generateId(): string {
     const bytes = new Uint8Array(8);
     crypto.randomFill(bytes);
@@ -76,10 +161,16 @@ function isPortPlaceholder(value: unknown): value is PortPlaceholder {
 
 function createRemotePort(id: string, pipe: CModuleWorker.MessagePipe): MessagePort {
     const existing = remotePorts.get(id);
-    if (existing) return existing;
+    if (existing) return existing.port;
 
     const port = new MessagePort();
     const close = port.close.bind(port);
+    const endpoint: RemotePortEndpoint = {
+        port,
+        pipe,
+        nativeClose: close,
+        removeDisentangleListener: () => {},
+    };
     port.postMessage = (message: unknown, transferOrOptions?: Transferable[] | StructuredSerializeOptions) => {
         if (isClosedPort(port)) {
             throw new DOMException('MessagePort is closed', 'InvalidStateError');
@@ -89,11 +180,15 @@ function createRemotePort(id: string, pipe: CModuleWorker.MessagePipe): MessageP
     };
     port.close = () => {
         if (isClosedPort(port)) return;
-        close();
-        remotePorts.delete(id);
-        pipe.postMessage({ __cno_port_close: { id } });
+        closeRemotePortEndpoint(id, endpoint, true);
     };
-    remotePorts.set(id, port);
+    remotePorts.set(id, endpoint);
+    retainPortPipe(pipe);
+    endpoint.removeDisentangleListener = addMessagePortDisentangleListener(port, () => {
+        // Disentanglement also occurs when the endpoint is transferred again;
+        // that path must not signal a peer-side close.
+        closeRemotePortEndpoint(id, endpoint, false);
+    });
     return port;
 }
 
@@ -126,12 +221,72 @@ function revivePortPlaceholders(value: unknown, pipe: CModuleWorker.MessagePipe,
 }
 
 function bindLocalPortEndpoint(id: string, port: MessagePort, pipe: CModuleWorker.MessagePipe): void {
-    localPortEndpoints.set(id, port);
-    port.addEventListener('message', (event: Event) => {
+    const listener: EventListener = (event: Event) => {
+        // The endpoint may have been torn down while a queued message was
+        // being delivered. Avoid writing through a stale pipe in that case.
+        const endpoint = localPortEndpoints.get(id);
+        if (!endpoint || endpoint.port !== port || endpoint.pipe !== pipe || isClosedPort(port)) return;
         const messageEvent = event as MessageEvent;
         const encoded = encodeMessageForPipe(messageEvent.data, messageEvent.ports, pipe);
         pipe.postMessage({ __cno_port_message: { id, ...encoded } });
+    };
+    const previous = localPortEndpoints.get(id);
+    if (previous) closeLocalPortEndpoint(id, previous, false);
+    const endpoint: LocalPortEndpoint = {
+        port,
+        pipe,
+        listener,
+        nativeClose: port.close.bind(port),
+        removeDisentangleListener: () => {},
+    };
+    // Publish the endpoint before installing the lifecycle hook: registering a
+    // hook on an already-closed port invokes it synchronously.
+    localPortEndpoints.set(id, endpoint);
+    retainPortPipe(pipe);
+    port.close = () => {
+        if (isClosedPort(port)) return;
+        closeLocalPortEndpoint(id, endpoint, true);
+    };
+    port.addEventListener('message', listener);
+    endpoint.removeDisentangleListener = addMessagePortDisentangleListener(port, () => {
+        // A transfer also disentangles the old endpoint. The new clone owns
+        // the route, so only an explicit close should notify the peer.
+        closeLocalPortEndpoint(id, endpoint, false);
     });
+}
+
+function closeLocalPortEndpoint(id: string, endpoint: LocalPortEndpoint, notifyPeer: boolean): void {
+    if (localPortEndpoints.get(id) !== endpoint) return;
+    localPortEndpoints.delete(id);
+    endpoint.port.removeEventListener('message', endpoint.listener);
+    endpoint.removeDisentangleListener();
+    if (!isClosedPort(endpoint.port)) endpoint.nativeClose();
+    if (notifyPeer) {
+        try { endpoint.pipe.postMessage({ __cno_port_close: { id } }); } catch { /* pipe teardown already owns cleanup */ }
+    }
+    releasePortPipe(endpoint.pipe);
+}
+
+function closeRemotePortEndpoint(id: string, endpoint: RemotePortEndpoint, notifyPeer: boolean): void {
+    if (remotePorts.get(id) !== endpoint) return;
+    remotePorts.delete(id);
+    endpoint.removeDisentangleListener();
+    if (!isClosedPort(endpoint.port)) endpoint.nativeClose();
+    if (notifyPeer) {
+        try { endpoint.pipe.postMessage({ __cno_port_close: { id } }); } catch { /* pipe teardown already owns cleanup */ }
+    }
+    releasePortPipe(endpoint.pipe);
+}
+
+/** Release all transferred ports and their listeners associated with a pipe. */
+function detachWorkerPortPipe(pipe: CModuleWorker.MessagePipe): void {
+    for (const [id, endpoint] of localPortEndpoints) {
+        if (endpoint.pipe === pipe) closeLocalPortEndpoint(id, endpoint, false);
+    }
+    for (const [id, endpoint] of remotePorts) {
+        if (endpoint.pipe === pipe) closeRemotePortEndpoint(id, endpoint, false);
+    }
+    disposePipeRefState(pipe);
 }
 
 function encodeMessageForPipe(
@@ -214,27 +369,39 @@ function handlePortControlMessage(rawData: unknown, pipe: CModuleWorker.MessageP
 
     const portMessage = rawData.__cno_port_message;
     if (isRecord(portMessage) && typeof portMessage.id === 'string') {
+        const localCandidate = localPortEndpoints.get(portMessage.id);
+        const localEndpoint = localCandidate?.pipe === pipe ? localCandidate : undefined;
+        const remoteCandidate = remotePorts.get(portMessage.id);
+        const remoteEndpoint = remoteCandidate?.pipe === pipe ? remoteCandidate : undefined;
+        if (!localEndpoint && !remoteEndpoint) {
+            const orphanIds = new Set<string>([portMessage.id]);
+            const transfer = portMessage.transfer;
+            const rawPorts = isRecord(transfer) ? transfer.ports : undefined;
+            if (Array.isArray(rawPorts)) {
+                for (const id of rawPorts) if (typeof id === 'string') orphanIds.add(id);
+            }
+            for (const id of orphanIds) {
+                try { pipe.postMessage({ __cno_port_close: { id } }); } catch { break; }
+            }
+            return true;
+        }
         const decoded = decodeMessageFromPipe(portMessage.transfer
             ? { __cno_data: portMessage.data, __cno_transfer: portMessage.transfer }
             : portMessage.data, pipe);
-        const localPort = localPortEndpoints.get(portMessage.id);
-        if (localPort) {
-            localPort.postMessage(decoded.data, decoded.ports);
-        } else {
-            const remotePort = remotePorts.get(portMessage.id);
-            if (remotePort) enqueueMessagePortMessage(remotePort, decoded.data, decoded.ports);
+        if (localEndpoint) {
+            localEndpoint.port.postMessage(decoded.data, decoded.ports);
+        } else if (remoteEndpoint) {
+            enqueueMessagePortMessage(remoteEndpoint.port, decoded.data, decoded.ports);
         }
         return true;
     }
 
     const portClose = rawData.__cno_port_close;
     if (isRecord(portClose) && typeof portClose.id === 'string') {
-        localPortEndpoints.delete(portClose.id);
-        const remotePort = remotePorts.get(portClose.id);
-        if (remotePort) {
-            remotePorts.delete(portClose.id);
-            remotePort.close();
-        }
+        const localEndpoint = localPortEndpoints.get(portClose.id);
+        if (localEndpoint?.pipe === pipe) closeLocalPortEndpoint(portClose.id, localEndpoint, false);
+        const remoteEndpoint = remotePorts.get(portClose.id);
+        if (remoteEndpoint?.pipe === pipe) closeRemotePortEndpoint(portClose.id, remoteEndpoint, false);
         return true;
     }
 
@@ -271,6 +438,11 @@ class Worker extends EventTarget implements globalThis.Worker {
             if (handleWorkerBroadcastControl(p, rawData)) return;
             if (handlePortControlMessage(rawData, p)) return;
 
+            if (isRecord(rawData)
+                && ('__cno_node_worker_ready__' in rawData
+                    || '__cno_node_worker_exit__' in rawData
+                    || '__cno_node_worker_error__' in rawData)) return;
+
             if (isRecord(rawData)) {
                 if (rawData.__cno_role === 'error') {
                     const fallbackMessage = typeof rawData.message === 'string' ? rawData.message : 'Unknown error';
@@ -294,8 +466,19 @@ class Worker extends EventTarget implements globalThis.Worker {
 
         p.onmessageerror = (e: unknown) => {
             if (this.#terminated) return;
-            const event = new MessageEvent('messageerror', { data: e }, true);
-            this.dispatchEvent(event);
+            if (isPipeEof(e)) {
+                this.#terminated = true;
+                this.#detachMessagePipe(p);
+                this.#worker.terminate();
+            }
+            this.dispatchEvent(new MessageEvent('messageerror', { data: e }, true));
+        };
+
+        p.onclose = () => {
+            if (this.#terminated) return;
+            this.#terminated = true;
+            this.#detachMessagePipe(p);
+            this.#worker.terminate();
         };
     }
 
@@ -359,7 +542,7 @@ class Worker extends EventTarget implements globalThis.Worker {
     terminate(): void {
         if (this.#terminated) return;
         this.#terminated = true;
-        detachWorkerBroadcastPipe(this.#worker.messagePipe);
+        this.#detachMessagePipe(this.#worker.messagePipe);
         return this.#worker.terminate();
     }
 
@@ -393,6 +576,15 @@ class Worker extends EventTarget implements globalThis.Worker {
             if (event !== undefined) this.#dispatchMessage(event);
         }
     }
+
+    #detachMessagePipe(pipe: CModuleWorker.MessagePipe): void {
+        pipe.onmessage = undefined;
+        pipe.onmessageerror = undefined;
+        pipe.onclose = undefined;
+        detachWorkerBroadcastPipe(pipe);
+        detachWorkerPortPipe(pipe);
+        this.#messageQueue.length = 0;
+    }
 }
 
 if (worker.isWorker) {
@@ -422,12 +614,82 @@ if (worker.isWorker) {
         onerror: null as ((ev: ErrorEvent) => unknown) | null
     };
     const messageQueue: MessageEvent[] = [];
+    // Keep this sticky: messages sent while no listener is registered are dropped,
+    // not retained and replayed when a later listener is added.
     let messageConsumerReady = false;
+    let messageFlushScheduled = false;
+    let flushingMessages = false;
+    type MessageListener = EventListenerOrEventListenerObject;
+    type MessageListenerRecord = {
+        listener: MessageListener;
+        capture: boolean;
+        once: boolean;
+        wrapped: EventListener;
+        signal?: AbortSignal;
+        abortHandler?: () => void;
+    };
+    const messageListeners: MessageListenerRecord[] = [];
+    const addEventListener = self.addEventListener.bind(self);
+    const removeEventListener = self.removeEventListener.bind(self);
+    const setPipeRef = (refed: boolean): void => {
+        setMessagePipeRef(pipe, refed);
+    };
+
+    const captureOption = (options?: boolean | EventListenerOptions): boolean =>
+        typeof options === 'boolean' ? options : !!options?.capture;
+    const findMessageListener = (listener: MessageListener, capture: boolean): MessageListenerRecord | undefined =>
+        messageListeners.find((entry) => entry.listener === listener && entry.capture === capture);
+    const releaseMessageListener = (entry: MessageListenerRecord): void => {
+        const index = messageListeners.indexOf(entry);
+        if (index === -1) return;
+        messageListeners.splice(index, 1);
+        removeEventListener('message', entry.wrapped, entry.capture);
+        entry.signal?.removeEventListener('abort', entry.abortHandler!);
+        if (messageListeners.length === 0) setPipeRef(false);
+    };
+    const addMessageListener = (listener: MessageListener, options?: boolean | AddEventListenerOptions): void => {
+        const capture = captureOption(options);
+        const signal = typeof options === 'boolean' ? undefined : options?.signal;
+        if (signal?.aborted || findMessageListener(listener, capture)) return;
+
+        const entry = {} as MessageListenerRecord;
+        entry.listener = listener;
+        entry.capture = capture;
+        entry.once = typeof options !== 'boolean' && !!options?.once;
+        entry.signal = signal;
+        entry.wrapped = (event: Event): void => {
+            if (entry.once) releaseMessageListener(entry);
+            if (typeof entry.listener === 'function') {
+                entry.listener.call(self, event);
+            } else {
+                entry.listener.handleEvent?.call(entry.listener, event);
+            }
+        };
+        messageListeners.push(entry);
+        addEventListener('message', entry.wrapped, options);
+        if (signal) {
+            entry.abortHandler = () => releaseMessageListener(entry);
+            signal.addEventListener('abort', entry.abortHandler, { once: true });
+            if (signal.aborted) releaseMessageListener(entry);
+        }
+        if (messageListeners.includes(entry)) {
+            setPipeRef(true);
+            messageConsumerReady = true;
+            scheduleMessageFlush();
+        }
+    };
+    const removeMessageListener = (listener: MessageListener, options?: boolean | EventListenerOptions): boolean => {
+        const entry = findMessageListener(listener, captureOption(options));
+        if (!entry) return false;
+        releaseMessageListener(entry);
+        return true;
+    };
+    // The control pipe is an implementation detail. It must not keep a worker
+    // alive until user code opts into receiving messages.
+    setPipeRef(false);
     let messageListener: ((event: Event) => void) | null = null;
     let messageErrorListener: ((event: Event) => void) | null = null;
     let errorListener: ((event: Event) => void) | null = null;
-    const addEventListener = self.addEventListener.bind(self);
-    const removeEventListener = self.removeEventListener.bind(self);
     let workerClosing = false;
 
     const isWorkerCloseError = (value: unknown): boolean => {
@@ -446,33 +708,53 @@ if (worker.isWorker) {
     });
 
     const dispatchMessage = (event: MessageEvent) => {
-        if (!messageConsumerReady) {
+        // Keep frames received while a deferred queue flush is pending in
+        // arrival order. A native pipe callback can run before the scheduled
+        // microtask, so dispatching it directly would overtake older frames.
+        if (!messageConsumerReady || (messageQueue.length > 0 && !flushingMessages)) {
             messageQueue.push(event);
+            if (messageConsumerReady) scheduleMessageFlush();
             return;
         }
         self.dispatchEvent(event);
     };
 
     const flushMessages = () => {
-        while (messageQueue.length > 0) {
-            const event = messageQueue.shift();
-            if (event !== undefined) dispatchMessage(event);
+        if (flushingMessages) return;
+        flushingMessages = true;
+        try {
+            while (messageQueue.length > 0) {
+                const event = messageQueue.shift();
+                if (event !== undefined) self.dispatchEvent(event);
+            }
+        } finally {
+            flushingMessages = false;
         }
+    };
+
+    // A message may already be queued when the entry module starts registering
+    // listeners. Defer the flush until the current turn completes so a listener
+    // can add/remove capture variants atomically before the queued event runs.
+    const scheduleMessageFlush = (): void => {
+        if (messageFlushScheduled || messageQueue.length === 0) return;
+        messageFlushScheduled = true;
+        queueMicrotask(() => {
+            messageFlushScheduled = false;
+            if (messageConsumerReady) flushMessages();
+        });
     };
 
     Object.defineProperty(self, 'onmessage', {
         get() { return events.onmessage; },
         set(value: ((ev: MessageEvent) => unknown) | null) {
             if (messageListener) {
-                removeEventListener('message', messageListener);
+                removeMessageListener(messageListener);
                 messageListener = null;
             }
             events.onmessage = typeof value === 'function' ? value : null;
             if (events.onmessage) {
                 messageListener = (event) => events.onmessage?.(event as MessageEvent);
-                addEventListener('message', messageListener);
-                messageConsumerReady = true;
-                flushMessages();
+                addMessageListener(messageListener);
             }
         }
     });
@@ -515,11 +797,21 @@ if (worker.isWorker) {
         options?: boolean | AddEventListenerOptions,
     ) => {
         if (!listener) return;
-        addEventListener(type, listener, options);
-        if (type === 'message') {
-            messageConsumerReady = true;
-            flushMessages();
+        if (type === 'message' && listener) {
+            addMessageListener(listener, options);
+            return;
         }
+        addEventListener(type, listener, options);
+    });
+
+    Reflect.set(self, 'removeEventListener', (
+        type: string,
+        listener: EventListenerOrEventListenerObject | null,
+        options?: boolean | EventListenerOptions,
+    ) => {
+        if (!listener) return;
+        if (type === 'message' && listener && removeMessageListener(listener, options)) return;
+        removeEventListener(type, listener, options);
     });
 
     addEventListener('error', (event) => {
@@ -566,6 +858,8 @@ if (worker.isWorker) {
     };
 
     pipe.onmessageerror = (e: unknown) => {
+        detachWorkerBroadcastPipe(pipe);
+        detachWorkerPortPipe(pipe);
         const event = new MessageEvent('messageerror', { data: e }, true);
         self.dispatchEvent(event);
     };

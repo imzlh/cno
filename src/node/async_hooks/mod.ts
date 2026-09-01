@@ -293,6 +293,17 @@ function installTimersPatches(): void {
             _handleStates.set(handle, state);
             return handle;
         });
+
+        if (originalClearImmediate) {
+            setGlobalFunction('clearImmediate', function(handle: TimerHandle): void {
+                const state = _handleStates.get(handle);
+                if (state) {
+                    _handleStates.delete(handle);
+                    emitDestroy(state.id);
+                }
+                originalClearImmediate(handle);
+            });
+        }
     }
 
     const setIntervalFn = getGlobalFunction('setInterval');

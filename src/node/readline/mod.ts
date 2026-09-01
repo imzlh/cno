@@ -3,9 +3,10 @@
  * Based on circu.js streams TTY/Pipe for terminal I/O
  */
 
-import type { Stream } from '../../deno/04_stdio';
 import { EventEmitter } from '../events';
 import { arrayBufferBackedBytes } from '../_internal/buffer';
+import { flattenPrototype } from '../_internal/prototype';
+import type { NodeStdioStream as Stream } from '../_internal/stdio';
 
 const streams = import.meta.use('streams');
 const engine = import.meta.use('engine');
@@ -87,23 +88,6 @@ function flushPendingLine(self: Interface): void {
     const line = self._lineBuf.join('');
     self._lineBuf = [];
     self.emit('line', line);
-}
-
-function flattenPrototype(target: object): void {
-    const parent = Object.getPrototypeOf(target);
-    if (!parent || parent === Object.prototype) return;
-
-    for (const key of Object.getOwnPropertyNames(parent)) {
-        if (key === 'constructor' || Object.prototype.hasOwnProperty.call(target, key)) continue;
-        const descriptor = Object.getOwnPropertyDescriptor(parent, key);
-        if (descriptor) Object.defineProperty(target, key, descriptor);
-    }
-
-    for (const key of Object.getOwnPropertySymbols(parent)) {
-        if (Object.prototype.hasOwnProperty.call(target, key)) continue;
-        const descriptor = Object.getOwnPropertyDescriptor(parent, key);
-        if (descriptor) Object.defineProperty(target, key, descriptor);
-    }
 }
 
 export interface Interface extends EventEmitter {

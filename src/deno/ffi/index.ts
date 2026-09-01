@@ -7,7 +7,7 @@
 export { UnsafePointer, UnsafePointerView } from './pointer';
 export { UnsafeCallback } from './callback';
 export { UnsafeFnPointer } from './fn_pointer';
-export { dlopen, DynamicLibraryImpl } from './library';
+export { dlopen, DynamicLibrary } from './library';
 
 import { UnsafePointer, UnsafePointerView } from './pointer';
 import { UnsafeCallback } from './callback';

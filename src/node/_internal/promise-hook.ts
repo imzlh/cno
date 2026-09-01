@@ -32,24 +32,10 @@ const callbacks = new Set<PromiseHookCallback>();
 let dispatcher: NativeHook | null = null;
 let previousHook: NativeHook | null = null;
 
-function readNativeHook(): NativeHook | null {
-    const existing: unknown = engine.promiseHook();
-    return typeof existing === 'function' ? (existing as NativeHook) : null;
-}
-
-function invokeCallbacks(state: number, promise: Promise<unknown>, parent?: Promise<unknown>): void {
-    for (const cb of callbacks) {
-        try {
-            cb(state, promise, parent);
-        } catch {
-            // A consumer hook must not break other consumers
-        }
-    }
-}
-
 function installDispatcher(): void {
     if (dispatcher) return;
-    previousHook = readNativeHook();
+    const existing: unknown = engine.promiseHook();
+    previousHook = typeof existing === 'function' ? (existing as NativeHook) : null;
     dispatcher = (state: number, promise: Promise<unknown>, parent?: Promise<unknown>) => {
         // Chain to the previous hook first (if any foreign code installed one)
         if (previousHook) {
@@ -60,7 +46,13 @@ function installDispatcher(): void {
             }
         }
         // Then dispatch to all registered consumers
-        invokeCallbacks(state, promise, parent);
+        for (const cb of callbacks) {
+            try {
+                cb(state, promise, parent);
+            } catch {
+                // A consumer hook must not break other consumers
+            }
+        }
     };
     engine.promiseHook(dispatcher);
 }

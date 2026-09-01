@@ -22,6 +22,7 @@ Some examples use a different entry file; see the table below.
 | `cnoterm/` | `index.ts` | CNO-specific pty-backed terminal-in-browser example |
 | `ssr2clash/` | `index.ts` or `main.ts` | Script-style URL/config conversion example |
 | `netease/` | `index.ts` or `main.ts` | Larger TypeScript example with shared local modules |
+| `zygote/` | `index.ts` | Reusable Linux prefork supervisor with two HTTP roles |
 
 ## Notes
 

@@ -9,10 +9,6 @@ function sameValueZero(a: unknown, b: unknown): boolean {
     return a === b || (typeof a === 'number' && typeof b === 'number' && Number.isNaN(a) && Number.isNaN(b));
 }
 
-function primitiveEqual(a: unknown, b: unknown, strict: boolean): boolean {
-    return strict ? Object.is(a, b) : sameValueZero(a, b);
-}
-
 // Loose mode ignores prototype identity but still separates object *kinds*:
 // Node reports `Object.create(null)` == `{}` yet `[]` != `{}` and
 // `new Error('x')` != `{ message: 'x' }`.
@@ -219,9 +215,9 @@ function compareObjects(
     }
 
     // Boxed primitives
-    if (a instanceof Number && b instanceof Number) return primitiveEqual(a.valueOf(), b.valueOf(), strict);
-    if (a instanceof Boolean && b instanceof Boolean) return primitiveEqual(a.valueOf(), b.valueOf(), strict);
-    if (a instanceof String && b instanceof String) return primitiveEqual(a.valueOf(), b.valueOf(), strict);
+    if (a instanceof Number && b instanceof Number) return strict ? Object.is(a.valueOf(), b.valueOf()) : sameValueZero(a.valueOf(), b.valueOf());
+    if (a instanceof Boolean && b instanceof Boolean) return strict ? Object.is(a.valueOf(), b.valueOf()) : sameValueZero(a.valueOf(), b.valueOf());
+    if (a instanceof String && b instanceof String) return strict ? Object.is(a.valueOf(), b.valueOf()) : sameValueZero(a.valueOf(), b.valueOf());
 
     // Types Node can only compare by reference: their contents are not
     // enumerable, so two distinct instances are never deep-equal. Reference

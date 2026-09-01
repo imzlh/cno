@@ -161,10 +161,6 @@ function hasMagic(segment: string): boolean {
     return /[*?[\]{}()]/.test(segment);
 }
 
-function escapeRegExp(value: string): string {
-    return value.replace(/[.+^$|{}\\]/g, '\\$&');
-}
-
 function findClosingParen(segment: string, start: number): number {
     let depth = 0;
     for (let index = start; index < segment.length; index++) {
@@ -216,7 +212,7 @@ function segmentRegexSource(segment: string): string {
                 continue;
             }
         }
-        source += escapeRegExp(character);
+        source += /[.+^$|{}\\]/.test(character) ? `\\${character}` : character;
         index++;
     }
     return source;

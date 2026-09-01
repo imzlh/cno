@@ -16,6 +16,7 @@ const pipe = import.meta.use('streams');
 const sfs = import.meta.use('fs');
 const sysError = import.meta.use('error');
 const timers = import.meta.use('timers');
+const worker = import.meta.use('worker');
 
 type AnyStream = CModuleStreams.Pipe | CModuleStreams.TTY | FileStdio | NullStdio;
 
@@ -462,6 +463,13 @@ export class Stream {
 export const stdin = new Stream(os.STDIN_FILENO, true, true);
 export const stdout = new Stream(os.STDOUT_FILENO, false, true);
 export const stderr = new Stream(os.STDERR_FILENO, false, true);
+
+if (worker.isWorker) {
+    for (const standardStream of [stdin, stdout, stderr]) {
+        const nativeStream = standardStream.__stream as { unref?: () => void };
+        nativeStream.unref?.();
+    }
+}
 
 // Expose to the node polyfill via the native `streams` namespace (node reaches
 // them with import.meta.use('streams') instead of importing across the boundary).

@@ -13,6 +13,9 @@ import {
     resolveEnvFilePath,
     type EnvFilePath,
 } from '../_internal/envfile';
+import path from '../path';
+
+const { basename, isAbsolute: isAbsolutePath, join } = path;
 
 const os = import.meta.use('os');
 const engine = import.meta.use('engine');
@@ -22,11 +25,7 @@ const streams = import.meta.use('streams');
 const console = import.meta.use('console');
 const errMod = import.meta.use('error');
 const napi = import.meta.use('nodeapi');
-// Module scope, not inside installWorkerExitReporter(): `import.meta.use` is a
-// static form the transformer rewrites, and a call in a function body (with its
-// return type referenced as `typeof import.meta.use`) failed to parse at all --
-// OBSERVED as `TransformError: process/mod: Unexpected token, expected "("`,
-// which surfaced on the parent as a worker 'error' event and exit code 1.
+// import.meta.use is transformed statically and must remain at module scope.
 const workerBinding = import.meta.use('worker');
 
 interface CnoProcessArgs {
@@ -43,20 +42,14 @@ type ProcessOsModule = typeof os & {
 
 const processOs = os as ProcessOsModule;
 const nativeUmask = processOs.umask;
-const emulatedUmaskBits = os.uname().sysname === 'Windows_NT' ? 0o600 : 0o777;
-let emulatedUmask = os.uname().sysname === 'Windows_NT' ? 0 : 0o022;
+const isWindows = os.platform === 'windows' || os.platform === 'win32';
+const emulatedUmaskBits = isWindows ? 0o600 : 0o777;
+let emulatedUmask = isWindows ? 0 : 0o022;
 
-// argv shapes come from cno/src/utils/args via the os shared namespace — node
-// modules must not import across the node/ boundary (AGENT.md). Read once here;
-// cno-cli sets argv before any user code runs, so the snapshot is stable and
-// stays mutable like Node's real process.argv.
 const cno_args = processOs.__cno_args;
 
-// Re-export streams and metrics under their original names
 export { stdout, stderr, stdin };
 export { hrtime, memoryUsage, cpuUsage, resourceUsage };
-
-// Helper functions
 
 function safeGetEnv(env: string): string | undefined {
     try {
@@ -145,11 +138,8 @@ function normalizeSignal(signal?: string | number | null): CModuleProcess.Signal
     throw codeError(new TypeError(`Unknown signal: ${signal}`), 'ERR_UNKNOWN_SIGNAL');
 }
 
-// Signal handling
-
 const signalMap: Map<string, Map<() => void, CModuleSignals.SignalHandler>> = new Map();
 
-// Signals that are not supported on this platform
 const UNSUPPORTED_SIGNALS = new Set(['SIGBREAK', 'SIGIOT', 'SIGPOLL', 'SIGSTKFLT', 'SIGUNUSED', 'SIGLOST', 'SIGINFO']);
 
 function throwIfUnsupportedSignal(signalName: string): void {
@@ -200,11 +190,7 @@ function shouldRefIpcForProcessEvent(event: string | symbol): boolean {
     return event === 'message' || event === 'disconnect';
 }
 
-/**
- * Events whose delivery depends on the native engine-event bridge below.
- * Registering one is the cue to (re)attempt installation, in case this module
- * was evaluated before the multiplexer existed.
- */
+// Retry bridge installation when a relevant listener is registered late.
 function needsEventBridge(event: string | symbol): boolean {
     return event === 'exit' ||
         event === 'beforeExit' ||
@@ -226,23 +212,10 @@ function syncIpcRef(emitter: EventEmitter): void {
     else _ipcChannel.unref();
 }
 
-// Environment variables
+// The proxy target stays empty because ownKeys is backed by the OS environment.
+const envTarget = Object.create(null) as NodeJS.ProcessEnv;
 
-/**
- * `envTarget` must stay permanently EMPTY. `ownKeys` reports only the real OS
- * environment, so any own property parked on the target breaks the Proxy
- * invariant "ownKeys must include every own key of a non-extensible target /
- * every non-configurable own key" and makes `Object.keys(process.env)`,
- * `for..in`, spread and `JSON.stringify` throw *forever*. Every trap below
- * therefore routes through the OS and never falls back to Reflect.*et on it.
- */
-const envTarget: NodeJS.ProcessEnv = {};
-
-/**
- * Node converts env values with ToString, which THROWS for a symbol
- * ("Cannot convert a Symbol value to a string") rather than yielding
- * "Symbol(x)" the way `String(sym)` would. Same for a symbol used as a key.
- */
+// ToString rejects symbols; String(symbol) would incorrectly accept them.
 function envToString(value: unknown): string {
     if (typeof value === 'symbol') {
         throw new TypeError('Cannot convert a Symbol value to a string');
@@ -250,17 +223,11 @@ function envToString(value: unknown): string {
     return `${value as string}`;
 }
 
-/**
- * Windows rejects a name containing `=` or an empty name; POSIX likewise.
- * Node's setenv/unsetenv fail SILENTLY there (the assignment is a no-op and the
- * read returns undefined) — verified on v24.18/win32. The native binding raises
- * EINVAL instead, so swallow it or a config loader iterating keys would crash.
- */
+// Node treats invalid environment names as no-ops.
 function setEnvQuietly(key: string, value: string): void {
     try {
         os.setenv(key, value);
     } catch {
-        // Match Node: an unusable variable name is a silent no-op.
     }
 }
 
@@ -277,13 +244,9 @@ const envProxy = new Proxy(envTarget, {
         }
         const value = safeGetEnv(key);
         if (value !== undefined) return value;
-        // Inherited members (toString, hasOwnProperty, ...) still resolve, but
-        // the target itself carries no own keys.
         return Reflect.get(target, key, receiver);
     },
     set(_target, key: string | symbol, value: unknown): boolean {
-        // A symbol key must throw like Node rather than being parked on the
-        // target, where it would also show up in getOwnPropertySymbols.
         const name = envToString(key);
         setEnvQuietly(name, envToString(value));
         return true;
@@ -306,8 +269,6 @@ const envProxy = new Proxy(envTarget, {
         }
         const value = safeGetEnv(key);
         if (value === undefined) return undefined;
-        // `writable` must be spelled out: omitting it defaults to false, which
-        // makes the descriptor read-only and violates the ownKeys invariant.
         return {
             value,
             writable: true,
@@ -316,8 +277,6 @@ const envProxy = new Proxy(envTarget, {
         };
     },
     defineProperty(_target, key: string | symbol, desc: PropertyDescriptor): boolean {
-        // Node only accepts a fully configurable+writable+enumerable DATA
-        // descriptor and forwards it to setenv; anything else is a TypeError.
         const name = envToString(key);
         if ('get' in desc || 'set' in desc) {
             throw invalidDefineProperty(
@@ -333,12 +292,9 @@ const envProxy = new Proxy(envTarget, {
         return true;
     },
     preventExtensions(): boolean {
-        // Node throws instead of letting the env be sealed.
         throw new TypeError('Cannot prevent extensions');
     },
 });
-
-// Process EventEmitter
 
 type ProcessListener = (...args: unknown[]) => void;
 type SendCallback = (error: Error | null) => void;
@@ -359,10 +315,6 @@ class ProcessEventEmitter extends EventEmitter {
         if (typeof event === 'string' && (event.startsWith('SIG') || event.startsWith('sig'))) {
             addSignalListener(event, listener);
         }
-        // Retry the native bridge: if this module was evaluated before the mux
-        // existed, the eager install was a no-op and 'exit'/'uncaughtException'
-        // would stay dead. Registering a listener is the point at which it
-        // starts to matter.
         retryEventBridge(event);
         const result = super.on(event, listener);
         if (shouldRefIpcForProcessEvent(event)) syncIpcRef(this);
@@ -372,18 +324,14 @@ class ProcessEventEmitter extends EventEmitter {
     override once(event: string | symbol, listener: ProcessListener): this {
         retryEventBridge(event);
         if (typeof event === 'string' && (event.startsWith('SIG') || event.startsWith('sig'))) {
-            // Register with the native signal system using a wrapper that cleans
-            // itself up AND removes the super.once listener to avoid double-fire.
+            // Keep native and EventEmitter once listeners in sync.
             const onceListener = () => {
                 removeSignalListener(event, onceListener);
-                // Remove the super.once wrapper so it doesn't fire again
                 super.off(event, wrappedListener);
                 listener();
             };
             const wrappedListener = onceListener;
             addSignalListener(event, onceListener);
-            // Register with super.once only so EventEmitter tracks the listener,
-            // but we intercept via onceListener above and remove it before it fires.
             return super.once(event, wrappedListener);
         }
         const result = super.once(event, listener);
@@ -426,27 +374,7 @@ class ProcessEventEmitter extends EventEmitter {
     }
 }
 
-/* ------------------------------------------------------------------ *
- * One emitter per process, not one per copy of this file
- * ------------------------------------------------------------------ *
- *
- * TWO copies of this module are live at once: the one baked into cno.exe and the
- * one `cno setup` writes to $CTS_CACHE_DIR/node/process/mod.ts. `import process
- * from 'node:process'` resolves to the baked copy's singleton (below), while
- * `import * as ns from 'node:process'` reaches the disk copy — so a
- * module-scoped `new ProcessEventEmitter()` gave each copy its own listener set
- * (OBSERVED: proc.emit('probe') was heard only by proc.on, procNS.emit('probe')
- * only by procNS.on, each reporting listenerCount === 1). The native 'exit'
- * bridge then emitted on whichever copy loaded last, so the portable
- * `process.on('exit')` form silently received nothing.
- *
- * The fix is the same order-independence trick the mux uses: the emitter lives on
- * a `Symbol.for()` slot, and a copy that finds one already there ADOPTS it
- * instead of creating a rival. Adoption (rather than migrating listeners across)
- * is what makes this work without a rebuild: whichever copy runs first owns the
- * emitter and all its listeners, and the second copy has none of its own to
- * move.
- */
+// The baked and cache copies can coexist; share their emitter through Symbol.for().
 const PROCESS_EE_SLOT = Symbol.for('cno.node.process.emitter');
 const PROCESS_DEFAULT_SINGLETON = Symbol.for('cno.node.process.default');
 
@@ -468,23 +396,10 @@ function isEmitterLike(value: unknown): value is EventEmitter {
         typeof v.listenerCount === 'function';
 }
 
-/**
- * The emitter behind an already-installed singleton.
- *
- * A copy old enough to predate PROCESS_EE_SLOT publishes nothing, so the slot
- * alone is not enough to unify with the currently baked binary. Its exported
- * `removeAllListeners` returns `processEE` (EventEmitter methods return `this`),
- * and called with a private symbol it is a pure no-op: nothing listens on it,
- * and syncIpcRef() only reacts to `undefined`/'message'/'disconnect'. So this
- * recovers the emitter without a rebuild and without side effects.
- */
+// Older singleton copies lack the slot; probe a no-op EventEmitter method to recover it.
 function probeSingletonEmitter(): EventEmitter | null {
     if (!existingProcessDefault) return null;
     try {
-        // Reached through Reflect.get and a plain call signature: the declared
-        // NodeJS.Process['removeAllListeners'] is an overloaded generic and
-        // `?.()` on it does not typecheck (TS2349), even though the runtime call
-        // is a straightforward one-argument invocation.
         const removeAll = Reflect.get(existingProcessDefault, 'removeAllListeners');
         if (typeof removeAll !== 'function') return null;
         const probe = (removeAll as (e: symbol) => unknown).call(
@@ -492,7 +407,7 @@ function probeSingletonEmitter(): EventEmitter | null {
             Symbol('cno.process.emitter.probe'),
         );
         if (isEmitterLike(probe) && (probe as unknown) !== existingProcessDefault) return probe;
-    } catch { /* exotic singleton; fall through */ }
+    } catch { /* treat an exotic singleton as unavailable */ }
     return null;
 }
 
@@ -502,7 +417,6 @@ function resolveProcessEmitter(): ProcessEventEmitter {
 
     const probed = probeSingletonEmitter();
     if (probed) {
-        // Publish it so a third copy finds it on the slot directly.
         Reflect.set(globalThis, PROCESS_EE_SLOT, probed);
         return probed as ProcessEventEmitter;
     }
@@ -537,7 +451,7 @@ function resolveUncaughtCaptureState(): UncaughtCaptureState {
         const existing = slots[UNCAUGHT_CAPTURE_SLOT];
         if (existing && 'callback' in existing) return existing;
         slots[UNCAUGHT_CAPTURE_SLOT] = fresh;
-    } catch { /* frozen globalThis falls back to per-copy state */ }
+    } catch { /* fall back to per-copy state */ }
     return fresh;
 }
 
@@ -573,29 +487,7 @@ function emitUserProcessEvent(event: string | symbol, ...args: unknown[]): boole
     const emit = uncaughtCaptureState.rawEmit ?? processEE.emit;
     return Reflect.apply(emit, processEE, [event, ...args]);
 }
-/* ------------------------------------------------------------------ *
- * ONE nextTick queue per process, not one per copy of this file
- * ------------------------------------------------------------------ *
- *
- * TWO copies of this module are live at once (see the emitter note above): the
- * baked one and the $CTS_CACHE_DIR/node/process/mod.ts one. A module-scoped
- * queue therefore gave each copy its own -- MEASURED: `import process` and
- * `import * as ns` expose different nextTick functions
- * (`proc.nextTick === procNS.nextTick` is false) and each used to drain its own
- * array.
- *
- * That was survivable while the drain was scheduled with queueMicrotask, because
- * each copy independently scheduled its own. It is NOT survivable with the
- * native checkpoint below: engine.setNextTickDrain() is a SINGLE-SLOT setter
- * that frees the previous function, so the second copy to load would EVICT the
- * first copy's drain and silently orphan its queue -- every callback registered
- * through the other facade would never run at all. This is the same single-slot
- * trap the engine.onEvent() note further down describes.
- *
- * So the queue and its two flags live on a Symbol.for() slot and a copy that
- * finds one already there ADOPTS it. One queue, one registration, and ordering
- * that is consistent across both facades the way node's single queue is.
- */
+// Baked and cache copies share one queue because the native drain hook is single-slot.
 const NEXT_TICK_SLOT = Symbol.for('cno.node.process.nextTickQueue.v1');
 
 type NextTickEntry = { callback: NextTickCallback; args: unknown[] };
@@ -616,29 +508,19 @@ function resolveNextTickState(): NextTickState {
     try {
         const slots = globalThis as unknown as Record<symbol, NextTickState | undefined>;
         const existing = slots[NEXT_TICK_SLOT];
-        // Adopt only something that actually looks like the state, so an exotic
-        // global cannot wedge nextTick into a permanently unusable shape.
         if (existing && Array.isArray(existing.queue)) return existing;
         slots[NEXT_TICK_SLOT] = fresh;
     } catch {
-        // Frozen or exotic globalThis: fall back to per-copy state. Degrades to
-        // the old per-copy behaviour rather than failing to schedule at all.
+        // A frozen global falls back to per-copy scheduling.
     }
     return fresh;
 }
 
 const tickState: NextTickState = resolveNextTickState();
 
-// Same array object every copy pushes into; the three use sites below are
-// ordinary array operations, so they need no further indirection.
 const nextTickQueue: NextTickEntry[] = tickState.queue;
 
 function drainNextTickQueue(): void {
-    // `scheduled` stays TRUE for the whole drain and is cleared in the finally,
-    // not on entry. A tick callback that queues another tick must not schedule a
-    // second drain -- the loop below already picks it up -- but the flag must
-    // still end up false, or the next nextTick() from a timer would see it set,
-    // return early, and never be drained at all.
     tickState.draining = true;
     try {
         while (nextTickQueue.length > 0) {
@@ -657,10 +539,6 @@ function drainNextTickQueue(): void {
     }
 }
 
-// Registered here, early in module evaluation, so a circular import that reaches
-// process.nextTick while this module is still evaluating cannot hit the TDZ of a
-// const declared further down. installNativeTickDrain() is a hoisted declaration;
-// see its comment block below for why the checkpoint has to come from C.
 const nativeTickDrain: boolean = installNativeTickDrain();
 
 function handleUncaughtException(error: unknown): void {
@@ -676,26 +554,8 @@ function handleUncaughtException(error: unknown): void {
     throw error;
 }
 
-/* ------------------------------------------------------------------ *
- * Native engine-event bridges: 'exit' and 'uncaughtException'
- * ------------------------------------------------------------------ *
- *
- * Neither existed. `processEE.emit('exit')` appeared in exactly one place —
- * inside process.exit() below — so `process.on('exit')` never fired for any
- * other termination path. And handleUncaughtException() was only ever reached
- * from the nextTick drain, so a throw from a timer, an I/O callback or a stray
- * socket 'error' produced no 'uncaughtException' at all (independently OBSERVED:
- * an unhandled socket 'error' event yielded nothing).
- *
- * Both are wired through the shared multiplexer in cts/src/runtime/event-mux.ts.
- * Not via engine.onEvent(): that is a single-slot setter which frees the
- * previous receiver (circu.js/src/mod_engine.c:871), so a direct call here would
- * destroy webapi's 'load'/'unload' bridge — trading one broken feature for
- * another. This module cannot *import* the mux (AGENT.md: node/ modules must not
- * import across the node/ boundary, and node/ is copied to the polyfill cache
- * dir where ../../../cts does not exist), so it reaches the registry through the
- * Symbol.for() slot the mux publishes for exactly this purpose.
- */
+// engine.onEvent() is single-slot. Node modules cannot import CTS because they
+// are copied independently into the polyfill cache, so use its Symbol registry.
 
 const EVENT_MUX_SLOT = Symbol.for('cno.engine.eventMux.v1');
 
@@ -710,30 +570,13 @@ function eventMux(): MuxRegistry | null {
     try {
         const slot = (globalThis as unknown as Record<symbol, unknown>)[EVENT_MUX_SLOT];
         if (slot && typeof (slot as MuxRegistry).install === 'function') return slot as MuxRegistry;
-    } catch { /* exotic global; treat as absent */ }
+    } catch { /* treat an exotic global as absent */ }
     return null;
 }
 
-/** Node fires 'exit' exactly once. Both paths that can emit it go through here. */
 let exitEmitted = false;
 
-/**
- * True while a teardown dispatch ('beforeExit' or 'exit') is running.
- *
- * Published on a `Symbol.for()` slot because the reader lives in the CLI entry
- * (src/main.ts), which this module must not import — the dependency runs the
- * other way.
- *
- * It exists because assigning `process.exitCode` has a side effect over there:
- * the setter wrapper arms a deferred-exit poll, and that poll is a ref'd timer.
- * The C counts a fresh ref'd handle as "a listener queued work" and gives the
- * loop another pass, so an assignment made FROM a 'beforeExit' listener re-armed
- * the poll, re-triggered the drain, and re-fired the listener, which assigned
- * again — an unbounded spin (OBSERVED: `beforeExit` firing forever, 13s of CPU
- * and no exit, where node fires once and exits 9). Guarding the arm with this
- * flag keeps the poll for the paths that need it and removes it from the one
- * window where the assignment is itself part of teardown.
- */
+// The CLI reads this slot to avoid rearming deferred exit during teardown.
 const IN_TEARDOWN_SLOT = Symbol.for('cno.runtime.inTeardown');
 
 function withTeardownFlag<T>(fn: () => T): T {
@@ -742,15 +585,12 @@ function withTeardownFlag<T>(fn: () => T): T {
     try {
         g[IN_TEARDOWN_SLOT] = true;
     } catch {
-        // Exotic global: the flag is an optimisation, so run the dispatch anyway.
         return fn();
     }
     try {
         return fn();
     } finally {
-        // Restored, not cleared: 'beforeExit' and 'exit' can nest (an 'exit'
-        // listener assigning a code runs inside the outer dispatch).
-        try { g[IN_TEARDOWN_SLOT] = previous; } catch { /* as above */ }
+        try { g[IN_TEARDOWN_SLOT] = previous; } catch { /* ignore an unwritable global */ }
     }
 }
 
@@ -761,21 +601,11 @@ function emitProcessExit(code: number): void {
     try {
         withTeardownFlag(() => processEE.emit('exit', code));
     } catch {
-        // A listener threw. Node prints and still exits; swallowing here keeps
-        // teardown going rather than losing the exit path entirely.
+        // Preserve the exit path when a listener throws.
     }
 }
 
-/**
- * Native id of EV_BEFORE_EXIT.
- *
- * Read from the runtime enum rather than written as `EventType.BEFORE_EXIT`
- * (the pattern webapi/index.ts:109 already uses for EV_BEFORE_UNLOAD): the
- * generated typings for the engine module do not carry the member, and reading
- * it keeps this file working against a core that predates the event — an absent
- * member yields -1, which no dispatch can equal, so the branch is simply dead
- * instead of throwing.
- */
+// Older cores lack this enum member; -1 leaves the branch inactive.
 function beforeExitEventId(): number {
     try {
         const v = (engine.EventType as unknown as Record<string, unknown>)?.BEFORE_EXIT;
@@ -785,42 +615,20 @@ function beforeExitEventId(): number {
     }
 }
 
-/**
- * Node's 'beforeExit'. Unlike 'exit' this has NO once-flag: node re-fires it on
- * every drain for as long as a listener keeps queueing work, and the C drives
- * that by re-dispatching EV_BEFORE_EXIT (circu.js/src/vm.c).
- *
- * A listener throw is deliberately NOT caught. Node reports it as an uncaught
- * error and exits 1 while still firing 'exit' (OBSERVED v24.18.0); the C
- * reproduces that only if the exception reaches its JS_IsException check, and
- * event-mux.ts re-throws for this id for the same reason.
- */
+// beforeExit may repeat while listeners keep scheduling work; listener errors propagate.
 function emitBeforeExit(code: number): void {
-    // 'exit' has already fired: teardown is past the point where node would ask.
     if (exitEmitted) return;
     if (processEE.listenerCount('beforeExit') === 0) return;
     withTeardownFlag(() => processEE.emit('beforeExit', code));
 }
 
-/**
- * Push `process.exitCode` into the runtime so a natural drain can return it.
- *
- * `exitCode` is a module-scoped `let` that nothing native could read: on a
- * natural drain TJS_Run returned its own untouched field, so a code assigned
- * from an 'exit' or 'beforeExit' listener was lost (OBSERVED: rc 0 where node
- * v24.18.0 exits with the assigned value).
- *
- * Guarded on the binding existing: this file is refreshed by `cno setup` and can
- * therefore run against an older core that has no os.setExitCode, where the
- * pre-existing deferred-exit watcher in the CLI entry remains the only path.
- */
+// Keep natural-drain exit status synchronized when the native binding supports it.
 function pushExitCodeToRuntime(value: number | undefined): void {
     const setExitCode = (os as unknown as Record<string, unknown>).setExitCode;
     if (typeof setExitCode !== 'function') return;
     try {
         (setExitCode as (v?: number) => void)(value);
     } catch {
-        // Never let bookkeeping break an assignment the user made.
     }
 }
 
@@ -831,42 +639,23 @@ const NODE_PROCESS_ROLE = 'node-process';
 function ensureEventBridge(): void {
     if (eventBridgeInstalled) return;
     const mux = eventMux();
-    // No mux yet (module load order, or a standalone cno without cts): stay off
-    // the bus. Falling back to a raw engine.onEvent() here would displace
-    // whatever receiver *is* installed, which is the very bug being fixed.
-    // ensureEventBridge() is retried when a listener is registered.
     if (!mux) return;
 
-    // mux.install() is ROLE-keyed and replaces same-role, so the second copy of
-    // this module to load used to EVICT the first copy's receiver. With the
-    // emitter now shared that eviction would be harmless for delivery, but it
-    // would also swap in a receiver whose module-scoped `exitEmitted` flag is a
-    // different variable — and the once-guard is per-copy. First install wins:
-    // whichever copy is on the bus emits through the shared emitter, so every
-    // listener is reached and exactly one flag governs the fire count.
     if (mux.has?.(NODE_PROCESS_ROLE)) {
         eventBridgeInstalled = true;
         return;
     }
     eventBridgeInstalled = true;
 
-    // Above PRIORITY_DIAGNOSTICS (0) so setting ctx.handled can suppress the
-    // cts "unhandled job exception" warning, the way a Node
-    // 'uncaughtException' handler suppresses the default report. Below
-    // PRIORITY_WEBAPI (100) so the web ErrorEvent still dispatches first.
     mux.install(NODE_PROCESS_ROLE, (name, data, ctx) => {
         const ET = engine.EventType;
 
         if (name === ET.EXIT) {
-            // EV_EXIT carries the status as an int (mod_os.c:87, vm.c:282).
             emitProcessExit(typeof data === 'number' ? data : (exitCode ?? 0));
-            // Return value is freed and ignored by the C for this event.
             return undefined;
         }
 
         if (name === beforeExitEventId()) {
-            // Carries the status the run would exit with right now, which is what
-            // node passes its listener (OBSERVED: 3 with `process.exitCode = 3`).
             emitBeforeExit(typeof data === 'number' ? data : (exitCode ?? 0));
             return undefined;
         }
@@ -883,24 +672,13 @@ function ensureEventBridge(): void {
                 return true;
             }
             if (processEE.listenerCount('uncaughtException') === 0) {
-                // No handler: leave the outcome exactly as it was. Do NOT call
-                // handleUncaughtException() — it rethrows, and the mux swallows
-                // receiver exceptions, so the error would disappear instead of
-                // being reported.
                 return undefined;
             }
             try {
                 processEE.emit('uncaughtException', data, 'uncaughtException');
             } catch {
-                // A throw from inside the handler must not become a TJS_Stop.
             }
-            // The program dealt with it: silence the runtime diagnostic.
             ctx.handled = true;
-            // POLARITY: utils.c:180 calls TJS_Stop when the receiver returns
-            // FALSE. So "handled, keep running" is `true` here — the opposite
-            // constant from EV_UNHANDLED_REJECTION, where vm.c:242 aborts on any
-            // non-false and "handled" is `false`. Returning false here would
-            // kill the process on precisely the errors the program handled.
             return true;
         }
 
@@ -908,43 +686,14 @@ function ensureEventBridge(): void {
     }, 50);
 }
 
-/* ------------------------------------------------------------------ *
- * process.nextTick priority
- * ------------------------------------------------------------------ *
- *
- * Node keeps the nextTick queue at HIGHER priority than promise microtasks and
- * drains it at the microtask checkpoint, so a nextTick callback runs before any
- * pending promise continuation REGARDLESS of registration order. MEASURED on
- * v24.18: registering `.then` first still yields nt>then, and queueMicrotask
- * first still yields nt>qmt.
- *
- * queueMicrotask() cannot express that. It appends to the very FIFO the promise
- * jobs use, so a drain scheduled from JS only won when it happened to be
- * enqueued first -- `.then`-first produced then>nt here, and qmt-first produced
- * qmt>nt. No JS primitive outranks queueMicrotask, so the checkpoint call has to
- * come from C: engine.setNextTickDrain() hands this drain to
- * tjs__execute_jobs(), which runs it before the pending-job loop and again after
- * that loop is exhausted (circu.js/src/vm.c). engine.notifyNextTick() only
- * raises the native "ticks are pending" flag so the checkpoint knows to call --
- * cheap, and it also keeps the loop awake for a nextTick with no promise in
- * sight, which JS_IsJobPending() cannot see.
- *
- * The queue, the argument handling and the uncaughtException semantics all stay
- * here. C decides only WHEN to drain.
- *
- * The fallback matters: this file is served to the runtime as SOURCE, so it
- * lands without a rebuild, while the C half does not. Against a binary that
- * predates the hook, feature detection keeps the old queueMicrotask behaviour
- * (FIFO ordering, as today) instead of dropping every callback on the floor.
- */
+// The native hook gives nextTick priority over promise jobs; older cores use a
+// queueMicrotask fallback rather than dropping callbacks.
 type NextTickEngineHook = {
     setNextTickDrain?: (fn: () => void) => void;
     notifyNextTick?: () => void;
 };
 
 function installNativeTickDrain(): boolean {
-    // Only the first copy to get here registers. A second registration would
-    // free this one and orphan the shared queue behind it.
     if (tickState.nativeInstalled) return true;
     try {
         const hook = engine as unknown as NextTickEngineHook;
@@ -962,8 +711,6 @@ function scheduleNextTickDrain(): void {
     if (tickState.scheduled) return;
     tickState.scheduled = true;
     if (nativeTickDrain) {
-        // Inside a drain the loop already sees the new entry; notifying again
-        // would only buy a redundant checkpoint crossing.
         if (!tickState.draining) {
             (engine as unknown as NextTickEngineHook).notifyNextTick!();
         }
@@ -995,8 +742,6 @@ function createProcessWarning(
     if (detailOptions.detail !== undefined) out.detail = detailOptions.detail;
     return out;
 }
-
-// Process object
 
 const uname = os.uname();
 
@@ -1062,8 +807,7 @@ export const platform: NodeJS.Platform = (() => {
     }
 })();
 
-// `let`, not `const`: a SECOND copy of this module must export the singleton's
-// env proxy, not its own. Re-pointed next to the processDefault fixups below.
+// Re-pointed to the singleton's live proxy when a second module copy loads.
 export let env: NodeJS.ProcessEnv = envProxy;
 
 export function cwd(): string {
@@ -1078,60 +822,19 @@ export function chdir(directory: string): void {
     }
 }
 
-/**
- * Announce a worker's exit status to its parent, for workers that never import
- * node:worker_threads.
- *
- * A worker's exit code otherwise reaches the parent by exactly one route: the
- * process 'exit' listener installed by createParentPort() in
- * node/worker_threads/mod.ts:834. That function only runs when the WORKER ITSELF
- * imports node:worker_threads. MEASURED 2026-08-09 against node v24.18.0: a
- * worker whose whole body is `process.exit(42)` reported code 0 to the parent's
- * 'exit' event where node reports 42, so `process.exit(1)` to signal failure read
- * as clean success to any pool that checks the code. Adding
- * `require('node:worker_threads')` anywhere in the same worker made it report 42,
- * which is what isolated "no reporter installed" from "code lost in transit".
- *
- * This is a processEE listener rather than a line inside exit() below, because
- * that exit() is not what a worker calls: `require('node:process').exit`
- * stringifies as `function exit() { [native code] }` (MEASURED), so the TS
- * function is bypassed and a call placed there never ran. The native exit
- * dispatches EV_EXIT, ensureEventBridge() turns that into processEE 'exit', and a
- * listener therefore sees every code the native path carries. That is the same
- * mechanism the worker_threads reporter already relies on.
- *
- * When worker_threads IS loaded both reporters fire and the parent receives two
- * exit records. That is harmless: Worker._finish() (worker_threads/mod.ts:700-701)
- * returns early once _exited is set, so the first record wins. No cross-module
- * once-flag is needed for that reason.
- *
- * Deliberately NOT covering natural drain with `process.exitCode = N`: that needs
- * an EV_EXIT a worker never receives, because tjs__lifecycle_drain()
- * (circu.js/src/vm.c:948-955) returns early for qrt->is_worker. That is a C fix
- * and stays reported rather than worked around here.
- */
+// Report worker exit status even when the worker does not import worker_threads.
+// Duplicate reports are harmless because Worker._finish() accepts only the first.
 function installWorkerExitReporter(): void {
     if (!workerBinding?.isWorker || !workerBinding.pipe) return;
     const pipe = workerBinding.pipe;
     processEE.on('exit', (code?: unknown) => {
         try {
             pipe.postMessage({ __cno_node_worker_exit__: { code: typeof code === 'number' ? code : 0 } });
-        } catch {
-            // The pipe is already torn down; the parent falls back to 0 on EOF,
-            // i.e. the previous behaviour.
-        }
+        } catch { /* pipe already closed */ }
     });
 }
 
 export function exit(code?: number): never {
-    // Forward to the singleton's exit when this is the SECOND copy of the module
-    // (same pattern as _setupIPC/send/disconnect below). `exitEmitted` is
-    // module-scoped and therefore per-copy: with the emitter now shared, a disk
-    // copy running its own exit() would emit on the shared emitter, and the
-    // baked copy's still-clear flag would let the native EV_EXIT bridge emit a
-    // SECOND time — a double-fire that was previously invisible only because the
-    // two emitters had disjoint listeners. Routing through the one live exit()
-    // keeps a single flag in charge.
     if (existingProcessDefault) {
         const activeExit = Reflect.get(processDefault, 'exit');
         if (typeof activeExit === 'function' && activeExit !== exit) {
@@ -1140,10 +843,6 @@ export function exit(code?: number): never {
         }
     }
     const exitCode_ = normalizeExitCodeValue(code) ?? exitCode ?? 0;
-    // Via emitProcessExit, not a bare emit: os.exit() below dispatches native
-    // EV_EXIT (mod_os.c:87), which the bridge above also turns into 'exit'.
-    // Node guarantees the event fires exactly once, so both paths share one
-    // once-flag.
     emitProcessExit(exitCode_);
     os.exit(exitCode_);
     throw new Error('unreachable');
@@ -1152,16 +851,8 @@ export function exit(code?: number): never {
 export let exitCode: number | undefined = undefined;
 export let _exiting: boolean = false;
 
-// Installed here, not at the definition site: the receiver reads `exitCode` and
-// writes `_exiting`, both `let` bindings declared just above. Attaching the
-// bridge before they are initialised would leave a window in which a native
-// EV_EXIT reaches emitProcessExit() and dies on a temporal-dead-zone error
-// instead of emitting 'exit'.
 ensureEventBridge();
 
-// Arm the worker exit-status reporter in the same breath as the bridge that
-// drives it: the reporter is a processEE 'exit' listener, and only a live bridge
-// turns a native EV_EXIT into that event.
 installWorkerExitReporter();
 
 export const execPath: string = os.exePath;
@@ -1169,7 +860,6 @@ export const execPath: string = os.exePath;
 export let title: string = 'node';
 
 export const version: string = 'v24.1.0';
-// version info
 type CnoProcessVersions = NodeJS.ProcessVersions & {
     typescript: string;
     deno: string;
@@ -1296,12 +986,8 @@ export const permission: NodeJS.ProcessPermission = {
     has: () => true,
 };
 
-// process.report — diagnostic dump (Node-shaped; approximate heap/libuv fields)
-
 let reportSeq = 0;
 
-// glibc version for report.header (empty on musl/non-linux). Used by packages
-// like rollup that branch optional natives via !glibcVersionRuntime.
 let cachedGlibcRuntime: string | undefined;
 function glibcVersionRuntime(): string {
     if (cachedGlibcRuntime !== undefined) return cachedGlibcRuntime;
@@ -1341,14 +1027,11 @@ function formatReportStamp(d: Date): { file: string; dumpEventTime: string; dump
 
 function joinReportPath(dir: string, name: string): string {
     if (!dir) return name;
-    const sep = platform === 'win32' ? '\\' : '/';
-    const base = dir.endsWith('/') || dir.endsWith('\\') ? dir.slice(0, -1) : dir;
-    return `${base}${sep}${name}`;
+    return join(dir, name);
 }
 
 function isAbsoluteReportPath(p: string): boolean {
-    if (platform === 'win32') return /^[A-Za-z]:[\\/]/.test(p) || p.startsWith('\\\\');
-    return p.startsWith('/');
+    return isAbsolutePath(p);
 }
 
 function collectEnvForReport(): Record<string, string> {
@@ -1357,9 +1040,7 @@ function collectEnvForReport(): Record<string, string> {
         try {
             const v = os.getenv(key);
             if (v !== undefined) out[key] = v;
-        } catch {
-            // skip unset/missing
-        }
+        } catch { /* environment changed while collecting */ }
     }
     return out;
 }
@@ -1442,7 +1123,6 @@ function buildResourceUsageSection(): Record<string, unknown> {
 }
 
 function buildLibuvHandles(): Array<Record<string, unknown>> {
-    // Approximate: expose stdio as pipe handles (full libuv walk needs native support).
     return [
         { type: 'tty', is_active: true, is_referenced: true, address: 'stdin' },
         { type: 'tty', is_active: true, is_referenced: true, address: 'stdout' },
@@ -1495,7 +1175,7 @@ function buildProcessReport(err?: Error, filename: string | null = null): Record
             filename,
             dumpEventTime: stamp.dumpEventTime,
             dumpEventTimeStamp: stamp.dumpEventTimeStamp,
-            processId: pid,
+            processId: os.pid,
             threadId: 0,
             cwd: os.cwd,
             commandLine: [...argv],
@@ -1552,8 +1232,7 @@ function resolveReportFilename(file?: string): { path: string; name: string } {
 
     if (file && typeof file === 'string' && file.length > 0) {
         if (isAbsoluteReportPath(file)) {
-            const parts = file.replace(/\\/g, '/').split('/');
-            return { path: file, name: parts[parts.length - 1] || file };
+            return { path: file, name: basename(file) || file };
         }
         return { path: joinReportPath(configuredDir || os.cwd, file), name: file };
     }
@@ -1567,7 +1246,7 @@ function resolveReportFilename(file?: string): { path: string; name: string } {
 
     reportSeq += 1;
     const stamp = formatReportStamp(new Date());
-    const name = `report.${stamp.file}.${pid}.0.${String(reportSeq).padStart(3, '0')}.json`;
+    const name = `report.${stamp.file}.${os.pid}.0.${String(reportSeq).padStart(3, '0')}.json`;
     return { path: joinReportPath(configuredDir || os.cwd, name), name };
 }
 
@@ -1622,25 +1301,14 @@ export const report: NodeJS.ProcessReport = {
         try {
             console.error(`Writing Node.js report to file: ${resolved.path}`);
             console.error('Node.js report completed');
-        } catch {
-            // console may be redirected
-        }
+        } catch { /* reporting output is unavailable */ }
         return resolved.path;
     },
 };
 
-/**
- * Node's default warning printer, verified against v24.18:
- *   (node:PID) [CODE] Name: message
- *   <detail, when present>
- *   (Use `node --trace-warnings ...` to show where the warning was created)
- * The code is omitted when absent, and a DeprecationWarning gets the
- * --trace-deprecation hint instead. Tooling and CI greps depend on the
- * `Name:` prefix, so a bare message is not a cosmetic difference.
- */
 function formatWarning(warning: ProcessWarning): string {
     const code = warning.code === undefined ? '' : ` [${String(warning.code)}]`;
-    let out = `(node:${pid})${code} ${warning.name}: ${warning.message}`;
+    let out = `(node:${os.pid})${code} ${warning.name}: ${warning.message}`;
     if (warning.detail !== undefined) out += `\n${String(warning.detail)}`;
     const flag = warning.name === 'DeprecationWarning' ? 'trace-deprecation' : 'trace-warnings';
     out += `\n(Use \`node --${flag} ...\` to show where the warning was created while cno is not supported)`;
@@ -1649,21 +1317,12 @@ function formatWarning(warning: ProcessWarning): string {
 
 export function emitWarning(warning: string | Error, options?: ProcessWarningOptions): void {
     const normalized = createProcessWarning(warning, options);
-    // Node defers BOTH the print and the event to the next tick, so a
-    // synchronous console.log after emitWarning lands first. A user 'warning'
-    // listener does NOT replace the default printer — v24.18 emits both.
     nextTick(() => {
         processEE.emit('warning', normalized);
         if (normalized.name === 'DeprecationWarning' && noDeprecation) return;
         console.error(formatWarning(normalized));
     });
 }
-
-// POSIX credential accessors. Real Node does not expose any of these on
-// Windows — verified on v24.18/win32: getuid, getgid, geteuid, getegid,
-// setuid, setgid, seteuid, setegid, getgroups, setgroups and initgroups are
-// all absent (not even present as keys). They are declared unconditionally
-// here and gated onto the exported surface below.
 
 function getuidImpl(): number {
     return os.userInfo.userId;
@@ -1701,7 +1360,6 @@ function getgroupsImpl(): number[] {
 
 function initgroupsImpl(): void { unsupported('initgroups'); }
 
-/** Windows has no POSIX uid/gid concept; match Node and expose nothing. */
 const hasCredentialApi = platform !== 'win32';
 
 export const getuid: (() => number) | undefined = hasCredentialApi ? getuidImpl : undefined;
@@ -1753,10 +1411,6 @@ export const mainModule: NodeJS.Module | undefined = undefined;
 
 export const debugPort: number = 5858;
 
-/**
- * Load a Node-API `.node` into `module.exports` (same loader as CJS require).
- * Legacy V8/NAN addons fail closed inside nodeapi.
- */
 export function dlopen(module: { exports?: unknown }, filename: string, _flags?: number): void {
     if (module === null || typeof module !== 'object') {
         throw new TypeError('The "module" argument must be of type object');
@@ -1794,7 +1448,8 @@ export function getBuiltinModule(id: string): NodeJS.Module | undefined {
         ), 'ERR_INVALID_ARG_TYPE');
     }
     try {
-        return require(id) as NodeJS.Module;
+        const specifier = id.startsWith('node:') ? id : `node:${id}`;
+        return require(specifier) as NodeJS.Module;
     } catch {
         return undefined;
     }
@@ -1895,15 +1550,12 @@ function createUvBinding(): UvBinding {
     const codeMap = new Map<string, number>();
     const constants: Record<string, number> = {};
     for (const [name, code] of Object.entries(errMod.errno)) {
-        // Real Node keeps UNKNOWN in the map (-4094 → 'unknown error'); only
-        // the non-error OK sentinel is excluded.
         if (name === 'OK') continue;
         if (typeof code !== 'number') continue;
         const errno = code;
         const message = errMod.strerror(errno).replace(new RegExp(`^${name}:\\s*`), '');
         errorMap.set(errno, [name, message]);
         codeMap.set(name, errno);
-        // Node exposes every errno as a UV_<NAME> constant on the binding.
         constants[`UV_${name}`] = errno;
     }
 
@@ -1998,8 +1650,8 @@ const processDefault = existingProcessDefault ?? {
     argv,
     get argv0() { return argv0; },
     execArgv,
-    pid,
-    ppid,
+    get pid() { return os.pid; },
+    get ppid() { return os.ppid; },
     platform,
     arch,
     version,
@@ -2064,8 +1716,23 @@ const processDefault = existingProcessDefault ?? {
 	constructor: Process,
 } as unknown as NodeJS.Process;
 
-// POSIX-only credential methods: added as own keys only where Node has them,
-// so `'getgid' in process` is false on Windows exactly as in real Node.
+try {
+    Object.defineProperties(processDefault, {
+        pid: {
+            enumerable: true,
+            configurable: true,
+            get: () => os.pid,
+        },
+        ppid: {
+            enumerable: true,
+            configurable: true,
+            get: () => os.ppid,
+        },
+    });
+} catch {
+    // Preserve a sealed embedding-provided process singleton.
+}
+
 if (!existingProcessDefault && hasCredentialApi) Object.assign(processDefault, {
     getuid: getuidImpl,
     getgid: getgidImpl,
@@ -2080,8 +1747,6 @@ if (!existingProcessDefault && hasCredentialApi) Object.assign(processDefault, {
     initgroups: initgroupsImpl,
 });
 
-// Re-evaluation (e.g. after `cno setup` refreshes cache) reuses the singleton
-// but must pick up newly filled surfaces like report.
 if (existingProcessDefault) {
     Reflect.set(processDefault, 'versions', versions);
     Reflect.set(processDefault, 'report', report);
@@ -2097,9 +1762,6 @@ if (existingProcessDefault) {
     Reflect.set(processDefault, 'hasUncaughtExceptionCaptureCallback', hasUncaughtExceptionCaptureCallback);
     Reflect.set(processDefault, 'emit', emit);
     Reflect.set(processDefault, 'constrainedMemory', constrainedMemory);
-    // The named export was this copy's own proxy while globalThis.process.env
-    // stayed the first copy's — identity-only, but `process.env === env` is a
-    // documented Node invariant. Derive it from the live singleton.
     const activeEnv = Reflect.get(processDefault, 'env');
     if (activeEnv && typeof activeEnv === 'object') env = activeEnv as NodeJS.ProcessEnv;
 }
@@ -2111,9 +1773,6 @@ if (!existingProcessDefault) Object.defineProperties(processDefault, {
         get: () => exitCode,
         set: (value: unknown) => {
             exitCode = normalizeExitCodeValue(value);
-            // Also push it into the runtime: a natural drain resolves its status
-            // from there, so an assignment made during teardown ('exit' or
-            // 'beforeExit') would otherwise be dropped.
             pushExitCodeToRuntime(exitCode);
         },
     },
@@ -2171,13 +1830,8 @@ if (!existingProcessDefault) Reflect.set(globalThis, PROCESS_DEFAULT_SINGLETON, 
 
 export default processDefault;
 
-// IPC Channel support (for child_process)
-
 let _ipcChannel: IPCChannel | null = null;
 
-/**
- * Set up IPC channel for child process (called by child_process module)
- */
 export function _setupIPC(pipe: CModuleStreams.Pipe, serialization: IPCSerialization = 'json'): IPCChannel {
     if (existingProcessDefault) {
         const setup = Reflect.get(processDefault, '_setupIPC');
@@ -2207,9 +1861,6 @@ export function _setupIPC(pipe: CModuleStreams.Pipe, serialization: IPCSerializa
     return _ipcChannel;
 }
 
-/**
- * Send a message to the parent process
- */
 export function send(message: unknown, sendHandleOrCallback?: unknown, optionsOrCallback?: unknown, callback?: SendCallback): boolean {
     if (existingProcessDefault) {
         const activeSend = Reflect.get(processDefault, 'send');
@@ -2240,16 +1891,11 @@ export function send(message: unknown, sendHandleOrCallback?: unknown, optionsOr
         return false;
     }
 
-    // Node sends user messages verbatim (no wrapper) so that the peer —
-    // including a real node process — receives exactly what was sent.
     _ipcChannel.send(message);
     if (cb) queueMicrotask(() => cb(null));
     return true;
 }
 
-/**
- * Disconnect the IPC channel
- */
 export function disconnect(): void {
     if (existingProcessDefault) {
         const activeDisconnect = Reflect.get(processDefault, 'disconnect');
@@ -2267,16 +1913,6 @@ export function disconnect(): void {
 
 if (!existingProcessDefault) Object.assign(processDefault, { _setupIPC, send, disconnect });
 
-// ============================================================================
-// Child-side IPC bootstrap
-// ----------------------------------------------------------------------------
-// When this process was forked by child_process with an IPC channel, the parent
-// inherits the channel endpoint to this process as fd 3 and exports its number
-// via NODE_CHANNEL_FD. Open that fd as a (now bidirectional, socketpair-backed)
-// pipe and wire up the channel so process.send() and process.on('message') work
-// in the child. This mirrors Node.js, where the child bootstraps its own channel.
-// No-op for normally launched processes (NODE_CHANNEL_FD unset).
-// ============================================================================
 (function bootstrapChildIPC() {
     if (existingProcessDefault) return;
     const fdStr = safeGetEnv('NODE_CHANNEL_FD');
@@ -2289,7 +1925,6 @@ if (!existingProcessDefault) Object.assign(processDefault, { _setupIPC, send, di
         pipe.open(fd);
         const ipcChannel = _setupIPC(pipe, serialization);
         ipcChannel.unref();
-        // Prevent grandchildren from wrongly inheriting this channel fd.
         unsetEnvQuietly('NODE_CHANNEL_FD');
         unsetEnvQuietly('CNO_IPC_SERIALIZATION');
     } catch {

@@ -1,6 +1,13 @@
 const os = import.meta.use('os');
 
-import { join } from './path';
+import { isAbsolutePath, isDrivePath, resolvePath } from './path';
+
+export interface EvalToken {
+    /** Exact option spelling used to select eval/print mode. */
+    flag: '-e' | '--eval' | '-p' | '--print';
+    /** Whether the source was joined to the option with `=`. */
+    inline: boolean;
+}
 
 export interface Args {
     binary: string;
@@ -9,6 +16,8 @@ export interface Args {
     actionArgs: string[];
     entry: string;
     args: string[];
+    /** Explicit lossless metadata for eval/print; absent for subcommand form. */
+    evalToken?: EvalToken;
 }
 
 // Single source of truth for the CLI vocabulary. cno-cli imports this instead
@@ -89,7 +98,7 @@ export function buildDenoArgs(): string[] {
 /** True for real filesystem entries: not `repl`, not `eval:`, not a URL. */
 function isFsEntry(entry: string): boolean {
     if (entry === 'repl' || entry === '-' || entry === '') return false;
-    if (/^[A-Za-z]:[\\/]/.test(entry)) return true;
+    if (isAbsolutePath(entry) || isDrivePath(entry)) return true;
     return !/^[a-z][a-z0-9+\-.]*:/i.test(entry);
 }
 
@@ -104,42 +113,15 @@ function isFsEntry(entry: string): boolean {
 //
 // Deno.args is unaffected: it only ever exposes args.args (verified below).
 
-const EVAL_FLAGS = new Set(['-e', '--eval', '-p', '--print']);
-
-/** True for any token that carries eval source, inline (`--eval=x`) or not. */
-function isEvalFlagToken(token: string): boolean {
-    return EVAL_FLAGS.has(token)
-        || token.startsWith('--eval=')
-        || token.startsWith('--print=');
-}
-
 function isEvalMode(): boolean {
     return args.action === 'eval';
 }
 
-/**
- * Recover the exact eval tokens the user typed, so execArgv matches Node
- * token-for-token: `-e CODE` stays two entries, `--eval=CODE` stays one.
- * The `cno eval "CODE"` subcommand form has no flag; Node's nearest
- * equivalent is `-e`, so that is the fallback.
- *
- * The scan is bounded: it stops at the `eval` subcommand or at the source
- * itself, so a trailing *user* arg that happens to be `-e`/`-p` (as in
- * `cno eval CODE -p`) can never be mistaken for the eval flag.
- */
+/** Build Node's exact eval/print execArgv representation from parser metadata. */
 function evalExecArgvTokens(code: string): string[] {
-    const raw = os.args;
-    if (Array.isArray(raw)) {
-        for (let i = 1; i < raw.length; i++) {
-            const token = raw[i];
-            // '--' ends flags; 'eval' is the subcommand form; `code` means we
-            // reached the source without seeing a flag.
-            if (token === undefined || token === '--' || token === 'eval' || token === code) break;
-            if (token.startsWith('--eval=') || token.startsWith('--print=')) return [token];
-            if (EVAL_FLAGS.has(token)) return [token, code];
-        }
-    }
-    return ['-e', code];
+    const token = args.evalToken;
+    if (!token) return ['-e', code];
+    return token.inline ? [`${token.flag}=${code}`] : [token.flag, code];
 }
 
 /** Node process.argv — [execPath, entry, ...scriptArgs]; argv[1] is absolute. */
@@ -148,9 +130,9 @@ export function buildNodeArgv(): string[] {
     if (isEvalMode()) return [args.binary, ...args.args];
 
     let entry = args.entry;
-    if (isFsEntry(entry) && !entry.startsWith('/') && !/^[A-Za-z]:[\\/]/.test(entry)) {
+    if (isFsEntry(entry) && !isAbsolutePath(entry)) {
         try {
-            entry = join(os.cwd, entry);
+            entry = resolvePath(entry, os.cwd);
         } catch { /* no cwd — keep the raw entry */ }
     }
     return [args.binary, entry, ...args.args];
@@ -164,11 +146,10 @@ export function buildNodeArgv0(): string {
 /** Node process.execArgv — runtime flags before the subcommand. */
 export function buildNodeExecArgv(): string[] {
     if (!isEvalMode()) return [...args.internalArgs];
-    // Node order is [...runtimeFlags, evalFlag, code] — verified against
-    // `node --no-warnings -e CODE` → ['--no-warnings', '-e', 'CODE'].
-    // Drop any eval token already in internalArgs so it cannot appear twice.
-    const flags = args.internalArgs.filter((token) => !isEvalFlagToken(token));
-    return [...flags, ...evalExecArgvTokens(args.entry)];
+    // Eval spelling is carried explicitly by Args.evalToken. internalArgs
+    // contains only runtime options, so no global argv scan or filtering is
+    // needed and user tokens cannot be mistaken for an eval selector.
+    return [...args.internalArgs, ...evalExecArgvTokens(args.entry)];
 }
 
 // Shared namespace on `os` so cno/src/node/* can reach these without importing

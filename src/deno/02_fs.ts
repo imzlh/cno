@@ -7,24 +7,24 @@ const error = import.meta.use("error");
 const console = import.meta.use('console');
 const crypto = import.meta.use('crypto');
 
-import { assert } from "../utils/assert";
-import { join, normalize, systemPathSplit } from "../utils/path";
-import { wrapFSErr, wrapFSns } from "../utils/wrap";
-import { errors } from "./01_errors";
-import { DOMException } from "../webapi/events";
 import { arrayBufferBackedBytes } from "../utils/bytes";
+import { hasErrno } from "../utils/errno";
+import { ensureDirectory, ensureDirectorySync } from "../utils/fs-path";
+import {
+    isAbsolutePath,
+    isPathWithin,
+    join,
+    resolveFsPath,
+    toFsPath,
+} from "../utils/path";
 import { isWindows } from "../utils/platform";
+import { wrapFSErr, wrapFSns } from "../utils/wrap";
+import { DOMException } from "../webapi/events";
+import { errors } from "./01_errors";
 
-export const toString = (e: URL | string): string => {
-    if (!(e instanceof URL)) return e;
-    if (e.protocol !== 'file:') throw new TypeError('Must be a file URL');
-    // Malformed escapes stay literal so the fs call reports NotFound, as upstream does.
-    let p: string;
-    try { p = decodeURIComponent(e.pathname); } catch { p = e.pathname; }
-    // On Windows, file:///C:/foo → pathname is /C:/foo — strip the leading slash
-    if (p.length >= 3 && p[0] === '/' && p[2] === ':') p = p.slice(1);
-    return p;
-};
+// Keep the local spelling used by this FS facade; path conversion itself is
+// owned by ../utils/path and is shared by the other Deno APIs.
+export const toString = toFsPath;
 
 export function toDenoStat(stat: CModuleAsyncFS.StatResult | CModuleFS.Stats) {
     return {
@@ -52,63 +52,14 @@ export function toDenoStat(stat: CModuleAsyncFS.StatResult | CModuleFS.Stats) {
     } satisfies Deno.FileInfo;
 }
 
-/**
- * Yield directory paths that need to be created (cross-platform)
- */
-function* iterMkdirPaths(fullPath: string): Generator<string> {
-    const normalizedPath = fullPath.replace(/\\/g, '/');
-    const parts = normalizedPath.split('/').filter(p => p !== '' && p !== '.');
-    let currentPath = '';
-    let i = 0;
-    if (normalizedPath.startsWith('//') && parts.length >= 2) {
-        currentPath = '//' + parts[0] + '/' + parts[1];
-        i = 2;
-    } else if (normalizedPath.startsWith('/')) {
-        currentPath = '/';
-    } else if (/^[A-Za-z]:/.test(normalizedPath) && parts.length > 0) {
-        currentPath = parts[0] + '/';
-        i = 1;
-    }
-    for (; i < parts.length; i++) {
-        const part = parts[i];
-        if (currentPath === '') currentPath = part;
-        else if (currentPath.endsWith('/')) currentPath = currentPath + part;
-        else currentPath = currentPath + '/' + part;
-        yield currentPath;
-    }
-}
-
 async function mkdirRecursive(fullPath: string, mode?: number): Promise<void> {
-    for (const p of iterMkdirPaths(fullPath)) {
-        await ensureDirectoryPart(p, mode);
-    }
+    await ensureDirectory(fullPath, mode);
 }
 
 function mkdirRecursiveSync(fullPath: string, mode?: number): void {
-    for (const p of iterMkdirPaths(fullPath)) {
-        ensureDirectoryPartSync(p, mode);
-    }
+    ensureDirectorySync(fullPath, mode);
 }
 
-async function ensureDirectoryPart(path: string, mode?: number): Promise<void> {
-    try {
-        if ((await asfs.stat(path)).isDirectory) return;
-    } catch {
-        await asfs.mkdir(path, mode);
-        return;
-    }
-    throw new Error(`Cannot create directory '${path}': File exists`);
-}
-
-function ensureDirectoryPartSync(path: string, mode?: number): void {
-    try {
-        if (fs.stat(path).isDirectory) return;
-    } catch {
-        fs.mkdir(path, mode);
-        return;
-    }
-    throw new Error(`Cannot create directory '${path}': File exists`);
-}
 
 function removeRecursiveSync(targetPath: string): void {
     const stats = fs.lstat(targetPath);
@@ -186,12 +137,10 @@ function writeOpenFlag(options?: Deno.WriteFileOptions): 'wx' | 'a' | 'w' {
     return options?.append ? 'a' : 'w';
 }
 
-function abortError(signal: AbortSignal): unknown {
-    return signal.reason ?? new DOMException('The operation was aborted', 'AbortError');
-}
 
 function throwIfAborted(signal?: AbortSignal): void {
-    if (signal?.aborted) throw abortError(signal);
+    if (signal?.aborted)
+        throw signal.reason ?? new DOMException('The operation was aborted', 'AbortError');
 }
 
 function toWriteBytes(data: string | Uint8Array): Uint8Array<ArrayBuffer> {
@@ -224,11 +173,6 @@ function validateTempAffix(value: string): void {
     if (/[\0*\x00-\x1f\x7f-\x9f]/.test(value)) {
         throw new errors.InvalidData('Invalid temporary file name');
     }
-}
-
-function hasErrno(value: unknown, code: number): boolean {
-    return typeof value === 'object' && value !== null
-        && Reflect.get(value, 'code') === code;
 }
 
 function tempPath(dir: string, prefix: string, suffix: string): string {
@@ -292,19 +236,6 @@ function toEpochMilliseconds(t: number | Date): number {
     return typeof t === 'number' ? t * 1000 : t.getTime();
 }
 
-function isAbsolutePath(path: string): boolean {
-    return path.startsWith('/') || /^[A-Za-z]:[\\/]/.test(path);
-}
-
-function absolutePath(path: string | URL): string {
-    const pathStr = toString(path);
-    return normalize(isAbsolutePath(pathStr) ? pathStr : join(os.cwd, pathStr));
-}
-
-function isContainedPath(parent: string, child: string): boolean {
-    return child === parent || child.startsWith(parent.endsWith(systemPathSplit) ? parent : parent + systemPathSplit);
-}
-
 function watchToIterator(path: string): AsyncIterableIterator<Deno.FsEvent> & { close(): void } {
     let watcher: CModuleFSWatch.FsWatcher | null = null;
     let deferred: ReturnType<typeof Promise.withResolvers<IteratorResult<Deno.FsEvent>>> | null = null;
@@ -328,9 +259,9 @@ function watchToIterator(path: string): AsyncIterableIterator<Deno.FsEvent> & { 
             return deferred.promise;
         },
 
-        [Symbol.asyncIterator]() {
-            return this;
-        },
+            [Symbol.asyncIterator]() {
+                return this as Deno.FsWatcher & AsyncIterableIterator<Deno.FsEvent>;
+            },
 
         async return(): Promise<IteratorResult<Deno.FsEvent>> {
             await this.close();
@@ -362,12 +293,22 @@ function watchToIterator(path: string): AsyncIterableIterator<Deno.FsEvent> & { 
     watcher = fswatch.watch(path, (filename, ev) => {
         if (isClosed) return;
         const eventPath = filename
-            ? absolutePath(isAbsolutePath(filename) ? filename : join(path, filename))
-            : absolutePath(path);
+            ? resolveFsPath(isAbsolutePath(filename) ? filename : join(path, filename), os.cwd)
+            : resolveFsPath(path, os.cwd);
+        let kind: Deno.FsEvent['kind'] = 'modify';
+        if (ev === 'rename') {
+            try {
+                fs.stat(eventPath);
+                kind = 'create';
+            } catch {
+                kind = 'remove';
+            }
+        }
         const event = {
-            kind: ev === 'rename' ? 'rename' : 'modify',
-            paths: [eventPath]
-        } as Deno.FsEvent;
+            kind,
+            paths: [eventPath],
+            flag: null
+        } as unknown as Deno.FsEvent;
 
         if (deferred) {
             deferred.resolve({ done: false, value: event });
@@ -767,20 +708,20 @@ Object.assign(Deno, wrapFSns({
         const recursive = options?.recursive !== false;
         const ignored = options?.ignore === undefined
             ? []
-            : (Array.isArray(options.ignore) ? options.ignore : [options.ignore]).map(absolutePath);
+            : (Array.isArray(options.ignore) ? options.ignore : [options.ignore]).map(path => resolveFsPath(path, os.cwd));
         const isIgnoredPath = (path: string): boolean =>
-            ignored.some(ignore => isContainedPath(ignore, absolutePath(path)));
+            ignored.some(ignore => isPathWithin(ignore, resolveFsPath(path, os.cwd)));
         const isIgnored = (event: Deno.FsEvent): boolean =>
             event.paths.some(isIgnoredPath);
         const watchers: Map<string, AsyncIterableIterator<Deno.FsEvent> & { close(): void }> = new Map();
         let isClosed = false;
         const eventQueue: Deno.FsEvent[] = [];
-        let deferred: ReturnType<typeof Promise.withResolvers<IteratorResult<Deno.FsEvent>>> | null = null;
+        const deferreds: ReturnType<typeof Promise.withResolvers<IteratorResult<Deno.FsEvent>>>[] = [];
 
         function pushEvent(event: Deno.FsEvent) {
+            const deferred = deferreds.shift();
             if (deferred) {
                 deferred.resolve({ done: false, value: event });
-                deferred = null;
             } else {
                 eventQueue.push(event);
             }
@@ -799,14 +740,13 @@ Object.assign(Deno, wrapFSns({
             }
             watchers.clear();
 
-            if (deferred) {
+            for (const deferred of deferreds.splice(0)) {
                 deferred.resolve({ done: true, value: undefined });
-                deferred = null;
             }
         }
 
         function watchPath(path: string) {
-            const watchPath = absolutePath(path);
+            const watchPath = resolveFsPath(path, os.cwd);
             if (isClosed || watchers.has(watchPath) || isIgnoredPath(watchPath)) return;
             const watcher = watchToIterator(watchPath);
             watchers.set(watchPath, watcher);
@@ -820,16 +760,17 @@ Object.assign(Deno, wrapFSns({
                         pushEvent(event);
                     }
                 } catch (error) {
-                    if (deferred && !isClosed) {
-                        deferred.reject(error);
-                        deferred = null;
+                    if (!isClosed) {
+                        for (const deferred of deferreds.splice(0)) {
+                            deferred.reject(error);
+                        }
                     }
                 }
             })();
         }
 
         function watchDirectoryTree(dir: string) {
-            const root = absolutePath(dir);
+            const root = resolveFsPath(dir, os.cwd);
             if (isClosed || isIgnoredPath(root)) return;
             watchPath(root);
             try {
@@ -856,7 +797,7 @@ Object.assign(Deno, wrapFSns({
 
         try {
             for (const path of paths) {
-                const root = absolutePath(path);
+                const root = resolveFsPath(path, os.cwd);
                 const stat = fs.stat(root);
                 if (recursive && stat.isDirectory) watchDirectoryTree(root);
                 else watchPath(root);
@@ -876,26 +817,25 @@ Object.assign(Deno, wrapFSns({
             }
 
             // wait for new events
-            deferred = Promise.withResolvers();
+            const deferred = Promise.withResolvers<IteratorResult<Deno.FsEvent>>();
+            deferreds.push(deferred);
             return deferred.promise;
         }
 
         async function throws(error?: unknown): Promise<IteratorResult<Deno.FsEvent>> {
-            if (deferred) {
+            for (const deferred of deferreds.splice(0)) {
                 deferred.reject(error);
-                deferred = null;
             }
             await iterator.close();
             return { done: true, value: undefined };
         }
 
-        const iterator: Deno.FsWatcher = {
-            [Symbol.asyncIterator]() {
-                return {
-                    ...this,
-                    next,
-                    throw: throws
-                };
+        const iterator: Deno.FsWatcher & AsyncIterableIterator<Deno.FsEvent> = {
+            next,
+            throw: throws,
+
+            [Symbol.asyncIterator](): AsyncIterableIterator<Deno.FsEvent> {
+                return this as Deno.FsWatcher & AsyncIterableIterator<Deno.FsEvent>;
             },
 
             [Symbol.dispose]() {

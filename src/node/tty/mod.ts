@@ -1,6 +1,6 @@
-import type { Stream } from '../../deno/04_stdio';
 import { Readable, Writable, type ReadableOptions, type WritableOptions } from '../stream';
 import { getTierLimits } from '../_internal/memory';
+import type { NodeStdioStream as Stream } from '../_internal/stdio';
 
 const os = import.meta.use('os');
 const fs = import.meta.use('fs');
@@ -17,7 +17,7 @@ type TTYRef = { stream: CModuleStreams.TTY; owned: boolean };
 
 const RESIZE_POLL_MS = 250;
 
-const isWindows = os.uname().sysname === 'Windows_NT';
+const isWindows = os.platform === 'windows' || os.platform === 'win32';
 
 const { readBufSize: READ_BUF_SIZE } = getTierLimits();
 
@@ -57,20 +57,12 @@ function openTTY(fd: number, readable: boolean): TTYRef {
 }
 
 function envValue(env: Record<string, string> | undefined, key: string): string | undefined {
-    if (env && key in env) return env[key];
+    if (env !== undefined) return env[key];
     try {
         return os.getenv(key);
     } catch {
         return undefined;
     }
-}
-
-function sameSize(a: Size | null, b: Size | null): boolean {
-    return a === b || !!(a && b && a.width === b.width && a.height === b.height);
-}
-
-function ansiForClearLine(dir: number): string {
-    return dir === -1 ? '\x1b[1K' : dir === 1 ? '\x1b[0K' : '\x1b[2K';
 }
 
 function ansiForCursorTo(x: number, y?: number): string {
@@ -344,7 +336,7 @@ export class WriteStream extends Writable {
     get writableRows(): number | undefined { return this.rows; }
 
     clearLine(dir: number, callback?: () => void): boolean {
-        this.writeControl(ansiForClearLine(dir), callback);
+        this.writeControl(dir === -1 ? '\x1b[1K' : dir === 1 ? '\x1b[0K' : '\x1b[2K', callback);
         return true;
     }
 
@@ -467,7 +459,8 @@ export class WriteStream extends Writable {
 
     private refreshSize(): Size | null {
         const next = this.handle.size;
-        if (!sameSize(this.currentSize, next)) {
+        if (!(this.currentSize === next || (this.currentSize && next
+            && this.currentSize.width === next.width && this.currentSize.height === next.height))) {
             this.currentSize = next;
             this.emit('resize');
         }

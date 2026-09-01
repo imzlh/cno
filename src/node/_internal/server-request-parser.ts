@@ -2,28 +2,20 @@ const engine = import.meta.use('engine');
 const http = import.meta.use('http');
 const algorithm = import.meta.use('algorithm');
 
+import { LLHTTP_METHODS } from '../http/constants';
 import {
     appendIncomingHeader,
-    applyIncomingRequestLine,
-    type IncomingMessageImpl,
-} from '../http/server';
-import { LLHTTP_METHODS } from '../http/constants';
+    type IncomingRequestTarget,
+} from './server-request-stream';
+
 import {
     buildNodeServerUrl,
     captureNodeNetworkCallFrames,
     nextNodeRequestId,
     normalizeHeaderRecord,
 } from './network-debug';
-import {
-    completeIncomingRequest,
-    pushIncomingRequestChunk,
-} from './server-request-stream';
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
-
-function concatUint8(a: Uint8Array, b: Uint8Array): Uint8Array {
-    return algorithm.bytesConcat([a, b]) as Uint8Array;
-}
 
 export interface ParsedServerRequest {
     requestId: string;
@@ -33,19 +25,12 @@ export interface ParsedServerRequest {
     postData: Uint8Array | null;
 }
 
-export interface ServerRequestParserOptions {
-    createIncoming(): IncomingMessageImpl;
+export interface ServerRequestParserOptions<TIncoming extends IncomingRequestTarget = IncomingRequestTarget> {
+    createIncoming(): TIncoming;
     protocol: 'http:' | 'https:';
     requestIdPrefix: string;
-    onRequest(incoming: IncomingMessageImpl, meta: ParsedServerRequest): void;
+    onRequest(incoming: TIncoming, meta: ParsedServerRequest): void;
     onParseError?(error: Error): void;
-}
-
-function toParserBuffer(chunk: Uint8Array): ArrayBuffer {
-    const buffer = chunk.buffer instanceof SharedArrayBuffer
-        ? new Uint8Array(chunk).buffer
-        : chunk.buffer;
-    return buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength);
 }
 
 function viewParserBuffer(buffer: CModuleHTTP.BufferSource): Uint8Array {
@@ -54,9 +39,11 @@ function viewParserBuffer(buffer: CModuleHTTP.BufferSource): Uint8Array {
     return new Uint8Array<ArrayBuffer>(buffer.buffer as ArrayBuffer, buffer.byteOffset, buffer.byteLength);
 }
 
-export function createServerRequestParser(options: ServerRequestParserOptions): { feed(chunk: Uint8Array): void } {
+export function createServerRequestParser<TIncoming extends IncomingRequestTarget>(
+    options: ServerRequestParserOptions<TIncoming>,
+): { feed(chunk: Uint8Array): void } {
     const parser = new http.Parser(http.REQUEST);
-    let incoming: IncomingMessageImpl | null = null;
+    let incoming: TIncoming | null = null;
     let currentHeaderField = '';
     let currentHeaderValue = '';
     let currentHeaderPart: 'field' | 'value' | null = null;
@@ -91,12 +78,11 @@ export function createServerRequestParser(options: ServerRequestParserOptions): 
     parser.onHeadersComplete = () => {
         flushHeader();
         const currentIncoming = getIncoming();
-        applyIncomingRequestLine(
-            currentIncoming,
-            LLHTTP_METHODS[parser.state.method] || 'GET',
-            currentIncoming.url || '/',
-            `${parser.state.httpMajor}.${parser.state.httpMinor}`,
-        );
+        currentIncoming.method = LLHTTP_METHODS[parser.state.method] || 'GET';
+        currentIncoming.url ||= '/';
+        currentIncoming.httpVersion = `${parser.state.httpMajor}.${parser.state.httpMinor}`;
+        currentIncoming.httpVersionMajor = parser.state.httpMajor;
+        currentIncoming.httpVersionMinor = parser.state.httpMinor;
         const requestHeaders = normalizeHeaderRecord(currentIncoming.headers);
         options.onRequest(currentIncoming, {
             requestId: nextNodeRequestId(options.requestIdPrefix),
@@ -107,12 +93,12 @@ export function createServerRequestParser(options: ServerRequestParserOptions): 
         });
     };
     parser.onBody = (buf, off, len) => {
-        const chunk = viewParserBuffer(buf).slice(off, off + len);
-        pushIncomingRequestChunk(getIncoming(), chunk);
+        getIncoming().push(viewParserBuffer(buf).slice(off, off + len));
     };
     parser.onMessageComplete = () => {
         const completedIncoming = getIncoming();
-        completeIncomingRequest(completedIncoming);
+        completedIncoming.complete = true;
+        completedIncoming.push(null);
         incoming = null;
         currentHeaderField = '';
         currentHeaderValue = '';
@@ -124,9 +110,14 @@ export function createServerRequestParser(options: ServerRequestParserOptions): 
             // Prepend any bytes the parser could not consume on the previous call
             // (a chunk that contained the tail of one request and the head of the
             // next). Without this, coalesced/co-parsed bytes are silently dropped.
-            const buffered = pendingLeftover ? concatUint8(pendingLeftover, chunk) : chunk;
+            const buffered = pendingLeftover
+                ? algorithm.bytesConcat([pendingLeftover, chunk]) as Uint8Array
+                : chunk;
             pendingLeftover = null;
-            const result = parser.execute(toParserBuffer(buffered));
+            const buffer = buffered.buffer instanceof SharedArrayBuffer
+                ? new Uint8Array(buffered).buffer
+                : buffered.buffer;
+            const result = parser.execute(buffer.slice(buffered.byteOffset, buffered.byteOffset + buffered.byteLength));
             if (result.errno !== 0) {
                 const consumed = Number(result.bytesConsumed ?? buffered.byteLength);
                 if (Number.isFinite(consumed) && consumed >= 0 && consumed < buffered.byteLength) {

@@ -1,9 +1,5 @@
-import type {
-    FetchHook,
-    NetworkCallFrame,
-    ServeHook,
-} from '../../utils/network-hooks';
 import { viewToUint8Array } from './buffer';
+import type { FetchHook, NetworkCallFrame, ServeHook } from './network-hooks';
 
 const debug = import.meta.use('debug');
 

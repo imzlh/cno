@@ -1,17 +1,39 @@
 import { page } from "fresh";
 import { Head } from "fresh/runtime";
 import { SiteFooter, SiteHeader } from "../../components/SiteChrome.tsx";
+import { isAdminRequest } from "../../data/auth.ts";
 import { formatPostDate, getPost, listPosts } from "../../data/posts.ts";
+import ArticleTools from "../../islands/ArticleTools.tsx";
 import { define } from "../../utils.ts";
 
 export const handler = define.handlers({
   async GET(ctx) {
-    const post = await getPost(ctx.params.slug);
-    const posts = post ? await listPosts() : [];
+    const preview = ctx.url.searchParams.get("preview") === "1" &&
+      await isAdminRequest(ctx.req);
+    const post = await getPost(ctx.params.slug, preview);
+    const posts = post ? await listPosts({ includeDrafts: preview }) : [];
+    const position = post ? posts.findIndex((item) => item.id === post.id) : -1;
     const related = post
-      ? posts.filter((item) => item.id !== post.id).slice(0, 2)
+      ? posts.filter((item) =>
+        item.id !== post.id && item.category === post.category
+      )
+        .concat(
+          posts.filter((item) =>
+            item.id !== post.id && item.category !== post.category
+          ),
+        )
+        .slice(0, 2)
       : [];
-    return page({ post, related }, { status: post ? 200 : 404 });
+    return page({
+      post,
+      preview,
+      related,
+      newer: position > 0 ? posts[position - 1] : null,
+      older: position >= 0 ? posts[position + 1] ?? null : null,
+    }, {
+      status: post ? 200 : 404,
+      headers: preview ? { "cache-control": "no-store" } : undefined,
+    });
   },
 });
 
@@ -64,6 +86,7 @@ export default define.page<typeof handler>(function ArticlePage({ data, url }) {
     <>
       <Head>
         <title>{post.title} — Quiet line</title>
+        {data.preview && <meta name="robots" content="noindex, nofollow" />}
         <link
           rel="canonical"
           href={`${url.origin}/article/${encodeURIComponent(post.slug)}`}
@@ -72,7 +95,15 @@ export default define.page<typeof handler>(function ArticlePage({ data, url }) {
         <meta property="og:title" content={post.title} />
         <meta property="og:description" content={post.excerpt} />
         <meta property="og:image" content={post.image} />
+        <meta
+          property="og:url"
+          content={`${url.origin}/article/${encodeURIComponent(post.slug)}`}
+        />
         <meta property="og:type" content="article" />
+        <meta name="twitter:card" content="summary_large_image" />
+        <meta name="twitter:title" content={post.title} />
+        <meta name="twitter:description" content={post.excerpt} />
+        <meta name="twitter:image" content={post.image} />
         <meta property="article:published_time" content={post.publishedAt} />
         <meta property="article:modified_time" content={post.updatedAt} />
       </Head>
@@ -83,12 +114,13 @@ export default define.page<typeof handler>(function ArticlePage({ data, url }) {
           actionLabel="Back to archive"
         />
         <main id="article">
-          <article class="article-page">
+          <article class="article-page" data-reading-target>
             <header class="article-header container">
               <a class="article-back" href="/archive">
                 <span aria-hidden="true">&lt;-</span> All notes
               </a>
               <div class="article-heading">
+                {data.preview && <p class="preview-badge">Private preview</p>}
                 <p class="eyebrow">{post.category}</p>
                 <h1>{post.title}</h1>
                 <p class="article-deck">{post.excerpt}</p>
@@ -105,6 +137,10 @@ export default define.page<typeof handler>(function ArticlePage({ data, url }) {
               <figcaption>{post.imageAlt}</figcaption>
             </figure>
 
+            <div class="article-tools-wrap container">
+              <ArticleTools slug={post.slug} />
+            </div>
+
             <div class="article-content container">
               <aside class="article-aside">
                 <span>Filed under</span>
@@ -112,6 +148,28 @@ export default define.page<typeof handler>(function ArticlePage({ data, url }) {
               </aside>
               <ArticleBody body={post.body} />
             </div>
+            {(data.newer || data.older) && (
+              <nav class="article-neighbors container" aria-label="More notes">
+                {data.older
+                  ? (
+                    <a href={`/article/${encodeURIComponent(data.older.slug)}`}>
+                      <span>Older note</span>
+                      <strong>{data.older.title}</strong>
+                      <b aria-hidden="true">&lt;-</b>
+                    </a>
+                  )
+                  : <span />}
+                {data.newer
+                  ? (
+                    <a href={`/article/${encodeURIComponent(data.newer.slug)}`}>
+                      <span>Newer note</span>
+                      <strong>{data.newer.title}</strong>
+                      <b aria-hidden="true">-&gt;</b>
+                    </a>
+                  )
+                  : <span />}
+              </nav>
+            )}
           </article>
 
           {data.related.length > 0 && (

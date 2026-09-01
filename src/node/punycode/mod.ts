@@ -31,8 +31,8 @@ function ucs2decode(s: string): number[] {
 
 const ucs2encode = (arr: number[]): string => String.fromCodePoint(...arr);
 
-const digitToBasic = (digit: number, flag: number): number =>
-    digit + 22 + 75 * (digit < 26 ? 1 : 0) - ((flag !== 0 ? 1 : 0) << 5);
+const digitToBasic = (digit: number): number =>
+    digit + 22 + 75 * (digit < 26 ? 1 : 0);
 
 function basicToDigit(cp: number): number {
     if (cp >= 0x30 && cp < 0x3A) return 26 + (cp - 0x30);
@@ -115,10 +115,10 @@ function encode(input: string): string {
                     const t = k <= bias ? T_MIN : (k >= bias + T_MAX ? T_MAX : k - bias);
                     if (q < t) break;
                     const qMinusT = q - t, baseMinusT = BASE - t;
-                    output.push(String.fromCharCode(digitToBasic(t + qMinusT % baseMinusT, 0)));
+                    output.push(String.fromCharCode(digitToBasic(t + qMinusT % baseMinusT)));
                     q = Math.floor(qMinusT / baseMinusT);
                 }
-                output.push(String.fromCharCode(digitToBasic(q, 0)));
+                output.push(String.fromCharCode(digitToBasic(q)));
                 bias = adapt(delta, handledCPCountPlusOne, handledCPCount === basicLength);
                 delta = 0;
                 handledCPCount++;

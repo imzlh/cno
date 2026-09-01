@@ -1,7 +1,8 @@
 import { Headers } from "../headers";
 import { resolveObjectURL } from "../url";
 import { toOwnedBytes } from "../../utils/bytes";
-import { engine } from "./helpers";
+import { toFsPath } from "../../utils/path";
+import { asyncfs, engine } from "./helpers";
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
@@ -96,12 +97,23 @@ async function blobUrlBytes(url: URL): Promise<LocalProtocolResponse> {
     };
 }
 
+async function fileUrlBytes(url: URL): Promise<LocalProtocolResponse> {
+    const body = toOwnedBytes(new Uint8Array(await asyncfs.readFile(toFsPath(url))));
+    return {
+        url: url.href,
+        status: 200,
+        headers: new Headers(),
+        body,
+    };
+}
+
 export function isLocalFetchProtocol(protocol: string): boolean {
-    return protocol === 'data:' || protocol === 'blob:';
+    return protocol === 'data:' || protocol === 'blob:' || protocol === 'file:';
 }
 
 export async function loadLocalProtocol(url: URL, rawUrl = url.href): Promise<LocalProtocolResponse | null> {
     if (url.protocol === 'data:') return dataUrlBytes(url, rawUrl);
     if (url.protocol === 'blob:') return blobUrlBytes(url);
+    if (url.protocol === 'file:') return fileUrlBytes(url);
     return null;
 }

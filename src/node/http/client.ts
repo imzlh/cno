@@ -18,6 +18,7 @@ import {
     expectsContinue,
     initClientRequestState,
     mergeUrlOptions,
+    normalizeClientRequestArgs,
     normalizeRequestOptions,
     releaseRequestTransport,
     setRequestTimeout,
@@ -33,6 +34,7 @@ import {
 } from '../diagnostics_channel/builtins';
 import { EventEmitter } from '../events';
 import { Socket } from '../net';
+import { flattenPrototype } from '../_internal/prototype';
 import { IncomingMessageImpl, OutgoingMessageImpl, validateRequestMethod, validateRequestPath } from './server';
 
 export { METHODS } from './constants';
@@ -69,24 +71,10 @@ export interface ClientRequest extends OutgoingMessageImpl {
     destroy(error?: Error): this;
 }
 
-function flattenPrototype(target: object): void {
-    const parent = Object.getPrototypeOf(target);
-    if (!parent || parent === Object.prototype) return;
-
-    for (const key of Object.getOwnPropertyNames(parent)) {
-        if (key === 'constructor' || Object.prototype.hasOwnProperty.call(target, key)) continue;
-        const descriptor = Object.getOwnPropertyDescriptor(parent, key);
-        if (descriptor) Object.defineProperty(target, key, descriptor);
-    }
-
-    for (const key of Object.getOwnPropertySymbols(parent)) {
-        if (Object.prototype.hasOwnProperty.call(target, key)) continue;
-        const descriptor = Object.getOwnPropertyDescriptor(parent, key);
-        if (descriptor) Object.defineProperty(target, key, descriptor);
-    }
-}
-
 export interface ClientRequestImpl extends ClientRequest, ClientRequestState<Socket> {
+    // Narrows both bases: OutgoingMessage allows any MessageSocket, the shared
+    // client state is transport-generic; a node:http request is always plain TCP.
+    socket: Socket | null;
     _tcp: CModuleStreams.TCP | null;
     _options: ClientRequestArgs;
     _callback: ((res: IncomingMessageImpl) => void) | null;
@@ -125,6 +113,7 @@ const HTTP_CLIENT_HOOKS: ClientHooks<ClientRequestImpl> = {
     // Node client sends Host only by default (no User-Agent / Accept-Encoding).
     defaultUserAgent: '',
     requestIdPrefix: 'http-fetch',
+    createIncomingMessage: (socket) => new IncomingMessageImpl(socket),
     connect: (request) => connectPlainTransport(request, 80),
     onTransportAssigned: (request, transport) => {
         request._tcp = (transport as Socket)._tcp ?? null;
@@ -710,10 +699,12 @@ export function request(
     optionsOrCallback?: ClientRequestArgs | ((res: IncomingMessageImpl) => void),
     callback?: (res: IncomingMessageImpl) => void,
 ): ClientRequestImpl {
-    if ((typeof urlOrOptions === 'string' || urlOrOptions instanceof URL) && optionsOrCallback && typeof optionsOrCallback === 'object') {
-        return new ClientRequestImpl(mergeUrlOptions(urlOrOptions, optionsOrCallback), callback);
-    }
-    return new ClientRequestImpl(urlOrOptions, optionsOrCallback as ((res: IncomingMessageImpl) => void) | undefined);
+    const args = normalizeClientRequestArgs<ClientRequestArgs, IncomingMessageImpl>(
+        urlOrOptions,
+        optionsOrCallback,
+        callback,
+    );
+    return new ClientRequestImpl(...args);
 }
 
 export function get(url: string | URL, options: ClientRequestArgs, callback?: (res: IncomingMessageImpl) => void): ClientRequestImpl;

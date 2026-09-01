@@ -11,6 +11,13 @@ const nativeError = import.meta.use('error');
 
 import { asError } from './_shared';
 import type { SpawnInput, SpawnOptions } from './types';
+import path from '../path';
+
+const { basename, isAbsolute, join, resolve } = path;
+
+function isDrivePath(value: string): boolean {
+    return /^[A-Za-z]:/.test(value);
+}
 
 // libuv always merges these from the parent when an explicit env is given, so a
 // Windows child never loses PATH/SYSTEMROOT no matter what the caller passes
@@ -25,7 +32,7 @@ export const WINDOWS_REQUIRED_ENV_VARS = [
 ];
 
 export function isWindowsHost(): boolean {
-    return os.uname().sysname === 'Windows_NT';
+    return os.platform === 'windows' || os.platform === 'win32';
 }
 
 // Windows env keys are case-insensitive, so a block containing both PATH and Path
@@ -80,32 +87,6 @@ export function withRequiredEnvVars(env: Record<string, string>): Record<string,
     return out;
 }
 
-// A redirection target that comes from a %VAR% cannot work on the sync path: cmd
-// resolves the target while parsing the expanded `call %VAR%` line, before the
-// second pass that would expand the target itself, so `echo x > "%OUT%"` created
-// a file literally named `%OUT%` in the cwd and still reported status 0.
-// Returning an error is a deliberate divergence from Node — it is the one
-// construct the sync path cannot honour, and silently writing to the wrong path
-// in execSync is worse than a catchable failure. The async path handles this
-// correctly and is the documented workaround.
-export function findShellRedirectVarTarget(command: string): string | undefined {
-    // `>` or `>>`, optional space, then a target token that contains a %...% pair.
-    const match = /(?:^|[^>])>>?\s*("[^"]*%[^%"]+%[^"]*"|[^\s"|&]*%[^%\s"|&]+%[^\s"|&]*)/.exec(command);
-    return match ? match[1] : undefined;
-}
-
-export function makeSyncShellRedirectError(target: string, command: string): NodeJS.ErrnoException {
-    const err = new Error(
-        `spawnSync: a redirection target that expands an environment variable (${target}) `
-        + 'is not supported with shell:true on Windows, because the sync spawn cannot pass '
-        + 'the command line through verbatim. Expand the path in JavaScript and pass a '
-        + 'literal target, or use the async exec/spawn, which handles this correctly.',
-    ) as NodeJS.ErrnoException;
-    Reflect.set(err, 'code', 'ERR_CNO_SYNC_SHELL_REDIRECT_VAR');
-    Reflect.set(err, 'syscall', `spawnSync ${command}`);
-    return err;
-}
-
 export function normalizeInput(input: unknown): SpawnInput | undefined {
     if (input === undefined) return undefined;
     if (typeof input === 'string' || input instanceof ArrayBuffer) return input;
@@ -120,7 +101,8 @@ export function normalizeInput(input: unknown): SpawnInput | undefined {
 }
 
 export function isPathLikeCommand(command: string): boolean {
-    return command.includes('/') || command.includes('\\') || /^[A-Za-z]:[\\/]/.test(command);
+    return command.includes('/') || command.includes('\\')
+        || isDrivePath(command);
 }
 
 export function makeSpawnError(command: string, syscall: string, args?: string[]): NodeJS.ErrnoException {
@@ -167,7 +149,7 @@ export function isRunnableFile(path: string): boolean {
 }
 
 export function isAbsoluteCommandPath(command: string): boolean {
-    return command.startsWith('/') || command.startsWith('\\') || /^[A-Za-z]:[\\/]/.test(command);
+    return isAbsolute(command);
 }
 
 // Relative commands resolve against the CHILD's cwd, not ours. Measured on Node
@@ -176,7 +158,7 @@ export function isAbsoluteCommandPath(command: string): boolean {
 // invents an ENOENT for a command that would have run.
 export function resolveAgainstCwd(command: string, cwd?: string): string {
     if (!cwd || isAbsoluteCommandPath(command)) return command;
-    return cwd.replace(/[\\/]+$/, '') + '/' + command;
+    return resolve(cwd, command);
 }
 
 // The native layer resolves a relative command against the PARENT's cwd, not the
@@ -208,9 +190,9 @@ export function resolveCommandForCwd(command: string, cwd?: string): string {
 export function resolveCommandFile(command: string, cwd?: string): string | null {
     const target = resolveAgainstCwd(command, cwd);
     if (isRunnableFile(target)) return target;
-    if (os.uname().sysname !== 'Windows_NT') return null;
+    if (!isWindowsHost()) return null;
     // Only an extensionless final segment gets the PATHEXT treatment.
-    const base = target.slice(Math.max(target.lastIndexOf('/'), target.lastIndexOf('\\')) + 1);
+    const base = basename(target);
     if (base.includes('.')) return null;
     for (const ext of windowsPathExts()) {
         if (/^\.(?:bat|cmd)$/i.test(ext)) continue;
@@ -247,7 +229,7 @@ export function commandFileExists(command: string, cwd?: string): boolean {
 // exec/execSync are exempt because they pass `shell: options?.shell ?? true`,
 // which is exactly how Node exempts them too.
 export function isBatchFileCommand(command: string): boolean {
-    if (os.uname().sysname !== 'Windows_NT') return false;
+    if (!isWindowsHost()) return false;
     return /\.(?:bat|cmd)$/i.test(command);
 }
 
@@ -289,12 +271,12 @@ export function resolvesOnPath(command: string): boolean {
     let raw: string | undefined;
     try { raw = os.getenv('PATH'); } catch { /* unset */ }
     if (!raw) return false;
-    const isWindows = os.uname().sysname === 'Windows_NT';
+    const isWindows = isWindowsHost();
     const sep = isWindows ? ';' : ':';
     for (const entry of raw.split(sep)) {
         const dir = entry.trim().replace(/^"|"$/g, '');
         if (!dir) continue;
-        const joined = dir.replace(/[\\/]+$/, '') + (isWindows ? '\\' : '/') + command;
+        const joined = join(dir, command);
         if (commandFileExists(joined)) return true;
     }
     return false;

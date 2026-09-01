@@ -14,6 +14,7 @@ export const handler = define.handlers({
     return page({
       posts,
       subscribed: ctx.url.searchParams.get("subscribed"),
+      unsubscribed: ctx.url.searchParams.get("unsubscribed"),
     }, {
       headers: { "cache-control": "public, max-age=30" },
     });
@@ -233,8 +234,44 @@ export default define.page<typeof handler>(function Home({ data, url }) {
                     Enter a valid email address.
                   </p>
                 )
+                : data.subscribed === "error"
+                ? (
+                  <p class="form-note form-error" role="alert">
+                    Subscription is temporarily unavailable. Try again later.
+                  </p>
+                )
+                : data.unsubscribed === "1"
+                ? (
+                  <p class="form-note form-message" role="status">
+                    You have been removed from the list.
+                  </p>
+                )
+                : data.unsubscribed === "error"
+                ? (
+                  <p class="form-note form-error" role="alert">
+                    We could not update that subscription. Try again later.
+                  </p>
+                )
                 : <p class="form-note">No noise. Unsubscribe whenever.</p>}
             </form>
+            {(data.subscribed === "1" || data.unsubscribed === "1") && (
+              <details class="unsubscribe-details">
+                <summary>Manage subscription</summary>
+                <form action="/api/unsubscribe" method="post">
+                  <label class="sr-only" htmlFor="unsubscribe-email">
+                    Email to remove
+                  </label>
+                  <input
+                    id="unsubscribe-email"
+                    name="email"
+                    type="email"
+                    placeholder="you@example.com"
+                    required
+                  />
+                  <button type="submit">Unsubscribe</button>
+                </form>
+              </details>
+            )}
           </section>
         </main>
 

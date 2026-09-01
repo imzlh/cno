@@ -7,7 +7,7 @@ const wasm = import.meta.use('wasm');
 const os = import.meta.use('os');
 const syncfs = import.meta.use('fs');
 const engine = import.meta.use('engine');
-const isWindowsHost = os.uname().sysname === 'Windows_NT';
+const isWindowsHost = os.platform == 'win32';
 
 export interface WASIOptions {
     version?: string;

@@ -16,6 +16,8 @@ import {
     validateKey,
     validateValue,
     type RawKey,
+    type AtomicDbOperation,
+    OP,
 } from './types';
 import { KvDatabase } from './db';
 import { DENO_CUSTOM_INSPECT, KvU64, isKvU64 } from './u64';
@@ -23,11 +25,11 @@ import { DENO_CUSTOM_INSPECT, KvU64, isKvU64 } from './u64';
 const console = import.meta.use('console');
 
 type AtomicOp =
-    | { type: 'check'; key: Deno.KvKey; versionstamp: string | null }
-    | { type: 'set'; key: Deno.KvKey; value: unknown; expireIn?: number }
-    | { type: 'delete'; key: Deno.KvKey }
-    | { type: 'sum' | 'max' | 'min'; key: Deno.KvKey; operand: bigint }
-    | { type: 'enqueue'; key: Deno.KvKey; value: unknown; delay: number; queueEntry: KvQueueEntry };
+    | { type: OP.CHECK; key: Deno.KvKey; versionstamp: string | null }
+    | { type: OP.SET; key: Deno.KvKey; value: unknown; expireIn?: number }
+    | { type: OP.DELETE; key: Deno.KvKey }
+    | { type: OP.SUM | OP.MAX | OP.MIN; key: Deno.KvKey; operand: bigint }
+    | { type: OP.ENQUEUE; key: Deno.KvKey; value: unknown; delay: number; queueEntry: KvQueueEntry };
 
 interface AtomicHooks {
     notify?: (key: Deno.KvKey) => void;
@@ -54,11 +56,11 @@ export class AtomicOperation implements Deno.AtomicOperation {
     }
 
     private countChecks(): number {
-        return this.ops.filter(op => op.type === 'check').length;
+        return this.ops.filter(op => op.type === OP.CHECK).length;
     }
 
     private countMutations(): number {
-        return this.ops.filter(op => op.type !== 'check').length;
+        return this.ops.filter(op => op.type !== OP.CHECK).length;
     }
 
     private pushMutation(op: AtomicOp): void {
@@ -75,9 +77,9 @@ export class AtomicOperation implements Deno.AtomicOperation {
         }
     }
 
-    private readU64Operand(type: 'sum' | 'max' | 'min', value: unknown): bigint {
+    private readU64Operand(type: OP.SUM | OP.MAX | OP.MIN, value: unknown): bigint {
         if (!isKvU64(value)) {
-            throw new TypeError(`Failed to perform '${type}' mutation on a non-U64 operand`);
+            throw new TypeError(`Failed to perform '${OP[type].toLowerCase()}' mutation on a non-U64 operand`);
         }
         return value.value;
     }
@@ -92,7 +94,7 @@ export class AtomicOperation implements Deno.AtomicOperation {
         for (const check of checks) {
             this.validateCheck(check);
             this.ops.push({
-                type: 'check',
+                type: OP.CHECK,
                 key: check.key,
                 versionstamp: check.versionstamp,
             });
@@ -110,7 +112,7 @@ export class AtomicOperation implements Deno.AtomicOperation {
                     validateValue(mutation.value);
                     validateExpireIn(mutation.expireIn);
                     this.pushMutation({
-                        type: 'set',
+                        type: OP.SET,
                         key: mutation.key,
                         value: mutation.value,
                         expireIn: mutation.expireIn,
@@ -120,32 +122,32 @@ export class AtomicOperation implements Deno.AtomicOperation {
                     validateKey(mutation.key);
                     if ('value' in mutation) throw new TypeError("delete mutation cannot have a value");
                     this.pushMutation({
-                        type: 'delete',
+                        type: OP.DELETE,
                         key: mutation.key,
                     });
                     break;
                 case 'sum':
                     validateKey(mutation.key);
                     this.pushMutation({
-                        type: 'sum',
+                        type: OP.SUM,
                         key: mutation.key,
-                        operand: this.readU64Operand('sum', mutation.value),
+                        operand: this.readU64Operand(OP.SUM, mutation.value),
                     });
                     break;
                 case 'max':
                     validateKey(mutation.key);
                     this.pushMutation({
-                        type: 'max',
+                        type: OP.MAX,
                         key: mutation.key,
-                        operand: this.readU64Operand('max', mutation.value),
+                        operand: this.readU64Operand(OP.MAX, mutation.value),
                     });
                     break;
                 case 'min':
                     validateKey(mutation.key);
                     this.pushMutation({
-                        type: 'min',
+                        type: OP.MIN,
                         key: mutation.key,
-                        operand: this.readU64Operand('min', mutation.value),
+                        operand: this.readU64Operand(OP.MIN, mutation.value),
                     });
                     break;
                 default:
@@ -163,7 +165,7 @@ export class AtomicOperation implements Deno.AtomicOperation {
         validateExpireIn(options?.expireIn);
 
         this.pushMutation({
-            type: 'set',
+            type: OP.SET,
             key,
             value,
             expireIn: options?.expireIn,
@@ -176,7 +178,7 @@ export class AtomicOperation implements Deno.AtomicOperation {
         validateKey(key);
 
         this.pushMutation({
-            type: 'delete',
+            type: OP.DELETE,
             key,
         });
         return this;
@@ -188,7 +190,7 @@ export class AtomicOperation implements Deno.AtomicOperation {
         const value = new KvU64(n);
 
         this.pushMutation({
-            type: 'sum',
+            type: OP.SUM,
             key,
             operand: value.value,
         });
@@ -201,7 +203,7 @@ export class AtomicOperation implements Deno.AtomicOperation {
         const value = new KvU64(n);
 
         this.pushMutation({
-            type: 'max',
+            type: OP.MAX,
             key,
             operand: value.value,
         });
@@ -214,7 +216,7 @@ export class AtomicOperation implements Deno.AtomicOperation {
         const value = new KvU64(n);
 
         this.pushMutation({
-            type: 'min',
+            type: OP.MIN,
             key,
             operand: value.value,
         });
@@ -235,7 +237,7 @@ export class AtomicOperation implements Deno.AtomicOperation {
         const prepared = prepareQueueEntry(value, options);
 
         this.pushMutation({
-            type: 'enqueue',
+            type: OP.ENQUEUE,
             key: prepared.key,
             value: prepared.entry,
             delay: prepared.delay,
@@ -276,25 +278,25 @@ export class AtomicOperation implements Deno.AtomicOperation {
         const lines = ['AtomicOperation'];
         for (const op of this.ops) {
             switch (op.type) {
-                case 'check':
+                case OP.CHECK:
                     lines.push(`  check({ key: ${inspect(op.key)}, versionstamp: ${inspect(op.versionstamp ?? null)} })`);
                     break;
-                case 'set':
+                case OP.SET:
                     if (op.expireIn === undefined) {
                         lines.push(`  set(${inspect(op.key)}, ${inspect(op.value)})`);
                     } else {
                         lines.push(`  set(${inspect(op.key)}, ${inspect(op.value)}, { expireIn: ${op.expireIn} })`);
                     }
                     break;
-                case 'delete':
+                case OP.DELETE:
                     lines.push(`  delete(${inspect(op.key)})`);
                     break;
-                case 'sum':
-                case 'max':
-                case 'min':
-                    lines.push(`  ${op.type}(${inspect(op.key)}, ${inspect(new KvU64(op.operand ?? 0n))})`);
+                case OP.SUM:
+                case OP.MAX:
+                case OP.MIN:
+                    lines.push(`  ${OP[op.type].toLowerCase()}(${inspect(op.key)}, ${inspect(new KvU64(op.operand))})`);
                     break;
-                case 'enqueue': {
+                case OP.ENQUEUE: {
                     const options: Record<string, unknown> = {};
                     if (op.delay) options.delay = op.delay;
                     if (op.queueEntry?.undeliveredKeys) options.keysIfUndelivered = op.queueEntry.undeliveredKeys;
@@ -320,63 +322,63 @@ export class AtomicOperation implements Deno.AtomicOperation {
         }
 
         const mutationVersionstamp = this.countMutations() > 0 ? generateVersionstamp() : undefined;
-        const dbOps = this.ops.map(op => {
-            const key = op.type === 'set' && mutationVersionstamp
-                ? resolveCommitVersionstampKey(op.key, mutationVersionstamp)
-                : op.key;
-            const rawKey = serializeKey(key);
-
-            switch (op.type) {
-                case 'check':
-                    if (typeof op.versionstamp === 'string' && !/^[0-9a-f]{20}$/.test(op.versionstamp)) {
-                        throw new TypeError('Invalid versionstamp');
-                    }
-                    return {
-                        type: 'check' as const,
-                        key: rawKey,
-                        versionstamp: op.versionstamp ?? null,
-                    };
-                case 'set':
-                    return {
-                        type: 'set' as const,
-                        key: rawKey,
-                        value: serializeValue(op.value),
-                        expireIn: op.expireIn,
-                    };
-                case 'delete':
-                    return {
-                        type: 'delete' as const,
-                        key: rawKey,
-                    };
-                case 'sum':
-                case 'max':
-                case 'min':
-                    return {
-                        type: op.type as 'sum' | 'max' | 'min',
-                        key: rawKey,
-                        operand: op.operand,
-                    };
-                case 'enqueue':
-                    return {
-                        type: 'set' as const,
-                        key: rawKey,
-                        value: serializeValue(op.value),
-                        expireIn: (op.delay ?? 0) + 86400000,
-                    };
-            }
-        });
-
         try {
+            const dbOps: AtomicDbOperation[] = this.ops.map(op => {
+                const key = op.type === OP.SET && mutationVersionstamp
+                    ? resolveCommitVersionstampKey(op.key, mutationVersionstamp)
+                    : op.key;
+                const rawKey = serializeKey(key);
+
+                switch (op.type) {
+                    case OP.CHECK:
+                        if (typeof op.versionstamp === 'string' && !/^[0-9a-f]{20}$/.test(op.versionstamp)) {
+                            throw new TypeError('Invalid versionstamp');
+                        }
+                        return {
+                            type: 'check' as const,
+                            key: rawKey,
+                            versionstamp: op.versionstamp ?? null,
+                        };
+                    case OP.SET:
+                        return {
+                            type: 'set' as const,
+                            key: rawKey,
+                            value: serializeValue(op.value),
+                            expireIn: op.expireIn,
+                        };
+                    case OP.DELETE:
+                        return {
+                            type: 'delete' as const,
+                            key: rawKey,
+                        };
+                    case OP.SUM:
+                    case OP.MAX:
+                    case OP.MIN:
+                        return {
+                            type: OP[op.type].toLowerCase() as 'sum' | 'max' | 'min',
+                            key: rawKey,
+                            operand: op.operand,
+                        };
+                    case OP.ENQUEUE:
+                        return {
+                            type: 'set' as const,
+                            key: rawKey,
+                            value: serializeValue(op.value),
+                            expireIn: (op.delay ?? 0) + 86400000,
+                        };
+                }
+            });
+
             const result = this.db.atomic(dbOps, mutationVersionstamp);
             
             if (result.success) {
                 for (const op of this.ops) {
-                    if (op.type === 'check') continue;
-                    const key = op.type === 'set' && mutationVersionstamp
+                    if (op.type === OP.CHECK) continue;
+                    const key = op.type === OP.SET && mutationVersionstamp
                         ? resolveCommitVersionstampKey(op.key, mutationVersionstamp)
                         : op.key;
                     const rawKey = serializeKey(key);
-                    if (op.type === 'enqueue') {
+                    if (op.type === OP.ENQUEUE) {
                         if (op.delay === 0 && op.queueEntry) {
                             this.hooks?.deliverQueue?.(op.queueEntry, rawKey);
                         }

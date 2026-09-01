@@ -1,8 +1,13 @@
 import { posixPathApi, win32PathApi } from './_shared';
 
+const os = import.meta.use('os');
+
 const posixCompat = posixPathApi;
 const win32Compat = win32PathApi;
-const platformPath = process.platform === 'win32' ? win32Compat : posixCompat;
+const sysname = os.uname().sysname;
+const platformPath = os.platform === 'windows' || os.platform === 'win32' || sysname === 'Windows_NT'
+    ? win32Compat
+    : posixCompat;
 
 export const sep = platformPath.sep;
 export const delimiter = platformPath.delimiter;

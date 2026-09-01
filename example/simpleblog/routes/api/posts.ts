@@ -9,6 +9,7 @@ import {
   slugify,
   StorageUnavailableError,
 } from "../../data/posts.ts";
+import { isAdminRequest } from "../../data/auth.ts";
 import { define } from "../../utils.ts";
 
 type Payload = Record<string, unknown>;
@@ -38,24 +39,6 @@ async function readPayload(request: Request): Promise<Payload> {
 function text(payload: Payload, key: string): string {
   const value = payload[key];
   return typeof value === "string" ? value.trim() : "";
-}
-
-async function tokensMatch(
-  expected: string,
-  provided: string,
-): Promise<boolean> {
-  const encoder = new TextEncoder();
-  const [expectedHash, providedHash] = await Promise.all([
-    crypto.subtle.digest("SHA-256", encoder.encode(expected)),
-    crypto.subtle.digest("SHA-256", encoder.encode(provided)),
-  ]);
-  const left = new Uint8Array(expectedHash);
-  const right = new Uint8Array(providedHash);
-  let difference = 0;
-  for (let index = 0; index < left.length; index++) {
-    difference |= left[index] ^ right[index];
-  }
-  return difference === 0;
 }
 
 function validImageSource(value: string): boolean {
@@ -149,8 +132,15 @@ function errorResponse(
 function adminRedirect(
   ctx: { redirect(path: string, status?: number): Response },
   value: string,
+  returnTo = "/admin",
 ) {
-  return ctx.redirect(`/admin?${value}`, 303);
+  const target = returnTo.startsWith("/admin") && !returnTo.startsWith("//")
+    ? returnTo
+    : "/admin";
+  return ctx.redirect(
+    `${target}${target.includes("?") ? "&" : "?"}${value}`,
+    303,
+  );
 }
 
 export const handler = define.handlers({
@@ -162,12 +152,19 @@ export const handler = define.handlers({
   },
 
   async POST(ctx) {
-    const configuredToken = Deno.env.get("QUIETLINE_ADMIN_TOKEN")?.trim();
-    if (!configuredToken) {
+    if (!await isAdminRequest(ctx.req)) {
+      const configured = Deno.env.get("QUIETLINE_ADMIN_TOKEN")?.trim();
+      if (!configured) {
+        return errorResponse(
+          ctx.req,
+          "Publishing is disabled until QUIETLINE_ADMIN_TOKEN is configured.",
+          503,
+        );
+      }
       return errorResponse(
         ctx.req,
-        "Publishing is disabled until QUIETLINE_ADMIN_TOKEN is configured.",
-        503,
+        "An admin session or token is required.",
+        401,
       );
     }
 
@@ -178,16 +175,8 @@ export const handler = define.handlers({
       return errorResponse(ctx.req, "The request body could not be read.", 400);
     }
 
-    const providedToken = ctx.req.headers.get("x-admin-token")?.trim() ||
-      text(payload, "adminToken");
-    if (!providedToken) {
-      return errorResponse(ctx.req, "An admin token is required.", 401);
-    }
-    if (!await tokensMatch(configuredToken, providedToken)) {
-      return errorResponse(ctx.req, "The admin token is invalid.", 403);
-    }
-
     const action = text(payload, "action") || "save";
+    const returnTo = text(payload, "returnTo");
 
     try {
       if (action === "delete") {
@@ -198,7 +187,7 @@ export const handler = define.handlers({
         await deletePost(slug);
         return wantsJson(ctx.req)
           ? Response.json({ deleted: slug })
-          : adminRedirect(ctx, "deleted=1");
+          : adminRedirect(ctx, "deleted=1", returnTo || "/admin?view=posts");
       }
 
       if (action === "toggle") {
@@ -211,7 +200,7 @@ export const handler = define.handlers({
         }, post.slug);
         return wantsJson(ctx.req)
           ? Response.json({ post: saved })
-          : adminRedirect(ctx, "updated=1");
+          : adminRedirect(ctx, "updated=1", returnTo || "/admin?view=posts");
       }
 
       if (action !== "save") {
@@ -224,14 +213,19 @@ export const handler = define.handlers({
           return Response.json({ errors: parsed.errors }, { status: 422 });
         }
         const message = encodeURIComponent(parsed.errors[0]);
-        return ctx.redirect(`/admin?error=${message}`, 303);
+        return ctx.redirect(`/admin?view=compose&error=${message}`, 303);
       }
 
       const originalSlug = text(payload, "originalSlug") || undefined;
       const saved = await savePost(parsed.input, originalSlug);
       return wantsJson(ctx.req)
         ? Response.json({ post: saved }, { status: originalSlug ? 200 : 201 })
-        : ctx.redirect(`/admin?saved=${encodeURIComponent(saved.slug)}`, 303);
+        : ctx.redirect(
+          `/admin?view=compose&edit=${encodeURIComponent(saved.slug)}&saved=${
+            encodeURIComponent(saved.slug)
+          }`,
+          303,
+        );
     } catch (error) {
       if (
         error instanceof PostConflictError ||

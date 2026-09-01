@@ -29,6 +29,7 @@ interface WatchSubscription {
     keys: readonly KvKey[];
     rawKeys: RawKey[];
     keyIds: string[];
+    raw: boolean;
     controller: ReadableStreamDefaultController<KvEntryMaybe<unknown>[]>;
     lastValues: Map<string, { versionstamp: string | null; value: unknown }>;
 }
@@ -254,6 +255,7 @@ export class Kv implements Deno.Kv {
                     keys,
                     rawKeys,
                     keyIds,
+                    raw: options?.raw ?? false,
                     controller: controller as ReadableStreamDefaultController<KvEntryMaybe<unknown>[]>,
                     lastValues,
                 };
@@ -380,7 +382,6 @@ export class Kv implements Deno.Kv {
                                 this.pendingDeliveries.delete(deliveryKey);
                             });
                         this.pendingDeliveries.set(deliveryKey, promise);
-                        this.db.delete(serializeKey(entry.key as KvKey));
                     }
                 }
             }
@@ -401,7 +402,7 @@ export class Kv implements Deno.Kv {
                 if (keyIndex === -1) continue;
                 const lastValue = sub.lastValues.get(changedKeyId);
 
-                if (lastValue && lastValue.versionstamp === changedVersionstamp) {
+                if (!sub.raw && lastValue && lastValue.versionstamp === changedVersionstamp) {
                     continue;
                 }
                 

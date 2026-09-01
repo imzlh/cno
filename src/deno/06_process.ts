@@ -1,11 +1,10 @@
 import { assert } from "../utils/assert";
 import { bytesToArrayBuffer, concatChunks } from "../utils/bytes";
 import { malloc } from "../utils/malloc";
-import { join } from "../utils/path";
+import { join, resolvePath, toFsPath } from "../utils/path";
 import { isWindows } from "../utils/platform";
 import { wrapFsClassDec as wrap, wrapFSns } from "../utils/wrap";
 import { ReadableStream } from "../webapi/streams";
-import { toString } from "./02_fs";
 import { useWritable } from "./05_net";
 import { errors } from "./01_errors";
 
@@ -97,19 +96,34 @@ function outputOptions(options?: Deno.CommandOptions): Deno.CommandOptions {
     if (options?.stdin === 'piped') {
         throw new TypeError("Piped stdin is not supported for this function, use 'Deno.Command.spawn()' instead");
     }
-    if (options?.stdout !== undefined && options.stdout !== 'piped') {
-        throw new TypeError("Cannot get 'stdout': 'stdout' is not piped");
-    }
-    if (options?.stderr !== undefined && options.stderr !== 'piped') {
-        throw new TypeError("Cannot get 'stderr': 'stderr' is not piped");
-    }
 
     return {
         ...options,
         stdin: options?.stdin ?? 'null',
-        stdout: 'piped',
-        stderr: 'piped',
+        stdout: options?.stdout ?? 'piped',
+        stderr: options?.stderr ?? 'piped',
     };
+}
+
+function commandOutput(
+    code: number,
+    signal: Deno.Signal | null,
+    success: boolean,
+    stdout: Uint8Array,
+    stderr: Uint8Array,
+    options?: Deno.CommandOptions,
+): Deno.CommandOutput {
+    const output = { code, signal, success } as Deno.CommandOutput;
+    for (const [name, bytes] of [['stdout', stdout], ['stderr', stderr]] as const) {
+        Object.defineProperty(output, name, {
+            enumerable: true,
+            configurable: true,
+            get: options?.[name] === undefined || options[name] === 'piped'
+                ? () => bytes
+                : () => { throw new TypeError(`Cannot get '${name}': '${name}' is not piped`); },
+        });
+    }
+    return output;
 }
 
 let cachedUmask: number | undefined;
@@ -118,7 +132,7 @@ function readUmask(): number {
     if (cachedUmask !== undefined) return cachedUmask;
     const bytes = new Uint8Array(4);
     crypto.randomFill(bytes);
-    const path = `${os.tmpDir}/cno-umask-${os.pid}-${crypto.hexEncode(bytes)}`;
+    const path = join(os.tmpDir, `cno-umask-${os.pid}-${crypto.hexEncode(bytes)}`);
     try {
         fs.mkdir(path, 0o777);
         const mode = fs.stat(path).mode & 0o777;
@@ -222,18 +236,20 @@ export class ChildProcess implements Deno.ChildProcess {
 
     @wrap
     async output(): Promise<Deno.CommandOutput> {
-        if (!this.#stdout) throw new TypeError("Cannot get 'stdout': 'stdout' is not piped");
-        if (!this.#stderr) throw new TypeError("Cannot get 'stderr': 'stderr' is not piped");
-        const stdout = this.#stdout.bytes();
-        const stderr = this.#stderr.bytes();
+        const stdout = this.#stdout?.bytes() ?? Promise.resolve(new Uint8Array(0));
+        const stderr = this.#stderr?.bytes() ?? Promise.resolve(new Uint8Array(0));
         const f = await this.#wait;
-        return {
-            code: commandCode(f.exit_status, f.term_signal),
-            signal: toDenoSignal(f.term_signal),
-            success: commandSuccess(f.exit_status, f.term_signal),
-            stderr: await stderr,
-            stdout: await stdout
-        };
+        return commandOutput(
+            commandCode(f.exit_status, f.term_signal),
+            toDenoSignal(f.term_signal),
+            commandSuccess(f.exit_status, f.term_signal),
+            await stdout,
+            await stderr,
+            {
+                stdout: this.#stdout ? 'piped' : 'null',
+                stderr: this.#stderr ? 'piped' : 'null',
+            },
+        );
     }
 
     @wrap
@@ -288,7 +304,7 @@ function commandEnv(options?: Deno.CommandOptions): Record<string, string> | und
 }
 
 function commandCwd(cwd: string | URL): string {
-    const path = toString(cwd);
+    const path = toFsPath(cwd);
     let stat: CModuleFS.Stats;
     try {
         stat = fs.stat(path);
@@ -303,16 +319,12 @@ function commandCwd(cwd: string | URL): string {
     return path;
 }
 
-function isAbsolutePath(path: string): boolean {
-    return path.startsWith('/') || /^[A-Za-z]:[\\/]/.test(path);
-}
-
 function ensureCommandPath(path: string, cwd?: string): void {
     if (!/[\\/]/.test(path)) return;
-    const statPath = cwd && !isAbsolutePath(path) ? join(cwd, path) : path;
+    const statPath = cwd ? resolvePath(path, cwd) : path;
     const stat = fs.stat(statPath);
     if (stat.isDirectory) throw new errors.PermissionDenied(`Permission denied: ${path}`);
-    if (os.uname().sysname !== 'Windows_NT' && (stat.mode & 0o111) === 0) {
+    if (os.platform !== 'windows' && (stat.mode & 0o111) === 0) {
         throw new errors.PermissionDenied(`Permission denied: ${path}`);
     }
 }
@@ -345,6 +357,7 @@ function spawn(path: string, args: string[], options?: Deno.CommandOptions): CMo
         stdout: pipe(options?.stdout, 'stdout'),
         stderr: pipe(options?.stderr, 'stderr'),
         detached: options?.detached,
+        windowsVerbatimArguments: options?.windowsRawArguments,
         uid: options?.uid,
         gid: options?.gid
     });
@@ -381,6 +394,7 @@ function spawnSync(path: string, args: string[], options?: Deno.CommandOptions):
             stdout: pipe(options?.stdout, 'stdout'),
             stderr: pipe(options?.stderr, 'stderr'),
             detached: options?.detached,
+            windowsVerbatimArguments: options?.windowsRawArguments,
             uid: options?.uid,
             gid: options?.gid
         });
@@ -413,27 +427,30 @@ class Command implements Deno.Command {
     #detached: boolean;
 
     constructor(command: string | URL, options?: Deno.CommandOptions) {
-        this.#path = toString(command);
+        this.#path = toFsPath(command);
         this.#args = options?.args ?? [];
         this.#options = options;
         this.#detached = options?.detached ?? false;
     }
 
     @wrap
-    async output(): Promise<Deno.CommandOutput> {
+    output(): Promise<Deno.CommandOutput> {
         assert(!this.#detached, "Detached process cannot be waited");
 
         const proc = spawn(this.#path, this.#args, outputOptions(this.#options));
         const stdo = proc.stdout ? new RStream(proc.stdout).bytes() : Promise.resolve(new Uint8Array(0));
         const stde = proc.stderr ? new RStream(proc.stderr).bytes() : Promise.resolve(new Uint8Array(0));
-        const res = await proc.wait();
-        return {
-            code: commandCode(res.exit_status, res.term_signal),
-            signal: toDenoSignal(res.term_signal),
-            success: commandSuccess(res.exit_status, res.term_signal),
-            stderr: await stde,
-            stdout: await stdo
-        };
+        return (async () => {
+            const res = await proc.wait();
+            return commandOutput(
+                commandCode(res.exit_status, res.term_signal),
+                toDenoSignal(res.term_signal),
+                commandSuccess(res.exit_status, res.term_signal),
+                await stdo,
+                await stde,
+                this.#options,
+            );
+        })();
     }
 
     @wrap
@@ -442,13 +459,14 @@ class Command implements Deno.Command {
 
         const res = spawnSync(this.#path, this.#args, outputOptions(this.#options));
         if (res.error) throw wrapSpawnErr(res.error, this.#path);
-        return {
-            code: commandCode(res.status, res.signal),
-            signal: toDenoSignal(res.signal),
-            success: commandSuccess(res.status, res.signal),
-            stderr: outputBytes(res.stderr),
-            stdout: outputBytes(res.stdout)
-        };
+        return commandOutput(
+            commandCode(res.status, res.signal),
+            toDenoSignal(res.signal),
+            commandSuccess(res.status, res.signal),
+            outputBytes(res.stdout),
+            outputBytes(res.stderr),
+            this.#options,
+        );
     }
 
     @wrap
@@ -474,7 +492,7 @@ Object.assign(Deno, wrapFSns({
     // unstable, but useful
     spawn(command: string | URL, optOrArgs?: Deno.CommandOptions | string[], opt?: Deno.CommandOptions): Deno.ChildProcess {
         const { args, options } = commandArgs(optOrArgs, opt);
-        const process = spawn(toString(command), args, options);
+        const process = spawn(toFsPath(command), args, options);
         return new ChildProcess(process, process.wait(), childProcessToken);
     },
 

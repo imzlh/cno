@@ -41,7 +41,12 @@ export async function readFile(path: PathLike | number, options?: { encoding?: B
             ? await withAbort(w(asfs.readFile(target.path), 'readFile', target.path), signal)
             : await withAbort(readFileWithFlag(target.path, flag), signal);
     if (signal?.aborted) throw makeAbortError(signal);
-    return decodeBuffer(buffer, encoding ?? 'utf-8');
+    // Node's promises API returns a Buffer when no encoding is requested.
+    // Supplying a synthetic UTF-8 default here changed the result into a
+    // string/Uint8Array path and made `fs.promises.readFile(path)` diverge
+    // from both callback and sync forms.  Let decodeBuffer's undefined
+    // encoding branch preserve the Buffer default.
+    return decodeBuffer(buffer, encoding);
 }
 
 async function withAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {

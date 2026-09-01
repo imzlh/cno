@@ -3,15 +3,15 @@
  * UnsafePointer and UnsafePointerView classes
  */
 
-import { brand, PointerObject, PointerValue } from './types';
+import { brand } from './utils';
 import { bytesToArrayBuffer } from '../../utils/bytes';
 const ffi = import.meta.use('ffi');
 
 type FfiBufferSource = ArrayBuffer | ArrayBufferView<ArrayBufferLike>;
-type PointerCarrier<T = unknown> = { pointer: PointerObject<T> };
+type PointerCarrier<T = unknown> = { pointer: Deno.PointerObject<T> };
 
-function createPointerObject<T = unknown>(addr: bigint): PointerObject<T> {
-    const obj: PointerObject<T> = { [brand]: null as T };
+function createPointerObject<T = unknown>(addr: bigint): Deno.PointerObject<T> {
+    const obj = { [brand]: null as T } as unknown as Deno.PointerObject<T>;
     Object.setPrototypeOf(obj, null);
     Object.defineProperty(obj, brand, {
         value: addr,
@@ -22,7 +22,7 @@ function createPointerObject<T = unknown>(addr: bigint): PointerObject<T> {
     return obj;
 }
 
-function getPointerAddress(ptr: PointerObject): bigint {
+function getPointerAddress(ptr: Deno.PointerObject): bigint {
     return Reflect.get(ptr, brand) as bigint;
 }
 
@@ -37,22 +37,22 @@ function bufferSourceBytes(value: FfiBufferSource): Uint8Array {
 }
 
 export class UnsafePointer {
-    static create<T = unknown>(value: bigint): PointerValue<T> {
+    static create<T = unknown>(value: bigint): Deno.PointerValue<T> {
         if (value === 0n) return null;
         return createPointerObject<T>(value);
     }
 
-    static equals<T = unknown>(a: PointerValue<T>, b: PointerValue<T>): boolean {
+    static equals<T = unknown>(a: Deno.PointerValue<T>, b: Deno.PointerValue<T>): boolean {
         if (a === null && b === null) return true;
         if (a === null || b === null) return false;
         return getPointerAddress(a) === getPointerAddress(b);
     }
 
-    static of<T = unknown>(value: BufferSource | PointerCarrier): PointerValue<T> {
+    static of<T = unknown>(value: BufferSource | PointerCarrier): Deno.PointerValue<T> {
         if (value === null || value === undefined) return null;
         
         if (hasPointer(value) && value.pointer) {
-            return value.pointer as PointerValue<T>;
+            return value.pointer as Deno.PointerValue<T>;
         }
         if (!(value instanceof ArrayBuffer) && !ArrayBuffer.isView(value)) return null;
         
@@ -63,24 +63,24 @@ export class UnsafePointer {
         return createPointerObject<T>(addr);
     }
 
-    static offset<T = unknown>(value: PointerObject, offset: number): PointerValue<T> {
+    static offset<T = unknown>(value: Deno.PointerObject, offset: number): Deno.PointerValue<T> {
         const addr = getPointerAddress(value);
         const newAddr = addr + BigInt(offset);
         if (newAddr === 0n) return null;
         return createPointerObject<T>(newAddr);
     }
 
-    static value(value: PointerValue): bigint {
+    static value(value: Deno.PointerValue): bigint {
         if (value === null) return 0n;
         return getPointerAddress(value);
     }
 }
 
 export class UnsafePointerView {
-    pointer: PointerObject;
+    pointer: Deno.PointerObject;
     private addr: bigint;
 
-    constructor(pointer: PointerObject) {
+    constructor(pointer: Deno.PointerObject) {
         this.pointer = pointer;
         this.addr = getPointerAddress(pointer);
     }
@@ -144,7 +144,7 @@ export class UnsafePointerView {
         return new DataView(buf.buffer, buf.byteOffset).getFloat64(0, true);
     }
 
-    getPointer<T = unknown>(offset: number = 0): PointerValue<T> {
+    getPointer<T = unknown>(offset: number = 0): Deno.PointerValue<T> {
         const addr = this.getBigUint64(offset);
         return UnsafePointer.create<T>(addr);
     }
@@ -153,7 +153,7 @@ export class UnsafePointerView {
         return ffi.getCString(this.addr + BigInt(offset));
     }
 
-    static getCString(pointer: PointerObject, offset: number = 0): string {
+    static getCString(pointer: Deno.PointerObject, offset: number = 0): string {
         const addr = getPointerAddress(pointer);
         return ffi.getCString(addr + BigInt(offset));
     }
@@ -164,7 +164,7 @@ export class UnsafePointerView {
     }
 
     static getArrayBuffer(
-        pointer: PointerObject,
+        pointer: Deno.PointerObject,
         byteLength: number,
         offset: number = 0
     ): ArrayBuffer {
@@ -181,7 +181,7 @@ export class UnsafePointerView {
     }
 
     static copyInto(
-        pointer: PointerObject,
+        pointer: Deno.PointerObject,
         destination: BufferSource,
         offset: number = 0
     ): void {

@@ -21,7 +21,6 @@ import {
     getAddressFamily,
     getDefaultLookupOrder,
     getDefaultServers,
-    hintFlags,
     isAddressAnswer,
     normalizeLookupError,
     normalizeLookupOptions,
@@ -63,13 +62,9 @@ export const NOTINITIALIZED = 'ENOTINITIALIZED';
 export const LOADIPHLPAPI = 'ELOADIPHLPAPI';
 export const ADDRGETNETWORKPARAMS = 'EADDRGETNETWORKPARAMS';
 export const CANCELLED = 'ECANCELLED';
-/**
- * Platform-correct getaddrinfo hint flags — see `hintFlags` in ./_internal.
- * Node exports the platform's own AI_* values, so these differ on Windows.
- */
-export const V4MAPPED = hintFlags.V4MAPPED;
-export const ALL = hintFlags.ALL;
-export const ADDRCONFIG = hintFlags.ADDRCONFIG;
+export const V4MAPPED = dns.V4MAPPED;
+export const ALL = dns.ALL;
+export const ADDRCONFIG = dns.ADDRCONFIG;
 
 export interface ResolveOptions {
     ttl?: boolean;

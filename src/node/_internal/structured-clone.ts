@@ -153,7 +153,7 @@ function dataCloneError(message: string): Error {
     return error;
 }
 
-function normalizeTransferList(input: TransferInput): readonly unknown[] {
+export function getTransferList(input: TransferInput): readonly unknown[] {
     if (input === undefined) return [];
     if (Array.isArray(input)) return input;
     if (input === null) return [];
@@ -912,15 +912,11 @@ export function structuredCloneWithTransfer<T, TPort extends object = object, TP
     transferOrOptions?: TransferInput,
     hooks: TransferHooks<TPort, TPortClone> = {},
 ): T {
-    const transferList = normalizeTransferList(transferOrOptions);
+    const transferList = getTransferList(transferOrOptions);
     const state = prepareTransfers(transferList, hooks);
     const cloned = cloneValue(value, state, new Map());
     commitTransfers(state);
     return cloned as T;
-}
-
-export function getTransferList(input: TransferInput): readonly unknown[] {
-    return normalizeTransferList(input);
 }
 
 export function encodeStructuredCloneForPipe<T>(value: T): T {

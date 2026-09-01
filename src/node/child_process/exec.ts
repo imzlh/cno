@@ -5,8 +5,9 @@
 const os = import.meta.use('os');
 
 import { Buffer } from '../buffer';
-import { decodeOutput, stdioChunkBytes } from './_shared';
+import { stdioChunkBytes } from './_shared';
 import { spawn } from './spawn';
+import { validateMaxBuffer } from './validate';
 import type {
     ChildProcess,
     ExecCallback,
@@ -31,6 +32,8 @@ export function exec(command: string, optionsOrCallback?: ExecOptions | ExecCall
         cb = callback;
     }
 
+    validateMaxBuffer(opts.maxBuffer);
+
     // Node's exec always runs through a shell; spawn owns the invocation layout
     // (including the Windows quote workaround), so just delegate.
     const child = spawn(command, [], {
@@ -44,18 +47,12 @@ export function exec(command: string, optionsOrCallback?: ExecOptions | ExecCall
     return child;
 }
 
-// Back a byte cut off to the previous UTF-8 sequence start so a truncated capture
-// never ends in half a character. Only meaningful for byte-oriented text
-// encodings; buffer/hex/base64 callers want the exact byte count.
-function utf8SafeCut(bytes: Uint8Array, limit: number, encoding?: BufferEncoding | 'buffer' | null): number {
-    if (limit <= 0 || limit >= bytes.byteLength) return Math.max(0, Math.min(limit, bytes.byteLength));
-    if (encoding === 'buffer' || encoding === null) return limit;
-    const normalized = (encoding ?? 'utf8').toLowerCase().replace(/[-_]/g, '');
-    if (normalized !== 'utf8') return limit;
-    let cut = limit;
-    // 0b10xxxxxx is a continuation byte: walk back to its lead byte.
-    while (cut > 0 && (bytes[cut] & 0xc0) === 0x80) cut--;
-    return cut;
+type OutputChunk = string | Uint8Array;
+
+function outputEncoding(encoding?: BufferEncoding | 'buffer' | null): BufferEncoding | undefined {
+    if (encoding === 'buffer' || encoding === null) return;
+    const requested = encoding ?? 'utf8';
+    return Buffer.isEncoding(requested) ? requested : undefined;
 }
 
 // Helper: collect stdout/stderr from a child process and invoke callback
@@ -65,26 +62,26 @@ function collectOutput(
     cmd: string,
     options: ExecOptions | ExecFileOptions = {},
 ): void {
-    const stdoutChunks: Uint8Array[] = [];
-    const stderrChunks: Uint8Array[] = [];
+    const encoding = outputEncoding(options.encoding);
+    const stdoutChunks: OutputChunk[] = [];
+    const stderrChunks: OutputChunk[] = [];
     const maxBuffer = options.maxBuffer ?? 1024 * 1024;
     let stdoutLength = 0;
     let stderrLength = 0;
     let maxBufferError: Error | null = null;
     let settled = false;
 
-    const pushChunk = (chunks: Uint8Array[], chunk: unknown, streamName: 'stdout' | 'stderr') => {
+    const pushChunk = (chunks: OutputChunk[], chunk: unknown, streamName: 'stdout' | 'stderr') => {
         if (maxBufferError) return;
-        const bytes = stdioChunkBytes(chunk);
+        const text = encoding && typeof chunk === 'string' ? chunk : undefined;
+        const bytes = text === undefined ? stdioChunkBytes(chunk) : undefined;
+        const length = text === undefined ? bytes.byteLength : Buffer.byteLength(text, encoding);
         const currentLength = streamName === 'stdout' ? stdoutLength : stderrLength;
         const allowed = maxBuffer - currentLength;
-        if (allowed <= 0 || bytes.byteLength > allowed) {
-            // Truncating at a raw byte offset can cut a multi-byte character in
-            // half: with maxBuffer 4 and a 6-byte "€€", the tail decoded to
-            // "€�" where Node yields "€€" because it counts DECODED units,
-            // not bytes. Back the cut off to the last UTF-8 sequence boundary so
-            // the retained prefix at least never contains a mangled character.
-            if (allowed > 0) chunks.push(bytes.subarray(0, utf8SafeCut(bytes, allowed, options.encoding)));
+        if (allowed <= 0 || length > allowed) {
+            if (allowed > 0) {
+                chunks.push(text === undefined ? bytes.subarray(0, allowed) : text.slice(0, allowed));
+            }
             const err = Object.assign(new Error(`${streamName} maxBuffer length exceeded`), {
                 code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER',
             });
@@ -93,11 +90,15 @@ function collectOutput(
             child.kill(options.killSignal);
             return;
         }
-        chunks.push(bytes);
-        if (streamName === 'stdout') stdoutLength += bytes.byteLength;
-        else stderrLength += bytes.byteLength;
+        chunks.push(text ?? bytes);
+        if (streamName === 'stdout') stdoutLength += length;
+        else stderrLength += length;
     };
 
+    if (encoding) {
+        child.stdout?.setEncoding(encoding);
+        child.stderr?.setEncoding(encoding);
+    }
     child.stdout?.on('data', (chunk) => pushChunk(stdoutChunks, chunk, 'stdout'));
     child.stderr?.on('data', (chunk) => pushChunk(stderrChunks, chunk, 'stderr'));
 
@@ -118,8 +119,8 @@ function collectOutput(
         if (settled) return;
         settled = true;
         if (!cb) return;
-        const stdout = convertCollectedOutput(stdoutChunks, options.encoding);
-        const stderr = convertCollectedOutput(stderrChunks, options.encoding);
+        const stdout = convertCollectedOutput(stdoutChunks, encoding);
+        const stderr = convertCollectedOutput(stderrChunks, encoding);
         let finalError = error ?? maxBufferError;
         if (finalError) {
             // Node decorates a pre-existing failure (spawn error, maxBuffer) with
@@ -146,13 +147,9 @@ function collectOutput(
 // know (measured on v24.18: `encoding:'bogus'` yields a Buffer, it does not
 // throw), so mirror that instead of letting the decode throw out of the 'close'
 // handler and strand the callback.
-function convertCollectedOutput(chunks: Uint8Array[], encoding?: BufferEncoding | 'buffer' | null): string | Buffer {
-    const buffer = Buffer.concat(chunks);
-    if (encoding === 'buffer' || encoding === null || encoding === undefined) {
-        return encoding === undefined ? decodeOutput(buffer, 'utf8') : buffer;
-    }
-    if (!Buffer.isEncoding(encoding)) return buffer;
-    return decodeOutput(buffer, encoding);
+function convertCollectedOutput(chunks: OutputChunk[], encoding?: BufferEncoding): string | Buffer {
+    if (encoding) return chunks.join('') as string;
+    return Buffer.concat(chunks as Uint8Array[]);
 }
 
 // execFile
@@ -191,6 +188,8 @@ export function execFile(
         }
     }
 
+    validateMaxBuffer(opts.maxBuffer);
+
     const child = spawn(file, args, {
         ...opts,
         stdio: 'pipe',
@@ -207,7 +206,7 @@ export function execFile(
 export function fork(modulePath: string, args?: string[] | SpawnOptions, options?: SpawnOptions): ChildProcess {
     const forkArgs = Array.isArray(args) ? args : [];
     const forkOptions = Array.isArray(args) ? (options ?? {}) : (args ?? {});
-    const execArgv = forkOptions.execArgv ?? [];
+    const execArgv = forkOptions.execArgv ?? process.execArgv;
     const configuredStdio = forkOptions.stdio;
     const forkStdio: StdioEntry[] = configuredStdio === undefined
         ? (forkOptions.silent ? ['pipe', 'pipe', 'pipe', 'ipc'] : ['inherit', 'inherit', 'inherit', 'ipc'])

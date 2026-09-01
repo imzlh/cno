@@ -3,6 +3,7 @@ import { bytesToArrayBuffer } from "../../utils/bytes";
 import { getFetchHook, getFetchInterceptHook, captureUserNetworkCallFrames, getCurlInitHook, type InterceptResult, type NetworkCallFrame } from "../../utils/network-hooks";
 import { attachCurlDebugTrace, buildConnectionInfo, CHARSET_RE, type CurlDebugTrace, curlMod, Decoder, engine, getCurlPool, parseHeaders, responseBodyToBytes, serializeBody, toCurlBody, truncateHookPostData } from "./helpers";
 import { isLocalFetchProtocol, loadLocalProtocol, type LocalProtocolResponse } from "./protocols";
+import { clearReferenceIfCurrent } from "./reference";
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
@@ -202,11 +203,17 @@ export class XMLHttpRequest extends EventTarget {
         this._overrideMimeType = String(mime);
     }
 
+    private _releaseCurl(curl: CModuleCURL.CURL): void {
+        this._curl = clearReferenceIfCurrent(this._curl, curl);
+    }
+
     abort(): void {
         if (this.readyState === XHR_UNSENT || this.readyState === XHR_DONE) return;
         this._aborted = true;
-        if (this._curl) {
-            abortCurlQuietly(this._curl);
+        const curl = this._curl;
+        if (curl) {
+            abortCurlQuietly(curl);
+            this._releaseCurl(curl);
         }
         this.readyState = XHR_DONE;
         this._emit('abort');
@@ -238,7 +245,6 @@ export class XMLHttpRequest extends EventTarget {
         }
 
         const curl = new curlMod.CURL(getCurlPool());
-        getCurlInitHook()?.(curl);
         this._curl = curl;
         const netHook = getFetchHook();
         const curlTrace = netHook ? attachCurlDebugTrace(curl) : undefined;
@@ -265,6 +271,7 @@ export class XMLHttpRequest extends EventTarget {
             .setHeaders(hdrs)
             .setFollowRedirects(true)
             .setMaxRedirects(20);
+        if (parsedUrl) getCurlInitHook()?.(curl, parsedUrl);
         const xhrAE = hdrs['accept-encoding'];
         curl.setAcceptEncoding(xhrAE === 'identity' ? 'identity' : undefined);
 
@@ -285,10 +292,15 @@ export class XMLHttpRequest extends EventTarget {
                 requestId: reqId, url: this._url, method: this._method,
                 headers: hdrs, postData: truncateHookPostData(bodyBytes ?? null), resourceType: 'XHR',
             }).then(result => {
-                if (this._aborted) return;
+                if (this._aborted) {
+                    this._releaseCurl(curl);
+                    return;
+                }
                 if (result?.action === 'fulfill') {
+                    this._releaseCurl(curl);
                     this._handleInterceptedFulfill(result);
                 } else if (result?.action === 'fail') {
+                    this._releaseCurl(curl);
                     this.readyState = XHR_DONE;
                     this._emit('error');
                     this._emit('loadend');
@@ -296,7 +308,11 @@ export class XMLHttpRequest extends EventTarget {
                     this._doPerform(curl, netHook, reqId, hdrs, bodyBytes, reqCallFrames, curlTrace);
                 }
             }).catch(() => {
-                if (!this._aborted) this._doPerform(curl, netHook, reqId, hdrs, bodyBytes, reqCallFrames, curlTrace);
+                if (this._aborted) {
+                    this._releaseCurl(curl);
+                    return;
+                }
+                this._doPerform(curl, netHook, reqId, hdrs, bodyBytes, reqCallFrames, curlTrace);
             });
         } else {
             this._doPerform(curl, netHook, reqId, hdrs, bodyBytes, reqCallFrames, curlTrace);
@@ -348,7 +364,7 @@ export class XMLHttpRequest extends EventTarget {
                 this._emit('error');
                 this._emit('loadend');
             }).finally(() => {
-                this._curl = null;
+                this._releaseCurl(curl);
             });
         } else {
             try {

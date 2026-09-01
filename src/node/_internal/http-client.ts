@@ -7,7 +7,7 @@ const timers = import.meta.use('timers');
 const win32 = import.meta.use('win32');
 
 import { encodeChunkedFrame, formatRequestHead } from '@cnojs/http/h1-frame';
-import { IncomingMessageImpl } from '../http/server';
+import type { IncomingMessageTarget } from './server-request-stream';
 import type { OutgoingHttpHeader, OutgoingHttpHeaders } from '../http/types';
 import { Socket } from '../net';
 import { type TLSSocket, type TlsOptions, connect as tlsConnect } from '../tls';
@@ -49,6 +49,19 @@ export interface ClientRequestOptions {
 
 type ClientTransport = Socket | TLSSocket;
 type ClientEventListener = { bivarianceHack(...args: unknown[]): unknown }['bivarianceHack'];
+/*
+ * The response callback is declared bivariantly on purpose.
+ *
+ * Each client stores the concrete IncomingMessage it constructs — node:http
+ * keeps `(res: IncomingMessageImpl) => void` — while this shared state only
+ * needs the minimal IncomingMessageTarget surface. Under strict function
+ * contravariance those two are incompatible, which made every shared helper
+ * reject the real ClientRequest that owns the callback. Method-style
+ * declarations are bivariant in TypeScript, so this keeps the shared runtime
+ * generic over transports without forcing each client to widen the callback it
+ * exposes to user code (same idiom as ClientEventListener above).
+ */
+type ClientResponseCallback = { bivarianceHack(res: IncomingMessageTarget): void }['bivarianceHack'];
 
 export interface ClientRequestState<TTransport extends ClientTransport = ClientTransport> {
     aborted: boolean;
@@ -59,13 +72,13 @@ export interface ClientRequestState<TTransport extends ClientTransport = ClientT
     path: string;
     socket: TTransport | null;
     /** Node exposes the IncomingMessage as `req.res` once the response arrives. */
-    res?: IncomingMessageImpl | null;
+    res?: IncomingMessageTarget | null;
     writableEnded: boolean;
     writableFinished: boolean;
     finished: boolean;
     headersSent: boolean;
     _options: ClientRequestOptions;
-    _callback: ((res: IncomingMessageImpl) => void) | null;
+    _callback: ClientResponseCallback | null;
     _aborted: boolean;
     _closeEmitted?: boolean;
     _timeoutId: number | null;
@@ -106,12 +119,13 @@ export interface ClientHooks<TRequest extends ClientRequestState = ClientRequest
     defaultAcceptEncoding?: string;
     requestIdPrefix: string;
     waitForSecureConnect?: boolean;
+    createIncomingMessage(socket: TRequest['socket']): IncomingMessageTarget;
     connect(request: TRequest): Promise<RequestTransport<TRequest>>;
     onTransportAssigned?(request: TRequest, transport: RequestTransport<TRequest>): void;
 }
 
 type RequestTransport<TRequest extends ClientRequestState> = NonNullable<TRequest['_transport']>;
-type AgentLike<TRequest extends ClientRequestState> = {
+export type AgentLike<TRequest extends ClientRequestState> = {
     addRequest(req: TRequest, options: TRequest['_options']): void;
 };
 type MaybeSecureTransport = ClientTransport & {
@@ -130,15 +144,15 @@ function destroyTransportQuietly(transport: { destroy(): unknown }): void {
     }
 }
 
-function emitAbortedQuietly(res: IncomingMessageImpl): void {
+function emitAbortedQuietly(res: IncomingMessageTarget): void {
     try {
-        res.emit('aborted');
+        res.emit?.('aborted');
     } catch {
         // Keep error propagation on the normalized request error path.
     }
 }
 
-export function initClientRequestState(self: ClientRequestState, cb?: (res: IncomingMessageImpl) => void): void {
+export function initClientRequestState(self: ClientRequestState, cb?: ClientResponseCallback): void {
     self.aborted = false;
     self.destroyed = false;
     self.host = 'localhost';
@@ -281,6 +295,19 @@ export function mergeUrlOptions<T extends ClientRequestOptions>(url: string | UR
     } as T);
 }
 
+export function normalizeClientRequestArgs<T extends ClientRequestOptions, TResponse>(
+    urlOrOptions: T | string | URL,
+    optionsOrCallback?: T | ((response: TResponse) => void),
+    callback?: (response: TResponse) => void,
+): [T | string | URL, ((response: TResponse) => void) | undefined] {
+    if ((typeof urlOrOptions === 'string' || urlOrOptions instanceof URL)
+        && optionsOrCallback
+        && typeof optionsOrCallback === 'object') {
+        return [mergeUrlOptions(urlOrOptions, optionsOrCallback), callback];
+    }
+    return [urlOrOptions, optionsOrCallback as ((response: TResponse) => void) | undefined];
+}
+
 export function shouldSendZeroContentLength(method: string): boolean {
     return method === 'POST' || method === 'PUT' || method === 'PATCH';
 }
@@ -378,9 +405,9 @@ export async function getSystemCa(): Promise<string | null> {
     for (const candidate of candidates) {
         try {
             if ((await asyncfs.stat(candidate)).isFile) {
-                const pem = await asyncfs.readFile(candidate, { encoding: 'utf8' });
-                systemCaPem = pem;
-                return pem;
+                const pem = await asyncfs.readFile(candidate);
+                systemCaPem = engine.decodeString(pem);
+                return systemCaPem;
             }
         } catch {}
     }
@@ -388,9 +415,8 @@ export async function getSystemCa(): Promise<string | null> {
     if (sysname === 'Windows_NT') {
         try {
             const certs = win32!.exportCerts();
-            if (certs?.length) systemCaPem = certs.join('\n');
+            if (certs?.length) return systemCaPem = certs.join('\n');
         } catch {}
-        return systemCaPem;
     }
 
     systemCaPem = null;
@@ -677,7 +703,7 @@ export async function doBufferedRequest<TRequest extends ClientRequestState>(req
             await writeToTransport(request._transport, CHUNKED_TRAILER);
             request._bodySent = true;
             markRequestFinished(request);
-            readResponse(request);
+            readResponse(request, hooks);
             return;
         }
 
@@ -695,7 +721,7 @@ export async function doBufferedRequest<TRequest extends ClientRequestState>(req
         }
         request._bodySent = true;
         markRequestFinished(request);
-        readResponse(request);
+        readResponse(request, hooks);
     } catch (err) {
         const normalized = normalizeErrnoError(err);
         try {
@@ -747,7 +773,7 @@ export async function finishStreaming<TRequest extends ClientRequestState>(reque
     }
     request._bodySent = true;
     markRequestFinished(request);
-    readResponse(request);
+    readResponse(request, hooks);
 }
 
 /**
@@ -777,7 +803,7 @@ export async function flushRequestHeaders<TRequest extends ClientRequestState>(r
     await ensureRequestConnected(request, hooks);
     if (!request._transport) return;
     await sendRequestLine(request);
-    readResponse(request);
+    readResponse(request, hooks);
 }
 
 /** True when the caller asked for the 100-continue handshake. */
@@ -801,18 +827,18 @@ export function startContinueHandshake<TRequest extends ClientRequestState>(requ
         });
 }
 
-export function readResponse<TRequest extends ClientRequestState>(request: TRequest): void {
+export function readResponse<TRequest extends ClientRequestState>(request: TRequest, hooks: ClientHooks<TRequest>): void {
     if (!request._transport) return;
     // With Expect: 100-continue the reader is started right after the head is
     // flushed, long before the body goes out, so the later finishStreaming /
     // doBufferedRequest call must not attach a second parser to the same socket.
     if (request._responseReaderStarted) return;
     request._responseReaderStarted = true;
-    const res = new IncomingMessageImpl(request.socket);
+    const res = hooks.createIncomingMessage(request.socket);
     const isConnect = request.method === 'CONNECT';
-    let connectResponse: IncomingMessageImpl | null = null;
-    let upgradeResponse: IncomingMessageImpl | null = null;
-    const { parser, finish } = setupResponseParser<IncomingMessageImpl>({
+    let connectResponse: IncomingMessageTarget | null = null;
+    let upgradeResponse: IncomingMessageTarget | null = null;
+    const { parser, finish } = setupResponseParser<IncomingMessageTarget>({
         requestId: request._requestId,
         protocol: request.protocol,
         host: request.host,
@@ -820,7 +846,7 @@ export function readResponse<TRequest extends ClientRequestState>(request: TRequ
         res,
         getHeaders: () => request.getHeaders(),
         onResponse: (response) => {
-            (request as TRequest & { _response?: IncomingMessageImpl | null })._response = response;
+            (request as TRequest & { _response?: IncomingMessageTarget | null })._response = response;
             // Node sets `req.res` before invoking the response callback. got's
             // close-handler guard (core/index.js:1198 `Boolean(request.res)`) reads
             // it to tell "closed after a response" from "closed with none"; leaving
@@ -871,7 +897,7 @@ export function readResponse<TRequest extends ClientRequestState>(request: TRequ
             // as an uncaught exception *after* the request had already reported
             // the same error. The request below is the correct — and only —
             // place to report it.
-            const delivered = !!(request as TRequest & { _response?: IncomingMessageImpl | null })._response;
+            const delivered = !!(request as TRequest & { _response?: IncomingMessageTarget | null })._response;
             if (delivered) res.destroy(normalized);
             else res.destroy();
         }
@@ -1105,7 +1131,7 @@ function socketResetError(): Error {
 }
 
 function isResponseComplete(request: ClientRequestState): boolean {
-    const response = (request as ClientRequestState & { _response?: IncomingMessageImpl | null })._response;
+    const response = (request as ClientRequestState & { _response?: IncomingMessageTarget | null })._response;
     return !!response?.complete;
 }
 

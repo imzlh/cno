@@ -25,13 +25,9 @@ export class KvU64 implements Deno.KvU64 {
     [DENO_CUSTOM_INSPECT](): string {
         return `[Deno.KvU64: ${this.value}n]`;
     }
+
+    static [Symbol.toStringTag] = 'Deno.KvU64';
 }
-
-Object.defineProperty(KvU64.prototype, Symbol.toStringTag, {
-    value: 'Deno.KvU64',
-    configurable: true,
-});
-
 export function isKvU64(value: unknown): value is KvU64 {
     return value instanceof KvU64;
 }

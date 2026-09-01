@@ -1,51 +1,7 @@
 /**
- * Windows sync-fs errno correction.
- *
- * HISTORY, because the shape of this file only makes sense with it: the native
- * sync `fs` module used to throw `uv_translate_sys_error(errno)` at ~14 call
- * sites, feeding a **CRT errno** to a helper that expects a **Win32** error
- * code. Overlapping numbers meant silent mistranslation:
- *   CRT EEXIST(17)    -> ERROR_NOT_SAME_DEVICE  -> UV_EXDEV    (want EEXIST)
- *   CRT EPERM(1)      -> ERROR_INVALID_FUNCTION -> UV_EINVAL   (want EPERM)
- *   CRT EACCES(13)    -> ERROR_INVALID_DATA     -> UV_EINVAL   (want EISDIR/EPERM)
- *   CRT ENOTEMPTY(41) -> unmapped               -> UV_UNKNOWN  (want ENOTEMPTY)
- *   CRT EBADF(9)      -> unmapped               -> UV_UNKNOWN  (want EBADF)
- *
- * **`mod_fs.c` now decodes CRT errno correctly** (`fs_errno2uv()`, 29 sites), so
- * the raw values arriving here have changed. A guard keyed on the OLD mangled
- * value silently stops firing — measured: `readFileSync(dir)` used to arrive as
- * UV_EINVAL and now arrives as UV_EACCES, so the EISDIR correction below became
- * dead and the error surfaced as EACCES where Node says EISDIR. Same fault hit
- * `openSync(dir,'w')`, `writeFileSync(dir)`, `appendFileSync(dir)` (none of them
- * asserted anywhere) and `unlinkSync(dir)`.
- *
- * So: **each correction must be keyed on the value the C layer actually produces
- * today.** When touching `mod_fs.c`, re-measure the raw `errno` reaching this
- * file rather than assuming. `asyncfs` goes through libuv and is unaffected.
- *
- * **PLATFORM GATE.** Every target value below was measured against Node on
- * *Windows*, and several are actively wrong elsewhere, so the whole numeric
- * remapping is gated on `isWindows`. Three rules would corrupt POSIX errors:
- *
- *   - `UV_EXDEV -> EEXIST/EPERM`. On Windows a real cross-device CRT error can
- *     never decode to UV_EXDEV, so UV_EXDEV is always mangled CRT EEXIST. On
- *     POSIX `rename(2)` across mount points returns a **genuine** EXDEV, and
- *     rewriting it to EEXIST breaks the copy+unlink fallback every library keys
- *     off `err.code === 'EXDEV'`.
- *   - `EACCES + isShareViolation -> EBUSY`. Windows-only: it compensates for the
- *     CRT flattening a share violation onto EACCES. On POSIX an EACCES from
- *     `unlink` is a genuine parent-directory permission denial, and a readable
- *     file would be mislabelled EBUSY.
- *   - `EACCES + isReadonlyFile -> EPERM`. Windows reports the DOS read-only
- *     attribute as EACCES where Node says EPERM. On POSIX a mode-444 file opened
- *     for write is EACCES in Node too, so the rewrite would be wrong.
- *
- * Off Windows the corrections are skipped and the native errno passes through
- * untouched — the pre-`errno-fix` status quo, which cannot mislabel anything.
- * The two rules that are *also* the POSIX answer (readlink of a non-symlink is
- * EINVAL; of a missing path, ENOENT) stay ungated, and where a platform-
- * independent C throw carries no errno at all the POSIX value is supplied
- * separately. See `fixSyncError`.
+ * Normalize Windows synchronous-fs errors where CRT and Win32 codes diverge.
+ * Numeric remaps are Windows-only; asyncfs already reports libuv codes and
+ * must never pass through them.
  */
 
 import { toErrnoException } from '../_internal/errno';
@@ -60,7 +16,7 @@ const os = import.meta.use('os');
  * `process.platform` so the check stays inside the native-module layer and does
  * not pull `process` into an `fs` dependency.
  */
-const isWindows = os.uname().sysname === 'Windows_NT';
+const isWindows = os.platform == 'win32';
 
 const UV_EXDEV = error.errno.EXDEV;
 const UV_EINVAL = error.errno.EINVAL;

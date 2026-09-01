@@ -37,10 +37,6 @@ function expandBraces(pattern: string): string[] {
     return [pattern];
 }
 
-function escapeRegExp(character: string): string {
-    return /[\\^$.*+?()[\]{}|]/.test(character) ? `\\${character}` : character;
-}
-
 function findClosingParen(pattern: string, start: number): number {
     let depth = 0;
     for (let index = start; index < pattern.length; index++) {
@@ -80,7 +76,7 @@ function segmentSource(pattern: string): string {
                 continue;
             }
             source += '\\[';
-        } else source += escapeRegExp(character);
+        } else source += /[\\^$.*+?()[\]{}|]/.test(character) ? `\\${character}` : character;
         index++;
     }
     return source;

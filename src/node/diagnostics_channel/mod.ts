@@ -153,27 +153,23 @@ type TracingChannelSubscribers = Partial<Record<typeof traceEvents[number], Chan
 const traceEvents = ['start', 'end', 'asyncStart', 'asyncEnd', 'error'] as const;
 
 /** Node accepts either a name prefix or an object of ready-made channels. */
-function resolveTraceChannels(nameOrChannels: string | TracingChannelSubscribers): Record<string, Channel> {
-    if (typeof nameOrChannels === 'string') {
-        const out: Record<string, Channel> = {};
-        for (const event of traceEvents) out[event] = channel(`tracing:${nameOrChannels}:${event}`);
-        return out;
-    }
-    if (!nameOrChannels || typeof nameOrChannels !== 'object') {
-        throw invalidArgType('The "nameOrChannels" argument must be of type string or object');
-    }
-    const out: Record<string, Channel> = {};
-    for (const event of traceEvents) {
-        const provided = nameOrChannels[event];
-        if (provided instanceof Channel) out[event] = provided;
-        else if (provided === undefined) out[event] = channel(Symbol(`tracing:${event}`));
-        else throw invalidArgType(`The "nameOrChannels.${event}" property must be an instance of Channel`);
-    }
-    return out;
-}
-
 export function tracingChannel(nameOrChannels: string | TracingChannelSubscribers): TracingChannel {
-    const resolved = resolveTraceChannels(nameOrChannels);
+    let resolved: Record<string, Channel>;
+    if (typeof nameOrChannels === 'string') {
+        resolved = {};
+        for (const event of traceEvents) resolved[event] = channel(`tracing:${nameOrChannels}:${event}`);
+    } else {
+        if (!nameOrChannels || typeof nameOrChannels !== 'object') {
+            throw invalidArgType('The "nameOrChannels" argument must be of type string or object');
+        }
+        resolved = {};
+        for (const event of traceEvents) {
+            const provided = nameOrChannels[event];
+            if (provided instanceof Channel) resolved[event] = provided;
+            else if (provided === undefined) resolved[event] = channel(Symbol(`tracing:${event}`));
+            else throw invalidArgType(`The "nameOrChannels.${event}" property must be an instance of Channel`);
+        }
+    }
     const traceHasSubscribers = (): boolean =>
         trace.start.hasSubscribers
         || trace.end.hasSubscribers

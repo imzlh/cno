@@ -114,14 +114,3 @@ export function getTierLimits(): TierLimits {
     if (_limits === null) detect();
     return _limits ?? TIER_NORMAL;
 }
-
-/**
- * Allow manual override (e.g. from env var or build flag).
- * Call before any stream/fetch code runs.
- */
-export function setMemoryTier(tier: MemoryTier): void {
-    _tier = tier;
-    _limits = tier === 'low' ? TIER_LOW
-            : tier === 'high' ? TIER_HIGH
-            : TIER_NORMAL;
-}
