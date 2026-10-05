@@ -361,51 +361,16 @@ export const promises = {
     setInterval<T = void>(delay?: number, value?: T, options?: TimerOptions): AsyncIterableIterator<T> {
         assertPromiseDelay(delay);
         assertTimerOptions(options);
-        const signal = options?.signal;
         const ms = normalizeDelay(delay);
-        let finished = false;
-        let pendingId: number | undefined;
 
-        // return()/throw() must cancel the pending tick so the loop can drain.
-        const stop = () => {
-            finished = true;
-            if (pendingId !== undefined) {
-                timer.clearTimeout(pendingId);
-                pendingId = undefined;
+        // Generator requests are serialized: return()/throw() wait for an
+        // outstanding next() to release its timer and abort listener, as in Node.
+        return (async function* () {
+            while (true) {
+                await promises.setTimeout(ms, undefined, options);
+                yield value as T;
             }
-        };
-
-        return {
-            [Symbol.asyncIterator]() { return this; },
-            async next(): Promise<IteratorResult<T>> {
-                if (finished) return { done: true, value: undefined };
-                if (signal?.aborted) { stop(); throw createAbortError(signal.reason); }
-
-                await new Promise<void>((resolve, reject) => {
-                    const cleanup = () => { signal?.removeEventListener('abort', onAbort); };
-                    const onAbort = () => { cleanup(); stop(); reject(createAbortError(signal?.reason)); };
-                    signal?.addEventListener('abort', onAbort, { once: true });
-
-                    pendingId = timer.setTimeout(() => {
-                        pendingId = undefined;
-                        cleanup();
-                        resolve();
-                    }, ms);
-                    if (options?.ref === false) timer.unrefTimer(pendingId);
-                });
-
-                if (finished) return { done: true, value: undefined };
-                return { done: false, value: value as T };
-            },
-            async return(): Promise<IteratorResult<T>> {
-                stop();
-                return { done: true, value: undefined };
-            },
-            async throw(err?: unknown): Promise<IteratorResult<T>> {
-                stop();
-                throw err;
-            },
-        };
+        })();
     },
 
     setImmediate<T = void>(value?: T, options?: TimerOptions): Promise<T> {

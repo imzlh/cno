@@ -39,6 +39,13 @@ interface AsyncState {
     stores: StoreMap;
 }
 
+interface TimerState {
+    state: AsyncState;
+    id: number;
+    generation: number;
+    refreshing: boolean;
+}
+
 let _nextId = 2;
 let _currentId: AsyncId = 1;
 let _currentTriggerId: TriggerAsyncId = 0;
@@ -48,7 +55,7 @@ let _timersPatchInstalled = false;
 
 const _hooks: HookCallbacks[] = [];
 const _promiseStates = new WeakMap<Promise<unknown>, AsyncState>();
-const _handleStates = new Map<TimerHandle, AsyncState>();
+const _handleStates = new Map<number, TimerState>();
 let _promiseHookStop: (() => void) | null = null;
 
 function emitInit(state: AsyncState): void {
@@ -215,9 +222,60 @@ function uninstallPromiseHook(): void {
     _promiseHookStop = null;
 }
 
+function destroyTimer(entry: TimerState): void {
+    if (_handleStates.get(entry.id) !== entry) return;
+    _handleStates.delete(entry.id);
+    emitDestroy(entry.state.id);
+}
+
+function trackTimerRefresh(handle: TimerHandle, entry: TimerState): void {
+    if (typeof handle !== 'object' || handle === null) return;
+    const refresh = Reflect.get(handle, 'refresh');
+    if (!isCallable(refresh)) return;
+    Object.defineProperty(handle, 'refresh', {
+        configurable: true,
+        writable: true,
+        value: function(this: unknown, ...args: unknown[]) {
+            if (this !== handle) return Reflect.apply(refresh, this, args);
+            const active = _handleStates.get(entry.id) === entry;
+            entry.refreshing = true;
+            try {
+                const result = Reflect.apply(refresh, this, args);
+                const id = Number(handle);
+                if (id !== entry.id) {
+                    if (active) _handleStates.delete(entry.id);
+                    else entry.state = createState(entry.state.type, entry.state.triggerId,
+                        entry.state.resource, entry.state.stores);
+                    entry.id = id;
+                    entry.generation++;
+                    _handleStates.set(id, entry);
+                }
+                return result;
+            } catch (error) {
+                destroyTimer(entry);
+                throw error;
+            } finally {
+                entry.refreshing = false;
+            }
+        },
+    });
+}
+
 function installTimersPatches(): void {
     if (_timersPatchInstalled) return;
     _timersPatchInstalled = true;
+
+    // All public cancellation paths eventually clear this native id, including
+    // node:timers, numeric aliases and a handle's close()/Symbol.dispose().
+    const timers = import.meta.use('timers');
+    for (const name of ['clearTimeout', 'clearInterval'] as const) {
+        const clear = timers[name];
+        timers[name] = (id: number): void => {
+            clear(id);
+            const entry = typeof id === 'number' ? _handleStates.get(Math.trunc(id)) : undefined;
+            if (entry && !entry.refreshing) destroyTimer(entry);
+        };
+    }
 
     const queueMicrotaskFn = getGlobalFunction('queueMicrotask');
     if (queueMicrotaskFn) {
@@ -232,109 +290,34 @@ function installTimersPatches(): void {
         });
     }
 
-    const setTimeoutFn = getGlobalFunction('setTimeout');
-    if (setTimeoutFn) {
-        const originalSetTimeout = setTimeoutFn.bind(globalThis);
-        const clearTimeoutFn = getGlobalFunction('clearTimeout');
-        const originalClearTimeout = clearTimeoutFn ? clearTimeoutFn.bind(globalThis) : null;
-
-        setGlobalFunction('setTimeout', function(callback: unknown, delay?: any, ...args: unknown[]) {
-            if (!isCallable(callback)) {
-                return originalSetTimeout(callback as AnyCallable, delay, ...args);
-            }
-            const state = createState('Timeout');
-            let handle: TimerHandle;
+    const timerFunctions = [
+        ['setTimeout', 'Timeout', false],
+        ['setImmediate', 'Immediate', false],
+        ['setInterval', 'Interval', true],
+    ] as const;
+    for (const [name, type, repeat] of timerFunctions) {
+        const original = getGlobalFunction(name)?.bind(globalThis);
+        if (!original) continue;
+        setGlobalFunction(name, function(callback: unknown, ...args: unknown[]) {
+            if (!isCallable(callback)) return original(callback, ...args);
+            const entry: TimerState = {
+                state: createState(type), id: 0, generation: 0, refreshing: false,
+            };
             const wrapped = function(this: unknown, ...innerArgs: unknown[]) {
+                const generation = entry.generation;
                 try {
-                    return runInState(state, callback, this, innerArgs);
+                    return runInState(entry.state, callback, this, innerArgs);
                 } finally {
-                    _handleStates.delete(handle);
-                    emitDestroy(state.id);
+                    // A refresh inside the callback leaves another firing pending.
+                    if (!repeat && generation === entry.generation) destroyTimer(entry);
                 }
             };
-            handle = originalSetTimeout(wrapped as AnyCallable, delay, ...args);
-            _handleStates.set(handle, state);
+            const handle = original(wrapped, ...args);
+            entry.id = Number(handle);
+            _handleStates.set(entry.id, entry);
+            trackTimerRefresh(handle, entry);
             return handle;
         });
-
-        if (originalClearTimeout) {
-            setGlobalFunction('clearTimeout', function(handle: TimerHandle): void {
-                const state = _handleStates.get(handle);
-                if (state) {
-                    _handleStates.delete(handle);
-                    emitDestroy(state.id);
-                }
-                originalClearTimeout(handle);
-            });
-        }
-    }
-
-    const setImmediateFn = getGlobalFunction('setImmediate');
-    if (setImmediateFn) {
-        const originalSetImmediate = setImmediateFn.bind(globalThis);
-        const clearImmediateFn = getGlobalFunction('clearImmediate');
-        const originalClearImmediate = clearImmediateFn ? clearImmediateFn.bind(globalThis) : null;
-
-        setGlobalFunction('setImmediate', function(callback: unknown, ...args: unknown[]) {
-            if (!isCallable(callback)) {
-                return originalSetImmediate(callback as AnyCallable, ...args);
-            }
-            const state = createState('Immediate');
-            let handle: TimerHandle;
-            const wrapped = function(this: unknown, ...innerArgs: unknown[]) {
-                try {
-                    return runInState(state, callback, this, innerArgs);
-                } finally {
-                    _handleStates.delete(handle);
-                    emitDestroy(state.id);
-                }
-            };
-            handle = originalSetImmediate(wrapped as AnyCallable, ...args);
-            _handleStates.set(handle, state);
-            return handle;
-        });
-
-        if (originalClearImmediate) {
-            setGlobalFunction('clearImmediate', function(handle: TimerHandle): void {
-                const state = _handleStates.get(handle);
-                if (state) {
-                    _handleStates.delete(handle);
-                    emitDestroy(state.id);
-                }
-                originalClearImmediate(handle);
-            });
-        }
-    }
-
-    const setIntervalFn = getGlobalFunction('setInterval');
-    if (setIntervalFn) {
-        const originalSetInterval = setIntervalFn.bind(globalThis);
-        const clearIntervalFn = getGlobalFunction('clearInterval');
-        const originalClearInterval = clearIntervalFn ? clearIntervalFn.bind(globalThis) : null;
-
-        setGlobalFunction('setInterval', function(callback: unknown, delay?: any, ...args: unknown[]) {
-            if (!isCallable(callback)) {
-                return originalSetInterval(callback as AnyCallable, delay, ...args);
-            }
-            const state = createState('Interval');
-            const wrapped = function(this: unknown, ...innerArgs: unknown[]) {
-                return runInState(state, callback, this, innerArgs);
-            };
-            const handle = originalSetInterval(wrapped as AnyCallable, delay, ...args);
-            _handleStates.set(handle, state);
-            return handle;
-        });
-
-        if (originalClearInterval) {
-            setGlobalFunction('clearInterval', function(handle: TimerHandle): void {
-                const state = _handleStates.get(handle);
-                if (state) {
-                    _handleStates.delete(handle);
-                    emitDestroy(state.id);
-                }
-                originalClearInterval(handle);
-            });
-        }
     }
 }
 

@@ -31,6 +31,18 @@ export interface IncomingRequestTarget extends IncomingMessageTarget {
 
 type BodyReader = (() => Promise<Uint8Array | null>) | null | undefined;
 
+interface RequestBodyPumpTarget extends IncomingRequestStreamTarget {
+    destroyed: boolean;
+    _read(size: number): void;
+    once(event: 'close', listener: () => void): unknown;
+    off(event: 'close', listener: () => void): unknown;
+    socket?: {
+        once(event: 'close', listener: () => void): unknown;
+        off(event: 'close', listener: () => void): unknown;
+        destroy(): unknown;
+    } | null;
+}
+
 export function appendIncomingHeader(target: IncomingRequestTarget, key: string, value: string): void {
     const lowerKey = key.toLowerCase();
     target.headers[lowerKey] = value;
@@ -78,24 +90,70 @@ function failIncomingRequest(target: IncomingRequestStreamTarget, err: unknown):
     } catch { /* already destroyed */ }
 }
 
-export function pumpIncomingRequestBody(target: IncomingRequestStreamTarget, body: BodyReader): void {
+export function pumpIncomingRequestBody(target: RequestBodyPumpTarget, body: BodyReader): void {
     if (typeof body !== 'function') {
         target.complete = true;
         target.push(null);
         return;
     }
 
-    (async () => {
-        try {
-            while (true) {
-                const chunk = await body();
-                if (chunk === null) break;
-                target.push(chunk);
-            }
-            target.complete = true;
-            target.push(null);
-        } catch (err) {
-            failIncomingRequest(target, err);
+    const socket = target.socket;
+    const previousRead = target._read;
+    let stopped = false;
+    let running = false;
+    let requested = false;
+    const cleanup = () => {
+        stopped = true;
+        if (target._read === onRead) target._read = previousRead;
+        target.off('close', onTargetClose);
+        socket?.off('close', onSocketClose);
+    };
+    const onTargetClose = () => {
+        cleanup();
+        // A destroyed reader cannot release the protocol's body backpressure.
+        if (!target.complete) socket?.destroy();
+    };
+    const onSocketClose = () => {
+        cleanup();
+        if (!target.complete && !target.destroyed) {
+            failIncomingRequest(target, Object.assign(new Error('socket closed before request completed'), {
+                code: 'ECONNRESET',
+            }));
         }
-    })().catch(() => {});
+    };
+    const pump = async () => {
+        if (running || stopped || target.destroyed) return;
+        running = true;
+        try {
+            while (!stopped && !target.destroyed) {
+                requested = false;
+                const chunk = await body();
+                if (stopped || target.destroyed) return;
+                if (chunk === null) {
+                    target.complete = true;
+                    cleanup();
+                    target.push(null);
+                    return;
+                }
+                // Keep unread bytes in the bounded protocol queue until _read
+                // asks for more, instead of growing IncomingMessage indefinitely.
+                if (!target.push(chunk) && !requested) return;
+            }
+        } catch (err) {
+            if (!stopped) {
+                cleanup();
+                failIncomingRequest(target, err);
+            }
+        } finally {
+            running = false;
+        }
+    };
+    const onRead = () => {
+        requested = true;
+        void pump();
+    };
+    target._read = onRead;
+    target.once('close', onTargetClose);
+    socket?.once('close', onSocketClose);
+    void pump();
 }

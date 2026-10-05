@@ -958,6 +958,14 @@ export class ServerImpl extends NetServer implements Server {
                 }
                 : null,
         );
+        response.once('finish', () => {
+            // Node drains an untouched request after replying so keep-alive can
+            // advance even when the handler never consumes its upload.
+            if (!incoming.readableDidRead && !incoming.destroyed) {
+                incoming.removeAllListeners('data');
+                incoming.resume();
+            }
+        });
 
         const adapter = new NodeResponseAdapter(response, res, serveHook, requestId, requestUrl, incoming.method === 'HEAD');
 

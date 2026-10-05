@@ -4,7 +4,7 @@ import { isAbsolutePath, isDrivePath, resolvePath } from './path';
 
 export interface EvalToken {
     /** Exact option spelling used to select eval/print mode. */
-    flag: '-e' | '--eval' | '-p' | '--print';
+    flag: '-e' | '--eval' | '-p' | '--print' | '-pe' | '-ep';
     /** Whether the source was joined to the option with `=`. */
     inline: boolean;
 }
@@ -18,6 +18,39 @@ export interface Args {
     args: string[];
     /** Explicit lossless metadata for eval/print; absent for subcommand form. */
     evalToken?: EvalToken;
+    /** Canonical layered argv names used by the CLI and runtime bridges. */
+    kernelArgs?: string[];
+    commandArgs?: string[];
+    scriptArgs?: string[];
+}
+
+export interface NormalizedArgs extends Args {
+    kernelArgs: string[];
+    commandArgs: string[];
+    scriptArgs: string[];
+}
+
+/** Keep the old field names as storage and expose live, non-copying aliases. */
+export function normalizeArgs(value: Args): NormalizedArgs {
+    const out: Args = {
+        binary: value.binary,
+        internalArgs: value.kernelArgs ?? value.internalArgs,
+        actionArgs: value.commandArgs ?? value.actionArgs,
+        entry: value.entry,
+        args: value.scriptArgs ?? value.args,
+    };
+    if (value.action !== undefined) out.action = value.action;
+    if (value.evalToken !== undefined) out.evalToken = value.evalToken;
+    for (const [alias, field] of [
+        ['kernelArgs', 'internalArgs'], ['commandArgs', 'actionArgs'], ['scriptArgs', 'args'],
+    ] as const) {
+        Object.defineProperty(out, alias, {
+            get: () => out[field],
+            set: (tokens: string[]) => { out[field] = tokens; },
+            configurable: true,
+        });
+    }
+    return out as NormalizedArgs;
 }
 
 // Single source of truth for the CLI vocabulary. cno-cli imports this instead
@@ -41,22 +74,28 @@ const SUBCOMMAND_SET = new Set<string>(SUBCOMMANDS);
  * Once the entry is found, every remaining token (flags included) is a script
  * arg. `argv` excludes the binary (os.args[0]).
  */
-export function parseArgs(argv: string[], binary: string): Args {
+export function parseArgs(argv: string[], binary: string): NormalizedArgs {
     const out: Args = { binary, internalArgs: [], actionArgs: [], entry: 'repl', args: [] };
     let i = 0;
-    for (let arg = argv[i]; arg !== undefined && arg[0] === '-'; arg = argv[i]) {
+    // Only the prefix before the command belongs to the kernel. The explicit
+    // command token is the ownership boundary; command flags remain in
+    // actionArgs and are intentionally invisible to the kernel.
+    for (let arg = argv[i]; arg !== undefined && arg[0] === '-' && arg !== '-' && arg !== '--'; arg = argv[i]) {
         out.internalArgs.push(arg);
         i++;
     }
+    const terminated = argv[i] === '--';
+    if (terminated) i++;
     const action = argv[i];
     if (action !== undefined) {
-        if (SUBCOMMAND_SET.has(action)) {
+        if (!terminated && SUBCOMMAND_SET.has(action)) {
             out.action = action;
             i++;
-            for (let arg = argv[i]; arg !== undefined && arg[0] === '-'; arg = argv[i]) {
+            for (let arg = argv[i]; arg !== undefined && arg[0] === '-' && arg !== '-' && arg !== '--'; arg = argv[i]) {
                 out.actionArgs.push(arg);
                 i++;
             }
+            if (argv[i] === '--') i++;
         } else {
             out.action = 'run';
         }
@@ -70,20 +109,20 @@ export function parseArgs(argv: string[], binary: string): Args {
             i++;
         }
     }
-    return out;
+    return normalizeArgs(out);
 }
 
 // Initial value from the raw process argv. cno-cli replaces this via setArgs
 // before any user code runs; the standalone submodule keeps it.
-let args: Args = parseArgs(os.args.slice(1), os.args[0]);
+let args: NormalizedArgs = parseArgs(os.args.slice(1), os.args[0]);
 
 export default function setArgs(usrargs: Args) {
-    args = usrargs;
+    args = normalizeArgs(usrargs);
     const refresh = Reflect.get(os, '__cno_process_args_refresh');
     if (typeof refresh === 'function') refresh();
 }
 
-export function getArgs(): Args {
+export function getArgs(): NormalizedArgs {
     return args;
 }
 
@@ -92,7 +131,7 @@ export function getArgs(): Args {
 
 /** Deno.args — user args after the entry only; not the entry, not cno's flags. */
 export function buildDenoArgs(): string[] {
-    return [...args.args];
+    return [...args.scriptArgs];
 }
 
 /** True for real filesystem entries: not `repl`, not `eval:`, not a URL. */
@@ -127,7 +166,7 @@ function evalExecArgvTokens(code: string): string[] {
 /** Node process.argv — [execPath, entry, ...scriptArgs]; argv[1] is absolute. */
 export function buildNodeArgv(): string[] {
     // Eval source is not an entry: argv holds only the trailing user args.
-    if (isEvalMode()) return [args.binary, ...args.args];
+    if (isEvalMode()) return [args.binary, ...args.scriptArgs];
 
     let entry = args.entry;
     if (isFsEntry(entry) && !isAbsolutePath(entry)) {
@@ -135,7 +174,7 @@ export function buildNodeArgv(): string[] {
             entry = resolvePath(entry, os.cwd);
         } catch { /* no cwd — keep the raw entry */ }
     }
-    return [args.binary, entry, ...args.args];
+    return [args.binary, entry, ...args.scriptArgs];
 }
 
 /** Node process.argv0 — the name cno was invoked as. */
@@ -145,11 +184,11 @@ export function buildNodeArgv0(): string {
 
 /** Node process.execArgv — runtime flags before the subcommand. */
 export function buildNodeExecArgv(): string[] {
-    if (!isEvalMode()) return [...args.internalArgs];
+    if (!isEvalMode()) return [...args.kernelArgs];
     // Eval spelling is carried explicitly by Args.evalToken. internalArgs
     // contains only runtime options, so no global argv scan or filtering is
     // needed and user tokens cannot be mistaken for an eval selector.
-    return [...args.internalArgs, ...evalExecArgvTokens(args.entry)];
+    return [...args.kernelArgs, ...evalExecArgvTokens(args.entry)];
 }
 
 // Shared namespace on `os` so cno/src/node/* can reach these without importing

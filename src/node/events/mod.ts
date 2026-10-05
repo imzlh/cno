@@ -390,7 +390,12 @@ Object.defineProperties(EventEmitter, {
     },
 });
 
-type EventTargetListenerEntry = { listener: EventListenerOrEventListenerObject; capture: boolean };
+type EventTargetListenerEntry = {
+    listener: EventListenerOrEventListenerObject;
+    capture: boolean;
+    signal?: AbortSignal;
+    onAbort?: () => void;
+};
 const eventTargetListeners = new WeakMap<EventTarget, Map<EventName, EventTargetListenerEntry[]>>();
 const eventTargetMaxListeners = new WeakMap<EventTarget, number>();
 
@@ -445,11 +450,19 @@ function removeTrackedEventTargetListener(
     listener: EventListenerOrEventListenerObject | null,
     options?: boolean | EventListenerOptions,
 ): void {
-    const listeners = eventTargetListeners.get(target)?.get(name);
+    const events = eventTargetListeners.get(target);
+    const listeners = events?.get(name);
     if (!listeners || !listener) return;
     const capture = captureOption(options);
     const index = listeners.findIndex((entry) => entry.listener === listener && entry.capture === capture);
-    if (index !== -1) arrayRemoveAt(listeners, index);
+    if (index === -1) return;
+    const entry = listeners[index];
+    arrayRemoveAt(listeners, index);
+    if (listeners.length === 0) {
+        events!.delete(name);
+        if (events!.size === 0) eventTargetListeners.delete(target);
+    }
+    if (entry.signal && entry.onAbort) entry.signal.removeEventListener('abort', entry.onAbort);
 }
 
 function trackEventTargetListener(
@@ -459,14 +472,17 @@ function trackEventTargetListener(
     options?: boolean | AddEventListenerOptions,
 ): void {
     if (!listener) return;
+    const signal = typeof options === 'object' ? options?.signal : undefined;
+    if (signal?.aborted) return;
     const capture = captureOption(options);
     const bucket = eventTargetBucket(target, name);
     if (bucket.some((entry) => entry.listener === listener && entry.capture === capture)) return;
-    arrayAppend(bucket, { listener, capture });
-    const signal = typeof options === 'object' ? options?.signal : undefined;
-    signal?.addEventListener('abort', () => {
-        removeTrackedEventTargetListener(target, name, listener, capture);
-    }, { once: true });
+    const entry: EventTargetListenerEntry = { listener, capture, signal };
+    arrayAppend(bucket, entry);
+    if (signal) {
+        entry.onAbort = () => removeTrackedEventTargetListener(target, name, listener, capture);
+        signal.addEventListener('abort', entry.onAbort, { once: true });
+    }
 }
 
 function patchEventTargetTracking(): void {

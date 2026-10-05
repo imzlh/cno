@@ -15,6 +15,7 @@
  */
 
 import { EventEmitter } from '../events';
+const os = import.meta.use('os');
 export { flattenPrototype } from '../_internal/prototype';
 import type {
     BaseStreamState,
@@ -30,8 +31,6 @@ import type {
     Writable,
     WritableState,
 } from './types';
-
-const os = import.meta.use('os');
 
 export function isAsyncIterable(value: Iterable<unknown> | AsyncIterable<unknown>): value is AsyncIterable<unknown> {
     return value !== null && value !== undefined
@@ -144,12 +143,16 @@ export function runStreamDestroy(
     finish(null);
 }
 
-const isWindows = os.platform == 'win32';
-let defaultByteHighWaterMark = isWindows ? 16 * 1024 : 64 * 1024;
+// Node normalizes Windows to `win32`; circu.js exposes `windows` and the
+// underlying uname spelling on the low-level os module.
+const isWindowsHost = os.platform === 'windows' || os.platform === 'win32'
+    || os.uname().sysname === 'Windows_NT';
+let defaultByteHighWaterMark = isWindowsHost ? 16 * 1024 : 64 * 1024;
 let defaultObjectHighWaterMark = 16;
 
 export function defaultHighWaterMark(objectMode: boolean): number {
-    return objectMode ? defaultObjectHighWaterMark : defaultByteHighWaterMark;
+    if (objectMode) return defaultObjectHighWaterMark;
+    return defaultByteHighWaterMark;
 }
 
 function validateHighWaterMark(value: number): void {

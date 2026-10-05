@@ -30,10 +30,9 @@ export function url(): string | undefined {
 }
 
 export function waitForDebugger(): void {
-	const bridge = requireBridge()
-	if (!bridge.isActive()) {
-		void bridge.open({ wait: true })
-		return
+	const bridge = getInspectorBridge()
+	if (!bridge?.isActive()) {
+		throw Object.assign(new Error('Inspector is not active'), { code: 'ERR_INSPECTOR_NOT_ACTIVE' })
 	}
 	void bridge.waitForDebugger()
 }

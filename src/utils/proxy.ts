@@ -49,7 +49,12 @@ export function shouldBypassProxy(url: URL, noProxy?: string | null): boolean {
         const value = raw.trim().toLowerCase();
         if (!value) continue;
         if (value === '*') return true;
-        if (value === '<local>' && !hostname.includes('.')) return true;
+        // `<local>` matches single-label host names. IP literals (including
+        // IPv6 addresses such as `::1`) are not host names for this rule;
+        // treating them as local would bypass the proxy even when a more
+        // specific NO_PROXY port entry does not match.
+        const isIpLiteral = hostname.includes(':') || /^(?:\d{1,3}\.){3}\d{1,3}$/.test(hostname);
+        if (value === '<local>' && !hostname.includes('.') && !isIpLiteral) return true;
         const { host, port: rulePort } = splitHostPort(value);
         if (!host || (rulePort !== null && rulePort !== port)) continue;
         const bare = host.startsWith('*.') ? host.slice(2) : host.startsWith('.') ? host.slice(1) : host;

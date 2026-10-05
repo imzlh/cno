@@ -710,13 +710,10 @@ function installNativeTickDrain(): boolean {
 function scheduleNextTickDrain(): void {
     if (tickState.scheduled) return;
     tickState.scheduled = true;
-    if (nativeTickDrain) {
-        if (!tickState.draining) {
-            (engine as unknown as NextTickEngineHook).notifyNextTick!();
-        }
-        return;
-    }
     queueMicrotask(drainNextTickQueue);
+    if (nativeTickDrain && !tickState.draining) {
+        (engine as unknown as NextTickEngineHook).notifyNextTick!();
+    }
 }
 
 type ProcessWarningOptions = string | { type?: string; code?: string; detail?: string };
@@ -862,12 +859,9 @@ export let title: string = 'node';
 export const version: string = 'v24.1.0';
 type CnoProcessVersions = NodeJS.ProcessVersions & {
     typescript: string;
-    deno: string;
 };
 
 const llhttpVersion = engine.versions.llhttp ?? '9.2.1';
-const cnoDenoVersion = '2.9.3';
-
 export const versions: CnoProcessVersions = {
     node: '24.1.0',
     v8: engine.versions.quickjs,
@@ -887,7 +881,6 @@ export const versions: CnoProcessVersions = {
     nghttp2: '1.62.1',
     acorn: '8.14.0',
     typescript: '5.9.2',
-    deno: cnoDenoVersion,
 };
 
 export const config: NodeJS.ProcessConfig = {

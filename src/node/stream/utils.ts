@@ -236,12 +236,38 @@ export function ReadableFrom(iterable: Iterable<unknown> | AsyncIterable<unknown
 }
 
 export function addAbortSignal(signal: AbortSignal, stream: Stream): Stream {
-    if (signal.aborted) {
+    const alreadyDestroyed = stream.closed || stream.destroyed;
+    const readable = isReadableLike(stream) ? stream : undefined;
+    const writable = isWritableLike(stream) ? stream : undefined;
+    const onAbort = () => {
         stream.destroy(createAbortError(signal.reason));
+    };
+    const cleanup = () => {
+        signal.removeEventListener('abort', onAbort);
+        stream.removeListener('end', onComplete);
+        stream.removeListener('finish', onComplete);
+        stream.removeListener('close', cleanup);
+        stream.removeListener('error', cleanup);
+    };
+    const onComplete = () => {
+        // A duplex remains abortable until both directions have completed.
+        if ((readable || writable)
+            && (!readable || readable.readableEnded || readable._readableState.endEmitted)
+            && (!writable || writable.writableFinished || writable._writableState.finished)) {
+            cleanup();
+        }
+    };
+
+    if (readable) stream.on('end', onComplete);
+    if (writable) stream.on('finish', onComplete);
+    stream.once('close', cleanup);
+    stream.once('error', cleanup);
+    if (signal.aborted) {
+        onAbort();
     } else {
-        signal.addEventListener('abort', () => {
-            stream.destroy(createAbortError(signal.reason));
-        });
+        signal.addEventListener('abort', onAbort, { once: true });
     }
+    if (alreadyDestroyed) cleanup();
+    else if (!signal.aborted) onComplete();
     return stream;
 }
