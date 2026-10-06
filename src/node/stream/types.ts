@@ -136,7 +136,7 @@ export type ReadableTarget = {
     emit(event: string, ...args: unknown[]): boolean;
 };
 
-export interface Readable extends Stream {
+export interface ReadableBase extends Stream {
     readable: boolean;
     readableEnded: boolean;
     readableFlowing: boolean | null;
@@ -149,7 +149,6 @@ export interface Readable extends Stream {
     _readableState: ReadableState;
     _read(size: number): void;
     _emitReadableEndIfNeeded(): void;
-    _readAndResolve(): void;
     read(n?: number): unknown;
     setEncoding(enc: BufferEncoding): this;
     pause(): this;
@@ -157,7 +156,6 @@ export interface Readable extends Stream {
     isPaused(): boolean;
     unpipe(destination?: Writable): this;
     unshift(chunk: unknown, encoding?: BufferEncoding): boolean;
-    wrap(stream: ReadableWrappedSource): this;
     push(chunk: unknown, encoding?: BufferEncoding): boolean;
     toArray(options?: StreamIteratorOptions): Promise<unknown[]>;
     map(fn: StreamIteratorCallback, options?: StreamIteratorOptions): Readable;
@@ -173,6 +171,11 @@ export interface Readable extends Stream {
     iterator(options?: { destroyOnReturn?: boolean }): AsyncIterableIterator<unknown>;
     compose(stream: unknown, options?: StreamIteratorOptions): Duplex;
     [Symbol.asyncIterator](): AsyncIterableIterator<unknown>;
+}
+
+export interface Readable extends ReadableBase {
+    _readAndResolve(): void;
+    wrap(stream: ReadableWrappedSource): this;
 }
 
 export interface ReadableConstructor {
@@ -244,43 +247,9 @@ export interface WritableConstructor {
     prototype: Writable;
 }
 
-export interface Duplex extends Writable {
+export interface Duplex extends Writable, ReadableBase {
     allowHalfOpen: boolean;
-    readable: boolean;
-    readableEnded: boolean;
-    readableFlowing: boolean | null;
-    readableHighWaterMark: number;
-    readableLength: number;
-    readableObjectMode: boolean;
-    readableEncoding: BufferEncoding | null;
-    readableAborted: boolean;
-    readableDidRead: boolean;
-    _readableState: ReadableState;
-    _read(size: number): void;
-    _emitReadableEndIfNeeded(): void;
     _duplexReadAndResolve(): void;
-    read(n?: number): unknown;
-    setEncoding(enc: BufferEncoding): this;
-    pause(): this;
-    resume(): this;
-    isPaused(): boolean;
-    unpipe(destination?: Writable): this;
-    unshift(chunk: unknown, encoding?: BufferEncoding): boolean;
-    push(chunk: unknown, encoding?: BufferEncoding): boolean;
-    toArray(options?: StreamIteratorOptions): Promise<unknown[]>;
-    map(fn: StreamIteratorCallback, options?: StreamIteratorOptions): Readable;
-    filter(fn: StreamIteratorCallback, options?: StreamIteratorOptions): Readable;
-    flatMap(fn: StreamIteratorCallback, options?: StreamIteratorOptions): Readable;
-    take(count: number, options?: StreamIteratorOptions): Readable;
-    drop(count: number, options?: StreamIteratorOptions): Readable;
-    forEach(fn: StreamIteratorCallback, options?: StreamIteratorOptions): Promise<void>;
-    reduce(reducer: StreamReducer, initialValue?: unknown, options?: StreamIteratorOptions): Promise<unknown>;
-    some(fn: StreamIteratorCallback, options?: StreamIteratorOptions): Promise<boolean>;
-    every(fn: StreamIteratorCallback, options?: StreamIteratorOptions): Promise<boolean>;
-    find(fn: StreamIteratorCallback, options?: StreamIteratorOptions): Promise<unknown>;
-    iterator(options?: { destroyOnReturn?: boolean }): AsyncIterableIterator<unknown>;
-    compose(stream: unknown, options?: StreamIteratorOptions): Duplex;
-    [Symbol.asyncIterator](): AsyncIterableIterator<unknown>;
 }
 
 export interface DuplexConstructor {

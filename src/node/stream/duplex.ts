@@ -8,10 +8,14 @@
  * flattenPrototype() call, exactly as the single-file version did.
  */
 
-import { StringDecoder } from '../string_decoder';
 import { Writable } from './writable';
 import { Readable } from './readable';
 import {
+    createReadableState,
+    flowReadable,
+    onReadableListenerAdded,
+    resumeReadable,
+    setReadableEncoding,
     addReadableLength,
     asError,
     collectReadableToArray,
@@ -20,7 +24,6 @@ import {
     defaultHighWaterMark,
     deferTick,
     flattenPrototype,
-    invokeReadableRead,
     isAsyncIterable,
     isConstructCallTarget,
     isIterable,
@@ -31,7 +34,6 @@ import {
     runStreamDestroy,
     scheduleReadableEmit,
     scheduleReadableFlow,
-    subtractReadableLength,
     unpipeDestinations,
     unshiftReadableChunk,
     updateReadableLength,
@@ -59,30 +61,7 @@ function initDuplex(self: Duplex, options?: DuplexOptions): void {
     self.readableEncoding = options?.encoding ?? null;
     self.readableAborted = false;
     self.readableDidRead = false;
-    self._readableState = {
-        buffer: [],
-        encoding: options?.encoding ?? null,
-        objectMode: self.readableObjectMode,
-        highWaterMark: self.readableHighWaterMark,
-        flowing: null,
-        ended: false,
-        endEmitted: false,
-        reading: false,
-        sync: true,
-        needReadable: false,
-        emittedReadable: false,
-        readableListening: false,
-        resumeScheduled: false,
-        destroyed: false,
-        defaultEncoding: 'utf8',
-        awaitDrain: 0,
-        readingMore: false,
-        decoder: options?.encoding ? new StringDecoder(options.encoding) : null,
-        disturbed: false,
-        emitClose: options?.emitClose ?? true,
-        autoDestroy: options?.autoDestroy ?? true,
-        closed: false,
-    };
+    self._readableState = createReadableState(options, self.readableObjectMode, self.readableHighWaterMark);
 
     if (options?.readable === false) {
         self.readableEnded = true;
@@ -125,27 +104,7 @@ Duplex.prototype.read = function read(this: Duplex, n?: number): unknown {
 };
 
 Duplex.prototype.setEncoding = function setEncoding(this: Duplex, enc: BufferEncoding): Duplex {
-    this.readableEncoding = enc;
-    const state = this._readableState;
-    state.encoding = enc;
-    state.decoder = new StringDecoder(enc);
-    const decoded: unknown[] = [];
-    for (const chunk of state.buffer) {
-        const bytes = decoderBytes(chunk);
-        if (bytes) {
-            const out = state.decoder.write(bytes);
-            if (out.length > 0) decoded.push(out);
-        } else {
-            decoded.push(chunk);
-        }
-    }
-    if (state.ended) {
-        const trailing = state.decoder.end();
-        if (trailing.length > 0) decoded.push(trailing);
-    }
-    state.buffer = decoded;
-    updateReadableLength(this);
-    return this;
+    return setReadableEncoding(this, enc);
 };
 
 Duplex.prototype.pause = function pause(this: Duplex): Duplex {
@@ -160,52 +119,18 @@ Duplex.prototype.pause = function pause(this: Duplex): Duplex {
 
 Duplex.prototype.resume = function resume(this: Duplex): Duplex {
     if (!this.readable) return this;
-    const state = this._readableState;
-    if (state.readableListening && this.listenerCount('data') === 0) {
-        this.emit('resume');
-        invokeReadableRead(this);
-        return this;
-    }
-    if (!state.flowing) {
-        state.flowing = true;
-        this.emit('resume');
-        // Same deferral as Readable.prototype.resume — see comment there.
-        scheduleReadableFlow(this, () => this._duplexReadAndResolve());
-    } else {
-        scheduleReadableFlow(this, () => this._duplexReadAndResolve());
-    }
-    return this;
+    return resumeReadable(this, () => this._duplexReadAndResolve());
 };
 
 Duplex.prototype.on = function on(this: Duplex, event: string | symbol, fn: StreamListener): Duplex {
     Writable.prototype.on.call(this, event, fn);
-    if (event === 'data') this.resume();
-    if (event === 'readable') {
-        const state = this._readableState;
-        state.readableListening = true;
-        // Node parks the stream in paused mode when a 'readable' listener is
-        // attached, overriding an earlier flowing=true, so isPaused() and
-        // readableFlowing report false rather than null/true.
-        state.flowing = false;
-        if (state.buffer.length > 0 || state.ended) scheduleReadableEmit(this);
-        else invokeReadableRead(this);
-    }
+    onReadableListenerAdded(this, event);
     return this;
 };
 
 Duplex.prototype.once = function once(this: Duplex, event: string | symbol, fn: StreamListener): Duplex {
     Writable.prototype.once.call(this, event, fn);
-    if (event === 'data') this.resume();
-    if (event === 'readable') {
-        const state = this._readableState;
-        state.readableListening = true;
-        // Node parks the stream in paused mode when a 'readable' listener is
-        // attached, overriding an earlier flowing=true, so isPaused() and
-        // readableFlowing report false rather than null/true.
-        state.flowing = false;
-        if (state.buffer.length > 0 || state.ended) scheduleReadableEmit(this);
-        else invokeReadableRead(this);
-    }
+    onReadableListenerAdded(this, event);
     return this;
 };
 
@@ -242,23 +167,7 @@ Duplex.prototype._emitReadableEndIfNeeded = function _emitReadableEndIfNeeded(th
 };
 
 Duplex.prototype._duplexReadAndResolve = function _duplexReadAndResolve(this: Duplex): void {
-    const state = this._readableState;
-    if (state.destroyed || !state.flowing) return;
-
-    while (!state.destroyed && state.flowing && state.buffer.length > 0) {
-        let chunk = state.buffer.shift();
-        state.disturbed = true;
-        this.readableDidRead = true;
-        subtractReadableLength(this, readableChunkLength(state, chunk));
-        this.emit('data', chunk);
-    }
-
-    if (state.ended) {
-        this._emitReadableEndIfNeeded();
-        return;
-    }
-
-    invokeReadableRead(this);
+    flowReadable(this);
 };
 
 Duplex.prototype.isPaused = function isPaused(this: Duplex): boolean {
@@ -293,23 +202,14 @@ Duplex.prototype.push = function push(this: Duplex, chunk: unknown, encoding?: B
     const ending = chunk === null;
     if (ending) {
         state.ended = true;
-        if (state.decoder) {
-            const trailing = state.decoder.end();
-            if (trailing) {
-                chunk = trailing;
-                decodedTrailing = true;
-            } else {
-                // See the Readable copy: without this, setEncoding() plus a
-                // 'readable' listener never reaches 'end'.
-                if (!state.flowing && state.readableListening) this.emit('readable');
-                if (state.flowing) this._emitReadableEndIfNeeded();
-                return false;
-            }
-        } else {
+        const trailing = state.decoder?.end();
+        if (!trailing) {
             if (!state.flowing && state.readableListening) this.emit('readable');
             if (state.flowing) this._emitReadableEndIfNeeded();
             return false;
         }
+        chunk = trailing;
+        decodedTrailing = true;
     }
 
     if (!state.objectMode && chunk === undefined) return true;

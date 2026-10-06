@@ -687,11 +687,15 @@ class Listener implements Deno.Listener {
     }
 
     @wrap
-    async *[Symbol.asyncIterator]() {
+    [Symbol.asyncIterator]() {
+        return this.acceptIterator(() => this.accept());
+    }
+
+    protected async *acceptIterator<T extends Deno.Conn>(accept: () => Promise<T>): AsyncIterableIterator<T> {
         try {
             while (true) {
                 try {
-                    const conn = await this.accept();
+                    const conn = await accept();
                     yield conn;
                 } catch (e) {
                     if (this.$closed && e instanceof errors.BadResource) return;
@@ -960,20 +964,8 @@ class TcpListener extends Listener implements Deno.TcpListener {
     }
 
     @wrap
-    async*[Symbol.asyncIterator]() {
-        try {
-            while (true) {
-                try {
-                    const conn = await this.accept();
-                    yield conn;
-                } catch (e) {
-                    if (this.$closed && e instanceof errors.BadResource) return;
-                    throw e;
-                }
-            }
-        } finally {
-            this.close();
-        }
+    [Symbol.asyncIterator]() {
+        return this.acceptIterator(() => this.accept());
     }
 }
 
@@ -988,20 +980,8 @@ class UnixListener extends Listener implements Deno.UnixListener {
     }
 
     @wrap
-    async*[Symbol.asyncIterator]() {
-        try {
-            while (true) {
-                try {
-                    const conn = await this.accept();
-                    yield conn;
-                } catch (e) {
-                    if (this.$closed && e instanceof errors.BadResource) return;
-                    throw e;
-                }
-            }
-        } finally {
-            this.close();
-        }
+    [Symbol.asyncIterator]() {
+        return this.acceptIterator(() => this.accept());
     }
 }
 
@@ -1022,20 +1002,8 @@ class TlsListener extends Listener implements Deno.TlsListener {
     }
 
     @wrap
-    async*[Symbol.asyncIterator]() {
-        try {
-            while (true) {
-                try {
-                    const conn = await this.accept();
-                    yield conn;
-                } catch (e) {
-                    if (this.$closed && e instanceof errors.BadResource) return;
-                    throw e;
-                }
-            }
-        } finally {
-            this.close();
-        }
+    [Symbol.asyncIterator]() {
+        return this.acceptIterator(() => this.accept());
     }
 
     get addr(): Deno.NetAddr {

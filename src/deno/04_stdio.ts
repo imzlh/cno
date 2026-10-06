@@ -1,4 +1,4 @@
-import { stdin, stdout, stderr } from "../utils/stdio";
+import { stdin, stdout, stderr, type Stream } from "../utils/stdio";
 
 const os = import.meta.use('os');
 
@@ -47,9 +47,14 @@ class Stdin {
     }
 }
 
-class Stdout {
-    #stream = stdout;
-    #writable = this.#stream.createWriteStream() as typeof Deno.stdout.writable;
+class Output {
+    #stream: Stream;
+    #writable: typeof Deno.stdout.writable;
+
+    constructor(stream: Stream) {
+        this.#stream = stream;
+        this.#writable = stream.createWriteStream() as typeof Deno.stdout.writable;
+    }
 
     get rid() {
         return this.#stream.fd;
@@ -76,34 +81,19 @@ class Stdout {
     }
 }
 
-class Stderr {
-    #stream = stderr;
-    #writable = this.#stream.createWriteStream() as typeof Deno.stderr.writable;
-
-    get rid() {
-        return this.#stream.fd;
-    }
-
-    close() {
-        this.#stream.close();
-    }
-
-    isTerminal() {
-        return this.#stream.isTTY;
-    }
-
-    write(data: Uint8Array) {
-        return this.#stream.write(data);
-    }
-
-    writeSync(data: Uint8Array) {
-        return this.#stream.writeSync(data);
-    }
-
-    get writable() {
-        return this.#writable;
-    }
+class Stdout extends Output {
+    constructor() { super(stdout); }
 }
+
+class Stderr extends Output {
+    constructor() { super(stderr); }
+}
+
+// Deno exposes these methods and accessors directly on each facade prototype.
+const outputDescriptors = Object.getOwnPropertyDescriptors(Output.prototype);
+Reflect.deleteProperty(outputDescriptors, 'constructor');
+Object.defineProperties(Stdout.prototype, outputDescriptors);
+Object.defineProperties(Stderr.prototype, outputDescriptors);
 
 const denoStdioNs: DenoStdioNamespace = {
     stdin: new Stdin(),

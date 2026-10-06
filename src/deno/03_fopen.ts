@@ -403,14 +403,14 @@ export class FsFile implements Deno.FsFile {
 export { FsFile as FSFile };
 
 function openFsFile(
-    pathStr: string,
-    fno: number,
-    flag: CModuleFS.OpenFlags,
-    mode: number | undefined,
-    append: boolean,
-    read: boolean,
-    write: boolean,
+    path: string | URL,
+    options?: Deno.OpenOptions,
 ): FsFile {
+    const flag = options ? optionsToMode(options) : 'r';
+    const pathStr = toFsPath(path);
+    const mode = options?.mode;
+    const fno = fs.open(pathStr, flag, mode);
+    const read = !options || options.read === true;
     let tty: CModuleStreams.TTY | undefined;
     let ttyFd: number | undefined;
     try {
@@ -423,7 +423,7 @@ function openFsFile(
             }
         }
         const handle = asfs.newStdioFile(pathStr, fno);
-        return new FsFile(handle, append, read, write, fsFileToken, tty);
+        return new FsFile(handle, !!options?.append, read, !!options?.write || !!options?.append, fsFileToken, tty);
     } catch (e) {
         try { tty?.close(); } catch {}
         if (!tty && ttyFd !== undefined) {
@@ -436,19 +436,11 @@ function openFsFile(
 
 Object.assign(Deno, wrapFSns({
     async open(path, opt) {
-        let flag: CModuleFS.OpenFlags = "r";
-        if (opt) flag = optionsToMode(opt);
-        const pathStr = toFsPath(path);
-        const fno = fs.open(pathStr, flag, opt?.mode);
-        return openFsFile(pathStr, fno, flag, opt?.mode, !!opt?.append, !opt || opt.read === true, !!opt?.write || !!opt?.append);
+        return openFsFile(path, opt);
     },
 
     openSync(path, opt) {
-        let flag: CModuleFS.OpenFlags = "r";
-        if (opt) flag = optionsToMode(opt);
-        const pathStr = toFsPath(path);
-        const fno = fs.open(pathStr, flag, opt?.mode);
-        return openFsFile(pathStr, fno, flag, opt?.mode, !!opt?.append, !opt || opt.read === true, !!opt?.write || !!opt?.append);
+        return openFsFile(path, opt);
     },
 
     create(path) {

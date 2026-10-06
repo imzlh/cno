@@ -135,28 +135,87 @@ function isFsConstructCallTarget(value: unknown, prototype: object): boolean {
         && prototype.isPrototypeOf(value as object);
 }
 
-/**
- * The mutable view initReadStreamState writes through. The class declares these
- * `private`/`readonly` for callers, but the shared init has to set them, and TS
- * privates are not reachable through the public type.
- */
-type ReadStreamInternals = {
+// Shared lifecycle helpers need a mutable view of the classes' private fields.
+type FileStreamInternals = {
     path: PathLike;
     pending: boolean;
     fd: number | null;
-    bytesRead: number;
     flags: string | number;
     mode?: Mode;
     autoClose: boolean;
-    start?: number;
-    end?: number;
     ownedHandle: { fd: number; close(): Promise<void> } | null;
     handle: CModuleAsyncFS.FileHandle | null;
     position: number | null;
     openPromise: Promise<void> | null;
     openFailed: boolean;
-    ensureOpen(): Promise<void>;
 };
+
+type ReadStreamInternals = FileStreamInternals & {
+    bytesRead: number;
+    start?: number;
+    end?: number;
+};
+
+type FileStream = ReadStream | WriteStream;
+
+// Reads, writes and teardown all wait for the same in-flight open.
+function ensureFileStreamOpen(stream: FileStream): Promise<void> {
+    const state = stream as unknown as FileStreamInternals;
+    if (state.openPromise) return state.openPromise;
+    const path = pathToString(stream.path);
+    state.openPromise = asfs.open(path, parseFlags(state.flags), modeToNumber(state.mode)).then(handle => {
+        if (stream.destroyed) {
+            try { handle.close(); } catch { /* already torn down */ }
+            return;
+        }
+        state.handle = handle;
+        stream.fd = handle.fileno();
+        stream.pending = false;
+        stream.emit('open', stream.fd);
+        stream.emit('ready');
+    });
+    return state.openPromise;
+}
+
+function openFileStream(stream: FileStream): void {
+    const state = stream as unknown as FileStreamInternals;
+    if (stream.fd === null) {
+        void ensureFileStreamOpen(stream).catch((error: unknown) => {
+            state.openFailed = true;
+            if (!stream.destroyed) stream.destroy(asFsError(error, 'open', pathToString(stream.path)));
+        });
+    } else {
+        queueMicrotask(() => {
+            if (stream.destroyed) return;
+            stream.emit('open', stream.fd);
+            stream.emit('ready');
+        });
+    }
+}
+
+function destroyFileStream(stream: FileStream, error: Error | null, callback: (err?: Error | null) => void): void {
+    const state = stream as unknown as FileStreamInternals;
+    const finish = () => {
+        try {
+            if (state.handle) {
+                state.handle.close();
+                state.handle = null;
+            } else if (state.ownedHandle) {
+                // Close the FileHandle, not the bare fd, so the handle knows.
+                void state.ownedHandle.close().catch(() => { /* already closed */ });
+            } else if (stream.fd !== null && state.autoClose) {
+                fs.close(stream.fd);
+            }
+        } catch { /* best-effort cleanup */ }
+        callback(error);
+    };
+    // An open in flight must settle first or its handle leaks.
+    if (state.openPromise && state.handle === null && stream.fd === null) {
+        state.openPromise.then(finish, finish);
+    } else {
+        finish();
+    }
+}
 
 /**
  * The Readable options ReadStream passes up. Split out of the constructor so the
@@ -173,19 +232,8 @@ function readableOptionsFor(options: ReadStreamOptions) {
     };
 }
 
-/**
- * Everything the ReadStream constructor did after `super()`, against an explicit
- * target rather than `this`.
- *
- * Extracting this is what lets `fs.ReadStream` be called without `new`. A class
- * constructor cannot run against a caller-supplied object, and it cannot be
- * faked by constructing an instance and copying its own properties across: the
- * open kicked off below closes over the object it was given, so a copy leaves
- * the caller's object with `handle` permanently null and the stream hangs with
- * zero bytes and no 'end' -- a silent failure, worse than the throw it replaces.
- * Running the init directly on the target keeps every callback pointed at the
- * object the caller will actually read from.
- */
+// Initialize the caller's object in place: the pending open must capture the
+// same instance the ES5-callable constructor returns, never a throwaway copy.
 function initReadStreamState(self: ReadStream, path: PathLike, options: ReadStreamOptions): void {
     const start = validatePosition('start', options.start);
     const end = validatePosition('end', options.end);
@@ -210,25 +258,12 @@ function initReadStreamState(self: ReadStream, path: PathLike, options: ReadStre
     // default to offset 0 when only `end` is given so the end bound applies
     target.position = start ?? (end !== undefined ? 0 : null);
 
-    if (self.fd === null) {
-        void target.ensureOpen().catch((err: unknown) => {
-            target.openFailed = true;
-            if (!self.destroyed) self.destroy(asFsError(err, 'open', pathToString(self.path)));
-        });
-    } else {
-        queueMicrotask(() => {
-            if (self.destroyed) return;
-            self.emit('open', self.fd);
-            self.emit('ready');
-        });
-    }
+    openFileStream(self);
 }
 
 class ReadStreamClass extends Readable {
     bytesRead = 0;
-    // Definite assignment: every one of these is set by initReadStreamState via the
-    // ReadStreamInternals cast above, which TS cannot see through. Without the `!`
-    // each field reports TS2564 even though the constructor does initialize it.
+    // Initialized by initReadStreamState, including the ES5-callable path.
     path!: PathLike;
     pending!: boolean;
     fd!: number | null;
@@ -257,32 +292,6 @@ class ReadStreamClass extends Readable {
         this.destroy();
     }
 
-    /**
-     * Single-flight open. The previous code tracked a `queuedRead` flag and
-     * re-entered `doRead()` from the open callback; when a consumer attached one
-     * macrotask late the read request landed while `reading` was still true, the
-     * re-entry was dropped, and the stream hung forever with zero bytes and no
-     * 'end'. Reads now await this promise instead.
-     */
-    private ensureOpen(): Promise<void> {
-        if (this.openPromise) return this.openPromise;
-        const pathStr = pathToString(this.path);
-        this.openPromise = asfs.open(pathStr, parseFlags(this.flags), modeToNumber(this.mode)).then(
-            (handle: CModuleAsyncFS.FileHandle) => {
-                if (this.destroyed) {
-                    try { handle.close(); } catch { /* already torn down */ }
-                    return;
-                }
-                this.handle = handle;
-                this.fd = handle.fileno();
-                this.pending = false;
-                this.emit('open', this.fd);
-                this.emit('ready');
-            },
-        );
-        return this.openPromise;
-    }
-
     override _read(size: number): void {
         void this.readChunk(size).then(
             (chunk) => {
@@ -303,31 +312,12 @@ class ReadStreamClass extends Readable {
     }
 
     override _destroy(error: Error | null, callback: (err?: Error | null) => void): void {
-        const finish = () => {
-            try {
-                if (this.handle) {
-                    this.handle.close();
-                    this.handle = null;
-                } else if (this.ownedHandle) {
-                    // Close the FileHandle, not the bare fd, so the handle knows.
-                    void this.ownedHandle.close().catch(() => { /* already closed */ });
-                } else if (this.fd !== null && this.autoClose) {
-                    fs.close(this.fd);
-                }
-            } catch { /* best-effort cleanup */ }
-            callback(error);
-        };
-        // An open in flight must settle first or its handle leaks.
-        if (this.openPromise && this.handle === null && this.fd === null) {
-            this.openPromise.then(finish, finish);
-            return;
-        }
-        finish();
+        destroyFileStream(this, error, callback);
     }
 
     private async readChunk(size: number): Promise<Uint8Array<ArrayBuffer> | null> {
         if (this.handle === null && this.fd === null) {
-            await this.ensureOpen();
+            await ensureFileStreamOpen(this);
             if (this.destroyed) return null;
         }
 
@@ -360,32 +350,9 @@ class ReadStreamClass extends Readable {
     }
 }
 
-/**
- * `fs.ReadStream` must be callable WITHOUT `new`.
- *
- * Node's is an ES5-style constructor, so the ecosystem subclasses it the ES5 way.
- * `graceful-fs` -- a transitive dependency of fs-extra, archiver, npm itself and
- * thousands of packages -- does exactly this (graceful-fs.js:297):
- *
- *     function ReadStream (path, options) {
- *       if (this instanceof ReadStream)
- *         return fs$ReadStream.apply(this, arguments), this
- *       else
- *         return ReadStream.apply(Object.create(ReadStream.prototype), arguments)
- *     }
- *
- * Against a `class`, that `.apply` throws "class constructors must be invoked
- * with 'new'", which took out every `fs.createReadStream` routed through
- * graceful-fs: `archiver` and `tar-stream` produced no output at all.
- *
- * Measured node v24.18.0 semantics, which this reproduces:
- *   - `.apply(o, args)` where o is prototype-linked: initializes o IN PLACE
- *     (12 own properties) and returns undefined -- callers use their own `this`.
- *   - a bare call (`this` undefined): returns a fresh working instance.
- *
- * The prototype is the class's own object, so every method is inherited
- * unchanged and `instanceof` holds for objects made either way.
- */
+// Libraries such as graceful-fs subclass through ReadStream.apply(this, args).
+// The callable facade adopts prototype-linked receivers and shares the class
+// prototype so inherited methods and instanceof work on both construction paths.
 export type ReadStream = ReadStreamClass;
 
 type ReadStreamConstructor = {
@@ -406,9 +373,7 @@ export const ReadStream = function ReadStream(this: unknown, path: PathLike, opt
 } as unknown as ReadStreamConstructor;
 
 Object.setPrototypeOf(ReadStream, Readable);
-// Without this, `stream.constructor.name` reads 'ReadStreamClass' -- the internal
-// name leaks to anything that reports or switches on it, where node says
-// 'ReadStream'. The prototype's constructor is the class, not the facade.
+// The class owns the shared prototype, so give it the public constructor name.
 Object.defineProperty(ReadStreamClass, 'name', { value: 'ReadStream', configurable: true });
 Object.defineProperty(ReadStream, 'prototype', {
     value: ReadStreamClass.prototype,
@@ -417,11 +382,6 @@ Object.defineProperty(ReadStream, 'prototype', {
     configurable: false,
 });
 
-/**
- * WriteStream's counterparts to readableOptionsFor/initWriteStreamState. Same
- * reason: `fs.WriteStream` has to be callable without `new`, because graceful-fs
- * patches BOTH streams with the identical ES5 `.apply` idiom.
- */
 function writableOptionsFor(options: WriteStreamOptions) {
     return {
         highWaterMark: validateHighWaterMark(options.highWaterMark),
@@ -430,20 +390,8 @@ function writableOptionsFor(options: WriteStreamOptions) {
     };
 }
 
-type WriteStreamInternals = {
-    path: PathLike;
-    pending: boolean;
-    fd: number | null;
+type WriteStreamInternals = FileStreamInternals & {
     bytesWritten: number;
-    flags: string | number;
-    mode?: Mode;
-    autoClose: boolean;
-    ownedHandle: { fd: number; close(): Promise<void> } | null;
-    handle: CModuleAsyncFS.FileHandle | null;
-    position: number | null;
-    openPromise: Promise<void> | null;
-    openFailed: boolean;
-    ensureOpen(): Promise<void>;
 };
 
 function initWriteStreamState(self: WriteStream, path: PathLike, options: WriteStreamOptions): void {
@@ -464,18 +412,7 @@ function initWriteStreamState(self: WriteStream, path: PathLike, options: WriteS
     target.position = start ?? null;
     if (options.encoding) self.setDefaultEncoding(options.encoding);
 
-    if (self.fd === null) {
-        void target.ensureOpen().catch((err: unknown) => {
-            target.openFailed = true;
-            if (!self.destroyed) self.destroy(asFsError(err, 'open', pathToString(self.path)));
-        });
-    } else {
-        queueMicrotask(() => {
-            if (self.destroyed) return;
-            self.emit('open', self.fd);
-            self.emit('ready');
-        });
-    }
+    openFileStream(self);
 }
 
 class WriteStreamClass extends Writable {
@@ -506,25 +443,6 @@ class WriteStreamClass extends Writable {
         this.end();
     }
 
-    private ensureOpen(): Promise<void> {
-        if (this.openPromise) return this.openPromise;
-        const pathStr = pathToString(this.path);
-        this.openPromise = asfs.open(pathStr, parseFlags(this.flags), modeToNumber(this.mode)).then(
-            (handle: CModuleAsyncFS.FileHandle) => {
-                if (this.destroyed) {
-                    try { handle.close(); } catch { /* already torn down */ }
-                    return;
-                }
-                this.handle = handle;
-                this.fd = handle.fileno();
-                this.pending = false;
-                this.emit('open', this.fd);
-                this.emit('ready');
-            },
-        );
-        return this.openPromise;
-    }
-
     override _write(chunk: FsChunk, encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
         const bytes = chunkToBytes(chunk, encoding);
         this.writeChunk(bytes).then(
@@ -546,30 +464,12 @@ class WriteStreamClass extends Writable {
      * not from _final. Destroying here emitted 'close' before 'finish'.
      */
     override _destroy(error: Error | null, callback: (err?: Error | null) => void): void {
-        const finish = () => {
-            try {
-                if (this.handle) {
-                    this.handle.close();
-                    this.handle = null;
-                } else if (this.ownedHandle) {
-                    // Close the FileHandle, not the bare fd, so the handle knows.
-                    void this.ownedHandle.close().catch(() => { /* already closed */ });
-                } else if (this.fd !== null && this.autoClose) {
-                    fs.close(this.fd);
-                }
-            } catch { /* best-effort cleanup */ }
-            callback(error);
-        };
-        if (this.openPromise && this.handle === null && this.fd === null) {
-            this.openPromise.then(finish, finish);
-            return;
-        }
-        finish();
+        destroyFileStream(this, error, callback);
     }
 
     private async writeChunk(chunk: Uint8Array<ArrayBuffer>): Promise<void> {
         if (this.handle === null && this.fd === null) {
-            await this.ensureOpen();
+            await ensureFileStreamOpen(this);
             if (this.destroyed) return;
         }
 

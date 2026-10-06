@@ -107,7 +107,7 @@ export async function writeAllHandle(
 ): Promise<void> {
     let written = 0;
     while (written < bytes.length) {
-        const n = await handle.write(arrayBufferBackedBytes(bytes.subarray(written)));
+        const n = await handle.write(bytes.subarray(written));
         if (n <= 0) break;
         written += n;
     }
@@ -525,8 +525,7 @@ export class BigIntStats extends Stats {
 }
 
 export function toNodeStat(stat: NativeStats, options?: { bigint?: boolean }): Stats {
-    if (options?.bigint === true) return new BigIntStats(stat) as unknown as Stats;
-    return new Stats(stat) as Stats;
+    return options?.bigint === true ? new BigIntStats(stat) : new Stats(stat);
 }
 
 type StatFsInput = CModuleFS.StatFsResult | CModuleAsyncFS.StatFsResult;
@@ -687,7 +686,7 @@ function needsResolve(entry: DirentInfo): boolean {
  * traversed regardless of path length, so the cap is the OS's, not a depth
  * limit of ours).
  */
-function resolvesToDirSync(absPath: string): boolean {
+function isDirectorySync(absPath: string): boolean {
     try {
         return fs.stat(absPath).isDirectory;
     } catch {
@@ -695,7 +694,7 @@ function resolvesToDirSync(absPath: string): boolean {
     }
 }
 
-async function resolvesToDir(absPath: string): Promise<boolean> {
+async function isDirectory(absPath: string): Promise<boolean> {
     try {
         return (await asfs.stat(absPath)).isDirectory;
     } catch {
@@ -745,7 +744,7 @@ export function readDirEntriesSync(
             if (!recursive) continue;
             const descend = entry.isDirectory
                 ? true
-                : policy === 'follow' && needsResolve(entry) && resolvesToDirSync(join(absDir, entry.name));
+                : policy === 'follow' && needsResolve(entry) && isDirectorySync(join(absDir, entry.name));
             if (descend) pending.push(relativePath);
         }
     }
@@ -783,7 +782,7 @@ export async function readDirEntries(
             if (!recursive) continue;
             const descend = entry.isDirectory
                 ? true
-                : policy === 'follow' && needsResolve(entry) && await resolvesToDir(join(absDir, entry.name));
+                : policy === 'follow' && needsResolve(entry) && await isDirectory(join(absDir, entry.name));
             if (descend) pending.push(entry.relativePath);
         }
     }
@@ -832,7 +831,6 @@ export class Dir {
         if (this.closed) throw dirClosedError();
         if (this.index >= this.entries.length) return null;
         const entry = this.entries[this.index++];
-        if (entry === undefined) return null;
         // parentPath is the containing directory, which for a recursive walk is
         // a descendant of this.path rather than this.path itself.
         return toNodeDirent(entry.name, entry, entry.parentPath);
@@ -862,19 +860,22 @@ export class Dir {
     }
 
     [Symbol.asyncIterator](): AsyncIterableIterator<Dirent> {
-        const dir = this;
-        return {
-            async next() {
-                const entry = await dir.read();
-                if (entry === null) return { done: true, value: undefined };
-                return { done: false, value: entry };
-            },
-            async return() {
-                await dir.close();
-                return { done: true, value: undefined };
-            },
-        } as AsyncIterableIterator<Dirent>;
+        return directoryIterator(this);
     }
+}
+
+function directoryIterator(dir: Pick<Dir, 'read' | 'close'>): AsyncIterableIterator<Dirent> {
+    return {
+        async next() {
+            const entry = await dir.read();
+            if (entry === null) return { done: true, value: undefined };
+            return { done: false, value: entry };
+        },
+        async return() {
+            await dir.close();
+            return { done: true, value: undefined };
+        },
+    } as AsyncIterableIterator<Dirent>;
 }
 
 // Flag parsing
@@ -1123,23 +1124,6 @@ function enotdirError(current: string): NodeJS.ErrnoException {
     return err;
 }
 
-/** True when path exists as a directory after a failed mkdir (race / already there). */
-function isExistingDirSync(current: string): boolean {
-    try {
-        return fs.stat(current).isDirectory;
-    } catch {
-        return false;
-    }
-}
-
-async function isExistingDir(current: string): Promise<boolean> {
-    try {
-        return (await asfs.stat(current)).isDirectory;
-    } catch {
-        return false;
-    }
-}
-
 /**
  * Create path recursively. Returns the first directory actually created
  * (Node.js mkdir recursive), or undefined when every segment already existed.
@@ -1162,7 +1146,7 @@ export function mkdirRecursiveSync(pathStr: string, mode?: number): string | und
             if (firstCreated === undefined) firstCreated = current;
         } catch (e) {
             // Concurrent create: ok only if the path is now a directory.
-            if (!isExistingDirSync(current)) throw e;
+            if (!isDirectorySync(current)) throw e;
         }
     }
     return firstCreated === undefined ? undefined : sysPath(firstCreated);
@@ -1183,7 +1167,7 @@ export async function mkdirRecursive(pathStr: string, mode?: number): Promise<st
             await asfs.mkdir(current, mode);
             if (firstCreated === undefined) firstCreated = current;
         } catch (e) {
-            if (!(await isExistingDir(current))) throw e;
+            if (!(await isDirectory(current))) throw e;
         }
     }
     return firstCreated === undefined ? undefined : sysPath(firstCreated);
@@ -1240,9 +1224,7 @@ export function createFileHandle(fd: number, handle: CModuleAsyncFS.FileHandle) 
         let currentPosition = position;
         while (total < data.length) {
             const chunk = data.subarray(total);
-            const written = currentPosition == null
-                ? await native('write', () => handle.write(chunk))
-                : await native('write', () => handle.write(chunk, currentPosition as number));
+            const written = await native('write', () => handle.write(chunk, currentPosition ?? undefined));
             if (written <= 0) break;
             total += written;
             if (currentPosition != null) currentPosition += written;
@@ -1280,10 +1262,8 @@ export function createFileHandle(fd: number, handle: CModuleAsyncFS.FileHandle) 
             }
             const norm = normalizeRwArgs(target, opts, len, pos);
             const window = arrayBufferBackedBytes(norm.window);
-            // native read() treats explicit null as offset 0, not "current offset" — omit the arg instead
-            const result = norm.position == null
-                ? await native('read', () => handle.read(window))
-                : await native('read', () => handle.read(window, norm.position as number));
+            // Native null means offset 0; undefined preserves the current offset.
+            const result = await native('read', () => handle.read(window, norm.position ?? undefined));
             return { bytesRead: result ?? 0, buffer: target };
         },
         async write(buffer: ArrayBufferView | string, offsetOrPosition?: unknown, lengthOrEncoding?: unknown, position?: number | null) {
@@ -1292,16 +1272,12 @@ export function createFileHandle(fd: number, handle: CModuleAsyncFS.FileHandle) 
                 const encoding = typeof lengthOrEncoding === 'string' ? (lengthOrEncoding as BufferEncoding) : undefined;
                 const data = toUint8Array(buffer, encoding);
                 const at = offsetOrPosition === null || offsetOrPosition === undefined ? null : Number(offsetOrPosition);
-                const bytesWritten = at == null
-                    ? await native('write', () => handle.write(data))
-                    : await native('write', () => handle.write(data, at));
+                const bytesWritten = await native('write', () => handle.write(data, at ?? undefined));
                 return { bytesWritten, buffer };
             }
             const norm = normalizeRwArgs(buffer, offsetOrPosition, lengthOrEncoding, position);
             const bytes = arrayBufferBackedBytes(norm.window);
-            const bytesWritten = norm.position == null
-                ? await native('write', () => handle.write(bytes))
-                : await native('write', () => handle.write(bytes, norm.position as number));
+            const bytesWritten = await native('write', () => handle.write(bytes, norm.position ?? undefined));
             return { bytesWritten, buffer };
         },
         async close() {
@@ -1377,9 +1353,7 @@ export function createFileHandle(fd: number, handle: CModuleAsyncFS.FileHandle) 
                 if (!ArrayBuffer.isView(buffer)) throw new TypeError('The "buffers" argument must be an ArrayBufferView[]');
                 const chunk = arrayBufferBackedBytes(new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength));
                 if (chunk.byteLength === 0) continue;
-                const read = currentPosition == null
-                    ? await native('readv', () => handle.read(chunk))
-                    : await native('readv', () => handle.read(chunk, currentPosition as number));
+                const read = await native('readv', () => handle.read(chunk, currentPosition ?? undefined));
                 const count = read ?? 0;
                 bytesRead += count;
                 if (currentPosition != null) currentPosition += count;
@@ -1395,7 +1369,7 @@ export function createFileHandle(fd: number, handle: CModuleAsyncFS.FileHandle) 
             for (const buffer of buffers) {
                 if (!ArrayBuffer.isView(buffer)) throw new TypeError('The "buffers" argument must be an ArrayBufferView[]');
                 const chunk = arrayBufferBackedBytes(new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength));
-                const written = await writeAll(arrayBufferBackedBytes(chunk), currentPosition);
+                const written = await writeAll(chunk, currentPosition);
                 bytesWritten += written;
                 if (currentPosition != null) currentPosition += written;
             }
@@ -1455,17 +1429,7 @@ export function createAsyncDir(
         },
 
         [Symbol.asyncIterator](): AsyncIterableIterator<Dirent> {
-            return {
-                async next() {
-                    const entry = await dir.read();
-                    if (entry === null) return { done: true, value: undefined };
-                    return { done: false, value: entry };
-                },
-                async return() {
-                    await dir.close();
-                    return { done: true, value: undefined };
-                },
-            } as AsyncIterableIterator<Dirent>;
+            return directoryIterator(dir);
         },
     } as Dir;
 
@@ -1492,7 +1456,6 @@ export function createEagerAsyncDir(
             if (closed) throw dirClosedError();
             if (index >= entries.length) return null;
             const entry = entries[index++];
-            if (entry === undefined) return null;
             return toNodeDirentAsync(entry, entry.parentPath);
         },
 
@@ -1511,17 +1474,7 @@ export function createEagerAsyncDir(
         },
 
         [Symbol.asyncIterator](): AsyncIterableIterator<Dirent> {
-            return {
-                async next() {
-                    const entry = await dir.read();
-                    if (entry === null) return { done: true, value: undefined };
-                    return { done: false, value: entry };
-                },
-                async return() {
-                    await dir.close();
-                    return { done: true, value: undefined };
-                },
-            } as AsyncIterableIterator<Dirent>;
+            return directoryIterator(dir);
         },
     } as Dir;
 

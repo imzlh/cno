@@ -50,17 +50,9 @@ export interface SpawnOptionsWithStdioTuple<
     stdio: [Stdin, Stdout, Stderr];
 }
 
-export interface ExecOptions extends SpawnOptions {
-    encoding?: BufferEncoding | 'buffer' | null;
-    maxBuffer?: number;
-}
+export interface ExecOptions extends SpawnOptions {}
 
-export interface ExecFileOptions extends SpawnOptions {
-    encoding?: BufferEncoding | 'buffer' | null;
-    timeout?: number;
-    maxBuffer?: number;
-    killSignal?: string | number;
-}
+export interface ExecFileOptions extends SpawnOptions {}
 
 export interface ChildProcess extends EventEmitter {
     stdin: Writable | null;
@@ -90,19 +82,11 @@ export type ExecCallback = (error: Error | null, stdout: string | Buffer, stderr
 export interface SpawnSyncResult {
     pid?: number;
     output?: Array<string | Buffer | null>;
-    stdout?: Buffer | string;
-    stderr?: Buffer | string;
+    stdout?: Buffer | string | null;
+    stderr?: Buffer | string | null;
     status?: number | null;
     signal?: string | null;
     error?: Error;
 }
 
-export interface ExecSyncResult {
-    pid?: number;
-    output?: Array<string | Buffer | null>;
-    stdout?: Buffer | string;
-    stderr?: Buffer | string;
-    status?: number | null;
-    signal?: string | null;
-    error?: Error;
-}
+export interface ExecSyncResult extends SpawnSyncResult {}

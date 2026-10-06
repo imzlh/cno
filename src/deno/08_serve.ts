@@ -223,10 +223,8 @@ class ResponseAdapter {
     }
 
     verify(res: Response): void {
-        const getHeader = (name: string) => res.headers.get(name);
-        const contentType = getHeader('content-type');
-        const contentLength = getHeader('content-length');
-        const transferEncoding = getHeader('transfer-encoding');
+        const contentLength = res.headers.get('content-length');
+        const transferEncoding = res.headers.get('transfer-encoding');
 
         if (isBodylessStatus(res.status)) {
             assert(!res.body, `Status ${res.status} must not have a response body`);
@@ -248,8 +246,6 @@ class ResponseAdapter {
             assert(!contentLength, 'Transfer-Encoding and Content-Length cannot coexist');
             assert(transferEncoding.trim().toLowerCase() === 'chunked', 'Unsupported Transfer-Encoding');
         }
-
-        void contentType;
     }
 
     async sendResponse(response: Response): Promise<void> {
@@ -463,12 +459,10 @@ function serve(
         options = { ...optionsOrHandler, handler: optionHandler };
     }
 
-    // Validate handler
-    if (!options.handler) {
-        throw new TypeError('Handler is required');
-    }
-
+    const requestHandler = options.handler;
     const unixPath = 'path' in options ? options.path : undefined;
+    const cert = optionalStringOption(options, 'cert');
+    const key = optionalStringOption(options, 'key');
 
     // Create core server
     const coreServer = createServer(
@@ -480,6 +474,24 @@ function serve(
             const requestPostData = req.body instanceof Uint8Array ? truncateHookPostData(req.body) : undefined;
             let requestUrl = '';
             let requestReported = false;
+            const reportRequest = () => {
+                if (!serveHook || requestReported) return;
+                requestReported = true;
+                emitServeHookQuietly(() => serveHook.onRequest?.({
+                    requestId,
+                    url: requestUrl,
+                    method: req.method,
+                    headers: headersArrayToRecord(req.headers),
+                    postData: requestPostData,
+                    callFrames: requestEntryCallFrames,
+                    timestamp: requestStartTime,
+                }));
+            };
+            const sendResponse = (response: Response) => {
+                const adapter = new ResponseAdapter(res, req.method, req.httpVersion, requestId, requestUrl, req.headers, requestEntryCallFrames);
+                adapter.verify(response);
+                return adapter.sendResponse(response);
+            };
             try {
                 // Create Web API Request
                 const addr = coreServer.address();
@@ -505,10 +517,8 @@ function serve(
                 };
 
                 // Call user handler
-                const handler = options.handler;
-                if (!handler) throw new TypeError('Deno.serve requires a handler');
-                const webResponse = await handler(webRequest, connInfo);
-                if (!webResponse || !(webResponse instanceof Response)) {
+                const webResponse = await requestHandler(webRequest, connInfo);
+                if (!(webResponse instanceof Response)) {
                     throw new TypeError('Handler must return a Response');
                 }
 
@@ -517,68 +527,27 @@ function serve(
                     responseCallFrames = captureServeCallFrames();
                     setResponseInitiatorCallFrames(webResponse, responseCallFrames);
                 }
-                if (serveHook && requestId && !requestReported) {
-                    emitServeHookQuietly(() => {
-                        serveHook.onRequest?.({
-                            requestId,
-                            url: requestUrl,
-                            method: req.method,
-                            headers: headersArrayToRecord(req.headers),
-                            postData: requestPostData,
-                            callFrames: requestEntryCallFrames,
-                            timestamp: requestStartTime,
-                        });
-                        requestReported = true;
-                    });
-                }
-
-                const adapter = new ResponseAdapter(res, req.method, req.httpVersion, requestId, requestUrl, req.headers, requestEntryCallFrames);
-                adapter.verify(webResponse);
-                await adapter.sendResponse(webResponse);
-
+                reportRequest();
+                await sendResponse(webResponse);
             } catch (error) {
-                if (error instanceof ServeResponseWriteError) {
-                    // The adapter already reported loadingFailed and closed the connection.
-                } else if (isServePeerDisconnect(error)) {
-                    // Peer left mid-response. Adapter already closed + onFinished; never onError/500.
-                } else {
-                    // Give user code the same error-recovery hook Deno.serve exposes.
-                    if (typeof options.onError !== 'function') {
-                        reportServeError(error, requestUrl);
+                // A started response or disconnected peer cannot be recovered with another response.
+                if (error instanceof ServeResponseWriteError || isServePeerDisconnect(error)) return;
+                if (typeof options.onError !== 'function') {
+                    reportServeError(error, requestUrl);
+                }
+                try {
+                    reportRequest();
+                    const handled = options.onError ? await options.onError(error) : undefined;
+                    const errorResponse = handled instanceof Response ? handled : new Response('Internal Server Error', {
+                        status: 500,
+                        headers: { 'Content-Type': 'text/plain' },
+                    });
+                    await sendResponse(errorResponse);
+                } catch (recoveryError) {
+                    if (!isServePeerDisconnect(recoveryError)) {
+                        reportServeError(recoveryError, requestUrl, 'error handler');
                     }
-                    try {
-                        if (serveHook && requestId && !requestReported) {
-                            serveHook.onRequest?.({
-                                requestId,
-                                url: requestUrl,
-                                method: req.method,
-                                headers: headersArrayToRecord(req.headers),
-                                postData: requestPostData,
-                                callFrames: requestEntryCallFrames,
-                                timestamp: requestStartTime,
-                            });
-                            requestReported = true;
-                        }
-
-                        let errorResponse: Response | undefined;
-                        if (options.onError) {
-                            const handled = await options.onError(error);
-                            if (handled instanceof Response) errorResponse = handled;
-                        }
-                        errorResponse ??= new Response('Internal Server Error', {
-                            status: 500,
-                            headers: { 'Content-Type': 'text/plain' },
-                        });
-
-                        const adapter = new ResponseAdapter(res, req.method, req.httpVersion, requestId, requestUrl, req.headers, requestEntryCallFrames);
-                        adapter.verify(errorResponse);
-                        await adapter.sendResponse(errorResponse);
-                    } catch (recoveryError) {
-                        if (!isServePeerDisconnect(recoveryError)) {
-                            reportServeError(recoveryError, requestUrl, 'error handler');
-                        }
-                        // Keep the connection failure isolated from the accept loop.
-                    }
+                    // Keep the connection failure isolated from the accept loop.
                 }
             }
         },
@@ -586,17 +555,15 @@ function serve(
             hostname: unixPath ? '0.0.0.0' : options.hostname || '0.0.0.0',
             port: unixPath ? 0 : options.port ?? 8000,
             path: unixPath,
-            cert: optionalStringOption(options, 'cert'),
-            key: optionalStringOption(options, 'key'),
+            cert,
+            key,
             keepAliveTimeout: optionalNumberOption(options, 'keepAliveTimeout'),
             requestTimeout: optionalNumberOption(options, 'requestTimeout'),
             // TLS: offer h2 when the native extension is linked (client ALPN picks).
             // Cleartext stays HTTP/1.1 only — Deno.serve does not speak prior-knowledge h2c.
-            protocols: (() => {
-                const hasTls = !!(optionalStringOption(options, 'cert') && optionalStringOption(options, 'key'));
-                if (hasTls && h2Available()) return [HttpVersion.HTTP2, HttpVersion.HTTP11];
-                return [HttpVersion.HTTP11];
-            })(),
+            protocols: cert && key && h2Available()
+                ? [HttpVersion.HTTP2, HttpVersion.HTTP11]
+                : [HttpVersion.HTTP11],
         }
     );
 

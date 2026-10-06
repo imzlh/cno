@@ -89,24 +89,16 @@ function requireBrotli<T>(value: T | undefined): T {
     if (typeof value !== 'function') throw new Error('Brotli compression is not supported in this environment');
     return value;
 }
-function brotliCompressImpl(buffer: ZlibInput, options?: BrotliOptions): Buffer {
+export function brotliCompressSync(buffer: ZlibInput, options?: BrotliOptions): Buffer {
     validateBrotliOptions(options);
     const compress = requireBrotli(nativeBrotli.compress);
     return checkMaxOutputLength(Buffer.from(compress(toUint8Array(buffer), brotliCompressOptions(options))), options);
 }
 
-function brotliDecompressImpl(buffer: ZlibInput, options?: BrotliOptions): Buffer {
+export function brotliDecompressSync(buffer: ZlibInput, options?: BrotliOptions): Buffer {
     validateBrotliOptions(options);
     const decompress = requireBrotli(nativeBrotli.decompress);
     return checkMaxOutputLength(Buffer.from(decompress(toUint8Array(buffer), brotliDecompressOptions(options))), options);
-}
-
-export function brotliCompressSync(buffer: ZlibInput, options?: BrotliOptions): Buffer {
-    return brotliCompressImpl(buffer, options);
-}
-
-export function brotliDecompressSync(buffer: ZlibInput, options?: BrotliOptions): Buffer {
-    return brotliDecompressImpl(buffer, options);
 }
 
 export const brotliCompress = wrapCallback(brotliCompressSync as SyncFn, options => validateBrotliOptions(options as BrotliOptions));
@@ -115,8 +107,6 @@ export const brotliDecompress = wrapCallback(brotliDecompressSync as SyncFn, opt
 type BrotliStreamState = {
     flush: number;
     finishFlush: number;
-    maxOutputLength?: number;
-    outputLength: number;
 };
 
 const brotliStreamStates = new WeakMap<object, BrotliStreamState>();
@@ -125,25 +115,13 @@ function configureBrotliStream(stream: object, options?: BrotliOptions): void {
     brotliStreamStates.set(stream, {
         flush: options?.flush ?? BROTLI_OPERATION_PROCESS,
         finishFlush: options?.finishFlush ?? BROTLI_OPERATION_FINISH,
-        // As with the zlib streams above, Node scopes `maxOutputLength` to the
-        // convenience methods only. Measured on v24.18.0:
-        // createBrotliDecompress({maxOutputLength:1}) emits all 100000 bytes,
-        // while brotliDecompressSync(..., {maxOutputLength:1}) throws
-        // ERR_BUFFER_TOO_LARGE. NOTE: not exercisable in this build, which has no
-        // system libbrotli, so these ctors throw before reaching here.
-        maxOutputLength: undefined,
-        outputLength: 0,
     });
 }
 
-function checkBrotliStreamOutput(stream: object, output: Buffer): Buffer {
+function brotliStreamState(stream: object): BrotliStreamState {
     const state = brotliStreamStates.get(stream);
     if (!state) throw new Error('Brotli stream is not initialized');
-    state.outputLength += output.byteLength;
-    if (state.maxOutputLength !== undefined && state.outputLength > state.maxOutputLength) {
-        throw new RangeError(`Cannot create a Buffer larger than ${state.maxOutputLength} bytes`);
-    }
-    return output;
+    return state;
 }
 
 function brotliCompressOperation(handle: CModuleBrotli.BrotliCompress, operation: number, input?: Uint8Array): Buffer {
@@ -189,7 +167,7 @@ BrotliCompress.prototype = Object.create(Transform.prototype);
 BrotliCompress.prototype._transform = function _transform(this: BrotliCompress, chunk: ZlibInput, _e: BufferEncoding, cb: TransformCallback): void {
     finishTransform(cb, () => {
         const state = brotliStreamStates.get(this)!;
-        return checkBrotliStreamOutput(this, brotliCompressOperation(this._handle, state.flush, toUint8Array(chunk)));
+        return brotliCompressOperation(this._handle, state.flush, toUint8Array(chunk));
     });
 };
 
@@ -197,7 +175,7 @@ BrotliCompress.prototype._flush = function _flush(this: BrotliCompress, cb: Tran
     finishTransform(cb, () => {
         const state = brotliStreamStates.get(this)!;
         try {
-            return checkBrotliStreamOutput(this, brotliCompressOperation(this._handle, state.finishFlush));
+            return brotliCompressOperation(this._handle, state.finishFlush);
         } catch (error) {
             if (/already finished/i.test(asError(error).message)) return Buffer.alloc(0);
             throw error;
@@ -207,7 +185,8 @@ BrotliCompress.prototype._flush = function _flush(this: BrotliCompress, cb: Tran
 
 BrotliCompress.prototype.flush = function flush(this: BrotliCompress, callback?: () => void): BrotliCompress {
     try {
-        const output = checkBrotliStreamOutput(this, Buffer.from(this._handle.flush()));
+        const output = Buffer.from(this._handle.flush());
+        brotliStreamState(this);
         if (output.length > 0) this.push(output);
         if (callback) queueMicrotask(callback);
     } catch (error) {
@@ -253,16 +232,25 @@ Object.setPrototypeOf(BrotliDecompress, Transform);
 BrotliDecompress.prototype = Object.create(Transform.prototype);
 
 BrotliDecompress.prototype._transform = function _transform(this: BrotliDecompress, chunk: ZlibInput, _e: BufferEncoding, cb: TransformCallback): void {
-    finishTransform(cb, () => checkBrotliStreamOutput(this, Buffer.from(this._handle.decompress(toUint8Array(chunk)))));
+    finishTransform(cb, () => {
+        const output = Buffer.from(this._handle.decompress(toUint8Array(chunk)));
+        brotliStreamState(this);
+        return output;
+    });
 };
 
 BrotliDecompress.prototype._flush = function _flush(this: BrotliDecompress, cb: TransformCallback): void {
-    finishTransform(cb, () => checkBrotliStreamOutput(this, Buffer.from(this._handle.finish())));
+    finishTransform(cb, () => {
+        const output = Buffer.from(this._handle.finish());
+        brotliStreamState(this);
+        return output;
+    });
 };
 
 BrotliDecompress.prototype.flush = function flush(this: BrotliDecompress, callback?: () => void): BrotliDecompress {
     try {
-        const output = checkBrotliStreamOutput(this, Buffer.from(this._handle.decompress(Buffer.alloc(0))));
+        const output = Buffer.from(this._handle.decompress(Buffer.alloc(0)));
+        brotliStreamState(this);
         if (output.length > 0) this.push(output);
         if (callback) queueMicrotask(callback);
     } catch (error) {

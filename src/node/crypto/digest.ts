@@ -4,8 +4,8 @@ const crypto = import.meta.use('crypto');
 import { Buffer } from '../buffer';
 import { Transform, type TransformOptions } from '../stream';
 import type { BinaryInput, Hash, Hmac, KeyInput } from './types';
-import { toBuffer, toExactArrayBuffer, encodeOutput, concatBuffers, normalizeHashAlgorithm, oneShotHmac, isSupportedHmacAlgorithm, getKeyBytes } from './helpers';
-import { createDigestAlreadyCalledError, withCode, asError } from './errors';
+import { toBuffer, encodeOutput, concatBuffers, normalizeHashAlgorithm, oneShotHmac, isSupportedHmacAlgorithm, getKeyBytes } from './helpers';
+import { createDigestAlreadyCalledError, asError } from './errors';
 
 type DigestState = {
     update(data: Uint8Array): void;
@@ -13,16 +13,23 @@ type DigestState = {
     copy(): DigestState;
 };
 
-type NativeDigest = CModuleCrypto.Hash & { copy(): CModuleCrypto.Hash };
-
-export function nativeDigest(factory: () => NativeDigest): DigestState {
-    const native = factory();
-    return {
-        update(data) { native.update(data); },
-        digest() { return native.digest(); },
-        copy() { return nativeDigest(() => native.copy() as NativeDigest); },
-    };
-}
+const streamingHashFactories: Record<string, () => DigestState> = {
+    md5: crypto.createMd5,
+    ripemd160: crypto.createRipemd160,
+    sha1: crypto.createSha1,
+    sha224: crypto.createSha224,
+    sha256: crypto.createSha256,
+    sha384: crypto.createSha384,
+    sha512: crypto.createSha512,
+    sha512224: crypto.createSha512_224,
+    sha512256: crypto.createSha512_256,
+    sha3224: crypto.createSha3_224,
+    sha3256: crypto.createSha3_256,
+    sha3384: crypto.createSha3_384,
+    sha3512: crypto.createSha3_512,
+    blake2b512: crypto.createBlake2b512,
+    blake2s256: crypto.createBlake2s256,
+};
 
 export function bufferedDigest(fn: (data: Uint8Array) => ArrayBuffer, seed: Uint8Array[] = []): DigestState {
     const chunks = seed.map(chunk => new Uint8Array(chunk));
@@ -89,30 +96,13 @@ export function createHash(algorithm: string, options?: TransformOptions & { out
     if (options?.outputLength !== undefined && !isShake) {
         throw new RangeError('outputLength is only supported for SHAKE hash algorithms');
     }
-    const streamingAlgos: Record<string, () => NativeDigest> = {
-        md5:       () => crypto.createMd5() as NativeDigest,
-        ripemd160: () => crypto.createRipemd160() as NativeDigest,
-        sha1:      () => crypto.createSha1() as NativeDigest,
-        sha224:    () => crypto.createSha224() as NativeDigest,
-        sha256:    () => crypto.createSha256() as NativeDigest,
-        sha384:    () => crypto.createSha384() as NativeDigest,
-        sha512:    () => crypto.createSha512() as NativeDigest,
-        sha512224: () => crypto.createSha512_224() as NativeDigest,
-        sha512256: () => crypto.createSha512_256() as NativeDigest,
-        sha3224:   () => crypto.createSha3_224() as NativeDigest,
-        sha3256:   () => crypto.createSha3_256() as NativeDigest,
-        sha3384:   () => crypto.createSha3_384() as NativeDigest,
-        sha3512:   () => crypto.createSha3_512() as NativeDigest,
-        blake2b512:() => crypto.createBlake2b512() as NativeDigest,
-        blake2s256:() => crypto.createBlake2s256() as NativeDigest,
-    };
     const shakeLength = options?.outputLength;
     const oneshotAlgos: Record<string, (buf: Uint8Array) => ArrayBuffer> = {
         shake128: buf => crypto.shake128(buf, shakeLength),
         shake256: buf => crypto.shake256(buf, shakeLength),
     };
-    const factory = streamingAlgos[a];
-    if (factory) return new HashImpl(nativeDigest(factory), options);
+    const factory = streamingHashFactories[a];
+    if (factory) return new HashImpl(factory(), options);
     const fn = oneshotAlgos[a];
     if (fn) return new HashImpl(bufferedDigest(fn), options);
     throw new Error(`Unsupported hash algorithm: ${algorithm}`);
@@ -202,28 +192,16 @@ export function createHmac(algorithm: string, key: KeyInput, options?: Transform
     const a = normalizeHashAlgorithm(algorithm);
     if (!isSupportedHmacAlgorithm(a)) throw new Error(`Unsupported HMAC algorithm: ${algorithm}`);
 
-    const nativeAlgos: Record<string, () => CModuleCrypto.Hmac> = {
-        sha256: () => crypto.createHmacSha256(keyBuf),
-        sha512: () => crypto.createHmacSha512(keyBuf),
-    };
     // The native streaming HMAC rejects a zero-length key with an InternalError,
     // but Node accepts one (HMAC pads any key, including the empty key, to the
     // block size). The generic one-shot path handles it and matches Node byte
     // for byte, so keep empty keys off the native fast path.
-    const nativeFactory = keyBuf.byteLength === 0 ? undefined : nativeAlgos[a];
-    if (nativeFactory) {
-        const native = nativeFactory();
-        return new HmacImpl({
-            update(data) { native.update(data); },
-            digest() { return native.digest(); },
-        }, options);
+    if (keyBuf.byteLength > 0) {
+        if (a === 'sha256') return new HmacImpl(crypto.createHmacSha256(keyBuf), options);
+        if (a === 'sha512') return new HmacImpl(crypto.createHmacSha512(keyBuf), options);
     }
 
-    const chunks: Uint8Array[] = [];
-    return new HmacImpl({
-        update(data) { chunks.push(new Uint8Array(data)); },
-        digest() { return oneShotHmac(algorithm, keyBuf, concatBuffers(chunks)); },
-    }, options);
+    return new HmacImpl(bufferedDigest(data => oneShotHmac(algorithm, keyBuf, data)), options);
 }
 
 // hmac - one-shot HMAC

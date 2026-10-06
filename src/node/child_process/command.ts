@@ -15,6 +15,15 @@ import path from '../path';
 
 const { basename, isAbsolute, join, resolve } = path;
 
+export function normalizeSpawnArgs(
+    argsOrOptions?: string[] | SpawnOptions,
+    options?: SpawnOptions,
+): [args: string[], options: SpawnOptions] {
+    return Array.isArray(argsOrOptions)
+        ? [argsOrOptions, options ?? {}]
+        : [[], argsOrOptions || {}];
+}
+
 function isDrivePath(value: string): boolean {
     return /^[A-Za-z]:/.test(value);
 }

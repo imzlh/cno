@@ -13,14 +13,14 @@ import {
     isBatchFileCommand,
     makeBatchFileError,
     normalizeEnv,
+    normalizeSpawnArgs,
     normalizeSpawnFailure,
     resolveCommandForCwd,
 } from './command';
 import type { ChildProcess, SpawnOptions } from './types';
 import {
-    ipcFdFromStdio,
+    nativeStdioOptions,
     toNativeExtraStdio,
-    toNativeStdio,
     validateStdio,
     validateStdioFdRedirects,
     validateTimeout,
@@ -31,15 +31,7 @@ export function spawn(command: string, options: SpawnOptions): ChildProcess;
 export function spawn(command: string, args: string[]): ChildProcess;
 export function spawn(command: string, args: string[], options: SpawnOptions): ChildProcess;
 export function spawn(command: string, argsOrOptions?: string[] | SpawnOptions, options?: SpawnOptions): ChildProcess {
-    let args: string[] = [];
-    let opts: SpawnOptions = {};
-
-    if (Array.isArray(argsOrOptions)) {
-        args = argsOrOptions;
-        opts = options ?? {};
-    } else if (argsOrOptions) {
-        opts = argsOrOptions;
-    }
+    let [args, opts] = normalizeSpawnArgs(argsOrOptions, options);
 
     // Reject unrecognised stdio entries the way Node does, before anything is
     // spawned. Previously every unknown value fell through to 'inherit'.
@@ -75,43 +67,15 @@ export function spawn(command: string, argsOrOptions?: string[] | SpawnOptions, 
         background: opts.windowsHide === true,
     };
 
-    // argv0 and windowsVerbatimArguments are both honoured by the native async
-    // spawn (mod_process.c reads "argv0" and sets
-    // UV_PROCESS_WINDOWS_VERBATIM_ARGUMENTS) but were never forwarded, so both
-    // options silently did nothing: `argv0:'MYARGV0'` left the child reporting the
-    // real exePath, and windowsVerbatimArguments still went through libuv's
-    // quote_cmd_arg (measured against Node v24.18, which passes the command line
-    // through untouched). Set through Reflect because the committed
-    // types/process.d.ts SpawnOptions does not declare either field yet.
-    if (opts.argv0 !== undefined) Reflect.set(spawnOpts, 'argv0', opts.argv0);
+    if (opts.argv0 !== undefined) spawnOpts.argv0 = opts.argv0;
     if (opts.windowsVerbatimArguments === true || shellVerbatim) {
-        Reflect.set(spawnOpts, 'windowsVerbatimArguments', true);
+        spawnOpts.windowsVerbatimArguments = true;
     }
 
-    // Handle stdio
-    let hasIPC = false;
-    let ipcFd = 3;
-    if (opts.stdio) {
-        if (Array.isArray(opts.stdio)) {
-            spawnOpts.stdin = toNativeStdio(opts.stdio[0]);
-            spawnOpts.stdout = toNativeStdio(opts.stdio[1]);
-            spawnOpts.stderr = toNativeStdio(opts.stdio[2]);
-            if (opts.stdio.length > 3) {
-                spawnOpts.stdioExtra = opts.stdio.slice(3).map(toNativeExtraStdio);
-            }
-            // Check for IPC in any stdio position
-            hasIPC = opts.stdio.includes('ipc');
-            ipcFd = ipcFdFromStdio(opts.stdio);
-        } else {
-            spawnOpts.stdin = toNativeStdio(opts.stdio);
-            spawnOpts.stdout = toNativeStdio(opts.stdio);
-            spawnOpts.stderr = toNativeStdio(opts.stdio);
-            hasIPC = false;
-        }
-    } else {
-        spawnOpts.stdin = 'pipe';
-        spawnOpts.stdout = 'pipe';
-        spawnOpts.stderr = 'pipe';
+    Object.assign(spawnOpts, nativeStdioOptions(opts.stdio));
+    const ipcFd = Array.isArray(opts.stdio) ? opts.stdio.indexOf('ipc') : -1;
+    if (Array.isArray(opts.stdio) && opts.stdio.length > 3) {
+        spawnOpts.stdioExtra = opts.stdio.slice(3).map(toNativeExtraStdio);
     }
 
     const child = new ChildProcessImpl();
@@ -134,7 +98,7 @@ export function spawn(command: string, argsOrOptions?: string[] | SpawnOptions, 
     }
 
     // Set IPC option in spawn options
-    if (hasIPC) {
+    if (ipcFd >= 0) {
         const serialization: IPCSerialization = opts.serialization === 'advanced' ? 'advanced' : 'json';
         spawnOpts.ipc = true;
         spawnOpts.ipcFd = ipcFd;
@@ -168,7 +132,7 @@ export function spawn(command: string, argsOrOptions?: string[] | SpawnOptions, 
     }
 
     // Set up IPC channel if created
-    if (hasIPC && process.ipc) {
+    if (ipcFd >= 0 && process.ipc) {
         child._setupIPC(process.ipc, opts.serialization === 'advanced' ? 'advanced' : 'json');
     }
 

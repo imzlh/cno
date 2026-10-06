@@ -7,20 +7,9 @@ const algorithm = import.meta.use('algorithm');
 import { normalizeHashAlgorithm, oneShotHmac, toBuffer } from './helpers';
 import { Buffer } from '../buffer';
 import type { BinaryInput } from './types';
+import { asError, assertCallback, withCode } from './errors';
 
 type RandomFillBuffer = ArrayBuffer | ArrayBufferView;
-
-function asError(error: unknown): Error {
-    return error instanceof Error ? error : new Error(String(error));
-}
-
-// Node attaches a `.code` to every crypto error; bare Error/TypeError is a
-// detectable divergence for callers that branch on err.code.
-function withCode<E extends Error>(error: E, code: string): E & { code: string } {
-    const err = error as E & { code: string };
-    err.code = code;
-    return err;
-}
 
 function outOfRange(message: string): RangeError {
     return withCode(new RangeError(message), 'ERR_OUT_OF_RANGE');
@@ -107,12 +96,6 @@ function parseScryptOptions(options?: ScryptOptions): { N: number; r: number; p:
     }
 
     return { N, r, p, maxmem };
-}
-
-function assertCallback(callback: unknown): asserts callback is (...args: unknown[]) => void {
-    if (typeof callback !== 'function') {
-        throw invalidArgType(`The "callback" argument must be of type function. Received ${callback === undefined ? 'undefined' : typeof callback}`);
-    }
 }
 
 // randomInt / randomFill

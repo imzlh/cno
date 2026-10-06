@@ -66,13 +66,13 @@ type OneShotKind = 'deflate' | 'deflateRaw' | 'gzip' | 'inflate' | 'inflateRaw' 
  */
 function newInfoEngine(kind: OneShotKind, opts?: ZlibOptions & TransformOptions): NodeZlibTransform {
     switch (kind) {
-        case 'deflate': return new Deflate(opts) as unknown as NodeZlibTransform;
-        case 'deflateRaw': return new DeflateRaw(opts) as unknown as NodeZlibTransform;
-        case 'gzip': return new Gzip(opts) as unknown as NodeZlibTransform;
-        case 'inflate': return new Inflate(opts) as unknown as NodeZlibTransform;
-        case 'inflateRaw': return new InflateRaw(opts) as unknown as NodeZlibTransform;
-        case 'gunzip': return new Gunzip(opts) as unknown as NodeZlibTransform;
-        case 'unzip': return new Unzip(opts) as unknown as NodeZlibTransform;
+        case 'deflate': return new Deflate(opts);
+        case 'deflateRaw': return new DeflateRaw(opts);
+        case 'gzip': return new Gzip(opts);
+        case 'inflate': return new Inflate(opts);
+        case 'inflateRaw': return new InflateRaw(opts);
+        case 'gunzip': return new Gunzip(opts);
+        case 'unzip': return new Unzip(opts);
     }
 }
 /**
@@ -167,34 +167,31 @@ function decompressSync(kind: DecompressKind, buffer: ZlibInput, options?: ZlibO
 }
 // Sync compress/decompress
 
-export function deflateSync(buffer: ZlibInput, options: ZlibOptions & { info: true }): ZlibInfoResult;
-export function deflateSync(buffer: ZlibInput, options?: ZlibOptions): Buffer;
-export function deflateSync(buffer: ZlibInput, options?: ZlibOptions): Buffer | ZlibInfoResult {
+function compressSync(kind: 'deflate' | 'deflateRaw' | 'gzip', buffer: ZlibInput, options?: ZlibOptions): Buffer | ZlibInfoResult {
     validateOptions(options);
     const level = options?.level ?? zlib.DEFAULT_COMPRESSION;
     const input = toUint8Array(buffer);
-    const out = checkMaxOutputLength(Buffer.from(zlib.deflate(input, level, orUndef(options?.strategy), orUndef(options?.memLevel))), options);
-    return withInfo('deflate', out, input.byteLength, options);
+    const output = zlib[kind](input, level, orUndef(options?.strategy), orUndef(options?.memLevel));
+    const out = checkMaxOutputLength(Buffer.from(output), options);
+    return withInfo(kind, out, input.byteLength, options);
+}
+
+export function deflateSync(buffer: ZlibInput, options: ZlibOptions & { info: true }): ZlibInfoResult;
+export function deflateSync(buffer: ZlibInput, options?: ZlibOptions): Buffer;
+export function deflateSync(buffer: ZlibInput, options?: ZlibOptions): Buffer | ZlibInfoResult {
+    return compressSync('deflate', buffer, options);
 }
 
 export function deflateRawSync(buffer: ZlibInput, options: ZlibOptions & { info: true }): ZlibInfoResult;
 export function deflateRawSync(buffer: ZlibInput, options?: ZlibOptions): Buffer;
 export function deflateRawSync(buffer: ZlibInput, options?: ZlibOptions): Buffer | ZlibInfoResult {
-    validateOptions(options);
-    const level = options?.level ?? zlib.DEFAULT_COMPRESSION;
-    const input = toUint8Array(buffer);
-    const out = checkMaxOutputLength(Buffer.from(zlib.deflateRaw(input, level, orUndef(options?.strategy), orUndef(options?.memLevel))), options);
-    return withInfo('deflateRaw', out, input.byteLength, options);
+    return compressSync('deflateRaw', buffer, options);
 }
 
 export function gzipSync(buffer: ZlibInput, options: ZlibOptions & { info: true }): ZlibInfoResult;
 export function gzipSync(buffer: ZlibInput, options?: ZlibOptions): Buffer;
 export function gzipSync(buffer: ZlibInput, options?: ZlibOptions): Buffer | ZlibInfoResult {
-    validateOptions(options);
-    const level = options?.level ?? zlib.DEFAULT_COMPRESSION;
-    const input = toUint8Array(buffer);
-    const out = checkMaxOutputLength(Buffer.from(zlib.gzip(input, level, orUndef(options?.strategy), orUndef(options?.memLevel))), options);
-    return withInfo('gzip', out, input.byteLength, options);
+    return compressSync('gzip', buffer, options);
 }
 
 export function inflateSync(buffer: ZlibInput, options: ZlibOptions & { info: true }): ZlibInfoResult;

@@ -155,40 +155,7 @@ export function writeFile(
     callback: NoParamCallback
 ): void;
 export function writeFile(path: PathLike | number, data: string | Uint8Array | ArrayBuffer, options?: unknown, callback?: unknown): void {
-    if (typeof options === 'function') {
-        callback = options;
-        options = {};
-    }
-
-    const target = splitPathOrFd(path);
-    const option = optionBag(options);
-    const mode = modeToNumber(option.mode);
-    const flag = option.flag !== undefined ? parseFlags(option.flag) : 'w';
-    const encoding = typeof options === 'string' ? options as BufferEncoding : option.encoding;
-    const buffer = toUint8Array(data, encoding);
-    assertCallback(callback);
-    if ('fd' in target) {
-        // Node: write from current offset; do not ftruncate the fd.
-        queueMicrotask(() => {
-            try {
-                writeAllSync(target.fd, buffer);
-            } catch (err) {
-                callback(toSyncErrnoException(err, 'writeFile', describeFd(target.fd)));
-                return;
-            }
-            callback(null);
-        });
-        return;
-    }
-
-    asfs.open(target.path, flag, mode).then(
-        handle =>
-            writeAllHandle(handle, buffer).then(
-                () => callback(null),
-                err => callback(toErrnoException(err, 'writeFile', target.path))
-            ).finally(() => handle.close()),
-        err => callback(toErrnoException(err, 'writeFile', target.path))
-    );
+    writeFileCallback('writeFile', path, data, options, callback);
 }
 
 export function appendFile(
@@ -203,6 +170,16 @@ export function appendFile(
     callback: NoParamCallback
 ): void;
 export function appendFile(path: PathLike | number, data: string | Uint8Array | ArrayBuffer, options?: unknown, callback?: unknown): void {
+    writeFileCallback('appendFile', path, data, options, callback);
+}
+
+function writeFileCallback(
+    syscall: 'writeFile' | 'appendFile',
+    path: PathLike | number,
+    data: string | Uint8Array | ArrayBuffer,
+    options: unknown,
+    callback: unknown,
+): void {
     if (typeof options === 'function') {
         callback = options;
         options = {};
@@ -211,16 +188,17 @@ export function appendFile(path: PathLike | number, data: string | Uint8Array | 
     const target = splitPathOrFd(path);
     const option = optionBag(options);
     const mode = modeToNumber(option.mode);
-    const flag = option.flag !== undefined ? parseFlags(option.flag) : 'a';
+    const flag = option.flag !== undefined ? parseFlags(option.flag) : syscall === 'appendFile' ? 'a' : 'w';
     const encoding = typeof options === 'string' ? options as BufferEncoding : option.encoding;
     const buffer = toUint8Array(data, encoding);
     assertCallback(callback);
     if ('fd' in target) {
+        // Node: write from current offset; do not truncate or close the caller's fd.
         queueMicrotask(() => {
             try {
                 writeAllSync(target.fd, buffer);
             } catch (err) {
-                callback(toSyncErrnoException(err, 'appendFile', describeFd(target.fd)));
+                callback(toSyncErrnoException(err, syscall, describeFd(target.fd)));
                 return;
             }
             callback(null);
@@ -232,9 +210,9 @@ export function appendFile(path: PathLike | number, data: string | Uint8Array | 
         handle =>
             writeAllHandle(handle, buffer).then(
                 () => callback(null),
-                err => callback(toErrnoException(err, 'appendFile', target.path))
+                err => callback(toErrnoException(err, syscall, target.path))
             ).finally(() => handle.close()),
-        err => callback(toErrnoException(err, 'appendFile', target.path))
+        err => callback(toErrnoException(err, syscall, target.path))
     );
 }
 

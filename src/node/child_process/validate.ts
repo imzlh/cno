@@ -103,13 +103,23 @@ export function validateStdioFdRedirects(stdio: SpawnOptions['stdio']): void {
     }
 }
 
-export function toNativeStdio(value: StdioEntry, fallback: NativeStdio = 'pipe'): NativeStdio {
-    if (value === null || value === undefined) return fallback;
+function toNativeStdio(value: StdioEntry): NativeStdio {
+    if (value === null || value === undefined) return 'pipe';
     if (typeof value === 'number') return value;
     if (value === 'pipe' || value === 'ignore' || value === 'inherit') return value;
     // Treat Node's Windows-only 'overlapped' mode as a pipe.
     if (value === 'overlapped') return 'pipe';
     return 'inherit';
+}
+
+export function nativeStdioOptions(stdio: SpawnOptions['stdio']) {
+    if (!stdio) stdio = 'pipe';
+    const entries = Array.isArray(stdio) ? stdio : [stdio, stdio, stdio];
+    return {
+        stdin: toNativeStdio(entries[0]),
+        stdout: toNativeStdio(entries[1]),
+        stderr: toNativeStdio(entries[2]),
+    };
 }
 
 export function toNativeExtraStdio(value: StdioEntry): CModuleProcess.StdioOption | null {
@@ -119,10 +129,4 @@ export function toNativeExtraStdio(value: StdioEntry): CModuleProcess.StdioOptio
         return value === 'overlapped' ? 'pipe' : value;
     }
     return 'ignore';
-}
-
-export function ipcFdFromStdio(stdio: StdioEntry[] | undefined): number {
-    if (!stdio) return 3;
-    const index = stdio.indexOf('ipc');
-    return index >= 0 ? index : 3;
 }

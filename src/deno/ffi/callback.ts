@@ -3,7 +3,7 @@
  * UnsafeCallback class for passing JS functions to C code
  */
 
-import { getTypeSize } from './utils';
+import { cachedCif, getTypeSize } from './utils';
 import { UnsafePointer, createPointerObject } from './pointer';
 
 const ffi = import.meta.use('ffi');
@@ -42,7 +42,7 @@ export class UnsafeCallback<
         this.definition = definition;
         this.callback = callback;
         
-        const cif = this.createCif(definition.parameters, definition.result);
+        const cif = cachedCif(UnsafeCallback.cifCache, definition.parameters, definition.result);
         const wrappedCallback = this.wrapCallback(callback, definition);
         
         const closure = new ffi.FfiClosure(cif, wrappedCallback);
@@ -94,63 +94,6 @@ export class UnsafeCallback<
         this.internal.closed = true;
         this.internal.refCount = 0;
         callbackRegistry.delete(this.pointer);
-    }
-
-    private createCif(
-        parameters: readonly Deno.NativeType[],
-        result: Deno.NativeResultType
-    ): CModuleFFI.FfiCif {
-        const cacheKey = `${this.typeCacheKey(result)}(${parameters.map(p => this.typeCacheKey(p)).join(',')})`;
-        let cif = UnsafeCallback.cifCache.get(cacheKey);
-        if (!cif) {
-            const retType = this.toFfiType(result);
-            const argTypes = parameters.map(p => this.toFfiType(p));
-            cif = new ffi.FfiCif(retType, ...argTypes);
-            UnsafeCallback.cifCache.set(cacheKey, cif);
-        }
-        return cif;
-    }
-
-    private typeCacheKey(type: Deno.NativeType | 'void'): string {
-        return typeof type === 'string'
-            ? type
-            : `struct(${type.struct.map(member => this.typeCacheKey(member)).join(',')})`;
-    }
-
-    private toFfiType(type: Deno.NativeType | 'void'): CModuleFFI.FfiType {
-        if (type === 'void') return ffi.type_void;
-        if (typeof type !== 'string') {
-            if ('struct' in type) {
-                const memberTypes = type.struct.map(t => this.toFfiType(t));
-                return new ffi.FfiType(...memberTypes);
-            }
-        }
-        
-        const typeMap: Record<Extract<Deno.NativeType, string>, keyof typeof ffi> = {
-            'u8': 'type_uint8',
-            'i8': 'type_sint8',
-            'u16': 'type_uint16',
-            'i16': 'type_sint16',
-            'u32': 'type_uint32',
-            'i32': 'type_sint32',
-            'u64': 'type_uint64',
-            'i64': 'type_sint64',
-            'f32': 'type_float',
-            'f64': 'type_double',
-            'bool': 'type_uint8',
-            'pointer': 'type_pointer',
-            'buffer': 'type_pointer',
-            'function': 'type_pointer',
-            'usize': 'type_size',
-            'isize': 'type_ssize',
-        };
-        
-        const propName = typeMap[type];
-        if (!propName) {
-            throw new TypeError(`Unknown type: ${type}`);
-        }
-        
-        return ffi[propName] as CModuleFFI.FfiType;
     }
 
     private wrapCallback(

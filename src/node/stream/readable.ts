@@ -6,9 +6,13 @@
  * Readable.from.
  */
 
-import { StringDecoder } from '../string_decoder';
 import { Stream } from './base';
 import {
+    createReadableState,
+    flowReadable,
+    onReadableListenerAdded,
+    resumeReadable,
+    setReadableEncoding,
     addReadableLength,
     collectReadableToArray,
     createInvalidChunkError,
@@ -17,7 +21,6 @@ import {
     defaultHighWaterMark,
     deferTick,
     flattenPrototype,
-    invokeReadableRead,
     isAsyncIterable,
     isConstructCallTarget,
     isIterable,
@@ -28,7 +31,6 @@ import {
     runStreamDestroy,
     scheduleReadableEmit,
     scheduleReadableFlow,
-    subtractReadableLength,
     unpipeDestinations,
     unshiftReadableChunk,
     updateReadableLength,
@@ -54,30 +56,7 @@ function initReadable(self: Readable, options?: ReadableOptions): void {
     self.readableEncoding = options?.encoding ?? null;
     self.readableAborted = false;
     self.readableDidRead = false;
-    self._readableState = {
-        buffer: [],
-        encoding: options?.encoding ?? null,
-        objectMode: self.readableObjectMode,
-        highWaterMark: self.readableHighWaterMark,
-        flowing: null,
-        ended: false,
-        endEmitted: false,
-        reading: false,
-        sync: true,
-        needReadable: false,
-        emittedReadable: false,
-        readableListening: false,
-        resumeScheduled: false,
-        destroyed: false,
-        defaultEncoding: 'utf8',
-        awaitDrain: 0,
-        readingMore: false,
-        decoder: options?.encoding ? new StringDecoder(options.encoding) : null,
-        disturbed: false,
-        emitClose: options?.emitClose ?? true,
-        autoDestroy: options?.autoDestroy ?? true,
-        closed: false,
-    };
+    self._readableState = createReadableState(options, self.readableObjectMode, self.readableHighWaterMark);
 
     if (options?.read) {
         self._read = options.read;
@@ -100,33 +79,13 @@ Readable.prototype = Object.create(Stream.prototype);
 
 Readable.prototype.on = function on(this: Readable, event: string | symbol, fn: StreamListener): Readable {
     Stream.prototype.on.call(this, event, fn);
-    if (event === 'data') this.resume();
-    if (event === 'readable') {
-        const state = this._readableState;
-        state.readableListening = true;
-        // Node parks the stream in paused mode when a 'readable' listener is
-        // attached, overriding an earlier flowing=true, so isPaused() and
-        // readableFlowing report false rather than null/true.
-        state.flowing = false;
-        if (state.buffer.length > 0 || state.ended) scheduleReadableEmit(this);
-        else invokeReadableRead(this);
-    }
+    onReadableListenerAdded(this, event);
     return this;
 };
 
 Readable.prototype.once = function once(this: Readable, event: string | symbol, fn: StreamListener): Readable {
     Stream.prototype.once.call(this, event, fn);
-    if (event === 'data') this.resume();
-    if (event === 'readable') {
-        const state = this._readableState;
-        state.readableListening = true;
-        // Node parks the stream in paused mode when a 'readable' listener is
-        // attached, overriding an earlier flowing=true, so isPaused() and
-        // readableFlowing report false rather than null/true.
-        state.flowing = false;
-        if (state.buffer.length > 0 || state.ended) scheduleReadableEmit(this);
-        else invokeReadableRead(this);
-    }
+    onReadableListenerAdded(this, event);
     return this;
 };
 
@@ -250,27 +209,7 @@ Readable.prototype.read = function read(this: Readable, n?: number): unknown {
 };
 
 Readable.prototype.setEncoding = function setEncoding(this: Readable, enc: BufferEncoding): Readable {
-    this.readableEncoding = enc;
-    const state = this._readableState;
-    state.encoding = enc;
-    state.decoder = new StringDecoder(enc);
-    const decoded: unknown[] = [];
-    for (const chunk of state.buffer) {
-        const bytes = decoderBytes(chunk);
-        if (bytes) {
-            const out = state.decoder.write(bytes);
-            if (out.length > 0) decoded.push(out);
-        } else {
-            decoded.push(chunk);
-        }
-    }
-    if (state.ended) {
-        const trailing = state.decoder.end();
-        if (trailing.length > 0) decoded.push(trailing);
-    }
-    state.buffer = decoded;
-    updateReadableLength(this);
-    return this;
+    return setReadableEncoding(this, enc);
 };
 
 Readable.prototype.pause = function pause(this: Readable): Readable {
@@ -283,42 +222,11 @@ Readable.prototype.pause = function pause(this: Readable): Readable {
 };
 
 Readable.prototype.resume = function resume(this: Readable): Readable {
-    const state = this._readableState;
-    if (state.readableListening && this.listenerCount('data') === 0) {
-        this.emit('resume');
-        invokeReadableRead(this);
-        return this;
-    }
-    if (!state.flowing) {
-        state.flowing = true;
-        this.emit('resume');
-        // Defer like Node's nextTick, else pipe()'s own 'end' listener (added
-        // right after this.on('data',...)) isn't registered yet when it fires.
-        scheduleReadableFlow(this, () => this._readAndResolve());
-    } else {
-        scheduleReadableFlow(this, () => this._readAndResolve());
-    }
-    return this;
+    return resumeReadable(this, () => this._readAndResolve());
 };
 
 Readable.prototype._readAndResolve = function _readAndResolve(this: Readable): void {
-    const state = this._readableState;
-    if (state.destroyed || !state.flowing) return;
-
-    while (!state.destroyed && state.flowing && state.buffer.length > 0) {
-        let chunk = state.buffer.shift();
-        state.disturbed = true;
-        this.readableDidRead = true;
-        subtractReadableLength(this, readableChunkLength(state, chunk));
-        this.emit('data', chunk);
-    }
-
-    if (state.ended) {
-        this._emitReadableEndIfNeeded();
-        return;
-    }
-
-    invokeReadableRead(this);
+    flowReadable(this);
 };
 
 Readable.prototype.isPaused = function isPaused(this: Readable): boolean {
@@ -367,24 +275,14 @@ Readable.prototype.push = function push(this: Readable, chunk: unknown, encoding
     const ending = chunk === null;
     if (ending) {
         state.ended = true;
-        if (state.decoder) {
-            const trailing = state.decoder.end();
-            if (trailing) {
-                chunk = trailing;
-                decodedTrailing = true;
-            } else {
-                // Same EOF notification as the no-decoder branch below. Without
-                // it, setEncoding() + a 'readable' listener never saw 'end':
-                // nothing re-entered read() to drain the buffer and emit it.
-                if (!state.flowing && state.readableListening) this.emit('readable');
-                if (state.flowing) this._emitReadableEndIfNeeded();
-                return false;
-            }
-        } else {
+        const trailing = state.decoder?.end();
+        if (!trailing) {
             if (!state.flowing && state.readableListening) this.emit('readable');
             if (state.flowing) this._emitReadableEndIfNeeded();
             return false;
         }
+        chunk = trailing;
+        decodedTrailing = true;
     }
 
     if (!state.objectMode && chunk === undefined) return true;

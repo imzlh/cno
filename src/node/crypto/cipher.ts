@@ -5,8 +5,8 @@ import { Buffer } from '../buffer';
 import { Transform, type TransformOptions } from '../stream';
 import type { BinaryInput, KeyInput, Cipheriv, Decipheriv, CipherGCM, DecipherGCM, GcmEncryptResult, GcmDecryptResult } from './types';
 import { toBuffer, toExactArrayBuffer, encodeOutput, isGcmAlgorithm } from './helpers';
-import { createInvalidIvError, createInvalidKeyLengthError, createUnknownCipherError, createAuthenticationFailedError, createCipherInvalidStateError, createInvalidGcmAuthTagLengthError, validateGcmAuthTagLength, withCode, asError } from './errors';
-import { type CipherCore, type CipherivWithAutoPadding, type DecipherivWithAutoPadding, GCM_KEY_LENGTHS, toCipherKey, getEcbFns, getCbcFns, validateCbcKeyIv, makeEcbCipher, mapBadDecrypt, makeEcbDecipher, makeCbcCipher, makeCbcDecipher } from './cipher-modes';
+import { createInvalidIvError, createInvalidKeyLengthError, createUnknownCipherError, createAuthenticationFailedError, createCipherInvalidStateError, createInvalidGcmAuthTagLengthError, validateGcmAuthTagLength, asError } from './errors';
+import { type CipherCore, GCM_KEY_LENGTHS, toCipherKey, getEcbFns, getCbcFns, validateCbcKeyIv, makeEcbCipher, makeEcbDecipher, makeCbcCipher, makeCbcDecipher } from './cipher-modes';
 
 class CipherTransform extends Transform implements CipherGCM, DecipherGCM {
     private readonly core: CipherCore;
@@ -74,7 +74,7 @@ class CipherTransform extends Transform implements CipherGCM, DecipherGCM {
     }
 }
 
-export function createCipheriv(algorithm: string, key: KeyInput, iv: BinaryInput | null, options?: TransformOptions & { authTagLength?: number }): Cipheriv {
+function createCipherTransform(decrypt: boolean, algorithm: string, key: KeyInput, iv: BinaryInput | null, options?: TransformOptions & { authTagLength?: number }): Cipheriv | Decipheriv {
     const keyBuf = toCipherKey(key);
     const a = algorithm.toLowerCase();
 
@@ -82,40 +82,28 @@ export function createCipheriv(algorithm: string, key: KeyInput, iv: BinaryInput
         const fns = getEcbFns(a);
         if (iv !== null) throw createInvalidIvError();
         if (keyBuf.byteLength !== fns.keyLength) throw createInvalidKeyLengthError();
-        return new CipherTransform(makeEcbCipher(keyBuf, fns), options);
+        const core = (decrypt ? makeEcbDecipher : makeEcbCipher)(keyBuf, fns);
+        return new CipherTransform(core, options);
     }
     if (isGcmAlgorithm(a)) {
         if (iv === null) throw createInvalidIvError();
-        return createCipherivGCM(a, keyBuf, iv, options);
+        return (decrypt ? createDecipherivGCM : createCipherivGCM)(a, keyBuf, iv, options);
     }
 
     const fns = getCbcFns(a);
     if (iv === null) throw createInvalidIvError();
     const ivBuf = toBuffer(iv);
     validateCbcKeyIv(keyBuf, ivBuf, fns);
-    return new CipherTransform(makeCbcCipher(keyBuf, ivBuf, fns), options);
+    const core = (decrypt ? makeCbcDecipher : makeCbcCipher)(keyBuf, ivBuf, fns);
+    return new CipherTransform(core, options);
+}
+
+export function createCipheriv(algorithm: string, key: KeyInput, iv: BinaryInput | null, options?: TransformOptions & { authTagLength?: number }): Cipheriv {
+    return createCipherTransform(false, algorithm, key, iv, options);
 }
 
 export function createDecipheriv(algorithm: string, key: KeyInput, iv: BinaryInput | null, options?: TransformOptions & { authTagLength?: number }): Decipheriv {
-    const keyBuf = toCipherKey(key);
-    const a = algorithm.toLowerCase();
-
-    if (a.endsWith('-ecb')) {
-        const fns = getEcbFns(a);
-        if (iv !== null) throw createInvalidIvError();
-        if (keyBuf.byteLength !== fns.keyLength) throw createInvalidKeyLengthError();
-        return new CipherTransform(makeEcbDecipher(keyBuf, fns), options);
-    }
-    if (isGcmAlgorithm(a)) {
-        if (iv === null) throw createInvalidIvError();
-        return createDecipherivGCM(a, keyBuf, iv, options);
-    }
-
-    const fns = getCbcFns(a);
-    if (iv === null) throw createInvalidIvError();
-    const ivBuf = toBuffer(iv);
-    validateCbcKeyIv(keyBuf, ivBuf, fns);
-    return new CipherTransform(makeCbcDecipher(keyBuf, ivBuf, fns), options);
+    return createCipherTransform(true, algorithm, key, iv, options);
 }
 
 export function createCipherAes256Cbc(

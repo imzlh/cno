@@ -236,6 +236,10 @@ export function ReadableFrom(iterable: Iterable<unknown> | AsyncIterable<unknown
 }
 
 export function addAbortSignal(signal: AbortSignal, stream: Stream): Stream {
+    if (signal.aborted) {
+        stream.destroy(createAbortError(signal.reason));
+        return stream;
+    }
     const alreadyDestroyed = stream.closed || stream.destroyed;
     const readable = isReadableLike(stream) ? stream : undefined;
     const writable = isWritableLike(stream) ? stream : undefined;
@@ -262,12 +266,8 @@ export function addAbortSignal(signal: AbortSignal, stream: Stream): Stream {
     if (writable) stream.on('finish', onComplete);
     stream.once('close', cleanup);
     stream.once('error', cleanup);
-    if (signal.aborted) {
-        onAbort();
-    } else {
-        signal.addEventListener('abort', onAbort, { once: true });
-    }
+    signal.addEventListener('abort', onAbort, { once: true });
     if (alreadyDestroyed) cleanup();
-    else if (!signal.aborted) onComplete();
+    else onComplete();
     return stream;
 }

@@ -240,54 +240,42 @@ export function isReadableStreamLike(body: unknown): body is ReadableStream<Uint
     return !!body && typeof body === 'object' && typeof Reflect.get(body, 'getReader') === 'function';
 }
 
-/**
- * Body-consumption tracking vs. tee(), and why clone() needs a way around it.
- *
- * Request and Response track consumption by installing a wrapping `getReader` as
- * an OWN property of the body stream (their `trackBodyStream`). That is
- * deliberate and load-bearing: it is how a direct `res.body.tee()`, `pipeTo()`,
- * `for await` or `cancel()` comes to mark the body used, and all of those match
- * node today.
- *
- * The problem is that `ReadableStream.prototype.tee()` acquires its ONE source
- * reader through that same public method (streams.ts:604) and feeds both branches
- * from it. So teeing a tracked stream makes every pull -- including pulls made by
- * a clone -- run the ORIGINAL object's `markUsed`. `clone()` tees, so reading the
- * clone marked the original consumed, and the original then threw "Already read"
- * with its bytes still sitting there intact. node's tee reaches the source through
- * internal slots and is immune (OBSERVED: under cno, tee() calls a patched public
- * getReader; under node it does not).
- *
- * `clone()` must therefore tee through the pre-patch reader and then track each
- * branch against its own Request/Response. `rememberRawGetReader` preserves the
- * raw method so it can, without weakening tracking for any other caller.
- */
 type BodyStream = ReadableStream<Uint8Array>;
 type RawGetReader = (options?: ReadableStreamGetReaderOptions) => unknown;
 
 const rawBodyGetReaders = new WeakMap<BodyStream, RawGetReader>();
 
-/** Called by `trackBodyStream` with the `getReader` it is about to shadow. */
-export function rememberRawGetReader(stream: BodyStream, raw: RawGetReader): void {
-    // Keep the FIRST one seen. One stream object can back two bodies
-    // (`new Response(s)` twice), which nests the patches; the first is the
-    // untracked prototype method, and that is the one tee() must use.
-    if (!rawBodyGetReaders.has(stream)) rawBodyGetReaders.set(stream, raw);
+/** Direct reads, cancellation, tee and piping must disturb the owning body. */
+export function trackBodyStream(stream: BodyStream, markUsed: () => void): BodyStream {
+    const getReader = stream.getReader.bind(stream);
+    // A stream can back multiple bodies; clone() needs the first, untracked reader.
+    if (!rawBodyGetReaders.has(stream)) rawBodyGetReaders.set(stream, getReader);
+    stream.getReader = ((options?: ReadableStreamGetReaderOptions) => {
+        const reader = getReader(options) as ReadableStreamDefaultReader<Uint8Array>;
+        const read = reader.read.bind(reader);
+        const cancel = reader.cancel.bind(reader);
+        reader.read = () => {
+            markUsed();
+            return read();
+        };
+        reader.cancel = (reason?: unknown) => {
+            markUsed();
+            return cancel(reason);
+        };
+        return reader;
+    }) as typeof stream.getReader;
+    const cancel = stream.cancel.bind(stream);
+    stream.cancel = (reason?: unknown) => {
+        markUsed();
+        return cancel(reason);
+    };
+    return stream;
 }
 
 /**
- * `stream.tee()`, but with consumption tracking bypassed for the duration, so
- * neither branch's pulls are attributed to the stream's current owner.
- *
- * The raw method is installed ON THE REAL STREAM rather than on a
- * `Object.create(stream, ...)` facade: cno's ReadableStream holds real private
- * fields (`#reader`, `#controller`), which do not travel down a prototype chain,
- * so a facade throws "private class field '#reader' does not exist" the moment
- * tee() reads `this.locked` (OBSERVED).
- *
- * The swap is restored in a `finally`, from the captured descriptor, so a throwing
- * tee (a locked stream, streams.ts:601) cannot leave the body permanently
- * untracked.
+ * tee() uses the public getReader, so clone() temporarily bypasses tracking and
+ * then tracks each branch separately. Patch the real stream to retain its private
+ * fields; restore its descriptor even when tee() throws on a locked stream.
  */
 export function teeUntracked(stream: BodyStream): [BodyStream, BodyStream] {
     const raw = rawBodyGetReaders.get(stream);
@@ -337,6 +325,15 @@ export function isBodyIterable(body: unknown): body is BodyIterable {
     if (ArrayBuffer.isView(body) || body instanceof ArrayBuffer) return false;
     return typeof Reflect.get(body, Symbol.asyncIterator) === 'function'
         || typeof Reflect.get(body, Symbol.iterator) === 'function';
+}
+
+export function bodyContentType(body: unknown): string | undefined {
+    if (body === null || body === undefined) return undefined;
+    if (body instanceof URLSearchParams) return 'application/x-www-form-urlencoded;charset=UTF-8';
+    if (body instanceof Blob) return body.type || undefined;
+    if (body instanceof FormData || isReadableStreamLike(body) || isBodyIterable(body)) return undefined;
+    if (ArrayBuffer.isView(body) || body instanceof ArrayBuffer) return undefined;
+    return 'text/plain;charset=UTF-8';
 }
 
 export function serializeBody(body: unknown): Uint8Array | null {
@@ -421,7 +418,10 @@ export type PreparedRequestBody =
     | { kind: 'none' }
     | { kind: 'buffer'; body: Uint8Array };
 
-async function readStreamBody(stream: ReadableStream<Uint8Array>, signal?: AbortSignal): Promise<Uint8Array> {
+export async function readStreamBody(
+    stream: ReadableStream<Uint8Array>,
+    { signal, bodyKind }: { signal?: AbortSignal; bodyKind?: 'Request' | 'Response' } = {},
+): Promise<Uint8Array> {
     const reader = stream.getReader();
     const chunks: Uint8Array[] = [];
     try {
@@ -429,14 +429,15 @@ async function readStreamBody(stream: ReadableStream<Uint8Array>, signal?: Abort
             throwIfAborted(signal);
             const { done, value } = await reader.read();
             if (done) break;
+            if (bodyKind && !(value instanceof Uint8Array)) {
+                throw new TypeError(`${bodyKind} body stream chunks must be Uint8Array values`);
+            }
             chunks.push(value);
         }
     } finally {
         reader.releaseLock();
     }
-    if (chunks.length === 0) return new Uint8Array(0);
-    if (chunks.length === 1) return chunks[0]!;
-    return toOwnedBytes(algorithm.bytesConcat(chunks));
+    return mergeChunks(chunks);
 }
 
 export async function prepareRequestBody(request: Request): Promise<PreparedRequestBody> {
@@ -447,7 +448,7 @@ export async function prepareRequestBody(request: Request): Promise<PreparedRequ
     }
     if (!request.body) return { kind: 'none' };
     request[markRequestBodyUsed]();
-    return { kind: 'buffer', body: await readStreamBody(request.body, request.signal) };
+    return { kind: 'buffer', body: await readStreamBody(request.body, { signal: request.signal }) };
 }
 
 // ---------------------------------------------------------------------------
@@ -491,6 +492,16 @@ export async function serializeFormData(fd: FormData, boundary: string = createM
     }
     parts.push(engine.encodeString(`--${boundary}--\r\n`));
     return mergeChunks(parts);
+}
+
+export function parseFormData(body: Uint8Array, contentType: string): FormData {
+    if (contentType.includes('multipart/form-data')) {
+        const boundary = BOUNDARY_RE.exec(contentType)?.[1];
+        if (!boundary) throw new TypeError('Missing multipart boundary');
+        return parseMultipart(body, boundary);
+    }
+    if (contentType.includes('application/x-www-form-urlencoded')) return parseUrlEncoded(body);
+    throw new TypeError(`Unsupported content type for formData(): ${contentType}`);
 }
 
 export function parseUrlEncoded(body: Uint8Array): FormData {

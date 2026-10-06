@@ -396,7 +396,14 @@ type EventTargetListenerEntry = {
     signal?: AbortSignal;
     onAbort?: () => void;
 };
-const eventTargetListeners = new WeakMap<EventTarget, Map<EventName, EventTargetListenerEntry[]>>();
+// The bundle and cached node:events module must share records, including those
+// registered before the cached module replaces the global tracking hooks.
+const eventTargetListenersKey = Symbol.for('cno.events.eventTargetListeners');
+const eventTargetListeners: WeakMap<EventTarget, Map<EventName, EventTargetListenerEntry[]>> =
+    Reflect.get(globalThis, eventTargetListenersKey) ?? new WeakMap();
+if (!Reflect.has(globalThis, eventTargetListenersKey)) {
+    Object.defineProperty(globalThis, eventTargetListenersKey, { value: eventTargetListeners });
+}
 const eventTargetMaxListeners = new WeakMap<EventTarget, number>();
 
 function isEventTarget(value: unknown): value is EventTarget {

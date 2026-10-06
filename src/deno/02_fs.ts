@@ -52,15 +52,6 @@ export function toDenoStat(stat: CModuleAsyncFS.StatResult | CModuleFS.Stats) {
     } satisfies Deno.FileInfo;
 }
 
-async function mkdirRecursive(fullPath: string, mode?: number): Promise<void> {
-    await ensureDirectory(fullPath, mode);
-}
-
-function mkdirRecursiveSync(fullPath: string, mode?: number): void {
-    ensureDirectorySync(fullPath, mode);
-}
-
-
 function removeRecursiveSync(targetPath: string): void {
     const stats = fs.lstat(targetPath);
     if (stats.isDirectory) {
@@ -96,40 +87,21 @@ async function denoWriteAnyFile(path: string | URL, data: string | Uint8Array | 
     throwIfAborted(options?.signal);
     if (options?.create === false) await asfs.stat(pathStr);
     const fhandle = await asfs.open(pathStr, flag, options?.mode);
-    let writtenAll = false;
-    try {
-        if (typeof data === "string")
-            data = engine.encodeString(data);
-
-        if (data instanceof Uint8Array) {
-            let written = 0;
-            while (written < data.length) {
-                throwIfAborted(options?.signal);
-                const n = await fhandle.write(arrayBufferBackedBytes(data.subarray(written)));
-                if (n === null) throw new errors.UnexpectedEof("write");
-                written += n;
-            }
-        } else {
-            const reader = data.getReader();
-            while (true) {
-                throwIfAborted(options?.signal);
-                const { value, done } = await reader.read();
-                if (done) break;
-                const bytes = toWriteBytes(value);
-                let written = 0;
-                while (written < bytes.length) {
-                    throwIfAborted(options?.signal);
-                    const n = await fhandle.write(bytes.subarray(written));
-                    if (n === null) throw new errors.UnexpectedEof("write");
-                    written += n;
-                }
-            }
+    const write = async (chunk: string | Uint8Array): Promise<void> => {
+        const bytes = toWriteBytes(chunk);
+        let written = 0;
+        while (written < bytes.length) {
+            throwIfAborted(options?.signal);
+            written += await fhandle.write(bytes.subarray(written));
         }
-        writtenAll = true;
+    };
+    try {
+        if (typeof data === 'string' || data instanceof Uint8Array) await write(data);
+        else await data.pipeTo(new WritableStream({ write }), { signal: options?.signal });
     } finally {
         await fhandle.close();
     }
-    if (writtenAll && options?.mode !== undefined) await asfs.chmod(pathStr, options.mode);
+    if (options?.mode !== undefined) await asfs.chmod(pathStr, options.mode);
 }
 
 function writeOpenFlag(options?: Deno.WriteFileOptions): 'wx' | 'a' | 'w' {
@@ -151,18 +123,16 @@ function writeFileSyncWithOptions(path: string | URL, data: string | Uint8Array,
     const pathStr = toString(path);
     if (options?.create === false) fs.stat(pathStr);
     const fd = fs.open(pathStr, writeOpenFlag(options), options?.mode);
-    let writtenAll = false;
     try {
         const bytes = toWriteBytes(data);
         let written = 0;
         while (written < bytes.length) {
             written += fs.write(fd, bytes.subarray(written));
         }
-        writtenAll = true;
     } finally {
         fs.close(fd);
     }
-    if (writtenAll && options?.mode !== undefined) fs.chmod(pathStr, options.mode);
+    if (options?.mode !== undefined) fs.chmod(pathStr, options.mode);
 }
 
 function truncateLen(len?: number): number {
@@ -576,7 +546,7 @@ Object.assign(Deno, wrapFSns({
         }
 
         // Recursive mode: create directory tree
-        await mkdirRecursive(pathStr, mode);
+        await ensureDirectory(pathStr, mode);
     },
 
     mkdirSync(path, opt) {
@@ -589,7 +559,7 @@ Object.assign(Deno, wrapFSns({
         }
 
         // Recursive mode: create directory tree
-        mkdirRecursiveSync(pathStr, opt?.mode);
+        ensureDirectorySync(pathStr, opt?.mode);
     },
 
     async makeTempDir(opt) {

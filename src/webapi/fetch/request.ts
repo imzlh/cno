@@ -1,7 +1,7 @@
 import { Headers } from "../headers";
 import { type NetworkCallFrame } from "../../utils/network-hooks";
 import { bytesToArrayBuffer } from "../../utils/bytes";
-import { BOUNDARY_RE, Decoder, ensureFormDataContentType, isBodyIterable, isReadableStreamLike, iterableBodyToStream, markRequestBodyUsed, mergeChunks, parseMultipart, parseUrlEncoded, rememberRawGetReader, serializeBody, serializeFormData, teeUntracked } from "./helpers";
+import { bodyContentType, Decoder, ensureFormDataContentType, isBodyIterable, isReadableStreamLike, iterableBodyToStream, markRequestBodyUsed, parseFormData, readStreamBody, serializeBody, serializeFormData, teeUntracked, trackBodyStream } from "./helpers";
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 type RequestBodySource = BodyInit | ReadableStream<Uint8Array> | Uint8Array | null;
@@ -56,24 +56,8 @@ function requestInitMethod(init: RequestInit | undefined, fallback: string): str
         : fallback;
 }
 
-function bodyContentType(body: unknown): string | undefined {
-    if (body === null || body === undefined) return undefined;
-    if (body instanceof URLSearchParams) return 'application/x-www-form-urlencoded;charset=UTF-8';
-    if (body instanceof Blob) return body.type || undefined;
-    if (body instanceof FormData || isReadableStreamLike(body) || isBodyIterable(body)) return undefined;
-    if (ArrayBuffer.isView(body) || body instanceof ArrayBuffer) return undefined;
-    return 'text/plain;charset=UTF-8';
-}
-
 function followSignal(source: AbortSignal | null | undefined): AbortSignal {
-    const controller = new AbortController();
-    if (!source) return controller.signal;
-    if (source.aborted) {
-        controller.abort(source.reason);
-    } else {
-        source.addEventListener('abort', () => controller.abort(source.reason), { once: true });
-    }
-    return controller.signal;
+    return source ? AbortSignal.any([source]) : new AbortController().signal;
 }
 
 /**
@@ -236,32 +220,7 @@ export class Request implements globalThis.Request {
     }
 
     private trackBodyStream(stream: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
-        const markUsed = () => { this[requestState].bodyUsed = true; };
-        const getReader = stream.getReader.bind(stream);
-        // Keep the unpatched method for clone(): tee() acquires its source reader
-        // through this public property, so without this the clone's pulls would run
-        // THIS request's markUsed. See rememberRawGetReader in ./helpers.
-        rememberRawGetReader(stream, getReader);
-        stream.getReader = ((options?: ReadableStreamGetReaderOptions) => {
-            const reader = getReader(options) as ReadableStreamDefaultReader<Uint8Array>;
-            const read = reader.read.bind(reader);
-            const cancel = reader.cancel.bind(reader);
-            reader.read = () => {
-                markUsed();
-                return read();
-            };
-            reader.cancel = (reason?: unknown) => {
-                markUsed();
-                return cancel(reason);
-            };
-            return reader;
-        }) as typeof stream.getReader;
-        const cancel = stream.cancel.bind(stream);
-        stream.cancel = (reason?: unknown) => {
-            markUsed();
-            return cancel(reason);
-        };
-        return stream;
+        return trackBodyStream(stream, () => { this[requestState].bodyUsed = true; });
     }
 
     clone(): Request {
@@ -269,10 +228,7 @@ export class Request implements globalThis.Request {
         if (state.bodyUsed) throw new TypeError('Already read');
         let clonedBody: RequestBodySource = state.bodyBuffer ?? state.bodySource;
         if (state.body && !state.bodyBuffer) {
-            // teeUntracked, not this.body.tee() -- see the matching comment in
-            // Response.clone(). A serialisable body is buffered at construction and
-            // never reaches here, which is why this defect was invisible for
-            // strings and only showed on a ReadableStream body.
+            // Clone pulls must only mark their own branch as used.
             const [original, clone] = teeUntracked(state.body);
             const trackedOriginal = this.trackBodyStream(original);
             state.body = trackedOriginal;
@@ -316,19 +272,7 @@ export class Request implements globalThis.Request {
         state.bodyUsed = true;
         if (state.bodyBuffer) return state.bodyBuffer;
         if (!state.body) return null;
-        const chunks: Uint8Array[] = [];
-        const reader = state.body.getReader();
-        try {
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                if (!(value instanceof Uint8Array)) throw new TypeError('Request body stream chunks must be Uint8Array values');
-                chunks.push(value);
-            }
-        } finally {
-            reader.releaseLock();
-        }
-        state.bodyBuffer = mergeChunks(chunks);
+        state.bodyBuffer = await readStreamBody(state.body, { bodyKind: 'Request' });
         return state.bodyBuffer;
     }
 
@@ -353,15 +297,7 @@ export class Request implements globalThis.Request {
         }
         const buf = await this.getBodyBuffer();
         if (!buf) throw new TypeError('Request body is empty');
-        const ct = this.headers.get('content-type') ?? '';
-        if (ct.includes('multipart/form-data')) {
-            const m = BOUNDARY_RE.exec(ct);
-            const boundary = m?.[1];
-            if (!boundary) throw new TypeError('Missing multipart boundary');
-            return parseMultipart(buf, boundary);
-        }
-        if (ct.includes('application/x-www-form-urlencoded')) return parseUrlEncoded(buf);
-        throw new TypeError(`Unsupported content type for formData(): ${ct}`);
+        return parseFormData(buf, this.headers.get('content-type') ?? '');
     }
     async text(): Promise<string> { return new Decoder().decode(new Uint8Array(await this.arrayBuffer())); }
     async json<T = unknown>(): Promise<T> { return JSON.parse(await this.text()); }

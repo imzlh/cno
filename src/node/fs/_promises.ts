@@ -4,7 +4,8 @@
 
 
 import { matchesErrnoCode } from '../_internal/errno';
-import { wrapFsPromise, normalizeFsErrnoError as normalizeErrnoError } from './errno-fix';
+import { wrapFsPromise as w, normalizeFsErrnoError as normalizeErrnoError } from './errno-fix';
+import { concatChunks } from '../_internal/buffer';
 import { getTierLimits } from '../_internal/memory';
 import { resolve } from '../path';
 import { copyPath, validateCopyOptions, type CopyOptions } from './copy';
@@ -19,13 +20,6 @@ const { readBufSize: READ_BUF_SIZE } = getTierLimits();
 import { nsfs, nsasfs, nsfswatch } from './syspath';
 const asfs = nsasfs;
 const fs = nsfs;
-
-// Helper: wrap asyncfs calls, auto-convert errno to ErrnoException.
-// `wrapFsPromise` also rewrites the JS API name to the libuv syscall name node
-// reports (readdir -> scandir, utimes -> utime); see fs/syscall-names.ts.
-function w<T>(promise: Promise<T>, syscall: string, path: string, dest?: string): Promise<T> {
-    return wrapFsPromise(promise, syscall, path, dest);
-}
 
 // File read/write
 
@@ -99,7 +93,7 @@ async function drainIterableData(
     data: unknown,
     encoding: BufferEncoding | null | undefined,
     signal: AbortSignal | undefined,
-): Promise<Uint8Array | null> {
+): Promise<Uint8Array<ArrayBuffer> | null> {
     if (typeof data === 'string' || data === null || data === undefined) return null;
     if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) return null;
     if (typeof data !== 'object' && typeof data !== 'function') return null;
@@ -108,20 +102,11 @@ async function drainIterableData(
     if (!isAsync && typeof holder[Symbol.iterator] !== 'function') return null;
 
     const parts: Uint8Array[] = [];
-    let total = 0;
     for await (const chunk of data as AsyncIterable<unknown>) {
         if (signal?.aborted) throw makeAbortError(signal);
-        const bytes = toUint8Array(chunk as string | Uint8Array | ArrayBuffer, encoding);
-        parts.push(bytes);
-        total += bytes.byteLength;
+        parts.push(toUint8Array(chunk as string | Uint8Array | ArrayBuffer, encoding));
     }
-    const outBuf = new Uint8Array(total);
-    let at = 0;
-    for (const part of parts) {
-        outBuf.set(part, at);
-        at += part.byteLength;
-    }
-    return outBuf;
+    return concatChunks(parts);
 }
 
 export async function writeFile(path: PathLike | number, data: string | Uint8Array | ArrayBuffer, options?: { encoding?: BufferEncoding | null; mode?: Mode; flag?: string | number; signal?: AbortSignal } | BufferEncoding | number): Promise<void> {
@@ -147,7 +132,7 @@ export async function writeFile(path: PathLike | number, data: string | Uint8Arr
     const handle = await w(asfs.open(target.path, flag, mode), 'writeFile', target.path);
     try {
         if (signal?.aborted) throw makeAbortError(signal);
-        await w(writeAllHandle(handle, buffer as Uint8Array<ArrayBuffer>), 'writeFile', target.path);
+        await w(writeAllHandle(handle, buffer), 'writeFile', target.path);
     } finally {
         await handle.close();
     }
@@ -414,79 +399,70 @@ export async function statfs(path: PathLike, options?: { bigint?: boolean }): Pr
  * `readableWebStream` leaves the handle open and refuses a second call.
  */
 function attachHandleStreams(handle: ReturnType<typeof createFileHandle>) {
-    const h = handle as ReturnType<typeof createFileHandle> & {
-        createReadStream?: unknown;
-        createWriteStream?: unknown;
-        readableWebStream?: unknown;
-        readLines?: unknown;
-    };
     let webStreamTaken = false;
-
-    h.createReadStream = function createReadStream(options?: Record<string, unknown>) {
-        // Passing the handle itself (not its bare fd) makes the stream close the
-        // handle on teardown, matching measured Node v24.18.0: after the
-        // stream's 'close', a later handle.stat() reports EBADF.
-        return new ReadStream(null as unknown as PathLike, {
-            highWaterMark: 64 * 1024,
-            ...(options ?? {}),
-            fd: handle,
-        } as ConstructorParameters<typeof ReadStream>[1]);
-    };
-
-    h.createWriteStream = function createWriteStream(options?: Record<string, unknown>) {
-        return new WriteStream(null as unknown as PathLike, {
-            ...(options ?? {}),
-            fd: handle,
-        } as ConstructorParameters<typeof WriteStream>[1]);
-    };
-
-    h.readableWebStream = function readableWebStream(): ReadableStream<Uint8Array> {
-        if (webStreamTaken) {
-            const e = new Error('The FileHandle is already being read');
-            Reflect.set(e, 'code', 'ERR_INVALID_STATE');
-            throw e;
-        }
-        webStreamTaken = true;
-        return new ReadableStream<Uint8Array>({
-            async pull(controller) {
-                const buffer = new Uint8Array(64 * 1024);
-                const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
-                if (!bytesRead) {
-                    controller.close();
-                    return;
-                }
-                controller.enqueue(buffer.subarray(0, bytesRead));
-            },
-        });
-    };
-
-    h.readLines = function readLines(options?: Record<string, unknown>) {
-        const stream = (h.createReadStream as (o?: Record<string, unknown>) => ReadStream)(options);
-        const iterator = async function* lines(): AsyncGenerator<string> {
-            let pending = '';
-            for await (const chunk of stream as unknown as AsyncIterable<Uint8Array | string>) {
-                pending += typeof chunk === 'string' ? chunk : decodeBuffer(toUint8Array(chunk), 'utf8');
-                let index: number;
-                // Node's readline strips a trailing \r so CRLF files yield clean lines.
-                while ((index = pending.indexOf('\n')) !== -1) {
-                    const line = pending.slice(0, index);
-                    pending = pending.slice(index + 1);
-                    yield line.endsWith('\r') ? line.slice(0, -1) : line;
-                }
+    const h = Object.assign(handle, {
+        createReadStream(options?: Record<string, unknown>) {
+            // Passing the handle makes stream teardown close its owner too.
+            return new ReadStream(null as unknown as PathLike, {
+                highWaterMark: 64 * 1024,
+                ...options,
+                fd: handle,
+            });
+        },
+        createWriteStream(options?: Record<string, unknown>) {
+            return new WriteStream(null as unknown as PathLike, {
+                ...options,
+                fd: handle,
+            });
+        },
+        readableWebStream(): ReadableStream<Uint8Array> {
+            if (webStreamTaken) {
+                const e = new Error('The FileHandle is already being read');
+                Reflect.set(e, 'code', 'ERR_INVALID_STATE');
+                throw e;
             }
-            if (pending.length > 0) yield pending.endsWith('\r') ? pending.slice(0, -1) : pending;
-        };
-        const it = iterator();
-        return {
-            [Symbol.asyncIterator]() { return it; },
-            next: () => it.next(),
-            return: (value?: unknown) => it.return(value as never),
-            throw: (err?: unknown) => it.throw(err),
-            close: () => { stream.destroy(); },
-        };
-    };
+            webStreamTaken = true;
+            return new ReadableStream<Uint8Array>({
+                async pull(controller) {
+                    const buffer = new Uint8Array(64 * 1024);
+                    const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+                    if (!bytesRead) {
+                        controller.close();
+                        return;
+                    }
+                    controller.enqueue(buffer.subarray(0, bytesRead));
+                },
+            });
+        },
+    });
 
-    return h;
+    return Object.assign(h, {
+        readLines(options?: Record<string, unknown>) {
+            const stream = h.createReadStream(options);
+            const iterator = async function* lines(): AsyncGenerator<string> {
+                let pending = '';
+                for await (const chunk of stream as unknown as AsyncIterable<Uint8Array | string>) {
+                    pending += typeof chunk === 'string' ? chunk : decodeBuffer(toUint8Array(chunk), 'utf8');
+                    let index: number;
+                    // Node's readline strips a trailing \r so CRLF files yield clean lines.
+                    while ((index = pending.indexOf('\n')) !== -1) {
+                        const line = pending.slice(0, index);
+                        pending = pending.slice(index + 1);
+                        yield line.endsWith('\r') ? line.slice(0, -1) : line;
+                    }
+                }
+                if (pending.length > 0) yield pending.endsWith('\r') ? pending.slice(0, -1) : pending;
+            };
+            const it = iterator();
+            return {
+                [Symbol.asyncIterator]() { return it; },
+                next: () => it.next(),
+                return: (value?: unknown) => it.return(value as never),
+                throw: (err?: unknown) => it.throw(err),
+                close: () => { stream.destroy(); },
+            };
+        },
+    });
 }
 
 export async function open(path: PathLike, flags?: string | number, mode?: Mode) {

@@ -192,6 +192,8 @@ class ReadableStreamController<R = unknown> implements globalThis.ReadableStream
         this.#backpressureBuffer = [];
         this.#backpressureBufferSize = 0;
         this.#onEnqueue = null;
+        this.#onDequeue = null;
+        this.#source = null;
 
         // Reject all pending reads
         for (const read of this.#pendingReads) {
@@ -317,6 +319,7 @@ class ReadableStreamController<R = unknown> implements globalThis.ReadableStream
         this.#backpressureBuffer = [];
         this.#backpressureBufferSize = 0;
         this.#onEnqueue = null;
+        this.#onDequeue = null;
         this.#storedError = undefined;
 
         // Save source for cancel callback, then release it.
@@ -347,6 +350,7 @@ class ReadableStreamController<R = unknown> implements globalThis.ReadableStream
         this.#backpressureBuffer = [];
         this.#backpressureBufferSize = 0;
         this.#onEnqueue = null;
+        this.#onDequeue = null;
         this.#storedError = undefined;
 
         // Break the closure chain: the source captures the producer's entire

@@ -46,6 +46,7 @@ function parseProtocolMessage(raw: string): ProtocolMessage | null {
 export class InspectorProtocolClient extends EventEmitter {
 	private ws: WebSocket | null = null
 	private connectPromise: Promise<void> | null = null
+	private generation = 0
 	private mode: 'bridge' | 'local' = 'bridge'
 	private nextId = 1
 	private pending = new Map<number, PendingRequest>()
@@ -56,17 +57,21 @@ export class InspectorProtocolClient extends EventEmitter {
 	}
 
 	disconnect(): void {
-		try {
-			this.ws?.close()
-		} catch {}
+		this.generation++
+		const ws = this.ws
 		this.ws = null
+		try {
+			ws?.close()
+		} catch {}
 		this.mode = 'bridge'
 		this.connectPromise = null
 		this.failPending(new Error('Inspector session disconnected'))
 	}
 
 	post(method: string, params?: Record<string, unknown>): Promise<ProtocolResponse> {
+		const generation = this.generation
 		return this.ensureConnected(false).then(() => {
+			if (generation !== this.generation) throw new Error('Inspector session disconnected')
 			if (this.mode === 'local') return this.postLocal(method, params)
 			return new Promise<ProtocolResponse>((resolve, reject) => {
 			const ws = this.ws
@@ -97,10 +102,13 @@ export class InspectorProtocolClient extends EventEmitter {
 			return Promise.resolve()
 		}
 
-		this.connectPromise = (async () => {
+		const generation = this.generation
+		const connecting = (async () => {
 			const wsUrl = await bridge.open({ wait: waitForDebugger })
+			if (generation !== this.generation) throw new Error('Inspector session disconnected')
 			await new Promise<void>((resolve, reject) => {
 				const ws = new WebSocket(wsUrl)
+				this.ws = ws
 				let settled = false
 				const finish = (fn: () => void): void => {
 					if (settled) return
@@ -108,18 +116,25 @@ export class InspectorProtocolClient extends EventEmitter {
 					fn()
 				}
 				ws.onopen = () => finish(() => {
-					this.ws = ws
+					if (generation !== this.generation || this.ws !== ws) {
+						ws.close()
+						reject(new Error('Inspector session disconnected'))
+						return
+					}
 					this.installSocket(ws)
 					resolve()
 				})
 				ws.onerror = () => finish(() => reject(new Error('Failed to connect to inspector WebSocket')))
 				ws.onclose = () => finish(() => reject(new Error('Inspector WebSocket closed before opening')))
 			})
-		})().finally(() => {
-			if (!this.ws || this.ws.readyState !== WebSocket.OPEN) this.connectPromise = null
+		})().catch((error) => {
+			if (generation === this.generation) throw error
+		}).finally(() => {
+			if (this.connectPromise === connecting) this.connectPromise = null
 		})
 
-		return this.connectPromise
+		this.connectPromise = connecting
+		return connecting
 	}
 
 	private postLocal(method: string, params?: Record<string, unknown>): Promise<ProtocolResponse> {
@@ -150,6 +165,7 @@ export class InspectorProtocolClient extends EventEmitter {
 
 	private installSocket(ws: WebSocket): void {
 		ws.onmessage = (event): void => {
+			if (this.ws !== ws) return
 			let raw = event.data
 			if (raw instanceof ArrayBuffer) raw = engine.decodeString(new Uint8Array(raw))
 			if (typeof raw !== 'string') return
@@ -179,13 +195,14 @@ export class InspectorProtocolClient extends EventEmitter {
 		}
 
 		ws.onclose = () => {
+			if (this.ws !== ws) return
 			this.ws = null
 			this.connectPromise = null
 			this.failPending(new Error('Inspector session disconnected'))
 		}
 
 		ws.onerror = () => {
-			this.emit('error', new Error('Inspector WebSocket error'))
+			if (this.ws === ws) this.emit('error', new Error('Inspector WebSocket error'))
 		}
 	}
 

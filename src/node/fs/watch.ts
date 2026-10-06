@@ -3,9 +3,8 @@ import buffer from '../buffer';
 import { toErrnoException } from '../_internal/errno';
 import { pathToString, toNodeStat, type PathLike } from './utils';
 
-import { nsfs, nsasfs, nsfswatch } from './syspath';
+import { nsasfs, nsfswatch } from './syspath';
 const fswatch = nsfswatch;
-const fs = nsfs;
 const asfs = nsasfs;
 const engine = import.meta.use('engine');
 const { Buffer } = buffer;
@@ -35,7 +34,6 @@ interface WatchFileOptions {
 
 interface WatchFileEntry {
     listeners: Set<WatchFileListener>;
-    prev: import('fs').Stats;
     timer: ReturnType<typeof setInterval>;
 }
 
@@ -216,16 +214,14 @@ export function watchFile(
     const interval = Math.max(1, options.interval ?? 5007);
     const timer = setInterval(() => {
         const curr = readStatOrZero(pathStr, bigint);
-        if (!statsEqual(curr, prev)) {
-            const old = prev;
-            prev = curr;
+        const old = prev;
+        prev = curr;
+        if (!statsEqual(curr, old)) {
             for (const fn of listeners) fn(curr, old);
-        } else {
-            prev = curr;
         }
     }, interval);
 
-    watchFileRegistry.set(pathStr, { listeners, prev, timer });
+    watchFileRegistry.set(pathStr, { listeners, timer });
 }
 
 export function unwatchFile(filename: PathLike, listener?: WatchFileListener): void {

@@ -390,10 +390,6 @@ export function inherits(constructor: InheritableFunction, superConstructor: Inh
         throw invalidArgType('ctor', 'function', constructor);
     }
 
-    if (superConstructor === undefined || superConstructor === null) {
-        throw invalidArgType('superCtor', 'function', superConstructor);
-    }
-
     if (typeof superConstructor !== 'function') {
         throw invalidArgType('superCtor', 'function', superConstructor);
     }
@@ -454,9 +450,7 @@ export function deprecate<T extends AnyCallable>(fn: T, message: string, code?: 
     // object that is not `instanceof` the original and has none of its methods.
     const proto = (fn as unknown as { prototype?: unknown }).prototype;
     if (proto !== undefined && proto !== null) {
-        try {
-            (deprecated as unknown as { prototype: unknown }).prototype = proto;
-        } catch { /* a frozen wrapper cannot carry the prototype; keep the wrapper usable */ }
+        (deprecated as unknown as { prototype: unknown }).prototype = proto;
     }
 
     Object.defineProperty(deprecated, 'name', { value: 'deprecated' });
@@ -691,54 +685,32 @@ export function parseArgs(options: {
             throw parseArgsError('ERR_PARSE_ARGS_UNKNOWN_OPTION', `Unknown option '${rawName}'`);
         }
 
-        if (def?.type === 'string') {
-            if (inlineValue !== undefined) {
-                setValue(name, inlineValue);
-                if (options.tokens) tokens.push({ kind: 'option', name, rawName, index, value: inlineValue, inlineValue: true });
-                return;
-            }
+        let value: string | boolean = inlineValue ?? true;
+        let consumed = 0;
+        if (def?.type === 'string' && inlineValue === undefined) {
             const next = args[index + 1];
-            if (next === undefined || (strict && next.startsWith('-'))) {
-                if (!strict) {
-                    setValue(name, true);
-                    if (options.tokens) tokens.push({ kind: 'option', name, rawName, index });
-                    return;
-                }
-                throw parseArgsError('ERR_PARSE_ARGS_INVALID_OPTION_VALUE', `Option '${rawName} <value>' argument missing`);
-            }
-            if (!strict && next.startsWith('-')) {
-                setValue(name, true);
-                if (options.tokens) tokens.push({ kind: 'option', name, rawName, index });
-                return;
-            }
-            setValue(name, next);
-            if (options.tokens) tokens.push({ kind: 'option', name, rawName, index, value: next, inlineValue: false });
-            return 1;
-        }
-
-        if (def?.type === 'boolean') {
-            if (inlineValue !== undefined) {
+            if (next === undefined || next.startsWith('-')) {
                 if (strict) {
-                    throw parseArgsError('ERR_PARSE_ARGS_INVALID_OPTION_VALUE', `Option '${rawName}' does not take an argument`);
+                    throw parseArgsError('ERR_PARSE_ARGS_INVALID_OPTION_VALUE', `Option '${rawName} <value>' argument missing`);
                 }
-                setValue(name, inlineValue);
-                if (options.tokens) tokens.push({ kind: 'option', name, rawName, index, value: inlineValue, inlineValue: true });
-                return;
+            } else {
+                value = next;
+                consumed = 1;
             }
-            setValue(name, true);
-            if (options.tokens) tokens.push({ kind: 'option', name, rawName, index });
-            return;
+        } else if (def?.type === 'boolean' && inlineValue !== undefined && strict) {
+            throw parseArgsError('ERR_PARSE_ARGS_INVALID_OPTION_VALUE', `Option '${rawName}' does not take an argument`);
         }
 
-        setValue(name, inlineValue ?? true);
+        setValue(name, value);
         if (options.tokens) {
             const token: ParseArgsToken = { kind: 'option', name, rawName, index };
-            if (inlineValue !== undefined) {
-                token.value = inlineValue;
-                token.inlineValue = true;
+            if (typeof value === 'string') {
+                token.value = value;
+                token.inlineValue = consumed === 0;
             }
             tokens.push(token);
         }
+        return consumed;
     };
 
     for (let i = 0; i < args.length; i++) {
@@ -783,13 +755,12 @@ export function parseArgs(options: {
                 }
                 // Short group: expand `-abc` to `-a -b -c`, stopping at a
                 // string-typed option, whose remainder becomes its value.
-                let stop = false;
-                for (let k = 1; k < arg.length && !stop; k++) {
+                for (let k = 1; k < arg.length; k++) {
                     const ch = arg.charAt(k);
                     const chName = shorts.get(ch) ?? ch;
                     if (defs[chName]?.type === 'string' && k !== arg.length - 1) {
                         readOption(chName, `-${ch}`, i, arg.slice(k + 1));
-                        stop = true;
+                        break;
                     } else {
                         readOption(chName, `-${ch}`, i, undefined);
                     }
@@ -867,7 +838,6 @@ function unquoteMimeParamValue(value: string): string | undefined {
     let escaped = false;
     for (let i = 1; i < trimmed.length - 1; i++) {
         const ch = trimmed[i];
-        if (ch === undefined) continue;
         if (escaped) {
             out += ch;
             escaped = false;

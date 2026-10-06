@@ -5,6 +5,48 @@
 
 export const brand = Symbol('brand');
 
+const ffi = import.meta.use('ffi');
+const ffiTypeNames = {
+    u8: 'type_uint8', i8: 'type_sint8',
+    u16: 'type_uint16', i16: 'type_sint16',
+    u32: 'type_uint32', i32: 'type_sint32',
+    u64: 'type_uint64', i64: 'type_sint64',
+    f32: 'type_float', f64: 'type_double',
+    bool: 'type_uint8', pointer: 'type_pointer',
+    buffer: 'type_pointer', function: 'type_pointer',
+    usize: 'type_size', isize: 'type_ssize',
+} as const satisfies Record<Extract<Deno.NativeType, string>, keyof typeof ffi>;
+
+function toFfiType(type: Deno.NativeResultType): CModuleFFI.FfiType {
+    if (type === 'void') return ffi.type_void;
+    if (typeof type !== 'string' && 'struct' in type) {
+        return new ffi.FfiType(...type.struct.map(toFfiType));
+    }
+    const name = ffiTypeNames[type];
+    if (!name) throw new TypeError(`Unknown type: ${type}`);
+    return ffi[name];
+}
+
+function typeCacheKey(type: Deno.NativeResultType): string {
+    return typeof type === 'string'
+        ? type
+        : `struct(${type.struct.map(typeCacheKey).join(',')})`;
+}
+
+export function cachedCif(
+    cache: Map<string, CModuleFFI.FfiCif>,
+    parameters: readonly Deno.NativeType[],
+    result: Deno.NativeResultType,
+): CModuleFFI.FfiCif {
+    const key = `${typeCacheKey(result)}(${parameters.map(typeCacheKey).join(',')})`;
+    let cif = cache.get(key);
+    if (!cif) {
+        cif = new ffi.FfiCif(toFfiType(result), ...parameters.map(toFfiType));
+        cache.set(key, cif);
+    }
+    return cif;
+}
+
 const TYPE_SIZES: Record<string, number> = {
     'u8': 1, 'i8': 1,
     'u16': 2, 'i16': 2,

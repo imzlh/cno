@@ -1,11 +1,8 @@
 /**
  * Node.js zlib module — Transform stream classes and their shared machinery.
  *
- * Owns the single `zlibStreamStates` WeakMap: `configureZlibStream`,
- * `streamState`, `checkStreamOutput`, `inflateChunk`, `_doTransform`,
- * `_doFlush` and the `bytesWritten` getter all read the same table, so it must
- * not be duplicated. `sync.ts` reaches it through the export below to stamp
- * `bytesWritten` on an `{ info: true }` engine.
+ * Owns the stream state shared by all codecs and by `sync.ts`, which stamps
+ * `bytesWritten` on the engine returned for `{ info: true }`.
  *
  * The handle types and the prototype helpers (`flattenPrototype`,
  * `receiverOrCreate`, `toTransformOptions`, `_create`) are also used by
@@ -107,8 +104,6 @@ type ZlibStreamState = {
     compress: boolean;
     flush: number;
     finishFlush: number;
-    maxOutputLength?: number;
-    outputLength: number;
     // Node counts every byte handed to the stream (uncompressed for compressors,
     // compressed for decompressors) and exposes it as `bytesWritten`.
     bytesWritten: number;
@@ -136,12 +131,6 @@ function configureZlibStream(stream: object, compress: boolean, options?: ZlibOp
         compress,
         flush: options?.flush ?? NO_FLUSH,
         finishFlush: options?.finishFlush ?? FINISH,
-        // `maxOutputLength` is deliberately NOT carried onto streams: Node applies it
-        // only to the convenience methods (zlibBuffer/zlibBufferSync), and a stream
-        // created with it decompresses without limit. Verified against v24.18.0 —
-        // createGunzip({maxOutputLength:1}) emits the full 100000-byte payload.
-        maxOutputLength: undefined,
-        outputLength: 0,
         bytesWritten: 0,
         multiMember: kind === 'gunzip',
         autoDetect: kind === 'unzip',
@@ -154,15 +143,6 @@ function streamState(stream: object): ZlibStreamState {
     return state;
 }
 
-function checkStreamOutput(stream: object, output: Buffer): Buffer {
-    const state = streamState(stream);
-    state.outputLength += output.byteLength;
-    if (state.maxOutputLength !== undefined && state.outputLength > state.maxOutputLength) {
-        throw new RangeError(`Cannot create a Buffer larger than ${state.maxOutputLength} bytes`);
-    }
-    return output;
-}
-
 function concatBytes(a: Uint8Array, b: Uint8Array): Uint8Array {
     const out = new Uint8Array(a.length + b.length);
     out.set(a, 0);
@@ -173,9 +153,9 @@ function concatBytes(a: Uint8Array, b: Uint8Array): Uint8Array {
  * Feed one chunk into a decompression handle, walking gzip member boundaries and
  * buffering any bytes that need more input before they can be decoded.
  */
-function inflateChunk(stream: NodeZlibTransform, state: ZlibStreamState, handle: ZlibInflateHandle, chunk: Uint8Array): Buffer {
+function inflateChunk(state: ZlibStreamState, handle: ZlibInflateHandle, chunk: Uint8Array): Buffer {
     // A NUL after a finished member closed the stream; everything after is discarded.
-    if (state.trailingDone) return checkStreamOutput(stream, Buffer.alloc(0));
+    if (state.trailingDone) return Buffer.alloc(0);
     const data = state.pending && state.pending.length > 0 ? concatBytes(state.pending, chunk) : chunk;
     state.pending = undefined;
     if (state.autoDetect && data.length >= 2) {
@@ -222,29 +202,22 @@ function inflateChunk(stream: NodeZlibTransform, state: ZlibStreamState, handle:
         }
         if (offset >= data.length) break;
     }
-    return checkStreamOutput(stream, Buffer.concat(outputs));
+    return Buffer.concat(outputs);
 }
 
-function _doTransform(stream: NodeZlibTransform, chunk: ZlibInput, cb: TransformCallback) {
+function _transform(this: NodeZlibTransform, chunk: ZlibInput, _encoding: BufferEncoding, cb: TransformCallback): void {
     try {
-        const state = streamState(stream);
-        const handle = stream._handle;
+        const state = streamState(this);
+        const handle = this._handle;
         const input = toUint8Array(chunk);
         // Node counts input bytes before processing, so a chunk that errors is
         // still reflected in `bytesWritten`.
         state.bytesWritten += input.byteLength;
         const output = isDeflateHandle(handle)
-            ? checkStreamOutput(stream, Buffer.from(handle.deflate(input, state.flush)))
-            : inflateChunk(stream, state, handle, input);
+            ? Buffer.from(handle.deflate(input, state.flush))
+            : inflateChunk(state, handle, input);
         cb(null, output.length > 0 ? output : undefined);
     } catch (err) { cb(asError(err)); }
-}
-
-function installHandleCompat(handle: ZlibDeflateHandle): ZlibDeflateHandle;
-function installHandleCompat(handle: ZlibInflateHandle): ZlibInflateHandle;
-function installHandleCompat(handle: ZlibHandle): ZlibHandle {
-    handle.close ??= () => {};
-    return handle;
 }
 
 function processChunk(handle: ZlibHandle, chunk: ZlibInput, flush?: number): Buffer {
@@ -260,9 +233,9 @@ function processChunk(handle: ZlibHandle, chunk: ZlibInput, flush?: number): Buf
         throw err;
     }
 }
-function _doFlush(stream: NodeZlibTransform, cb: TransformCallback) {
+function _flush(this: NodeZlibTransform, cb: TransformCallback): void {
     try {
-        const state = streamState(stream);
+        const state = streamState(this);
         if (state.error) throw state.error;
         // A NUL after a finished member already completed the stream.
         if (state.trailingDone) { cb(null); return; }
@@ -274,16 +247,16 @@ function _doFlush(stream: NodeZlibTransform, cb: TransformCallback) {
             if (pending.every((byte) => byte === 0)) { cb(null); return; }
             if (state.finishFlush === FINISH) throw truncatedError();
         }
-        const handle = stream._handle;
+        const handle = this._handle;
         const raw = state.finishFlush === FINISH
             ? handle.finish()
             : isDeflateHandle(handle)
                 ? handle.deflate(new Uint8Array(), state.finishFlush)
                 : handle.inflate(new Uint8Array(), state.finishFlush);
-        const output = checkStreamOutput(stream, Buffer.from(raw));
+        const output = Buffer.from(raw);
         cb(null, output.length > 0 ? output : undefined);
     } catch (err) {
-        const state = zlibStreamStates.get(stream);
+        const state = zlibStreamStates.get(this);
         if (state?.error) {
             cb(state.error);
             return;
@@ -320,7 +293,7 @@ function flushStream(this: NodeZlibTransform, kindOrCallback?: number | (() => v
     try {
         // Called for its side effect: throws if the stream was never initialized.
         streamState(this);
-        const output = checkStreamOutput(this, processChunk(this._handle, Buffer.alloc(0), kind));
+        const output = processChunk(this._handle, Buffer.alloc(0), kind);
         if (output.length > 0) this.push(output);
         if (cb) queueMicrotask(cb);
     } catch (error) {
@@ -331,8 +304,7 @@ function flushStream(this: NodeZlibTransform, kindOrCallback?: number | (() => v
 
 function resetStream(this: NodeZlibTransform): void {
     this._handle.reset?.();
-    const state = streamState(this);
-    state.outputLength = 0;
+    streamState(this);
 }
 
 function paramsStream(this: NodeZlibTransform, level: number, strategy: number, callback?: () => void): NodeZlibTransform {
@@ -342,7 +314,7 @@ function paramsStream(this: NodeZlibTransform, level: number, strategy: number, 
     // Drain pending output before changing params, as Node does. The native
     // deflateParams() would otherwise flush into the previous call's output buffer.
     streamState(this);
-    const drained = checkStreamOutput(this, processChunk(handle, Buffer.alloc(0), SYNC_FLUSH));
+    const drained = processChunk(handle, Buffer.alloc(0), SYNC_FLUSH);
     if (drained.length > 0) this.push(drained);
     handle.params(level, strategy);
     if (callback) queueMicrotask(callback);
@@ -355,13 +327,49 @@ function closeStream(this: NodeZlibTransform, callback?: () => void): void {
     this.destroy();
 }
 
-function installZlibMethods(prototype: NodeZlibTransform): void {
+function _processChunk(this: NodeZlibTransform, chunk: ZlibInput, flush?: number): Buffer {
+    const output = processChunk(this._handle, chunk, flush);
+    streamState(this);
+    return output;
+}
+
+interface ZlibConstructor<T extends NodeZlibTransform> {
+    new (options?: ZlibOptions & TransformOptions): T;
+    (options?: ZlibOptions & TransformOptions): T;
+    prototype: T;
+}
+
+function defineZlibConstructor<T extends NodeZlibTransform>(
+    name: string,
+    createHandle: (options?: ZlibOptions) => T['_handle'],
+    kind?: DecompressKind,
+): ZlibConstructor<T> {
+    const Constructor = function(this: T | undefined, options?: ZlibOptions & TransformOptions): T {
+        const target = receiverOrCreate(this, Constructor.prototype);
+        validateOptions(options);
+        Transform.call(target, toTransformOptions(options));
+        target._handle = createHandle(options);
+        // Native handles use finalizers; Node consumers still expect _handle.close().
+        target._handle.close ??= () => {};
+        configureZlibStream(target, isDeflateHandle(target._handle), options, kind);
+        return target;
+    } as ZlibConstructor<T>;
+    Object.defineProperty(Constructor, 'name', { value: name, configurable: true });
+    Object.setPrototypeOf(Constructor, Transform);
+    Constructor.prototype = Object.create(Transform.prototype);
+    const prototype: NodeZlibTransform = Constructor.prototype;
+    Object.assign(prototype, { _transform, _flush, _processChunk });
+    Object.defineProperty(prototype, 'constructor', {
+        value: Constructor,
+        writable: true,
+        configurable: true,
+    });
+    flattenPrototype(prototype);
     prototype.flush = flushStream;
     prototype.reset = resetStream;
     prototype.params = paramsStream;
     prototype.close = closeStream;
-    // Node exposes `bytesWritten` on every zlib stream: the running total of bytes
-    // handed to the stream. `reset()` does not clear it (verified against v24.18.0).
+    // reset() preserves bytesWritten; maxOutputLength applies only to one-shots.
     Object.defineProperty(prototype, 'bytesWritten', {
         get(this: NodeZlibTransform): number {
             return zlibStreamStates.get(this)?.bytesWritten ?? 0;
@@ -369,377 +377,38 @@ function installZlibMethods(prototype: NodeZlibTransform): void {
         configurable: true,
         enumerable: false,
     });
-}
-export interface Deflate extends NodeZlibTransform {
-    _handle: ZlibDeflateHandle;
-    _processChunk(chunk: ZlibInput, flush?: number): Buffer;
-    close(callback?: () => void): void;
+    return Constructor;
 }
 
-interface DeflateConstructor {
-    new (o?: ZlibOptions & TransformOptions): Deflate;
-    (o?: ZlibOptions & TransformOptions): Deflate;
-    prototype: Deflate;
-}
+export interface Deflate extends NodeZlibTransform { _handle: ZlibDeflateHandle; }
+export interface Inflate extends NodeZlibTransform { _handle: ZlibInflateHandle; }
+export interface Gzip extends NodeZlibTransform { _handle: ZlibDeflateHandle; }
+export interface Gunzip extends NodeZlibTransform { _handle: ZlibInflateHandle; }
+export interface DeflateRaw extends NodeZlibTransform { _handle: ZlibDeflateHandle; }
+export interface InflateRaw extends NodeZlibTransform { _handle: ZlibInflateHandle; }
+export interface Unzip extends NodeZlibTransform { _handle: ZlibInflateHandle; }
 
-function initDeflate(self: Deflate, o?: ZlibOptions & TransformOptions): void {
-    validateOptions(o);
-    Transform.call(self, toTransformOptions(o));
-    self._handle = installHandleCompat(zlib.createDeflate(..._opts(o)));
-    configureZlibStream(self, true, o);
-}
+type DeflateConstructor = ZlibConstructor<Deflate>;
+type InflateConstructor = ZlibConstructor<Inflate>;
+type GzipConstructor = ZlibConstructor<Gzip>;
+type GunzipConstructor = ZlibConstructor<Gunzip>;
+type DeflateRawConstructor = ZlibConstructor<DeflateRaw>;
+type InflateRawConstructor = ZlibConstructor<InflateRaw>;
+type UnzipConstructor = ZlibConstructor<Unzip>;
 
-export const Deflate: DeflateConstructor = function Deflate(this: Deflate | undefined, o?: ZlibOptions & TransformOptions) {
-    const target = receiverOrCreate(this, Deflate.prototype);
-    initDeflate(target, o);
-    return target;
-} as DeflateConstructor;
-
-Object.setPrototypeOf(Deflate, Transform);
-Deflate.prototype = Object.create(Transform.prototype);
-
-Deflate.prototype._transform = function _transform(this: Deflate, chunk: ZlibInput, _e: BufferEncoding, cb: TransformCallback): void {
-    _doTransform(this, chunk, cb);
-};
-
-Deflate.prototype._flush = function _flush(this: Deflate, cb: TransformCallback): void {
-    _doFlush(this, cb);
-};
-
-Deflate.prototype._processChunk = function _processChunk(this: Deflate, chunk: ZlibInput, flush?: number): Buffer {
-    return checkStreamOutput(this, processChunk(this._handle, chunk, flush));
-};
-
-Deflate.prototype.close = function close(this: Deflate): void {
-    this._handle.close?.();
-};
-
-Object.defineProperty(Deflate.prototype, 'constructor', {
-    value: Deflate,
-    writable: true,
-    configurable: true,
-});
-
-flattenPrototype(Deflate.prototype);
-installZlibMethods(Deflate.prototype);
-
-const _opts = (o?: ZlibOptions) => [
-    o?.level ?? zlib.DEFAULT_COMPRESSION,
-    o?.strategy ?? zlib.DEFAULT_STRATEGY,
-    o?.memLevel ?? 8
+const compressionOptions = (options?: ZlibOptions) => [
+    options?.level ?? zlib.DEFAULT_COMPRESSION,
+    options?.strategy ?? zlib.DEFAULT_STRATEGY,
+    options?.memLevel ?? 8,
 ] as const;
-export interface Inflate extends NodeZlibTransform {
-    _handle: ZlibInflateHandle;
-    _processChunk(chunk: ZlibInput, flush?: number): Buffer;
-    close(callback?: () => void): void;
-}
 
-interface InflateConstructor {
-    new (o?: ZlibOptions & TransformOptions): Inflate;
-    (o?: ZlibOptions & TransformOptions): Inflate;
-    prototype: Inflate;
-}
-
-function initInflate(self: Inflate, o?: ZlibOptions & TransformOptions): void {
-    validateOptions(o);
-    Transform.call(self, toTransformOptions(o));
-    self._handle = installHandleCompat(zlib.createInflate());
-    configureZlibStream(self, false, o);
-}
-
-export const Inflate: InflateConstructor = function Inflate(this: Inflate | undefined, o?: ZlibOptions & TransformOptions) {
-    const target = receiverOrCreate(this, Inflate.prototype);
-    initInflate(target, o);
-    return target;
-} as InflateConstructor;
-
-Object.setPrototypeOf(Inflate, Transform);
-Inflate.prototype = Object.create(Transform.prototype);
-
-Inflate.prototype._transform = function _transform(this: Inflate, chunk: ZlibInput, _e: BufferEncoding, cb: TransformCallback): void {
-    _doTransform(this, chunk, cb);
-};
-
-Inflate.prototype._flush = function _flush(this: Inflate, cb: TransformCallback): void {
-    _doFlush(this, cb);
-};
-
-Inflate.prototype._processChunk = function _processChunk(this: Inflate, chunk: ZlibInput, flush?: number): Buffer {
-    return checkStreamOutput(this, processChunk(this._handle, chunk, flush));
-};
-
-Inflate.prototype.close = function close(this: Inflate): void {
-    this._handle.close?.();
-};
-
-Object.defineProperty(Inflate.prototype, 'constructor', {
-    value: Inflate,
-    writable: true,
-    configurable: true,
-});
-
-flattenPrototype(Inflate.prototype);
-installZlibMethods(Inflate.prototype);
-export interface Gzip extends NodeZlibTransform {
-    _handle: ZlibDeflateHandle;
-    _processChunk(chunk: ZlibInput, flush?: number): Buffer;
-    close(callback?: () => void): void;
-}
-
-interface GzipConstructor {
-    new (o?: ZlibOptions & TransformOptions): Gzip;
-    (o?: ZlibOptions & TransformOptions): Gzip;
-    prototype: Gzip;
-}
-
-function initGzip(self: Gzip, o?: ZlibOptions & TransformOptions): void {
-    validateOptions(o);
-    Transform.call(self, toTransformOptions(o));
-    self._handle = installHandleCompat(zlib.createGzip(..._opts(o)));
-    configureZlibStream(self, true, o);
-}
-
-export const Gzip: GzipConstructor = function Gzip(this: Gzip | undefined, o?: ZlibOptions & TransformOptions) {
-    const target = receiverOrCreate(this, Gzip.prototype);
-    initGzip(target, o);
-    return target;
-} as GzipConstructor;
-
-Object.setPrototypeOf(Gzip, Transform);
-Gzip.prototype = Object.create(Transform.prototype);
-
-Gzip.prototype._transform = function _transform(this: Gzip, chunk: ZlibInput, _e: BufferEncoding, cb: TransformCallback): void {
-    _doTransform(this, chunk, cb);
-};
-
-Gzip.prototype._flush = function _flush(this: Gzip, cb: TransformCallback): void {
-    _doFlush(this, cb);
-};
-
-Gzip.prototype._processChunk = function _processChunk(this: Gzip, chunk: ZlibInput, flush?: number): Buffer {
-    return checkStreamOutput(this, processChunk(this._handle, chunk, flush));
-};
-
-Gzip.prototype.close = function close(this: Gzip): void {
-    this._handle.close?.();
-};
-
-Object.defineProperty(Gzip.prototype, 'constructor', {
-    value: Gzip,
-    writable: true,
-    configurable: true,
-});
-
-flattenPrototype(Gzip.prototype);
-installZlibMethods(Gzip.prototype);
-export interface Gunzip extends NodeZlibTransform {
-    _handle: ZlibInflateHandle;
-    _processChunk(chunk: ZlibInput, flush?: number): Buffer;
-    close(callback?: () => void): void;
-}
-
-interface GunzipConstructor {
-    new (o?: ZlibOptions & TransformOptions): Gunzip;
-    (o?: ZlibOptions & TransformOptions): Gunzip;
-    prototype: Gunzip;
-}
-
-function initGunzip(self: Gunzip, o?: ZlibOptions & TransformOptions): void {
-    validateOptions(o);
-    Transform.call(self, toTransformOptions(o));
-    self._handle = installHandleCompat(zlib.createGunzip());
-    configureZlibStream(self, false, o, 'gunzip');
-}
-
-export const Gunzip: GunzipConstructor = function Gunzip(this: Gunzip | undefined, o?: ZlibOptions & TransformOptions) {
-    const target = receiverOrCreate(this, Gunzip.prototype);
-    initGunzip(target, o);
-    return target;
-} as GunzipConstructor;
-
-Object.setPrototypeOf(Gunzip, Transform);
-Gunzip.prototype = Object.create(Transform.prototype);
-
-Gunzip.prototype._transform = function _transform(this: Gunzip, chunk: ZlibInput, _e: BufferEncoding, cb: TransformCallback): void {
-    _doTransform(this, chunk, cb);
-};
-
-Gunzip.prototype._flush = function _flush(this: Gunzip, cb: TransformCallback): void {
-    _doFlush(this, cb);
-};
-
-Gunzip.prototype._processChunk = function _processChunk(this: Gunzip, chunk: ZlibInput, flush?: number): Buffer {
-    return checkStreamOutput(this, processChunk(this._handle, chunk, flush));
-};
-
-Gunzip.prototype.close = function close(this: Gunzip): void {
-    this._handle.close?.();
-};
-
-Object.defineProperty(Gunzip.prototype, 'constructor', {
-    value: Gunzip,
-    writable: true,
-    configurable: true,
-});
-
-flattenPrototype(Gunzip.prototype);
-installZlibMethods(Gunzip.prototype);
-export interface DeflateRaw extends NodeZlibTransform {
-    _handle: ZlibDeflateHandle;
-    _processChunk(chunk: ZlibInput, flush?: number): Buffer;
-    close(callback?: () => void): void;
-}
-
-interface DeflateRawConstructor {
-    new (o?: ZlibOptions & TransformOptions): DeflateRaw;
-    (o?: ZlibOptions & TransformOptions): DeflateRaw;
-    prototype: DeflateRaw;
-}
-
-function initDeflateRaw(self: DeflateRaw, o?: ZlibOptions & TransformOptions): void {
-    validateOptions(o);
-    Transform.call(self, toTransformOptions(o));
-    self._handle = installHandleCompat(zlib.createDeflateRaw(..._opts(o)));
-    configureZlibStream(self, true, o);
-}
-
-export const DeflateRaw: DeflateRawConstructor = function DeflateRaw(this: DeflateRaw | undefined, o?: ZlibOptions & TransformOptions) {
-    const target = receiverOrCreate(this, DeflateRaw.prototype);
-    initDeflateRaw(target, o);
-    return target;
-} as DeflateRawConstructor;
-
-Object.setPrototypeOf(DeflateRaw, Transform);
-DeflateRaw.prototype = Object.create(Transform.prototype);
-
-DeflateRaw.prototype._transform = function _transform(this: DeflateRaw, chunk: ZlibInput, _e: BufferEncoding, cb: TransformCallback): void {
-    _doTransform(this, chunk, cb);
-};
-
-DeflateRaw.prototype._flush = function _flush(this: DeflateRaw, cb: TransformCallback): void {
-    _doFlush(this, cb);
-};
-
-DeflateRaw.prototype._processChunk = function _processChunk(this: DeflateRaw, chunk: ZlibInput, flush?: number): Buffer {
-    return checkStreamOutput(this, processChunk(this._handle, chunk, flush));
-};
-
-DeflateRaw.prototype.close = function close(this: DeflateRaw): void {
-    this._handle.close?.();
-};
-
-Object.defineProperty(DeflateRaw.prototype, 'constructor', {
-    value: DeflateRaw,
-    writable: true,
-    configurable: true,
-});
-
-flattenPrototype(DeflateRaw.prototype);
-installZlibMethods(DeflateRaw.prototype);
-export interface InflateRaw extends NodeZlibTransform {
-    _handle: ZlibInflateHandle;
-    _processChunk(chunk: ZlibInput, flush?: number): Buffer;
-    close(callback?: () => void): void;
-}
-
-interface InflateRawConstructor {
-    new (o?: ZlibOptions & TransformOptions): InflateRaw;
-    (o?: ZlibOptions & TransformOptions): InflateRaw;
-    prototype: InflateRaw;
-}
-
-function initInflateRaw(self: InflateRaw, o?: ZlibOptions & TransformOptions): void {
-    validateOptions(o);
-    Transform.call(self, toTransformOptions(o));
-    self._handle = installHandleCompat(zlib.createInflateRaw());
-    configureZlibStream(self, false, o);
-}
-
-export const InflateRaw: InflateRawConstructor = function InflateRaw(this: InflateRaw | undefined, o?: ZlibOptions & TransformOptions) {
-    const target = receiverOrCreate(this, InflateRaw.prototype);
-    initInflateRaw(target, o);
-    return target;
-} as InflateRawConstructor;
-
-Object.setPrototypeOf(InflateRaw, Transform);
-InflateRaw.prototype = Object.create(Transform.prototype);
-
-InflateRaw.prototype._transform = function _transform(this: InflateRaw, chunk: ZlibInput, _e: BufferEncoding, cb: TransformCallback): void {
-    _doTransform(this, chunk, cb);
-};
-
-InflateRaw.prototype._flush = function _flush(this: InflateRaw, cb: TransformCallback): void {
-    _doFlush(this, cb);
-};
-
-InflateRaw.prototype._processChunk = function _processChunk(this: InflateRaw, chunk: ZlibInput, flush?: number): Buffer {
-    return checkStreamOutput(this, processChunk(this._handle, chunk, flush));
-};
-
-InflateRaw.prototype.close = function close(this: InflateRaw): void {
-    this._handle.close?.();
-};
-
-Object.defineProperty(InflateRaw.prototype, 'constructor', {
-    value: InflateRaw,
-    writable: true,
-    configurable: true,
-});
-
-flattenPrototype(InflateRaw.prototype);
-installZlibMethods(InflateRaw.prototype);
-export interface Unzip extends NodeZlibTransform {
-    _handle: ZlibInflateHandle;
-    _processChunk(chunk: ZlibInput, flush?: number): Buffer;
-    close(callback?: () => void): void;
-}
-
-interface UnzipConstructor {
-    new (o?: ZlibOptions & TransformOptions): Unzip;
-    (o?: ZlibOptions & TransformOptions): Unzip;
-    prototype: Unzip;
-}
-
-function initUnzip(self: Unzip, o?: ZlibOptions & TransformOptions): void {
-    validateOptions(o);
-    Transform.call(self, toTransformOptions(o));
-    self._handle = installHandleCompat(zlib.createUnzip());
-    configureZlibStream(self, false, o, 'unzip');
-}
-
-export const Unzip: UnzipConstructor = function Unzip(this: Unzip | undefined, o?: ZlibOptions & TransformOptions) {
-    const target = receiverOrCreate(this, Unzip.prototype);
-    initUnzip(target, o);
-    return target;
-} as UnzipConstructor;
-
-Object.setPrototypeOf(Unzip, Transform);
-Unzip.prototype = Object.create(Transform.prototype);
-
-Unzip.prototype._transform = function _transform(this: Unzip, chunk: ZlibInput, _e: BufferEncoding, cb: TransformCallback): void {
-    _doTransform(this, chunk, cb);
-};
-
-Unzip.prototype._flush = function _flush(this: Unzip, cb: TransformCallback): void {
-    _doFlush(this, cb);
-};
-
-Unzip.prototype._processChunk = function _processChunk(this: Unzip, chunk: ZlibInput, flush?: number): Buffer {
-    return checkStreamOutput(this, processChunk(this._handle, chunk, flush));
-};
-
-Unzip.prototype.close = function close(this: Unzip): void {
-    this._handle.close?.();
-};
-
-Object.defineProperty(Unzip.prototype, 'constructor', {
-    value: Unzip,
-    writable: true,
-    configurable: true,
-});
-
-flattenPrototype(Unzip.prototype);
-installZlibMethods(Unzip.prototype);
+export const Deflate = defineZlibConstructor<Deflate>('Deflate', options => zlib.createDeflate(...compressionOptions(options)));
+export const Inflate = defineZlibConstructor<Inflate>('Inflate', () => zlib.createInflate());
+export const Gzip = defineZlibConstructor<Gzip>('Gzip', options => zlib.createGzip(...compressionOptions(options)));
+export const Gunzip = defineZlibConstructor<Gunzip>('Gunzip', () => zlib.createGunzip(), 'gunzip');
+export const DeflateRaw = defineZlibConstructor<DeflateRaw>('DeflateRaw', options => zlib.createDeflateRaw(...compressionOptions(options)));
+export const InflateRaw = defineZlibConstructor<InflateRaw>('InflateRaw', () => zlib.createInflateRaw());
+export const Unzip = defineZlibConstructor<Unzip>('Unzip', () => zlib.createUnzip(), 'unzip');
 
 // Factory functions
 

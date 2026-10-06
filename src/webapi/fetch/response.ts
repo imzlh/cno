@@ -1,7 +1,7 @@
 import { Headers } from "../headers";
 import { type NetworkCallFrame } from "../../utils/network-hooks";
 import { bytesToArrayBuffer } from "../../utils/bytes";
-import { BOUNDARY_RE, Decoder, ensureFormDataContentType, engine, isBodyIterable, isNullBodyStatus, isReadableStreamLike, iterableBodyToStream, mergeChunks, parseMultipart, parseUrlEncoded, rememberRawGetReader, serializeBody, serializeFormData, teeUntracked } from "./helpers";
+import { bodyContentType, Decoder, ensureFormDataContentType, engine, isBodyIterable, isNullBodyStatus, isReadableStreamLike, iterableBodyToStream, parseFormData, readStreamBody, serializeBody, serializeFormData, teeUntracked, trackBodyStream } from "./helpers";
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 type ResponseBodySource = BodyInit | ReadableStream<Uint8Array> | Uint8Array | null;
@@ -43,15 +43,6 @@ function toUint16(value: unknown): number {
     const number = Number(value);
     if (!Number.isFinite(number)) return 0;
     return ((Math.trunc(number) % 65536) + 65536) % 65536;
-}
-
-function bodyContentType(body: unknown): string | undefined {
-    if (body === null || body === undefined) return undefined;
-    if (body instanceof URLSearchParams) return 'application/x-www-form-urlencoded;charset=UTF-8';
-    if (body instanceof Blob) return body.type || undefined;
-    if (body instanceof FormData || isReadableStreamLike(body) || isBodyIterable(body)) return undefined;
-    if (ArrayBuffer.isView(body) || body instanceof ArrayBuffer) return undefined;
-    return 'text/plain;charset=UTF-8';
 }
 
 const responseInitiatorCallFrames = new WeakMap<globalThis.Response, NetworkCallFrame[]>();
@@ -158,32 +149,7 @@ export class Response implements globalThis.Response {
     }
 
     private trackBodyStream(stream: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
-        const markUsed = () => { this[responseState].bodyUsed = true; };
-        const getReader = stream.getReader.bind(stream);
-        // Keep the unpatched method for clone(): tee() acquires its source reader
-        // through this public property, so without this the clone's pulls would run
-        // THIS response's markUsed. See rememberRawGetReader in ./helpers.
-        rememberRawGetReader(stream, getReader);
-        stream.getReader = ((options?: ReadableStreamGetReaderOptions) => {
-            const reader = getReader(options) as ReadableStreamDefaultReader<Uint8Array>;
-            const read = reader.read.bind(reader);
-            const cancel = reader.cancel.bind(reader);
-            reader.read = () => {
-                markUsed();
-                return read();
-            };
-            reader.cancel = (reason?: unknown) => {
-                markUsed();
-                return cancel(reason);
-            };
-            return reader;
-        }) as typeof stream.getReader;
-        const cancel = stream.cancel.bind(stream);
-        stream.cancel = (reason?: unknown) => {
-            markUsed();
-            return cancel(reason);
-        };
-        return stream;
+        return trackBodyStream(stream, () => { this[responseState].bodyUsed = true; });
     }
 
     clone(): Response {
@@ -191,10 +157,7 @@ export class Response implements globalThis.Response {
         if (state.bodyUsed) throw new TypeError('Already read');
         let clonedBody: ResponseBodySource = state.bodyBuffer;
         if (clonedBody === null && state.body) {
-            // teeUntracked, not this.body.tee(): a tracked tee would attribute BOTH
-            // branches' pulls to this response, so reading the clone marked the
-            // original consumed and the original then threw "Already read" with its
-            // bytes intact. Each branch is tracked separately just below.
+            // Clone pulls must only mark their own branch as used.
             const [s1, s2] = teeUntracked(state.body);
             state.body = this.trackBodyStream(s1);
             clonedBody = s2;
@@ -221,19 +184,7 @@ export class Response implements globalThis.Response {
         if (state.bodyBuffer) return state.bodyBuffer;
         if (!state.body) return new Uint8Array(0);
 
-        const chunks: Uint8Array[] = [];
-        const reader = state.body.getReader();
-        try {
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                if (!(value instanceof Uint8Array)) throw new TypeError('Response body stream chunks must be Uint8Array values');
-                chunks.push(value);
-            }
-        } finally {
-            reader.releaseLock();
-        }
-        state.bodyBuffer = mergeChunks(chunks);
+        state.bodyBuffer = await readStreamBody(state.body, { bodyKind: 'Response' });
         return state.bodyBuffer;
     }
     arrayBuffer(): Promise<ArrayBuffer> { return this.bytes().then(bytesToArrayBuffer); }
@@ -241,15 +192,7 @@ export class Response implements globalThis.Response {
     async formData(): Promise<FormData> {
         const buf = await this.arrayBuffer();
         const bytes = new Uint8Array(buf);
-        const ct = this.headers.get('content-type') ?? '';
-        if (ct.includes('multipart/form-data')) {
-            const m = BOUNDARY_RE.exec(ct);
-            const boundary = m?.[1];
-            if (!boundary) throw new TypeError('Missing multipart boundary');
-            return parseMultipart(bytes, boundary);
-        }
-        if (ct.includes('application/x-www-form-urlencoded')) return parseUrlEncoded(bytes);
-        throw new TypeError(`Unsupported content type for formData(): ${ct}`);
+        return parseFormData(bytes, this.headers.get('content-type') ?? '');
     }
     async json<T = unknown>(): Promise<T> { return JSON.parse(await this.text()); }
     /** Spec: always UTF-8, regardless of the content-type charset (only XHR honours charset). */

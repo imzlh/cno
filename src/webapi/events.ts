@@ -95,8 +95,19 @@ interface ListenerEntry {
     once: boolean;
     capture: boolean;
     passive: boolean;
+    internal: boolean;
     signal?: AbortSignal;
     abortHandler?: () => void;
+}
+
+const listenerChangeHook = Symbol.for('cno.internal.eventTargetListenerChange');
+const internalListener = Symbol.for('cno.internal.eventTargetListener');
+
+function notifyListenerChange(target: EventTarget, type: string, bucket: ListenerEntry[]): void {
+    const hook = Reflect.get(target, listenerChangeHook);
+    if (typeof hook === 'function') {
+        Reflect.apply(hook, target, [type, bucket.filter(entry => !entry.internal).length]);
+    }
 }
 
 const captureOption = (options?: AddEventListenerOptions | boolean): boolean =>
@@ -139,15 +150,19 @@ export class EventTarget implements globalThis.EventTarget {
         }
         const capture = !!opts.capture;
         if (bucket.some(e => e.listener === listener && e.capture === capture)) return;
-        const entry: ListenerEntry = { listener, once: !!opts.once, capture, passive: !!opts.passive, signal: opts.signal };
+        const internal = (typeof listener === 'function' || typeof listener === 'object')
+            && Reflect.get(listener, internalListener) === true;
+        const entry: ListenerEntry = { listener, once: !!opts.once, capture, passive: !!opts.passive, internal, signal: opts.signal };
         bucket.push(entry);
         callTrackingHook('__cnoTrackEventTargetListener', target, eventType, listener, options);
+        if (!entry.internal) notifyListenerChange(target, eventType, bucket);
         if (opts.signal) {
             entry.abortHandler = () => {
                 const idx = bucket.indexOf(entry);
                 if (idx !== -1) {
                     bucket.splice(idx, 1);
                     callTrackingHook('__cnoUntrackEventTargetListener', target, eventType, listener, entry.capture);
+                    if (!entry.internal) notifyListenerChange(target, eventType, bucket);
                 }
             };
             opts.signal.addEventListener('abort', entry.abortHandler, { once: true });
@@ -177,6 +192,7 @@ export class EventTarget implements globalThis.EventTarget {
             bucket.splice(idx, 1);
             if (entry?.signal && entry.abortHandler) entry.signal.removeEventListener('abort', entry.abortHandler);
             callTrackingHook('__cnoUntrackEventTargetListener', target, eventType, listener, options);
+            if (!entry?.internal) notifyListenerChange(target, eventType, bucket);
         }
     }
 
@@ -208,6 +224,7 @@ export class EventTarget implements globalThis.EventTarget {
                         bucket.splice(idx, 1);
                         if (entry.signal && entry.abortHandler) entry.signal.removeEventListener('abort', entry.abortHandler);
                         callTrackingHook('__cnoUntrackEventTargetListener', target, event.type, entry.listener, entry.capture);
+                        if (!entry.internal) notifyListenerChange(target, event.type, bucket);
                     }
                     const fn = entry.listener;
                     event._setPassiveListener(entry.passive);

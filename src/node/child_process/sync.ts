@@ -13,13 +13,14 @@ import {
     makeBatchFileError,
     normalizeEnv,
     normalizeInput,
+    normalizeSpawnArgs,
     normalizeSpawnFailure,
     resolveCommandForCwd,
     withRequiredEnvVars,
 } from './command';
 import type { ExecFileOptions, ExecOptions, SpawnOptions, SpawnSyncResult } from './types';
 import {
-    toNativeStdio,
+    nativeStdioOptions,
     validateMaxBuffer,
     validateStdio,
     validateStdioFdRedirects,
@@ -29,15 +30,7 @@ import {
 export function spawnSync(command: string, options?: SpawnOptions): SpawnSyncResult;
 export function spawnSync(command: string, args?: string[], options?: SpawnOptions): SpawnSyncResult;
 export function spawnSync(command: string, argsOrOptions?: string[] | SpawnOptions, options?: SpawnOptions): SpawnSyncResult {
-    let args: string[] = [];
-    let optsSource: SpawnOptions = {};
-
-    if (Array.isArray(argsOrOptions)) {
-        args = argsOrOptions;
-        optsSource = options ?? {};
-    } else if (argsOrOptions) {
-        optsSource = argsOrOptions;
-    }
+    let [args, optsSource] = normalizeSpawnArgs(argsOrOptions, options);
 
     validateStdio(optsSource.stdio);
     validateStdioFdRedirects(optsSource.stdio);
@@ -83,27 +76,14 @@ export function spawnSync(command: string, argsOrOptions?: string[] | SpawnOptio
         clearEnv: optsSource.env !== undefined,
         uid: optsSource.uid,
         gid: optsSource.gid,
-        stdin: 'pipe',
-        stdout: 'pipe',
-        stderr: 'pipe',
         background: optsSource.windowsHide === true,
         input: normalizeInput(optsSource.input),
     };
     if (optsSource.windowsVerbatimArguments === true || shellVerbatim) {
-        Reflect.set(opts, 'windowsVerbatimArguments', true);
+        opts.windowsVerbatimArguments = true;
     }
 
-    if (optsSource.stdio) {
-        if (Array.isArray(optsSource.stdio)) {
-            opts.stdin = toNativeStdio(optsSource.stdio[0]);
-            opts.stdout = toNativeStdio(optsSource.stdio[1]);
-            opts.stderr = toNativeStdio(optsSource.stdio[2]);
-        } else {
-            opts.stdin = toNativeStdio(optsSource.stdio);
-            opts.stdout = toNativeStdio(optsSource.stdio);
-            opts.stderr = toNativeStdio(optsSource.stdio);
-        }
-    }
+    Object.assign(opts, nativeStdioOptions(optsSource.stdio));
 
     const immediateError = getImmediateSpawnError(command, 'spawnSync', optsSource.cwd, args);
     if (immediateError) {
@@ -119,8 +99,8 @@ export function spawnSync(command: string, argsOrOptions?: string[] | SpawnOptio
         // Node defaults spawnSync to raw Buffers — only an explicit encoding
         // (other than 'buffer') turns stdout/stderr into strings.
         const encoding = optsSource.encoding;
-        const convert = (value: ArrayBuffer | null | undefined): Buffer | string | null | undefined => {
-            if (value == null) return value;
+        const convert = (value: ArrayBuffer | null): Buffer | string | null => {
+            if (value === null) return null;
             const bytes = new Uint8Array(value);
             if (encoding === undefined || encoding === 'buffer' || encoding === null) {
                 return Buffer.from(bytes);
@@ -151,13 +131,12 @@ export function spawnSync(command: string, argsOrOptions?: string[] | SpawnOptio
         // 0 and Infinity both mean unlimited, so neither enters the check below.
         if (error === undefined && typeof maxBuffer === 'number' && maxBuffer > 0 && Number.isFinite(maxBuffer)) {
             const CHUNK = 65536;
-            const lengthOf = (value: Buffer | string | null | undefined) =>
-                value == null ? 0 : (typeof value === 'string' ? value.length : value.byteLength);
-            const over = (value: Buffer | string | null | undefined) => lengthOf(value) > maxBuffer;
+            const lengthOf = (value: Buffer | string | null) => value === null ? 0 : value.length;
+            const over = (value: Buffer | string | null) => lengthOf(value) > maxBuffer;
             if (over(stdout) || over(stderr)) {
                 const limit = (Math.floor(maxBuffer / CHUNK) + 1) * CHUNK;
-                const truncate = (value: Buffer | string | null | undefined) =>
-                    value == null || lengthOf(value) <= limit
+                const truncate = (value: Buffer | string | null) =>
+                    value === null || lengthOf(value) <= limit
                         ? value
                         : (typeof value === 'string' ? value.slice(0, limit) : value.subarray(0, limit));
                 stdout = truncate(stdout);
@@ -179,14 +158,14 @@ export function spawnSync(command: string, argsOrOptions?: string[] | SpawnOptio
         // on success (measured v24.18: Object.keys is output,pid,signal,status,
         // stderr,stdout), so always listing it makes `'error' in result` -- a
         // reasonable success check -- report a failure that did not happen.
-        const syncResult = {
+        const syncResult: SpawnSyncResult = {
             pid: result.pid,
-            output: [result.output?.[0] ?? null, stdout ?? null, stderr ?? null],
+            output: [null, stdout, stderr],
             stdout,
             stderr,
             status,
             signal,
-        } as SpawnSyncResult;
+        };
         if (error !== undefined) syncResult.error = error;
         return syncResult;
     } catch (err) {

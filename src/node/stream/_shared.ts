@@ -15,6 +15,7 @@
  */
 
 import { EventEmitter } from '../events';
+import { StringDecoder } from '../string_decoder';
 const os = import.meta.use('os');
 export { flattenPrototype } from '../_internal/prototype';
 import type {
@@ -25,6 +26,7 @@ import type {
     NextTickHost,
     PipeTrackedWritable,
     Readable,
+    ReadableOptions,
     ReadableState,
     ReadableTarget,
     Stream,
@@ -185,6 +187,99 @@ export function decoderBytes(chunk: unknown): Buffer | null {
     if (Buffer.isBuffer(chunk)) return chunk;
     if (chunk instanceof Uint8Array) return Buffer.from(chunk);
     return null;
+}
+
+export function createReadableState(options: ReadableOptions | undefined, objectMode: boolean, highWaterMark: number): ReadableState {
+    return {
+        buffer: [],
+        encoding: options?.encoding ?? null,
+        objectMode,
+        highWaterMark,
+        flowing: null,
+        ended: false,
+        endEmitted: false,
+        reading: false,
+        sync: true,
+        needReadable: false,
+        emittedReadable: false,
+        readableListening: false,
+        resumeScheduled: false,
+        destroyed: false,
+        defaultEncoding: 'utf8',
+        awaitDrain: 0,
+        readingMore: false,
+        decoder: options?.encoding ? new StringDecoder(options.encoding) : null,
+        disturbed: false,
+        emitClose: options?.emitClose ?? true,
+        autoDestroy: options?.autoDestroy ?? true,
+        closed: false,
+    };
+}
+
+export function setReadableEncoding<T extends Readable | Duplex>(stream: T, encoding: BufferEncoding): T {
+    stream.readableEncoding = encoding;
+    const state = stream._readableState;
+    state.encoding = encoding;
+    state.decoder = new StringDecoder(encoding);
+    const decoded: unknown[] = [];
+    for (const chunk of state.buffer) {
+        const bytes = decoderBytes(chunk);
+        if (bytes) {
+            const out = state.decoder.write(bytes);
+            if (out.length > 0) decoded.push(out);
+        } else {
+            decoded.push(chunk);
+        }
+    }
+    if (state.ended) {
+        const trailing = state.decoder.end();
+        if (trailing.length > 0) decoded.push(trailing);
+    }
+    state.buffer = decoded;
+    updateReadableLength(stream);
+    return stream;
+}
+
+export function onReadableListenerAdded(stream: Readable | Duplex, event: string | symbol): void {
+    if (event === 'data') stream.resume();
+    if (event === 'readable') {
+        const state = stream._readableState;
+        state.readableListening = true;
+        // A readable listener parks even an already flowing stream.
+        state.flowing = false;
+        if (state.buffer.length > 0 || state.ended) scheduleReadableEmit(stream);
+        else invokeReadableRead(stream);
+    }
+}
+
+export function resumeReadable<T extends Readable | Duplex>(stream: T, drain: () => void): T {
+    const state = stream._readableState;
+    if (state.readableListening && stream.listenerCount('data') === 0) {
+        stream.emit('resume');
+        invokeReadableRead(stream);
+        return stream;
+    }
+    if (!state.flowing) {
+        state.flowing = true;
+        stream.emit('resume');
+    }
+    // pipe() registers its end listener after the data listener starts flowing.
+    scheduleReadableFlow(stream, drain);
+    return stream;
+}
+
+export function flowReadable(stream: Readable | Duplex): void {
+    const state = stream._readableState;
+    if (state.destroyed || !state.flowing) return;
+    while (!state.destroyed && state.flowing && state.buffer.length > 0) {
+        const chunk = state.buffer.shift();
+        state.disturbed = true;
+        stream.readableDidRead = true;
+        subtractReadableLength(stream, readableChunkLength(state, chunk));
+        stream.emit('data', chunk);
+    }
+    if (state.ended) stream._emitReadableEndIfNeeded();
+    else invokeReadableRead(stream);
 }
 
 function bufferFromView(chunk: unknown): Buffer {

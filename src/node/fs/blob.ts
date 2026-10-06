@@ -81,14 +81,11 @@ class FileBackedBlob extends Blob {
     }
 
     async arrayBuffer(): Promise<ArrayBuffer> {
-        const bytes = await this.#read();
-        const copy = new Uint8Array(bytes.byteLength);
-        copy.set(bytes);
-        return copy.buffer;
+        return (await this.#read()).buffer;
     }
 
     async bytes(): Promise<Uint8Array<ArrayBuffer>> {
-        return new Uint8Array(await this.arrayBuffer());
+        return this.#read();
     }
 
     async text(): Promise<string> {
@@ -99,7 +96,7 @@ class FileBackedBlob extends Blob {
         return new ReadableStream({
             start: async controller => {
                 try {
-                    controller.enqueue(new Uint8Array(await this.arrayBuffer()));
+                    controller.enqueue(await this.bytes());
                     controller.close();
                 } catch (error) {
                     controller.error(error);

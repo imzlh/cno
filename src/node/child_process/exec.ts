@@ -6,6 +6,7 @@ const os = import.meta.use('os');
 
 import { Buffer } from '../buffer';
 import { stdioChunkBytes } from './_shared';
+import { normalizeSpawnArgs } from './command';
 import { spawn } from './spawn';
 import { validateMaxBuffer } from './validate';
 import type {
@@ -73,14 +74,13 @@ function collectOutput(
 
     const pushChunk = (chunks: OutputChunk[], chunk: unknown, streamName: 'stdout' | 'stderr') => {
         if (maxBufferError) return;
-        const text = encoding && typeof chunk === 'string' ? chunk : undefined;
-        const bytes = text === undefined ? stdioChunkBytes(chunk) : undefined;
-        const length = text === undefined ? bytes.byteLength : Buffer.byteLength(text, encoding);
+        const data = encoding && typeof chunk === 'string' ? chunk : stdioChunkBytes(chunk);
+        const length = typeof data === 'string' ? Buffer.byteLength(data, encoding) : data.byteLength;
         const currentLength = streamName === 'stdout' ? stdoutLength : stderrLength;
         const allowed = maxBuffer - currentLength;
         if (allowed <= 0 || length > allowed) {
             if (allowed > 0) {
-                chunks.push(text === undefined ? bytes.subarray(0, allowed) : text.slice(0, allowed));
+                chunks.push(typeof data === 'string' ? data.slice(0, allowed) : data.subarray(0, allowed));
             }
             const err = Object.assign(new Error(`${streamName} maxBuffer length exceeded`), {
                 code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER',
@@ -90,7 +90,7 @@ function collectOutput(
             child.kill(options.killSignal);
             return;
         }
-        chunks.push(text ?? bytes);
+        chunks.push(data);
         if (streamName === 'stdout') stdoutLength += length;
         else stderrLength += length;
     };
@@ -148,7 +148,7 @@ function collectOutput(
 // throw), so mirror that instead of letting the decode throw out of the 'close'
 // handler and strand the callback.
 function convertCollectedOutput(chunks: OutputChunk[], encoding?: BufferEncoding): string | Buffer {
-    if (encoding) return chunks.join('') as string;
+    if (encoding) return chunks.join('');
     return Buffer.concat(chunks as Uint8Array[]);
 }
 
@@ -204,8 +204,7 @@ export function execFile(
 // fork
 
 export function fork(modulePath: string, args?: string[] | SpawnOptions, options?: SpawnOptions): ChildProcess {
-    const forkArgs = Array.isArray(args) ? args : [];
-    const forkOptions = Array.isArray(args) ? (options ?? {}) : (args ?? {});
+    const [forkArgs, forkOptions] = normalizeSpawnArgs(args, options);
     const execArgv = forkOptions.execArgv ?? process.execArgv;
     const configuredStdio = forkOptions.stdio;
     const forkStdio: StdioEntry[] = configuredStdio === undefined
