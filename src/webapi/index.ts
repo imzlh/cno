@@ -204,7 +204,7 @@ await import('./crypto');
 await import('./performance');
 
 // wasm
-await import('./wasm');
+if (import.meta.use('wasm')) await import('./wasm');
 
 // storage
 await import('./storage');
