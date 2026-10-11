@@ -30,16 +30,16 @@ function closeStreamQuietly(pipe: CModuleStreams.Stream): void {
 }
 
 export const useWritable = (pipe: CModuleStreams.Stream) => new WritableStream({
-    write: async (chunk, control) => {
+    write: async (chunk) => {
         try {
             await pipe.write(chunk);
         } catch (e) {
-            control.error(wrapFSErr(e));
+            closeStreamQuietly(pipe);
+            throw wrapFSErr(e);
         }
     },
-    close: () => {
-        pipe.close();
-    }
+    close: () => pipe.close(),
+    abort: () => closeStreamQuietly(pipe),
 });
 
 export const useReadable = (pipe: CModuleStreams.Stream) => new ReadableStream({
@@ -53,9 +53,11 @@ export const useReadable = (pipe: CModuleStreams.Stream) => new ReadableStream({
                 controller.enqueue(buf.slice(0, n));
             }
         } catch (e) {
+            closeStreamQuietly(pipe);
             controller.error(wrapFSErr(e));
         }
-    }
+    },
+    cancel: () => closeStreamQuietly(pipe),
 });
 
 const kRawPipe = Symbol('Stream.rawPipe');
@@ -182,8 +184,13 @@ async function denoConnect(options: ConnectRuntimeOptions): Promise<Deno.TcpConn
             return new TcpConn(await connectTcp(options.hostname ?? '127.0.0.1', options.port, options.signal));
         case 'unix':
             const unix = new stream.Pipe();
-            await unix.connect(options.path);
-            return new UnixConn(unix, options.path);
+            try {
+                await unix.connect(options.path);
+                return new UnixConn(unix, options.path);
+            } catch (error) {
+                closeStreamQuietly(unix);
+                throw error;
+            }
         default:
             throw new errors.NotSupported(`Unsupported transport: ${options.transport}`);
     }
@@ -208,21 +215,26 @@ function denoListen(opt: ListenRuntimeOptions): Deno.TcpListener | Deno.UnixList
         case 'tcp':
             const bindHost = normalizeHostname(opt.hostname ?? '0.0.0.0');
             const isV4 = !isIPv6Hostname(bindHost);
+            const port = validateListenPort(opt.port, 80);
             const tcp = new stream.TCP(isV4 ? os.AF_INET : os.AF_INET6);
-            tcp.bind({
-                ip: bindHost,
-                port: validateListenPort(opt.port, 80)
-            })
-            tcp.listen(opt.tcpBacklog);
-            return new TcpListener(tcp, true, addrinfo2deno(tcp.sockname));
+            try {
+                tcp.bind({ ip: bindHost, port });
+                tcp.listen(opt.tcpBacklog);
+                return new TcpListener(tcp, true, addrinfo2deno(tcp.sockname));
+            } catch (error) {
+                closeStreamQuietly(tcp);
+                throw error;
+            }
         case 'unix':
             const unix = new stream.Pipe();
-            unix.bind(opt.path);
-            unix.listen();
-            return new UnixListener(unix, false, {
-                path: opt.path,
-                transport: 'unix'
-            });
+            try {
+                unix.bind(opt.path);
+                unix.listen();
+                return new UnixListener(unix, false, { path: opt.path, transport: 'unix' });
+            } catch (error) {
+                closeStreamQuietly(unix);
+                throw error;
+            }
         default:
             throw new errors.NotSupported(`Unsupported transport: ${opt.transport}`);
     }
@@ -759,39 +771,23 @@ const isTxtAnswer = (answer: CModuleDNS.DNSAnswer): answer is CModuleDNS.TxtAnsw
 
 async function withAbort<T>(op: Promise<T>, signal?: AbortSignal, cleanup?: () => void): Promise<T> {
     if (!signal) return op;
-    if (signal.aborted) {
+    const abort = Promise.withResolvers<never>();
+    const onAbort = () => {
+        // Settle before cleanup can reject the operation with a close error.
+        abort.reject(abortReason(signal));
         try {
             cleanup?.();
         } catch {
-            // Ignore cleanup errors so the abort reason is preserved.
+            // Preserve the abort reason when cleanup fails.
         }
-        throw abortReason(signal);
-    }
-
-    let aborted = false;
-    let onAbort: (() => void) | undefined;
-    const abortPromise = new Promise<never>((_, reject) => {
-        onAbort = () => {
-            aborted = true;
-            try {
-                cleanup?.();
-            } catch {
-                // Ignore cleanup errors so the abort reason is preserved.
-            } finally {
-                reject(abortReason(signal));
-            }
-        };
-        signal.addEventListener('abort', onAbort, { once: true });
-    });
+    };
+    if (signal.aborted) onAbort();
+    else signal.addEventListener('abort', onAbort, { once: true });
 
     try {
-        const guardedOp = op.catch(err => {
-            if (aborted) return new Promise<T>(() => { });
-            throw err;
-        });
-        return await Promise.race([guardedOp, abortPromise]);
+        return await Promise.race([abort.promise, op]);
     } finally {
-        if (onAbort) signal.removeEventListener('abort', onAbort);
+        signal.removeEventListener('abort', onAbort);
     }
 }
 
@@ -859,12 +855,8 @@ async function connectTcp(hostname: string, port: number, signal?: AbortSignal):
     if (signal?.aborted) throw abortReason(signal);
     const host = normalizeHostname(hostname);
 
-    // If the caller passed a literal IP, connect directly (no dual-stack logic needed).
     if (isIpLiteral(host)) {
-        const family = host.includes(':') ? 6 : 4;
-        const tcp = new stream.TCP(family === 6 ? os.AF_INET6 : os.AF_INET);
-        await withAbort(tcp.connect({ ip: host, port }), signal, () => tcp.close());
-        return tcp;
+        return connectAddress(host, port, signal);
     }
 
     // Happy Eyeballs (RFC 8305): resolve both A + AAAA, race connections with
@@ -879,27 +871,16 @@ async function connectTcp(hostname: string, port: number, signal?: AbortSignal):
     const v6ip = v6addrs[0]?.ip;
     const v4ip = v4addrs[0]?.ip;
 
+    if (signal?.aborted) throw abortReason(signal);
     if (!v6ip && !v4ip) throw new Error(`Could not resolve hostname ${host}`);
 
-    // Only one family resolved — connect directly.
-    if (!v6ip) {
-        if (!v4ip) throw new Error(`Could not resolve hostname ${host}`);
-        const tcp = new stream.TCP(os.AF_INET);
-        await withAbort(tcp.connect({ ip: v4ip, port }), signal, () => tcp.close());
-        return tcp;
-    }
-    if (!v4ip) {
-        const tcp = new stream.TCP(os.AF_INET6);
-        await withAbort(tcp.connect({ ip: v6ip, port }), signal, () => tcp.close());
-        return tcp;
-    }
+    if (!v6ip || !v4ip) return connectAddress(v6ip ?? v4ip!, port, signal);
 
     // Both families available — race with Happy Eyeballs delay.
     return new Promise<CModuleStreams.TCP>((resolve, reject) => {
         let settled = false;
         let v4started = false;
         let failCount = 0;
-        let lastError: unknown;
         let v4timer: ReturnType<typeof timers.setTimeout> | undefined;
         const tcpV6 = new stream.TCP(os.AF_INET6);
         const tcpV4 = new stream.TCP(os.AF_INET);
@@ -924,13 +905,11 @@ async function connectTcp(hostname: string, port: number, signal?: AbortSignal):
             if (v4started || settled) return;
             v4started = true;
             cancelTimer();
-            withAbort(tcpV4.connect({ ip: v4ip, port }), signal, () => tcpV4.close())
-                .then(() => win(tcpV4), onFail);
+            connectAddress(v4ip, port, signal, tcpV4).then(win, onFail);
         }
 
         function onFail(err: unknown) {
             if (settled) return;
-            lastError = err;
             failCount++;
             if (!v4started) {
                 // v6 failed before the delay fired — start v4 immediately
@@ -938,19 +917,35 @@ async function connectTcp(hostname: string, port: number, signal?: AbortSignal):
                 return;
             }
             if (failCount >= 2) {
-                // Both failed
                 settled = true;
-                reject(lastError);
+                cancelTimer();
+                closeStreamQuietly(tcpV6);
+                closeStreamQuietly(tcpV4);
+                reject(err);
             }
         }
 
         // Start IPv6 immediately
-        withAbort(tcpV6.connect({ ip: v6ip, port }), signal, () => tcpV6.close())
-            .then(() => win(tcpV6), onFail);
+        connectAddress(v6ip, port, signal, tcpV6).then(win, onFail);
 
         // Start IPv4 after HAPPY_EYEBALLS_DELAY ms
         v4timer = timers.setTimeout(startV4, HAPPY_EYEBALLS_DELAY);
     });
+}
+
+async function connectAddress(
+    ip: string,
+    port: number,
+    signal?: AbortSignal,
+    tcp = new stream.TCP(ip.includes(':') ? os.AF_INET6 : os.AF_INET),
+): Promise<CModuleStreams.TCP> {
+    try {
+        await withAbort(tcp.connect({ ip, port }), signal, () => closeStreamQuietly(tcp));
+        return tcp;
+    } catch (error) {
+        closeStreamQuietly(tcp);
+        throw error;
+    }
 }
 
 class TcpListener extends Listener implements Deno.TcpListener {

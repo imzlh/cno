@@ -8,8 +8,6 @@ import { getMemoryTier } from "../utils/memory-tier";
 const zlib = import.meta.use('zlib');
 const transformReadableDefault = Symbol('transformReadableDefault');
 
-type ClosableHandle = { close?: () => void };
-
 const validateHighWaterMark = (value: number | undefined): number => {
     const hwm = Number(value);
     if (Number.isNaN(hwm) || hwm < 0) {
@@ -36,10 +34,6 @@ const extractSizeAlgorithm = <T>(strategy: QueuingStrategy<T> | undefined): (chu
     }
     return size;
 };
-
-function closeHandle(handle: ClosableHandle | null): void {
-    handle?.close?.();
-}
 
 function notifyEnqueueQuietly(callback: () => void): void {
     try {
@@ -1469,161 +1463,88 @@ export class TextDecoderStream implements globalThis.TextDecoderStream {
     }
 }
 
+function createCompressionStreams(handle: CModuleZLib.Deflate | CModuleZLib.Inflate | null) {
+    const fail = (error: unknown): TypeError => {
+        handle = null;
+        const reason = error instanceof TypeError
+            ? error
+            : new TypeError(error instanceof Error ? error.message : String(error));
+        controller.error(reason);
+        return reason;
+    };
+    const enqueue = (output: Uint8Array): void => {
+        if (output.byteLength > 0) controller.enqueue(new Uint8Array(output));
+    };
+    const readable = new ReadableStream<Uint8Array<ArrayBuffer>>({
+        cancel(reason) {
+            handle = null;
+            return writable._controller._abort(reason);
+        },
+    });
+    const controller = readable._controller;
+    const writable = new WritableStream<BufferSource>({
+        write(chunk) {
+            if (!handle) throw new TypeError('Compression stream is closed');
+            try {
+                enqueue('inflate' in handle ? handle.inflate(chunk) : handle.deflate(chunk));
+            } catch (error) {
+                throw fail(error);
+            }
+        },
+        close() {
+            if (!handle) return;
+            try {
+                // inflate() may already have consumed the trailer; finish() would then throw.
+                if (!('finished' in handle && handle.finished)) enqueue(handle.finish());
+                controller.close();
+            } catch (error) {
+                throw fail(error);
+            } finally {
+                // Native zlib handles release their allocations through their finalizer.
+                handle = null;
+            }
+        },
+        abort(reason) {
+            handle = null;
+            controller.error(reason);
+        },
+    });
+    return { readable, writable };
+}
+
 export class CompressionStream implements globalThis.CompressionStream {
     readonly readable: globalThis.ReadableStream<Uint8Array<ArrayBuffer>>;
     readonly writable: globalThis.WritableStream<BufferSource>;
 
-    private handle: CModuleZLib.Deflate | null;
-    private controller: ReadableStreamDefaultController<Uint8Array<ArrayBuffer>> | null = null;
-
     constructor(format: CompressionFormat) {
-        if (format !== 'gzip' && format !== 'deflate' && format !== 'deflate-raw') {
-            throw new TypeError(`Unsupported compression format: ${format}`);
+        let handle: CModuleZLib.Deflate;
+        switch (format) {
+            case 'gzip': handle = zlib.createGzip(); break;
+            case 'deflate': handle = zlib.createDeflate(); break;
+            case 'deflate-raw': handle = zlib.createDeflateRaw(); break;
+            default: throw new TypeError(`Unsupported compression format: ${format}`);
         }
-
-        if (format === 'gzip') {
-            this.handle = zlib.createGzip(zlib.DEFAULT_COMPRESSION, zlib.DEFAULT_STRATEGY, 8);
-        } else if (format === 'deflate') {
-            this.handle = zlib.createDeflate(zlib.DEFAULT_COMPRESSION, zlib.DEFAULT_STRATEGY, 8);
-        } else if (format === 'deflate-raw') {
-            this.handle = zlib.createDeflateRaw(zlib.DEFAULT_COMPRESSION, zlib.DEFAULT_STRATEGY, 8);
-        } else {
-            throw new TypeError(`Unsupported compression format: ${format}`);
-        }
-
-        this.readable = new ReadableStream<Uint8Array<ArrayBuffer>>({
-            start: (c) => {
-                this.controller = c as ReadableStreamDefaultController<Uint8Array<ArrayBuffer>>;
-            }
-        }) as globalThis.ReadableStream<Uint8Array<ArrayBuffer>>;
-
-        this.writable = new WritableStream<BufferSource>({
-            write: (chunk) => {
-                if (!this.handle) throw new TypeError('CompressionStream is closed');
-                const output = this.handle.deflate(chunk);
-                if (output && output.byteLength > 0) {
-                    this.controller?.enqueue(new Uint8Array(output));
-                }
-            },
-            close: () => {
-                if (!this.handle) return;
-                const output = this.handle.finish();
-                if (output && output.byteLength > 0) {
-                    this.controller?.enqueue(new Uint8Array(output));
-                }
-                this.controller?.close();
-                closeHandle(this.handle as ClosableHandle);
-                this.handle = null;
-            },
-            abort: (reason) => {
-                this.controller?.error(reason);
-                closeHandle(this.handle as ClosableHandle | null);
-                this.handle = null;
-            }
-        }) as globalThis.WritableStream<BufferSource>;
+        const streams = createCompressionStreams(handle);
+        this.readable = streams.readable;
+        this.writable = streams.writable;
     }
 }
-
-// A finished inflate handle reports "already finished" rather than succeeding; both
-// mean the member completed, so only *other* failures indicate truncated input.
-const isAlreadyFinished = (error: unknown): boolean =>
-    error instanceof Error && /already finished/i.test(error.message);
-
-const asDecompressError = (error: unknown): TypeError =>
-    error instanceof TypeError
-        ? error
-        : new TypeError(error instanceof Error ? error.message : String(error));
 
 export class DecompressionStream implements globalThis.DecompressionStream {
     readonly readable: globalThis.ReadableStream<Uint8Array<ArrayBuffer>>;
     readonly writable: globalThis.WritableStream<BufferSource>;
 
-    private handle: CModuleZLib.Inflate | null;
-    private controller: ReadableStreamDefaultController<Uint8Array<ArrayBuffer>> | null = null;
-    private wroteInput = false;
-
     constructor(format: CompressionFormat) {
-        if (format !== 'gzip' && format !== 'deflate' && format !== 'deflate-raw') {
-            throw new TypeError(`Unsupported decompression format: ${format}`);
+        let handle: CModuleZLib.Inflate;
+        switch (format) {
+            case 'gzip': handle = zlib.createGunzip(); break;
+            case 'deflate': handle = zlib.createInflate(); break;
+            case 'deflate-raw': handle = zlib.createInflateRaw(); break;
+            default: throw new TypeError(`Unsupported decompression format: ${format}`);
         }
-
-        if (format === 'gzip') {
-            this.handle = zlib.createGunzip();
-        } else if (format === 'deflate') {
-            this.handle = zlib.createInflate();
-        } else if (format === 'deflate-raw') {
-            this.handle = zlib.createInflateRaw();
-        } else {
-            throw new TypeError(`Unsupported decompression format: ${format}`);
-        }
-
-        this.readable = new ReadableStream<Uint8Array<ArrayBuffer>>({
-            start: (c) => {
-                this.controller = c as ReadableStreamDefaultController<Uint8Array<ArrayBuffer>>;
-            }
-        }) as globalThis.ReadableStream<Uint8Array<ArrayBuffer>>;
-
-        this.writable = new WritableStream<BufferSource>({
-            write: (chunk) => {
-                if (!this.handle) throw new TypeError('DecompressionStream is closed');
-                if (chunk.byteLength > 0) this.wroteInput = true;
-                let output: ArrayBuffer;
-                try {
-                    output = this.handle.inflate(chunk);
-                } catch (error) {
-                    // Corrupt input. The readable must be errored too: erroring only the
-                    // writable left every consumer of `readable` awaiting a chunk that
-                    // never arrived, so a garbage body hung instead of rejecting.
-                    const reason = asDecompressError(error);
-                    this.controller?.error(reason);
-                    closeHandle(this.handle as ClosableHandle | null);
-                    this.handle = null;
-                    throw reason;
-                }
-                if (output && output.byteLength > 0) {
-                    this.controller?.enqueue(new Uint8Array(output));
-                }
-            },
-            close: () => {
-                if (!this.handle) return;
-                try {
-                    if (!this.wroteInput) {
-                        throw new TypeError('corrupt gzip stream does not have a matching checksum');
-                    }
-                    // `inflate()` returns partial output for input that stops mid-member
-                    // without reporting anything, so ask the handle to finish: only
-                    // success or "already finished" means the stream really ended.
-                    let tail: ArrayBuffer | undefined;
-                    try {
-                        tail = this.handle.finish();
-                    } catch (error) {
-                        if (!isAlreadyFinished(error)) {
-                            throw new TypeError('unexpected end of file');
-                        }
-                    }
-                    if (tail && tail.byteLength > 0) {
-                        this.controller?.enqueue(new Uint8Array(tail));
-                    }
-                    this.controller?.close();
-                } catch (error) {
-                    if (isAlreadyFinished(error)) {
-                        this.controller?.close();
-                        return;
-                    }
-                    const reason = asDecompressError(error);
-                    this.controller?.error(reason);
-                    throw reason;
-                } finally {
-                    closeHandle(this.handle as ClosableHandle | null);
-                    this.handle = null;
-                }
-            },
-            abort: (reason) => {
-                this.controller?.error(reason);
-                closeHandle(this.handle as ClosableHandle | null);
-                this.handle = null;
-            }
-        }) as globalThis.WritableStream<BufferSource>;
+        const streams = createCompressionStreams(handle);
+        this.readable = streams.readable;
+        this.writable = streams.writable;
     }
 }
 

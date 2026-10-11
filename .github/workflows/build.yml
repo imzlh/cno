@@ -1,0 +1,102 @@
+name: Build JavaScript
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  javascript:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: cno
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: cno
+          persist-credentials: false
+
+      # Keep the sibling layout used by package.json and native declarations.
+      - name: Check out circu.js declarations
+        uses: actions/checkout@v4
+        with:
+          repository: imzlh/circu.js
+          ref: 8df0b515762350a1cb29731655c9ecca39edc098
+          path: circu.js
+          sparse-checkout: types
+          persist-credentials: false
+
+      - name: Check out HTTP source
+        uses: actions/checkout@v4
+        with:
+          repository: imzlh/cno-stdhttp
+          ref: 219d3e077418e8d8135c03857611e5409b1a3354
+          path: http
+          persist-credentials: false
+
+      - name: Check out QUIC declarations
+        uses: actions/checkout@v4
+        with:
+          repository: imzlh/cno-ext-quic
+          ref: 0b7e6f7c97f9b25b6fe6110a66385586019849d1
+          path: ext-quic
+          sparse-checkout: |
+            native.d.ts
+            index.d.ts
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Check out the shared CTS event dispatcher
+        uses: actions/checkout@v4
+        with:
+          repository: imzlh/cts
+          ref: 9c3117af92d43fc9f049bcfa4e23c2f7db9e84ec
+          path: cts
+          sparse-checkout: src/runtime/event-mux.ts
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: cno/package.json
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: pnpm
+          cache-dependency-path: cno/pnpm-lock.yaml
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Check release version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            const { version } = JSON.parse(readFileSync("package.json", "utf8"));
+            if (process.env.GITHUB_REF_NAME !== `v${version}`) {
+              throw new Error("Release tag must match package.json version");
+            }
+          '
+
+      - run: pnpm run type-check:bundle
+      - run: pnpm run build
+      - run: pnpm run min-build
+
+      - name: Validate and checksum JavaScript artifacts
+        run: |
+          node --check dist.js
+          node --check dist.min.js
+          sha256sum dist.js dist.min.js > SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cno-js
+          path: |
+            cno/dist.js
+            cno/dist.min.js
+            cno/SHA256SUMS
+          if-no-files-found: error

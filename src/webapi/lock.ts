@@ -15,13 +15,7 @@ interface LockRequest {
     reject: (reason: unknown) => void;
     signal?: AbortSignal;
     cb: LockCallback<unknown>;
-    /**
-     * Detaches the `abort` listener. Called the moment the request is granted:
-     * per spec the signal only aborts a request that is still *queued*; once
-     * the lock is held, abort() is ignored and the callback's result stands.
-     * OBSERVED Deno 2.9.3: aborting during the callback resolves with the
-     * callback's return value.
-     */
+    /** Detach the abort listener on grant; signals only cancel queued requests. */
     granted?: () => void;
 }
 
@@ -35,18 +29,9 @@ export class Lock {
     }
 }
 
-/**
- * Currently-granted locks, keyed by name. `active` holds the granted requests
- * themselves (not just a count) so that `steal` can reject their promises and
- * so that a release can be matched to the request that is finishing — a stolen
- * holder must not release the thief's lock when its callback finally settles.
- */
+// Track holder identity so a stolen request cannot release its replacement.
 const held = new Map<string, { mode: LockMode; active: Set<LockRequest> }>();
 const queues = new Map<string, LockRequest[]>();
-
-function isPromiseLike<T>(value: unknown): value is PromiseLike<T> {
-    return !!value && typeof value === 'object' && typeof Reflect.get(value, 'then') === 'function';
-}
 
 function canGrantImmediately(name: string, mode: LockMode): boolean {
     const queue = queues.get(name);
@@ -71,7 +56,6 @@ function deleteEmptyQueue(name: string, queue?: LockRequest[]): void {
 function processQueue(name: string) {
     const queue = queues.get(name);
     if (!queue?.length) {
-        held.delete(name);
         deleteEmptyQueue(name, queue);
         return;
     }
@@ -83,7 +67,6 @@ function processQueue(name: string) {
         aborted.reject(aborted.signal?.reason ?? new DOMException('Lock request aborted', 'AbortError'));
     }
     if (!queue.length) {
-        held.delete(name);
         deleteEmptyQueue(name, queue);
         return;
     }
@@ -123,48 +106,27 @@ function processQueue(name: string) {
     }
 }
 
-function runLock(name: string, req: LockRequest) {
-    // Granted: the signal can no longer abort this request (spec), so drop the
-    // listener before the callback runs — a callback that aborts its own signal
-    // must still see its return value reach the caller.
+async function runLock(name: string, req: LockRequest): Promise<void> {
     req.granted?.();
-    const lock = new Lock(name, req.mode);
-    let result: unknown;
     try {
-        result = req.cb(lock);
-    } catch (e) {
-        req.reject(e);
-        release(name, req);
-        return;
-    }
-    if (isPromiseLike<unknown>(result)) {
-        result.then(
-            (v) => { req.resolve(v); release(name, req); },
-            (e) => { req.reject(e); release(name, req); },
-        );
-    } else {
-        req.resolve(result);
+        req.resolve(await req.cb(new Lock(name, req.mode)));
+    } catch (error) {
+        req.reject(error);
+    } finally {
         release(name, req);
     }
 }
 
 function release(name: string, req: LockRequest) {
     const h = held.get(name);
-    // Not the current holder — e.g. this request was stolen out from under us
-    // and its callback has only now settled. Releasing here would hand the
-    // thief's lock away, so do nothing.
+    // A stolen request may finish after a new holder acquires the lock.
     if (!h || !h.active.has(req)) return;
     h.active.delete(req);
     if (h.active.size === 0) held.delete(name);
     processQueue(name);
 }
 
-/**
- * `steal: true` — break every lock currently held under `name` and reject each
- * holder. OBSERVED Deno 2.9.3: the victim rejects with
- * `AbortError: The lock was broken`, its callback keeps running to completion,
- * and the thief jumps ahead of anything already queued.
- */
+/** Reject current holders while their callbacks continue running. */
 function breakLock(name: string) {
     const h = held.get(name);
     if (!h) return;
@@ -184,10 +146,7 @@ export class LockManager {
         const mode: LockMode = options.mode ?? 'exclusive';
         const signal: AbortSignal | undefined = options.signal;
         if (mode !== 'exclusive' && mode !== 'shared') throw new TypeError('Invalid lock mode');
-        // NOTE: spec + Deno throw NotSupportedError here, but
-        // tests/webapi/locks-broadcast.test.ts pins TypeError for this pair, so
-        // the pre-existing type is kept. The two checks below are new and follow
-        // Deno's NotSupportedError.
+        // Keep the established TypeError for this conflicting option pair.
         if (options.ifAvailable && options.steal) throw new TypeError('ifAvailable and steal cannot both be true');
         if (options.steal && mode !== 'exclusive') {
             throw new DOMException("'mode' must be 'exclusive' if 'steal' is specified", 'NotSupportedError');
@@ -208,17 +167,7 @@ export class LockManager {
 
         if (options.steal) breakLock(name);
 
-        // `return await` is load-bearing, not a style choice. `processQueue`
-        // below can run the callback synchronously, so this promise may already
-        // be REJECTED by the time the executor returns. Handing an
-        // already-rejected promise back with a bare `return` makes the async
-        // function adopt it via a *later* job, while the runtime's
-        // unhandled-rejection probe is already queued — so a rejection the
-        // caller does handle gets reported as unhandled (fires both
-        // `unhandledrejection` and `process.on('unhandledRejection')`).
-        // `await` attaches the reaction synchronously, in this same turn, so the
-        // promise is marked handled before that probe runs. The caller still
-        // rejects with the original error.
+        // Attach rejection handling before a synchronous callback can fail.
         return await new Promise<T>((resolve, reject) => {
             let settled = false;
             let onAbort: (() => void) | undefined;
@@ -259,9 +208,7 @@ export class LockManager {
                 queue = [];
                 queues.set(name, queue);
             }
-            // A thief jumps the queue: it must be granted immediately rather
-            // than waiting behind requests that were already pending (OBSERVED
-            // Deno 2.9.3: order is thief, then the earlier waiter).
+            // A stolen lock is granted ahead of pending requests.
             if (options.steal) queue.unshift(req);
             else queue.push(req);
             processQueue(name);

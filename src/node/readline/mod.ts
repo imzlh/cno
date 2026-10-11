@@ -1,8 +1,3 @@
-/**
- * Node.js readline module
- * Based on circu.js streams TTY/Pipe for terminal I/O
- */
-
 import { EventEmitter } from '../events';
 import { arrayBufferBackedBytes } from '../_internal/buffer';
 import { flattenPrototype } from '../_internal/prototype';
@@ -37,10 +32,7 @@ async function writeTarget(target: OutputTarget, data: string): Promise<void> {
     }
 
     await new Promise<void>((resolve, reject) => {
-        let settled = false;
         const done = (err?: Error | null): void => {
-            if (settled) return;
-            settled = true;
             if (err) reject(err);
             else resolve();
         };
@@ -174,11 +166,7 @@ function initInterface(self: Interface, options: ReadLineOptions | NodeJS.Readab
     self._lineBuf = [];
     self._reading = false;
     self._pendingCR = false;
-    // `stream: true` must be passed to each decode() call, not just the ctor —
-    // the ctor flag alone does not retain the partial-sequence state, so a
-    // multi-byte character split across two chunks decodes to U+FFFD per byte.
-    // `ignoreBOM: true` keeps a leading U+FEFF in the data: Node's readline
-    // reports the BOM as part of the first line rather than swallowing it.
+    // Preserve BOMs and pass stream: true to each decode to retain partial UTF-8.
     self._decoder = new text.Decoder(undefined, { stream: true, ignoreBOM: true });
     self._outputQueue = Promise.resolve();
     self._outputPending = 0;
@@ -197,9 +185,7 @@ function initInterface(self: Interface, options: ReadLineOptions | NodeJS.Readab
     self._removeHistoryDups = opts.removeHistoryDuplicates ?? false;
     self._prompt = opts.prompt ?? '> ';
 
-    // Only touch raw mode when the input really is the shared stdin TTY;
-    // otherwise a readline over an unrelated stream would flip the whole
-    // process's terminal into raw mode and never be able to restore it.
+    // Only the shared stdin TTY owns the process's raw mode.
     const isSharedStdin = (self._input as unknown) === (stdin as unknown);
     if (self._terminal && isSharedStdin && stdin.isTTY) try {
         const stream = stdin.__stream as CModuleStreams.TTY;
@@ -208,11 +194,17 @@ function initInterface(self: Interface, options: ReadLineOptions | NodeJS.Readab
         self._rawMode = true;
     } catch { }
 
-    if (opts.signal) {
-        if (opts.signal.aborted) self.close();
-        else opts.signal.addEventListener('abort', () => self.close(), { once: true });
+    const { signal } = opts;
+    if (signal) {
+        if (signal.aborted) self.close();
+        else {
+            const onAbort = () => self.close();
+            signal.addEventListener('abort', onAbort, { once: true });
+            self.once('close', () => signal.removeEventListener('abort', onAbort));
+        }
     }
 
+    if (self._closed) return;
     if (opts.prompt && self._terminal) self._displayPrompt();
     if (!self._paused) self._startRead();
 }
@@ -266,7 +258,6 @@ Interface.prototype._refreshLine = function _refreshLine(this: Interface): void 
 
 type StreamListener = (...args: never[]) => void;
 
-/** The duck-typed surface `_startRead` actually probes on an input stream. */
 type EmitterInput = NodeJS.ReadableStream & {
     __stream?: CModuleStreams.Stream;
     on?: (event: string, listener: StreamListener) => unknown;
@@ -291,17 +282,13 @@ Interface.prototype._startRead = function _startRead(this: Interface): void {
             this._reading = false;
             this.close();
         };
-        // Node re-emits an input stream error on the Interface (and leaves it
-        // open). Swallowing it made a failed read indistinguishable from a
-        // clean EOF, because 'close' still arrived.
         const onError = (err: unknown) => {
-            this._reading = false;
             this.emit('error', err);
         };
         input.on('data', onData as StreamListener);
         input.once?.('end', onEnd);
         input.once?.('close', onEnd);
-        input.once?.('error', onError);
+        input.on('error', onError);
         this._detachInput = () => {
             input.off?.('data', onData as StreamListener);
             input.off?.('end', onEnd);
@@ -343,17 +330,10 @@ Interface.prototype._readLoop = async function _readLoop(this: Interface): Promi
 };
 
 Interface.prototype._processInput = function _processInput(this: Interface, data: string): void {
-    // `terminal` (not the OS raw-mode flag) selects line editing + history, so a
-    // terminal:true interface over a plain stream still behaves like Node's.
     if (this._terminal) this._processRawInput(data);
     else this._processLineInput(data);
 };
 
-/**
- * Node splits lines on LF, CR, CRLF *and* the Unicode separators U+2028 /
- * U+2029. Missing the latter two collapses a whole LS/PS-separated file into a
- * single line.
- */
 function isLineTerminator(ch: string | undefined): boolean {
     return ch === '\r' || ch === '\n' || ch === ' ' || ch === ' ';
 }
@@ -361,9 +341,7 @@ function isLineTerminator(ch: string | undefined): boolean {
 Interface.prototype._processLineInput = function _processLineInput(this: Interface, data: string): void {
     for (let i = 0; i < data.length; i++) {
         const ch = data[i];
-        // A CR that ended the *previous* chunk leaves its LF to be swallowed
-        // here; without this, a chunk boundary landing inside a CRLF pair
-        // emits a spurious empty line.
+        // A CRLF pair can span chunks.
         if (this._pendingCR) {
             this._pendingCR = false;
             if (ch === '\n') continue;

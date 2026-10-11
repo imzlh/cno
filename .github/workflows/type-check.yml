@@ -1,32 +1,19 @@
-name: Type Check
+name: Type check and bundle
 
 on:
   push:
     branches: [master, main]
   pull_request:
     branches: [master, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cno-ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  type-check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: pnpm/action-setup@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-
-      - run: pnpm install
-
-      - name: clone types
-        run: |
-          mkdir -p types
-          cd types
-          git clone https://github.com/imzlh/circu.js
-          mv circu.js/types/* .
-          wget https://github.com/denoland/deno/releases/download/v2.7.14/lib.deno.d.ts
-
-      - run: pnpm run type-check
+  build:
+    uses: ./.github/workflows/build.yml

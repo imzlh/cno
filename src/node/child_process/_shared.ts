@@ -45,9 +45,15 @@ export function streamEndPending(stream: Readable | null): stream is Readable {
 export function waitStreamEnd(stream: Readable | null): Promise<void> {
     if (!streamEndPending(stream)) return Promise.resolve();
     return new Promise<void>((resolve) => {
-        stream.once('end', resolve);
-        stream.once('close', resolve);
-        stream.once('error', resolve);
+        const done = () => {
+            stream.removeListener('end', done);
+            stream.removeListener('close', done);
+            stream.removeListener('error', done);
+            resolve();
+        };
+        stream.once('end', done);
+        stream.once('close', done);
+        stream.once('error', done);
     });
 }
 

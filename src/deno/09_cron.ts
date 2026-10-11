@@ -8,14 +8,10 @@ type CronOptions = {
 type CronField = 'minute' | 'hour' | 'dayOfMonth' | 'month' | 'dayOfWeek';
 
 type Matcher = {
-    minute: Set<number>;
-    hour: Set<number>;
     dayOfMonth: Set<number>;
-    month: Set<number>;
     dayOfWeek: Set<number>;
     minuteValues: number[];
     hourValues: number[];
-    dayOfMonthValues: number[];
     monthValues: number[];
     dayOfMonthWildcard: boolean;
     dayOfWeekWildcard: boolean;
@@ -23,7 +19,7 @@ type Matcher = {
 
 type CompiledSchedule = {
     source: string | Deno.CronSchedule;
-    matches(date: Date): boolean;
+    matcher: Matcher;
 };
 
 const timers = import.meta.use('timers');
@@ -148,28 +144,17 @@ function compileMatcher(source: string | Deno.CronSchedule): Matcher {
     if (typeof source === 'string') {
         const fields = source.trim().split(/\s+/);
         if (fields.length !== 5) fail(`expected 5 cron fields, got ${fields.length}`);
-        const minute = fields[0];
-        const hour = fields[1];
-        const dayOfMonth = fields[2];
-        const month = fields[3];
-        const dayOfWeek = fields[4];
-        if (minute === undefined || hour === undefined || dayOfMonth === undefined || month === undefined || dayOfWeek === undefined) {
-            fail(`expected 5 cron fields, got ${fields.length}`);
-        }
+        const [minute, hour, dayOfMonth, month, dayOfWeek] = fields;
         const minuteSet = parseStringField('minute', minute);
         const hourSet = parseStringField('hour', hour);
         const dayOfMonthSet = parseStringField('dayOfMonth', dayOfMonth);
         const monthSet = parseStringField('month', month);
         const dayOfWeekSet = parseStringField('dayOfWeek', dayOfWeek);
         return {
-            minute: minuteSet,
-            hour: hourSet,
             dayOfMonth: dayOfMonthSet,
-            month: monthSet,
             dayOfWeek: dayOfWeekSet,
             minuteValues: Array.from(minuteSet).sort((a, b) => a - b),
             hourValues: Array.from(hourSet).sort((a, b) => a - b),
-            dayOfMonthValues: Array.from(dayOfMonthSet).sort((a, b) => a - b),
             monthValues: Array.from(monthSet).sort((a, b) => a - b),
             dayOfMonthWildcard: dayOfMonth === '*',
             dayOfWeekWildcard: dayOfWeek === '*',
@@ -182,35 +167,13 @@ function compileMatcher(source: string | Deno.CronSchedule): Matcher {
     const monthSet = parseScheduleExpression('month', source.month);
     const dayOfWeekSet = parseScheduleExpression('dayOfWeek', source.dayOfWeek);
     return {
-        minute: minuteSet,
-        hour: hourSet,
         dayOfMonth: dayOfMonthSet,
-        month: monthSet,
         dayOfWeek: dayOfWeekSet,
         minuteValues: Array.from(minuteSet).sort((a, b) => a - b),
         hourValues: Array.from(hourSet).sort((a, b) => a - b),
-        dayOfMonthValues: Array.from(dayOfMonthSet).sort((a, b) => a - b),
         monthValues: Array.from(monthSet).sort((a, b) => a - b),
         dayOfMonthWildcard: source.dayOfMonth === undefined,
         dayOfWeekWildcard: source.dayOfWeek === undefined,
-    };
-}
-
-function compileSchedule(source: string | Deno.CronSchedule): CompiledSchedule {
-    const matcher = compileMatcher(source);
-    return {
-        source,
-        matches(date: Date): boolean {
-            const dayOfMonthMatch = matcher.dayOfMonth.has(date.getUTCDate());
-            const dayOfWeekMatch = matcher.dayOfWeek.has(date.getUTCDay());
-            const dayMatch = matcher.dayOfMonthWildcard || matcher.dayOfWeekWildcard
-                ? dayOfMonthMatch && dayOfWeekMatch
-                : dayOfMonthMatch || dayOfWeekMatch;
-            return matcher.minute.has(date.getUTCMinutes())
-                && matcher.hour.has(date.getUTCHours())
-                && matcher.month.has(date.getUTCMonth() + 1)
-                && dayMatch;
-        }
     };
 }
 
@@ -230,7 +193,7 @@ function matchesDay(matcher: Matcher, date: Date): boolean {
 }
 
 function nextRunAt(schedule: CompiledSchedule, now: Date): Date {
-    const matcher = compileMatcher(schedule.source);
+    const { matcher } = schedule;
     const cursor = new Date(now.getTime());
     cursor.setUTCSeconds(0, 0);
     cursor.setUTCMinutes(cursor.getUTCMinutes() + 1);
@@ -240,9 +203,7 @@ function nextRunAt(schedule: CompiledSchedule, now: Date): Date {
         const month = cursor.getUTCMonth() + 1;
         const nextMonth = nextAllowedValue(matcher.monthValues, month);
         if (nextMonth === null) {
-            const firstMonth = matcher.monthValues[0];
-            if (firstMonth === undefined) fail('empty month schedule');
-            cursor.setUTCFullYear(cursor.getUTCFullYear() + 1, firstMonth - 1, 1);
+            cursor.setUTCFullYear(cursor.getUTCFullYear() + 1, matcher.monthValues[0] - 1, 1);
             cursor.setUTCHours(0, 0, 0, 0);
             continue;
         }
@@ -281,13 +242,12 @@ function nextRunAt(schedule: CompiledSchedule, now: Date): Date {
             continue;
         }
 
-        if (schedule.matches(cursor)) return new Date(cursor.getTime());
-        cursor.setUTCMinutes(cursor.getUTCMinutes() + 1, 0, 0);
+        return cursor;
     }
     fail(`unable to find next run for schedule ${JSON.stringify(schedule.source)}`);
 }
 
-function normalizeOptions(options?: CronOptions): Required<CronOptions> {
+function normalizeOptions(options?: CronOptions): CronOptions & { backoffSchedule: number[] } {
     const backoff = options?.backoffSchedule ?? [];
     if (!Array.isArray(backoff)) fail('backoffSchedule must be an array');
     if (backoff.length > MAX_RETRIES) fail(`backoffSchedule can contain at most ${MAX_RETRIES} entries`);
@@ -295,7 +255,7 @@ function normalizeOptions(options?: CronOptions): Required<CronOptions> {
         if (!Number.isInteger(delay) || delay < 0) fail('backoffSchedule values must be non-negative integers');
         if (delay > MAX_BACKOFF_MS) fail(`backoffSchedule values must be <= ${MAX_BACKOFF_MS}`);
     }
-    return { backoffSchedule: backoff, signal: options?.signal ?? new AbortController().signal };
+    return { backoffSchedule: backoff, signal: options?.signal };
 }
 
 function validateName(name: string): void {
@@ -352,19 +312,16 @@ async function runWithBackoff(name: string, backoffSchedule: number[], signal: A
                 emitCronError(name, error);
                 return;
             }
-            const delay = backoffSchedule[attempt];
-            if (delay === undefined) return;
-            await sleep(delay, signal);
+            await sleep(backoffSchedule[attempt], signal);
         }
     }
 }
 
-function createCronJob(name: string, schedule: string | Deno.CronSchedule, options: Required<CronOptions>, handler: () => Promise<void> | void): Promise<void> {
-    const compiled = compileSchedule(schedule);
+function createCronJob(name: string, schedule: string | Deno.CronSchedule, options: ReturnType<typeof normalizeOptions>, handler: () => Promise<void> | void): Promise<void> {
+    const compiled = { source: schedule, matcher: compileMatcher(schedule) };
     let timerId: number | null = null;
     let stopped = false;
-    let running = false;
-    let resolveJob: (() => void) | undefined;
+    const job = Promise.withResolvers<void>();
 
     const stop = () => {
         if (stopped) return;
@@ -375,7 +332,7 @@ function createCronJob(name: string, schedule: string | Deno.CronSchedule, optio
         }
         options.signal?.removeEventListener('abort', stop);
         activeCronJobs.delete(name);
-        resolveJob?.();
+        job.resolve();
     };
 
     if (options.signal) {
@@ -390,24 +347,24 @@ function createCronJob(name: string, schedule: string | Deno.CronSchedule, optio
         timerId = timers.setTimeout(async () => {
             timerId = null;
             if (stopped || options.signal?.aborted) return;
-            if (!running) {
-                running = true;
-                try {
-                    await runWithBackoff(name, options.backoffSchedule, options.signal, handler);
-                } finally {
-                    running = false;
-                }
+            try {
+                await runWithBackoff(name, options.backoffSchedule, options.signal, handler);
+                scheduleNext();
+            } catch (error) {
+                stop();
+                if (!options.signal?.aborted) emitCronError(name, error);
             }
-            scheduleNext();
         }, delay);
     };
 
     activeCronJobs.set(name, stop);
-    scheduleNext();
-    return new Promise<void>((resolve) => {
-        resolveJob = resolve;
-        if (stopped) resolve();
-    });
+    try {
+        scheduleNext();
+    } catch (error) {
+        stop();
+        throw error;
+    }
+    return job.promise;
 }
 
 function cron(

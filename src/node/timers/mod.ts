@@ -1,9 +1,3 @@
-/**
- * Node.js timers module
- * Timer functions and TimersPromises for promise-based timer APIs
- * Type definitions reference: @types/node/timers.d.ts
- */
-
 const timer = import.meta.use('timers');
 
 type TimerCallback = (...args: unknown[]) => void;
@@ -11,14 +5,7 @@ type TimerCallback = (...args: unknown[]) => void;
 // Node clamps every timer delay into [1, 2^31-1] and warns outside that range.
 const TIMEOUT_MAX = 2 ** 31 - 1;
 
-// Node's timers/promises rejects with an instance of a real `AbortError` class,
-// not a plain Error carrying `name = 'AbortError'`. Measured on v24.18.0:
-// `err.constructor.name` and `Object.getPrototypeOf(err).constructor.name` are
-// both 'AbortError', while a plain-Error version reports 'Error' for both. Code
-// that brands errors by constructor rather than by `.name` (a common pattern in
-// retry/cancellation wrappers) sees a different class and misroutes the error.
-// `name` and `code` stay OWN properties so `Object.getOwnPropertyNames` remains
-// cause+code+message+name+stack, exactly as Node reports it.
+// Preserve the AbortError constructor identity and own name/code properties.
 class AbortError extends Error {
     name: string;
     code: string;
@@ -30,10 +17,6 @@ class AbortError extends Error {
         this.code = 'ABORT_ERR';
         if (reason !== undefined) this.cause = reason;
     }
-}
-
-function createAbortError(reason?: unknown): Error & { name: string; code: string; cause?: unknown } {
-    return new AbortError(reason);
 }
 
 function describeReceived(value: unknown): string {
@@ -98,14 +81,10 @@ function toTimerId(timeout: NodeJS.Timeout | string | number | undefined): numbe
     return Number.isNaN(id) ? undefined : id;
 }
 
-// TimerOptions
-
 export interface TimerOptions {
     ref?: boolean;
     signal?: AbortSignal;
 }
-
-// Timeout wrapper
 
 class Timeout implements NodeJS.Timeout {
     #id = 0;
@@ -134,10 +113,7 @@ class Timeout implements NodeJS.Timeout {
     }
 
     #schedule(): void {
-        // Node marks a one-shot destroyed only once its callback RETURNS, and
-        // leaves it live if the callback re-armed it via refresh(). Bumping a
-        // generation on every (re)schedule lets the finally block tell those
-        // two cases apart. Measured against Node v24.18.0.
+        // A refresh inside the callback must keep the new timer alive.
         const generation = ++this.#generation;
         const callback = () => {
             if (!this.#isInterval) this.#active = false;
@@ -212,8 +188,6 @@ class Timeout implements NodeJS.Timeout {
         return Number(this.#id);
     }
 }
-
-// Immediate wrapper
 
 class Immediate implements NodeJS.Immediate {
     #id: number;
@@ -292,8 +266,6 @@ function clearForeignImmediate(handle: object): boolean {
     return true;
 }
 
-// Timer functions
-
 export function setTimeout<T>(callback: (...args: T[]) => void, ms?: number, ...args: T[]): NodeJS.Timeout {
     assertTimerCallback(callback);
     return new Timeout(false, callback, normalizeDelay(ms), args);
@@ -336,26 +308,31 @@ export function clearImmediate(immediate: NodeJS.Immediate | undefined): void {
     if (typeof immediate === 'object' && immediate !== null) clearForeignImmediate(immediate);
 }
 
-// promises namespace
+function timerPromise<T>(delay: number | undefined, value: T, options: TimerOptions | undefined, immediate = false): Promise<T> {
+    assertTimerOptions(options);
+    const signal = options?.signal;
+    if (signal?.aborted) return Promise.reject(new AbortError(signal.reason));
+
+    return new Promise<T>((resolve, reject) => {
+        const onAbort = () => {
+            cleanup();
+            timer.clearTimeout(id);
+            reject(new AbortError(signal?.reason));
+        };
+        const cleanup = () => signal?.removeEventListener('abort', onAbort);
+        signal?.addEventListener('abort', onAbort, { once: true });
+        const id = timer.setTimeout(() => {
+            cleanup();
+            resolve(value);
+        }, immediate ? 0 : normalizeDelay(delay));
+        if (options?.ref === false) timer.unrefTimer(id);
+    });
+}
 
 export const promises = {
     setTimeout<T = void>(delay?: number, value?: T, options?: TimerOptions): Promise<T> {
         assertPromiseDelay(delay);
-        assertTimerOptions(options);
-        const signal = options?.signal;
-        if (signal?.aborted) return Promise.reject(createAbortError(signal.reason));
-
-        return new Promise<T>((resolve, reject) => {
-            const onAbort = () => { cleanup(); timer.clearTimeout(id); reject(createAbortError(signal?.reason)); };
-            const cleanup = () => { signal?.removeEventListener('abort', onAbort); };
-            signal?.addEventListener('abort', onAbort, { once: true });
-
-            const id = timer.setTimeout(() => {
-                cleanup();
-                resolve(value as T);
-            }, normalizeDelay(delay));
-            if (options?.ref === false) timer.unrefTimer(id);
-        });
+        return timerPromise(delay, value as T, options);
     },
 
     setInterval<T = void>(delay?: number, value?: T, options?: TimerOptions): AsyncIterableIterator<T> {
@@ -374,41 +351,12 @@ export const promises = {
     },
 
     setImmediate<T = void>(value?: T, options?: TimerOptions): Promise<T> {
-        assertTimerOptions(options);
-        const signal = options?.signal;
-        if (signal?.aborted) return Promise.reject(createAbortError(signal.reason));
-
-        return new Promise<T>((resolve, reject) => {
-            const onAbort = () => { cleanup(); timer.clearTimeout(id); reject(createAbortError(signal?.reason)); };
-            const cleanup = () => { signal?.removeEventListener('abort', onAbort); };
-            signal?.addEventListener('abort', onAbort, { once: true });
-
-            const id = timer.setTimeout(() => {
-                cleanup();
-                resolve(value as T);
-            }, 0);
-            if (options?.ref === false) timer.unrefTimer(id);
-        });
+        return timerPromise(undefined, value as T, options, true);
     },
 
     scheduler: {
         wait(delay: number, options?: { signal?: AbortSignal }): Promise<void> {
-            assertPromiseDelay(delay);
-            assertTimerOptions(options);
-            const signal = options?.signal;
-            if (signal?.aborted) return Promise.reject(createAbortError(signal.reason));
-
-            return new Promise<void>((resolve, reject) => {
-                const onAbort = () => { cleanup(); timer.clearTimeout(id); reject(createAbortError(signal?.reason)); };
-                const cleanup = () => { signal?.removeEventListener('abort', onAbort); };
-                signal?.addEventListener('abort', onAbort, { once: true });
-
-                const id = timer.setTimeout(() => {
-                    cleanup();
-                    resolve();
-                }, normalizeDelay(delay));
-                if (Reflect.get(options ?? {}, 'ref') === false) timer.unrefTimer(id);
-            });
+            return promises.setTimeout(delay, undefined, options);
         },
 
         yield(): Promise<void> {

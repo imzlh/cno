@@ -1,6 +1,6 @@
 {
     "compilerOptions": {
-        "rootDir": "./",
+        "rootDir": "../",
         "outDir": "./dist",
         "module": "esnext",
         "target": "esnext",
@@ -29,11 +29,13 @@
         "skipLibCheck": true,
         "allowJs": true
     },
+    "files": [
+        "./node_modules/.cache/cno-types/lib.deno.d.ts"
+    ],
     "include": [
         "src/**/*",
         "src/type/**/*.d.ts",
-        "lib.deno.d.ts",
-        "types/**/*.d.ts"
+        "../circu.js/types/**/*.d.ts"
     ],
     "exclude": [
         "./example/",

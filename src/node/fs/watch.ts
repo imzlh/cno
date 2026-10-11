@@ -102,16 +102,12 @@ export class FSWatcher extends EventEmitter<WatchEvents> {
         if (signal && abortHandler) signal.removeEventListener('abort', abortHandler);
         const watcher = this.watcher;
         this.watcher = null;
-        if (!watcher) {
-            this.emit('close');
-            return;
-        }
         try {
-            watcher.close();
-            this.emit('close');
+            watcher?.close();
         } catch (err) {
-            try { this.emit('error', normalizeError(err)); }
-            finally { this.emit('close'); }
+            this.emit('error', normalizeError(err));
+        } finally {
+            this.emit('close');
         }
     }
 
@@ -135,20 +131,17 @@ export function watch(
     listener?: WatchListener,
 ): FSWatcher {
     const { options, listener: watchListener } = normalizeWatchArgs(optionsOrListener, listener);
+    const pathStr = pathToString(path);
     const watcher = new FSWatcher(options);
     if (watchListener) watcher.on('change', watchListener);
 
-    const pathStr = pathToString(path);
     try {
         const nativeWatcher = fswatch.watch(pathStr, (filename, eventType) => {
             watcher.emitChange(eventType, filename);
         }, !!options.recursive);
         watcher.attach(nativeWatcher);
     } catch (err) {
-        // fswatch throws a numeric UV code; Node callers match on 'ENOENT'.
-        // The FSWatcher registers its signal listener before native creation.
-        // Tear it down when creation fails, otherwise a long-lived signal keeps
-        // the failed watcher (and its closure) reachable forever.
+        // Failed native creation must also release the abort listener.
         watcher.close();
         throw toErrnoException(err, 'watch', pathStr);
     }

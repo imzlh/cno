@@ -49,18 +49,7 @@ export interface ClientRequestOptions {
 
 type ClientTransport = Socket | TLSSocket;
 type ClientEventListener = { bivarianceHack(...args: unknown[]): unknown }['bivarianceHack'];
-/*
- * The response callback is declared bivariantly on purpose.
- *
- * Each client stores the concrete IncomingMessage it constructs — node:http
- * keeps `(res: IncomingMessageImpl) => void` — while this shared state only
- * needs the minimal IncomingMessageTarget surface. Under strict function
- * contravariance those two are incompatible, which made every shared helper
- * reject the real ClientRequest that owns the callback. Method-style
- * declarations are bivariant in TypeScript, so this keeps the shared runtime
- * generic over transports without forcing each client to widen the callback it
- * exposes to user code (same idiom as ClientEventListener above).
- */
+// Bivariance lets each client retain its concrete IncomingMessage callback type.
 type ClientResponseCallback = { bivarianceHack(res: IncomingMessageTarget): void }['bivarianceHack'];
 
 export interface ClientRequestState<TTransport extends ClientTransport = ClientTransport> {
@@ -131,8 +120,6 @@ export type AgentLike<TRequest extends ClientRequestState> = {
 type MaybeSecureTransport = ClientTransport & {
     encrypted?: boolean;
     _handshakeComplete?: boolean;
-    once(event: 'secureConnect' | 'error', listener: (...args: unknown[]) => void): unknown;
-    off(event: 'secureConnect' | 'error', listener: (...args: unknown[]) => void): unknown;
 };
 
 const CHUNKED_TRAILER = engine.encodeString('0\r\n\r\n');
@@ -192,17 +179,6 @@ function createAbortError(): Error {
     });
 }
 
-/**
- * Emit `'close'` on the ClientRequest exactly once.
- *
- * Node emits 'close' on the request in *every* terminal path — success,
- * destroy(), destroy(err), abort() and a signal abort — and cno emitted it in
- * none of them. `await once(req, 'close')` and `stream.finished(req)` are the
- * ordinary ways to wait for a request to be over, so both hung forever;
- * OBSERVED as TIMEBOX on all six lifecycle probes in /d/tmp/ag-http/p3-lifecycle.js
- * while node completed each one. The response object did emit 'close', which is
- * why the gap survived: anything that happened to await `res` looked fine.
- */
 export function emitRequestClose<TRequest extends ClientRequestState>(request: TRequest): void {
     if (request._closeEmitted) return;
     request._closeEmitted = true;
@@ -213,42 +189,18 @@ export function applyRequestCommonOptions(self: ClientRequestState): void {
     if (self._options.timeout) self.setTimeout(self._options.timeout);
     const signal = self._options.signal;
     if (!signal) return;
-    // A signal that is ALREADY aborted must fail the request immediately. cno
-    // only ever registered a listener, so a pre-aborted signal was silently
-    // ignored and the request proceeded to connect — OBSERVED as p3-lifecycle S5
-    // TIMEBOX where node rejects with AbortError before touching the network.
-    // Deferred to a microtask so the caller can still attach 'error'/'close'
-    // between http.request(...) returning and the failure landing.
+    // Defer a pre-aborted signal so callers can attach error/close listeners.
     if (signal.aborted) {
-        queueMicrotask(() => abortRequestWithSignal(self, signal));
+        queueMicrotask(() => abortRequestWithSignal(self));
         return;
     }
-    self._abortHandler = () => abortRequestWithSignal(self, signal);
+    self._abortHandler = () => abortRequestWithSignal(self);
     signal.addEventListener('abort', self._abortHandler, { once: true });
 }
 
-/**
- * Signal-driven abort. Distinct from the legacy `req.abort()`: node surfaces an
- * `AbortError` (name 'AbortError', code 'ABORT_ERR', message 'The operation was
- * aborted') rather than the ECONNRESET that `abort()` produces. cno routed both
- * through `abort()`, so a signal abort emitted only the legacy 'abort' event and
- * no error at all: code waiting on 'error' never woke up (p3-lifecycle S4).
- *
- * MEASURED (/d/tmp/ag-http/p14-abortreason.js): node's http client ignores
- * `signal.reason` completely — abort(), abort(new Error('X')),
- * abort('string') and abort(new TypeError) all produce the identical
- * ABORT_ERR AbortError. Only `fetch` propagates the reason. Passing the reason
- * through here (the obvious implementation) therefore diverges three ways: a
- * bare abort() leaked the DOMException with numeric `code` 20, and a custom
- * reason leaked its own name/code.
- */
-function abortRequestWithSignal(request: ClientRequestState, _signal: AbortSignal): void {
+function abortRequestWithSignal(request: ClientRequestState): void {
     if (request._aborted) return;
-    // `_aborted` is the internal "stop reporting transport errors" flag; the
-    // PUBLIC `aborted` stays false for a signal abort. Node only sets
-    // `req.aborted` from the legacy `.abort()` — OBSERVED p1-basic T16
-    // "close:aborted=false:destroyed=true" — so mirroring it here would make
-    // code that branches on `req.aborted` think abort() had been called.
+    // Only legacy abort() sets public `aborted`; signals report AbortError.
     request._aborted = true;
     cleanupRequest(request);
     request.destroyed = true;
@@ -358,20 +310,34 @@ export async function lookupRequestHost(options: ClientRequestOptions, hostname:
     return addrs.find((item: CModuleDNS.ResolvedAddress) => item.family === (isIPv6 ? 6 : 4)) || addrs[0];
 }
 
-async function connectSocket(host: string, port: number): Promise<Socket> {
+async function connectSocket(host: string, port: number, request: ClientRequestState): Promise<Socket> {
     const socket = new Socket();
     await new Promise<void>((resolve, reject) => {
-        const onConnect = () => {
+        const cleanup = () => {
+            socket.off('connect', onConnect);
             socket.off('error', onError);
+            socket.off('close', onClose);
+            request.off('close', onClose);
+        };
+        const onConnect = () => {
+            cleanup();
             resolve();
         };
         const onError = (err: Error) => {
-            socket.off('connect', onConnect);
+            cleanup();
+            destroyTransportQuietly(socket);
             reject(err);
         };
+        const onClose = () => onError(socketResetError());
         socket.once('connect', onConnect);
         socket.once('error', onError);
-        socket.connect(port, host);
+        socket.once('close', onClose);
+        request.once('close', onClose);
+        try {
+            socket.connect(port, host);
+        } catch (error) {
+            onError(normalizeErrnoError(error));
+        }
     });
     socket.setNoDelay(true);
     return socket;
@@ -427,7 +393,8 @@ export async function connectPlainTransport<TRequest extends ClientRequestState>
     const port = resolvePort(request._options.port, fallbackPort);
     const lookupHost = hostForLookup(request.host);
     const addr = await lookupRequestHost(request._options, lookupHost, isIPv6Literal(request.host));
-    return await connectSocket(addr.ip, port);
+    if (request._aborted || request.destroyed) throw socketResetError();
+    return await connectSocket(addr.ip, port, request);
 }
 
 export async function connectSecureTransport<TRequest extends ClientRequestState>(request: TRequest, fallbackPort = 443): Promise<TLSSocket> {
@@ -450,27 +417,35 @@ export async function connectSecureTransport<TRequest extends ClientRequestState
     });
 
     await new Promise<void>((resolve, reject) => {
-        const timeout = timers.setTimeout(() => {
+        const cleanup = () => {
+            timers.clearTimeout(timeout);
             tlsSocket.off('secureConnect', onConnect);
             tlsSocket.off('error', onError);
-            reject(new Error('TLS handshake timeout'));
+            tlsSocket.off('close', onClose);
+            request.off('close', onClose);
+        };
+        const fail = (error: Error) => {
+            cleanup();
+            destroyTransportQuietly(tlsSocket);
+            reject(error);
+        };
+        const timeout = timers.setTimeout(() => {
+            fail(new Error('TLS handshake timeout'));
         }, 10000);
         const onConnect = () => {
-            timers.clearTimeout(timeout);
-            tlsSocket.off('error', onError);
             if (rejectUnauthorized && !tlsSocket.authorized) {
-                reject(tlsSocket.authorizationError ?? new Error('Certificate verification failed'));
+                fail(tlsSocket.authorizationError ?? new Error('Certificate verification failed'));
                 return;
             }
+            cleanup();
             resolve();
         };
-        const onError = (err: Error) => {
-            timers.clearTimeout(timeout);
-            tlsSocket.off('secureConnect', onConnect);
-            reject(err);
-        };
+        const onError = (err: Error) => fail(err);
+        const onClose = () => fail(socketResetError());
         tlsSocket.once('secureConnect', onConnect);
         tlsSocket.once('error', onError);
+        tlsSocket.once('close', onClose);
+        request.once('close', onClose);
     });
 
     return tlsSocket;
@@ -492,6 +467,7 @@ export function releaseRequestTransport<TRequest extends ClientRequestState>(req
     request._transportCleanup?.();
     request._transport = null;
     request._connectPromise = null;
+    request._requestBody.length = 0;
 }
 
 function findHeaderEnd(data: Uint8Array): number {
@@ -521,11 +497,13 @@ function assignRequestTransport<TRequest extends ClientRequestState>(request: TR
 function waitForSecureConnectIfNeeded(transport: ClientTransport, hooks: ClientHooks): Promise<void> {
     if (!hooks.waitForSecureConnect) return Promise.resolve();
     const secure = transport as MaybeSecureTransport;
+    if (secure.destroyed) return Promise.reject(socketResetError());
     if (secure.encrypted !== true || secure._handshakeComplete === true) return Promise.resolve();
     return new Promise((resolve, reject) => {
         const cleanup = () => {
             secure.off('secureConnect', onSecure);
             secure.off('error', onError);
+            secure.off('close', onClose);
         };
         const onSecure = () => {
             cleanup();
@@ -535,8 +513,10 @@ function waitForSecureConnectIfNeeded(transport: ClientTransport, hooks: ClientH
             cleanup();
             reject(error instanceof Error ? error : new Error(String(error)));
         };
+        const onClose = () => onError(socketResetError());
         secure.once('secureConnect', onSecure);
         secure.once('error', onError);
+        secure.once('close', onClose);
     });
 }
 
@@ -567,7 +547,7 @@ export function connectRequest<TRequest extends ClientRequestState>(request: TRe
         request._requestId = request._requestId || nextNodeRequestId(hooks.requestIdPrefix);
 
         const transport = await hooks.connect(request);
-        if (request._aborted) {
+        if (request._aborted || request.destroyed) {
             destroyTransportQuietly(transport);
             throw new Error('Request aborted');
         }
@@ -592,32 +572,32 @@ export function connectRequestWithAgent<TRequest extends ClientRequestState>(req
             hostname: request._options.hostname ?? request.host,
         };
         const transport = await new Promise<RequestTransport<TRequest>>((resolve, reject) => {
-            const onSocket = (socket: RequestTransport<TRequest>) => {
-                // @ts-ignore - args cast
+            const cleanup = () => {
+                request.off('socket', onSocket);
                 request.off('error', onError);
+                request.off('close', onClose);
+            };
+            const onSocket = (socket: RequestTransport<TRequest>) => {
+                cleanup();
                 if (!request._transport) assignRequestTransport(request, socket, hooks);
                 resolve(request._transport || socket);
             };
             const onError = (error: Error) => {
-                // @ts-ignore - args cast
-                request.off('socket', onSocket);
+                cleanup();
                 reject(error);
             };
-            // @ts-ignore - args cast
+            const onClose = () => onError(socketResetError());
             request.once('socket', onSocket);
-            // @ts-ignore - args cast
             request.once('error', onError);
+            request.once('close', onClose);
             try {
                 agent.addRequest(request, agentOptions);
             } catch (error) {
-                // @ts-ignore - args cast
-                request.off('socket', onSocket);
-                // @ts-ignore - args cast
-                request.off('error', onError);
+                cleanup();
                 reject(error);
             }
         });
-        if (request._aborted) {
+        if (request._aborted || request.destroyed) {
             destroyTransportQuietly(transport);
             throw new Error('Request aborted');
         }
@@ -627,6 +607,7 @@ export function connectRequestWithAgent<TRequest extends ClientRequestState>(req
 }
 
 export function ensureRequestConnected<TRequest extends ClientRequestState>(request: TRequest, hooks: ClientHooks<TRequest>): Promise<void> {
+    if (request._aborted || request.destroyed) return Promise.reject(socketResetError());
     const agent = (request as TRequest & { agent?: unknown }).agent;
     if (agent && typeof agent === 'object' && typeof (agent as AgentLike<TRequest>).addRequest === 'function') {
         return connectRequestWithAgent(request, hooks, agent as AgentLike<TRequest>);
@@ -679,10 +660,11 @@ export function formatClientRequestHeader<TRequest extends ClientRequestState>(r
 }
 
 export function markRequestFinished<TRequest extends ClientRequestState>(request: TRequest): void {
-    if (request.writableFinished) return;
+    if (request.writableFinished || request.destroyed) return;
     request.writableEnded = true;
     request.writableFinished = true;
     request.finished = true;
+    request._requestBody.length = 0;
     request.emit('finish');
 }
 
@@ -692,12 +674,12 @@ export async function doBufferedRequest<TRequest extends ClientRequestState>(req
         await ensureRequestConnected(request, hooks);
         if (!request._transport) return;
 
-        const requestBody = Buffer.concat(request._requestBody);
         const bodyLength = request._requestBody.reduce((sum, chunk) => sum + chunk.length, 0);
 
         if (request.hasHeader('transfer-encoding') && String(request.getHeader('transfer-encoding')).toLowerCase().includes('chunked')) {
             await sendRequestLine(request);
             if (bodyLength > 0) {
+                const requestBody = Buffer.concat(request._requestBody);
                 await writeToTransport(request._transport, encodeChunkedFrame(requestBody as Uint8Array));
             }
             await writeToTransport(request._transport, CHUNKED_TRAILER);
@@ -732,22 +714,13 @@ export async function doBufferedRequest<TRequest extends ClientRequestState>(req
                 errorText: String(normalized.message ?? normalized),
             });
         } catch {}
-        if (!request._aborted) request.emit('error', normalized);
+        failRequest(request, normalized);
     }
 }
 
 export async function streamChunk<TRequest extends ClientRequestState>(request: TRequest, data: Uint8Array, hooks: ClientHooks<TRequest>): Promise<void> {
     if (request._streamErrored) return;
-    if (!request._headerFlushStarted) {
-        request._headerFlushStarted = true;
-        request._chunkedEncoding = !request.hasHeader('content-length') && !request.hasHeader('transfer-encoding');
-        if (request._chunkedEncoding && !request.hasHeader('transfer-encoding')) {
-            request.setHeader('Transfer-Encoding', 'chunked');
-        }
-        await ensureRequestConnected(request, hooks);
-        if (!request._transport) return;
-        await sendRequestLine(request);
-    }
+    await startRequestHeaders(request, hooks);
 
     if (!request._transport) return;
     if (request._chunkedEncoding) {
@@ -758,16 +731,7 @@ export async function streamChunk<TRequest extends ClientRequestState>(request: 
 }
 
 export async function finishStreaming<TRequest extends ClientRequestState>(request: TRequest, hooks: ClientHooks<TRequest>): Promise<void> {
-    if (!request._headerFlushStarted) {
-        request._headerFlushStarted = true;
-        request._chunkedEncoding = !request.hasHeader('content-length') && !request.hasHeader('transfer-encoding');
-        if (request._chunkedEncoding && !request.hasHeader('transfer-encoding')) {
-            request.setHeader('Transfer-Encoding', 'chunked');
-        }
-        await ensureRequestConnected(request, hooks);
-        if (!request._transport) return;
-        await sendRequestLine(request);
-    }
+    await startRequestHeaders(request, hooks);
     if (request._transport && request._chunkedEncoding) {
         await writeToTransport(request._transport, CHUNKED_TRAILER);
     }
@@ -776,26 +740,7 @@ export async function finishStreaming<TRequest extends ClientRequestState>(reque
     readResponse(request, hooks);
 }
 
-/**
- * Connect and write the request head *now*, without waiting for `end()`.
- *
- * Two callers need this:
- *  - `req.flushHeaders()`, which in cno only flipped `headersSent` and never
- *    touched the socket.
- *  - `Expect: 100-continue`, where the whole point is that the server sees the
- *    head and answers 100 *before* the body is produced. cno deferred every
- *    byte until `end()`, so the documented flow — wait for 'continue', then
- *    `end(body)` — deadlocked: the client waited for 100, the server waited for
- *    a request. OBSERVED as TIMEBOX with no bytes on the wire at all
- *    (/d/tmp/ag-http/p15-continue.js CASE-A and CASE-B) against node's
- *    ["continue","info:100","res:200:OK"].
- *
- * Framing is decided here because the head is about to be committed: an
- * explicit Content-Length is honoured, otherwise chunked, matching what
- * streamChunk would have chosen. The response reader is started too, since the
- * 1xx cannot be observed without a parser attached.
- */
-export async function flushRequestHeaders<TRequest extends ClientRequestState>(request: TRequest, hooks: ClientHooks<TRequest>): Promise<void> {
+async function startRequestHeaders<TRequest extends ClientRequestState>(request: TRequest, hooks: ClientHooks<TRequest>): Promise<void> {
     if (request._headerFlushStarted) return;
     request._headerFlushStarted = true;
     request._chunkedEncoding = !request.hasHeader('content-length') && !request.hasHeader('transfer-encoding');
@@ -803,6 +748,11 @@ export async function flushRequestHeaders<TRequest extends ClientRequestState>(r
     await ensureRequestConnected(request, hooks);
     if (!request._transport) return;
     await sendRequestLine(request);
+}
+
+export async function flushRequestHeaders<TRequest extends ClientRequestState>(request: TRequest, hooks: ClientHooks<TRequest>): Promise<void> {
+    await startRequestHeaders(request, hooks);
+    // Expect: 100-continue needs a reader before the request body is sent.
     readResponse(request, hooks);
 }
 
@@ -819,19 +769,12 @@ export function expectsContinue(request: ClientRequestState): boolean {
 export function startContinueHandshake<TRequest extends ClientRequestState>(request: TRequest, hooks: ClientHooks<TRequest>): void {
     request._sendChain = request._sendChain
         .then(() => flushRequestHeaders(request, hooks))
-        .catch((err) => {
-            if (!request._streamErrored && !request._aborted) {
-                request._streamErrored = true;
-                request.emit('error', normalizeErrnoError(err));
-            }
-        });
+        .catch((err) => failRequest(request, err));
 }
 
 export function readResponse<TRequest extends ClientRequestState>(request: TRequest, hooks: ClientHooks<TRequest>): void {
     if (!request._transport) return;
-    // With Expect: 100-continue the reader is started right after the head is
-    // flushed, long before the body goes out, so the later finishStreaming /
-    // doBufferedRequest call must not attach a second parser to the same socket.
+    // Header flushing and body completion share one response parser.
     if (request._responseReaderStarted) return;
     request._responseReaderStarted = true;
     const res = hooks.createIncomingMessage(request.socket);
@@ -847,18 +790,11 @@ export function readResponse<TRequest extends ClientRequestState>(request: TRequ
         getHeaders: () => request.getHeaders(),
         onResponse: (response) => {
             (request as TRequest & { _response?: IncomingMessageTarget | null })._response = response;
-            // Node sets `req.res` before invoking the response callback. got's
-            // close-handler guard (core/index.js:1198 `Boolean(request.res)`) reads
-            // it to tell "closed after a response" from "closed with none"; leaving
-            // it unset made every completed request raise a bogus
-            // ReadError/ECONNRESET "The server aborted pending request".
             request.res = response;
             request.emit('response', response);
             if (request._callback) request._callback(response);
         },
         onInformation: (info) => {
-            // Node's order is 'continue' first, then 'information' (OBSERVED
-            // p15-continue CASE-A: ["continue","info:100",...]).
             if (info.statusCode === 100) request.emit('continue');
             request.emit('information', info);
         },
@@ -890,13 +826,7 @@ export function readResponse<TRequest extends ClientRequestState>(request: TRequ
         if (!res.complete) {
             res.aborted = true;
             emitAbortedQuietly(res);
-            // Only fail the response with the error once the caller has actually
-            // received it. If the fault happened before 'response' was emitted
-            // (a refused handshake, for instance) nobody can have attached an
-            // 'error' listener, so res.destroy(err) re-raised it asynchronously
-            // as an uncaught exception *after* the request had already reported
-            // the same error. The request below is the correct — and only —
-            // place to report it.
+            // An undelivered response has no caller error listeners yet.
             const delivered = !!(request as TRequest & { _response?: IncomingMessageTarget | null })._response;
             if (delivered) res.destroy(normalized);
             else res.destroy();
@@ -1033,10 +963,7 @@ export function writeRequest<TRequest extends ClientRequestState>(request: TRequ
     request._sendChain = request._sendChain
         .then(() => streamChunk(request, data, hooks))
         .then(() => callback?.(), (err) => {
-            if (!request._streamErrored && !request._aborted) {
-                request._streamErrored = true;
-                request.emit('error', normalizeErrnoError(err));
-            }
+            failRequest(request, err);
             callback?.(normalizeErrnoError(err));
         });
 
@@ -1060,10 +987,7 @@ export function endRequest<TRequest extends ClientRequestState>(request: TReques
         return request;
     }
 
-    // A pre-flushed head (flushHeaders() or Expect: 100-continue) means the
-    // buffered path can no longer own the framing — it would re-send the head
-    // and re-add Content-Length. The streaming path already keys off
-    // `_headerFlushStarted`, so route through it instead.
+    // A flushed head has already committed the framing.
     if (request._streamedBeforeEnd || request._headerFlushStarted) {
         if (finalChunk !== undefined) {
             const encoding = typeof encodingOrCb === 'string' ? encodingOrCb : undefined;
@@ -1071,14 +995,8 @@ export function endRequest<TRequest extends ClientRequestState>(request: TReques
             request._sendChain = request._sendChain.then(() => streamChunk(request, data, hooks));
         }
         request.writableEnded = true;
-        request._sendChain = request._sendChain.then(() => finishStreaming(request, hooks)).then(() => {
-            markRequestFinished(request);
-            callback?.();
-        }, (err) => {
-            if (!request._streamErrored && !request._aborted) {
-                request._streamErrored = true;
-                request.emit('error', normalizeErrnoError(err));
-            }
+        request._sendChain = request._sendChain.then(() => finishStreaming(request, hooks)).then(() => callback?.(), (err) => {
+            failRequest(request, err);
             callback?.();
         });
         return request;
@@ -1105,9 +1023,6 @@ export function abortRequest<TRequest extends ClientRequestState>(request: TRequ
     const inFlight = request.headersSent && !isResponseComplete(request);
     cleanupRequest(request);
     request.destroyed = true;
-    // Node's legacy abort() tears the socket down under an in-flight request, so
-    // the caller sees ECONNRESET then 'close'. cno emitted neither, so
-    // `req.on('error')` never fired and 'close' never arrived (p3 S3).
     if (inFlight) request.emit('error', socketResetError());
     emitRequestClose(request);
 }
@@ -1130,26 +1045,24 @@ function socketResetError(): Error {
     return normalizeErrnoError(Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }), 'read');
 }
 
+function failRequest(request: ClientRequestState, error: unknown): void {
+    if (request._streamErrored || request._aborted || request.destroyed) return;
+    request._streamErrored = true;
+    request.destroyed = true;
+    cleanupRequest(request);
+    request.emit('error', normalizeErrnoError(error));
+}
+
 function isResponseComplete(request: ClientRequestState): boolean {
     const response = (request as ClientRequestState & { _response?: IncomingMessageTarget | null })._response;
     return !!response?.complete;
 }
 
 export function cleanupRequest<TRequest extends ClientRequestState>(request: TRequest): void {
-    if (request._timeoutId) {
-        timers.clearTimeout(request._timeoutId);
-        request._timeoutId = null;
-    }
-    removeAbortHandler(request);
-    request._transportCleanup?.();
-    if (request._transport) {
-        destroyTransportQuietly(request._transport);
-        request._transport = null;
-    }
-    request._connectPromise = null;
-    // Deferred so the caller's own 'error'/'end' handlers, and the explicit
-    // emitRequestClose() in destroyRequest/abortRequest, all land first;
-    // emitRequestClose is idempotent so whichever runs first wins.
+    const transport = request._transport;
+    releaseRequestTransport(request);
+    if (transport) destroyTransportQuietly(transport);
+    // Let the caller's error/end handlers run before the terminal close event.
     queueMicrotask(() => emitRequestClose(request));
 }
 

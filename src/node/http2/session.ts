@@ -37,7 +37,7 @@ export class Http2Session extends EventEmitter {
     pendingSettingsAck = false;
     /** Settings requested before a transport existed; flushed on attach. */
     private queuedSettings: Array<Record<string, unknown>> = [];
-    private settingsAckWaiters: Array<(s: Http2Session) => void> = [];
+    private settingsAckWaiters: Array<((s: Http2Session) => void) | undefined> = [];
     private timeoutMs = 0;
     private timeoutTimer: ReturnType<typeof setTimeout> | null = null;
     private _originSet: string[] | undefined;
@@ -110,6 +110,19 @@ export class Http2Session extends EventEmitter {
         this._connecting = false;
         this._encrypted = secure;
         this._alpnProtocol = secure ? (alpn ?? 'h2') : false;
+        const session = this.conn!.session;
+        const prevOnSettings = session.onsettings;
+        // The native session sent its initial SETTINGS before transport attachment.
+        this.settingsAckWaiters.unshift(undefined);
+        this.pendingSettingsAck = true;
+        session.onsettings = (isAck: boolean) => {
+            if (typeof prevOnSettings === 'function') prevOnSettings(isAck);
+            if (!isAck) return;
+            const waiter = this.settingsAckWaiters.shift();
+            this.pendingSettingsAck = this.settingsAckWaiters.length > 0;
+            waiter?.(this);
+            this.emit('localSettings', this.localSettings);
+        };
         const queued = this.queuedSettings;
         this.queuedSettings = [];
         for (const s of queued) this.sendSettings(s);
@@ -123,16 +136,6 @@ export class Http2Session extends EventEmitter {
             return;
         }
         this.pendingSettingsAck = true;
-        const prevOnSettings = session.onsettings;
-        session.onsettings = (isAck: boolean) => {
-            if (typeof prevOnSettings === 'function') prevOnSettings(isAck);
-            if (!isAck) return;
-            this.pendingSettingsAck = false;
-            const waiters = this.settingsAckWaiters;
-            this.settingsAckWaiters = [];
-            for (const w of waiters) w(this);
-            this.emit('localSettings', this.localSettings);
-        };
         // `configure` only understands the named RFC 7540 settings.
         session.configure(settings as Parameters<typeof session.configure>[0]);
     }
@@ -156,10 +159,10 @@ export class Http2Session extends EventEmitter {
         }
         this.mergeLocalSettings(settings);
         const start = Date.now();
-        if (callback) {
-            this.settingsAckWaiters.push(s => callback(null, s, Date.now() - start));
-        }
-        this.sendSettings(settings);
+        this.settingsAckWaiters.push(callback ? s => callback(null, s, Date.now() - start) : undefined);
+        // Native configure skips empty settings; repeat the current table size
+        // so every queued callback corresponds to a frame that receives an ACK.
+        this.sendSettings({ ...settings, headerTableSize: this.localSettings.headerTableSize });
     }
 
     setLocalWindowSize(windowSize: number): void {
@@ -217,12 +220,19 @@ export class Http2Session extends EventEmitter {
         return this;
     }
 
+    private clearSettings(): void {
+        this.queuedSettings.length = 0;
+        this.settingsAckWaiters.length = 0;
+        this.pendingSettingsAck = false;
+    }
+
     close(cb?: () => void): void {
         if (this.closed) {
             if (cb) queueMicrotask(cb);
             return;
         }
         this.closed = true;
+        this.clearSettings();
         if (this.timeoutTimer) {
             clearTimeout(this.timeoutTimer);
             this.timeoutTimer = null;
@@ -237,6 +247,7 @@ export class Http2Session extends EventEmitter {
         if (this.destroyed) return;
         this.destroyed = true;
         this.closed = true;
+        this.clearSettings();
         if (this.timeoutTimer) {
             clearTimeout(this.timeoutTimer);
             this.timeoutTimer = null;

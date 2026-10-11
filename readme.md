@@ -133,7 +133,40 @@ status language and compatibility boundaries.
 
 ## Build And Validation
 
-From the repository root:
+The standalone repository publishes `dist.js` and `dist.min.js`, containing
+the runtime polyfills for circu.js. The release workflow builds JavaScript and
+attaches both files plus `SHA256SUMS` to the matching `v<package.json version>`
+tag. It does not build a native executable.
+
+The CI workflow checks out these sibling repositories at fixed revisions:
+
+| Directory | Repository | Revision | Required content |
+| --- | --- | --- | --- |
+| `../circu.js` | `imzlh/circu.js` | `8df0b515762350a1cb29731655c9ecca39edc098` | `types/` |
+| `../http` | `imzlh/cno-stdhttp` | `219d3e077418e8d8135c03857611e5409b1a3354` | TypeScript source and package exports |
+| `../ext-quic` | `imzlh/cno-ext-quic` | `0b7e6f7c97f9b25b6fe6110a66385586019849d1` | `native.d.ts` and `index.d.ts` |
+| `../cts` | `imzlh/cts` | `9c3117af92d43fc9f049bcfa4e23c2f7db9e84ec` | `src/runtime/event-mux.ts` |
+
+Use the same sibling layout for local standalone development. Native
+submodules and compilers are not required. From this repository's directory:
+
+```sh
+pnpm install --frozen-lockfile
+pnpm run type-check:bundle
+pnpm run build
+pnpm run min-build
+```
+
+Both type-check commands download and verify the SHA-256 of the pinned Deno
+2.9.0 declarations on their first run, then reuse the cache under
+`node_modules`. They do not depend on an untracked `lib.deno.d.ts` or a local
+Deno install. CI runs `type-check:bundle` against `src/main.ts` and its complete
+dependency graph, matching the published JavaScript. `pnpm run type-check`
+retains the full-source audit, including separately loaded Node polyfills and
+source tests; that broader audit currently reports existing type errors.
+
+When working inside a `cno-cli` checkout, run these commands from the parent
+repository root to rebuild the integrated runtime:
 
 ```sh
 pnpm run type-check

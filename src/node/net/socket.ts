@@ -1,14 +1,3 @@
-/**
- * node:net Socket.
- *
- * Owns every piece of identity-sensitive state for the client/accepted socket:
- *   - `kNetClientSocketPublished`, a bare Symbol() whose identity is the guard
- *     against a double diagnostics-channel publish. It must exist exactly once
- *     in the process, so it lives here and nowhere else.
- *   - `duplexWrite`, the Duplex.prototype.write capture. It is order-sensitive:
- *     `../stream` must already be fully evaluated when this module runs.
- */
-
 const streams = import.meta.use('streams');
 const os = import.meta.use('os');
 const engine = import.meta.use('engine');
@@ -52,6 +41,17 @@ type NativeReadError = CModuleError.Error | undefined;
 
 export interface Socket extends SocketShape {}
 
+function watchSocketAbort(socket: Socket, signal: AbortSignal): boolean {
+    const onAbort = () => socket.destroy(abortError());
+    if (signal.aborted) {
+        queueMicrotask(onAbort);
+        return false;
+    }
+    signal.addEventListener('abort', onAbort, { once: true });
+    socket.once('close', () => signal.removeEventListener('abort', onAbort));
+    return true;
+}
+
 function initSocket(self: Socket, options?: SocketConstructorOpts): void {
     Duplex.call(self, { allowHalfOpen: options?.allowHalfOpen ?? false });
 
@@ -91,11 +91,7 @@ function initSocket(self: Socket, options?: SocketConstructorOpts): void {
     if (options?.readable === false) self._readable = false;
     if (options?.writable === false) self._writable = false;
 
-    if (options?.signal) {
-        options.signal.addEventListener('abort', () => {
-            self.destroy(new Error('aborted'));
-        });
-    }
+    if (options?.signal) watchSocketAbort(self, options.signal);
 }
 
 export const Socket: SocketConstructor = function Socket(this: Socket | undefined, options?: SocketConstructorOpts) {
@@ -154,11 +150,7 @@ function handleSocketEof(socket: Socket): void {
     socket._pipeReadStarted = false;
     socket._upgradeReadStarted = false;
     socket.push(null);
-    // Node keeps `readable` true until 'end' is emitted, i.e. until the buffer has
-    // actually drained — measured: with 3 bytes still buffered it reports
-    // `readable === true`. Clearing it here while chunks remain is what let
-    // `Duplex.read()`'s old `if (!this.readable) return null` gate strand them
-    // forever, so the flag flip is deferred to _emitReadableEndIfNeeded below.
+    // Keep public `readable` true until the buffered data drains and 'end' fires.
     socket._readable = false;
     if (socket._destroyed) return;
     if (!socket._readableState.flowing && socket._readableState.buffer.length === 0) {
@@ -167,29 +159,8 @@ function handleSocketEof(socket: Socket): void {
 
     if (!socket._allowHalfOpen && !socket.writableEnded) {
         socket.readyState = 'readOnly';
-        // Node's `allowHalfOpen:false` means "auto-end AFTER the 'end' handler
-        // has had its turn", not "close the write side now". Node implements it
-        // as an `onReadableStreamEnd` listener, which runs on the tick after
-        // 'end' — so a server doing `s.on('end', () => s.write(tail))` still
-        // delivers `tail`. Calling end() inline here flipped `writable` false
-        // before the user's 'end' handler ran, so that write was REJECTED and
-        // the peer received "" instead of the payload — measured:
-        //   node: S:end(writable=true)  > write returned true  > C:end(recv="AFTER-END")
-        //   cno:  S:end(writable=false) > write returned false > C:end(recv="")
-        // i.e. silent data loss on every allowHalfOpen:false socket whose 'end'
-        // handler writes a farewell (the standard request/response shape).
-        // Node's `allowHalfOpen:false` means "auto-end AFTER the 'end' handler
-        // has had its turn", not "close the write side now". Node implements it
-        // as an `onReadableStreamEnd` listener, which runs on the tick after
-        // 'end' — so a server doing `s.on('end', () => s.write(tail))` still
-        // delivers `tail`. Calling end() inline flips `writable` false before
-        // the user's 'end' handler runs, so that write is REJECTED — measured:
-        //   node: S:end(writable=true)  > write returned true  > C:end("AFTER-END")
-        //   cno:  S:end(writable=false) > write returned false > C:end("")
-        // i.e. silent data loss on an allowHalfOpen:false socket whose 'end'
-        // handler writes a farewell (the standard request/response shape).
-        // HTTP-owned sockets keep the inline path: core drives its own
-        // shutdown sequencing and deferring here hangs every TLS response.
+        // HTTP core owns its shutdown sequence; other sockets allow 'end'
+        // listeners to write before automatically ending the writable side.
         if (socket._httpOwned) {
             socket.end();
             return;
@@ -242,18 +213,12 @@ Socket.prototype.connect = function connect(
     let options: TcpNetConnectOpts | undefined;
 
     if (typeof portOrPath === 'object' && portOrPath !== null) {
+        if (portOrPath.signal && !watchSocketAbort(this, portOrPath.signal)) return this;
         // Node selects the pipe branch on `!!options.path`, so a key that is merely
         // present with an undefined/null value stays TCP. undici builds its connect
         // options as `{...options, port, host}`, which carries `path: undefined`.
         const pipePath = (portOrPath as { path?: unknown }).path;
         if (pipePath !== undefined && pipePath !== null && pipePath !== '') {
-            if (portOrPath.signal?.aborted) {
-                queueMicrotask(() => this.destroy(abortError()));
-                return this;
-            }
-            if (portOrPath.signal) {
-                portOrPath.signal.addEventListener('abort', () => this.destroy(abortError()), { once: true });
-            }
             return this.connect(pipePath as string, typeof hostOrCb === 'function' ? hostOrCb : undefined);
         }
         options = portOrPath;
@@ -264,13 +229,6 @@ Socket.prototype.connect = function connect(
         if (portOrPath.keepAlive !== undefined) this._keepAlive = portOrPath.keepAlive;
         if (portOrPath.keepAliveInitialDelay !== undefined) this._keepAliveDelay = portOrPath.keepAliveInitialDelay;
         if (portOrPath.timeout !== undefined) this.setTimeout(portOrPath.timeout);
-        if (portOrPath.signal) {
-            if (portOrPath.signal.aborted) {
-                queueMicrotask(() => this.destroy(abortError()));
-                return this;
-            }
-            portOrPath.signal.addEventListener('abort', () => this.destroy(abortError()), { once: true });
-        }
     } else if (typeof portOrPath === 'number') {
         port = portOrPath;
         options = { port };
@@ -817,11 +775,7 @@ Socket.prototype.destroy = function destroy(this: Socket, error?: Error): Socket
     // Sync parent Duplex destroyed state
     this.destroyed = true;
 
-    // Node's destroy() never emits inline: it defers to nextTick (emitErrorNT /
-    // emitCloseNT) so `sock.destroy(err); sock.on('error', h)` — legal because
-    // the emit has not happened yet — still reaches h. Measured on Node v24.18
-    // that idiom catches; emitting inline here made it miss (caught=false).
-    // Both emissions go through the SAME queue so 'error' stays before 'close'.
+    // Defer both events so callers can attach listeners after destroy().
     deferTick(() => {
         if (error) emitErrorQuietly(this, normalizeErrnoError(error));
         this.emit('close', !!error);

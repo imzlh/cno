@@ -424,10 +424,16 @@ export async function readStreamBody(
 ): Promise<Uint8Array> {
     const reader = stream.getReader();
     const chunks: Uint8Array[] = [];
+    const onAbort = () => {
+        // Cancel wakes a pending read even if the producer's cleanup never settles.
+        void reader.cancel(abortError(signal)).catch(() => {});
+    };
     try {
+        signal?.addEventListener('abort', onAbort, { once: true });
         while (true) {
             throwIfAborted(signal);
             const { done, value } = await reader.read();
+            throwIfAborted(signal);
             if (done) break;
             if (bodyKind && !(value instanceof Uint8Array)) {
                 throw new TypeError(`${bodyKind} body stream chunks must be Uint8Array values`);
@@ -435,6 +441,7 @@ export async function readStreamBody(
             chunks.push(value);
         }
     } finally {
+        signal?.removeEventListener('abort', onAbort);
         reader.releaseLock();
     }
     return mergeChunks(chunks);
@@ -471,10 +478,7 @@ export async function serializeFormData(fd: FormData, boundary: string = createM
     const parts: Uint8Array[] = [];
     const entries: Array<[string, FormDataEntryValue]> = [];
     fd.forEach((value, key) => { entries.push([key, value]); });
-    for (let i = 0; i < entries.length; i++) {
-        const entry = entries[i];
-        if (entry === undefined) continue;
-        const [key, value] = entry;
+    for (const [key, value] of entries) {
         const escapedName = escapeMultipartParameter(key, true);
         let header = `--${boundary}\r\nContent-Disposition: form-data; name="${escapedName}"`;
         if (value instanceof Blob) {
