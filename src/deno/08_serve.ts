@@ -161,7 +161,7 @@ function truncateHookPostData(body?: Uint8Array | null): Uint8Array | null | und
 /**
  * Convert core HttpRequest to Web API Request
  */
-function createWebRequest(coreReq: HttpRequest, connInfo: { hostname: string; port: number; secure: boolean }): Request {
+function createWebRequest(coreReq: HttpRequest, connInfo: { hostname: string; port: number; secure: boolean }, signal: AbortSignal): Request {
     // Convert headers
     const headers = new Headers(coreReq.headers);
     const host = headers.get('host') || `${connInfo.hostname}:${connInfo.port}`;
@@ -173,6 +173,7 @@ function createWebRequest(coreReq: HttpRequest, connInfo: { hostname: string; po
     const init: RequestInit & { duplex?: 'half' } = {
         method: coreReq.method,
         headers,
+        signal,
         body: bodyPoll ? new ReadableStream({
             async pull(ctrl) {
                 const res = await bodyPoll();
@@ -285,14 +286,29 @@ class ResponseAdapter {
                 });
             });
         }
-        await this.coreRes.writeHead(response.status, statusText, headers);
-
         const body = response.body;
-        if (hasBody && body) {
-            const reader = body.getReader();
-            try {
+        const reader = body?.getReader();
+        let disconnectError: Error | undefined;
+        let cancellation: Promise<void> | undefined;
+        const cancelBody = (reason: unknown) => {
+            if (!reader) return Promise.resolve();
+            return cancellation ??= cancelReaderQuietly(reader, reason);
+        };
+        // A proxy may be awaiting an idle upstream read when the client leaves.
+        // Cancel that read immediately instead of waiting for another body write.
+        const removeCloseListener = hasBody ? this.coreRes.onTerminalClose?.(() => {
+            disconnectError = Object.assign(new Error('HTTP response peer disconnected'), { code: 'ECONNRESET' });
+            void cancelBody(disconnectError);
+        }) : undefined;
+        try {
+            if (disconnectError) throw disconnectError;
+            await this.coreRes.writeHead(response.status, statusText, headers);
+            if (disconnectError) throw disconnectError;
+
+            if (hasBody && reader) {
                 while (true) {
                     const { done, value } = await reader.read();
+                    if (disconnectError) throw disconnectError;
                     if (done) break;
                     if (serveHook) {
                         emitServeHookQuietly(() => {
@@ -308,29 +324,23 @@ class ResponseAdapter {
                 if (!isHead && !noBodyStatus && this.declaredContentLength !== null) {
                     assert(bodyBytes === this.declaredContentLength, 'Response body does not match Content-Length');
                 }
-            } catch (err) {
-                const message = errorMessage(err);
-                this.emitFinished(false, message);
-                // Propagate downstream cancellation/write failure back to the
-                // upstream body source (for example fetch -> curl), otherwise
-                // the producer keeps downloading after the client has gone away.
-                await cancelReaderQuietly(reader, err);
-                this.coreRes.close();
-                // Keep structured UV/Deno code for peer-gone; do not strip to message-only.
-                if (isServePeerDisconnect(err)) throw err;
-                throw new ServeResponseWriteError(message, err);
-            } finally {
-                reader.releaseLock();
+            } else if (reader) {
+                // HEAD sends representation headers but must release its producer.
+                await cancelBody(undefined);
             }
-        }
-
-        try {
+            // Ending a completed H2 response can itself close its stream.
+            removeCloseListener?.();
             await this.coreRes.end();
         } catch (err) {
-            this.emitFinished(false, errorMessage(err));
+            const message = errorMessage(err);
+            this.emitFinished(false, message);
+            await cancelBody(err);
             this.coreRes.close();
             if (isServePeerDisconnect(err)) throw err;
-            throw new ServeResponseWriteError(errorMessage(err), err);
+            throw new ServeResponseWriteError(message, err);
+        } finally {
+            removeCloseListener?.();
+            reader?.releaseLock();
         }
         this.emitFinished(true);
     }
@@ -492,6 +502,10 @@ function serve(
                 adapter.verify(response);
                 return adapter.sendResponse(response);
             };
+            const requestAbort = new AbortController();
+            const removeRequestCloseListener = res.onTerminalClose?.(() => {
+                requestAbort.abort(Object.assign(new Error('HTTP request peer disconnected'), { code: 'ECONNRESET' }));
+            });
             try {
                 // Create Web API Request
                 const addr = coreServer.address();
@@ -506,7 +520,7 @@ function serve(
                     hostname: denoAddr.transport === 'tcp' ? denoAddr.hostname : 'localhost',
                     port: denoAddr.transport === 'tcp' ? denoAddr.port : 80,
                     secure: coreServer.isSecure
-                });
+                }, requestAbort.signal);
                 req.body = null;
                 requestUrl = webRequest.url;
 
@@ -531,7 +545,7 @@ function serve(
                 await sendResponse(webResponse);
             } catch (error) {
                 // A started response or disconnected peer cannot be recovered with another response.
-                if (error instanceof ServeResponseWriteError || isServePeerDisconnect(error)) return;
+                if (requestAbort.signal.aborted || error instanceof ServeResponseWriteError || isServePeerDisconnect(error)) return;
                 if (typeof options.onError !== 'function') {
                     reportServeError(error, requestUrl);
                 }
@@ -549,6 +563,8 @@ function serve(
                     }
                     // Keep the connection failure isolated from the accept loop.
                 }
+            } finally {
+                removeRequestCloseListener?.();
             }
         },
         {
