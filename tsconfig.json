@@ -29,9 +29,6 @@
         "skipLibCheck": true,
         "allowJs": true
     },
-    "files": [
-        "./node_modules/.cache/cno-types/lib.deno.d.ts"
-    ],
     "include": [
         "src/**/*",
         "src/type/**/*.d.ts",

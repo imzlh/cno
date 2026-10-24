@@ -1,7 +1,3 @@
-/**
- * Deno KV Database Implementation using SQLite3
- */
-
 const sqlite3 = import.meta.use('sqlite3');
 import { getMemoryTier } from '../../utils/memory-tier';
 import { dirname } from '../../utils/path';

@@ -26,29 +26,30 @@ function hostForUrl(hostname: string): string {
     return hostname.includes(':') ? `[${hostname}]` : hostname;
 }
 
-/**
- * HTTP proxy connection - CONNECT tunnel
- */
+/** An URL with no explicit port leaves `port` empty; HTTP proxies default to 80. */
+function proxyPort(proxyUrl: URL): number {
+    return parseInt(proxyUrl.port) || 80;
+}
+
+async function dialTcp(hostname: string, port: number, viaProxy = false): Promise<CModuleStreams.TCP> {
+    const addrs = await dnsCache.resolve(hostname, { family: os.AF_UNSPEC });
+    if (!addrs || !addrs.length) {
+        throw new Error(`DNS resolution failed for ${viaProxy ? 'proxy ' : ''}${hostname}`);
+    }
+    const socket = new streams.TCP();
+    await socket.connect({ ip: preferIPv4(addrs).ip, port });
+    return socket;
+}
+
 async function connectHttpProxy(
-    proxyUrl: URL, 
-    targetHost: string, 
+    proxyUrl: URL,
+    targetHost: string,
     targetPort: number,
     basicAuth?: string
 ): Promise<CModuleStreams.TCP> {
-    // DNS resolution for proxy
-    const addrs = await dnsCache.resolve(proxyUrl.hostname, { family: os.AF_UNSPEC });
-    if (!addrs || !addrs.length) {
-        throw new Error(`DNS resolution failed for proxy ${proxyUrl.hostname}`);
-    }
-    const addr = preferIPv4(addrs);
-    
-    const socket = new streams.TCP();
-    await socket.connect({ 
-        ip: addr.ip, 
-        port: parseInt(proxyUrl.port) || 80 
-    });
+    const socket = await dialTcp(proxyUrl.hostname, proxyPort(proxyUrl), true);
 
-    let connectReq = 
+    let connectReq =
         `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\n` +
         `Host: ${targetHost}:${targetPort}\r\n`;
     
@@ -76,9 +77,6 @@ async function connectHttpProxy(
     return socket;
 }
 
-/**
- * HTTP Client configuration
- */
 export interface HttpClientOptions {
     caCerts?: string[];
     cert?: string;
@@ -94,9 +92,6 @@ export interface HttpClientOptions {
     http2?: boolean;
 }
 
-/**
- * HTTP Client for custom TLS and proxy configuration
- */
 export class HttpClient {
     #options: HttpClientOptions;
     #sslContext: CModuleSSL.Context | null = null;
@@ -109,7 +104,7 @@ export class HttpClient {
             ...options
         };
 
-        // Build SSL context if custom certs provided
+        // Custom CA/cert material only needs a dedicated context when present.
         if (options.caCerts || options.cert || options.key) {
             this.#sslContext = this.createSSLContext();
         }
@@ -120,17 +115,15 @@ export class HttpClient {
     }
 
     private createSSLContext(): CModuleSSL.Context {
-        // Concatenate CA certs
         let caData: string | undefined;
         if (this.options.caCerts && this.options.caCerts.length > 0) {
             const caContent = this.options.caCerts.filter(c => c && c.trim()).join('\n');
             if (caContent) caData = caContent;
         }
 
-        // Client certificate for mTLS
         let certData: string | undefined;
         let keyData: string | undefined;
-        if (this.options.cert && this.options.cert.trim() && 
+        if (this.options.cert && this.options.cert.trim() &&
             this.options.key && this.options.key.trim()) {
             certData = this.options.cert;
             keyData = this.options.key;
@@ -145,42 +138,27 @@ export class HttpClient {
         });
     }
 
-    /**
-     * Get SSL context for connections
-     */
     getSSLContext(): CModuleSSL.Context | null {
         return this.#sslContext;
     }
 
-    /**
-     * Check if proxy should be used for a URL
-     */
     shouldUseProxy(url: URL): boolean {
         if (!this.options.proxy) return false;
         const noProxy = safeGetEnv('NO_PROXY') ?? safeGetEnv('no_proxy');
         return !shouldBypassProxy(url, noProxy);
     }
 
-    /**
-     * Get proxy URL
-     */
     getProxyUrl(): URL | null {
         if (!this.options.proxy) return null;
         return new URL(this.options.proxy.url);
     }
 
-    /**
-     * Get proxy authentication header if configured
-     */
     getProxyAuth(): string | null {
         if (!this.options.proxy?.basicAuth) return null;
         const { username, password } = this.options.proxy.basicAuth;
         return `Basic ${crypto.base64Encode(engine.encodeString(`${username}:${password}`))}`;
     }
 
-    /**
-     * Establish connection through proxy if configured
-     */
     @wrap
     async connect(hostname: string, port: number, isSecure: boolean): Promise<CModuleStreams.TCP> {
         if (this.#closed) {
@@ -189,42 +167,15 @@ export class HttpClient {
 
         const targetUrl = new URL(`${isSecure ? 'https' : 'http'}://${hostForUrl(hostname)}:${port}/`);
         const proxyUrl = this.shouldUseProxy(targetUrl) ? this.getProxyUrl() : null;
-        
-        if (proxyUrl && !isSecure) {
-            // HTTP through proxy - connect to proxy server
-            const addrs = await dnsCache.resolve(proxyUrl.hostname, { family: os.AF_UNSPEC });
-            if (!addrs || !addrs.length) {
-                throw new Error(`DNS resolution failed for proxy ${proxyUrl.hostname}`);
-            }
-            const addr = preferIPv4(addrs);
-            
-            const socket = new streams.TCP();
-            await socket.connect({
-                ip: addr.ip,
-                port: parseInt(proxyUrl.port) || 80
-            });
-            return socket;
-        } else if (proxyUrl && isSecure) {
-            // HTTPS through proxy - use CONNECT tunnel
-            const auth = this.getProxyAuth();
-            return connectHttpProxy(proxyUrl, hostname, port, auth || undefined);
-        } else {
-            // Direct connection - DNS resolution
-            const addrs = await dnsCache.resolve(hostname, { family: os.AF_UNSPEC });
-            if (!addrs || !addrs.length) {
-                throw new Error(`DNS resolution failed for ${hostname}`);
-            }
-            const addr = preferIPv4(addrs);
-            
-            const socket = new streams.TCP();
-            await socket.connect({ ip: addr.ip, port });
-            return socket;
-        }
+
+        if (!proxyUrl) return dialTcp(hostname, port);
+        if (isSecure) return connectHttpProxy(proxyUrl, hostname, port, this.getProxyAuth() || undefined);
+        // Plain HTTP through a proxy connects to the proxy itself; curl sends the absolute-form target.
+        return dialTcp(proxyUrl.hostname, proxyPort(proxyUrl), true);
     }
 
     close(): void {
         this.#closed = true;
-        // Note: SSL context cleanup is handled by GC
     }
 
     [Symbol.dispose](): void {
@@ -232,28 +183,17 @@ export class HttpClient {
     }
 }
 
-/**
- * Global HTTP client store for fetch integration
- */
+/** Client attached by fetch()'s `init.client`, looked up at perform time. */
 const httpClients = new WeakMap<Request, HttpClient>();
 
-/**
- * Associate a client with a request for fetch to use
- */
 export function setRequestClient(request: Request, client: HttpClient): void {
     httpClients.set(request, client);
 }
 
-/**
- * Get the client associated with a request
- */
 export function getRequestClient(request: Request): HttpClient | undefined {
     return httpClients.get(request);
 }
 
-/**
- * Create HTTP client (Deno API)
- */
 function createHttpClient(options: HttpClientOptions = {}): HttpClient {
     return new HttpClient(options);
 }

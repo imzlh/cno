@@ -3,7 +3,6 @@ import { structuredCloneWithTransfer } from "../node/_internal/structured-clone"
 const console = import.meta.use('console');
 const denoCustomInspect = Symbol.for('Deno.customInspect');
 
-// Store native performance.now reference
 const nativePerformanceNow = globalThis.performance?.now?.bind(globalThis.performance) ?? (() => Date.now());
 
 type PerformanceEntryType =
@@ -68,8 +67,6 @@ function isThenable(value: unknown): value is PromiseLike<unknown> {
     return typeof Reflect.get(value, 'then') === 'function';
 }
 
-// ==================== PerformanceEntry ====================
-
 class PerformanceEntry<ET extends PerformanceEntryType> implements globalThis.PerformanceEntry {
     readonly name: string;
     readonly entryType: ET;
@@ -115,8 +112,6 @@ class PerformanceEntry<ET extends PerformanceEntryType> implements globalThis.Pe
     }
 }
 
-// ==================== PerformanceMark ====================
-
 class PerformanceMark extends PerformanceEntry<'mark'> implements globalThis.PerformanceMark {
     public detail: unknown;
 
@@ -127,8 +122,6 @@ class PerformanceMark extends PerformanceEntry<'mark'> implements globalThis.Per
         this.detail = detail;
     }
 }
-
-// ==================== PerformanceMeasure ====================
 
 class PerformanceMeasure extends PerformanceEntry<'measure'> implements globalThis.PerformanceMeasure {
     constructor(
@@ -142,8 +135,6 @@ class PerformanceMeasure extends PerformanceEntry<'measure'> implements globalTh
         super(constructorKey, name, 'measure', startTime, duration, cloneDetail(detail));
     }
 }
-
-// ==================== PerformanceNavigationTiming ====================
 
 class PerformanceNavigationTiming extends PerformanceEntry<'navigation'> {
     readonly unloadEventStart: number = 0;
@@ -185,8 +176,6 @@ class PerformanceNavigationTiming extends PerformanceEntry<'navigation'> {
         };
     }
 }
-
-// ==================== PerformanceResourceTiming ====================
 
 class PerformanceResourceTiming extends PerformanceEntry<'resource'> {
     readonly initiatorType: string;
@@ -254,8 +243,6 @@ class PerformanceResourceTiming extends PerformanceEntry<'resource'> {
     }
 }
 
-// ==================== Node-compatible Performance Timing ====================
-
 class PerformanceNodeTiming extends PerformanceEntry<'node'> {
     readonly bootstrapComplete: number;
     readonly environment: number = 0;
@@ -269,8 +256,6 @@ class PerformanceNodeTiming extends PerformanceEntry<'node'> {
         this.bootstrapComplete = nativePerformanceNow();
     }
 }
-
-// ==================== PerformanceObserverEntryList ====================
 
 class PerformanceObserverEntryList {
     #entries: globalThis.PerformanceEntry[];
@@ -299,8 +284,6 @@ class PerformanceObserverEntryList {
             .sort((a, b) => a.startTime - b.startTime);
     }
 }
-
-// ==================== PerformanceObserver ====================
 
 class PerformanceObserver {
     #callback: PerformanceObserverCallback;
@@ -449,8 +432,6 @@ class PerformanceObserver {
         return this.#connected && this.#observedTypes.has(type);
     }
 }
-
-// ==================== Performance ====================
 
 class Performance extends EventTarget implements globalThis.Performance {
     #entries: globalThis.PerformanceEntry[] = [];
@@ -642,8 +623,6 @@ class Performance extends EventTarget implements globalThis.Performance {
         return this.#timeOrigin;
     }
 
-    // ==================== User Timing API ====================
-
     mark(markName: string, options?: PerformanceMarkOptions): PerformanceMark {
         if (arguments.length === 0) {
             throw new TypeError('Failed to execute \'mark\' on \'Performance\': 1 argument required, but only 0 present.');
@@ -750,8 +729,6 @@ class Performance extends EventTarget implements globalThis.Performance {
         }
     }
 
-    // ==================== Performance Timeline API ====================
-
     getEntries(): globalThis.PerformanceEntryList {
         return [...this.#entries].sort((a, b) => a.startTime - b.startTime);
     }
@@ -771,8 +748,6 @@ class Performance extends EventTarget implements globalThis.Performance {
             })
             .sort((a, b) => a.startTime - b.startTime);
     }
-
-    // ==================== Resource Timing API ====================
 
     clearResourceTimings(): void {
         this.#entries = this.#entries.filter(entry => entry.entryType !== 'resource');
@@ -822,8 +797,6 @@ class Performance extends EventTarget implements globalThis.Performance {
         this.#addEntry(entry);
         this.#trimResourceTimings();
     }
-
-    // ==================== Utilities ====================
 
     toJSON(): object {
         return {
@@ -904,8 +877,6 @@ class Performance extends EventTarget implements globalThis.Performance {
         }
         this.#pendingEntries.clear();
     }
-
-    // ==================== Observer Management ====================
 
     _registerObserver(observer: PerformanceObserver): void {
         this.#observers.add(observer);

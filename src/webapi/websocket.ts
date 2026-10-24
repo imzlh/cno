@@ -49,8 +49,7 @@ function emitWebSocketHookQuietly(callback: () => void): void {
 
 function toError(error: unknown, fallback?: string): Error {
     if (engine.isError(error)) return error as Error;
-    if (fallback !== undefined) return new Error(fallback);
-    try { return new Error(String(error)); } catch { return new Error('WebSocket operation failed'); }
+    return new Error(fallback ?? String(error));
 }
 
 function applySlotGetter<T>(getter: ((this: unknown) => T) | undefined, value: object): T {

@@ -10,7 +10,7 @@ function getPlatform(): string {
         case 'Linux':
             return machine === 'x86_64' ? 'Linux x86_64' : `Linux ${machine}`;
         case 'Darwin':
-            return machine === 'arm64' ? 'MacIntel' : 'MacIntel';
+            return 'MacIntel';
         case 'Windows_NT':
             return 'win32';
         default:
@@ -50,14 +50,7 @@ function getUserAgent(): string {
 }
 
 function getLanguage(): string {
-    const getenv = (name: string): string | null => {
-        try {
-            return os.getenv(name) ?? null;
-        } catch {
-            return null;
-        }
-    };
-    const lang = getenv('LANG') || getenv('LC_ALL') || getenv('LC_MESSAGES');
+    const lang = os.getenv('LANG') || os.getenv('LC_ALL') || os.getenv('LC_MESSAGES');
     if (lang) {
         const match = lang.match(/^([a-z]{2}_[A-Z]{2})/);
         if (match) {

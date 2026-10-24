@@ -1,7 +1,3 @@
-/**
- * Deno FFI Library Implementation
- * DynamicLibrary and dlopen function
- */
 const ffi = import.meta.use('ffi');
 
 import { UnsafePointer, bufferSourceBytes, createPointerObject } from './pointer';

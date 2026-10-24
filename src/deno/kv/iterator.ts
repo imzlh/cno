@@ -1,7 +1,3 @@
-/**
- * Deno KV List Iterator Implementation
- */
-
 import {
     cursorToRawKey,
     compareKeys,

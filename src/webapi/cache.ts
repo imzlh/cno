@@ -1,13 +1,9 @@
-// CacheStorage + Cache — in-memory implementation for cno runtime.
-// Matches the subset of the Cache API tested by Deno's cache_api_test.ts.
-
 import { Response as CnoResponse } from "./fetch";
 import { bytesToArrayBuffer } from "../utils/bytes";
 import { getMemoryTier } from "../utils/memory-tier";
 
 const ILLEGAL = Symbol('cache.illegal');
 
-// Max cache entries per Cache instance, tier-aware
 const MAX_ENTRIES = getMemoryTier() === 'low' ? 64 : getMemoryTier() === 'normal' ? 256 : 1024;
 
 function toRequestKey(input: RequestInfo | URL): Request {
@@ -18,10 +14,6 @@ function assertGetRequest(request: Request): void {
     if (request.method !== 'GET') {
         throw new TypeError('Cache only supports GET requests');
     }
-}
-
-function cloneStoredRequest(request: Request): Request {
-    return request.clone();
 }
 
 function urlsMatch(storedUrl: string, candidateUrl: string, ignoreSearch?: boolean): boolean {
@@ -38,13 +30,11 @@ function urlsMatch(storedUrl: string, candidateUrl: string, ignoreSearch?: boole
     }
 }
 
-// Parse Vary header and return the list of field names (lower-cased).
 function varyFields(headers: Headers): string[] {
     const vary = headers.get('Vary') ?? '';
     return vary.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 }
 
-// Check whether two requests match under the response's Vary constraints.
 function varyMatches(stored: Request, candidate: Request, responseHeaders: Headers): boolean {
     const fields = varyFields(responseHeaders);
     for (const field of fields) {
@@ -88,30 +78,31 @@ class CacheImpl implements Cache {
         const req = toRequestKey(request);
         assertGetRequest(req);
 
-        // Vary: * is forbidden
         if ((response.headers.get('Vary') ?? '').split(',').map(s => s.trim()).includes('*')) {
             throw new TypeError("Vary header must not contain '*'");
         }
 
-        // Consume the body — throws if stream errors, leaves bodyUsed = true
-        if (response.bodyUsed) throw new TypeError('Body already consumed');
-        let body: Uint8Array;
-        try {
-            body = await response.bytes();
-        } catch (e) {
-            // Body read failed — do not store, re-throw
-            throw e;
+        let storedResponse: globalThis.Response = response;
+        const body = await response.bytes();
+        // A response built on a plain byte stream is bodyUsed after the read;
+        // store a rebuilt one so the cached entry stays a usable, unconsumed Response.
+        if (response.bodyUsed) {
+            try {
+                storedResponse = new CnoResponse(bytesToArrayBuffer(body), {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers,
+                }) as unknown as globalThis.Response;
+            } catch {}
         }
 
         const responseHeaders = new Headers(response.headers);
 
-        // Overwrite existing entry with same URL and compatible Vary constraints.
         const idx = this.#entries.findIndex(e => queryMatches(e, req));
-        const entry: CacheEntry = { request: cloneStoredRequest(req), response, responseHeaders, body };
+        const entry: CacheEntry = { request: req.clone(), response: storedResponse, responseHeaders, body };
         if (idx >= 0) {
             this.#entries[idx] = entry;
         } else {
-            // Evict LRU (oldest) entries when over capacity
             while (this.#entries.length >= MAX_ENTRIES) {
                 this.#entries.shift();
             }
@@ -123,7 +114,6 @@ class CacheImpl implements Cache {
         const req = toRequestKey(request);
         const entry = this.#entries.find(e => queryMatches(e, req, options));
         if (!entry) return undefined;
-        // Return a fresh Response backed by the stored bytes
         return new CnoResponse(bytesToArrayBuffer(entry.body), {
             status: entry.response.status,
             statusText: entry.response.statusText,
@@ -149,9 +139,9 @@ class CacheImpl implements Cache {
     }
 
     async keys(request?: RequestInfo | URL, options?: CacheQueryOptions): Promise<ReadonlyArray<Request>> {
-        if (request === undefined) return this.#entries.map(e => cloneStoredRequest(e.request));
+        if (request === undefined) return this.#entries.map(e => e.request.clone());
         const req = toRequestKey(request);
-        return this.#entries.filter(e => queryMatches(e, req, options)).map(e => cloneStoredRequest(e.request));
+        return this.#entries.filter(e => queryMatches(e, req, options)).map(e => e.request.clone());
     }
 
     async add(request: RequestInfo | URL): Promise<void> {
@@ -225,7 +215,6 @@ class CacheStorageImpl implements CacheStorage {
     }
 }
 
-// Expose Cache constructor that always throws (per spec, Cache is not directly constructable)
 const CacheCtorProxy = new Proxy(function Cache() {
     throw new TypeError('Illegal constructor');
 }, {

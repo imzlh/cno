@@ -210,19 +210,13 @@ class NavigatorImpl implements ImplementedNavigator {
     }
 
     sendBeacon(url: string, data?: BodyInit): boolean {
-        try {
-            const fetchOptions: RequestInit = {
-                method: 'POST',
-                keepalive: true,
-            };
-            if (data) {
-                fetchOptions.body = data;
-            }
-            fetch(url, fetchOptions).catch(() => {});
-            return true;
-        } catch {
-            return false;
-        }
+        const fetchOptions: RequestInit = {
+            method: 'POST',
+            keepalive: true,
+            body: data,
+        };
+        fetch(url, fetchOptions).catch(() => {});
+        return true;
     }
 
     vibrate(pattern: number | number[]): boolean {

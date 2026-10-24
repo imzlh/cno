@@ -104,11 +104,9 @@ const EV_BEFORE_UNLOAD: number = (() => {
 })();
 
 /**
- * Is this runtime a worker? `vm.c:407` defines the global for exactly this kind
- * of check. Deno fires neither 'beforeunload' nor 'unload' inside a worker
- * (OBSERVED), and `tjs__lifecycle_drain` already returns early for is_worker —
- * but worker teardown reaches EV_EXIT by a different route (uv__stop), so the
- * EXIT arm below has to make the same exclusion itself.
+ * `isWorker` is defined by the runtime (vm.c:407). `tjs__lifecycle_drain` already
+ * skips workers, but worker teardown reaches EV_EXIT through uv__stop instead, so
+ * the EXIT arm below repeats the exclusion.
  */
 function inWorker(): boolean {
     return Reflect.get(globalThis, 'isWorker') === true;
@@ -121,25 +119,19 @@ function bridgeEvent(
 ): boolean | undefined {
     // beforeunload returns its cancellation decision directly to the native loop.
     if (eventName === EV_BEFORE_UNLOAD) {
-        // beforeunload is cancelable; unload is not.
         const event = new Event('beforeunload', { cancelable: true });
-
         // Listener throws propagate so native teardown fails consistently.
         globalEvent.dispatchEvent(event);
-
-        // Native teardown cancels only on explicit true from preventDefault().
         return event.defaultPrevented;
     }
 
     let event;
     switch (eventName) {
         case EventType.EXIT:
-            // Workers do not receive the process unload lifecycle.
             if (!inWorker()) globalEvent.dispatchEvent(new Event('unload'));
             event = new Event('exit');
             break;
         case EventType.JOB_EXCEPTION:
-            // Only listener cancellation marks a job exception handled.
             event = fromError(eventData);
             break;
         case EventType.UNHANDLED_REJECTION: {
@@ -161,11 +153,11 @@ function bridgeEvent(
     ctx.dispatched = true;
 
     if (event.defaultPrevented) {
-        // Suppress diagnostics only when user code cancelled the default action.
+        // Only user cancellation suppresses diagnostics.
         ctx.handled = true;
     }
 
-    // Event-specific native return polarity is owned by the multiplexer.
+    // Native return polarity per event is the multiplexer's decision.
     return undefined;
 }
 
@@ -174,10 +166,8 @@ await installWebApiEventReceiver(bridgeEvent, () => {
     onEvent((eventName: number, eventData: unknown) => {
         const ctx: BridgeCtx = { handled: false, dispatched: false };
         const ret = bridgeEvent(eventName, eventData, ctx);
-        // Carry beforeunload cancellation through the standalone receiver.
         if (eventName === EV_BEFORE_UNLOAD) return ret === true;
-        // Preserve the legacy contract in this path: rejections must not abort.
-        return eventName === EventType.JOB_EXCEPTION ? true : false;
+        return eventName === EventType.JOB_EXCEPTION;
     });
 });
 

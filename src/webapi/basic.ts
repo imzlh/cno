@@ -22,8 +22,7 @@ const nativeCaptureStackTrace = NativeError.captureStackTrace;
 /**
  * QuickJS exposes an error's frames through a `stack` CGETSET accessor on
  * `Error.prototype` (quickjs.c `js_error_proto_funcs`), reading the frames out
- * of the instance's internal `[[ErrorData]]` slot. Two consequences, both
- * measured against Node v24.18.0:
+ * of the instance's internal `[[ErrorData]]` slot. Two consequences:
  *
  *  - No error instance has an *own* `stack`. V8 defines one on every error at
  *    construction, so `Object.getOwnPropertyNames(e)` includes `'stack'` there
@@ -68,11 +67,8 @@ const hookFormattedErrors = new WeakSet<object>();
  * Prepend `Name: message` to headerless engine frames.
  *
  * Only engine frames get a header. A value produced by an
- * `Error.prepareStackTrace` hook is returned verbatim — re-heading it is the
- * specific mistake that a previous eager implementation made and had to revert,
- * and `tests/cts/sourcemap-stack-position.test.ts` pins it. (Before this, a hook
- * returning `'SENTINEL'` produced `'Error: m\nSENTINEL'` on `Error` but a correct
- * bare `'SENTINEL'` on `TypeError`, because only `Error` was wrapped.)
+ * `Error.prepareStackTrace` hook is returned verbatim — re-heading it is wrong
+ * and `tests/cts/sourcemap-stack-position.test.ts` pins it.
  *
  * Node's `.stack` has no trailing newline; QuickJS's frames always end in one.
  */
@@ -93,9 +89,9 @@ function headerizeErrorStack(error: object, raw: unknown): unknown {
  * True when the frame starting at `from` (after indentation) is one of the proxy
  * trap's own frames.
  *
- * Compared in place against the source string. The obvious version — slice the
- * line, `trimStart()`, then test four prefixes — cost 39us/op on its own, more
- * than the rest of the getter combined, because it allocated twice per call.
+ * Compared in place against the source string. Slicing the line, calling
+ * `trimStart()`, then testing four prefixes costs more than the rest of the
+ * getter combined because it allocates twice per call.
  */
 function isInternalErrorProxyFrameAt(stack: string, from: number, lineEnd: number): boolean {
     let rest: number;
@@ -142,11 +138,8 @@ function stripInternalErrorProxyFrames(stack: string): string {
  * `build_backtrace` (quickjs.c) has two branches: it builds a string, or — when a
  * `prepareStackTrace` hook is installed — an array of CallSite objects.
  * `stripInternalErrorProxyFrames` only cleans the string, so the proxy's trap
- * frames survived into the array as `sites[0]` and `sites[1]`, which is exactly
- * where every CallSite-consuming library looks for the throw site.
- *
- * This matters more now than it did: wrapping all ten error constructors would
- * otherwise spread a leak that previously only affected `Error`.
+ * frames must also be dropped here, at `sites[0]`/`sites[1]` where every
+ * CallSite-consuming library looks for the throw site.
  */
 function isInternalErrorProxyCallSite(site: unknown): boolean {
     if (!site || typeof site !== 'object') return false;
@@ -186,11 +179,10 @@ function clearLazyErrorStack(error: object): void {
  * (own accessor, non-enumerable, configurable) rather than QuickJS's
  * prototype-only one.
  *
- * Lazy is load-bearing in two directions. The getter must not run at
- * construction because reading + splitting frames for every error thrown is
- * expensive (measured: 95us/op eager vs 45us/op lazy for 20k constructions),
- * and the setter must latch a user-assigned value verbatim because Node does
- * not re-header an assigned stack.
+ * Laziness is load-bearing in both directions: computing frames at construction
+ * costs ~2x per error on paths that never read `.stack`, and the setter must
+ * latch a user-assigned value verbatim because V8 does not re-header an assigned
+ * stack.
  *
  * `mode` distinguishes the two callers, which need different sources:
  *  - `'construct'`: a brand-new error from a constructor trap. It cannot already
@@ -198,10 +190,9 @@ function clearLazyErrorStack(error: object): void {
  *    in the engine's `[[ErrorData]]` slot, read on demand.
  *  - `'capture'`: after native `Error.captureStackTrace`, which has just written
  *    an own *data* property. Those frames are headerless and still need a header,
- *    so they must NOT be latched as if a user had assigned them — doing that
- *    regressed `Error.captureStackTrace({name,message})` from `'N: M\n at …'` to
- *    bare frames. The target is often a plain object with no `[[ErrorData]]` slot
- *    at all, so the value has to be carried in the closure.
+ *    so they must NOT be latched as if a user had assigned them; the target is
+ *    often a plain object with no `[[ErrorData]]` slot, so the value has to be
+ *    carried in the closure.
  */
 function installLazyErrorStack<T>(error: T, mode: 'construct' | 'capture'): T {
     if (!error || (typeof error !== 'object' && typeof error !== 'function')) return error;
@@ -245,11 +236,9 @@ function installLazyErrorStack<T>(error: T, mode: 'construct' | 'capture'): T {
                 const raw = hasCapturedFrames ? capturedFrames : readNativeStack(self);
                 const computed = headerizeErrorStack(self, raw);
                 if (self === target) {
-                    // V8 formats the stack once, on first read, and caches it, so a
-                    // later `err.name = …` does NOT re-header an already-read stack
-                    // (measured: read-then-rename keeps `Error: m`, whereas
-                    // rename-then-read yields `Renamed: m`). Latching through the
-                    // same slot the setter uses reproduces both orders.
+                    // V8 formats the stack once on first read and caches it, so a
+                    // later `err.name = …` does not re-header an already-read stack.
+                    // Latching through the same slot the setter uses reproduces that.
                     customStack = computed;
                     hasCustomStack = true;
                 }
@@ -265,11 +254,10 @@ function installLazyErrorStack<T>(error: T, mode: 'construct' | 'capture'): T {
 }
 
 /**
- * Every native error constructor needs wrapping, not just `Error`. Wrapping only
- * `Error` left `new TypeError('m').stack` frames-only, so `util.inspect` rendered
- * `[    at <anonymous> (…)]` instead of `TypeError: m` — the dominant remaining
- * inspect-parity gap (76 of 105 fuzz failures). `src/node/vm/mod.ts` already
- * wraps the same list for sandbox realms; this mirrors it for the host realm.
+ * Every native error constructor needs wrapping, not just `Error`: unwrapped
+ * ones render frames-only under `util.inspect` (`[ at <anonymous> (…)]`)
+ * instead of `TypeError: m`. `src/node/vm/mod.ts` wraps the same list for
+ * sandbox realms; this mirrors it for the host realm.
  *
  * `InternalError` is QuickJS-only and has no Node counterpart, but it is a real
  * global here and errors thrown from it deserve the same header.
@@ -890,18 +878,12 @@ class Immediate extends Number {
 type TimerCallback = string | ((...args: unknown[]) => void);
 
 // No receiver ("brand") check on any timer entry point: Node exposes the very
-// same function objects as both the globals and the `node:timers` exports
-// (measured: `globalThis.setTimeout === require('node:timers').setTimeout` is
-// true in v24.18.0), so `timers.setTimeout(...)` is itself a method call with a
-// non-global receiver. Any `this` validation therefore has to accept everything,
-// and Node accordingly accepts every receiver — plain object, arbitrary object,
-// boxed primitive, Reflect.apply — for setTimeout/clearTimeout/setInterval/
-// clearInterval/setImmediate/clearImmediate/queueMicrotask alike.
+// same function objects as both the globals and the `node:timers` exports, so
+// `timers.setTimeout(...)` calls a non-global receiver by design and Node
+// accepts every receiver for all timer functions alike.
 //
-// This is load-bearing: copying the timer functions onto a table and calling
-// them as methods is exactly what sinon, @sinonjs/fake-timers and jest's
-// useFakeTimers do when they install and restore, so a brand check here breaks
-// every fake-timer library.
+// This is load-bearing: sinon, @sinonjs/fake-timers and jest's useFakeTimers
+// copy these functions onto a table and call them as methods.
 
 function toTimerDelay(value: unknown): number {
     if (value === undefined) return 0;

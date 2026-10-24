@@ -8,10 +8,12 @@ function getEnv(name: string): string | null {
     }
 }
 
-const platform = os.uname().sysname;
-export const isWindows = platform === 'Windows_NT' || platform.startsWith('MSYS');
-export const isPosixCompatible = platform != 'Windows_NT'; // MSYS is unix-compatible
-export const isMac = platform === 'Darwin';
+/** `os.platform` is CMAKE_SYSTEM_NAME lowercased; Node spells Windows 'win32'. */
+export const platform = os.platform;
+export const isWindows = platform === 'windows' || platform === 'win32';
+export const isMac = platform === 'darwin' || platform === 'macos';
+export const isLinux = platform === 'linux';
+export const isPosixCompatible = !isWindows; // MSYS is unix-compatible
 export const osShell = (() => {
     if (isPosixCompatible) {
         return getEnv('SHELL') || '/bin/sh';

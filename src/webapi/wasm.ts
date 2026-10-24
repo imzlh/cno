@@ -162,8 +162,6 @@ function isFuncrefWrapper(v: unknown): v is FuncrefWrapper {
     return typeof v === 'function' && typeof (v as FuncrefWrapper)[FUNCREF_INDEX] === 'number';
 }
 
-// Error Classes
-
 class CompileError extends Error {
     constructor(message: string) {
         super(message);
@@ -197,8 +195,6 @@ class RuntimeError extends Error {
     }
 }
 
-// Module
-
 class Module {
     _native: CModuleWASM.Module;
 
@@ -222,8 +218,6 @@ class Module {
         return 'WebAssembly.Module';
     }
 }
-
-// Memory
 
 class Memory {
     _instance: CModuleWASM.Instance | null;
@@ -319,8 +313,6 @@ function toWasmPageCount(value: unknown, name: string): number {
 function toOptionalWasmPageCount(value: unknown, name: string): number | undefined {
     return value === undefined ? undefined : toWasmPageCount(value, name);
 }
-
-// Table
 
 const VALID_GLOBAL_TYPES = new Set(['i32', 'i64', 'f32', 'f64']);
 const VALID_ELEMENT_TYPES = new Set(['anyfunc', 'funcref', 'externref']);
@@ -472,8 +464,6 @@ function toTableIndex(value: unknown): number {
     return index;
 }
 
-// Global
-
 class Global {
     _instance: CModuleWASM.Instance | null;
     _name: string | null;
@@ -567,8 +557,6 @@ function toWasmNumber(value: unknown): number {
     return Number(value);
 }
 
-// Instance
-
 class Instance {
     _instance: CModuleWASM.Instance;
     _exports: WasmExports;
@@ -600,8 +588,6 @@ class Instance {
         return 'WebAssembly.Instance';
     }
 }
-
-// Import Resolution
 
 /*
  * True when the module declares an import that an omitted import object cannot
@@ -721,8 +707,6 @@ function toGlobalImportValue(value: CModuleWASM.WasmGlobalValue): number | bigin
     throw new LinkError('WebAssembly.Global import value must be numeric');
 }
 
-// Export Creation
-
 function createExports(
     instance: CModuleWASM.Instance,
     nativeModule: CModuleWASM.Module
@@ -777,8 +761,6 @@ function createExports(
 
     return result;
 }
-
-// WebAssembly Global Setup
 
 if (wasm) {
     const webAssembly: WebAssemblyFacade = {

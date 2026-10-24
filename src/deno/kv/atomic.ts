@@ -1,7 +1,3 @@
-/**
- * Deno KV Atomic Operation Implementation
- */
-
 import {
     AtomicCheck,
     KvCommitResult,

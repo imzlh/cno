@@ -114,25 +114,22 @@ function isRecord(value: unknown): value is RecordLike {
 }
 
 function currentRuntimeConfig(): unknown {
-    try {
-        return Reflect.get(globalThis, '__cno_worker_runtime_config');
-    } catch {
-        return undefined;
-    }
+    return Reflect.get(globalThis, '__cno_worker_runtime_config');
 }
 
 function workerEntrySpecifier(specifier: string | URL): string {
     const raw = specifier.toString();
+    let url: URL;
     try {
-        const url = new URL(raw);
-        if (url.protocol !== 'blob:') return raw;
-        const payload = resolveObjectURLBytes(url);
-        if (!payload) return raw;
-        const mime = payload.type || 'application/javascript';
-        return `data:${mime};base64,${crypto.base64Encode(payload.bytes)}`;
+        url = new URL(raw);
     } catch {
         return raw;
     }
+    if (url.protocol !== 'blob:') return raw;
+    const payload = resolveObjectURLBytes(url);
+    if (!payload) return raw;
+    const mime = payload.type || 'application/javascript';
+    return `data:${mime};base64,${crypto.base64Encode(payload.bytes)}`;
 }
 
 function isPromiseRejectionEvent(value: Event): value is PromiseRejectionEvent {

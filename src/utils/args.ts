@@ -53,8 +53,8 @@ export function normalizeArgs(value: Args): NormalizedArgs {
     return out as NormalizedArgs;
 }
 
-// Single source of truth for the CLI vocabulary. cno-cli imports this instead
-// of keeping its own copy, so the two parsers can never drift.
+// Single source of truth for the CLI vocabulary, shared with cno-cli so the
+// two parsers cannot drift.
 export const SUBCOMMANDS = [
     'run', 'serve', 'task', 'eval', 'cache', 'pack', 'repl', 'exec',
     'test', 'setup', 'help', 'version',
@@ -63,16 +63,15 @@ export type Subcommand = typeof SUBCOMMANDS[number];
 const SUBCOMMAND_SET = new Set<string>(SUBCOMMANDS);
 
 /**
- * Deno-liked argv parse — the fallback used when the cno submodule runs on its
- * own (no cno-cli front-end). cno-cli has a richer parser (src/cli.ts) and
- * overrides the result via setArgs, so this only needs to get the boundaries
- * right:
+ * Deno-like argv parse — the fallback used when the cno submodule runs on its
+ * own (cno-cli overrides the result via setArgs). It only needs to get the
+ * boundaries right:
  *
  *   cno --internal=x run --run-args=1 main.js --user-args=y zzz
  *        internalArgs   action actionArgs entry  ──── args ────
  *
  * Once the entry is found, every remaining token (flags included) is a script
- * arg. `argv` excludes the binary (os.args[0]).
+ * arg; `argv` excludes the binary (os.args[0]).
  */
 export function parseArgs(argv: string[], binary: string): NormalizedArgs {
     const out: Args = { binary, internalArgs: [], actionArgs: [], entry: 'repl', args: [] };
@@ -126,8 +125,8 @@ export function getArgs(): NormalizedArgs {
     return args;
 }
 
-// ── argv derivations: the ONLY place argv shapes are computed ──────────────
-// Deno and Node both derive from the same Args so they can never disagree.
+// The ONLY place argv shapes are computed: Deno and Node both derive from the
+// same Args, so they can never disagree.
 
 /** Deno.args — user args after the entry only; not the entry, not cno's flags. */
 export function buildDenoArgs(): string[] {
@@ -141,16 +140,14 @@ function isFsEntry(entry: string): boolean {
     return !/^[a-z][a-z0-9+\-.]*:/i.test(entry);
 }
 
-// ── eval mode (-e / -p / --eval / --print) ─────────────────────────────────
-// Node treats eval source as a *runtime flag*, not a script: it lands in
-// execArgv and argv stays [execPath, ...userArgs]. cno's Args carries the
-// source in `entry` with action 'eval', so both Node derivations must
-// special-case it — otherwise the source text is emitted as argv[1] and even
-// join(cwd, …)-ed into a bogus path.
+// eval mode (-e / -p / --eval / --print)
+// Node treats eval source as a runtime flag: it lands in execArgv and argv is
+// [execPath, ...userArgs]. cno stores the source in `entry` with action 'eval',
+// so both Node derivations must special-case it.
 //
 //   node -e "CODE" a b  → argv [execPath, 'a', 'b']   execArgv ['-e', 'CODE']
 //
-// Deno.args is unaffected: it only ever exposes args.args (verified below).
+// Deno.args is unaffected: it only ever exposes args.scriptArgs.
 
 function isEvalMode(): boolean {
     return args.action === 'eval';
@@ -185,15 +182,11 @@ export function buildNodeArgv0(): string {
 /** Node process.execArgv — runtime flags before the subcommand. */
 export function buildNodeExecArgv(): string[] {
     if (!isEvalMode()) return [...args.kernelArgs];
-    // Eval spelling is carried explicitly by Args.evalToken. internalArgs
-    // contains only runtime options, so no global argv scan or filtering is
-    // needed and user tokens cannot be mistaken for an eval selector.
     return [...args.kernelArgs, ...evalExecArgvTokens(args.entry)];
 }
 
 // Shared namespace on `os` so cno/src/node/* can reach these without importing
-// across the node/ boundary (see AGENT.md: node modules must go through
-// import.meta.use()). deno/ code imports the builders directly instead.
+// across the node/ boundary (see AGENT.md).
 Reflect.set(os, '__cno_args', {
     set: setArgs,
     get: getArgs,

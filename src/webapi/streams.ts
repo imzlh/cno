@@ -189,20 +189,17 @@ class ReadableStreamController<R = unknown> implements globalThis.ReadableStream
         this.#onDequeue = null;
         this.#source = null;
 
-        // Reject all pending reads
         for (const read of this.#pendingReads) {
             queueMicrotask(() => read.reject(e));
         }
         this.#pendingReads = [];
 
-        // Reject all closed promises
         for (const cb of this.#closedCallbacks) {
             queueMicrotask(() => cb.reject(e));
         }
         this.#closedCallbacks = [];
     }
 
-    // Internal methods
     async #start(): Promise<void> {
         if (this.#started) return;
         if (this.#startPromise) return this.#startPromise;
@@ -222,7 +219,6 @@ class ReadableStreamController<R = unknown> implements globalThis.ReadableStream
     }
 
     #read(): void {
-        // State checks
         if (this.#state === 'closed') {
             const read = this.#pendingReads.shift();
             if (read) read.resolve({ value: undefined, done: true });
@@ -336,9 +332,8 @@ class ReadableStreamController<R = unknown> implements globalThis.ReadableStream
     #finishClose(): void {
         this.#state = 'closed';
 
-        // Release all queued data so it can be GC'd.
-        // close() already drained #backpressureBuffer into #queue before
-        // calling us, so clearing both is safe — no data is lost.
+        // close() already drained #backpressureBuffer into #queue before calling
+        // us, so clearing both here loses nothing.
         this.#queue = [];
         this.#queueSize = 0;
         this.#backpressureBuffer = [];
@@ -348,17 +343,14 @@ class ReadableStreamController<R = unknown> implements globalThis.ReadableStream
         this.#storedError = undefined;
 
         // Break the closure chain: the source captures the producer's entire
-        // scope (curl handle, headers, hooks, etc.).  Once the stream is done
-        // the source will never be called again, so we can release it.
+        // scope (curl handle, headers, hooks, etc.) and is never called again.
         this.#source = null;
 
-        // Resolve any pending reads with done
         for (const read of this.#pendingReads) {
             read.resolve({ value: undefined, done: true });
         }
         this.#pendingReads = [];
 
-        // Resolve closed promises
         for (const cb of this.#closedCallbacks) {
             cb.resolve();
         }

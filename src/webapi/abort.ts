@@ -218,7 +218,6 @@ class AbortController implements globalThis.AbortController {
 Object.defineProperty(AbortSignal.prototype, Symbol.toStringTag, { value: 'AbortSignal', configurable: true });
 Object.defineProperty(AbortController.prototype, Symbol.toStringTag, { value: 'AbortController', configurable: true });
 
-// ==================== Export ====================
 export {
     AbortController,
     AbortSignal,

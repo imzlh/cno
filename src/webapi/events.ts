@@ -288,9 +288,6 @@ export class ErrorEvent extends Event implements globalThis.ErrorEvent {
         this.lineno = init.lineno ?? 0;
         this.colno = init.colno ?? 0;
         this.error = init.error ?? null;
-
-        // Ensures `instanceof ErrorEvent` works correctly.
-        Object.setPrototypeOf(this, ErrorEvent.prototype);
     }
 
     get [Symbol.toStringTag]() {
@@ -373,7 +370,6 @@ export class DOMException extends Error {
                 stackValue = value;
             },
         });
-        Object.setPrototypeOf(this, DOMException.prototype);
     }
 
     // Static error code constants (as defined in DOM Standard)

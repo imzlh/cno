@@ -19,7 +19,7 @@ const sysError = import.meta.use('error');
 
 type StdioName = 'stdin' | 'stdout' | 'stderr';
 
-function pipe(type: Deno.CommandOptions['stdout'] | undefined, _name: StdioName): CModuleProcess.SpawnOptions<false>['stdout'] {
+function pipe(type: Deno.CommandOptions['stdout'] | undefined, name: StdioName): CModuleProcess.SpawnOptions<false>['stdout'] {
     switch (type) {
         case undefined:
         case 'inherit':
@@ -29,7 +29,7 @@ function pipe(type: Deno.CommandOptions['stdout'] | undefined, _name: StdioName)
         case 'null':
             return 'ignore';
         default:
-            throw new TypeError(`unknown variant \`${String(type)}\`, expected one of \`inherit\`, \`piped\`, \`null\``);
+            throw new TypeError(`unknown variant \`${name}: ${String(type)}\`, expected one of \`inherit\`, \`piped\`, \`null\``);
     }
 }
 
@@ -258,9 +258,10 @@ export class ChildProcess implements Deno.ChildProcess {
         this.#proc.kill(normalizeSignal(signo));
     }
 
-    ref(): void { /* no-op: process lifecycle not managed by ref counting */ }
+    // Child handles are not ref-counted by this runtime's event loop.
+    ref(): void { }
 
-    unref(): void { /* no-op */ }
+    unref(): void { }
 
     get stdin(): WritableStream<Uint8Array<ArrayBufferLike>> {
         if (!this.#stdin) throw new TypeError("Cannot get 'stdin': 'stdin' is not piped");

@@ -1,25 +1,4 @@
-/**
- * Deno KV Module
- * 
- * Usage:
- * ```ts
- * const kv = await Deno.openKv();
- * await kv.set(["users", "alice"], { name: "Alice", age: 30 });
- * const entry = await kv.get(["users", "alice"]);
- * console.log(entry.value); // { name: "Alice", age: 30 }
- * 
- * // Atomic operations
- * const result = await kv.atomic()
- *   .check({ key: ["users", "alice"], versionstamp: entry.versionstamp })
- *   .set(["users", "alice"], { name: "Alice", age: 31 })
- *   .commit();
- * 
- * // List entries
- * for await (const entry of kv.list({ prefix: ["users"] })) {
- *   console.log(entry.key, entry.value);
- * }
- * ```
- */
+/** Deno KV on the SQLite3 backend. */
 
 import { Kv } from './core';
 import { KvListIterator } from './iterator';

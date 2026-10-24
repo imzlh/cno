@@ -1,6 +1,3 @@
-/**
- * Deno KV Implementation
- */
 import {
     KvKey, KvEntryMaybe, KvSetOptions,
     KvQueueOptions, serializeKey, serializeValue,
@@ -73,7 +70,7 @@ export class Kv implements Deno.Kv {
             try {
                 sub.controller.close();
             } catch {
-                // Ignore
+                // Already cancelled.
             }
         }
         this.watchSubscriptions.clear();
@@ -294,7 +291,7 @@ export class Kv implements Deno.Kv {
                 try {
                     controller.enqueue(initialValues);
                 } catch {
-                    // Stream might be cancelled
+                    // Stream cancelled before the first batch.
                 }
             },
             cancel() {
@@ -348,7 +345,7 @@ export class Kv implements Deno.Kv {
                         try {
                             await this.set(key, entry.data);
                         } catch {
-                            // Ignore
+                            // Best-effort restore; the queue row is dropped either way.
                         }
                     }
                 }
@@ -386,7 +383,7 @@ export class Kv implements Deno.Kv {
                 }
             }
         } catch {
-            // Ignore processing errors
+            // A failing row must not stop the rest of the queue from draining.
         }
     }
 
@@ -439,7 +436,7 @@ export class Kv implements Deno.Kv {
                 
                 sub.controller.enqueue(values);
             } catch {
-                // Controller might be closed
+                // The consumer cancelled the watch stream.
             }
         }
     }

@@ -68,18 +68,10 @@ class LocationImpl implements globalThis.Location {
     }
 }
 
-// Without --location, Deno leaves location undefined (specs/run/_071_location_unset).
-// With --location=<url>, install a frozen-assignment Location instance.
-function installLocationFromFlag(): void {
-    let raw: string | undefined;
-    try {
-        raw = os.getenv('CNO_LOCATION');
-    } catch {
-        raw = undefined;
-    }
-    if (!raw) {
-        // Keep Location constructor public; leave global location unset.
-        Reflect.set(globalThis, 'Location', LocationImpl);
+// Deno leaves location undefined unless --location was given (specs/run/_071_location_unset).
+function installLocation(url: string | undefined): void {
+    Reflect.set(globalThis, 'Location', LocationImpl);
+    if (!url) {
         Object.defineProperty(globalThis, 'location', {
             get() { return undefined; },
             set() { notSupported('location'); },
@@ -89,14 +81,7 @@ function installLocationFromFlag(): void {
         return;
     }
 
-    let href = raw;
-    try {
-        href = new URL(raw).href;
-    } catch {
-        // Keep raw string if URL parse fails; constructor will throw.
-    }
-    const loc = new LocationImpl(href);
-    Reflect.set(globalThis, 'Location', LocationImpl);
+    const loc = new LocationImpl(url);
     Object.defineProperty(globalThis, 'location', {
         get() { return loc; },
         set() { notSupported('location'); },
@@ -105,12 +90,20 @@ function installLocationFromFlag(): void {
     });
 }
 
-installLocationFromFlag();
+installLocation(os.getenv('CNO_LOCATION'));
+
+function normalizeLocationUrl(raw: string): string {
+    try {
+        return new URL(raw).href;
+    } catch {
+        return raw;
+    }
+}
 
 /** Re-apply after CLI parses --location (polyfill may load before flags). */
 export function applyLocation(href: string): void {
-    try { os.setenv('CNO_LOCATION', href); } catch { /* */ }
-    const loc = new LocationImpl(new URL(href).href);
+    os.setenv('CNO_LOCATION', href);
+    const loc = new LocationImpl(normalizeLocationUrl(href));
     Object.defineProperty(globalThis, 'location', {
         get() { return loc; },
         set() { notSupported('location'); },

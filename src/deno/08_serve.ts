@@ -9,18 +9,15 @@ import { h2Available } from '@cnojs/http/h2-native';
 import { TcpSocket } from '@cnojs/http/socket';
 import { assert } from '../utils/assert';
 import { createWebSocketFromConnection } from "../webapi/websocket";
-import { createSwitchingProtocolsResponse, getResponseInitiatorCallFrames, setResponseInitiatorCallFrames } from '../webapi/fetch';
+import { createSwitchingProtocolsResponse, getResponseInitiatorCallFrames, setResponseInitiatorCallFrames, truncateHookPostData } from '../webapi/fetch';
 import { wrapFsClassDec as wrap, wrapFSErr, wrapFSns } from "../utils/wrap";
 import { errors } from './01_errors';
 import { getServeHook, captureUserNetworkCallFrames, type NetworkCallFrame } from '../utils/network-hooks';
-import { getTierLimits } from '../utils/memory-tier';
 import type { ISocket } from "@cnojs/http/socket";
 
 const crypto = import.meta.use('crypto');
 const engine = import.meta.use('engine');
 const http = import.meta.use('http');
-
-const { hookPayloadCap: PAYLOAD_LEN } = getTierLimits();
 
 /* ------------------------------------------------------------------ */
 /* WebSocket Upgrade Symbol                                           */
@@ -130,39 +127,22 @@ function newServeRequestId(): string {
     return `serve-${++serveRequestSeq}`;
 }
 
+/** captureUserNetworkCallFrames skips the fetch() frame; skip this helper's too. */
 function captureServeCallFrames(): NetworkCallFrame[] | undefined {
     return captureUserNetworkCallFrames();
 }
 
-function headersArrayToRecord(headers: Array<[string, string]>): Record<string, string> {
+function headersToRecord(headers: Iterable<[string, string]>): Record<string, string> {
     const out: Record<string, string> = {};
-    for (const [k, v] of headers) out[k] = v;
+    for (const [key, value] of headers) out[key] = value;
     return out;
-}
-
-function headersToRecord(headers: Headers): Record<string, string> {
-    const out: Record<string, string> = {};
-    headers.forEach((value, key) => { out[key] = value; });
-    return out;
-}
-
-function truncateHookPostData(body?: Uint8Array | null): Uint8Array | null | undefined {
-    if (!body) return body;
-    if (body.byteLength > PAYLOAD_LEN) {
-        return new Uint8Array(body.subarray(0, PAYLOAD_LEN));
-    }
-    return body;
 }
 
 /* ------------------------------------------------------------------ */
 /* Adapter: Server Core → Web API                                    */
 /* ------------------------------------------------------------------ */
 
-/**
- * Convert core HttpRequest to Web API Request
- */
 function createWebRequest(coreReq: HttpRequest, connInfo: { hostname: string; port: number; secure: boolean }, signal: AbortSignal): Request {
-    // Convert headers
     const headers = new Headers(coreReq.headers);
     const host = headers.get('host') || `${connInfo.hostname}:${connInfo.port}`;
     const protocol = connInfo.secure ? 'https:' : 'http:';
@@ -188,9 +168,6 @@ function createWebRequest(coreReq: HttpRequest, connInfo: { hostname: string; po
     return new Request(url.toString(), init);
 }
 
-/**
- * Adapter for HttpResponse to handle Web API Response
- */
 class ResponseAdapter {
     private coreRes: HttpResponse;
     private finishedEmitted = false;
@@ -345,12 +322,8 @@ class ResponseAdapter {
         this.emitFinished(true);
     }
 
-    /**
-     * Handle WebSocket upgrade
-     */
     @wrap
     private async handleWebSocketUpgrade(response: WebSocketResponse): Promise<void> {
-        // Send upgrade headers
         const headers = Array.from(response.headers.entries());
         const statusText = response.statusText ?? http.strstatus(response.status);
         const serveHook = getServeHook();
@@ -369,10 +342,8 @@ class ResponseAdapter {
         }
         await this.coreRes.writeHead(response.status, statusText, headers);
 
-        // Upgrade connection
         const conn = this.coreRes.upgrade();
 
-        // Execute WebSocket handler
         const websocketHandler = response[kWebSocket];
         if (websocketHandler) {
             Reflect.set(conn, kWSMeta, {
@@ -393,9 +364,6 @@ class ResponseAdapter {
 /* Deno.serve Implementation                                          */
 /* ------------------------------------------------------------------ */
 
-/**
- * HTTP server wrapper (implements Deno.HttpServer interface)
- */
 class DenoHttpServer implements Deno.HttpServer<Deno.Addr> {
     private server: Server;
     private finishedPromise: Promise<void>;
@@ -421,13 +389,10 @@ class DenoHttpServer implements Deno.HttpServer<Deno.Addr> {
         return this.finishedPromise;
     }
 
-    ref(): void {
-        // Txiki.js server handles do not expose ref/unref.
-    }
+    // The server handle exposes no ref/unref.
+    ref(): void { }
 
-    unref(): void {
-        // Kept as the matching no-op for ref().
-    }
+    unref(): void { }
 
     async shutdown(): Promise<void> {
         await this.server.closeGracefully();
@@ -439,9 +404,6 @@ class DenoHttpServer implements Deno.HttpServer<Deno.Addr> {
     }
 }
 
-/**
- * Deno.serve - main entry point
- */
 function serve(options: Deno.ServeOptions): Deno.HttpServer;
 function serve(handler: Deno.ServeHandler): Deno.HttpServer;
 function serve(
@@ -491,7 +453,7 @@ function serve(
                     requestId,
                     url: requestUrl,
                     method: req.method,
-                    headers: headersArrayToRecord(req.headers),
+                    headers: headersToRecord(req.headers),
                     postData: requestPostData,
                     callFrames: requestEntryCallFrames,
                     timestamp: requestStartTime,
@@ -507,7 +469,6 @@ function serve(
                 requestAbort.abort(Object.assign(new Error('HTTP request peer disconnected'), { code: 'ECONNRESET' }));
             });
             try {
-                // Create Web API Request
                 const addr = coreServer.address();
                 const denoAddr: Deno.Addr = addr && 'path' in addr
                     ? { transport: 'unix', path: addr.path }
@@ -524,13 +485,11 @@ function serve(
                 req.body = null;
                 requestUrl = webRequest.url;
 
-                // Create connection info
                 const connInfo: Deno.ServeHandlerInfo = {
                     remoteAddr: denoAddr,
                     completed: Promise.resolve() // Simplified
                 };
 
-                // Call user handler
                 const webResponse = await requestHandler(webRequest, connInfo);
                 if (!(webResponse instanceof Response)) {
                     throw new TypeError('Handler must return a Response');
@@ -622,7 +581,6 @@ function upgradeWebSocket(
     request: Request,
     options?: Deno.UpgradeWebSocketOptions
 ): Deno.WebSocketUpgrade {
-    // Validate WebSocket request
     const upgradeHeader = request.headers.get('upgrade')?.toLowerCase();
     const connectionHeader = request.headers.get('connection')?.toLowerCase();
     const wsKey = request.headers.get('sec-websocket-key');
@@ -639,14 +597,12 @@ function upgradeWebSocket(
         throw new TypeError("Invalid Header: 'sec-websocket-key' header must be set");
     }
 
-    // Build response headers
     const headers = new Headers({
         'upgrade': 'websocket',
         'connection': 'Upgrade',
         'sec-websocket-accept': calculateWebSocketAccept(wsKey)
     });
 
-    // Handle protocol negotiation
     const protocols = request.headers.get('sec-websocket-protocol');
     if (protocols && options?.protocol) {
         const requestedProtocols = protocols.split(',').map(p => p.trim());
@@ -655,16 +611,13 @@ function upgradeWebSocket(
         }
     }
 
-    // Create WebSocket promise
     const conProm = Promise.withResolvers<ISocket>();
 
-    // Create upgrade response
     const response = createSwitchingProtocolsResponse({
         statusText: 'Switching Protocols',
         headers
     }) as WebSocketResponse;
 
-    // Attach WebSocket handler
     const ws = createWebSocketFromISocket(conProm.promise);
     response[kWebSocket] = c => conProm.resolve(c);
 
@@ -674,10 +627,6 @@ function upgradeWebSocket(
     };
 }
 
-/**
- * Create WebSocket from ISocket
- * This adapts the raw connection to WebSocket protocol
- */
 function createWebSocketFromISocket(conn: Promise<ISocket>): globalThis.WebSocket {
     const serverMeta = conn.then(c => Reflect.get(c, kWSMeta) as IWSMeta);
     return createWebSocketFromConnection(

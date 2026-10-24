@@ -10,7 +10,6 @@ const udp = import.meta.use('udp');
 const windows = import.meta.use('win32');
 const timers = import.meta.use('timers');
 const error = import.meta.use('error');
-const algo = import.meta.use('algorithm');
 
 import { dnsCache } from '@cnojs/http/dns-cache';
 import { errors } from "./01_errors";
@@ -822,7 +821,7 @@ let systemCaPemCache: string | null | undefined;
 function systemCaPem(): string | undefined {
     if (systemCaPemCache !== undefined) return systemCaPemCache ?? undefined;
     systemCaPemCache = null;
-    if (os.platform === 'win32') {
+    if (os.platform === 'windows' || os.platform === 'win32') {
         try {
             const certs = windows?.exportCerts();
             if (certs?.length) systemCaPemCache = certs.join('\n');
@@ -989,7 +988,6 @@ class TlsListener extends Listener implements Deno.TlsListener {
     async accept(): Promise<Deno.TlsConn> {
         const conn = await super.accept();
 
-        // create SSLPipe
         const sslpipe = new ssl.Pipe(this.sslCtx, {
             servername: (this.$addr as Deno.NetAddr).hostname
         });
@@ -1108,8 +1106,8 @@ const denoNetNs = {
             const request = dns.query(query, nativeType, server, port);
             info = await withTimeoutAbort(request, 5000, opt?.signal, () => request.abort?.());
         } catch (cause) {
-            const code = (cause as { code?: string })?.code;
-            if (code === 'ENOTFOUND' || code === 'ENODATA') {
+            const code = (cause as CModuleError.Error)?.code;
+            if (code === error.errno.ENOENT || (code as unknown) === 'ENOTFOUND' || code == error.errno.ENODATA) {
                 throw new errors.NotFound(`No ${type} records found for ${query}`);
             }
             throw cause;
@@ -1177,7 +1175,6 @@ const denoNetNs = {
         const hostname = options.hostname ?? '127.0.0.1';
         const pipe = await connectTcp(hostname, options.port, options.signal);
 
-        // create SSL context
         const ctx = new ssl.Context({
             alpn: options.alpnProtocols,
             ca: caCertsPem(options.caCerts),

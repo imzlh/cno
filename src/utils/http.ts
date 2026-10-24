@@ -1,8 +1,4 @@
-/**
- * Shared HTTP/1.1 connection utilities.
- * Provides TCP connection establishment, HTTP request building,
- * and response header parsing for WebSocket, SSE, and other HTTP-based protocols.
- */
+/** Shared HTTP/1.1 utilities: TCP connect helpers, request building and response head parsing. */
 
 import { HttpRequestBuilder, HttpResponseParser } from "@cnojs/http/h1";
 import { Headers } from "../webapi/headers";
@@ -19,10 +15,6 @@ type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 /** Socket subset required for HTTP request/response exchange. */
 export type IHttpSocket = Pick<ISocket, 'onReadable' | 'stopReading' | 'write' | 'close'>;
 
-/* -------------------------------------------------------------------------- */
-/* TLS verification policy                                                    */
-/* -------------------------------------------------------------------------- */
-
 /** Per-connection TLS verification settings for the raw (non-libcurl) path. */
 export interface TlsOptions {
     /**
@@ -36,12 +28,7 @@ export interface TlsOptions {
 
 /**
  * Process-wide default. Verification is ON unless something explicitly turns it
- * off, so a caller that passes no options gets a verified connection.
- *
- * This mirrors how the libcurl side already works: `--skip-cert-verify` sets one
- * process-global flag rather than threading an option through every call site.
- * The raw path had no equivalent, which is why `https:`/`wss:` were unverified
- * even without the flag.
+ * off, mirroring the libcurl side's single `--skip-cert-verify` flag.
  */
 let defaultTls: TlsOptions = { rejectUnauthorized: true };
 
@@ -74,28 +61,18 @@ function isIpLiteral(hostname: string): boolean {
 /**
  * Build the client SSL context for a raw TLS connection.
  *
- * `verify: true` is what makes OpenSSL fail the handshake on an untrusted chain
- * (`SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT`), and it is also what
- * arms the hostname check: `ssl.Pipe` calls `SSL_set1_host(servername)` only
- * when the context wants hostname verification, and that check can only reject
- * a handshake while peer verification is on. So chain and name are enforced
- * together or not at all — there is no "chain only" state to reach by accident.
+ * `verify: true` makes OpenSSL fail on an untrusted chain and is also what arms
+ * the hostname check (`SSL_set1_host` in `ssl.Pipe`), so chain and name are
+ * enforced together.
  *
- * The CA bundle must be passed explicitly. OpenSSL's compile-time default verify
- * paths point at a directory that does not exist on Windows, so relying on
- * `SSL_CTX_set_default_verify_paths` alone leaves the store empty and every
- * verification fails with UNKNOWN_CA.
+ * The CA bundle must be passed explicitly: OpenSSL's compile-time verify paths
+ * are empty on Windows, so default verify paths alone reject every server.
  *
  * KNOWN WEAKNESS — IP-literal targets get chain verification but no name check.
- * `SSL_set1_host` matches DNS names only; OpenSSL requires `SSL_set1_ip_asc` to
- * match an IP against an iPAddress SAN, and the binding never calls it (there is
- * no `GEN_IPADD` handling in mod_ssl.c at all). Measured: a certificate with
- * `CN=127.0.0.1`, supplied as its own trust root, still fails the handshake when
- * connecting to `127.0.0.1` — the chain is fine and the *name* is what rejects.
- * Leaving hostname verification on for IP literals would therefore make every
- * `https://<ip>` connection fail regardless of how correct its certificate is,
- * so it is switched off for those and the chain check is kept. That is weaker
- * than Node, which matches IP SANs, and it must be closed in C rather than here.
+ * `SSL_set1_host` matches DNS names only; matching an IP needs `SSL_set1_ip_asc`,
+ * which the native layer never calls. Leaving the name check on would make every
+ * `https://<ip>` fail even with a correct certificate, so it is off for those.
+ * Node matches IP SANs; closing this needs a C-side change.
  */
 export function createClientTlsContext(alpn: string[], options?: TlsOptions, servername?: string): CModuleSSL.Context {
     const effective = options ?? defaultTls;
@@ -115,13 +92,10 @@ export function createClientTlsContext(alpn: string[], options?: TlsOptions, ser
 /**
  * Connect to the first reachable address for `hostname`.
  *
- * A fresh `streams.TCP` per candidate is required, not an optimisation: a handle
- * that has failed `connect` cannot be reused, so sharing one across the loop made
- * every candidate after the first fail regardless of reachability. Measured with
- * `['::1', '127.0.0.1']` against an IPv4-only listener — shared handle: all
- * candidates failed; fresh handle: connected via 127.0.0.1. Since `dnsCache`
- * returns IPv6 first for `localhost`, that turned "try each IP" into "try only
- * the first" and broke every IPv6-first name on an IPv4-only path.
+ * A fresh `streams.TCP` per candidate is required: a handle whose `connect`
+ * failed cannot be reused. Measured with `['::1', '127.0.0.1']` against an
+ * IPv4-only listener — a shared handle failed both candidates, fresh handles
+ * connected via 127.0.0.1.
  */
 export async function openTcp(hostname: string, port: number): Promise<TcpSocket> {
     const ips = await dnsCache.resolve(hostname);
@@ -146,14 +120,7 @@ export interface HttpResponseHead {
     leftover?: Uint8Array;
 }
 
-/**
- * Establish a TCP connection (with optional TLS) to the given URL's host.
- * Resolves DNS via cache, tries each IP until one connects, then performs
- * TLS handshake if the URL scheme is https: or wss:.
- *
- * The handshake verifies the peer by default. Pass `tls` to override, e.g. a
- * test that deliberately talks to a self-signed server.
- */
+/** Connect to the URL's host, over TLS for https:/wss:. `tls` overrides the verification policy. */
 export async function connectDirectTcp(url: URL, tls?: TlsOptions): Promise<TcpSocket> {
     const isSecure = url.protocol === 'https:' || url.protocol === 'wss:';
     const port = url.port ? parseInt(url.port) : (isSecure ? 443 : 80);
@@ -178,9 +145,7 @@ export async function connectTcp(url: URL): Promise<TcpSocket> {
     return (await connectHttp(url)).socket;
 }
 
-/**
- * Build raw HTTP/1.1 request bytes from method, URL, and headers.
- */
+/** Build raw HTTP/1.1 request bytes from method, URL, and headers. */
 export function buildRequest(opts: {
     method: string;
     url: URL;
@@ -198,11 +163,8 @@ export function buildRequest(opts: {
 }
 
 /**
- * Feed socket data into an HttpResponseParser until the headers are complete.
- * Uses the event-driven onReadable pattern.
- * Returns a promise resolving with status code and headers once they are fully parsed.
- * After resolution the socket's reader is stopped so the caller can set up
- * a new onReadable handler for the body / next protocol phase.
+ * Parse the response head, then stop the socket's reader so the caller can
+ * attach its own handler for the body / next protocol phase.
  */
 export function readHeaders(socket: IHttpSocket, parser: HttpResponseParser): Promise<HttpResponseHead> {
     let settled = false;

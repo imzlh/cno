@@ -21,7 +21,7 @@ type BodyIterable = Iterable<unknown> | AsyncIterable<unknown>;
 /** Internal capability used by fetch to disturb buffered Request bodies. */
 export const markRequestBodyUsed = Symbol('markRequestBodyUsed');
 
-// Pre-compiled regexes (avoid recompilation in hot paths).
+// Pre-compiled: these run per request.
 export const HTTP_LINE_RE = /^HTTP\//i;
 export const TIMEOUT_ERR_RE = /\b(timed?\s*out|timeout)\b/i;
 export const BOUNDARY_RE = /boundary=([^\s;]+)/i;
@@ -399,13 +399,13 @@ export function ensureFormDataContentType(headers: Headers): string {
     return boundary;
 }
 
-export function truncateHookPostData(body?: Uint8Array | null): Uint8Array | null | undefined {
+/** Cap hook payloads so debug observers never copy an unbounded request body. */
+export function truncateHookPostData(
+    body?: globalThis.Uint8Array<ArrayBufferLike> | null,
+): Uint8Array | null | undefined {
     if (!body) return body;
-    
-    if (body.byteLength > hookPayloadCap) {
-        return new Uint8Array(body.subarray(0, hookPayloadCap));
-    }
-    return body;
+    if (body.byteLength > hookPayloadCap) return new Uint8Array(body.subarray(0, hookPayloadCap));
+    return body as Uint8Array;
 }
 
 export function toCurlBody(body: globalThis.Uint8Array<ArrayBufferLike>): Uint8Array | ArrayBuffer {
@@ -516,7 +516,7 @@ export function parseUrlEncoded(body: Uint8Array): FormData {
     return fd;
 }
 
-// Pre-built CRLF2 needle for parseMultipart (avoids per-call allocation).
+// Pre-built to avoid a per-call allocation.
 const CRLF2 = new Uint8Array([0x0d, 0x0a, 0x0d, 0x0a]);
 
 export function parseMultipart(body: Uint8Array, boundary: string): FormData {
@@ -525,40 +525,33 @@ export function parseMultipart(body: Uint8Array, boundary: string): FormData {
     const firstBnd = engine.encodeString(`--${boundary}`);
     let pos = 0;
 
-    // Find first boundary (may or may not have leading CRLF).
     pos = algorithm.bytesIndexOf(body, firstBnd, 0);
     if (pos < 0) return fd;
     pos += firstBnd.length;
 
     while (pos < body.length) {
-        // Skip CRLF after boundary.
         if (body[pos] === 0x0d && body[pos + 1] === 0x0a) pos += 2;
-        // End boundary check (--).
         if (body[pos] === 0x2d && body[pos + 1] === 0x2d) break;
 
-        // Parse part headers until blank line.
         const hdrEnd = algorithm.bytesIndexOf(body, CRLF2, pos);
         if (hdrEnd < 0) break;
         const hdrStr = new Decoder().decode(body.subarray(pos, hdrEnd));
         pos = hdrEnd + 4;
 
-        // Extract name and filename from Content-Disposition.
         const nameMatch = hdrStr.match(/name="([^"]+)"/);
         const filenameMatch = hdrStr.match(/filename="([^"]+)"/);
         const ctMatch = hdrStr.match(/Content-Type:\s*(.+)/i);
         const name = nameMatch?.[1] ?? '';
 
-        // Find next boundary.
         const nextBnd = algorithm.bytesIndexOf(body, delimiter, pos);
         if (nextBnd < 0) break;
-        // Body is everything before the CRLF that precedes the boundary.
         const partBody = body.subarray(pos, nextBnd);
         pos = nextBnd + delimiter.length;
 
         if (filenameMatch) {
             const ct = ctMatch?.[1]?.trim() || 'application/octet-stream';
             const blob = new Blob([partBody], { type: ct });
-            // File polyfill: Blob + name.
+            // Blob polyfill has no `name`.
             Object.defineProperty(blob, 'name', { value: filenameMatch[1] });
             fd.append(name, blob, filenameMatch[1]);
         } else {

@@ -218,13 +218,11 @@ function watchToIterator(path: string): AsyncIterableIterator<Deno.FsEvent> & { 
                 return { done: true, value: undefined };
             }
 
-            // if there are events in the queue, return the first one
             if (eventQueue.length > 0) {
                 const value = eventQueue.shift();
                 if (value !== undefined) return { done: false, value };
             }
 
-            // wait for new events
             deferred = Promise.withResolvers();
             return deferred.promise;
         },
@@ -254,7 +252,6 @@ function watchToIterator(path: string): AsyncIterableIterator<Deno.FsEvent> & { 
                 watcher = null;
             }
 
-            // if there is a pending promise, resolve it
             deferred?.resolve({ done: true, value: undefined });
             deferred = null;
         }
@@ -427,7 +424,6 @@ Object.assign(Deno, wrapFSns({
         const oldStr = toString(old);
         const newStr = toString(newf);
         const resolved = inferredSymlinkType(oldStr, opt);
-        // Sync C layer takes a Windows hint string and has no junction flag — map to 'dir'.
         const hint = resolved?.type === 'dir' || resolved?.type === 'junction' ? 'dir' : resolved?.type;
         try {
             return fs.symlink(oldStr, newStr, hint);
@@ -453,12 +449,7 @@ Object.assign(Deno, wrapFSns({
             try {
                 fs.unlink(pathStr);
             } catch (error1) {
-                try {
-                    fs.rmdir(pathStr);
-                } catch (error2) {
-                    // Directory removal failed; surface the rmdir error
-                    throw error2;
-                }
+                fs.rmdir(pathStr);
             }
             return;
         }
@@ -478,7 +469,6 @@ Object.assign(Deno, wrapFSns({
             return;
         }
 
-        // Recursive: delete directory tree recursively
         await removeRecursive(pathStr);
     },
 
@@ -541,11 +531,9 @@ Object.assign(Deno, wrapFSns({
         const mode = opt?.mode;
 
         if (!recursive) {
-            // Non-recursive mode: create single directory
             return await asfs.mkdir(pathStr, mode);
         }
 
-        // Recursive mode: create directory tree
         await ensureDirectory(pathStr, mode);
     },
 
@@ -554,11 +542,9 @@ Object.assign(Deno, wrapFSns({
         const recursive = opt?.recursive ?? false;
 
         if (!recursive) {
-            // Non-recursive mode: create single directory
             return fs.mkdir(pathStr, opt?.mode);
         }
 
-        // Recursive mode: create directory tree
         ensureDirectorySync(pathStr, opt?.mode);
     },
 

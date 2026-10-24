@@ -1,8 +1,4 @@
-/**
- * Deno KV Types
- * Based on Deno 1.40+ KV API
- */
-
+// Encoding matches the Deno 1.40+ KV API so existing databases stay readable.
 import { arrayBufferBackedBytes, concatChunks, toOwnedBytes } from '../../utils/bytes';
 import { KvU64, isKvU64 } from './u64';
 

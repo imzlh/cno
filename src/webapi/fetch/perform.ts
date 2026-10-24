@@ -104,14 +104,12 @@ function applyClientToCurl(curl: CModuleCURL.CURL, client: HttpClient, url: URL)
     const proxy = opts.proxy;
     if (proxy) {
         clearCurlProxy(curl);
-        if (client.shouldUseProxy(url)) {
-            const proxyUrl = client.getProxyUrl();
-            if (proxyUrl) {
-                curl.setProxy(proxyUrl.href, getCurlProxyType(proxyUrl.protocol));
-                if (proxy.basicAuth) {
-                    curl.setOpt(curlMod.CURLOPT_PROXYUSERNAME, proxy.basicAuth.username);
-                    curl.setOpt(curlMod.CURLOPT_PROXYPASSWORD, proxy.basicAuth.password);
-                }
+        const proxyUrl = client.shouldUseProxy(url) ? client.getProxyUrl() : null;
+        if (proxyUrl) {
+            curl.setProxy(proxyUrl.href, getCurlProxyType(proxyUrl.protocol));
+            if (proxy.basicAuth) {
+                curl.setOpt(curlMod.CURLOPT_PROXYUSERNAME, proxy.basicAuth.username);
+                curl.setOpt(curlMod.CURLOPT_PROXYPASSWORD, proxy.basicAuth.password);
             }
         }
     }
@@ -167,8 +165,7 @@ export async function performFetch(request: Request, url: URL): Promise<Response
 
     const curl = new curlMod.CURL(getCurlPool());
 
-    // If a Deno.HttpClient is attached, apply its proxy/SSL config to curl
-    // instead of reimplementing HTTP on a raw socket.
+    // A Deno.HttpClient is applied to curl rather than reimplementing HTTP on a raw socket.
     const client = (await import('../../deno/07_http')).getRequestClient(request);
     const configureRequestNetwork = (target: URL) => {
         getCurlInitHook()?.(curl, target);
@@ -184,7 +181,6 @@ export async function performFetch(request: Request, url: URL): Promise<Response
     const ts = () => Date.now() / 1000;
     const reqCallFrames = (netHook || interceptHook) ? request.getInitiatorCallFrames() : undefined;
 
-    // Build final headers: request headers + extra CDP headers + UA override
     const finalHeaders = new Headers(request.headers);
     const extraHdrs = getExtraHTTPHeaders();
     for (const [k, v] of Object.entries(extraHdrs))
@@ -196,10 +192,9 @@ export async function performFetch(request: Request, url: URL): Promise<Response
     else if (!finalHeaders.has('User-Agent'))
         finalHeaders.set('User-Agent', `cno/${version}`);
 
-    // Read accept-encoding BEFORE filterHeaders strips it.
+    // Read before filterHeaders strips it.
     const acceptEncoding = compressionAcceptEncoding(finalHeaders);
 
-    // referrer → Referer header (only if not already set by caller)
     if (!finalHeaders.has('Referer') && request.referrer && request.referrer !== 'no-referrer' && request.referrer !== 'about:client') {
         try {
             const refUrl = new URL(request.referrer);
@@ -209,12 +204,10 @@ export async function performFetch(request: Request, url: URL): Promise<Response
         } catch { /* invalid referrer, skip */ }
     }
 
-    // filter headers managed internally by curl
     filterHeaders(finalHeaders);
 
-    // Merge duplicate headers (curl setHeaders only accepts Record<string,string>).
-    // HTTP/1.1 §3.2.2: field values with the same name may be combined with ", ".
-    // Exception: Cookie uses "; " per RFC 6265 §5.4.
+    // curl.setHeaders takes a Record, so duplicates are folded: ", " per
+    // HTTP/1.1 §3.2.2, except Cookie which uses "; " per RFC 6265 §5.4.
     const objHeaders: Record<string, string> = {};
     for (const [k, v] of finalHeaders.entries()) {
         if (k in objHeaders) {
@@ -229,10 +222,9 @@ export async function performFetch(request: Request, url: URL): Promise<Response
     configureRequestNetwork(url);
     curl.setOpt(curlMod.CURLOPT_AUTOREFERER, 1);  // update Referer to the Location URL on each redirect hop
     curl.setAcceptEncoding(acceptEncoding);
-    // Default timeouts (ms): bound a hung upstream so a single fetch can't block forever.
+    // Bound a hung upstream so one fetch cannot block forever.
     curl.setConnectTimeout(15000);
 
-    // redirect mode
     if (request.redirect === 'error' || request.redirect === 'manual') {
         curl.setFollowRedirects(false);
     } else {
@@ -244,7 +236,6 @@ export async function performFetch(request: Request, url: URL): Promise<Response
         curl.setBody(toCurlBody(body));
     }
 
-    // AbortSignal directly cancels the underlying curl request
     let abortHandler: (() => void) | null = null;
     if (request.signal) {
         abortHandler = () => {
@@ -505,7 +496,6 @@ export async function performFetch(request: Request, url: URL): Promise<Response
         }
     }
 
-    // call hook
     const reqStartTime = Date.now() / 1000;  // absolute start for timing delta calc
     if (netHook) {
         emitFetchHookQuietly(() => {
@@ -599,20 +589,11 @@ export async function performFetch(request: Request, url: URL): Promise<Response
 
 /**
  * Attach an `init.client` (Deno.HttpClient) to the request so performFetch applies
- * its proxy/CA/mTLS settings.
+ * its proxy/CA/mTLS settings. `Request` does not retain unknown init keys, so the
+ * client is carried out of band; a non-HttpClient value is rejected rather than
+ * silently dropped, matching Deno.
  *
- * The option used to be dropped on the floor: `Request` does not retain unknown
- * init keys, and nothing in the tree ever called `setRequestClient`, so every
- * caller that configured a proxy, pinned a CA or supplied a client certificate got
- * a default connection and no indication that it had happened. Silently ignoring a
- * security-relevant option is the defect, so a non-HttpClient value is rejected
- * rather than ignored.
- *
- * Measured against Deno 2.9.3: `fetch(url, { client: {} })` rejects with
- * `TypeError: Failed to construct 'Request': Argument 2 \`client\` must be a
- * Deno.HttpClient` — duck-typed objects are refused too — while `null` and
- * `undefined` mean "no client". A client attached to a Request also survives
- * `fetch(new Request(rq))`, which the carry-over below preserves.
+ * A client attached to a Request also survives `fetch(new Request(rq))`.
  */
 async function attachRequestClient(request: Request, init: RequestInit | undefined, input: unknown): Promise<void> {
     const client = (init as { client?: unknown } | undefined)?.client;
@@ -621,7 +602,6 @@ async function attachRequestClient(request: Request, init: RequestInit | undefin
     if ((client === undefined || client === null) && !(input instanceof Request)) return;
     const http = await import('../../deno/07_http');
     if (client === undefined || client === null) {
-        // Carry a client forward off an input Request, matching Deno.
         if (input instanceof Request) {
             const inherited = http.getRequestClient(input);
             if (inherited) http.setRequestClient(request, inherited);

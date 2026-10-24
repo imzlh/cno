@@ -1,15 +1,8 @@
-/**
- * Web Crypto API (SubtleCrypto) implementation for txiki.js
- * Based on W3C Web Cryptography API specification
- */
-
 import { DOMException } from "./events";
 
 const crypto = import.meta.use('crypto');
 const algo = import.meta.use('algorithm');
 const engine = import.meta.use('engine');
-
-// Type Definitions
 
 type BufferSource = ArrayBuffer | ArrayBufferView;
 type HashAlgorithmIdentifier = AlgorithmIdentifier | string;
@@ -135,8 +128,6 @@ interface Pbkdf2Params extends Algorithm {
 interface EcdhKeyDeriveParams extends Algorithm {
     public: CryptoKey;
 }
-
-// Utility Functions
 
 function toArrayBuffer(source: BufferSource): ArrayBuffer {
     if (source instanceof ArrayBuffer) return source;
@@ -468,8 +459,6 @@ function pbkdf2Sha1(password: ArrayBuffer, salt: ArrayBuffer, iterations: number
     return out.slice(0, keylen).buffer;
 }
 
-// CryptoKey Implementation
-
 // Key bytes live outside the object graph so they are not an own property and
 // cannot be reached by Object.keys/getOwnPropertyDescriptors/structuredClone or
 // dumped by a debug log. Membership in this map is also the brand: only _create
@@ -547,20 +536,12 @@ function handleOf(key: CryptoKey): ArrayBuffer {
     return handle;
 }
 
-// SubtleCrypto Implementation
-
 class SubtleCrypto implements RuntimeSubtleCrypto {
-    /**
-     * Generate cryptographic digest (hash)
-     */
     async digest(algorithm: HashAlgorithmIdentifier, data: BufferSource): Promise<ArrayBuffer> {
         const hashFn = getHashFunction(algorithm);
         return hashFn(toArrayBuffer(data));
     }
 
-    /**
-     * Generate a new key pair or secret key
-     */
     async generateKey(
         algorithm: AlgorithmIdentifier,
         extractable: boolean,
@@ -662,9 +643,6 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
         throw new Error(`Unsupported algorithm: ${alg.name}`);
     }
 
-    /**
-     * Sign data
-     */
     async sign(algorithm: AlgorithmIdentifier, key: CryptoKey, data: BufferSource): Promise<ArrayBuffer> {
         // Brand check first: node reports a TypeError for a non-CryptoKey
         // argument before it ever looks at usages.
@@ -740,9 +718,6 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
         throw new Error(`Unsupported signing algorithm: ${alg.name}`);
     }
 
-    /**
-     * Verify signature
-     */
     async verify(
         algorithm: AlgorithmIdentifier,
         key: CryptoKey,
@@ -846,9 +821,6 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
         throw new Error(`Unsupported verification algorithm: ${alg.name}`);
     }
 
-    /**
-     * Encrypt data
-     */
     async encrypt(algorithm: AlgorithmIdentifier, key: CryptoKey, data: BufferSource): Promise<ArrayBuffer> {
         handleOf(key);
         if (!key.usages.includes('encrypt')) {
@@ -911,9 +883,6 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
         throw new Error(`Unsupported encryption algorithm: ${alg.name}`);
     }
 
-    /**
-     * Decrypt data
-     */
     async decrypt(algorithm: AlgorithmIdentifier, key: CryptoKey, data: BufferSource): Promise<ArrayBuffer> {
         handleOf(key);
         if (!key.usages.includes('decrypt')) {
@@ -981,9 +950,6 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
         throw new Error(`Unsupported decryption algorithm: ${alg.name}`);
     }
 
-    /**
-     * Derive key from base key
-     */
     async deriveKey(
         algorithm: AlgorithmIdentifier,
         baseKey: CryptoKey,
@@ -1002,9 +968,6 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
         return this.importKey('raw', bits, derivedKeyAlgorithm, extractable, keyUsages);
     }
 
-    /**
-     * Derive bits from base key
-     */
     async deriveBits(algorithm: AlgorithmIdentifier, baseKey: CryptoKey, length: number | null): Promise<ArrayBuffer> {
         const keyHandle = handleOf(baseKey);
         if (!baseKey.usages.includes('deriveBits') && !baseKey.usages.includes('deriveKey')) {
@@ -1083,9 +1046,6 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
         throw new Error(`Unsupported derivation algorithm: ${alg.name}`);
     }
 
-    /**
-     * Import key from external format
-     */
     async importKey(
         format: string,
         keyData: BufferSource | JsonWebKey,
@@ -1187,9 +1147,6 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
         throw new Error(`Unsupported import format: ${format}`);
     }
 
-    /**
-     * Export key to external format
-     */
     async exportKey(format: string, key: CryptoKey): Promise<ArrayBuffer | JsonWebKey> {
         const keyHandle = handleOf(key);
         if (!key.extractable) {
@@ -1235,9 +1192,6 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
 
         throw new Error(`Unsupported export format: ${format}`);
     }
-    /**
-     * Wrap a key for secure storage or transmission
-     */
     async wrapKey(
         format: string,
         key: CryptoKey,
@@ -1256,9 +1210,6 @@ class SubtleCrypto implements RuntimeSubtleCrypto {
         return this.encryptData(wrapAlgorithm, wrappingKey as CryptoKeyImpl, toArrayBuffer(exportKeyBytes(format, exportedKey)));
     }
 
-    /**
-     * Unwrap a previously wrapped key
-     */
     async unwrapKey(
         format: string,
         wrappedKey: BufferSource,

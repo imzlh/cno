@@ -108,8 +108,6 @@ const webConsole = {
     format,
 };
 
-Object.setPrototypeOf(webConsole, Object.create(Object.prototype));
-
 Object.defineProperty(globalThis, 'console', {
     value: webConsole,
     writable: true,
