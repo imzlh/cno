@@ -1,5 +1,6 @@
 import { Readable, Writable } from '../stream';
 import { arrayBufferBackedBytes } from '../_internal/buffer';
+import { withCode } from '../_internal/errors';
 import { toErrnoException } from '../_internal/errno';
 import { modeToNumber, parseFlags, pathToString, toUint8Array, type Mode, type PathLike } from './utils';
 
@@ -73,16 +74,18 @@ function describeValue(value: unknown): string {
 }
 
 function invalidArgType(name: string, value: unknown): never {
-    const e = new TypeError(`The "${name}" argument must be of type number. Received ${describeValue(value)}`);
-    Reflect.set(e, 'code', 'ERR_INVALID_ARG_TYPE');
-    throw e;
+    throw withCode(
+        new TypeError(`The "${name}" argument must be of type number. Received ${describeValue(value)}`),
+        'ERR_INVALID_ARG_TYPE',
+    );
 }
 
 function outOfRange(name: string, constraint: string, value: unknown): never {
     const shown = typeof value === 'number' ? formatNumber(value) : String(value);
-    const e = new RangeError(`The value of "${name}" is out of range. It must be ${constraint}. Received ${shown}`);
-    Reflect.set(e, 'code', 'ERR_OUT_OF_RANGE');
-    throw e;
+    throw withCode(
+        new RangeError(`The value of "${name}" is out of range. It must be ${constraint}. Received ${shown}`),
+        'ERR_OUT_OF_RANGE',
+    );
 }
 
 /**
@@ -103,9 +106,10 @@ function validateHighWaterMark(value: unknown): number | undefined {
     if (value === undefined) return undefined;
     if (typeof value !== 'number' || Number.isNaN(value) || value < 0) {
         const shown = typeof value === 'string' ? `'${value}'` : String(value);
-        const e = new TypeError(`The property 'options.highWaterMark' is invalid. Received ${shown}`);
-        Reflect.set(e, 'code', 'ERR_INVALID_ARG_VALUE');
-        throw e;
+        throw withCode(
+            new TypeError(`The property 'options.highWaterMark' is invalid. Received ${shown}`),
+            'ERR_INVALID_ARG_VALUE',
+        );
     }
     return value;
 }

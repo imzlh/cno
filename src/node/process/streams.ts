@@ -12,7 +12,7 @@ const engine = import.meta.use('engine');
 const streams = import.meta.use('streams');
 
 const { streamHighWaterMark: PROCESS_READ_STREAM_HWM } = getTierLimits();
-const { stdin: denoStdin, stdout: denoStdout, stderr: denoStderr } = streams as any as Record<string, StdioStream>;
+const { stdin: denoStdin, stdout: denoStdout, stderr: denoStderr } = streams;
 
 function readTtySize(stdio: StdioStream): { width: number; height: number } | undefined {
     try {
@@ -69,10 +69,12 @@ export class ProcessWriteStream extends Writable {
         return this;
     }
 
+    // Node's tty.WriteStream reports 0, not undefined, when the size is unknown
+    // (not a TTY, or getWindowSize failed), so `columns > 0` stays a number test.
     get columns(): number {
         if (this.#columnsOverride !== undefined) return this.#columnsOverride;
-        if (!this.#stdio.isTTY) return undefined as unknown as number;
-        return readTtySize(this.#stdio)?.width as unknown as number;
+        if (!this.#stdio.isTTY) return 0;
+        return readTtySize(this.#stdio)?.width ?? 0;
     }
 
     set columns(value: number | undefined) {
@@ -81,8 +83,8 @@ export class ProcessWriteStream extends Writable {
 
     get rows(): number {
         if (this.#rowsOverride !== undefined) return this.#rowsOverride;
-        if (!this.#stdio.isTTY) return undefined as unknown as number;
-        return readTtySize(this.#stdio)?.height as unknown as number;
+        if (!this.#stdio.isTTY) return 0;
+        return readTtySize(this.#stdio)?.height ?? 0;
     }
 
     set rows(value: number | undefined) {
@@ -141,7 +143,7 @@ export class ProcessWriteStream extends Writable {
     }
 
     getWindowSize(): [number, number] {
-        return [this.columns ?? 80, this.rows ?? 24];
+        return [this.columns || 80, this.rows || 24];
     }
 
     clearScreenDown(callback?: () => void): boolean {

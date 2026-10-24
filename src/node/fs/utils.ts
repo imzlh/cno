@@ -7,6 +7,7 @@ const { dirname, join } = path;
 import { fileURLToPath } from '../url';
 import { Buffer } from '../buffer';
 import { arrayBufferBackedBytes, base64ToBytes, concatChunks, hexToBytes } from '../_internal/buffer';
+import { withCode } from '../_internal/errors';
 import { toErrnoException } from '../_internal/errno';
 import { wrapSync } from './errno-fix';
 
@@ -35,15 +36,7 @@ export function modeToNumber(mode?: Mode): number | undefined {
     return mode;
 }
 
-/**
- * Node's `toUnixTimestamp`: every accepted form collapses to **seconds**.
- * A bare number is already seconds (`fs.utimesSync(p, 1614834367, ...)` means
- * 2021-03-04), a numeric string is seconds, and a Date contributes ms/1000.
- *
- * The previous version returned ms for a Date but the raw value for a number,
- * so callers that divided by 1000 turned 1614834367 *seconds* into 1614834
- * seconds and stamped every numeric utimes/futimes/lutimes call with 1970.
- */
+/** Every accepted form collapses to seconds; a Date contributes ms/1000. */
 export function timeToUnixSeconds(time: TimeLike, _name = 'time'): number {
     if (typeof time === 'string' && String(Number(time)) === time.trim() && time.trim() !== '') {
         return Number(time);
@@ -57,9 +50,7 @@ export function timeToUnixSeconds(time: TimeLike, _name = 'time'): number {
         if (Number.isFinite(ms)) return ms / 1000;
     }
     // Node uses the literal name "time" here regardless of the parameter.
-    const e = new TypeError('The "time" argument must be an instance of Date or an Time in seconds.');
-    Reflect.set(e, 'code', 'ERR_INVALID_ARG_TYPE');
-    throw e;
+    throw withCode(new TypeError('The "time" argument must be an instance of Date or an Time in seconds.'), 'ERR_INVALID_ARG_TYPE');
 }
 
 /** Milliseconds, for the asyncfs `utime`/`lutime`/`FileHandle.utime` bindings. */
@@ -164,11 +155,8 @@ export function toUint8Array(data: string | Uint8Array | ArrayBuffer, encoding?:
     if (data instanceof ArrayBuffer) {
         return new Uint8Array(data);
     }
-    // Anything that is not a string, ArrayBuffer or ArrayBufferView used to fall
-    // through to a zero-length view, so `writeFile(path, 42)` or
-    // `writeFile(path, {})` silently truncated the target to an empty file and
-    // reported success. Node rejects these with ERR_INVALID_ARG_TYPE and leaves
-    // the file alone.
+    // Reject anything that is not a string, ArrayBuffer or view: a zero-length fallback
+    // would silently truncate the target to an empty file.
     if (!ArrayBuffer.isView(data)) {
         throw Object.assign(
             new TypeError(
@@ -192,12 +180,7 @@ function inspectArgType(value: unknown): string {
     return name ? `an instance of ${name}` : 'type object';
 }
 
-/**
- * Node accepts any `ArrayBufferView` (incl. DataView / non-Uint8Array TypedArray)
- * as an fd read/write buffer, and treats it as raw bytes over its own window.
- * `new Uint8Array(dataView)` yields length 0 (DataView has no `.length`) and
- * `dataView.subarray` does not exist, so normalise on the exact window instead.
- */
+/** Raw bytes over the view's own window; `new Uint8Array(dataView)` would be length 0. */
 export function byteViewOf(buffer: ArrayBufferView | ArrayBuffer): Uint8Array {
     if (buffer instanceof ArrayBuffer) return new Uint8Array(buffer);
     if (!ArrayBuffer.isView(buffer)) {
@@ -304,19 +287,14 @@ const VALID_ENCODINGS = new Set([
 export function validateEncodingOption(encoding: unknown): void {
     if (encoding === undefined || encoding === null) return;
     if (typeof encoding !== 'string' || !VALID_ENCODINGS.has(encoding.toLowerCase())) {
-        const error = new TypeError(`The argument '${String(encoding)}' is invalid encoding. Received 'encoding'`);
-        Reflect.set(error, 'code', 'ERR_INVALID_ARG_VALUE');
-        throw error;
+        throw withCode(
+            new TypeError(`The argument '${String(encoding)}' is invalid encoding. Received 'encoding'`),
+            'ERR_INVALID_ARG_VALUE',
+        );
     }
 }
 
-/**
- * `validateRecursive` is opt-in because Node only rejects a non-boolean
- * `recursive` on `readdirSync` and callback `readdir` (both throw
- * ERR_INVALID_ARG_TYPE, the callback form synchronously). `fsp.readdir` and
- * every `opendir` form skip the check entirely and just coerce — measured, so
- * `{recursive:'yes'}` really does walk there.
- */
+/** `validateRecursive` opt-in: only readdirSync and callback readdir reject a non-boolean. */
 export function validateReaddirOptions(options: unknown, validateRecursive = false): void {
     if (options === undefined || options === null) return;
     if (typeof options === 'string') {
@@ -328,11 +306,10 @@ export function validateReaddirOptions(options: unknown, validateRecursive = fal
     if (!validateRecursive) return;
     const recursive = Reflect.get(options, 'recursive');
     if (recursive === undefined || recursive === null || typeof recursive === 'boolean') return;
-    const e = new TypeError(
-        `The "options.recursive" property must be of type boolean. Received ${describeArg(recursive)}`,
+    throw withCode(
+        new TypeError(`The "options.recursive" property must be of type boolean. Received ${describeArg(recursive)}`),
+        'ERR_INVALID_ARG_TYPE',
     );
-    Reflect.set(e, 'code', 'ERR_INVALID_ARG_TYPE');
-    throw e;
 }
 
 export function validateOpendirOptions(options: unknown): void {
@@ -362,57 +339,39 @@ function describeArg(v: unknown): string {
 }
 
 /**
- * Node's `validateInt32(fd, 'fd', 0, 2147483647)`, message-for-message.
- *
- * This is load-bearing beyond argument hygiene: without it a bogus fd reaches
- * the CRT, and UCRT's lowio `_VALIDATE_*` macros print
- * `... Assertion failed: (fh >= 0 && (unsigned)fh < (unsigned)_nhandle)` to
- * stderr — measured 4071 bytes on one probe sweep where Node writes 0. It is
- * also a correctness fix: before this, `fstatSync(undefined)` / `(NaN)` /
- * `({})` all *succeeded* (coerced to fd 0) and `writeSync(1.5)` wrote to
- * stdout, where Node throws. Range-checking here cannot cover an in-range but
- * unopened fd (9999); that still reaches the CRT and needs the C-side
- * `_set_invalid_parameter_handler` that libuv installs.
+ * Without this a bogus fd reaches the CRT, whose `_VALIDATE_*` assertion writes to stderr,
+ * and `fstatSync(undefined)` / `writeSync(1.5)` succeed instead of throwing.
  */
 export function validateFd(fd: number): void {
     if (typeof fd !== 'number') {
-        const e = new TypeError(`The "fd" argument must be of type number. Received ${describeArg(fd)}`);
-        Reflect.set(e, 'code', 'ERR_INVALID_ARG_TYPE');
-        throw e;
+        throw withCode(new TypeError(`The "fd" argument must be of type number. Received ${describeArg(fd)}`), 'ERR_INVALID_ARG_TYPE');
     }
     if (!Number.isInteger(fd)) {
-        const e = new RangeError(`The value of "fd" is out of range. It must be an integer. Received ${String(fd)}`);
-        Reflect.set(e, 'code', 'ERR_OUT_OF_RANGE');
-        throw e;
+        throw withCode(
+            new RangeError(`The value of "fd" is out of range. It must be an integer. Received ${String(fd)}`),
+            'ERR_OUT_OF_RANGE',
+        );
     }
     if (fd < 0 || fd > 0x7fffffff) {
-        const e = new RangeError(`The value of "fd" is out of range. It must be >= 0 && <= 2147483647. Received ${String(fd)}`);
-        Reflect.set(e, 'code', 'ERR_OUT_OF_RANGE');
-        throw e;
+        throw withCode(
+            new RangeError(`The value of "fd" is out of range. It must be >= 0 && <= 2147483647. Received ${String(fd)}`),
+            'ERR_OUT_OF_RANGE',
+        );
     }
 }
 
-/**
- * Node rejects aborted fs operations with its own `AbortError` class, not with
- * `signal.reason`. Measured v24.18.0 for `fsp.readFile(p, { signal })`:
- * `ctor=AbortError name=AbortError code='ABORT_ERR' isDOMException=false`, and
- * the reason is on `.cause` — even a custom `abort(new Error(...))` reason is
- * *not* passed through (`err === reason` is false).
- *
- * Returning `reason` verbatim handed back the platform DOMException, whose
- * `code` is the number 20, so no `err.code === 'ABORT_ERR'` check could match.
- */
+/** Node's own AbortError shape (`code` 'ABORT_ERR', reason on `.cause`), not the DOMException. */
 class AbortError extends Error {
+    code = 'ABORT_ERR';
     constructor(cause?: unknown) {
         super('The operation was aborted');
         this.name = 'AbortError';
-        Reflect.set(this, 'code', 'ABORT_ERR');
         if (cause !== undefined) Reflect.set(this, 'cause', cause);
     }
 }
 
-export function makeAbortError(signal: AbortSignal): NodeJS.ErrnoException {
-    return new AbortError(signal.reason) as NodeJS.ErrnoException;
+export function makeAbortError(signal: AbortSignal): NodeJS.ErrnoException & AbortError {
+    return new AbortError(signal.reason);
 }
 
 export function assertCopyFileMode(src: string, dest: string, mode?: unknown): void {
@@ -641,27 +600,7 @@ export function toNodeDirentAsync(
     return new Dirent(entryName, direntType(ent), parentPath);
 }
 
-/**
- * How a recursive walk decides whether to descend into a directory entry.
- *
- * Node uses two different gates and they disagree, so both are needed
- * (all figures measured against real node v24.18.0 on Windows):
- *
- * - `'follow'` — descend when the entry *resolves* to a directory. Reparse
- *   points (junctions AND directory symlinks) are therefore walked. Used by
- *   `readdirSync`, callback `readdir` (both with and without `withFileTypes`)
- *   and `fsp.readdir` without `withFileTypes`.
- * - `'strict'` — descend only when the dirent itself is typed as a directory,
- *   so no reparse point is ever walked. Used by `fsp.readdir` *with*
- *   `withFileTypes` and by every `opendir` form.
- *
- * A junction and a directory symlink are indistinguishable at the dirent level
- * on Windows: `FILE_ATTRIBUTE_REPARSE_POINT` is tested before
- * `FILE_ATTRIBUTE_DIRECTORY`, so both are `UV_DIRENT_LINK`. libuv does exactly
- * the same (see deps/libuv/src/win/fs.c:1552 and :1738), and Node's own Dirent
- * reports `isDirectory()===false, isSymbolicLink()===true` for both. So the
- * dirent type cannot be the discriminator — the follow gate must stat.
- */
+/** Walk gate for a recursive listing; both must exist because they disagree (docs/node-internals.md#fs-walk-gates). */
 export type LinkWalkPolicy = 'follow' | 'strict';
 
 /** A dirent whose type the platform did not report (POSIX `DT_UNKNOWN`). */
@@ -679,13 +618,7 @@ function needsResolve(entry: DirentInfo): boolean {
     return entry.isSymbolicLink || direntTypeUnknown(entry);
 }
 
-/**
- * A resolve failure means "not a directory", never an abort: Node lists broken
- * links without descending, and terminates a junction cycle when Windows
- * refuses the 65th reparse traversal with ELOOP (measured: 64 junctions
- * traversed regardless of path length, so the cap is the OS's, not a depth
- * limit of ours).
- */
+/** A resolve failure means "not a directory", never an abort (broken links are listed, not descended). */
 function isDirectorySync(absPath: string): boolean {
     try {
         return fs.stat(absPath).isDirectory;
@@ -722,9 +655,47 @@ function toWalkEntry(
 }
 
 /**
- * Breadth-first, because Node's recursive `readdirSync` is: every entry of a
- * level is emitted before any entry of the next one (measured — a depth-first
- * walk reorders the result the moment a directory has more than one child).
+ * Fast path: `join` normalizes, which is wasted work for the plain ASCII names a directory
+ * listing yields; anything else takes the real `join` so every normalisation rule still applies.
+ */
+function joinWalk(dir: string, name: string): string {
+    const len = name.length;
+    if (len === 0 || dir.length === 0) return join(dir, name);
+    for (let i = 0; i < len; i++) {
+        const code = name.charCodeAt(i);
+        if (code < 32 || code > 126 || code === 47 || code === 92 || code === 46 || code === 58) {
+            return join(dir, name);
+        }
+    }
+    // The walk feeds each directory through the same namespacing as any other
+    // fs path argument, so `dir` is never re-resolved here — only the leaf is
+    // appended. A flat level starts from the caller's string (prepareWalkRoot
+    // did the URL/leading-slash work once) and is passed to the binding
+    // pre-namespaced, so the syscall wrapper's per-level `resolve` is skipped.
+    const last = dir.charCodeAt(dir.length - 1);
+    if (last === 47 || last === 92) return dir + name;
+    return isWindows ? `${dir}\\${name}` : `${dir}/${name}`;
+}
+let walkNeedsSysDir = false;
+const isWindows = process.platform === 'win32';
+
+/** `pathToString` has no observable effect here; only its two rewrites matter. */
+function prepareWalkRoot(pathStr: string): string {
+    if (isWindows) {
+        if (/^file:\/\//i.test(pathStr)) return join(fileURLToPath(pathStr), '.');
+        if (/^\/[A-Za-z]{1,2}:[\\/]/.test(pathStr)) return sysPath(pathStr.slice(1));
+        return pathStr;
+    }
+    return /^file:\/\//i.test(pathStr) ? join(fileURLToPath(pathStr), '.') : pathStr;
+}
+
+function walkReadDir(dir: string): CModuleFS.DirEnt[] {
+    return walkNeedsSysDir || dir.startsWith('\\\\') ? fs.readdir(dir, true) : fs.readdir(sysPath(dir), true);
+}
+
+/**
+ * Breadth-first: Node's recursive readdir emits every entry of a level before the next,
+ * so a depth-first walk would reorder results.
  */
 export function readDirEntriesSync(
     pathStr: string,
@@ -734,17 +705,19 @@ export function readDirEntriesSync(
 ): DirEntryWithParent[] {
     const out: DirEntryWithParent[] = [];
     const pending: string[] = [prefix];
+    const root = prepareWalkRoot(pathStr);
+    const needsSysDir = walkNeedsSysDir;
 
     while (pending.length > 0) {
         const rel = pending.shift() as string;
-        const absDir = rel ? join(pathStr, rel) : pathStr;
-        for (const entry of fs.readdir(absDir, true)) {
-            const relativePath = rel ? join(rel, entry.name) : entry.name;
+        const absDir = rel ? joinWalk(root, rel) : root;
+        for (const entry of walkReadDir(absDir)) {
+            const relativePath = rel ? joinWalk(rel, entry.name) : entry.name;
             out.push(toWalkEntry(entry, relativePath, absDir));
             if (!recursive) continue;
             const descend = entry.isDirectory
                 ? true
-                : policy === 'follow' && needsResolve(entry) && isDirectorySync(join(absDir, entry.name));
+                : policy === 'follow' && needsResolve(entry) && isDirectorySync(joinWalk(absDir, entry.name));
             if (descend) pending.push(relativePath);
         }
     }
@@ -759,18 +732,19 @@ export async function readDirEntries(
 ): Promise<DirEntryWithParent[]> {
     const out: DirEntryWithParent[] = [];
     const pending: string[] = [prefix];
+    const root = prepareWalkRoot(pathStr);
+    const needsSysDir = walkNeedsSysDir;
 
     while (pending.length > 0) {
         const rel = pending.shift() as string;
-        const absDir = rel ? join(pathStr, rel) : pathStr;
+        const absDir = rel ? joinWalk(root, rel) : root;
 
-        // Drain and close the handle before any stat: the resolve step below is
-        // its own round of I/O and must not straddle an open native dir handle.
+        // Drain and close the handle before any stat, so the resolve step never straddles it.
         const level: DirEntryWithParent[] = [];
-        const dirHandle = await asfs.readDir(absDir);
+        const dirHandle = await asfs.readDir(needsSysDir ? absDir : sysPath(absDir));
         try {
             for await (const entry of dirHandle) {
-                const relativePath = rel ? join(rel, entry.name) : entry.name;
+                const relativePath = rel ? joinWalk(rel, entry.name) : entry.name;
                 level.push(toWalkEntry(entry, relativePath, absDir));
             }
         } finally {
@@ -782,7 +756,7 @@ export async function readDirEntries(
             if (!recursive) continue;
             const descend = entry.isDirectory
                 ? true
-                : policy === 'follow' && needsResolve(entry) && await isDirectory(join(absDir, entry.name));
+                : policy === 'follow' && needsResolve(entry) && await isDirectory(joinWalk(absDir, entry.name));
             if (descend) pending.push(entry.relativePath);
         }
     }
@@ -798,9 +772,7 @@ export class Dir {
     constructor(path: PathLike, recursive = false) {
         const pathStr = pathToString(path);
         this.path = pathStr;
-        // Wrap: the raw native error carries a numeric .code, but Node's is a string.
-        // `opendir` uses the strict gate — it never walks a junction or a
-        // directory symlink, unlike recursive `readdirSync` (measured).
+        // `opendir` uses the strict gate and never walks a junction or directory symlink.
         this.entries = wrapSync(
             () => readDirEntriesSync(pathStr, recursive, '', 'strict'),
             'opendir',
@@ -872,7 +844,7 @@ function directoryIterator(dir: Pick<Dir, 'read' | 'close'>): AsyncIterableItera
             return { done: false, value: entry };
         },
         async return() {
-            await dir.close();
+            try { await dir.close(); } catch { /* already closed */ }
             return { done: true, value: undefined };
         },
     } as AsyncIterableIterator<Dirent>;
@@ -881,11 +853,7 @@ function directoryIterator(dir: Pick<Dir, 'read' | 'close'>): AsyncIterableItera
 // Flag parsing
 
 /**
- * The exact set of flag strings Node accepts, in every documented ordering.
- * Validation matters here because the native layer matches flag *characters*
- * rather than whole strings: an unvalidated `'rw'` contains a `w` and so opened
- * the file O_TRUNC, silently destroying its contents, where Node throws
- * ERR_INVALID_ARG_VALUE and leaves it intact.
+ * Whitespace validation is load-bearing (docs/node-internals.md#fs-open-flags).
  */
 const VALID_OPEN_FLAGS = new Set([
     'r', 'rs', 'sr', 'r+', 'rs+', 'sr+',
@@ -983,32 +951,12 @@ export function removeRecursiveSync(targetPath: string): void {
     }
 }
 
-/**
- * Error codes Node's rimraf retries on. Copied from `internal/fs/rimraf`'s
- * `retryErrorCodes` (verified against v24.18.0 via --expose-internals).
- */
+/** Node's rimraf retry codes (`internal/fs/rimraf` `retryErrorCodes`). */
 const RETRY_ERROR_CODES = new Set(['EBUSY', 'EMFILE', 'ENFILE', 'ENOTEMPTY', 'EPERM']);
 
 /**
- * Node's async recursive remove retries transient Windows failures with a
- * **linear** backoff — `delay = attempt * retryDelay` — up to `maxRetries`
- * (v24.18.0 `internal/fs/rimraf`:
- *     `const delay = retries * options.retryDelay;`
- *     `return setTimeout(_rimraf, delay, path, options, CB);`).
- *
- * Measured on v24.18.0 (Windows 11) with a blocker released by a child process
- * after 600ms: `fsp.rm(dir, {recursive:true, maxRetries:10, retryDelay:200})`
- * succeeded after 608ms, while the same call with the defaults threw at once.
- *
- * Deliberately **async-only**. Node's *sync* `rmSync` accepts the same options
- * and ignores them: v24 moved sync recursive removal into C++, and
- * `internal/fs/rimraf` exports only `rimraf`/`rimrafPromises` — no sync variant.
- * Measured: sync `rmSync` with `maxRetries:10, retryDelay:200` against the same
- * releasing blocker threw EPERM in 0ms. Adding retries to the sync path would
- * therefore be a divergence, not a fix.
- *
- * `fn` must already produce string `code`s (i.e. be wrapped), because the raw
- * asyncfs rejection carries only a numeric errno.
+ * Async rm only: Node's rmSync accepts the retry options and ignores them.
+ * `fn` must produce string `code`s already (raw asyncfs errors carry a numeric errno).
  */
 export async function retryOnBusy(
     fn: () => Promise<void>,
@@ -1125,13 +1073,8 @@ function enotdirError(current: string): NodeJS.ErrnoException {
 }
 
 /**
- * Create path recursively. Returns the first directory actually created
- * (Node.js mkdir recursive), or undefined when every segment already existed.
- *
- * Node namespaces the path before walking it, so the value it hands back is the
- * namespaced form (`\\?\D:\a\b`) — observed directly against v24.18.0. The
- * segments built below are plain (the binding namespaces each syscall on the
- * way in), so the return needs converting explicitly to match.
+ * Returns the first directory actually created, or undefined when all existed.
+ * Node returns the namespaced form (`\\?\D:\a\b`), hence the `sysPath` conversion below.
  */
 export function mkdirRecursiveSync(pathStr: string, mode?: number): string | undefined {
     let firstCreated: string | undefined;
@@ -1173,11 +1116,7 @@ export async function mkdirRecursive(pathStr: string, mode?: number): Promise<st
     return firstCreated === undefined ? undefined : sysPath(firstCreated);
 }
 
-/**
- * Node's promises.open() resolves to a `FileHandle` instance; this returned a
- * bare object literal, so `handle.constructor.name` read 'Object' and any
- * `instanceof FileHandle` / duck-type-by-class check failed.
- */
+/** Exists so `handle.constructor.name` is 'FileHandle' and `instanceof` works. */
 class FileHandle {}
 
 export function createFileHandle(fd: number, handle: CModuleAsyncFS.FileHandle) {
@@ -1185,13 +1124,7 @@ export function createFileHandle(fd: number, handle: CModuleAsyncFS.FileHandle) 
 
     async function ensureOpen(syscall: string): Promise<void> {
         if (!closed) return;
-        // Node reports EBADF for any operation on a closed FileHandle (measured
-        // v24.18.0: `code` 'EBADF', `errno` undefined). A bare Error left `code`
-        // undefined, so no `err.code === 'EBADF'` check could ever match.
-        // Node also tags it with the libuv syscall name, which was missing at all
-        // 13 methods (measured: `syscall` undefined where Node says 'read',
-        // 'write', 'fstat', 'fsync', 'fdatasync', 'ftruncate', 'fchmod', 'readv',
-        // 'writev', 'futimes', 'readFile').
+        // Node: `code` 'EBADF', `errno` undefined, `syscall` the libuv operation name.
         const err = new Error('EBADF: bad file descriptor') as NodeJS.ErrnoException;
         err.code = 'EBADF';
         err.syscall = syscall;
@@ -1199,17 +1132,8 @@ export function createFileHandle(fd: number, handle: CModuleAsyncFS.FileHandle) 
     }
 
     /**
-     * Convert a native handle rejection to Node's ErrnoException shape.
-     *
-     * The native handle rejects with the raw UV number as `code` — measured -4083
-     * for a `write()` on a read-only handle — which is the dangerous shape: a
-     * numeric `code` silently fails every `err.code === 'EBADF'` comparison. Only
-     * `truncate()` was wrapped; the other native calls leaked the number through.
-     *
-     * The rejection is awaited directly rather than transformed with `.then()`:
-     * `engine.waitIO()` drains the *native* promise handle and cannot see through
-     * a derived chain, so returning a `.then()`-derived promise from here would
-     * break callers that wait on it (this is what breaks `fs.watchFile`).
+     * Native calls must stay wrapped: an unwrapped rejection carries the raw UV number as
+     * `code`, which fails every string `err.code` comparison.
      */
     async function native<T>(syscall: string, op: () => Promise<T>): Promise<T> {
         try {
@@ -1242,13 +1166,8 @@ export function createFileHandle(fd: number, handle: CModuleAsyncFS.FileHandle) 
             position?: number | null,
         ) {
             await ensureOpen('read');
-            // Node also accepts `read()` (fresh 16 KiB buffer) and `read({buffer,offset,length,position})`.
-            // The fresh buffer must be a Buffer, not a bare Uint8Array: measured against
-            // v24.18.0, `(await fh.read()).buffer` is a Buffer, so the idiomatic
-            // `buffer.toString('utf8', 0, bytesRead)` decoded the bytes. A Uint8Array
-            // inherits Array.prototype.toString instead, which returned the
-            // comma-joined decimal bytes ("65,66,67,6...") rather than "ABCDEFGHIJ" —
-            // a wrong answer with no error — and left `readUInt8` undefined.
+            // The default buffer must be a Buffer, not a bare Uint8Array, or `toString()` yields
+            // the comma-joined decimals instead of text.
             let target: ArrayBufferView;
             let opts: unknown = offset, len: unknown = length, pos: unknown = position;
             if (bufferOrOptions === undefined || bufferOrOptions === null) {
@@ -1284,14 +1203,8 @@ export function createFileHandle(fd: number, handle: CModuleAsyncFS.FileHandle) 
             if (closed) return;
             closed = true;
             await native('close', () => handle.close());
-            // Node sets `fd` to -1 once closed. Leaving the real descriptor in place
-            // is not cosmetic: `fd !== -1` reads as a live handle, and the stale value
-            // reaches a real syscall. Measured consequence — `fh.createReadStream()`
-            // on a closed handle HUNG indefinitely (no 'data', 'end' or 'error'),
-            // after leaking a debug-CRT assertion to stderr
-            // (`read.cpp(381): Assertion failed: _osfile(fh) & FOPEN`), where node
-            // throws RangeError/ERR_OUT_OF_RANGE synchronously from the stream
-            // constructor's fd validation — before any syscall is issued.
+            // Node sets `fd` to -1 once closed; a stale descriptor reads as a live handle and
+            // reaches a real syscall (a stream built from it hangs).
             fileHandle.fd = -1;
         },
         async stat(options?: { bigint?: boolean }) {
@@ -1302,8 +1215,6 @@ export function createFileHandle(fd: number, handle: CModuleAsyncFS.FileHandle) 
         async datasync() { await ensureOpen('fdatasync'); await native('fdatasync', () => handle.datasync()); },
         async truncate(len?: number) {
             await ensureOpen('ftruncate');
-            // Unwrapped, a native rejection escapes with `code` as the raw UV number
-            // (measured -4048 for a directory target), breaking string-code checks.
             await native('ftruncate', () => handle.truncate(len ?? 0));
         },
         async chmod(mode: Mode) { await ensureOpen('fchmod'); await native('fchmod', () => handle.chmod(modeToNumber(mode))); },
@@ -1313,14 +1224,12 @@ export function createFileHandle(fd: number, handle: CModuleAsyncFS.FileHandle) 
             await native('futimes', () => handle.utime(timeToUnixMs(atime, 'atime'), timeToUnixMs(mtime, 'mtime')));
         },
         async appendFile(data: string | Uint8Array | ArrayBuffer) {
-            // 'writeFile', not 'appendFile' and not 'write' — measured v24.18.0.
+            // 'writeFile', not 'appendFile' or 'write'.
             await ensureOpen('writeFile');
             await writeAll(toUint8Array(data));
         },
         async readFile(options?: { encoding?: BufferEncoding | null; signal?: AbortSignal } | BufferEncoding) {
             await ensureOpen('readFile');
-            // Node honours `signal` here; it was accepted and ignored, so an
-            // aborted read still resolved with the whole file.
             const signal = typeof options === 'object' && options !== null ? options.signal : undefined;
             if (signal?.aborted) throw makeAbortError(signal);
             const st = await native('fstat', () => handle.stat());
@@ -1338,9 +1247,7 @@ export function createFileHandle(fd: number, handle: CModuleAsyncFS.FileHandle) 
             return decodeBuffer(concatChunks(chunks), typeof options === 'string' ? options : options?.encoding);
         },
         async writeFile(data: string | Uint8Array | ArrayBuffer) {
-            // Node reports 'writeFile' here, NOT 'write' — measured v24.18.0 on a
-            // closed handle. The FileHandle set of names is its own thing: node
-            // reports 'writeFile' for both writeFile() and appendFile().
+            // 'writeFile' for both writeFile() and appendFile().
             await ensureOpen('writeFile');
             await writeAll(toUint8Array(data));
         },
@@ -1402,9 +1309,7 @@ export function createAsyncDir(
 
         async read(): Promise<Dirent | null> {
             if (closed) throw dirClosedError();
-            // Node keeps returning null once the directory is drained; the native
-            // handle yields `undefined` from a second post-exhaustion `next()`,
-            // which used to surface as "cannot read property 'done' of undefined".
+            // Sticky: a second post-exhaustion native `next()` yields undefined, not null.
             if (exhausted) return null;
             const result = await dirHandle.next();
             if (result === undefined || result.done) {
@@ -1436,12 +1341,7 @@ export function createAsyncDir(
     return dir;
 }
 
-/**
- * `opendir({recursive:true})`: the whole walk is materialised up front, the same
- * way the synchronous `Dir` already does, and handed out one entry at a time.
- * `dir.path` stays the root while each `Dirent.parentPath` is its real container
- * (measured against node v24.18.0).
- */
+/** `dir.path` stays the root while each `Dirent.parentPath` is its real container. */
 export function createEagerAsyncDir(
     pathStr: string,
     entries: DirEntryWithParent[],

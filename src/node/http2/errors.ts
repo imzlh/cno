@@ -6,6 +6,7 @@
  */
 
 import { h2Available } from '@cnojs/http/h2-native';
+import { withCode } from '../_internal/errors';
 
 // Node's ERR_INVALID_ARG_TYPE "Received …" suffix, for the common cases.
 export function describeReceived(value: unknown): string {
@@ -56,7 +57,7 @@ export function h2Unavailable(): Error & { code: string } {
 }
 
 export function h2Error(code: string, message: string): Error & { code: string } {
-    return Object.assign(new Error(message), { code });
+    return withCode(new Error(message), code);
 }
 
 export function ensureH2(): void {

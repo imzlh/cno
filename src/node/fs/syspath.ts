@@ -1,32 +1,12 @@
 /**
  * Windows MAX_PATH ceiling: namespaced paths at the syscall boundary.
  *
- * Win32 resolves a plain path against a 260-char `MAX_PATH` budget, so cno's
- * fs bindings died well short of what Node reaches. Measured ceilings before
- * this module existed (total path length, D:\ root):
- *
- *   - stat/lstat/access/exists/open/read/write/copy/rename … 259
- *   - readdir/opendir/rm -r ……………………………………………………………………………… 257  (`\*` glob suffix)
- *   - mkdir recursive ………………………………………………………………………………………… 247  (MAX_PATH-12, 8.3 reserve)
- *
- * Node has no such ceiling because every fs entry point funnels the path
- * through `path.toNamespacedPath()` before it reaches libuv. libuv's
- * `fs__capture_path` does not add the prefix itself, and `uv_fs_stat` /
- * `FindFirstFileW` in `mod_fs.c` are handed whatever we give them — so the
- * prefix has to come from here, exactly as it does in Node.
- *
- * Two properties this module must preserve:
- *
- * 1. **Errors keep the ORIGINAL path.** `wrapSync`/`wrapAsync` receive the
- *    user's path as a separate argument from the closure that performs the
- *    syscall, so namespacing *inside* the closure leaves `err.path` and the
- *    message text untouched. Never hand a namespaced string to those.
- * 2. **`\\?\` disables Win32 path normalisation.** `.`, `..`, `/` and repeated
- *    separators stop being resolved by the OS once the prefix is on, so the
- *    path must be fully normalised *first*. `toNamespacedPath` resolves before
- *    prefixing (verified byte-identical to Node across 30 shapes, including
- *    `..`, `.`, mixed slashes, UNC, and `\\.\` device paths), which is why we
- *    call it rather than concatenating the prefix ourselves.
+ * A plain path is limited to `MAX_PATH` (260 chars); Node prefixes every fs path
+ * with `\\?\` before libuv, and the native `mod_fs.c` does not, so the prefix
+ * comes from here. `\\?\` disables Win32 normalisation (`.`, `..`, `/`), so the
+ * path must be fully normalised first — `toNamespacedPath` resolves before
+ * prefixing. Errors keep the ORIGINAL path: never hand a namespaced string to
+ * `wrapSync`/`wrapAsync`.
  */
 
 import { toNamespacedPath } from '../path';
@@ -103,18 +83,11 @@ function wrapFn(fn: (...a: unknown[]) => unknown, positions: readonly number[], 
             const isThenable = out && typeof (out as Promise<unknown>).then === 'function';
             if (isThenable) {
                 const p = out as Promise<unknown>;
-                // `engine.waitIO()` drains the *native* promise handle
-                // synchronously and cannot see through a `.then()` chain, so
-                // returning a derived promise here silently broke fs.watchFile's
-                // poll (fs-watch 8/0 -> 7/1) and would break the lchownSync /
-                // lutimesSync bridges on long paths.
-                //
-                // `dePrefixError` mutates the Error in place, and every rejection
-                // handler receives the same object, so registering ours first
-                // repairs the message that later handlers observe — while the
-                // ORIGINAL promise is what we hand back. The trailing no-op catch
-                // keeps this bookkeeping from counting as a second unhandled
-                // rejection. (Verified in both runtimes.)
+                // `engine.waitIO()` drains the *native* promise handle and cannot
+                // see through a `.then()` chain, so return the original promise.
+                // `dePrefixError` mutates the Error in place, so our handler must
+                // run first; the trailing no-op catch keeps it from counting as a
+                // second unhandled rejection.
                 if (swaps.length > 0) {
                     p.catch((e: unknown) => { dePrefixError(e, swaps); }).catch(() => { /* bookkeeping only */ });
                 }

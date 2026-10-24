@@ -10,8 +10,14 @@ const ffi = import.meta.use('ffi');
 type FfiBufferSource = ArrayBuffer | ArrayBufferView<ArrayBufferLike>;
 type PointerCarrier<T = unknown> = { pointer: Deno.PointerObject<T> };
 
+/** A Deno.PointerObject carries its address as a bigint under the opaque brand
+ *  key. The declared slot type is the pointee (`T`), which is a fiction, so the
+ *  carrier is spelled with the real stored type and the `T`-typed view is taken
+ *  only at the API boundary (createPointerObject's return). */
+type BrandedPointer = { [brand]: bigint } & Record<typeof brand, bigint>;
+
 function createPointerObject<T = unknown>(addr: bigint): Deno.PointerObject<T> {
-    const obj = { [brand]: null as T } as unknown as Deno.PointerObject<T>;
+    const obj = { [brand]: addr } as BrandedPointer;
     Object.setPrototypeOf(obj, null);
     Object.defineProperty(obj, brand, {
         value: addr,
@@ -19,7 +25,7 @@ function createPointerObject<T = unknown>(addr: bigint): Deno.PointerObject<T> {
         configurable: false,
         enumerable: false,
     });
-    return obj;
+    return obj as unknown as Deno.PointerObject<T>;
 }
 
 function getPointerAddress(ptr: Deno.PointerObject): bigint {

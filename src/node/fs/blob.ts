@@ -1,4 +1,5 @@
 import { decodeBuffer, pathToString, type PathLike } from './utils';
+import { withCode } from '../_internal/errors';
 
 import { nsfs, nsasfs } from './syspath';
 const fs = nsfs;
@@ -120,24 +121,18 @@ class FileBackedBlob extends Blob {
 
 export function openAsBlob(path: PathLike, options: OpenAsBlobOptions = {}): Promise<Blob> {
     if (options === null || typeof options !== 'object' || Array.isArray(options)) {
-        const error = new TypeError('The "options" argument must be of type object.');
-        Reflect.set(error, 'code', 'ERR_INVALID_ARG_TYPE');
-        throw error;
+        throw withCode(new TypeError('The "options" argument must be of type object.'), 'ERR_INVALID_ARG_TYPE');
     }
     const type = options.type || '';
     if (typeof type !== 'string') {
-        const error = new TypeError('The "options.type" property must be of type string.');
-        Reflect.set(error, 'code', 'ERR_INVALID_ARG_TYPE');
-        throw error;
+        throw withCode(new TypeError('The "options.type" property must be of type string.'), 'ERR_INVALID_ARG_TYPE');
     }
     const pathString = pathToString(path);
     let stat: CModuleFS.Stats;
     try {
         stat = fs.stat(pathString);
     } catch {
-        const error = new TypeError('Unable to open file as blob');
-        Reflect.set(error, 'code', 'ERR_INVALID_ARG_VALUE');
-        throw error;
+        throw withCode(new TypeError('Unable to open file as blob'), 'ERR_INVALID_ARG_VALUE');
     }
     return Promise.resolve(new FileBackedBlob(pathString, snapshot(stat), type));
 }

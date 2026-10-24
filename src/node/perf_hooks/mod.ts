@@ -5,6 +5,8 @@
  * entry buffer and one set of classes — as Node does.
  */
 
+import { withCode } from '../_internal/errors';
+
 type UnknownFn = (...args: unknown[]) => unknown;
 type EventLoopUtilization = { idle: number; active: number; utilization: number };
 
@@ -28,11 +30,11 @@ export const constants = {
     NODE_PERFORMANCE_GC_FLAGS_SCHEDULE_IDLE: 64,
 };
 
-function outOfRange(name: string, range: string, actual: unknown): RangeError {
-    const error = new RangeError(
-        `The value of "${name}" is out of range. It must be ${range}. Received ${String(actual)}`,
+function outOfRange(name: string, range: string, actual: unknown): RangeError & { code: string } {
+    return withCode(
+        new RangeError(`The value of "${name}" is out of range. It must be ${range}. Received ${String(actual)}`),
+        'ERR_OUT_OF_RANGE',
     );
-    return Object.assign(error, { code: 'ERR_OUT_OF_RANGE' });
 }
 
 function assertPercentile(value: number): void {

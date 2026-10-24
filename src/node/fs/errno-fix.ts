@@ -120,28 +120,11 @@ const fdFromPath = (p?: string): number => {
 
 /**
  * Is this fd definitely not an open descriptor? `fstat` is the discriminator:
- * measured, the native `fs.stat`-on-fd path reports a correct UV_EBADF for a
- * bogus fd even when its siblings do not.
+ * the fd syscalls report a code left behind by a prior Win32 call, because the
+ * failing step is `_get_osfhandle(fd)`, a CRT call that sets CRT errno and not
+ * the Win32 last-error. Probing the fd is deterministic.
  *
- * This exists because several fd syscalls report a code with **no relationship to
- * the failure**. `tjs_syncfs_fsync` (mod_fs.c) calls `THROW2`, which formats
- * `GetLastError()`, but the failing step is `_get_osfhandle(fd)` — a CRT call
- * that sets CRT `errno` and leaves the Win32 last-error untouched. The reported
- * code is therefore whatever the *previous* Win32 call left behind. Measured, same
- * `fsyncSync(9999)` call:
- *
- *   preceding op            cno code        real Node
- *   (none)                  UNKNOWN errno=0 EBADF
- *   statSync(missing)       ENOENT          EBADF
- *   closeSync(badfd)        ENOENT          EBADF
- *   openSync(missing)       ENOENT          EBADF
- *
- * A wrong-but-plausible ENOENT is worse than UNKNOWN: retry logic keyed on
- * ENOENT will act on it. Probing the fd is deterministic, so it replaces the
- * guesswork entirely.
- *
- * Not platform-gated: EBADF for an operation on a closed descriptor is the POSIX
- * answer too, and the rule only fires when the fd is *provably* bad.
+ * Not platform-gated: EBADF for a closed descriptor is the POSIX answer too.
  */
 const isBadFd = (fd: number): boolean => {
     if (fd < 0) return false;
@@ -158,30 +141,9 @@ const failedOnBadFd = (syscall?: string, path?: string): boolean => {
 
 /**
  * Windows refuses to delete/move an entry whose handle is held without
- * FILE_SHARE_DELETE. The CRT surfaces that as EACCES, indistinguishable from a
- * genuine ACL denial, but libuv reports EBUSY/EPERM because it goes through
- * `CreateFileW(..., DELETE, ...)`/`MoveFileExW` and sees the raw Win32 code.
- *
- * **Windows-only.** Reached solely from `correctSyncErrno`, which returns early
- * off Windows. On POSIX an EACCES from `unlink` is a genuine parent-directory
- * permission error and this rule would mislabel any still-readable file EBUSY —
- * that is precisely why the gate exists.
- *
- * The discriminator: a share-violated file is still **openable for read** (the
- * holder allows FILE_SHARE_READ; it only withheld DELETE), whereas an ACL denial
- * blocks the read open too. Readonly-attribute files are excluded — that is the
- * separate, still-open mod_fs.c gap where Node clears the attribute and
- * succeeds, and it must keep reporting EACCES so the known-failing test in
- * fs-errno-parity.test.ts stays accurate.
- *
- * Measured in-process, sqlite3 holding the file (asyncfs IS libuv, so the async
- * column is exactly what Node reports; confirmed against real Node v24.18.0
- * using node:sqlite as the same blocker):
- *
- *   operation                   sync (before)   libuv/async   real Node
- *   unlink(held file)           EACCES          EBUSY         EBUSY
- *   rename(held file)           EACCES          EBUSY         EBUSY
- *   rename(dir w/ held child)   EACCES          EPERM         EPERM
+ * FILE_SHARE_DELETE. The CRT surfaces that as EACCES, indistinguishable from an
+ * ACL denial; a share-violated file is still openable for read, which is the
+ * discriminator. The readonly attribute is excluded — a different cause.
  */
 const isShareViolation = (p: string): boolean => {
     try {
@@ -199,29 +161,19 @@ const isShareViolation = (p: string): boolean => {
 export function correctSyncErrno(raw: number, syscall?: string, path?: string, dest?: string): number {
     const base = baseSyscall(syscall);
 
-    // Ungated: a provably-closed descriptor is EBADF on every platform, and the
-    // C layer's fd errors are nondeterministic here. See failedOnBadFd.
+    // Ungated: a provably-closed descriptor is EBADF on every platform. See failedOnBadFd.
     if (failedOnBadFd(syscall, path)) return UV_EBADF;
 
-    // Every rule below encodes a Windows-measured value. See the PLATFORM GATE
-    // note at the top of this file: on POSIX the EXDEV, share-violation and
-    // read-only rules would each turn a correct errno into a wrong one.
+    // Every rule below encodes a Windows-measured value; on POSIX the EXDEV,
+    // share-violation and read-only rules would each turn a correct errno wrong.
     if (!isWindows) return raw;
 
     // readdir/opendir on a plain file reports the CRT's ENOENT; Node says ENOTDIR.
     if (DIR_SYSCALLS.has(base) && path && raw === UV_ENOENT && lexists(path)) return UV_ENOTDIR;
 
     // A genuine cross-device CRT error (EXDEV=18) decodes to ERROR_NO_MORE_FILES,
-    // never to UV_EXDEV, so UV_EXDEV out of the sync layer is always CRT EEXIST.
-    //
-    // Which Node code that becomes depends on WHAT is in the way, measured on
-    // v24.18.0: an existing **file** target gives EEXIST (link, mkdir), but an
-    // existing **directory** target gives EPERM (symlink onto a dir, rename onto
-    // a dir — empty or not). An unrestricted `=> EEXIST` rewrite reported EEXIST
-    // for both, which was wrong for every directory case.
-    //
-    // For two-path syscalls the blocking entry is `dest`, not `path`: rename's
-    // `path` is the SOURCE file, so checking `path` alone silently missed it.
+    // so UV_EXDEV out of the sync layer is always CRT EEXIST. The blocking entry
+    // is `dest` for two-path syscalls: a directory gives EPERM, a file EEXIST.
     if (raw === UV_EXDEV) {
         const blocking = TWO_PATH_SYSCALLS.has(base) ? (dest ?? path) : path;
         if (blocking && isDir(blocking)) return UV_EPERM;
@@ -239,21 +191,16 @@ export function correctSyncErrno(raw: number, syscall?: string, path?: string, d
     }
 
     // A directory target: CRT reports EACCES for both, Node distinguishes them.
-    // Keyed on UV_EACCES because mod_fs.c now decodes CRT EACCES(13) correctly;
-    // before that fix these same failures arrived as UV_EINVAL.
     if (raw === UV_EACCES && path) {
         // unlink/rm of a directory is EPERM in Node.
         if (UNLINK_SYSCALLS.has(base) && isDir(path)) return UV_EPERM;
         // Reading/writing a directory as a file is EISDIR in Node.
         if (CONTENT_SYSCALLS.has(base) && isDir(path)) return UV_EISDIR;
         // The DOS read-only attribute blocking a write is EPERM in Node, not
-        // EACCES (measured: openSync(ro,'w'), appendFileSync(ro), writeFileSync(ro)).
-        // A read-only *open* of such a file succeeds, so reaching here means write
-        // intent. An ACL denial on a writable file keeps EACCES, which is correct.
+        // EACCES. An ACL denial on a writable file keeps EACCES.
         if (READONLY_EPERM_SYSCALLS.has(base) && isReadonlyFile(path)) return UV_EPERM;
-        // A handle held without FILE_SHARE_DELETE. See isShareViolation above:
-        // libuv reports EBUSY for a blocked file and EPERM for a directory whose
-        // child is blocked. Checked last so the ACL/readonly cases above win.
+        // A handle held without FILE_SHARE_DELETE. See isShareViolation above.
+        // Checked last so the ACL/readonly cases above win.
         if (UNLINK_SYSCALLS.has(base) && isShareViolation(path)) return UV_EBUSY;
         if (base === 'rename') {
             if (isDir(path)) return UV_EPERM;
@@ -311,16 +258,8 @@ export function fixSyncError(e: unknown, syscall?: string, path?: string, dest?:
         const base = baseSyscall(syscall);
 
         // `mod_fs.c` rejects several fd operations with a bare TypeError carrying
-        // no errno at all — measured: `futimes` ("futimes: invalid file
-        // descriptor"), `fchown` ("… not supported on Windows"). Node
-        // reports EBADF for a bad descriptor, so an errno-less throw on a
-        // provably-closed fd is EBADF. Checked first: it needs no path probing.
-        //
-        // `fchmod` was in that list until 2026-08-04. It now delegates to
-        // uv_fs_fchmod (mod_fs.c:2733), whose VERIFY_FD yields a real UV_EBADF,
-        // so it no longer reaches this errno-less block at all. It stays in the
-        // FD_SYSCALLS set above because that set is also consulted for the
-        // defined-errno path below.
+        // no errno (futimes, fchown). An errno-less throw on a provably-closed fd
+        // is EBADF. Checked first: it needs no path probing.
         if (failedOnBadFd(syscall, path)) return rebuild(e, UV_EBADF, syscall, path);
 
         // A directory already in the way is EPERM in Node on Windows; a file is
@@ -341,27 +280,19 @@ export function fixSyncError(e: unknown, syscall?: string, path?: string, dest?:
             return rebuild(e, lexists(path) ? UV_EINVAL : UV_ENOENT, syscall, path);
         }
 
-        // copyFile onto a directory is EPERM on Windows. `path` is the SOURCE
-        // here, so the blocking entry must be read from `dest`.
-        //
-        // POSIX differs: `uv__fs_copyfile` opens the destination with
-        // `O_WRONLY|O_CREAT`, which a directory rejects with EISDIR, so Node
-        // reports EISDIR (REASONED from the vendored
-        // `deps/libuv/src/unix/fs.c:1283`; not measured — no POSIX host here).
+        // copyFile onto a directory is EPERM on Windows; POSIX gets EISDIR from
+        // `uv__fs_copyfile` opening the destination `O_WRONLY|O_CREAT`
+        // (REASONED from vendored libuv, not measured). `path` is the SOURCE, so
+        // the blocker is read from `dest`.
         if (base === 'copyFile' && dest && isDir(dest)) {
             return rebuild(e, isWindows ? UV_EPERM : UV_EISDIR, syscall, path);
         }
 
-        // copyFile *from* a directory is also EPERM in Node on Windows (measured
-        // v24.18.0, empty or not). mod_fs.c:1770 rejects this before touching the
-        // FS with a bare `JS_ThrowTypeError("Source is a directory, not a file")`,
-        // which carries no errno at all — so it arrived as code 'UNKNOWN' and no
-        // `e.code === 'EPERM'` check could ever match. Checked after the dest
+        // copyFile *from* a directory is EPERM in Node on Windows; on POSIX Node
+        // gets EISDIR from reading the directory fd (REASONED, same libuv
+        // reading). Both C legs throw a bare errno-less TypeError before touching
+        // the FS, so it would arrive as code 'UNKNOWN'. Checked after the dest
         // rule so a dir->dir copy still reports on the same footing.
-        //
-        // On POSIX the C leg throws "Source is not a regular file" from the
-        // `!S_ISREG` check at mod_fs.c:1819, equally errno-less. Node there gets
-        // EISDIR from reading the directory fd (REASONED, same libuv reading).
         if (base === 'copyFile' && path && isDir(path)) {
             return rebuild(e, isWindows ? UV_EPERM : UV_EISDIR, syscall, path);
         }
@@ -395,20 +326,8 @@ function rebuild(e: Error, code: number, syscall?: string, path?: string): Error
 
 /**
  * `toErrnoException`, then correct `syscall` to the libuv name node reports.
- *
- * Split out rather than folded into `_internal/errno` because that module is
- * shared with net/dns/child_process, whose syscall names are already correct and
- * follow different conventions (`spawn <cmd>`, `getaddrinfo`). Only `fs` needs
- * the translation.
- *
- * The mapping runs *after* conversion because several libuv names depend on the
- * resolved code, not just the API — see STEP_BY_CODE in `syscall-names.ts`
- * (`readFile` is 'open' for ENOENT but 'read' for EISDIR).
- *
- * Guarded on `err.syscall === syscall`: only the JS name we just passed in is
- * rewritten. A nested wrapper that already stamped a specific step (rm's inner
- * 'lstat') is left alone, since `toErrnoException` returns an
- * already-string-coded error untouched and its name is more precise than ours.
+ * Split from `_internal/errno` because that module is shared with
+ * net/dns/child_process, whose syscall names must not be remapped.
  */
 function toFsErrnoException(
     e: unknown,

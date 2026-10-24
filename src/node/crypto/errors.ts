@@ -1,3 +1,5 @@
+import { withCode } from '../_internal/errors';
+
 ﻿/** Error factories and argument validation shared across the crypto modules. */
 
 export function assertCallback(callback: unknown): asserts callback is (...args: unknown[]) => void {
@@ -21,12 +23,9 @@ export function createDigestAlreadyCalledError(): Error {
 }
 
 // Node attaches a `.code` to every crypto error; bare Error/TypeError is a
-// detectable divergence for callers that branch on err.code.
-export function withCode<E extends Error>(error: E, code: string): E & { code: string } {
-    const err = error as E & { code: string };
-    err.code = code;
-    return err;
-}
+// detectable divergence for callers that branch on err.code. The helper lives
+// in _internal so non-crypto modules share one implementation.
+export { withCode };
 
 export function createInvalidIvError(): TypeError {
     return withCode(new TypeError('Invalid initialization vector'), 'ERR_CRYPTO_INVALID_IV');

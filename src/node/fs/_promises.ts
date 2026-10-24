@@ -6,6 +6,7 @@
 import { matchesErrnoCode } from '../_internal/errno';
 import { wrapFsPromise as w, normalizeFsErrnoError as normalizeErrnoError } from './errno-fix';
 import { concatChunks } from '../_internal/buffer';
+import { withCode } from '../_internal/errors';
 import { getTierLimits } from '../_internal/memory';
 import { resolve } from '../path';
 import { copyPath, validateCopyOptions, type CopyOptions } from './copy';
@@ -417,9 +418,7 @@ function attachHandleStreams(handle: ReturnType<typeof createFileHandle>) {
         },
         readableWebStream(): ReadableStream<Uint8Array> {
             if (webStreamTaken) {
-                const e = new Error('The FileHandle is already being read');
-                Reflect.set(e, 'code', 'ERR_INVALID_STATE');
-                throw e;
+                throw withCode(new Error('The FileHandle is already being read'), 'ERR_INVALID_STATE');
             }
             webStreamTaken = true;
             return new ReadableStream<Uint8Array>({

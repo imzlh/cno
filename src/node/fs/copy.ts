@@ -2,6 +2,7 @@ import { matchesErrnoCode } from '../_internal/errno';
 import { normalizeFsErrnoError as normalizeErrnoError, wrapFsPromise as wrapPromise, wrapSync } from './errno-fix';
 import path from '../path';
 import { assertCopyFileMode, mkdirRecursive, mkdirRecursiveSync } from './utils';
+import { withCode } from '../_internal/errors';
 
 const { dirname, isAbsolute, join, parse, relative, resolve } = path;
 import { nsfs, nsasfs } from './syspath';
@@ -37,10 +38,11 @@ export interface ResolvedCopyOptions {
     verbatimSymlinks: boolean;
 }
 
-function invalidArgType(name: string, expected: string, value: unknown): TypeError {
-    const error = new TypeError(`The "${name}" property must be of type ${expected}. Received ${String(value)}`);
-    Reflect.set(error, 'code', 'ERR_INVALID_ARG_TYPE');
-    return error;
+function invalidArgType(name: string, expected: string, value: unknown): TypeError & { code: string } {
+    return withCode(
+        new TypeError(`The "${name}" property must be of type ${expected}. Received ${String(value)}`),
+        'ERR_INVALID_ARG_TYPE',
+    );
 }
 
 function validateBooleanOption(name: string, value: unknown, fallback: boolean): boolean {
@@ -68,18 +70,20 @@ export function validateCopyOptions(options?: CopyOptions | CopySyncOptions): Re
     const dereference = validateBooleanOption('dereference', options.dereference, false);
     const verbatimSymlinks = validateBooleanOption('verbatimSymlinks', options.verbatimSymlinks, false);
     if (dereference && verbatimSymlinks) {
-        const error = new TypeError('Option "dereference" cannot be used in combination with option "verbatimSymlinks"');
-        Reflect.set(error, 'code', 'ERR_INCOMPATIBLE_OPTION_PAIR');
-        throw error;
+        throw withCode(
+            new TypeError('Option "dereference" cannot be used in combination with option "verbatimSymlinks"'),
+            'ERR_INCOMPATIBLE_OPTION_PAIR',
+        );
     }
     if (options.filter !== undefined && typeof options.filter !== 'function') {
         throw invalidArgType('options.filter', 'function', options.filter);
     }
     const mode = options.mode ?? 0;
     if (!Number.isInteger(mode) || mode < 0 || mode > 7) {
-        const error = new TypeError(`The value of "options.mode" is out of range. It must be >= 0 && <= 7. Received ${String(mode)}`);
-        Reflect.set(error, 'code', 'ERR_OUT_OF_RANGE');
-        throw error;
+        throw withCode(
+            new TypeError(`The value of "options.mode" is out of range. It must be >= 0 && <= 7. Received ${String(mode)}`),
+            'ERR_OUT_OF_RANGE',
+        );
     }
 
     return {
@@ -434,9 +438,10 @@ function copySyncEntry(
     if (options.filter) {
         const filtered = options.filter(source, destination);
         if (filtered instanceof Promise) {
-            const error = new TypeError('Expected a boolean to be returned from the "filter" function but got an instance of Promise.');
-            Reflect.set(error, 'code', 'ERR_INVALID_RETURN_VALUE');
-            throw error;
+            throw withCode(
+                new TypeError('Expected a boolean to be returned from the "filter" function but got an instance of Promise.'),
+                'ERR_INVALID_RETURN_VALUE',
+            );
         }
         if (!filtered) return;
     }

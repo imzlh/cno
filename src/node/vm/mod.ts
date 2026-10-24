@@ -1,26 +1,15 @@
 /**
- * Node.js vm module
- * Uses engine.Sandbox and mirrors a host context object in and out.
+ * Node.js vm module. Uses engine.Sandbox and mirrors a host context object.
  *
- * NOT A SECURITY BOUNDARY — the same stance Node's own documentation takes, and
- * here the gap is wider than Node's. Measured against this runtime:
- *
- *   - `Date.constructor('return globalThis')()` inside a context returns the
- *     HOST global object, from which `process` and everything else is reachable
- *     (OBSERVED). Every intrinsic in CONTEXT_GLOBAL_KEYS is the host's own
- *     object, and each one carries the host `Function` on its `constructor`.
- *   - Writing to `Date.prototype` / `Map.prototype` inside a context changes
- *     those methods for the host (OBSERVED).
- *   - `options.timeout` is accepted and never fires: an infinite loop in a
- *     context is unkillable and wedges the process (OBSERVED). QuickJS's
- *     JS_SetInterruptHandler is not wired up anywhere in circu.js/src.
- *
- * Only the first two are even partly addressable from TypeScript, and neither is
- * addressed here — see CONTEXT_GLOBAL_KEYS for why. Use a worker or a process
- * for untrusted code; treat `vm` as an isolation convenience for trusted code.
+ * NOT A SECURITY BOUNDARY, and weaker than Node's: every intrinsic in
+ * CONTEXT_GLOBAL_KEYS is the host's own object, so `Date.constructor('return
+ * globalThis')()` reaches the host global and patching prototypes leaks out.
+ * `options.timeout` never fires (no JS_SetInterruptHandler wiring), so an
+ * infinite loop wedges the process. Use a worker or process for untrusted code.
  */
 
 const engine = import.meta.use('engine');
+import { withCode } from '../_internal/errors';
 type VmCallable = (...args: unknown[]) => unknown;
 
 export interface Context {
@@ -63,22 +52,25 @@ function typeName(value: unknown): string {
     return Array.isArray(value) ? 'an instance of Array' : typeof value;
 }
 
-function invalidArgType(name: string, expected: string, value: unknown): TypeError {
-    const error = new TypeError(`The "${name}" property must be of type ${expected}. Received ${typeName(value)}`);
-    Reflect.set(error, 'code', 'ERR_INVALID_ARG_TYPE');
-    return error;
+function invalidArgType(name: string, expected: string, value: unknown): TypeError & { code: string } {
+    return withCode(
+        new TypeError(`The "${name}" property must be of type ${expected}. Received ${typeName(value)}`),
+        'ERR_INVALID_ARG_TYPE',
+    );
 }
 
-function outOfRange(name: string, range: string, value: unknown): RangeError {
-    const error = new RangeError(`The value of "${name}" is out of range. It must be ${range}. Received ${String(value)}`);
-    Reflect.set(error, 'code', 'ERR_OUT_OF_RANGE');
-    return error;
+function outOfRange(name: string, range: string, value: unknown): RangeError & { code: string } {
+    return withCode(
+        new RangeError(`The value of "${name}" is out of range. It must be ${range}. Received ${String(value)}`),
+        'ERR_OUT_OF_RANGE',
+    );
 }
 
-function invalidArgValue(name: string, value: unknown, reason: string): TypeError {
-    const error = new TypeError(`The property '${name}' ${reason}. Received ${JSON.stringify(value)}`);
-    Reflect.set(error, 'code', 'ERR_INVALID_ARG_VALUE');
-    return error;
+function invalidArgValue(name: string, value: unknown, reason: string): TypeError & { code: string } {
+    return withCode(
+        new TypeError(`The property '${name}' ${reason}. Received ${JSON.stringify(value)}`),
+        'ERR_INVALID_ARG_VALUE',
+    );
 }
 
 function validateString(name: string, value: unknown): void {
@@ -103,9 +95,10 @@ function validateBoolean(name: string, value: unknown): void {
 function validateCreateContextOptions(options: unknown): void {
     if (options === undefined) return;
     if (options === null || typeof options !== 'object') {
-        const error = new TypeError(`The "options" argument must be of type object. Received ${typeName(options)}`);
-        Reflect.set(error, 'code', 'ERR_INVALID_ARG_TYPE');
-        throw error;
+        throw withCode(
+            new TypeError(`The "options" argument must be of type object. Received ${typeName(options)}`),
+            'ERR_INVALID_ARG_TYPE',
+        );
     }
     const opts = options as CreateContextOptions;
     validateString('options.name', opts.name);
@@ -134,9 +127,10 @@ function isBufferSource(value: unknown): value is Buffer {
 function validateCachedData(value: unknown): void {
     if (value === undefined) return;
     if (!isBufferSource(value)) {
-        const error = new TypeError('The "options.cachedData" property must be an instance of Buffer, TypedArray, or DataView. Received ' + typeName(value));
-        Reflect.set(error, 'code', 'ERR_INVALID_ARG_TYPE');
-        throw error;
+        throw withCode(
+            new TypeError('The "options.cachedData" property must be an instance of Buffer, TypedArray, or DataView. Received ' + typeName(value)),
+            'ERR_INVALID_ARG_TYPE',
+        );
     }
 }
 
@@ -297,18 +291,20 @@ function installContextGlobals(scope: Context): void {
 function getContextState(context: Context): ContextState {
     const state = _contextMap.get(context);
     if (!state) {
-        const error = new TypeError('The "contextifiedObject" argument must be an vm.Context. Received an instance of Object');
-        Reflect.set(error, 'code', 'ERR_INVALID_ARG_TYPE');
-        throw error;
+        throw withCode(
+            new TypeError('The "contextifiedObject" argument must be an vm.Context. Received an instance of Object'),
+            'ERR_INVALID_ARG_TYPE',
+        );
     }
     return state;
 }
 
 function validateContextObject(object: unknown): asserts object is Context {
     if (object === null || typeof object !== 'object') {
-        const error = new TypeError('The "object" argument must be of type object. Received ' + typeName(object));
-        Reflect.set(error, 'code', 'ERR_INVALID_ARG_TYPE');
-        throw error;
+        throw withCode(
+            new TypeError('The "object" argument must be of type object. Received ' + typeName(object)),
+            'ERR_INVALID_ARG_TYPE',
+        );
     }
 }
 
@@ -519,27 +515,11 @@ export function createScript(code: string, options?: ScriptOptions | string): Sc
 }
 
 /**
- * Enforce `createContext({ codeGeneration })`. Both flags were validated and
- * then ignored: with `{strings:false, wasm:false}` a context still evaluated
- * `eval('1+1')` to 2, `new Function('return 2')()` to 2, and compiled a
- * `WebAssembly.Module` (all OBSERVED). Node v24.18.0 on the same inputs throws
- * `EvalError: Code generation from strings disallowed for this context` and
- * `CompileError: WebAssembly.Module(): Wasm code generation disallowed by
- * embedder` (both OBSERVED).
- *
- * V8 enforces this inside the engine, so every alias of the capability dies at
- * once. QuickJS has no equivalent switch, so each reachable reference has to be
- * closed by hand:
- *   - `eval`: replacing the global binding blocks direct `eval(s)` AND indirect
- *     `(0,eval)(s)` — QuickJS resolves the binding at the call site (OBSERVED).
- *   - `Function`: the global binding alone is not enough, because
- *     `Function.prototype.constructor` is a second live reference to the same
- *     capability. Patching only that one still left `new Function('return 1')()`
- *     returning 1 (OBSERVED).
- *   - the generator and async function constructors, which have no global
- *     binding at all but are reachable as `(function*(){}).constructor`.
- * All of these are per-realm inside a Sandbox, so patching them cannot reach the
- * host. This is a capability fence only — it does not make the sandbox an
+ * Enforce `createContext({ codeGeneration })`. Nodes throws EvalError /
+ * CompileError; QuickJS has no switch for it, so each reachable path is closed by
+ * hand: the `eval` binding (covers indirect `(0,eval)`), `Function` (also via
+ * `Function.prototype.constructor`), and the generator/async constructors behind
+ * `(function*(){}).constructor`. All are per-realm. Capability fence only, not an
  * escape-proof boundary (see CONTEXT_GLOBAL_KEYS).
  */
 const CODEGEN_MESSAGE = 'Code generation from strings disallowed for this context';
@@ -831,9 +811,10 @@ interface CompileFunctionOptions {
 
 export function compileFunction(code: string, params?: string[], options?: CompileFunctionOptions): VmCallable {
     if (params !== undefined && !Array.isArray(params)) {
-        const error = new TypeError('The "params" argument must be an instance of Array. Received ' + typeName(params));
-        Reflect.set(error, 'code', 'ERR_INVALID_ARG_TYPE');
-        throw error;
+        throw withCode(
+            new TypeError('The "params" argument must be an instance of Array. Received ' + typeName(params)),
+            'ERR_INVALID_ARG_TYPE',
+        );
     }
     validateCompileOptions(options);
     if (options?.parsingContext !== undefined) validateContextObject(options.parsingContext);

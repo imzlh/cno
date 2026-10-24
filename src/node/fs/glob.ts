@@ -1,5 +1,6 @@
 import path from '../path';
 import { pathToString, toNodeDirent, toNodeDirentAsync } from './utils';
+import { withCode } from '../_internal/errors';
 
 const { basename, dirname, isAbsolute, join, relative, resolve, sep } = path;
 import { nsfs, nsasfs } from './syspath';
@@ -39,10 +40,11 @@ interface SyncGlobEntry {
 
 interface AsyncGlobEntry extends SyncGlobEntry {}
 
-function invalidArgType(name: string, expected: string, value: unknown): TypeError {
-    const error = new TypeError(`The "${name}" argument must be of type ${expected}. Received ${String(value)}`);
-    Reflect.set(error, 'code', 'ERR_INVALID_ARG_TYPE');
-    return error;
+function invalidArgType(name: string, expected: string, value: unknown): TypeError & { code: string } {
+    return withCode(
+        new TypeError(`The "${name}" argument must be of type ${expected}. Received ${String(value)}`),
+        'ERR_INVALID_ARG_TYPE',
+    );
 }
 
 export function validateGlobPatterns(pattern: string | readonly string[]): string[] {

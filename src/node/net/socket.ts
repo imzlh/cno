@@ -7,9 +7,7 @@ import { matchesErrnoCode, normalizeErrnoError } from '../_internal/errno';
 import { onNetClientSocket } from '../diagnostics_channel/builtins';
 import {
     abortError,
-    closePipeQuietly,
-    closeTcpQuietly,
-    closeUpgradeHandleQuietly,
+    closeQuietly,
     deferTick,
     destroyWithReadError,
     emitErrorQuietly,
@@ -738,21 +736,21 @@ Socket.prototype.destroy = function destroy(this: Socket, error?: Error): Socket
 
     if (this._httpOwned) {
         // Ask core to drop the connection; do not closeTcp on a borrowed handle.
-        try { this._httpOwned.close(); } catch { /* already closed */ }
+        closeQuietly(this._httpOwned);
         this._httpOwned = null;
     } else if (this._tcp) {
-        closeTcpQuietly(this._tcp);
+        closeQuietly(this._tcp);
         this._tcp = null;
     }
 
     if (this._stream) {
         stopPipeReadQuietly(this._stream);
-        closePipeQuietly(this._stream);
+        closeQuietly(this._stream);
         this._stream = null;
     }
 
     if (this._upgradeHandle) {
-        closeUpgradeHandleQuietly(this._upgradeHandle);
+        closeQuietly(this._upgradeHandle);
         this._upgradeHandle = null;
     }
 

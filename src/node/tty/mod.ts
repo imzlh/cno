@@ -1,6 +1,7 @@
 import { Readable, Writable, type ReadableOptions, type WritableOptions } from '../stream';
 import { getTierLimits } from '../_internal/memory';
 import type { NodeStdioStream as Stream } from '../_internal/stdio';
+import { withCode } from '../_internal/errors';
 
 const os = import.meta.use('os');
 const fs = import.meta.use('fs');
@@ -8,9 +9,7 @@ const engine = import.meta.use('engine');
 const streams = import.meta.use('streams');
 const timers = import.meta.use('timers');
 
-type StreamsWithStdio = typeof streams & { stdin: Stream; stdout: Stream; stderr: Stream };
-
-const { stdin, stdout, stderr } = streams as StreamsWithStdio;
+const { stdin, stdout, stderr } = streams;
 
 type Size = { width: number; height: number };
 type TTYRef = { stream: CModuleStreams.TTY; owned: boolean };
@@ -181,14 +180,16 @@ function computeColorDepth(env?: Record<string, string>): number {
 
 function validateColorCount(count: unknown): number {
     if (typeof count !== 'number' || !Number.isInteger(count)) {
-        const e = new TypeError(`The "count" argument must be of type number. Received ${typeof count}`);
-        Reflect.set(e, 'code', 'ERR_INVALID_ARG_TYPE');
-        throw e;
+        throw withCode(
+            new TypeError(`The "count" argument must be of type number. Received ${typeof count}`),
+            'ERR_INVALID_ARG_TYPE',
+        );
     }
     if (count < 2) {
-        const e = new RangeError(`The value of "count" is out of range. It must be >= 2 && <= ${Number.MAX_SAFE_INTEGER}. Received ${count}`);
-        Reflect.set(e, 'code', 'ERR_OUT_OF_RANGE');
-        throw e;
+        throw withCode(
+            new RangeError(`The value of "count" is out of range. It must be >= 2 && <= ${Number.MAX_SAFE_INTEGER}. Received ${count}`),
+            'ERR_OUT_OF_RANGE',
+        );
     }
     return count;
 }
