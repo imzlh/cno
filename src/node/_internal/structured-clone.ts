@@ -7,7 +7,6 @@ const PIPE_DATAVIEW_TAG = '__cno_structured_clone_dataview__';
 const arrayBufferByteLengthGetter = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength')?.get;
 const arrayBufferResizableGetter = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'resizable')?.get;
 const arrayBufferMaxByteLengthGetter = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'maxByteLength')?.get;
-const arrayBufferSlice = ArrayBuffer.prototype.slice;
 const arrayBufferTransfer = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'transfer')?.value;
 const dateGetTime = Date.prototype.getTime;
 const booleanValueOf = Boolean.prototype.valueOf;
@@ -49,62 +48,14 @@ const objectPrototype = Object.prototype;
 const arrayPrototype = Array.prototype;
 const objectGetPrototypeOf = Object.getPrototypeOf;
 const objectHasOwn = Object.prototype.hasOwnProperty;
-// ArrayBuffer.isView is slot-based and never throws, so it replaces a try/catch probe
-// outright. Guarded because it is the only non-throwing view predicate available and a
-// host without it must keep the old path.
 const arrayBufferIsView = typeof ArrayBuffer.isView === 'function' ? ArrayBuffer.isView : undefined;
 
-// ---------------------------------------------------------------------------
-// Tag-based dispatch, and why it is shaped this way.
-//
-// Probing a type by calling a prototype accessor and catching the TypeError costs
-// ~13-48us per object in QuickJS. `cloneValue` did that seven times for every ordinary
-// object (five in cloneBoxedPrimitive, plus isSharedArrayBuffer and isArrayBufferView),
-// which measured 0.44ms per object -- ~800x Node for an array of 2000 plain objects.
-//
-// `Object.prototype.toString` answers the same question from internal slots, but only
-// when @@toStringTag is absent: @@toStringTag is user-settable, so
-// `{[Symbol.toStringTag]:'Map'}` reports `[object Map]` while being an ordinary object.
-// So the gate checks the chain's own properties first (without invoking getters), and
-// `toString` runs only when no tag is present. A Proxy in that chain is detected and sent
-// through the old probes instead: a raw `in` check would invoke its `has` trap, while Node
-// never runs that user code during cloning. That ordering is load-bearing for FIDELITY,
-// not just speed: a spoofed tag getter must never surface.
-//
-// When the gate says "no @@toStringTag anywhere in the chain", the tag is derived purely
-// from internal slots and is authoritative for the boxed primitives -- it even survives
-// prototype surgery, which is why `Object.setPrototypeOf(new Number(11), Object.prototype)`
-// still clones as a boxed Number, matching Node. When the gate says "tagged", nothing is
-// assumed and the original throwing probes run unchanged, so every spoof case behaves
-// exactly as before.
-//
-// What the tag is NOT allowed to decide is spelled out at the gate in `cloneValue`: only the
-// types that `Object.prototype.toString` derives from an internal slot may be ruled out by
-// it. Map/Set/ArrayBuffer/SharedArrayBuffer/DataView/TypedArray/Promise/Weak* are named by
-// @@toStringTag rather than by a slot, so they are settled by non-throwing native predicates
-// instead.
-//
-// Cross-realm objects are unaffected: a foreign Map inherits @@toStringTag from its own
-// realm's Map.prototype, so it is routed to the slot-based `engine.isMap`. All 14
-// cross-realm shapes in the fidelity matrix match Node.
-// ---------------------------------------------------------------------------
+// Tag-based dispatch; see docs/node-internals.md#structured-clone-tagged-dispatch.
 const TAG_NUMBER = '[object Number]';
 const TAG_STRING = '[object String]';
 const TAG_BOOLEAN = '[object Boolean]';
 
-// The tag is trusted for exactly one decision: "is this a boxed Number/String/Boolean?",
-// where a `[object Object]` answer is taken as proof that it is not. Only two types can
-// falsify that proof -- a BigInt object and a Symbol object -- because they are named by
-// @@toStringTag rather than by a slot, so deleting that property makes a real one report
-// `[object Object]`. It would then be cloned as a plain object (losing the BigInt value) or
-// cloned at all (where a Symbol object must throw).
-//
-// This is checked PER CALL rather than once at load. A load-time check was tried first and
-// is not sufficient: it cannot see `delete BigInt.prototype[Symbol.toStringTag]` executed
-// afterwards, and measurement confirmed the divergence that let through -- cno produced a
-// slot-less object where Node preserved 7n, and cloned a Symbol object where Node threw.
-// Two `hasOwnProperty` calls measured 6.6us per object against 43.4us for reinstating the
-// two throwing probes, so the robust version is also the cheap one.
+// Must be checked PER CALL: a load-time check misses a later `delete BigInt.prototype[Symbol.toStringTag]`.
 function tagDispatchIsSound(): boolean {
     return objectHasOwn.call(BigInt.prototype, Symbol.toStringTag)
         && objectHasOwn.call(Symbol.prototype, Symbol.toStringTag);
@@ -189,9 +140,7 @@ function isUnsupportedObject(value: object): boolean {
         || engine.isWeakRef(value);
 }
 
-// Blob/File carry their bytes in a private field, so the plain-object fallback
-// below cloned them to `{}` and silently dropped the payload. `Symbol.for`
-// avoids importing webapi/formdata here (that would be circular).
+// `Symbol.for` rather than an import: webapi/formdata would be circular.
 const blobBytesSymbol = Symbol.for('cno.blob.bytes');
 
 function cloneBlob(value: object): object | null {
@@ -210,31 +159,10 @@ function cloneBlob(value: object): object | null {
     return new BlobCtor([bytes], { type: (value as unknown as Blob).type });
 }
 
-// Platform objects with internal slots and no serialization steps must throw
-// DataCloneError. The plain-object fallback used to hand back a hollow `{}` —
-// e.g. a cloned URL with `href === undefined`. This list is the measured
-// intersection of what Node 24 and Deno 2 both reject; AbortSignal, EventTarget,
-// TextEncoder/Decoder, Performance and BroadcastChannel are deliberately absent
-// because both engines clone those to plain objects.
+// Must not be gated on @@toStringTag: in cno these objects carry no tag (see docs/node-internals.md).
 const nonSerializableCtors = ['URL', 'URLSearchParams', 'Headers', 'FormData',
     'Request', 'Response', 'ReadableStream', 'WritableStream', 'TransformStream'];
 
-// This check CANNOT be gated on the @@toStringTag test: in cno, Request, Response,
-// ReadableStream, WritableStream and TransformStream carry no @@toStringTag and report
-// `[object Object]` (measured; in Node all five are tagged). Gating on the tag would
-// silently turn "throws DataCloneError" into "clones to a hollow plain object" for them.
-//
-// Instead it is gated on prototype identity. `value instanceof C` walks value's prototype
-// chain looking for C.prototype, so an object whose immediate prototype is exactly
-// Object.prototype or Array.prototype (or null) cannot be an instance of any of the nine
-// -- none of them has Object.prototype as its own `prototype`. That reduces the common case
-// from nine globalThis reads plus nine instanceof checks (51.7us/object measured) to a
-// single getPrototypeOf and two comparisons. Anything else still runs the full loop, so
-// subclasses, cross-realm instances and exotic prototypes are unaffected.
-//
-// Not covered, deliberately: a constructor with a custom Symbol.hasInstance that claims
-// plain objects. `instanceof` would honour it; this gate skips it. Node's structured clone
-// does not consult globals at all, so that shape is outside what either engine guarantees.
 function hasOrdinaryPrototype(value: object): boolean {
     const proto = Object.getPrototypeOf(value);
     return proto === objectPrototype || proto === arrayPrototype || proto === null;
@@ -272,8 +200,6 @@ function applyGetter<T>(getter: ((this: unknown) => T) | undefined, receiver: ob
 
 function isArrayBufferView(value: unknown): value is ArrayBufferView {
     if (!value || typeof value !== 'object') return false;
-    // Slot-based and non-throwing: correct even for a view whose prototype chain has been
-    // severed from @@toStringTag, which a tag test alone could not detect.
     if (arrayBufferIsView) return arrayBufferIsView(value);
     if (engine.isDataView(value)) return true;
     if (!typedArrayBufferGetter) return false;
@@ -303,7 +229,7 @@ function cloneArrayBuffer(buffer: ArrayBuffer): ArrayBuffer {
             new Uint8Array(out).set(new Uint8Array(buffer));
             return out;
         }
-        return Reflect.apply(arrayBufferSlice, buffer, [0]);
+        return buffer.slice(0);
     } catch (e) {
         throw dataCloneError('An ArrayBuffer is detached and could not be cloned');
     }
@@ -328,9 +254,7 @@ function isDetachedArrayBuffer(buffer: ArrayBuffer): boolean {
 
 function transferArrayBuffer(buffer: ArrayBuffer): void {
     try {
-        // Never consult an instance property named `transfer`: structured cloning
-        // operates on the ArrayBuffer internal slot, and user code must not be able
-        // to intercept or suppress the detach step by shadowing the prototype.
+        // Internal slot, not an instance property named `transfer`, which user code could shadow.
         if (typeof arrayBufferTransfer === 'function') {
             Reflect.apply(arrayBufferTransfer, buffer, []);
         } else {
@@ -479,8 +403,7 @@ function cloneObjectProperties<TPort extends object, TPortClone extends object>(
         const descriptor = Object.getOwnPropertyDescriptor(source, key);
         if (!descriptor) continue;
         const value = 'value' in descriptor ? descriptor.value : sourceRecord[key];
-        // Assignment would invoke Object.prototype.__proto__. Structured clone
-        // instead creates an ordinary enumerable own data property for every key.
+        // defineProperty, not assignment: a `__proto__` key must become an own data property.
         Object.defineProperty(target, key, {
             value: cloneValue(value, state, seen),
             writable: true,
@@ -490,9 +413,7 @@ function cloneObjectProperties<TPort extends object, TPortClone extends object>(
     }
 }
 
-// The original five-probe version, kept verbatim for every value the tag test cannot
-// speak for (anything carrying @@toStringTag, and BigInt/Symbol objects which are tagged
-// by definition). Correct but expensive: five caught exceptions for an ordinary object.
+// Fallback for values the tag test cannot speak for (anything carrying @@toStringTag).
 function cloneBoxedPrimitiveByProbe<TPort extends object, TPortClone extends object>(
     value: object,
     state: CloneState<TPort, TPortClone>,
@@ -513,11 +434,7 @@ function cloneBoxedPrimitiveByProbe<TPort extends object, TPortClone extends obj
     return out;
 }
 
-// Fast path: `plainTag` is the internal-slot-derived tag, already computed by the caller
-// and only ever passed when @@toStringTag is provably absent, so it is authoritative.
-// Boxed Number/String/Boolean take one valueOf call -- the one that will succeed -- rather
-// than up to five that throw. Any other tag (`[object Object]`, `[object Array]`,
-// `[object Date]`, ...) is proof of no boxed slot, so no probe runs at all.
+// `plainTag` is authoritative only when @@toStringTag is provably absent (caller's contract).
 function cloneBoxedPrimitiveByTag<TPort extends object, TPortClone extends object>(
     value: object,
     plainTag: string,
@@ -644,16 +561,9 @@ function encodeForPipe(value: unknown, seen: Map<object, unknown>): unknown {
     if (engine.isArrayBuffer(value) || isSharedArrayBuffer(value)) {
         return value;
     }
-    // A DataView IS an ArrayBufferView, so without this it fell through to the
-    // passthrough below and reached the native pipe serializer, which rejects it
-    // with "unsupported object class". Typed arrays survive that encoder; DataView
-    // does not, so it needs a tag the way Date and RegExp above do. Encoded as its
-    // backing buffer plus the window, since a bare ArrayBuffer crosses intact.
-    //
-    // Not cosmetic: when the receiving worker is not ready the payload is queued,
-    // so the throw surfaces later from _flushOutgoingQueue as an unhandled
-    // rejection no try/catch around postMessage can reach, and the loop wedges.
-    // Measured before this fix: cno rc=124 (killed on timeout) vs node rc=0.
+    // Must precede the view passthrough: the native pipe serializer rejects a bare DataView
+    // ("unsupported object class"), and the throw surfaces later from the outgoing queue
+    // where no caller try/catch can reach it. Format: docs/node-internals.md#dataview-pipe-tag.
     if (engine.isDataView(value)) {
         const view = value as DataView;
         const out: CloneRecord = {
@@ -731,8 +641,7 @@ function decodeFromPipe(value: unknown, seen: Map<object, unknown>): unknown {
         return out;
     }
     if (isPipeEncodedDataView(value)) {
-        // Routed through decodeFromPipe so two views over one buffer decode to two
-        // views over ONE buffer: ArrayBuffer returns identity, preserving sharing.
+        // Through decodeFromPipe so sibling views decode onto ONE buffer (ArrayBuffer is identity).
         const buffer = decodeFromPipe(value.buffer, seen) as ArrayBuffer;
         const out = new DataView(buffer, Number(value.byteOffset), Number(value.byteLength));
         seen.set(value, out);
@@ -795,34 +704,14 @@ function cloneValue<T, TPort extends object, TPortClone extends object>(
         return cloneBuffer(value as unknown as ArrayBuffer, state);
     }
 
-    // Compute the slot-derived tag once, and only when @@toStringTag is provably absent
-    // from the whole prototype chain. `plainTag` non-undefined means "this tag came from
-    // an internal slot and no user code was consulted to produce it".
-    //
-    // IMPORTANT SCOPE LIMIT, measured: the tag may be used ONLY to answer questions that
-    // Object.prototype.toString answers from an internal slot -- that is, the boxed
-    // primitives (Number/String/Boolean), plus Array/Date/RegExp/Error/Arguments. It must
-    // NOT be used to rule out Map, Set, ArrayBuffer, SharedArrayBuffer, DataView,
-    // TypedArray, Promise, WeakMap, WeakSet or WeakRef, because none of those appears in
-    // that spec list: they report their name *via @@toStringTag on their prototype*. Delete
-    // that property at runtime -- `delete SharedArrayBuffer.prototype[Symbol.toStringTag]`
-    // -- and a real SharedArrayBuffer reports `[object Object]`.
-    //
-    // An earlier revision of this fix did gate the SharedArrayBuffer and Weak/Promise
-    // probes on the tag, and it measurably diverged from Node: a SharedArrayBuffer cloned
-    // to a hollow object (`byteLength === undefined`, payload gone) and a Promise/WeakMap
-    // cloned instead of throwing, in all three cases where Node still did the right thing.
-    // Node reads internal slots throughout and is immune, so those gates are gone. The
-    // predicates below that are cheap and non-throwing (`engine.*`, `ArrayBuffer.isView`)
-    // simply run unconditionally.
+    // Only when @@toStringTag is provably absent; must NOT rule out @@toStringTag-named types
+    // (Map/Set/ArrayBuffer/views/Promise/Weak*) -- see docs/node-internals.md.
     let plainTag: string | undefined;
     const tagState = tagPropertyState(value);
     if (tagState === false && tagDispatchIsSound()) {
         plainTag = Reflect.apply(objectToString, value, []) as string;
     }
 
-    // Views are settled by ArrayBuffer.isView: slot-based, non-throwing, and correct even
-    // for a view whose prototype chain no longer carries @@toStringTag.
     if (isArrayBufferView(value)) return cloneView(value, state, seen);
     if (engine.isDate(value)) {
         const out = new Date(Reflect.apply(dateGetTime, value, []));
@@ -835,17 +724,11 @@ function cloneValue<T, TPort extends object, TPortClone extends object>(
         seen.set(value, out);
         return out;
     }
-    // Four native slot checks, no exceptions thrown. Unconditional: see the scope limit
-    // above -- all four types are identified by @@toStringTag, so the tag cannot exclude them.
+    // Unconditional: these types are @@toStringTag-named, so the tag cannot exclude them.
     if (isUnsupportedObject(value)) throw dataCloneError(`${String(value)} could not be cloned.`);
 
-    // Map/Set/Error are settled BEFORE the boxed-primitive probe. An object holds at most
-    // one of [[MapData]] / [[SetData]] / [[ErrorData]] / [[NumberData]] / [[StringData]] /
-    // [[BooleanData]] -- slots are assigned at construction and cannot be added later -- so
-    // these three predicates and the boxed probe are mutually exclusive and the order
-    // between them cannot change any outcome. It matters for cost: Map, Set and Error all
-    // carry @@toStringTag (or tag as `[object Error]`), so they take the slow path, and
-    // testing them first spares them the five-throw probe.
+    // Before the boxed probe: slots are mutually exclusive, so order is cost only (Map/Set/Error
+    // are tagged and would otherwise take the five-throw probe).
     if (engine.isMap(value)) {
         const out = new Map();
         seen.set(value, out);
@@ -866,25 +749,13 @@ function cloneValue<T, TPort extends object, TPortClone extends object>(
         return cloneError(value as unknown as Error, state, seen);
     }
 
-    // A known slot tag settles the boxed-primitive question outright, and this IS one of the
-    // questions Object.prototype.toString answers from an internal slot, so it is sound:
-    // `[object Number]` / `[object String]` / `[object Boolean]` take the one valueOf call
-    // that will succeed, and any other tag provably has no boxed slot, so the five-throw
-    // probe is skipped. A value carrying @@toStringTag falls back to the original probe,
-    // which is what keeps every spoof case behaving as before. BigInt and Symbol objects are
-    // always tagged, so they always take that probe -- which is where the Symbol rejection
-    // lives.
+    // BigInt/Symbol objects are always tagged, so they always take the probe (which rejects Symbol).
     const boxed = plainTag !== undefined
         ? cloneBoxedPrimitiveByTag(value, plainTag, state, seen)
         : cloneBoxedPrimitiveByProbe(value, state, seen);
     if (boxed) return boxed;
 
-    // The SharedArrayBuffer probe is the one remaining throw on this path, and it cannot be
-    // gated on the tag (see the scope limit above) -- so it is placed as late as possible
-    // instead. Everything tested before it is identified by a distinct internal slot and is
-    // therefore mutually exclusive with a SharedArrayBuffer, so a Date, RegExp, Map, Set,
-    // Error, view or boxed primitive now exits before paying for it. Only genuinely
-    // plain-looking objects reach it.
+    // Throwing probe, cannot be tag-gated: keep it last so every other type exits first.
     if (isSharedArrayBuffer(value)) return cloneSharedBuffer(value, state);
     const blob = cloneBlob(value);
     if (blob) {

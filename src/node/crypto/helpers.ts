@@ -1,44 +1,39 @@
-/**
- * Node.js crypto module - shared helper functions
- */
-
-const engine = import.meta.use('engine');
-const crypto = import.meta.use('crypto');
-const algorithm = import.meta.use('algorithm');
 import { Buffer } from '../buffer';
 import type { BinaryInput, KeyInput, KeyObject, KeyWithOptions, AsymmetricKeyType } from './types';
 import { base64ToBytes, concatChunks as concatBuffers, hexToBytes } from '../_internal/buffer';
 export { concatBuffers };
 
+const engine = import.meta.use('engine');
+const crypto = import.meta.use('crypto');
+const algorithm = import.meta.use('algorithm');
 const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
-const typedArrayBufferGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')?.get;
-const typedArrayByteOffsetGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteOffset')?.get;
-const typedArrayByteLengthGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteLength')?.get;
-const dataViewBufferGetter = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer')?.get;
-const dataViewByteOffsetGetter = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset')?.get;
-const dataViewByteLengthGetter = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength')?.get;
-const arrayBufferByteLengthGetter = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength')?.get;
-const arrayBufferSlice = ArrayBuffer.prototype.slice;
-const uint8ArraySet = Uint8Array.prototype.set;
+const typedArrayBufferGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')?.get as
+    ((this: object) => ArrayBufferLike) | undefined;
+const typedArrayByteOffsetGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteOffset')?.get as
+    ((this: object) => number) | undefined;
+const typedArrayByteLengthGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteLength')?.get as
+    ((this: object) => number) | undefined;
+const dataViewBufferGetter = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer')?.get as
+    ((this: object) => ArrayBufferLike) | undefined;
+const dataViewByteOffsetGetter = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset')?.get as
+    ((this: object) => number) | undefined;
+const dataViewByteLengthGetter = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength')?.get as
+    ((this: object) => number) | undefined;
 
 export const kKeyData = Symbol('cno.node.crypto.keyData');
 export const kKeyFormat = Symbol('cno.node.crypto.keyFormat');
 export type KeyFormat = 'raw' | 'pem' | 'der';
 
-function applySlot<T>(getter: ((this: unknown) => T) | undefined, value: object): T {
-    if (!getter) throw new TypeError('Required BufferSource slot is unavailable');
-    return Reflect.apply(getter, value, []);
-}
-
 function viewSlots(value: unknown): { buffer: ArrayBufferLike; byteOffset: number; byteLength: number } | null {
-    if (!value || typeof value !== 'object') return null;
+    // The spec getters read internal slots, not properties: a view that shadows these
+    // names as instance properties still yields its real slots, as in Node. Calling
+    // ArrayBuffer.isView would also resolve through a replaced global.
     const dataView = engine.isDataView(value);
-    const bufferGetter = dataView ? dataViewBufferGetter : typedArrayBufferGetter;
     try {
         return {
-            buffer: applySlot(bufferGetter, value),
-            byteOffset: applySlot(dataView ? dataViewByteOffsetGetter : typedArrayByteOffsetGetter, value),
-            byteLength: applySlot(dataView ? dataViewByteLengthGetter : typedArrayByteLengthGetter, value),
+            buffer: Reflect.apply(dataView ? dataViewBufferGetter : typedArrayBufferGetter, value, []),
+            byteOffset: Reflect.apply(dataView ? dataViewByteOffsetGetter : typedArrayByteOffsetGetter, value, []),
+            byteLength: Reflect.apply(dataView ? dataViewByteLengthGetter : typedArrayByteLengthGetter, value, []),
         };
     } catch { return null; }
 }
@@ -65,15 +60,15 @@ export function toBuffer(data: BinaryInput, encoding: string = 'utf8'): Uint8Arr
 export function toExactArrayBuffer(data: Uint8Array): ArrayBuffer {
     const view = viewSlots(data);
     if (!view) throw new TypeError('The input must be a Uint8Array');
-    if (engine.isArrayBuffer(view.buffer)) {
-        const buffer = view.buffer as ArrayBuffer;
-        const bufferLength = applySlot(arrayBufferByteLengthGetter, buffer);
-        if (view.byteOffset === 0 && view.byteLength === bufferLength) return buffer;
-        return Reflect.apply(arrayBufferSlice, buffer, [view.byteOffset, view.byteOffset + view.byteLength]);
+    const { buffer, byteOffset, byteLength } = view;
+    if (engine.isArrayBuffer(buffer)) {
+        if (byteOffset === 0 && byteLength === (buffer as ArrayBuffer).byteLength) return buffer as ArrayBuffer;
+        const out = new Uint8Array(byteLength);
+        out.set(new Uint8Array(buffer, byteOffset, byteLength));
+        return out.buffer as ArrayBuffer;
     }
-    const copy = new Uint8Array(view.byteLength);
-    Reflect.apply(uint8ArraySet, copy, [new Uint8Array(view.buffer, view.byteOffset, view.byteLength)]);
-    return copy.buffer;
+    // Over a SharedArrayBuffer: copy into a new ArrayBuffer.
+    return (Reflect.apply(Uint8Array.prototype.slice, data, []) as Uint8Array).buffer as ArrayBuffer;
 }
 
 export function encodeOutput(data: ArrayBuffer, encoding?: string): Buffer | string {
@@ -138,17 +133,8 @@ export function readKeyOptions(input: KeyInput | KeyWithOptions): { key: Uint8Ar
 }
 
 /**
- * The native sign/verify entry points (`crypto.signSha256` and friends) take no
- * padding argument — they always use PKCS#1 v1.5. So a caller asking for PSS was
- * silently served the legacy scheme, and measured on the 17:41 binary a PKCS1
- * signature VERIFIED TRUE against an explicit PSS request, where real Node
- * v24.18.0 returns false. That is a padding-scheme downgrade, and silently
- * accepting it is worse than not supporting PSS at all: the caller believes it
- * opted in.
- *
- * Until the native layer accepts a padding parameter, fail loudly instead. Node's
- * own error for an unsupported padding is ERR_CRYPTO_INVALID_PADDING-shaped, so
- * mirror that rather than inventing a code.
+ * Native sign/verify only implement PKCS#1 v1.5, so a PSS request must fail rather than be
+ * silently downgraded (docs/node-internals.md#crypto-rsa-padding).
  */
 export function rejectUnsupportedPadding(padding: number | undefined, fn: 'sign' | 'verify'): void {
     // 1 = RSA_PKCS1_PADDING, which is what the native layer actually does.
@@ -178,33 +164,7 @@ export function detectEcCoordinateSize(bytes: Uint8Array): number | undefined {
     }
 }
 
-/* ------------------------------------------------------------------------- *
- * Key inspection for the ieee-p1363 signature paths
- *
- * The P1363 encoding is defined by the key's CURVE: the signature is exactly two
- * fixed-width coordinates. So both directions of the conversion need the curve.
- * A raw scalar or raw uncompressed point announces it by length, but a PEM or DER
- * key does not, and the encoded key's byte length says nothing about the curve.
- *
- * Guessing instead of asking produced four measured divergences from Node
- * v24.18.0:
- *   - sign({ key: <PEM>, dsaEncoding: 'ieee-p1363' }) threw, because no raw
- *     length matched (3/3 curves).
- *   - verify() inferred `size = signature.length / 2` from the SIGNATURE, so a
- *     valid signature zero-extended to any even length verified TRUE where Node
- *     returns FALSE (12/12 crafted cases across P-256/P-384/P-521). Signature
- *     malleability: one valid signature yields unboundedly many accepted byte
- *     strings, which breaks anything using signature bytes as a dedup key.
- *   - a malformed length threw where Node returns false (9/9 cases), turning a
- *     remote peer's bad signature into an uncaught exception.
- *   - RSA keys were dragged through the EC conversion, because dsaEncoding was
- *     honoured for every key type; Node ignores it for non-EC keys (4/4 cases).
- *
- * So read the namedCurve OID out of the key structure. The walk below is
- * STRUCTURAL, not a byte-scan for the OID pattern: a scan can match random key
- * material -- a modulus, a coordinate, an encrypted blob -- and "the odds are
- * tiny" is precisely the reasoning that produces this defect class.
- * ------------------------------------------------------------------------- */
+// ieee-p1363 needs the curve's coordinate size; see docs/node-internals.md#crypto-p1363-key-inspection.
 
 // OID content octets (hex) -> EC coordinate size in bytes.
 const EC_CURVE_COORDINATE_SIZE = new Map<string, number>([
@@ -235,16 +195,7 @@ function bytesToHex(bytes: Uint8Array): string {
     return out;
 }
 
-/**
- * Collect OBJECT IDENTIFIER contents by walking constructed nodes only.
- *
- * Primitive payloads (INTEGER, BIT STRING, OCTET STRING) are never re-parsed as
- * TLV, so raw key material can never be mistaken for an OID. Every structure we
- * care about carries the curve OID inside a constructed node:
- *   SPKI    SEQUENCE { SEQUENCE { OID alg, OID curve }, BIT STRING }
- *   PKCS8   SEQUENCE { INTEGER, SEQUENCE { OID alg, OID curve }, OCTET STRING }
- *   SEC1    SEQUENCE { INTEGER, OCTET STRING, [0] { OID curve }, [1] { ... } }
- */
+/** Must stay structural: a byte-scan can match key material (docs/node-internals.md#crypto-p1363-key-inspection). */
 function collectDerOids(der: Uint8Array, out: string[], depth: number): void {
     if (depth > 4) return;
     let offset = 0;
@@ -297,14 +248,7 @@ export type P1363KeyShape =
     | { kind: 'non-ec' }
     | { kind: 'unknown' };
 
-/**
- * Classify key material for the ieee-p1363 paths: an EC key with a known
- * coordinate size, a key type for which Node ignores dsaEncoding, or unknown.
- *
- * 'unknown' is deliberately distinct from 'non-ec' so callers can preserve the
- * pre-existing behaviour for key shapes this function does not recognise rather
- * than silently changing what they do.
- */
+/** 'unknown' stays distinct from 'non-ec' so unrecognised key shapes keep their old behaviour. */
 export function classifyKeyForP1363(keyBytes: Uint8Array): P1363KeyShape {
     // Raw scalars and raw uncompressed points are self-describing by length.
     const rawSize = detectEcCoordinateSize(keyBytes);
@@ -324,9 +268,7 @@ export function classifyKeyForP1363(keyBytes: Uint8Array): P1363KeyShape {
     for (const oid of oids) {
         if (NON_EC_ALGORITHM_OIDS.has(oid)) return { kind: 'non-ec' };
     }
-    // PKCS#1 carries no OID at all -- it is a bare SEQUENCE of INTEGERs -- so the
-    // PEM label is the only signal. Node accepts PKCS#1 input even though this
-    // build cannot export it.
+    // PKCS#1 has no OID, so the PEM label is the only signal.
     if (parsed.label.indexOf('RSA') >= 0) return { kind: 'non-ec' };
     return { kind: 'unknown' };
 }
@@ -338,13 +280,8 @@ function readAsn1Length(bytes: Uint8Array, offset: number): { length: number; of
 }
 
 /**
- * Non-throwing DER length reader.
- *
- * `length = (length << 8) | byte` wraps to a NEGATIVE number for a 4-byte length
- * whose top bit is set (0x84 FF FF FF FF read back as -1), and a negative length
- * silently defeats every `end > bytes.length` bounds check downstream -- the
- * comparison is simply false. Accumulate with multiplication instead, and reject
- * any length that cannot fit in the buffer we were handed.
+ * Accumulate with multiplication: `(length << 8) | byte` wraps negative, and a negative length
+ * defeats every downstream bounds check.
  */
 function readAsn1LengthOrUndefined(bytes: Uint8Array, offset: number): { length: number; offset: number } | undefined {
     const first = bytes[offset++];
@@ -385,11 +322,7 @@ function writeAsn1Length(length: number): number[] {
 }
 
 function normalizeDerInteger(bytes: Uint8Array): Uint8Array {
-    // `bytes` is one fixed-width big-endian half of a P1363 signature -- a raw
-    // scalar, never a TLV. Do not special-case a leading 0x04 here: that is the
-    // uncompressed EC *point* prefix, which belongs to public keys, not to r/s.
-    // Skipping it drops a real high-order byte for the ~1-in-128 signature whose
-    // r or s happens to start with 0x04, and the rebuilt DER then fails to verify.
+    // Do not strip a leading 0x04: that is the EC point prefix, not part of r/s.
     let start = 0;
     while (start < bytes.length - 1 && bytes[start] === 0) {
         start++;
@@ -607,23 +540,7 @@ export function readAsymmetricCipherArgs(
     throw new TypeError('Invalid key or options for asymmetric cipher');
 }
 
-/* ------------------------------------------------------------------------- *
- * asymmetricKeyDetails for PARSED keys
- *
- * `createPrivateKey`/`createPublicKey` built KeyObjects with no details, so
- * `asymmetricKeyDetails` was `undefined` for every key that came from a PEM or
- * DER -- i.e. every key loaded from a file, which is how production keys are
- * actually supplied. `jsonwebtoken` reads `.asymmetricKeyDetails.namedCurve` to
- * check the curve against the algorithm, so ES256/ES384 signing crashed with
- * "cannot read property 'namedCurve' of undefined" for a real .pem while
- * working for a key generated in the same process.
- *
- * Node's exact shapes (measured, v24.18.0):
- *   EC       { namedCurve: 'prime256v1' | 'secp384r1' | 'secp521r1' }
- *   RSA      { modulusLength: <bits>, publicExponent: <BigInt> }
- *   ed/x     {}          (present but empty)
- *   secret   undefined
- * ------------------------------------------------------------------------- */
+// asymmetricKeyDetails for parsed keys (docs/node-internals.md#crypto-asymmetric-key-details)
 
 // OID content octets (hex) -> the curve name Node reports.
 const EC_CURVE_NAME = new Map<string, string>([
@@ -636,12 +553,7 @@ const EC_CURVE_NAME = new Map<string, string>([
 const RSA_OIDS = new Set<string>(['2a864886f70d010101', '2a864886f70d01010a']);
 const RFC8410_OIDS = new Set<string>(['2b6570', '2b6571', '2b656e', '2b656f']);
 
-/**
- * Walk to the first two INTEGERs of an RSA key body and report (modulus bits,
- * exponent). Structural like `collectDerOids`: descend only constructed nodes,
- * and follow the one OCTET STRING (PKCS#8) or BIT STRING (SPKI) that wraps the
- * inner RSAPrivateKey/RSAPublicKey, never re-parsing arbitrary primitives.
- */
+/** Take the first two INTEGERs as (modulus bits, exponent); structural, never re-parses primitives. */
 function readRsaIntegers(der: Uint8Array, depth: number): { modulusLength: number; publicExponent: bigint } | undefined {
     if (depth > 4) return undefined;
     let offset = 0;
@@ -692,10 +604,7 @@ export type AsymmetricKeyDetails = { namedCurve?: string; modulusLength?: number
  * when these bytes are not a key structure this build recognises.
  */
 export function keyDetailsFromBytes(keyBytes: Uint8Array): AsymmetricKeyDetails | undefined {
-    // Structure BEFORE length. An ed25519/x25519 PKCS#8 is 48 bytes, which is
-    // also P-384's coordinate width, so trusting the raw-length probe first
-    // reported `namedCurve: 'secp384r1'` for an Ed25519 DER key. Only fall back
-    // to the length heuristic when these bytes are not a PEM/DER structure.
+    // Structure before length: an Ed25519 PKCS#8 is 48 bytes, same as a P-384 coordinate.
     const parsed = derFromKeyBytes(keyBytes);
     if (parsed) {
         const oids: string[] = [];
@@ -710,8 +619,7 @@ export function keyDetailsFromBytes(keyBytes: Uint8Array): AsymmetricKeyDetails 
         for (const oid of oids) {
             if (RSA_OIDS.has(oid)) return readRsaIntegers(parsed.der, 0);
         }
-        // PKCS#1 carries no OID -- a bare SEQUENCE of INTEGERs -- so the PEM
-        // label is the only signal, matching classifyKeyForP1363.
+        // No OID in PKCS#1, so the PEM label is the only signal (as in classifyKeyForP1363).
         if (parsed.label.indexOf('RSA') >= 0) return readRsaIntegers(parsed.der, 0);
         return undefined;
     }
@@ -724,3 +632,5 @@ export function keyDetailsFromBytes(keyBytes: Uint8Array): AsymmetricKeyDetails 
     }
     return undefined;
 }
+
+

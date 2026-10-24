@@ -6,6 +6,7 @@ import { Readable, Writable } from '../stream';
 import { createWriteAfterEndError } from '../stream/_shared';
 import { Socket, Server as NetServer, AddressInfo, type HttpOwnedTransport } from '../net';
 import { normalizeTcpHost } from '../net/_shared';
+import { closeQuietly } from '../_internal/close';
 import type { HttpRequest, HttpResponse, Server as HttpServer } from '@cnojs/http/server';
 import {
     buildNodeServerUrl,
@@ -94,9 +95,8 @@ function createAttachedSocketQuietly(
 }
 
 /**
- * Node view of a connection. When `owned` is set, HTTP core owns all I/O —
- * the Socket is address/destroy metadata only (no dual-write on the TCP).
- * Without `owned` (e.g. clientError display), destroy may close the handle.
+ * When `owned` is set HTTP core owns all I/O and the Socket is address/destroy
+ * metadata only (no dual-write on the TCP); otherwise destroy may close the handle.
  */
 export function createAttachedSocket(
     tcp: CModuleStreams.TCP,
@@ -107,7 +107,7 @@ export function createAttachedSocket(
     // Without `owned` (clientError display) the socket is metadata only; it must
     // not keep the TCP reachable for stream I/O, matching fromHttpOwned.
     return Socket.fromHttpOwned(tcp, { close: () => {
-        try { tcp.close(); } catch { /* already closed */ }
+        closeQuietly(tcp);
     } });
 }
 
@@ -140,13 +140,7 @@ export function applyCoreServerRequest(incoming: IncomingMessageImpl, request: P
 // Re-export from shared constants (single source of truth)
 export { STATUS_CODES, METHODS } from './constants';
 
-// Old-style function-constructor + prototype pattern (mirrors Readable/Writable
-// in ../stream/mod.ts and EventEmitter in ../events/mod.ts). Real Node.js core
-// implements IncomingMessage/OutgoingMessage/ServerResponse/ClientRequest as
-// function constructors too, so mock/test-double libraries and middleware can
-// do `http.IncomingMessage.call(this)` + `util.inherits()` instead of
-// `class X extends http.IncomingMessage` (which ES6 class constructors reject
-// when invoked as a plain function).
+// Function constructors, not classes, so `http.IncomingMessage.call(this)` plus `util.inherits()` works.
 export interface IncomingMessageImpl extends IncomingMessage {}
 
 export interface IncomingMessageImplConstructor {
@@ -203,18 +197,8 @@ IncomingMessageImpl.prototype.setTimeout = function setTimeout(this: IncomingMes
 };
 
 IncomingMessageImpl.prototype.destroy = function destroy(this: IncomingMessageImpl, error?: Error): IncomingMessageImpl {
-    // Node only marks/announces an abort when the message was still incomplete;
-    // destroying an already-complete message is just a teardown. cno set
-    // `aborted = true` unconditionally and never emitted 'aborted' at all, so
-    // `res.on('aborted')` — the documented way to notice a truncated response —
-    // never fired. OBSERVED: node ["data:4","aborted","close:complete=false"]
-    // vs cno ["data:4","close:complete=false"] (/d/tmp/ag-http/p1-basic.js T10).
-    //
-    // The `!this.aborted` half is load-bearing: the truncation path in
-    // http-client.ts::failResponse already announces the abort and *then* calls
-    // destroy(err), so emitting unconditionally here produced
-    // 'aborted->aborted->error->close' and broke
-    // tests/webapi/h1-truncation.test.ts.
+    // 'aborted' only for an incomplete message, and never if already aborted: the client
+    // truncation path calls destroy(err) after announcing it (docs/node-internals.md#http-aborted).
     if (!this.complete && !this.aborted) {
         this.aborted = true;
         this.emit('aborted');
@@ -379,28 +363,7 @@ OutgoingMessageImpl.prototype.flushHeaders = function flushHeaders(this: Outgoin
     if (!this.headersSent) this._sendHeaders();
 };
 
-/*
- * Legacy Node internals that real middleware reaches for directly.
- *
- * `compression`, `on-headers`, `express`'s res.sendFile path and several other
- * widely-used packages open-code Node's own OutgoingMessage guard:
- *
- *     if (!this._header) { this._implicitHeader(); }
- *
- * Without `_implicitHeader` that throws "TypeError: not a function" from inside
- * the middleware's res.write/res.end wrapper, before any head is emitted, so
- * the client gets ZERO bytes and the request hangs until it times out --
- * measured 2026-08-09 with express 4.21.2 + compression 1.7.5, where every
- * response (including Accept-Encoding: identity, which does no zlib work at
- * all) returned 0 bytes under cno and was byte-exact under Node v24.18.0.
- *
- * In Node, `_implicitHeader` sends the head with the current statusCode, which
- * is exactly flushHeaders(); ServerResponseImpl overrides _sendHeaders to route
- * through NodeResponseAdapter, so the subclass gets the right behaviour for
- * free. `_header` is Node's pre-serialized head string, truthy only once the
- * head is out -- expose it as an accessor over the existing state rather than a
- * second copy that could drift out of sync.
- */
+// Legacy internals middleware calls directly (`if (!this._header) this._implicitHeader()`).
 OutgoingMessageImpl.prototype._implicitHeader = function _implicitHeader(this: OutgoingMessageImpl): void {
     this.flushHeaders();
 };
@@ -421,9 +384,8 @@ Object.defineProperty(OutgoingMessageImpl.prototype, '_header', {
         return `${status}${this._formatHeaders()}\r\n`;
     },
     set(this: OutgoingMessageImpl, _value: string | null): void {
-        // Node allows `res._header = null` to reset. Setting it is not
-        // meaningful here because the head is derived from live state; accept
-        // and ignore rather than throwing inside third-party middleware.
+        // Accept and ignore `res._header = null`: the head is derived from live state, and
+        // throwing would break third-party middleware.
     },
 });
 
@@ -561,11 +523,7 @@ ServerResponseImpl.prototype.writeHead = function writeHead(
     return this;
 };
 
-// Interim (1xx) responses require writing to the socket before the final
-// response. ServerResponseImpl no longer owns the socket — the core
-// @cnojs/http HttpResponse has no interim-write API yet — so these are
-// no-ops. Vite/Connect do not use them; a future HttpResponse adapter can
-// route interim writes through the core response if that support is added.
+// No-ops: interim writes need the socket, and @cnojs/http has no interim-write API.
 ServerResponseImpl.prototype.writeProcessingContinue = function writeProcessingContinue(this: ServerResponseImpl): void {};
 
 ServerResponseImpl.prototype.writeEarlyHints = function writeEarlyHints(this: ServerResponseImpl, _hints: Record<string, string | string[]>, callback?: () => void): void {
@@ -574,10 +532,7 @@ ServerResponseImpl.prototype.writeEarlyHints = function writeEarlyHints(this: Se
 
 ServerResponseImpl.prototype._sendHeaders = function _sendHeaders(this: ServerResponseImpl): void {
     if (this.headersSent) return;
-    // State-only. All socket I/O flows through NodeResponseAdapter ->
-    // coreResponse (@cnojs/http), which is rebound onto this instance in
-    // ServerImpl.listen() before the request handler runs. This base impl
-    // exists only so any pre-override call keeps Node-facing state coherent.
+    // State-only; socket I/O belongs to NodeResponseAdapter -> coreResponse (@cnojs/http).
     OutgoingMessageImpl.prototype._sendHeaders.call(this);
 };
 
@@ -609,9 +564,7 @@ ServerResponseImpl.prototype.write = function write(
     const data = toBodyChunkBytes(chunk, value => encoder.encode(value));
     this._bodyLength += data.length;
 
-    // State-only. NodeResponseAdapter rebinds write() per request and owns
-    // all socket I/O via coreResponse (@cnojs/http). This base impl exists
-    // only for pre-override calls and must never touch the socket.
+    // State-only; NodeResponseAdapter rebinds this per request and must never touch the socket.
     const callback = typeof encodingOrCb === 'function' ? encodingOrCb : cb;
     callback?.();
     return true;
@@ -627,9 +580,7 @@ ServerResponseImpl.prototype.end = function end(this: ServerResponseImpl, chunk?
         return this;
     }
 
-    // State-only. NodeResponseAdapter rebinds end() per request and owns all
-    // socket I/O via coreResponse (@cnojs/http). This base impl exists only
-    // for pre-override calls and must never touch the socket.
+    // State-only; NodeResponseAdapter rebinds this per request and must never touch the socket.
     this._ended = true;
     this.writableEnded = true;
     this.finished = true;
@@ -671,32 +622,13 @@ class NodeResponseAdapter extends ServerResponseAdapter<ServerResponseImpl> {
                 }
             },
             abort: () => {
-                try { coreResponse.close(); } catch { /* already closed */ }
+                closeQuietly(coreResponse);
             },
         }, serveHook as ResponseAdapterServeHook | null, requestId, requestUrl, suppressBody);
     }
 
-    /*
-     * Route the head through the response's OWN writeHead property.
-     *
-     * The base adapter emits the implicit head with `this.writeHead(...)` — its
-     * own method. Node reaches it via `this.writeHead(...)` on the *response
-     * instance*, so middleware that replaces `res.writeHead` sits in the path.
-     *
-     * The `on-headers` package works exactly that way, and it is a dependency of
-     * `compression`, `morgan` and `serve-static`. Measured 2026-08-09: under cno
-     * its listener never fired (node: fired), which cost two user-visible bugs
-     * at once — `compression` never installed its gzip stream (no
-     * Content-Encoding for any Accept-Encoding), and, because it defers the
-     * `drain` listener pipe() registers until that same callback, a piped 100KB
-     * file stalled after exactly 16384 bytes: a valid-looking truncated body,
-     * the shape of the originally reported express.static failure.
-     *
-     * bindServerResponseAdapter points response.writeHead at this very method,
-     * so re-dispatching would recurse; `inPublicWriteHead` breaks the cycle.
-     * Unpatched, the call lands here again and behaves exactly as before — only
-     * now any middleware wrapper runs first, as it does in Node.
-     */
+    // Dispatch through the instance property so middleware wrappers (on-headers) run.
+    // bindServerResponseAdapter points it back here, so inPublicWriteHead stops the recursion.
     private inPublicWriteHead = false;
 
     override writeHead(
@@ -856,31 +788,25 @@ export class ServerImpl extends NetServer implements Server {
         }
     }
 
-    /**
-     * Facade for a core-owned TCP. Reused across keep-alive requests on the
-     * same handle; destroy closes the HTTP connection via the current res.
-     */
+    /** Facade for a core-owned TCP; reused across keep-alive requests on the same handle. */
     private socketForCoreRequest(tcp: CModuleStreams.TCP, res: HttpResponse): Socket {
         const existing = this._httpSocketByTcp.get(tcp);
         if (existing && !existing.destroyed) return existing;
 
         const owned: HttpOwnedTransport = {
             close: () => {
-                try { res.close(); } catch { /* already closed */ }
+                closeQuietly(res);
             },
         };
         const socket = createAttachedSocket(tcp, owned);
-        res.onTerminalClose(() => {
+        res.onTerminalClose?.(() => {
             if (socket._httpOwned !== owned) return;
             socket._httpOwned = null;
             socket.destroy();
         });
         this._httpSocketByTcp.set(tcp, socket);
         this.trackHttpSocket(socket);
-        // In Node http.Server extends net.Server, so every accepted HTTP
-        // connection also publishes net.server.socket. cno's HTTP server is
-        // backed by native core rather than net.Server, so this is the
-        // equivalent point: once per new connection, not per keep-alive request.
+        // Once per new connection (not per keep-alive request), standing in for net.Server's publish.
         if (onNetServerSocket.hasSubscribers) {
             onNetServerSocket.publish({ socket });
         }
@@ -907,10 +833,7 @@ export class ServerImpl extends NetServer implements Server {
         if (nodeSocket) this._httpActiveSockets.add(nodeSocket);
         const { incoming, response } = createServerRequestObjects(nodeSocket);
         applyCoreServerRequest(incoming, req);
-        // Node publishes http.server.response.created from the ServerResponse
-        // constructor, at which point the paired IncomingMessage already carries
-        // its method/url. cno fills those in via applyCoreServerRequest, so the
-        // publish belongs here — before it, subscribers would see a blank request.
+        // After applyCoreServerRequest, or subscribers would see a blank request.
         if (onServerResponseCreated.hasSubscribers) {
             onServerResponseCreated.publish({ request: incoming, response });
         }
@@ -926,9 +849,8 @@ export class ServerImpl extends NetServer implements Server {
                 this.markHttpSocketUpgraded(nodeSocket);
                 this.emit('connect', incoming, connectSocket, new Uint8Array(0));
             } catch (err) {
-                // Once upgrade() succeeds, ownership has moved to the Node socket.
-                // Deterministically close it if the connect listener throws.
-                if (connectSocket && !connectSocket.destroyed) connectSocket.destroy();
+            // Ownership moved to the Node socket once upgrade() succeeded.
+            if (connectSocket && !connectSocket.destroyed) connectSocket.destroy();
                 this.emit('error', err);
             }
             this.releaseActiveHttpSocket(nodeSocket);
@@ -951,8 +873,7 @@ export class ServerImpl extends NetServer implements Server {
                 : null,
         );
         response.once('finish', () => {
-            // Node drains an untouched request after replying so keep-alive can
-            // advance even when the handler never consumes its upload.
+            // Drain an untouched request so keep-alive can advance when the handler never reads its upload.
             if (!incoming.readableDidRead && !incoming.destroyed) {
                 incoming.removeAllListeners('data');
                 incoming.resume();
@@ -961,9 +882,7 @@ export class ServerImpl extends NetServer implements Server {
 
         const adapter = new NodeResponseAdapter(response, res, serveHook, requestId, requestUrl, incoming.method === 'HEAD');
 
-        // Node publishes http.server.request.start immediately before the request
-        // listener runs, and http.server.response.finish from the response's
-        // 'finish' handler. Both payloads carry the same four keys.
+        // Both diagnostic-channel payloads carry the same four keys.
         if (onServerRequestStart.hasSubscribers) {
             onServerRequestStart.publish({ request: incoming, response, socket: nodeSocket, server: this });
         }
@@ -1000,8 +919,8 @@ export class ServerImpl extends NetServer implements Server {
 
     private _handleNativeRequestError(err: Error, tcpSock: { socket?: unknown } | undefined): void {
         if (isTransportDisconnectError(err)) return;
-        // H1 marks parse faults with this prefix (structured kind pending).
-        // clientError is the Node-compatible surface for bad request lines.
+        // Parse faults carry this H1 prefix and surface as clientError (the Node-compatible
+        // surface for bad request lines), not as a server 'error'.
         const message = String(err.message ?? err);
         if (message.startsWith('Parse error:')) {
             const transport = tcpSock?.socket;
@@ -1019,17 +938,7 @@ export class ServerImpl extends NetServer implements Server {
     }
 
     private _createNativeServer(hostname: string, port: number | undefined, handler: (req: HttpRequest, res: HttpResponse) => Promise<void>): HttpServer {
-        // maxHeaderSize / maxHeadersCount / maxConnections were accepted here and
-        // never forwarded, so the core server always used its own defaults: an
-        // 8 KB request head sailed through `maxHeaderSize: 2048` with 200 OK
-        // while node answered 431, and `server.maxConnections = 1` served a
-        // second concurrent connection that node reset. The enforcement paths
-        // are live in the core server (http/src/h1.ts:484 for the size,
-        // http/src/server.ts:199 for the connection count) — a 20 KB head is
-        // refused at the hardcoded 16384 default — so only the plumbing was
-        // missing. maxConnections is inherited from net.Server, which applies it
-        // itself on its own accept path (cno/src/node/net/mod.ts:1319); this is
-        // the native-HTTP equivalent.
+        // These limits are enforced by the core only if forwarded here (docs/node-internals.md#http-core-limits).
         const configuredMaxConnections = (this as unknown as { maxConnections?: number }).maxConnections;
         return createHttpServer(handler, {
             port: port ?? 0,
@@ -1044,9 +953,7 @@ export class ServerImpl extends NetServer implements Server {
             ...(typeof this._options.maxHeaderSize === 'number' && this._options.maxHeaderSize > 0
                 ? { maxHeaderSize: this._options.maxHeaderSize }
                 : {}),
-            // Node leaves maxHeadersCount null by default and does not itself
-            // enforce it (measured: 200 headers still got 200 OK on v24.18), so
-            // only forward a value the caller explicitly set.
+            // Forward only an explicitly set value: Node does not enforce maxHeadersCount itself.
             ...(typeof this.maxHeadersCount === 'number' && this.maxHeadersCount > 0
                 ? { maxHeadersCount: this.maxHeadersCount }
                 : {}),
@@ -1097,8 +1004,7 @@ export class ServerImpl extends NetServer implements Server {
             return this;
         }
 
-        // Node marks the public listening state false as soon as close starts;
-        // the callback/event still wait for active HTTP requests to drain.
+        // Node flips `listening` false at once; the callback/event still wait for requests to drain.
         this.listening = false;
         const core = this._httpServer;
         const gracefulClose = core ? Reflect.get(core, 'closeGracefully') : null;
@@ -1110,8 +1016,7 @@ export class ServerImpl extends NetServer implements Server {
         if (typeof gracefulClose === 'function') {
             this._httpClosePromise = invoke(gracefulClose);
         } else if (typeof forceClose === 'function' && this._httpActiveSockets.size > 0) {
-            // Older embedded cores expose only shutdown(). Defer that destructive
-            // operation until the facade's active request set has drained.
+            // Only shutdown() exists: defer that destructive call until the active set drains.
             const listener = core ? Reflect.get(core, 'listener') : null;
             const stopAccepting = listener && Reflect.get(listener, 'close');
             if (typeof stopAccepting === 'function') {
@@ -1132,9 +1037,7 @@ export class ServerImpl extends NetServer implements Server {
             this.listening = false;
             const callbacks = this._httpCloseCallbacks.splice(0);
             this._httpClosePromise = null;
-            // The native HTTP server owns the listener; this facade never calls
-            // net.Server.listen(), so delegating to super.close() would run the
-            // unrelated net.Server close state machine a second time.
+            // Never delegate to super.close(): that would run net.Server's close state machine again.
             this.emit('close');
             for (const cb of callbacks) cb();
         }, (err: unknown) => {
@@ -1160,11 +1063,7 @@ export function createServer(options: ServerOptions | RequestListener, requestLi
     return new ServerImpl(options, requestListener);
 }
 
-/**
- * Node's `ERR_INVALID_HTTP_TOKEN` / `ERR_INVALID_CHAR` / `ERR_UNESCAPED_CHARACTERS`.
- * cno threw bare TypeErrors with no `code`, so the documented way to branch on
- * these failures (`if (err.code === 'ERR_INVALID_CHAR')`) never matched.
- */
+/** Carries Node's error `code`s so `err.code === 'ERR_INVALID_CHAR'` branching works. */
 function httpValidationError(code: string, message: string): TypeError & { code: string } {
     return Object.assign(new TypeError(message), { code });
 }
@@ -1186,30 +1085,14 @@ export function validateHeaderValue(name: string, value: string): void {
     }
 }
 
-/**
- * Reject a non-token method before it can reach the wire.
- *
- * cno performed no method validation at all, so `http.request({method:'BAD
- * METHOD'})` serialised `BAD METHOD /x HTTP/1.1` and sent it — OBSERVED on a raw
- * sink in /d/tmp/ag-http/p2-inject.js, where node throws
- * ERR_INVALID_HTTP_TOKEN synchronously. A malformed request line is exactly the
- * input that makes a peer and an intermediary disagree about where the method
- * ends, so being more permissive than node here is the wrong direction.
- */
+/** Synchronous, before serialisation: a malformed request line lets peers split the method differently. */
 export function validateRequestMethod(method: string): void {
     if (typeof method !== 'string' || !HTTP_TOKEN_RE.test(method)) {
         throw httpValidationError('ERR_INVALID_HTTP_TOKEN', `Method must be a valid HTTP token ["${method}"]`);
     }
 }
 
-/**
- * Reject an unescaped path before it can reach the wire.
- *
- * Same story as the method: `path:'/he llo'` went out as
- * `GET /he llo HTTP/1.1`. CRLF in a path *was* already caught, but only
- * asynchronously as a request 'error', so a try/catch around http.request()
- * — which is where node reports it — missed it entirely.
- */
+/** Synchronous, as an issue is reported by http.request(): an async 'error' escapes a try/catch. */
 export function validateRequestPath(path: string): void {
     if (typeof path === 'string' && INVALID_REQUEST_PATH_RE.test(path)) {
         throw httpValidationError('ERR_UNESCAPED_CHARACTERS', 'Request path contains unescaped characters');
