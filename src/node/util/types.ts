@@ -43,41 +43,23 @@ function toStringTag(value: object): unknown {
     }
 }
 
-export function isAnyArrayBuffer(value: unknown): value is ArrayBuffer | SharedArrayBuffer {
-    return engine.isArrayBuffer(value) || hasSharedArrayBufferSlot(value);
-}
+export function isAnyArrayBuffer(value: unknown): value is ArrayBuffer | SharedArrayBuffer { return engine.isArrayBuffer(value) || hasSharedArrayBufferSlot(value); }
 
-export function isArrayBuffer(value: unknown): value is ArrayBuffer {
-    return engine.isArrayBuffer(value);
-}
+export function isArrayBuffer(value: unknown): value is ArrayBuffer { return engine.isArrayBuffer(value); }
 
-export function isArgumentsObject(value: unknown): value is IArguments {
-    return engine.isArgumentsObject(value);
-}
+export function isArgumentsObject(value: unknown): value is IArguments { return engine.isArgumentsObject(value); }
 
-export function isArrayBufferView(value: unknown): value is ArrayBufferView {
-    return hasArrayBufferViewSlot(value);
-}
+export function isArrayBufferView(value: unknown): value is ArrayBufferView { return hasArrayBufferViewSlot(value); }
 
-export function isAsyncFunction(value: unknown): value is (...args: unknown[]) => Promise<unknown> {
-    return engine.isAsyncFunction(value);
-}
+export function isAsyncFunction(value: unknown): value is (...args: unknown[]) => Promise<unknown> { return engine.isAsyncFunction(value); }
 
-export function isBigInt64Array(value: unknown): value is BigInt64Array {
-    return typedArrayTag(value) === 'BigInt64Array';
-}
+export function isBigInt64Array(value: unknown): value is BigInt64Array { return typedArrayTag(value) === 'BigInt64Array'; }
 
-export function isBigUint64Array(value: unknown): value is BigUint64Array {
-    return typedArrayTag(value) === 'BigUint64Array';
-}
+export function isBigUint64Array(value: unknown): value is BigUint64Array { return typedArrayTag(value) === 'BigUint64Array'; }
 
-export function isBooleanObject(value: unknown): value is Boolean {
-    return hasBoxedSlot(value, booleanValueOf);
-}
+export function isBooleanObject(value: unknown): value is Boolean { return hasBoxedSlot(value, booleanValueOf); }
 
-export function isBigIntObject(value: unknown): value is BigInt {
-    return hasBoxedSlot(value, bigintValueOf);
-}
+export function isBigIntObject(value: unknown): value is BigInt { return hasBoxedSlot(value, bigintValueOf); }
 
 export function isBoxedPrimitive(value: unknown): value is Boolean | String | Number | Symbol | BigInt {
     if (value === null || typeof value !== 'object') return false;
@@ -88,97 +70,51 @@ export function isBoxedPrimitive(value: unknown): value is Boolean | String | Nu
         || hasBoxedSlot(value, bigintValueOf);
 }
 
-export function isDataView(value: unknown): value is DataView {
-    return engine.isDataView(value);
-}
+export function isDataView(value: unknown): value is DataView { return engine.isDataView(value); }
 
-export function isDate(value: unknown): value is Date {
-    return engine.isDate(value);
-}
+export function isDate(value: unknown): value is Date { return engine.isDate(value); }
 
-export function isFloat16Array(value: unknown): boolean {
-    return typedArrayTag(value) === 'Float16Array';
-}
+export function isFloat16Array(value: unknown): boolean { return typedArrayTag(value) === 'Float16Array'; }
 
-export function isFloat32Array(value: unknown): value is Float32Array {
-    return typedArrayTag(value) === 'Float32Array';
-}
+export function isFloat32Array(value: unknown): value is Float32Array { return typedArrayTag(value) === 'Float32Array'; }
 
-export function isFloat64Array(value: unknown): value is Float64Array {
-    return typedArrayTag(value) === 'Float64Array';
-}
+export function isFloat64Array(value: unknown): value is Float64Array { return typedArrayTag(value) === 'Float64Array'; }
 
-export function isGeneratorFunction(value: unknown): value is GeneratorFunction {
-    return engine.isGeneratorFunction(value);
-}
+export function isGeneratorFunction(value: unknown): value is GeneratorFunction { return engine.isGeneratorFunction(value); }
 
-export function isGeneratorObject(value: unknown): value is Generator {
-    return engine.isGeneratorObject(value);
-}
+export function isGeneratorObject(value: unknown): value is Generator { return engine.isGeneratorObject(value); }
 
-export function isInt8Array(value: unknown): value is Int8Array {
-    return typedArrayTag(value) === 'Int8Array';
-}
+export function isInt8Array(value: unknown): value is Int8Array { return typedArrayTag(value) === 'Int8Array'; }
 
-export function isInt16Array(value: unknown): value is Int16Array {
-    return typedArrayTag(value) === 'Int16Array';
-}
+export function isInt16Array(value: unknown): value is Int16Array { return typedArrayTag(value) === 'Int16Array'; }
 
-export function isInt32Array(value: unknown): value is Int32Array {
-    return typedArrayTag(value) === 'Int32Array';
-}
+export function isInt32Array(value: unknown): value is Int32Array { return typedArrayTag(value) === 'Int32Array'; }
 
-export function isMap(value: unknown): value is Map<unknown, unknown> {
-    return engine.isMap(value);
-}
+export function isMap(value: unknown): value is Map<unknown, unknown> { return engine.isMap(value); }
 
-export function isMapIterator(value: unknown): boolean {
-    return engine.isMapIterator(value);
-}
+export function isMapIterator(value: unknown): boolean { return engine.isMapIterator(value); }
 
-export function isModuleNamespaceObject(value: unknown): boolean {
-    return engine.isModuleNamespaceObject(value);
-}
+export function isModuleNamespaceObject(value: unknown): boolean { return engine.isModuleNamespaceObject(value); }
 
-export function isNativeError(value: unknown): value is Error {
-    return engine.isError(value);
-}
+export function isNativeError(value: unknown): value is Error { return engine.isError(value); }
 
-export function isNumberObject(value: unknown): value is Number {
-    return hasBoxedSlot(value, numberValueOf);
-}
+export function isNumberObject(value: unknown): value is Number { return hasBoxedSlot(value, numberValueOf); }
 
-export function isPromise(value: unknown): value is Promise<unknown> {
-    return engine.isPromise(value);
-}
+export function isPromise(value: unknown): value is Promise<unknown> { return engine.isPromise(value); }
 
-export function isProxy(value: unknown): boolean {
-    return engine.isProxy(value);
-}
+export function isProxy(value: unknown): boolean { return engine.isProxy(value); }
 
-export function isRegExp(value: unknown): value is RegExp {
-    return engine.isRegExp(value);
-}
+export function isRegExp(value: unknown): value is RegExp { return engine.isRegExp(value); }
 
-export function isSet(value: unknown): value is Set<unknown> {
-    return engine.isSet(value);
-}
+export function isSet(value: unknown): value is Set<unknown> { return engine.isSet(value); }
 
-export function isSetIterator(value: unknown): boolean {
-    return engine.isSetIterator(value);
-}
+export function isSetIterator(value: unknown): boolean { return engine.isSetIterator(value); }
 
-export function isSharedArrayBuffer(value: unknown): value is SharedArrayBuffer {
-    return hasSharedArrayBufferSlot(value);
-}
+export function isSharedArrayBuffer(value: unknown): value is SharedArrayBuffer { return hasSharedArrayBufferSlot(value); }
 
-export function isStringObject(value: unknown): value is String {
-    return hasBoxedSlot(value, stringValueOf);
-}
+export function isStringObject(value: unknown): value is String { return hasBoxedSlot(value, stringValueOf); }
 
-export function isSymbolObject(value: unknown): value is object {
-    return hasBoxedSlot(value, symbolValueOf);
-}
+export function isSymbolObject(value: unknown): value is object { return hasBoxedSlot(value, symbolValueOf); }
 
 /** NodeJS.TypedArray is not declared in this build's type env; spell it out. */
 type TypedArrayLike =
@@ -188,33 +124,19 @@ type TypedArrayLike =
     | Float32Array | Float64Array
     | BigInt64Array | BigUint64Array;
 
-export function isTypedArray(value: unknown): value is TypedArrayLike {
-    return typedArrayTag(value) !== undefined;
-}
+export function isTypedArray(value: unknown): value is TypedArrayLike { return typedArrayTag(value) !== undefined; }
 
-export function isUint8Array(value: unknown): value is Uint8Array {
-    return typedArrayTag(value) === 'Uint8Array';
-}
+export function isUint8Array(value: unknown): value is Uint8Array { return typedArrayTag(value) === 'Uint8Array'; }
 
-export function isUint8ClampedArray(value: unknown): value is Uint8ClampedArray {
-    return typedArrayTag(value) === 'Uint8ClampedArray';
-}
+export function isUint8ClampedArray(value: unknown): value is Uint8ClampedArray { return typedArrayTag(value) === 'Uint8ClampedArray'; }
 
-export function isUint16Array(value: unknown): value is Uint16Array {
-    return typedArrayTag(value) === 'Uint16Array';
-}
+export function isUint16Array(value: unknown): value is Uint16Array { return typedArrayTag(value) === 'Uint16Array'; }
 
-export function isUint32Array(value: unknown): value is Uint32Array {
-    return typedArrayTag(value) === 'Uint32Array';
-}
+export function isUint32Array(value: unknown): value is Uint32Array { return typedArrayTag(value) === 'Uint32Array'; }
 
-export function isWeakMap(value: unknown): value is WeakMap<object, unknown> {
-    return engine.isWeakMap(value);
-}
+export function isWeakMap(value: unknown): value is WeakMap<object, unknown> { return engine.isWeakMap(value); }
 
-export function isWeakSet(value: unknown): value is WeakSet<object> {
-    return engine.isWeakSet(value);
-}
+export function isWeakSet(value: unknown): value is WeakSet<object> { return engine.isWeakSet(value); }
 
 /**
  * Node returns true only for a native `napi_external`. Nothing reachable from

@@ -15,9 +15,9 @@ const CRLF = new Uint8Array([0x0D, 0x0A]);
 
 type HttpStreamMessage = CNO.HttpRequestMessage | CNO.HttpResponseMessage;
 
+// View over the parser's buffer, never a copy: the parser reuses it between events.
 function toByteView(buf: CModuleHTTP.BufferSource): Uint8Array {
-    if (buf instanceof ArrayBuffer) return new Uint8Array(buf);
-    return new Uint8Array(new globalThis.Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength));
+    return buf instanceof ArrayBuffer ? new Uint8Array(buf) : new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
 }
 
 const decode = (buf: CModuleHTTP.BufferSource, off: number, len: number): string =>
@@ -39,9 +39,7 @@ function concat(...parts: Uint8Array[]): Uint8Array {
     return algorithm.bytesConcat(parts);
 }
 
-function encode(s: string): Uint8Array {
-    return engine.encodeString(s);
-}
+const encode = engine.encodeString;
 
 // Low-level: event-driven parser
 
@@ -58,24 +56,25 @@ class LLHttpParser implements CNO.HttpParser {
     }
 
     #wire(): void {
-        const onUrl = this.#events.onUrl;
-        if (onUrl) this.#parser.onUrl = (buf, off, len) => { onUrl(decode(buf, off, len)); };
-        const onStatus = this.#events.onStatus;
-        if (onStatus) this.#parser.onStatus = (buf, off, len) => { onStatus(decode(buf, off, len)); };
-        const onHeaderField = this.#events.onHeaderField;
-        if (onHeaderField) this.#parser.onHeaderField = (buf, off, len) => { onHeaderField(decode(buf, off, len)); };
-        const onHeaderValue = this.#events.onHeaderValue;
-        if (onHeaderValue) this.#parser.onHeaderValue = (buf, off, len) => { onHeaderValue(decode(buf, off, len)); };
-        const onHeadersComplete = this.#events.onHeadersComplete;
-        if (onHeadersComplete) this.#parser.onHeadersComplete = () => { onHeadersComplete(mapState(this.#parser.state, this.#type)); };
-        const onBody = this.#events.onBody;
-        if (onBody) this.#parser.onBody = (buf, off, len) => { onBody(toByteView(buf).slice(off, off + len)); };
-        const onMessageComplete = this.#events.onMessageComplete;
-        if (onMessageComplete) this.#parser.onMessageComplete = () => { onMessageComplete(); };
-        const onChunkHeader = this.#events.onChunkHeader;
-        if (onChunkHeader) this.#parser.onChunkHeader = () => { onChunkHeader(0); };
-        const onChunkComplete = this.#events.onChunkComplete;
-        if (onChunkComplete) this.#parser.onChunkComplete = () => { onChunkComplete(); };
+        const p = this.#parser;
+        const e = this.#events;
+        // llhttp hands out slices of its own buffer: text events get decoded,
+        // body events get an owned copy (the buffer is reused after the event).
+        const text = (key: 'onUrl' | 'onStatus' | 'onHeaderField' | 'onHeaderValue') => {
+            const handler = e[key];
+            if (handler) p[key] = (buf, off, len) => { handler(decode(buf, off, len)); };
+        };
+        text('onUrl');
+        text('onStatus');
+        text('onHeaderField');
+        text('onHeaderValue');
+
+        const { onHeadersComplete, onBody, onMessageComplete, onChunkHeader, onChunkComplete } = e;
+        if (onHeadersComplete) p.onHeadersComplete = () => { onHeadersComplete(mapState(p.state, this.#type)); };
+        if (onBody) p.onBody = (buf, off, len) => { onBody(toByteView(buf).slice(off, off + len)); };
+        if (onMessageComplete) p.onMessageComplete = () => { onMessageComplete(); };
+        if (onChunkHeader) p.onChunkHeader = () => { onChunkHeader(0); }; // llhttp gives no chunk length
+        if (onChunkComplete) p.onChunkComplete = () => { onChunkComplete(); };
     }
 
     execute(data: Uint8Array | ArrayBuffer): CNO.HttpParserResult {
