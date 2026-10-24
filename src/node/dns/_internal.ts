@@ -388,11 +388,22 @@ export function normalizeServers(servers: unknown): string[] {
     return servers.map(normalizeServer);
 }
 
-let defaultServers = (dns as any).__default_dnssrv as string[];
+let defaultServers: string[] | undefined;
 let defaultResultOrder: DefaultResultOrder = 'verbatim';
 
+function readSystemServers(): string[] {
+    const servers: unknown = Reflect.get(dns, '__default_dnssrv');
+    return Array.isArray(servers) ? [...servers] : [];
+}
+
 export function getDefaultServers(): string[] {
+    defaultServers ??= readSystemServers();
     return [...defaultServers];
+}
+
+// Capture explicit defaults now; defer system discovery until the resolver is used.
+export function snapshotDefaultServers(): string[] | undefined {
+    return defaultServers && [...defaultServers];
 }
 
 export function setDefaultServers(servers: unknown): void {
@@ -511,7 +522,7 @@ export function queryDns(
     options?: number | ResolverOptions,
 ): AbortableDnsQuery {
     validateHostname(hostname);
-    const endpoints = (servers.length > 0 ? servers : defaultServers).map(parseServer);
+    const endpoints = (servers.length > 0 ? servers : getDefaultServers()).map(parseServer);
     const config = normalizeQueryOptions(options);
     const syscall = dnsSyscall(rrtype);
     let settled = false;
@@ -743,15 +754,15 @@ export function normalizeResolverOptions(options: unknown): NormalizedResolverOp
 
 export class ResolverQuery {
     private readonly pending = new Set<AbortableDnsQuery>();
-    private servers: string[];
+    private servers: string[] | undefined;
     private localAddressV4?: string;
     private localAddressV6?: string;
     readonly timeout: number;
     readonly tries: number;
     readonly maxTimeout: number;
 
-    constructor(servers: readonly string[], options?: ResolverOptions) {
-        this.servers = [...servers];
+    constructor(servers: readonly string[] | undefined, options?: ResolverOptions) {
+        this.servers = servers && [...servers];
         const normalized = normalizeResolverOptions(options);
         this.timeout = normalized.timeout;
         this.tries = normalized.tries;
@@ -759,6 +770,7 @@ export class ResolverQuery {
     }
 
     getServers(): string[] {
+        this.servers ??= readSystemServers();
         return [...this.servers];
     }
 
@@ -786,7 +798,7 @@ export class ResolverQuery {
     }
 
     query(hostname: string, rrtype: Rrtype): AbortableDnsQuery {
-        const request = queryDns(hostname, rrtype, this.servers, {
+        const request = queryDns(hostname, rrtype, this.getServers(), {
             timeout: this.timeout,
             tries: this.tries,
             maxTimeout: this.maxTimeout,

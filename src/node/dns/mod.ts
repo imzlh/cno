@@ -21,6 +21,7 @@ import {
     getAddressFamily,
     getDefaultLookupOrder,
     getDefaultServers,
+    snapshotDefaultServers,
     isAddressAnswer,
     normalizeLookupError,
     normalizeLookupOptions,
@@ -403,7 +404,7 @@ export class Resolver {
     private readonly resolver: ResolverQuery;
 
     constructor(options?: ResolverOptions) {
-        this.resolver = new ResolverQuery(getDefaultServers(), options);
+        this.resolver = new ResolverQuery(snapshotDefaultServers(), options);
     }
 
     cancel(): void {

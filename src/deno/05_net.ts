@@ -1064,8 +1064,6 @@ const denoNetNs = {
             port = opt.nameServer.port;
             if (port !== undefined && (port <= 0 || port > 65535))
                 throw new RangeError('Invalid DNS nameServer port');
-        } else {
-            server = systemDnsServers()[0];
         }
 
         const typeMap: Record<string, number> = {
@@ -1102,6 +1100,8 @@ const denoNetNs = {
                 throw cause;
             }
         }
+
+        if (!opt?.nameServer) server = systemDnsServers()[0];
 
         let info: CModuleDNS.DNSAnswer[];
         try {

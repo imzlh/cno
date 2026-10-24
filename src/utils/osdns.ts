@@ -65,5 +65,8 @@ export function systemDnsServers(): string[] {
     return systemDnsServersCache;
 }
 
-// inject default DNS to node polyfill
-Reflect.set(dns, '__default_dnssrv', systemDnsServers());
+// Share defaults with Node without reading system settings during bootstrap.
+Object.defineProperty(dns, '__default_dnssrv', {
+    get: systemDnsServers,
+    configurable: true,
+});
