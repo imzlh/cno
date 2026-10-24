@@ -8,6 +8,8 @@ import { DOMException, EventTarget } from '../events';
 import { LockManager } from '../lock';
 
 const os = import.meta.use('os');
+
+// Held by the prototype getter; one instance per realm.
 const _lockManager = new LockManager();
 
 type ClipboardWriteItem = unknown;
@@ -232,7 +234,12 @@ class NavigatorImpl implements ImplementedNavigator {
     }
 }
 
-const navigator = new NavigatorImpl();
+// Built on first read: the constructor runs os.uname()/networkInterfaces() and allocates
+// several sub-objects that most short scripts never touch.
+let _navigator: NavigatorImpl | undefined;
+function getNavigator(): NavigatorImpl {
+    return _navigator ??= new NavigatorImpl();
+}
 
 function NavigatorCtor(): never {
     throw new TypeError('Illegal constructor');
@@ -245,8 +252,7 @@ function NavigatorUADataCtor(): never {
 NavigatorUADataCtor.prototype = NavigatorUADataImpl.prototype;
 
 Object.defineProperty(globalThis, 'navigator', {
-    value: navigator,
-    writable: false,
+    get: getNavigator,
     enumerable: true,
     configurable: true,
 });

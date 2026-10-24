@@ -1,3 +1,5 @@
+import { getEnv } from '../../utils/env';
+
 const os = import.meta.use('os');
 const engine = import.meta.use('engine');
 
@@ -50,7 +52,7 @@ function getUserAgent(): string {
 }
 
 function getLanguage(): string {
-    const lang = os.getenv('LANG') || os.getenv('LC_ALL') || os.getenv('LC_MESSAGES');
+    const lang = getEnv('LANG') || getEnv('LC_ALL') || getEnv('LC_MESSAGES');
     if (lang) {
         const match = lang.match(/^([a-z]{2}_[A-Z]{2})/);
         if (match) {

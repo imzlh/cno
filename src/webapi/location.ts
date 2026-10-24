@@ -1,4 +1,5 @@
 import { DOMException } from './events';
+import { getEnv } from '../utils/env';
 
 const os = import.meta.use('os');
 
@@ -90,7 +91,7 @@ function installLocation(url: string | undefined): void {
     });
 }
 
-installLocation(os.getenv('CNO_LOCATION'));
+installLocation(getEnv('CNO_LOCATION'));
 
 function normalizeLocationUrl(raw: string): string {
     try {

@@ -3,7 +3,10 @@
  * Consolidates duplicate concatChunks implementations.
  */
 
+import { withCode } from './errors';
+
 const algorithm = import.meta.use('algorithm');
+const engine = import.meta.use('engine');
 
 export function toOwnedBytes(bytes: Uint8Array): Uint8Array<ArrayBuffer> {
     const buffer = new ArrayBuffer(bytes.byteLength);
@@ -43,7 +46,6 @@ export function viewToUint8Array(view: ArrayBufferView): Uint8Array<ArrayBuffer>
     return copy;
 }
 
-const engine = import.meta.use('engine');
 
 /**
  * WHATWG UTF-8 decode with U+FFFD replacement.
@@ -59,64 +61,109 @@ const engine = import.meta.use('engine');
  * per-byte scan.
  */
 export function utf8DecodeReplace(bytes: Uint8Array): string {
-    if (algorithm.bytesIsUtf8(bytes)) return engine.decodeString(bytes);
+    if (algorithm.bytesIsUtf8(bytes)) return engineDecode(bytes);
+    return replaceMalformed(bytes);
+}
 
-    const out: string[] = [];
-    let codepoint = 0;
-    let needed = 0;
-    let seen = 0;
-    let lower = 0x80;
-    let upper = 0xbf;
+/**
+ * `engine.decodeString` returns a bare `0` when it cannot allocate its result.
+ * Exposing that as `undefined` made a failed decode look like an empty string
+ * to callers; throw the error Node's own `'buffer'.toString` would.
+ */
+function engineDecode(bytes: Uint8Array): string {
+    const out = engine.decodeString(bytes);
+    if (typeof out !== 'string') throw withCode(new RangeError('Invalid string length'), 'ERR_STRING_TOO_LONG');
+    return out;
+}
 
-    for (let i = 0; i < bytes.length; i++) {
-        const byte = bytes[i]!;
-        if (needed === 0) {
-            if (byte <= 0x7f) {
-                out.push(String.fromCharCode(byte));
-            } else if (byte >= 0xc2 && byte <= 0xdf) {
-                needed = 1;
-                codepoint = byte & 0x1f;
-            } else if (byte >= 0xe0 && byte <= 0xef) {
-                if (byte === 0xe0) lower = 0xa0;
-                else if (byte === 0xed) upper = 0x9f;
-                needed = 2;
-                codepoint = byte & 0x0f;
-            } else if (byte >= 0xf0 && byte <= 0xf4) {
-                if (byte === 0xf0) lower = 0x90;
-                else if (byte === 0xf4) upper = 0x8f;
-                needed = 3;
-                codepoint = byte & 0x07;
-            } else {
-                out.push('�');
+// The old decoder handled EVERY byte in JS and pushed one string per byte, so
+// one malformed sequence cost ~10ms more for every byte after it (9.7s on 1MB
+// of "A" + 0xE9, 750k bytes in 15625 runs). Segments fix the part that was
+// quadratic in the input: a well-formed run is one native decode, and only the
+// maximal invalid subpart at a fault is written out here. The fault SCAN is
+// still linear in the text between faults (a JS step is ~3us however it is
+// done -- a byte read or a one-position regex alike), so the bill is roughly
+// "3us per well-formed sequence between faults + 12us per fault" instead of
+// "11us per byte".
+//
+// A stray continuation byte and a truncated tail are one U+FFFD. A lead with
+// one or more valid continuations is maximal over (lead, second): the valid
+// scalars keep their native decoding, and the lead and the byte that ended the
+// sequence are each a U+FFFD -- the same shape Node builds.
+function replaceMalformed(bytes: Uint8Array): string {
+    let out = '';
+    let start = 0;
+    let at = -1;
+    for (;;) {
+        at = nextFault(bytes, start);
+        if (at < 0) break;
+        if (at > start) out += engineDecode(bytes.subarray(start, at));
+        const lead = bytes[at];
+        if (lead >= 0xc2 && lead <= 0xf4) {
+            // A valid lead swallows its continuation bytes into ONE U+FFFD:
+            // `e4 bd` is one replacement. A UTF-16 surrogate encoding (`ed a0`)
+            // is structurally invalid, so Node replaces those bytes one by one.
+            const need = lead < 0xe0 ? 1 : lead < 0xf0 ? 2 : 3;
+            if (lead === 0xed && at + 1 < bytes.length && bytes[at + 1] >= 0xa0) {
+                out += '�';
+                start = at + 1;
+                continue;
             }
-            continue;
-        }
-        if (byte < lower || byte > upper) {
-            // One replacement char for the maximal subpart, then reprocess
-            // this byte as a fresh sequence start.
-            codepoint = 0;
-            needed = 0;
-            seen = 0;
-            lower = 0x80;
-            upper = 0xbf;
-            out.push('�');
-            i--;
-            continue;
-        }
-        lower = 0x80;
-        upper = 0xbf;
-        codepoint = (codepoint << 6) | (byte & 0x3f);
-        if (++seen === needed) {
-            out.push(String.fromCodePoint(codepoint));
-            codepoint = 0;
-            needed = 0;
-            seen = 0;
+            let consumed = 0;
+            while (consumed < need && at + 1 + consumed < bytes.length) {
+                const next = bytes[at + 1 + consumed];
+                if (next < 0x80 || next > 0xbf) break;
+                consumed++;
+            }
+            out += '�';
+            start = at + consumed + 1;
+        } else {
+            out += '�';
+            start = at + 1;
         }
     }
-    // A sequence still open at the end of input is an error.
-    if (needed !== 0) out.push('�');
-    return out.join('');
+    if (start < bytes.length) out += engineDecode(bytes.subarray(start));
+    return out;
 }
+
+/**
+ * Offset of the first byte that begins an ill-formed sequence at or after
+ * `from`, or -1.
+ *
+ * One JS step is ~3us per position here, so this is the minimal byte-wise
+ * scan: only called once `bytesIsUtf8` has proved the input is not all ASCII,
+ * it stops at the first stray continuation byte or overlong lead instead of
+ * validating further, and skips over each valid multi-byte sequence.
+ */
+function nextFault(bytes: Uint8Array, from: number): number {
+    let at = firstNonAscii(bytes, from);
+    const len = bytes.length;
+    while (at >= 0) {
+        const lead = bytes[at];
+        if (lead < 0xc2) return at;
+        const need = lead < 0xe0 ? 1 : lead < 0xf0 ? 2 : lead < 0xf5 ? 3 : -1;
+        if (need < 0 || at + need >= len) return at;
+        const p1 = bytes[at + 1];
+        const lo = lead === 0xe0 ? 0xa0 : lead === 0xf0 ? 0x90 : 0x80;
+        const hi = lead === 0xed ? 0x9f : lead === 0xf4 ? 0x8f : 0xbf;
+        if (p1 < lo || p1 > hi) return at;
+        const p2 = need > 1 ? bytes[at + 2] : 0;
+        const p3 = need > 2 ? bytes[at + 3] : 0;
+        if (need > 1 && (p2 < 0x80 || p2 > 0xbf)) return at;
+        if (need > 2 && (p3 < 0x80 || p3 > 0xbf)) return at;
+        at = firstNonAscii(bytes, at + need + 1);
+    }
+    return -1;
+}
+
+function firstNonAscii(bytes: Uint8Array, from: number): number {
+    for (let i = from; i < bytes.length; i++) {
+        const c = bytes[i];
+        if (c >= 0x80) return i;
+    }
+    return -1;
+}
+
 
 /**
  * Node narrows every UTF-16 code unit to its low 8 bits before decoding `hex`
