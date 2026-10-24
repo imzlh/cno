@@ -13,7 +13,9 @@ const nativeDns = import.meta.use('dns');
 import type { EventEmitter } from '../events';
 import { normalizeErrnoError } from '../_internal/errno';
 export { flattenPrototype } from '../_internal/prototype';
-import type { Server, Socket, TcpNetConnectOpts, UpgradeHandle } from './types';
+import type { Server, Socket, TcpNetConnectOpts } from './types';
+
+export { closeQuietly } from '../_internal/close';
 
 export function normalizeTcpHost(host: string): string {
     if (!host || host === '*') return '0.0.0.0';
@@ -57,18 +59,6 @@ export function setTcpKeepAlive(tcp: CModuleStreams.TCP, enabled: boolean, delay
 /* Destroy paths must finish cleaning up even when a handle is already closed. */
 export function stopPipeReadQuietly(pipe: CModuleStreams.Pipe): void {
     try { pipe.stopRead(); } catch { /* best-effort */ }
-}
-
-export function closeTcpQuietly(tcp: CModuleStreams.TCP): void {
-    try { tcp.close(); } catch { /* best-effort */ }
-}
-
-export function closePipeQuietly(pipe: CModuleStreams.Pipe): void {
-    try { pipe.close(); } catch { /* best-effort */ }
-}
-
-export function closeUpgradeHandleQuietly(handle: UpgradeHandle): void {
-    try { handle.close(); } catch { /* best-effort */ }
 }
 
 /**

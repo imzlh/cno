@@ -1,28 +1,5 @@
-/**
- * Node.js crypto module — public surface.
- *
- * This file is a facade: the implementation lives in the sibling modules listed
- * below, and the export list here IS the public API. It is deliberately spelled
- * out name by name rather than using `export *`, because the submodules also
- * export internals to each other (error factories, mode tables, key encoders)
- * and `export *` would silently publish those as `node:crypto` exports.
- *
- *   errors.ts        error factories + argument validation
- *   curves.ts        EC curve name resolution
- *   helpers.ts       byte/encoding helpers, key format probes, DER<->P1363
- *   keys.ts          KeyObject, createPrivateKey/createPublicKey/createSecretKey
- *   keygen.ts        generateKeyPair(Sync), RFC 8410 PKCS#8 builder
- *   sigcodec.ts      ECDSA signature re-encoding (dsaEncoding)
- *   digest.ts        Hash / Hmac
- *   cipher-modes.ts  ECB/CBC native tables + incremental cores
- *   cipher.ts        createCipheriv / createDecipheriv, GCM, one-shot AES
- *   sign.ts          createSign / createVerify, one-shot sign / verify
- *   ec.ts            ECDSA, ECDH, diffieHellman
- *   rsa.ts           RSA-OAEP, RSA-PSS
- *   random.ts        randomBytes, randomFill, pbkdf2, scrypt, hkdf, timingSafeEqual
- *   misc.ts          encodings, padding constants, algorithm enumeration
- *   webcrypto.ts     webcrypto / subtle
- */
+// Spelled out name by name rather than `export *`: submodules also export
+// internals to each other.
 
 export type { BinaryInput, KeyInput, KeyWithOptions, KeyExportOptions, SecretJwk, AsymmetricKeyType, Hash, Hmac, Cipheriv, Decipheriv, CipherGCM, DecipherGCM, GcmEncryptResult, GcmDecryptResult, CipherInfo, Sign, Verify } from './types';
 export type { ScryptOptions } from './random';

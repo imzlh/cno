@@ -1,15 +1,6 @@
-/**
- * node:stream — every interface and type used across the split.
- *
- * Type-only: this file has no runtime side effects and imports nothing but
- * types, which is what keeps the dependency graph a DAG. The six *shape*
- * interfaces here (Stream/Readable/Writable/Duplex/Transform/PassThrough) are
- * internal: each impl file re-declares the public name as
- * `export interface X extends XShape {}` next to its `export const X`, so the
- * merged type+value pair that mod.ts publishes stays one name with two meanings
- * exactly as it was before the split. Re-exporting these shapes from mod.ts
- * would be a duplicate identifier.
- */
+// Type-only, which keeps the dependency graph a DAG. The *Shape* interfaces here
+// are internal: each impl file merges `interface X extends XShape` with its
+// `export const X`; re-exporting these shapes from mod.ts would collide.
 
 import type { EventEmitter } from '../events';
 import type { StringDecoder } from '../string_decoder';

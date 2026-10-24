@@ -273,9 +273,8 @@ export function trackBodyStream(stream: BodyStream, markUsed: () => void): BodyS
 }
 
 /**
- * tee() uses the public getReader, so clone() temporarily bypasses tracking and
- * then tracks each branch separately. Patch the real stream to retain its private
- * fields; restore its descriptor even when tee() throws on a locked stream.
+ * tee() goes through the public getReader, so clone() bypasses tracking and
+ * tracks each branch. Restore the descriptor even when tee() throws.
  */
 export function teeUntracked(stream: BodyStream): [BodyStream, BodyStream] {
     const raw = rawBodyGetReaders.get(stream);

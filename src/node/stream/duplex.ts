@@ -1,12 +1,5 @@
-/**
- * node:stream Duplex.
- *
- * Imports ./writable because Duplex.prototype's prototype IS Writable.prototype
- * (and initDuplex calls Writable), and ./readable for one reverse edge: the
- * Symbol.asyncIterator implementation is shared by reference with Readable's,
- * copied here after every prototype method is in place and before this file's
- * flattenPrototype() call, exactly as the single-file version did.
- */
+// Duplex.prototype's prototype IS Writable.prototype. Symbol.asyncIterator is
+// shared by reference with Readable's before flattenPrototype() runs.
 
 import { Writable } from './writable';
 import { Readable } from './readable';

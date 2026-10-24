@@ -1,26 +1,5 @@
-/**
- * Node.js zlib module — public surface.
- * Based on CModuleZLib implementation
- *
- * This file is a facade: the implementation lives in the sibling modules listed
- * below, and the export list here IS the public API. It is spelled out name by
- * name rather than using `export *`, because the submodules also export
- * internals to each other (error factories, byte probes, prototype helpers, the
- * stream-state WeakMap) and `export *` would publish those as `node:zlib`
- * exports.
- *
- *   constants.ts  native flush/level/strategy values, `constants`, `codes`;
- *                 error factories, Node's `Received ...`/ERR_OUT_OF_RANGE
- *                 forms; option and input validation, byte probes,
- *                 VALID_FLUSH_FLAGS
- *   streams.ts    the 7 zlib Transform classes + the zlibStreamStates WeakMap
- *   sync.ts       one-shot *Sync helpers and their callback wrappers
- *   brotli.ts     Brotli one-shots, streams + the brotliStreamStates WeakMap
- *
- * Import order below mirrors the original single-file evaluation order
- * (constants, then streams/sync, then brotli), so side effects such as the
- * prototype flattening in `streams.ts` still run at the same point.
- */
+// Spelled out rather than `export *`: submodules export internals to each other.
+// Import order matters: streams.ts flattens prototypes as a side effect.
 
 export {
     // Compression Levels

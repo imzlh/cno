@@ -117,24 +117,8 @@ function mapBindError(e: Error): Error | null {
 
 /**
  * Give a native error Node's `node:sqlite` shape: enumerable `code`, `errcode`
- * and `errstr`, matching Node's own enumerable key set exactly.
- *
- * DIVERGENCE: Node's `errcode` is the *extended* result code (2067 for a UNIQUE
- * violation, 1299 for NOT NULL, 275 for CHECK, 787 for FOREIGN KEY) and its
- * `message` is sqlite3_errmsg (`UNIQUE constraint failed: u.k`). The binding
- * only surfaces the primary code (19 for every one of those) and sqlite3_errstr
- * (`constraint failed` for every one of those), so all five distinguishable
- * constraint failures collapse into one indistinguishable error. Closing that
- * needs sqlite3_extended_errcode + sqlite3_errmsg in mod_sqlite3.c — it cannot
- * be done here, because neither value is reachable from JS and `errstr` is the
- * same string for all five, so there is nothing to derive the distinction from.
- * `code` — the part callers actually branch on — is exact.
- *
- * `errstr` is read from the binding when present and falls back to `message`
- * otherwise. That fallback is today's only path (the binding sets no `errstr`),
- * and it keeps `errstr` *enumerable* either way: defining it only-when-absent
- * would silently drop it out of Object.keys the moment the binding starts
- * reporting it separately, breaking the key set this function exists to match.
+ * and `errstr`. DIVERGENCE: `errcode` is only the primary code, not the
+ * extended result code; `code` is exact.
  */
 function sqliteError(e: unknown): unknown {
     if (!(e instanceof Error)) return e;
@@ -266,11 +250,9 @@ export class StatementSync {
     constructor(private readonly db: DatabaseSync, private readonly stmt: Sqlite3Stmt, readonly sourceSQL = '') {}
 
     /**
-     * Node finalizes every outstanding statement when the database closes, so
-     * any later use reports ERR_INVALID_STATE. The native binding here does not
-     * finalize on close and the sqlite3_stmt keeps returning its cached rows, so
-     * without this guard a statement outlives its database and reads memory the
-     * connection no longer owns. Check before touching the native handle.
+     * Node finalizes outstanding statements on close (later use is
+     * ERR_INVALID_STATE); the native binding does not, and a stale stmt keeps
+     * returning cached rows from a connection that no longer owns them.
      */
     private assertUsable(): void {
         if (!this.db.isOpen) {
@@ -323,15 +305,10 @@ export class StatementSync {
 
     columns(): StatementColumnMetadata[] {
         this.assertUsable();
-        // Metadata must never execute the statement: deriving it via this.get()
-        // stepped the statement, so `prepare('DELETE FROM t').columns()` deleted
-        // every row. Three paths, best first:
-        //   1. native `columnMetadata()` -- Node's full five-key shape.
-        //   2. native `columnNames()` -- names only; the other four fields are
-        //      not derivable from a name and must NOT be guessed from the SQL.
-        //   3. no native accessor -- a non-stepping fallback (see below).
-        // Paths 2 and 3 exist because a binary without the newer natives must
-        // degrade rather than throw "TypeError: not a function".
+        // Metadata must never step the statement (doing so made
+        // `prepare('DELETE ...').columns()` delete every row). Prefer native
+        // columnMetadata(), then columnNames() (names only; never guess the rest
+        // from SQL), then the non-stepping fallback, so older natives degrade.
         const stmt = this.stmt as unknown as {
             columnMetadata?: () => StatementColumnMetadata[];
             columnNames?: () => string[];

@@ -1,5 +1,6 @@
 import { fromError, PromiseRejectionEvent, EventTarget } from './events';
 import { installWebApiEventReceiver } from './event-mux-bootstrap';
+import { defineLazy } from '../utils/lazy-accessor';
 
 const { onEvent, EventType } = import.meta.use('engine');
 
@@ -91,12 +92,8 @@ defineGlobalHandler('onbeforeunload', 'beforeunload');
 type BridgeCtx = { handled: boolean; dispatched: boolean };
 
 /**
- * EV_BEFORE_UNLOAD (circu.js/src/private.h:172, exposed at mod_engine.c:1281).
- *
- * Read from the runtime enum rather than written as `EventType.BEFORE_UNLOAD`:
- * the hand-maintained `types/engine.d.ts` enum still stops at LOAD, and it is
- * duplicated across four submodules. Taking the live value (with the C constant
- * as fallback) cannot drift from the binary the way the declaration has.
+ * EV_BEFORE_UNLOAD, read from the runtime enum (fallback 4): the hand-maintained
+ * `types/engine.d.ts` enum stops at LOAD and drifts from the binary.
  */
 const EV_BEFORE_UNLOAD: number = (() => {
     const v = (EventType as unknown as Record<string, unknown>)?.BEFORE_UNLOAD;
@@ -181,11 +178,25 @@ Reflect.set(globalThis, 'Headers', Headers);
 // fetch & xhr polyfill (CNO secondary wrapping layer)
 await import('./fetch');
 
-// sse(EventSource) polyfill (CNO secondary wrapping layer)
-await import('./sse');
+// sse(EventSource) polyfill (CNO secondary wrapping layer), lazily evaluated: the
+// same reason as the WebSocket client above.
+void defineLazy(globalThis as unknown as Record<string, unknown>, [
+    { name: 'EventSource', kind: 'ctor' },
+], () => import('./sse').then(() => new Map<string, unknown>([
+    ['EventSource', Reflect.get(globalThis, 'EventSource')],
+])));
 
-// websocket (CNO secondary wrapping layer)
-await import('./websocket');
+// websocket (CNO secondary wrapping layer): the client stack (frames, handshake,
+// WebSocketStream) is ~55 KB of bytecode that only a program constructing a
+// WebSocket reaches, so the module is not evaluated at boot. The accessors keep
+// `typeof WebSocket === 'function'` true and start the load on the first read.
+void defineLazy(globalThis as unknown as Record<string, unknown>, [
+    { name: 'WebSocket', kind: 'ctor' },
+    { name: 'WebSocketStream', kind: 'ctor' },
+], () => import('./websocket').then(() => new Map<string, unknown>([
+    ['WebSocket', Reflect.get(globalThis, 'WebSocket')],
+    ['WebSocketStream', Reflect.get(globalThis, 'WebSocketStream')],
+])));
 
 // crypto
 await import('./crypto');
@@ -202,14 +213,14 @@ await import('./storage');
 // BroadcastChannel
 await import('./broadcast-channel');
 
-// CacheStorage / Cache API
+// cache
 await import('./cache');
 
-// Scheduling API (scheduler.postTask)
-const { scheduler } = await import('./scheduler');
-Reflect.set(globalThis, 'scheduler', scheduler);
-
 // Intl (partial support)
+// Always loaded, and still after the globals above: its Date/Number/BigInt re-points
+// must land before user code, and node/vm boots user code in the same tick as this
+// module resolves, so a lazy typeof/Reflect probe would lose. The deferral lives
+// inside intl.ts instead.
 await import('./intl');
 
 // webtransport (QUIC) — loads always; native gate fails closed in ctor

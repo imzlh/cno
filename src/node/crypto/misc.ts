@@ -34,16 +34,8 @@ export const constants = {
     RSA_NO_PADDING: 3,
     RSA_PKCS1_OAEP_PADDING: 4,
     RSA_X931_PADDING: 5,
-    // PSS was missing, and its absence was a real padding-scheme DOWNGRADE, not
-    // just a missing constant. Measured on the 17:41 binary: because
-    // `RSA_PKCS1_PSS_PADDING` was `undefined`, `sign/verify({ padding:
-    // constants.RSA_PKCS1_PSS_PADDING })` passed `padding: undefined`, which
-    // falls back to PKCS#1 v1.5 — so a PKCS1 signature VERIFIED TRUE against a
-    // caller explicitly asking for PSS. Real Node returns false there. Code that
-    // opted in to PSS silently got the legacy scheme.
-    // Values checked against Node v24.18.0; SALTLEN_AUTO and MAX_SIGN are both -2
-    // upstream, and RSA_SSLV23_PADDING is genuinely absent in Node so it is not
-    // added here.
+    // Must not be undefined: `padding: undefined` falls back to PKCS#1 v1.5, so
+    // a PKCS1 signature would verify against an explicit PSS request.
     RSA_PKCS1_PSS_PADDING: 6,
     RSA_PSS_SALTLEN_DIGEST: -1,
     RSA_PSS_SALTLEN_MAX_SIGN: -2,

@@ -1,4 +1,4 @@
-import { DOMException } from "../webapi/events";
+import { DOMException } from "../webapi/dom-exception";
 
 type CronOptions = {
     backoffSchedule?: number[];

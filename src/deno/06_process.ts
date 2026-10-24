@@ -5,7 +5,7 @@ import { join, resolvePath, toFsPath } from "../utils/path";
 import { isWindows } from "../utils/platform";
 import { wrapFsClassDec as wrap, wrapFSns } from "../utils/wrap";
 import { ReadableStream } from "../webapi/streams";
-import { useWritable } from "./05_net";
+import { useWritable } from "./pipe-streams";
 import { errors } from "./01_errors";
 
 const os = import.meta.use('os');
@@ -478,6 +478,11 @@ class Command implements Deno.Command {
         return child;
     }
 }
+
+/** The command surface, exported so `index.ts` can resolve its lazy accessors
+ *  with the values the registration below installs. */
+const COMMAND_EXPORTS = Object.freeze({ Command, ChildProcess, Process });
+export { COMMAND_EXPORTS };
 
 Object.assign(Deno, wrapFSns({
     kill(pid: number, signo?: number | Deno.Signal): void {

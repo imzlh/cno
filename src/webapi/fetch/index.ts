@@ -8,6 +8,9 @@ export * from "./request";
 export * from "./response";
 export * from "./perform";
 export * from "./xhr";
+// `get/setResponseInitiatorCallFrames` come from `./response` above and
+// `truncateHookPostData` from `./helpers`; only the 101 builder moved out.
+export { createSwitchingProtocolsResponse } from "./server-response";
 
 Reflect.set(globalThis, "fetch", fetch);
 Reflect.set(globalThis, "Response", Response);

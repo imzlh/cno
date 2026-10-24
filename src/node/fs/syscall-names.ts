@@ -1,17 +1,11 @@
 /**
  * `err.syscall` for `fs` errors: the **libuv operation name**, not the JS API
- * name. Do not derive it from the JS name.
- *
- * SCOPE. Call sites keep passing the **JS** name, because `errno-fix.ts` keys
- * numeric-errno corrections off it. `FileHandle` methods do NOT come through
- * here: node uses a different set of names for them (`fh.utimes` reports
- * 'futimes' where module-level `futimes` reports 'futime').
+ * name. Do not derive it from the JS name. FileHandle methods do not come here.
  */
 
 /**
  * JS API name (minus any `Sync`) -> libuv name for the step that usually fails.
- * Identity entries are kept explicit: they document "measured, node agrees" and
- * stop a future reader assuming the omission means "unverified".
+ * Identity entries are kept explicit so an omission never reads as "unverified".
  */
 const UV_NAME: Record<string, string> = {
     // --- content ops. The reported step depends on the errno; see STEP_BY_CODE.
@@ -24,8 +18,8 @@ const UV_NAME: Record<string, string> = {
     close: 'close',
     read: 'read',
     write: 'write',
-    // Module-level readv/writev collapse onto read/write. (FileHandle.readv does
-    // NOT — it reports 'readv'. That path bypasses this table.)
+    // Module-level readv/writev collapse onto read/write; FileHandle.readv does
+    // NOT (it reports 'readv') and bypasses this table.
     readv: 'read',
     writev: 'write',
 
@@ -56,9 +50,8 @@ const UV_NAME: Record<string, string> = {
     truncate: 'open',
     ftruncate: 'ftruncate',
 
-    // --- links. `realpath` walks the path with lstat in the sync/callback forms,
-    // so that is the name node reports; `fs.promises.realpath` and
-    // `realpathSync.native` call uv_fs_realpath and report 'realpath'.
+    // --- links. `realpath` walks with lstat in the sync/callback forms;
+    // `fs.promises.realpath` and `realpathSync.native` report 'realpath'.
     realpath: 'lstat',
     // `.native` and `fs.promises.realpath` report 'realpath', unlike the other forms.
     realpathNative: 'realpath',
@@ -109,12 +102,10 @@ function baseName(syscall: string): string {
 }
 
 /**
- * Translate a JS API name to the libuv name node reports.
- *
- * Unknown names pass through unchanged, which is deliberate and load-bearing:
- * call sites that already know the exact failing step pass it directly (`'lstat'`
- * for rm's probe, `'copyfile'` from the copy helper) and must not be rewritten,
- * and cno-only operations with no node equivalent (`flock`) keep their name.
+ * Translate a JS API name to the libuv name node reports. Unknown names pass
+ * through unchanged, which is load-bearing: call sites that already know the
+ * exact failing step (`'lstat'`, `'copyfile'`) and cno-only ops (`flock`) keep
+ * their name.
  */
 export function uvSyscall(syscall?: string, code?: string): string | undefined {
     if (!syscall) return syscall;

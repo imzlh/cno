@@ -1,13 +1,25 @@
-import { Response as CnoResponse } from "./fetch";
 import { bytesToArrayBuffer } from "../utils/bytes";
 import { getMemoryTier } from "../utils/memory-tier";
 
 const ILLEGAL = Symbol('cache.illegal');
 
-const MAX_ENTRIES = getMemoryTier() === 'low' ? 64 : getMemoryTier() === 'normal' ? 256 : 1024;
+/**
+ * Responses are built with the platform constructors. Resolving them through
+ * `globalThis` rather than importing `./fetch` keeps this module off the fetch
+ * stack in the boot graph, and both are installed whenever a program can reach a
+ * cache.
+ */
+function platformResponse(): typeof globalThis.Response {
+    return globalThis.Response;
+}
+
+function maxEntries(): number {
+    return getMemoryTier() === 'low' ? 64 : getMemoryTier() === 'normal' ? 256 : 1024;
+}
 
 function toRequestKey(input: RequestInfo | URL): Request {
-    return input instanceof Request ? input : new Request(input);
+    const RequestCtor = globalThis.Request;
+    return input instanceof RequestCtor ? input : new RequestCtor(input);
 }
 
 function assertGetRequest(request: Request): void {
@@ -88,7 +100,7 @@ class CacheImpl implements Cache {
         // store a rebuilt one so the cached entry stays a usable, unconsumed Response.
         if (response.bodyUsed) {
             try {
-                storedResponse = new CnoResponse(bytesToArrayBuffer(body), {
+                storedResponse = new (platformResponse())(bytesToArrayBuffer(body), {
                     status: response.status,
                     statusText: response.statusText,
                     headers: response.headers,
@@ -103,7 +115,7 @@ class CacheImpl implements Cache {
         if (idx >= 0) {
             this.#entries[idx] = entry;
         } else {
-            while (this.#entries.length >= MAX_ENTRIES) {
+            while (this.#entries.length >= maxEntries()) {
                 this.#entries.shift();
             }
             this.#entries.push(entry);
@@ -114,7 +126,7 @@ class CacheImpl implements Cache {
         const req = toRequestKey(request);
         const entry = this.#entries.find(e => queryMatches(e, req, options));
         if (!entry) return undefined;
-        return new CnoResponse(bytesToArrayBuffer(entry.body), {
+        return new (platformResponse())(bytesToArrayBuffer(entry.body), {
             status: entry.response.status,
             statusText: entry.response.statusText,
             headers: entry.responseHeaders,
@@ -123,12 +135,12 @@ class CacheImpl implements Cache {
 
     async matchAll(request?: RequestInfo | URL, options?: CacheQueryOptions): Promise<globalThis.Response[]> {
         if (request === undefined) return this.#entries.map(e =>
-            new CnoResponse(e.body, { status: e.response.status, headers: e.responseHeaders })
+            new (platformResponse())(bytesToArrayBuffer(e.body), { status: e.response.status, headers: e.responseHeaders })
         );
         const req = toRequestKey(request);
         return this.#entries
             .filter(e => queryMatches(e, req, options))
-            .map(e => new CnoResponse(e.body, { status: e.response.status, headers: e.responseHeaders }));
+            .map(e => new (platformResponse())(bytesToArrayBuffer(e.body), { status: e.response.status, headers: e.responseHeaders }));
     }
 
     async delete(request: RequestInfo | URL, options?: CacheQueryOptions): Promise<boolean> {
@@ -223,4 +235,11 @@ const CacheCtorProxy = new Proxy(function Cache() {
 
 Reflect.set(globalThis, 'Cache', CacheCtorProxy);
 Reflect.set(globalThis, 'CacheStorage', CacheStorageImpl);
-Reflect.set(globalThis, 'caches', new CacheStorageImpl());
+// One instance per process, but only built (and only then reading the memory tier) on
+// first use; the getter keeps identity stable and caches a live, never-reset store.
+let cachesInstance: CacheStorageImpl | undefined;
+Object.defineProperty(globalThis, 'caches', {
+    get: () => cachesInstance ??= new CacheStorageImpl(),
+    enumerable: true,
+    configurable: true,
+});

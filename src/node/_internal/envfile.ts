@@ -1,17 +1,17 @@
-const os = import.meta.use('os');
-const fs = import.meta.use('fs');
-const engine = import.meta.use('engine');
 import path from '../path';
 import { fileURLToPath } from '../url';
 import { nodeEnvEntriesToObject, parseNodeEnvEntries } from './dotenv';
 
+const os = import.meta.use('os');
+const fs = import.meta.use('fs');
+const engine = import.meta.use('engine');
 const { resolve: resolvePath } = path;
 
 export type EnvFilePath = string | URL | Uint8Array;
 
-function safeGetEnv(name: string): string | undefined {
+export function readEnv(name: string): string | undefined {
     try {
-        return os.getenv(name) ?? undefined;
+        return os.getenv(name);
     } catch {
         return undefined;
     }
@@ -44,7 +44,7 @@ export function resolveEnvFilePath(path: EnvFilePath): string {
 
 function applyNodeVars(vars: Iterable<readonly [string, string]>): void {
     for (const [key, value] of vars) {
-        if (safeGetEnv(key) === undefined) os.setenv(key, value);
+        if (readEnv(key) === undefined) os.setenv(key, value);
     }
 }
 
@@ -55,3 +55,4 @@ export function loadNodeEnvFile(path: EnvFilePath = '.env'): Record<string, stri
     applyNodeVars(parsed);
     return nodeEnvEntriesToObject(parsed);
 }
+

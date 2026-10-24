@@ -1,11 +1,5 @@
-/**
- * node:http2 constants.
- *
- * Node's `http2.constants` table, the `sensitiveHeaders` marker symbol, and the
- * RFC 7540 SETTINGS identifier tables. Leaf module: it imports nothing from this
- * directory, so the identity-sensitive `sensitiveHeaders` symbol is created
- * exactly once.
- */
+// Leaf module: it imports nothing from this directory, so the identity-sensitive
+// `sensitiveHeaders` symbol is created exactly once.
 
 export const constants = {
     // NGHTTP2 error / setting / flag / state codes

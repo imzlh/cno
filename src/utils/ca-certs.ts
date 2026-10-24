@@ -23,13 +23,9 @@ const LINUX_BUNDLES = [
 ];
 
 /**
- * Read the OS trust store once, synchronously.
- *
- * picotls' `ptls_openssl_init_verify_certificate(self, NULL)` builds its store
- * from OpenSSL's compile-time default paths. On Windows those point at
- * `C:\Program Files\Common Files\SSL\{certs,cert.pem}`, which does not exist,
- * so the store stays empty and every verification fails with UNKNOWN_CA.
- * Callers must therefore pass these PEMs explicitly as `caCerts`.
+ * Read the OS trust store once, synchronously. picotls' default store comes
+ * from OpenSSL's compile-time paths, empty on Windows, so callers must pass
+ * these PEMs explicitly as `caCerts`.
  */
 export function systemCaCerts(): string[] {
     if (cached !== null) return cached;
@@ -83,14 +79,10 @@ export function withSystemCaCerts(caCerts?: string[]): string[] | undefined {
 let cachedBundle: string | null = null;
 
 /**
- * The same roots as `withSystemCaCerts`, concatenated for `ssl.Context.ca`,
- * which takes one PEM string rather than an array.
+ * The same roots as `withSystemCaCerts`, concatenated for `ssl.Context.ca`.
  *
- * Returns undefined when nothing was found, which is not the same as an empty
- * string: passing `ca: ''` would make `ssl_ctx_load_ca_pem` load zero certs and
- * throw, whereas omitting `ca` leaves OpenSSL's default verify paths as the only
- * source. Callers that need verification must treat undefined as "no roots
- * available" rather than as "trust nothing".
+ * undefined is distinct from '': `ca: ''` makes `ssl_ctx_load_ca_pem` load zero
+ * certs and throw, whereas omitting `ca` keeps OpenSSL's default verify paths.
  */
 export function systemCaBundle(caCerts?: string[]): string | undefined {
     if (!caCerts?.length) {

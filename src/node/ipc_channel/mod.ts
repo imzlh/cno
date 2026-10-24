@@ -1,31 +1,15 @@
 /**
- * Internal IPC Channel module
- * Used by child_process and process modules for inter-process communication.
- *
- * Users should NOT import this module directly.
- * Instead use:
- *   - child.send() / child.on('message') in parent
- *   - process.send() / process.on('message') in child
- *
- * Wire protocol (Node.js-compatible, serialization: 'json')
- * --------------------------------------------------------
- * Each message is `JSON.stringify(value)` followed by a single newline byte
- * (0x0A), encoded as UTF-8. Messages are delimited by that newline byte.
- * Because JSON.stringify never emits a raw 0x0A (newlines inside strings are
- * escaped), the 0x0A byte is an unambiguous delimiter even across multi-byte
- * UTF-8 sequences (continuation bytes are 0x80-0xBF and can never be 0x0A).
- *
- * User messages are transmitted verbatim as arbitrary JSON values (object, array,
- * string, number, boolean or null). Internal control messages are objects
- * whose `cmd` field begins with "NODE_" (e.g. NODE_HANDLE); these are kept off
- * the user 'message' stream. This is exactly Node's framing, so a circu
- * process and a real node process can exchange IPC messages over the same
- * channel (e.g. node parent <-> circu child via NODE_CHANNEL_FD, or vice versa).
+ * Internal IPC channel (child_process, process), not a public module.
+ * Wire protocol matches Node: JSON plus a 0x0A byte, which is unambiguous
+ * because JSON.stringify escapes newlines. Control messages have a `cmd`
+ * starting "NODE_" and never reach 'message'. Interoperates with real node over
+ * NODE_CHANNEL_FD.
  */
 
 import { EventEmitter } from '../events';
 import { getMemoryTier } from '../_internal/memory';
 import { toOwnedBytes } from '../_internal/buffer';
+import { closeQuietly } from '../_internal/close';
 
 const engine = import.meta.use('engine');
 const algorithm = import.meta.use('algorithm');
@@ -269,15 +253,12 @@ export class IPCChannel extends EventEmitter {
 
         this._connected = true;
 
-        // Arm the read only once something consumes read-driven events, and arm
-        // it as soon as that happens. On Windows the child's inherited IPC
-        // endpoint may be a *synchronous* pipe handle, and NT serialises all I/O
-        // on a synchronous file object: a pending read then blocks this process's
-        // own writes on the same handle until the peer happens to write first.
-        // A send-only endpoint (the `cno test` worker: send the result, close,
-        // exit) therefore deadlocked for ~30 s. Nothing is lost by arming late —
-        // unread bytes wait in the OS pipe buffer, and an unarmed handle does not
-        // hold the event loop open.
+        // Arm the read only once something consumes read-driven events. On
+        // Windows the inherited endpoint may be a synchronous pipe, where a
+        // pending read blocks this process's own writes: a send-only endpoint
+        // (`cno test` worker) deadlocked until the peer wrote first. Nothing is
+        // lost by arming late — unread bytes wait in the OS pipe buffer, and an
+        // unarmed handle does not hold the event loop open.
         this.on('newListener', (event: unknown) => {
             if (event === 'message' || event === 'internalMessage' || event === 'close') {
                 this._armRead();
@@ -395,10 +376,10 @@ export class IPCChannel extends EventEmitter {
                 pipe.shutdown()
                     .catch(() => undefined)
                     .finally(() => {
-                        try { pipe.close(); } catch { /* ignore */ }
+                        closeQuietly(pipe);
                     });
             } catch {
-                try { pipe.close(); } catch { /* ignore */ }
+                closeQuietly(pipe);
             }
         }
         this._closeAfterWrites = false;

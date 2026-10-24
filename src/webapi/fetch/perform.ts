@@ -376,10 +376,8 @@ export async function performFetch(request: Request, url: URL): Promise<Response
         }
     };
 
-    // The interceptor runs before curl.perform(). If it rejects, there is no
-    // perform() finally block to release the global in-flight marker or the
-    // AbortSignal listener. Keep this cleanup idempotent so every early exit
-    // releases the request-owned state exactly once.
+    // Idempotent: the interceptor can reject before perform(), with no finally to
+    // release the in-flight marker or abort listener.
     const cleanupBeforePerform = () => {
         inFlightFetchFrames.delete(headersDone.promise);
         removeAbortHandler();
@@ -588,12 +586,9 @@ export async function performFetch(request: Request, url: URL): Promise<Response
 }
 
 /**
- * Attach an `init.client` (Deno.HttpClient) to the request so performFetch applies
- * its proxy/CA/mTLS settings. `Request` does not retain unknown init keys, so the
- * client is carried out of band; a non-HttpClient value is rejected rather than
- * silently dropped, matching Deno.
- *
- * A client attached to a Request also survives `fetch(new Request(rq))`.
+ * Attach an `init.client` (Deno.HttpClient) for performFetch. Request does not
+ * retain unknown init keys, so the client is carried out of band; a non-HttpClient
+ * value is rejected rather than dropped, matching Deno.
  */
 async function attachRequestClient(request: Request, init: RequestInit | undefined, input: unknown): Promise<void> {
     const client = (init as { client?: unknown } | undefined)?.client;

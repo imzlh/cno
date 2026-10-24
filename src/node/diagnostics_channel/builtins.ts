@@ -1,19 +1,7 @@
 /**
- * Built-in diagnostics channels that core modules publish to.
- *
- * These are the exact channel names Node core creates and publishes to (verified
- * against Node v24.18.0 `_http_client.js` / `_http_server.js` / `net.js`). They
- * live here rather than in each owning module so that the channel *identity* is
- * shared: `require('diagnostics_channel').channel('http.client.request.start')`
- * must return the very same Channel object a publisher holds, otherwise a
- * subscriber never sees anything.
- *
- * NOT exported from `node:diagnostics_channel`'s public surface — Node does not
- * expose a `builtinChannels`, and adding one would be an API divergence. This
- * module is imported directly by http/https/net.
- *
- * Every publish site MUST be guarded by `channel.hasSubscribers` so the
- * uninstrumented path stays allocation-free, exactly as Node does it.
+ * Built-in diagnostics channels that core modules publish to. They live here so
+ * channel identity is shared, and must not surface on `node:diagnostics_channel`.
+ * Every publish site MUST be guarded by `hasSubscribers` to stay allocation-free.
  */
 import { channel } from './mod';
 import type { Channel } from './mod';
@@ -43,10 +31,8 @@ export const onNetClientSocket: Channel = channel('net.client.socket');
 export const onNetServerSocket: Channel = channel('net.server.socket');
 
 /**
- * True when any of the four http-client channels has a subscriber.
- *
- * Used to decide whether to install the per-request `emit` interception at all,
- * so a request made with nothing subscribed pays only this boolean read.
+ * True when any of the four http-client channels has a subscriber, so the
+ * per-request `emit` interception is installed only when needed.
  */
 export function anyClientChannelActive(): boolean {
     return onClientRequestCreated.hasSubscribers
@@ -62,21 +48,10 @@ type EmittingRequest = {
 const instrumented = new WeakSet<object>();
 
 /**
- * Publish `http.client.request.error` / `http.client.response.finish` for one
- * ClientRequest.
- *
- * Node publishes both from inside core, *before* the corresponding user-visible
- * event is emitted (`emitErrorEvent` publishes then calls `request.emit('error')`;
- * `parserOnIncomingClient` publishes then calls `req.emit('response')`). cno's
- * client internals live in `_internal/http-client.ts`, which is shared with
- * https and out of this module's reach, so instead of adding listeners we shadow
- * `emit` on the instance and publish on the way through.
- *
- * A listener would have been wrong for 'error' specifically: attaching one turns
- * an otherwise-unhandled 'error' into a silently swallowed one, because
- * EventEmitter only throws when the listener count is zero. Shadowing `emit`
- * leaves the listener count — and therefore the throw-on-unhandled behaviour —
- * exactly as it was.
+ * Publish `http.client.request.error` / `http.client.response.finish` before
+ * the user-visible event. The client internals are out of reach, so `emit` is
+ * shadowed rather than a listener added: an 'error' listener would swallow
+ * otherwise-unhandled errors.
  */
 export function instrumentClientRequest(request: EmittingRequest): void {
     if (instrumented.has(request)) return;

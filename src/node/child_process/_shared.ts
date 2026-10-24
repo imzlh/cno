@@ -1,10 +1,4 @@
-/**
- * Node.js child_process module - shared internals
- *
- * Errno/pipe/stream plumbing, signal + output decoding, prototype flattening and
- * the shell-invocation builder. Internal to the module: nothing here is part of
- * the public `node:child_process` surface.
- */
+// Internal to the module: nothing here is part of the public surface.
 
 const os = import.meta.use('os');
 const signals = import.meta.use('signals');
@@ -30,14 +24,8 @@ export function startPipeReadQuietly(pipe: CModuleStreams.Pipe): void {
 }
 
 /**
- * Hand one stdio chunk to a child-process Readable.
- *
- * The native pipe is mid-read when onread fires, yet push() turns round and
- * calls _read() synchronously for 'data' listeners, and child.ts' _read() then
- * re-enters startRead() — which throws "startRead already in progress" and
- * destroys the stream (observed: esbuild's service channel closed after the
- * first message). Keep push() to a plain buffer append while the pipe owns the
- * read; flowReadable() delivers the buffered chunk when it consumes.
+ * Hand one stdio chunk to a child-process Readable. While the pipe owns the
+ * read, only append to the buffer: push() would re-enter startRead().
  */
 export function deliverPipeChunk(readable: Readable, pipe: CModuleStreams.Pipe, data: Uint8Array): void {
     const state = readable._readableState;
@@ -120,8 +108,8 @@ export function stdioChunkBytes(chunk: unknown): Uint8Array {
     throw new TypeError('Child process stdio chunk must be a string or binary buffer');
 }
 
-// Node uppercases the signal name before looking it up, so kill('sigterm') works
-// (measured on v24.18), and reports an unknown name as ERR_UNKNOWN_SIGNAL.
+// Node uppercases the signal name before looking it up and reports an unknown
+// name as ERR_UNKNOWN_SIGNAL.
 export function transformSignal(signal?: string | number): number | undefined {
     if (signal === undefined || signal === null) return;
     if (typeof signal === 'string') {

@@ -1,10 +1,5 @@
 /**
- * Myers line diff, ported from Node's `internal/assert/myers_diff` and
- * `internal/util/diff`.
- *
- * `assert`'s error messages need `+ actual` / `- expected` line markers, and in
- * Node that machinery lives under util rather than in assert itself. Exposing it
- * here keeps the same layering: `assert` gets a single call site.
+ * Myers line diff, used by assert's error messages (`+ actual` / `- expected`).
  */
 
 import { inspect } from './inspect';
@@ -276,14 +271,9 @@ function getSimpleDiff(
 }
 
 /**
- * One-call helper for assert's `buildGeneratedMessage`: inspects both sides with
- * assert's options and returns Node's diff body, choosing between the simple
- * one-line form and the `+ actual` / `- expected` marked form exactly as Node
- * does.
- *
- * Compose the final message as Node's createErrDiff does:
- *   `${errorMessage}\n${header}${skipped ? '\n... Skipped lines' : ''}\n${message}\n`
- * where `header` is `'+ actual - expected'` unless this returns `header: ''`.
+ * One-call helper for assert's `buildGeneratedMessage`: Node's createErrDiff
+ * body. The caller composes
+ * `${errorMessage}\n${header}${skipped ? '\n... Skipped lines' : ''}\n${message}\n`.
  */
 export function inspectDiff(
     actual: unknown,

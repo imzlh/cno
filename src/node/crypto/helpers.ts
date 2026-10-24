@@ -6,36 +6,13 @@ export { concatBuffers };
 const engine = import.meta.use('engine');
 const crypto = import.meta.use('crypto');
 const algorithm = import.meta.use('algorithm');
-const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
-const typedArrayBufferGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')?.get as
-    ((this: object) => ArrayBufferLike) | undefined;
-const typedArrayByteOffsetGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteOffset')?.get as
-    ((this: object) => number) | undefined;
-const typedArrayByteLengthGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteLength')?.get as
-    ((this: object) => number) | undefined;
-const dataViewBufferGetter = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer')?.get as
-    ((this: object) => ArrayBufferLike) | undefined;
-const dataViewByteOffsetGetter = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset')?.get as
-    ((this: object) => number) | undefined;
-const dataViewByteLengthGetter = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength')?.get as
-    ((this: object) => number) | undefined;
-
 export const kKeyData = Symbol('cno.node.crypto.keyData');
 export const kKeyFormat = Symbol('cno.node.crypto.keyFormat');
 export type KeyFormat = 'raw' | 'pem' | 'der';
 
 function viewSlots(value: unknown): { buffer: ArrayBufferLike; byteOffset: number; byteLength: number } | null {
-    // The spec getters read internal slots, not properties: a view that shadows these
-    // names as instance properties still yields its real slots, as in Node. Calling
-    // ArrayBuffer.isView would also resolve through a replaced global.
-    const dataView = engine.isDataView(value);
-    try {
-        return {
-            buffer: Reflect.apply(dataView ? dataViewBufferGetter : typedArrayBufferGetter, value, []),
-            byteOffset: Reflect.apply(dataView ? dataViewByteOffsetGetter : typedArrayByteOffsetGetter, value, []),
-            byteLength: Reflect.apply(dataView ? dataViewByteLengthGetter : typedArrayByteLengthGetter, value, []),
-        };
-    } catch { return null; }
+    if (!ArrayBuffer.isView(value)) return null;
+    return { buffer: value.buffer, byteOffset: value.byteOffset, byteLength: value.byteLength };
 }
 
 function isBufferSource(value: unknown): value is ArrayBuffer | ArrayBufferView {
@@ -61,14 +38,13 @@ export function toExactArrayBuffer(data: Uint8Array): ArrayBuffer {
     const view = viewSlots(data);
     if (!view) throw new TypeError('The input must be a Uint8Array');
     const { buffer, byteOffset, byteLength } = view;
-    if (engine.isArrayBuffer(buffer)) {
-        if (byteOffset === 0 && byteLength === (buffer as ArrayBuffer).byteLength) return buffer as ArrayBuffer;
-        const out = new Uint8Array(byteLength);
-        out.set(new Uint8Array(buffer, byteOffset, byteLength));
-        return out.buffer as ArrayBuffer;
+    if (engine.isArrayBuffer(buffer) && byteOffset === 0 && byteLength === (buffer as ArrayBuffer).byteLength) {
+        return buffer as ArrayBuffer;
     }
-    // Over a SharedArrayBuffer: copy into a new ArrayBuffer.
-    return (Reflect.apply(Uint8Array.prototype.slice, data, []) as Uint8Array).buffer as ArrayBuffer;
+    // A subarray, or a view over a SharedArrayBuffer: copy into a new ArrayBuffer.
+    const out = new Uint8Array(byteLength);
+    out.set(new Uint8Array(buffer, byteOffset, byteLength));
+    return out.buffer as ArrayBuffer;
 }
 
 export function encodeOutput(data: ArrayBuffer, encoding?: string): Buffer | string {

@@ -26,31 +26,29 @@ import { errors } from "./01_errors";
 // owned by ../utils/path and is shared by the other Deno APIs.
 export const toString = toFsPath;
 
-export function toDenoStat(stat: CModuleAsyncFS.StatResult | CModuleFS.Stats) {
-    return {
-        dev: stat.dev,
-        ino: stat.ino,
-        mode: stat.mode,
-        nlink: stat.nlink,
-        uid: stat.uid,
-        gid: stat.gid,
-        rdev: stat.rdev,
-        size: stat.size,
-        blksize: stat.blksize,
-        blocks: stat.blocks,
-        atime: stat.atim,
-        mtime: stat.mtim,
-        ctime: stat.ctim,
-        birthtime: stat.birthtim ?? null,
-        isSymlink: !!stat.isSymbolicLink,
-        isCharDevice: !!stat.isCharacterDevice,
-        isFifo: !!stat.isFIFO,
-        isDirectory: !!stat.isDirectory,
-        isFile: !!stat.isFile,
-        isBlockDevice: !!stat.isBlockDevice,
-        isSocket: !!stat.isSocket,
-    } satisfies Deno.FileInfo;
-}
+export const toDenoStat = (stat: CModuleAsyncFS.StatResult | CModuleFS.Stats) => ({
+    dev: stat.dev,
+    ino: stat.ino,
+    mode: stat.mode,
+    nlink: stat.nlink,
+    uid: stat.uid,
+    gid: stat.gid,
+    rdev: stat.rdev,
+    size: stat.size,
+    blksize: stat.blksize,
+    blocks: stat.blocks,
+    atime: stat.atim,
+    mtime: stat.mtim,
+    ctime: stat.ctim,
+    birthtime: stat.birthtim ?? null,
+    isSymlink: !!stat.isSymbolicLink,
+    isCharDevice: !!stat.isCharacterDevice,
+    isFifo: !!stat.isFIFO,
+    isDirectory: !!stat.isDirectory,
+    isFile: !!stat.isFile,
+    isBlockDevice: !!stat.isBlockDevice,
+    isSocket: !!stat.isSocket,
+} satisfies Deno.FileInfo);
 
 function removeRecursiveSync(targetPath: string): void {
     const stats = fs.lstat(targetPath);
@@ -227,9 +225,9 @@ function watchToIterator(path: string): AsyncIterableIterator<Deno.FsEvent> & { 
             return deferred.promise;
         },
 
-            [Symbol.asyncIterator]() {
-                return this as Deno.FsWatcher & AsyncIterableIterator<Deno.FsEvent>;
-            },
+        [Symbol.asyncIterator]() {
+            return this as Deno.FsWatcher & AsyncIterableIterator<Deno.FsEvent>;
+        },
 
         async return(): Promise<IteratorResult<Deno.FsEvent>> {
             await this.close();

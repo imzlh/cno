@@ -125,34 +125,49 @@ function decompressSync(kind: DecompressKind, buffer: ZlibInput, options?: ZlibO
     const handle = DECOMPRESS_FACTORIES[kind]();
     const chunks: Buffer[] = [];
     let offset = 0;
+    // Bytes up to the end of the last complete member (what `info` reports).
+    let consumed = 0;
 
     while (true) {
+        // `inflate()` validates its input and throws a catchable TypeError for
+        // anything that is not a byte view. Every other failure it raises is an
+        // uncatchable InternalError, so refuse those inputs here: bytes after a
+        // finished member are read as the start of the next one, and Node
+        // reports that as Z_DATA_ERROR rather than ending the process.
+        const rest = input.subarray(offset);
+        if (!ArrayBuffer.isView(rest)) throw corruptError();
         let produced: Uint8Array;
         try {
-            produced = handle.inflate(input.subarray(offset), NO_FLUSH);
+            produced = handle.inflate(rest, NO_FLUSH);
         } catch (err) {
+            // The handle refuses input once the member's trailer has been
+            // consumed; the `finished` check below normally prevents that.
             if (isAlreadyFinished(err)) break;
             throw corruptError();
         }
         if (produced.length > 0) chunks.push(Buffer.from(produced));
 
         const used = handle.getTotalIn?.() ?? input.length - offset;
-        let complete: boolean;
-        try {
-            const tail = handle.finish();
-            if (tail.length > 0) chunks.push(Buffer.from(tail));
-            complete = true;
-        } catch (err) {
-            if (isAlreadyFinished(err)) complete = true;
-            else if (partialOk) complete = false;
-            else throw truncatedError();
+        // The native handle marks itself finished the moment inflate() sees the
+        // trailer, and finishing again throws an uncatchable InternalError, so
+        // ask for the state instead of calling finish() unconditionally.
+        // `partialOk` (finishFlush !== Z_FINISH) keeps a truncated member's
+        // output, as Node does; otherwise a member that never reached its
+        // trailer is Z_BUF_ERROR.
+        if (handle.finished !== true) {
+            if (!partialOk) throw truncatedError();
+            break;
         }
 
-        if (!complete) break;
         offset += used;
+        consumed = offset;
         if (used === 0 || offset >= input.length || !multiMember) break;
         // Trailing NUL padding after a complete member is not an error in Node.
         if (trailingIsPadding(input.subarray(offset))) break;
+        // Anything else is read as the start of a new member and rejected by
+        // Node with Z_DATA_ERROR. Handing those bytes to the native handle
+        // raises an uncatchable InternalError instead, so reject them here.
+        if (!hasGzipMagic(input.subarray(offset))) throw corruptError();
         if (!handle.reset) break;
         handle.reset();
     }
@@ -162,7 +177,7 @@ function decompressSync(kind: DecompressKind, buffer: ZlibInput, options?: ZlibO
         checkMaxOutputLength(Buffer.concat(chunks), options),
         input.byteLength,
         options,
-        offset,
+        consumed,
     );
 }
 // Sync compress/decompress

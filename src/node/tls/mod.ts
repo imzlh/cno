@@ -5,28 +5,12 @@
  */
 
 /**
- * This file is a facade: the implementation lives in the sibling modules listed
- * below, and the export list here IS the public API. It is deliberately spelled
- * out name by name rather than using `export *`, because the submodules also
- * export internals to each other (PEM converters, the prototype flattener, the
- * error factories, the CA cache) and `export *` would silently publish those as
- * `node:tls` exports.
+ * Facade over the sibling modules. The export list IS the public API and is
+ * spelled out rather than `export *`, because submodules export internals to each
+ * other (PEM converters, error factories, CA cache).
  *
- *   types.ts     every interface/type, plus the TLSSocket / Server *shapes*
- *   errors.ts    X509_V_ERR_* -> Node `code` table, verify-error factories,
- *                checkServerIdentity, nameFailureError, cipher/version constants
- *   _shared.ts   PEM/byte helpers, ALPN normalisation, quiet cleanup,
- *                flattenPrototype, and the CA trust state: system-store cache
- *                + override set + flag
- *   context.ts   SecureContext, the JS-stream adapter, the secureContext merge
- *   socket.ts    TLSSocket ctor + prototype
- *   server.ts    Server ctor + prototype, createServer
- *
- * Load order: ./socket sets its prototype from `Duplex.prototype` and ./server
- * from `EventEmitter.prototype` at evaluation time, so ../stream and ../events
- * must already be evaluated when they run. Importing ./socket (as connect()
- * below does) pulls ../stream — the same order the single-file version produced.
- */
+ * Load order matters: ./socket and ./server set their prototypes from
+ * Duplex.prototype / EventEmitter.prototype at evaluation time. */
 
 import { mergeSuppliedSecureContext } from './context';
 import { TLSSocket } from './socket';

@@ -91,17 +91,9 @@ function blockListLabel(family: BlockListFamily): string {
     return family === 'ipv4' ? 'IPv4' : 'IPv6';
 }
 
-// An IPv4-mapped IPv6 address is exactly the ::ffff:0:0/96 prefix. Measured
-// against node v24.18.0: rules are stored verbatim (`bl.rules` keeps the family
-// and spelling it was given), and the mapped/plain equivalence is resolved at
-// CHECK time, in BOTH directions:
-//   addAddress('1.2.3.4')            + check('::ffff:1.2.3.4','ipv6') -> true
-//   addAddress('::ffff:1.2.3.4','ipv6') + check('1.2.3.4','ipv4')     -> true
-// and identically for addRange and addSubnet, including the range edges. A
-// *pure* v6 rule (2001:db8::1) checked with a v4 address stays false, so the
-// equivalence applies only to the mapped prefix and must not be widened.
-// BlockList exists solely for access control, so a miss here is a bypass: a
-// blocked IPv4 peer reconnecting over IPv6 presents the mapped form.
+// An IPv4-mapped IPv6 address is exactly the ::ffff:0:0/96 prefix. The equivalence
+// is resolved at check time in both directions and only for that prefix: a miss
+// is an access-control bypass. See node-internals.md "BlockList mapped addresses".
 const V4_MAPPED_LOW = 0xffff00000000n;
 const V4_MAPPED_HIGH = 0xffffffffffffn;
 

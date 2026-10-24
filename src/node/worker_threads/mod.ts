@@ -1,3 +1,10 @@
+// MessagePorts do not cross threads here: the native thread pipe carries only
+// structured-clone bytes, so a port in workerData or in a transfer list is
+// rejected with dataCloneError ("MessagePort cannot be transferred to another
+// thread in this runtime"). Tools that hand a channel to a worker (esbuild's
+// service channel, tinypool) fail on this; a fix has to travel a port handle
+// beside the payload rather than inside it, and every consumer of the pipe has
+// to learn the new envelope at once.
 import { EventEmitter } from '../events';
 import { PassThrough } from '../stream';
 import {

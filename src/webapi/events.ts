@@ -1,3 +1,5 @@
+import { DOMException } from './dom-exception';
+
 const denoCustomInspect = Symbol.for('Deno.customInspect');
 
 export class Event implements globalThis.Event {
@@ -13,7 +15,7 @@ export class Event implements globalThis.Event {
 
     target: EventTarget | null = null;
     currentTarget: EventTarget | null = null;
-    timeStamp: number = performance.now();
+    timeStamp: number = 0;
 
     private _stopped = false;
     private _immediateStopped = false;
@@ -113,13 +115,24 @@ function notifyListenerChange(target: EventTarget, type: string, bucket: Listene
 const captureOption = (options?: AddEventListenerOptions | boolean): boolean =>
     typeof options === 'boolean' ? options : !!options?.capture;
 
-function callTrackingHook(name: string, ...args: unknown[]): void {
-    const hook = Reflect.get(globalThis, name);
-    if (typeof hook === 'function') Reflect.apply(hook, globalThis, args);
-}
+/*
+ * node:events keeps listener bookkeeping (getEventListeners and friends) and
+ * reads its hooks from globals: the polyfill never imports node:events. The
+ * hooks are installed before user code runs, but either module may evaluate
+ * first, so node:events publishes an installer on a global and this module
+ * calls it once it is defined.
+ */
 
 export class EventTarget implements globalThis.EventTarget {
     #listeners = new Map<string, ListenerEntry[]>();
+    /**
+     * Version of #listeners, bumped on every structural change. A dispatch
+     * only needs the entry-identity check below when a callback ran and the
+     * version moved — Node's rule (a listener added mid-dispatch is not
+     * called, one removed mid-dispatch is skipped, re-adding appends) holds
+     * either way, so the untouched fast path skips it.
+     */
+    #version = 0;
 
     static #receiver(receiver: EventTarget | typeof globalThis | null | undefined): EventTarget | null {
         if (receiver === undefined || receiver === null || receiver === globalThis) return null;
@@ -154,14 +167,14 @@ export class EventTarget implements globalThis.EventTarget {
             && Reflect.get(listener, internalListener) === true;
         const entry: ListenerEntry = { listener, once: !!opts.once, capture, passive: !!opts.passive, internal, signal: opts.signal };
         bucket.push(entry);
-        callTrackingHook('__cnoTrackEventTargetListener', target, eventType, listener, options);
+        target.#version++;
         if (!entry.internal) notifyListenerChange(target, eventType, bucket);
         if (opts.signal) {
             entry.abortHandler = () => {
                 const idx = bucket.indexOf(entry);
                 if (idx !== -1) {
                     bucket.splice(idx, 1);
-                    callTrackingHook('__cnoUntrackEventTargetListener', target, eventType, listener, entry.capture);
+                    target.#version++;
                     if (!entry.internal) notifyListenerChange(target, eventType, bucket);
                 }
             };
@@ -190,8 +203,8 @@ export class EventTarget implements globalThis.EventTarget {
         if (idx !== -1) {
             const entry = bucket[idx];
             bucket.splice(idx, 1);
+            target.#version++;
             if (entry?.signal && entry.abortHandler) entry.signal.removeEventListener('abort', entry.abortHandler);
-            callTrackingHook('__cnoUntrackEventTargetListener', target, eventType, listener, options);
             if (!entry?.internal) notifyListenerChange(target, eventType, bucket);
         }
     }
@@ -213,17 +226,30 @@ export class EventTarget implements globalThis.EventTarget {
         const bucket = listeners.get(event.type);
         event.eventPhase = Event.AT_TARGET;
         event._setDispatching(true);
+        let version = target.#version;
         try {
             if (bucket) {
-                const snapshot = [...bucket];
-                for (const entry of snapshot) {
+                // No copy by default. When a `once` entry self-removes or a
+                // callback mutates the bucket (version bumps), iterate a
+                // snapshot so an added listener is not called and a removed one
+                // is skipped — Node's semantics either way.
+                let list: ListenerEntry[] = bucket;
+                for (let i = 0; i < list.length; i++) {
                     if (event.immediatePropagationStopped) break;
-                    const idx = bucket.indexOf(entry);
-                    if (idx === -1) continue;
+                    if (version !== target.#version) {
+                        version = target.#version;
+                        list = bucket.slice();
+                    }
+                    if (i >= list.length) break;
+                    const entry = list[i];
+                    // A snapshot element may have been removed by an earlier
+                    // callback; a `once` entry removes itself and re-enters the
+                    // callback at its own index, so only identity can tell.
+                    if (entry.once && bucket.indexOf(entry) === -1) continue;
                     if (entry.once) {
-                        bucket.splice(idx, 1);
+                        bucket.splice(bucket.indexOf(entry), 1);
+                        target.#version++;
                         if (entry.signal && entry.abortHandler) entry.signal.removeEventListener('abort', entry.abortHandler);
-                        callTrackingHook('__cnoUntrackEventTargetListener', target, event.type, entry.listener, entry.capture);
                         if (!entry.internal) notifyListenerChange(target, event.type, bucket);
                     }
                     const fn = entry.listener;
@@ -352,113 +378,13 @@ export class MessageEvent extends Event implements globalThis.MessageEvent {
     }
 }
 
-export class DOMException extends Error {
-    public code: number;
-
-    constructor(message: string = '', name: string = 'Error') {
-        super(message);
-
-        this.name = name;
-        this.code = DOMException.getErrorCode(name);
-        let stackValue = this.stack;
-        Object.defineProperty(this, 'stack', {
-            configurable: true,
-            get() {
-                return stackValue;
-            },
-            set(value) {
-                stackValue = value;
-            },
-        });
-    }
-
-    // Static error code constants (as defined in DOM Standard)
-    static readonly INDEX_SIZE_ERR: number = 1;
-    static readonly DOMSTRING_SIZE_ERR: number = 2;
-    static readonly HIERARCHY_REQUEST_ERR: number = 3;
-    static readonly WRONG_DOCUMENT_ERR: number = 4;
-    static readonly INVALID_CHARACTER_ERR: number = 5;
-    static readonly NO_DATA_ALLOWED_ERR: number = 6;
-    static readonly NO_MODIFICATION_ALLOWED_ERR: number = 7;
-    static readonly NOT_FOUND_ERR: number = 8;
-    static readonly NOT_SUPPORTED_ERR: number = 9;
-    static readonly INUSE_ATTRIBUTE_ERR: number = 10;
-    static readonly INVALID_STATE_ERR: number = 11;
-    static readonly SYNTAX_ERR: number = 12;
-    static readonly INVALID_MODIFICATION_ERR: number = 13;
-    static readonly NAMESPACE_ERR: number = 14;
-    static readonly INVALID_ACCESS_ERR: number = 15;
-    static readonly VALIDATION_ERR: number = 16;
-    static readonly TYPE_MISMATCH_ERR: number = 17;
-    static readonly SECURITY_ERR: number = 18;
-    static readonly NETWORK_ERR: number = 19;
-    static readonly ABORT_ERR: number = 20;
-    static readonly URL_MISMATCH_ERR: number = 21;
-    static readonly QUOTA_EXCEEDED_ERR: number = 22;
-    static readonly TIMEOUT_ERR: number = 23;
-    static readonly INVALID_NODE_TYPE_ERR: number = 24;
-    static readonly DATA_CLONE_ERR: number = 25;
-
-    // Map error names to error codes
-    private static errorCodeMap: Record<string, number> = {
-        'IndexSizeError': DOMException.INDEX_SIZE_ERR,
-        'DOMStringSizeError': DOMException.DOMSTRING_SIZE_ERR,
-        'HierarchyRequestError': DOMException.HIERARCHY_REQUEST_ERR,
-        'WrongDocumentError': DOMException.WRONG_DOCUMENT_ERR,
-        'InvalidCharacterError': DOMException.INVALID_CHARACTER_ERR,
-        'NoDataAllowedError': DOMException.NO_DATA_ALLOWED_ERR,
-        'NoModificationAllowedError': DOMException.NO_MODIFICATION_ALLOWED_ERR,
-        'NotFoundError': DOMException.NOT_FOUND_ERR,
-        'NotSupportedError': DOMException.NOT_SUPPORTED_ERR,
-        'InUseAttributeError': DOMException.INUSE_ATTRIBUTE_ERR,
-        'InvalidStateError': DOMException.INVALID_STATE_ERR,
-        'SyntaxError': DOMException.SYNTAX_ERR,
-        'InvalidModificationError': DOMException.INVALID_MODIFICATION_ERR,
-        'NamespaceError': DOMException.NAMESPACE_ERR,
-        'InvalidAccessError': DOMException.INVALID_ACCESS_ERR,
-        'ValidationError': DOMException.VALIDATION_ERR,
-        'TypeMismatchError': DOMException.TYPE_MISMATCH_ERR,
-        'SecurityError': DOMException.SECURITY_ERR,
-        'NetworkError': DOMException.NETWORK_ERR,
-        'AbortError': DOMException.ABORT_ERR,
-        'URLMismatchError': DOMException.URL_MISMATCH_ERR,
-        'QuotaExceededError': DOMException.QUOTA_EXCEEDED_ERR,
-        'TimeoutError': DOMException.TIMEOUT_ERR,
-        'InvalidNodeTypeError': DOMException.INVALID_NODE_TYPE_ERR,
-        'DataCloneError': DOMException.DATA_CLONE_ERR,
-        'Error': 0 // Default error
-    };
-
-    private static getErrorCode(name: string): number {
-        return Object.prototype.hasOwnProperty.call(this.errorCodeMap, name)
-            ? this.errorCodeMap[name] ?? 0
-            : 0;
-    }
-
-    static create(name: string, message: string = ''): DOMException {
-        return new DOMException(message, name);
-    }
-
-    static of(name: string, message?: string): DOMException {
-        return new DOMException(message, name);
-    }
-
-    static indexSize(message?: string) { return DOMException.of('IndexSizeError', message); }
-    static hierarchyRequest(message?: string) { return DOMException.of('HierarchyRequestError', message); }
-    static notFound(message?: string) { return DOMException.of('NotFoundError', message); }
-    static security(message?: string) { return DOMException.of('SecurityError', message); }
-    static syntax(message?: string) { return DOMException.of('SyntaxError', message); }
-    static typeMismatch(message?: string) { return DOMException.of('TypeMismatchError', message); }
-    static invalidState(message?: string) { return DOMException.of('InvalidStateError', message); }
-
-    get [Symbol.toStringTag]() {
-        return 'DOMException';
-    }
-
-    [denoCustomInspect]() {
-        return inspectDOMException(this);
-    }
-}
+// The class lives on its own module: cron only imports the exception type, and
+// pulling this file for it would register the whole event surface.
+export { DOMException };
+Object.defineProperty(DOMException.prototype, denoCustomInspect, {
+    configurable: true,
+    value() { return inspectDOMException(this); },
+});
 
 export class ProgressEvent<T extends EventTarget = EventTarget> extends Event implements globalThis.ProgressEvent<T> {
     readonly lengthComputable: boolean;
@@ -484,7 +410,6 @@ for (const [name, cls] of Object.entries({
     CloseEvent, MessageEvent, DOMException, ProgressEvent,
 })) Reflect.set(globalThis, name, cls);
 
-callTrackingHook('__cnoPatchEventTargetTracking');
 
 export const parseStackFrame = (
     line: string

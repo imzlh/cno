@@ -468,12 +468,6 @@ type TrackingInstall = {
     patch(): void;
 };
 
-function isEventTargetPolyfill(target: unknown): boolean {
-    if (typeof target !== 'object' || target === null) return false;
-    const proto = Reflect.getPrototypeOf(target);
-    return proto !== null && Reflect.get(proto, Symbol.for('cno.internal.webEventTarget')) === true;
-}
-
 /**
  * Installs the tracking hooks the EventTarget polyfill reads from globals.
  * A polyfill EventTarget already reports its own listener changes, so the
@@ -486,7 +480,7 @@ function installTracking(install: TrackingInstall): void {
         listener: EventListenerOrEventListenerObject | null,
         options?: boolean | AddEventListenerOptions,
     ): void {
-        if (!listener || isEventTargetPolyfill(target)) return;
+        if (!listener) return;
         install.track(target, name, listener, options);
     });
 
@@ -496,7 +490,6 @@ function installTracking(install: TrackingInstall): void {
         listener: EventListenerOrEventListenerObject | null,
         options?: boolean | EventListenerOptions,
     ): void {
-        if (isEventTargetPolyfill(target)) return;
         install.untrack(target, name, listener, options);
     });
 

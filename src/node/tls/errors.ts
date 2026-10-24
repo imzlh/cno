@@ -1,13 +1,4 @@
-/**
- * node:tls error shaping and peer-identity checking: the X509_V_ERR_* -> Node
- * `code` table, the error factories that `authorizationError` and the emitted
- * 'error' carry, `checkServerIdentity`, and the cipher/version constants.
- *
- * `nameFailureError` delegates to `checkServerIdentity` to rebuild Node's
- * ERR_TLS_CERT_ALTNAME_INVALID from the peer certificate, and
- * `checkServerIdentity` builds it through `altNameError`, so all three belong
- * in one file. Pulls types plus the ssl native only, no sibling runtime imports.
- */
+// Pulls types plus the ssl native only, no sibling runtime imports.
 
 import type { CodedError, PeerCertificate } from './types';
 
@@ -98,15 +89,9 @@ function altNameError(reason: string, host: string, cert?: PeerCertificate): Cod
 }
 
 /**
- * Build Node's ERR_TLS_CERT_ALTNAME_INVALID for a name-check failure.
- *
- * OpenSSL reports only "hostname mismatch" / "IP address mismatch" and aborts
- * the handshake itself when SSL_set1_host is armed, so the terse text was all a
- * caller ever saw and `host`/`cert` were absent. Node names the host and lists
- * the cert's altnames. Rebuild that when the peer cert is reachable; otherwise
- * keep OpenSSL's text but still attach what we have.
- *
- * X509 codes: 62 hostname, 63 email, 64 IP address mismatch.
+ * Build Node's ERR_TLS_CERT_ALTNAME_INVALID for a name-check failure, naming the
+ * host when the peer cert is reachable. See node-internals.md "TLS secure
+ * contexts".
  */
 export function nameFailureError(
     verifyCode: number | undefined,

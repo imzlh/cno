@@ -25,12 +25,8 @@ export interface ResolvedConnectTarget {
 }
 
 /**
- * Validate `authority` and resolve the dial target.
- *
- * Exported (double-underscore = internal/test surface, as with
- * __forceH2Unavailable) so the resolution table is observable without a build
- * that has the h2 native extension. Called by connect() BEFORE ensureH2, so a
- * caller gets a useful argument error rather than a build-config message.
+ * Validate `authority` and resolve the dial target. Called by connect() before
+ * ensureH2, so argument errors beat build-config errors. @internal for tests.
  */
 export function __resolveConnectTarget(
     authority: unknown,

@@ -9,17 +9,10 @@ import type { DnsAddressType } from '@cnojs/http/dns-cache';
 import { dnsCache } from '@cnojs/http/dns-cache';
 import { wrapFsClassDec as wrap } from '../utils/wrap';
 import { shouldBypassProxy } from '../utils/proxy';
+import { getEnv } from '../utils/env';
 
 const preferIPv4 = (addrs: DnsAddressType[]): DnsAddressType =>
     addrs.find(addr => addr.family === 4) ?? addrs[0];
-
-function safeGetEnv(name: string): string | null {
-    try {
-        return os.getenv(name) ?? null;
-    } catch {
-        return null;
-    }
-}
 
 function hostForUrl(hostname: string): string {
     if (hostname.startsWith('[') && hostname.endsWith(']')) return hostname;
@@ -144,7 +137,7 @@ export class HttpClient {
 
     shouldUseProxy(url: URL): boolean {
         if (!this.options.proxy) return false;
-        const noProxy = safeGetEnv('NO_PROXY') ?? safeGetEnv('no_proxy');
+        const noProxy = getEnv('NO_PROXY') ?? getEnv('no_proxy');
         return !shouldBypassProxy(url, noProxy);
     }
 

@@ -1,5 +1,6 @@
-const os = import.meta.use('os');
 import { matchGlobPattern } from '../_internal/glob-match';
+
+const os = import.meta.use('os');
 
 type FormatInputPathObject = {
     root?: string;
@@ -43,7 +44,7 @@ type RootInfo = {
     rest: string;
 };
 
-/** Node's `Received ...` clause for ERR_INVALID_ARG_TYPE. Verified against v24.18. */
+/** Node's `Received ...` clause for ERR_INVALID_ARG_TYPE. */
 function receivedOf(actual: unknown): string {
     if (actual === null) return 'null';
     if (actual === undefined) return 'undefined';
@@ -101,9 +102,21 @@ function isWindowsDeviceRootCode(code: number): boolean {
 }
 
 /**
+ * False only when the string contains none of `\ / . :`. Such a string is
+ * already normalized, so the normalizers can be skipped.
+ */
+function hasPathSyntax(path: string): boolean {
+    const len = path.length;
+    for (let i = 0; i < len; i++) {
+        const code = path.charCodeAt(i);
+        if (code === 46 || code === 47 || code === 58 || code === 92) return true;
+    }
+    return false;
+}
+
+/**
  * Node's internal `normalizeString`: resolve `.`/`..` in the *relative* portion
- * of a path without touching the root. Ported verbatim so both flavours agree
- * with Node byte for byte.
+ * of a path without touching the root. Ported verbatim.
  */
 function normalizeString(
     path: string,
@@ -233,10 +246,8 @@ function splitRoot(path: string, windows: boolean): RootInfo {
  * Length of the root prefix, treating `/` and `\` as equally valid separators
  * and preserving whichever one the caller passed.
  *
- * `parse()` is the one operation Node does NOT normalize separators for: it
- * reports the root exactly as written, so `win32.parse('/a/b/c.js').root` is
- * `'/'` and `win32.parse('C:/a').root` is `'C:/'`. Everything else in this file
- * runs on normalized input and can keep using splitWin32Root.
+ * `parse()` is the one operation Node does NOT normalize separators for:
+ * `win32.parse('/a').root` stays `'/'`.
  */
 function win32ParseRootEnd(path: string): number {
     const len = path.length;
@@ -301,9 +312,8 @@ function normalizePosix(path: string): string {
 
 /**
  * Node prepends `.\` when a rootless win32 path contains a segment ending in
- * `:`, so the result can never be re-read as a drive-relative path
- * (`join('a','b:')` must not yield `a\b:`). Keyed off the INPUT segments, not
- * the normalized output: `normalize('a\\b:\\..\\c')` is `.\a\c`.
+ * `:`, so the result can never be re-read as drive-relative. Keyed off the
+ * INPUT segments: `normalize('a\\b:\\..\\c')` is `.\a\c`.
  */
 function win32NeedsDotGuard(input: string): boolean {
     let segStart = 0;
@@ -381,9 +391,8 @@ function normalizeWin32(path: string): string {
     if (device === undefined) {
         if (isAbsolute) return `\\${tail}`;
         // Rootless: guard so the result cannot be re-read as drive-relative.
-        // Two independent triggers, both verified against Node v24.18:
-        //   1. an INPUT segment ends in `:`  (normalize('a\\b:\\..\\c') === '.\\a\\c')
-        //   2. the normalized TAIL starts with a drive root (normalize('a\\..\\C:x') === '.\\C:x')
+        // Two triggers: an INPUT segment ends in `:`, or the normalized TAIL
+        // starts with a drive root.
         const tailIsDriveLike = tail.length > 1
             && isWindowsDeviceRootCode(tail.charCodeAt(0))
             && tail.charCodeAt(1) === CHAR_COLON;
@@ -619,16 +628,10 @@ function parseImpl(path: string, windows: boolean): ParsedPath {
     const base = path.slice(start, end);
     const dir = start <= rootLength ? root : path.slice(0, start - 1);
 
-    // Node's posix.parse contradicts its own extname for exactly one shape:
-    // a single-slash-rooted path whose only component is '..' reports
-    // ext '.' / name '.', while extname('/..') is '' and win32.parse('/..')
-    // reports ext ''. Node's carve-out for "the component is exactly .."
-    // tests `startDot === startPart + 1`, but on `/..` the backward scan
-    // breaks at the root instead of at a separator, so startPart stays 0
-    // while the slice actually starts at 1 — and the carve-out misfires.
-    // Reproduced verbatim because callers diff against Node, not the spec.
-    // Only `/..` (+ trailing separators) qualifies: `//..`, `/a/..`, `..`
-    // and `/./..` all take the ordinary path.
+    // Node's posix.parse contradicts its own extname for exactly one shape: a
+    // single-slash-rooted path whose only component is '..' reports ext/name
+    // '.', while extname('/..') is ''. Reproduced verbatim because callers diff
+    // against Node, not the spec. Only `/..` (+ trailing separators) qualifies.
     const nodePosixDotDotQuirk = !windows && base === '..'
         && root === '/' && start === rootLength;
     if (nodePosixDotDotQuirk) {
@@ -640,8 +643,7 @@ function parseImpl(path: string, windows: boolean): ParsedPath {
 
     return {
         root,
-        // No '.' -> '' collapse: Node reports parse('./a').dir as '.', and a
-        // bare '.' already yields '' here because start <= rootLength.
+        // No '.' -> '' collapse: Node reports parse('./a').dir as '.'.
         dir,
         base,
         ext,
@@ -651,8 +653,7 @@ function parseImpl(path: string, windows: boolean): ParsedPath {
 
 function formatImpl(pathObject: FormatInputPathObject, sep: '/' | '\\'): string {
     // Node: `dir || root`, and the separator is skipped exactly when dir is the
-    // root itself — not merely when dir ends in a separator. That distinction
-    // matters for posix format({root:'/',dir:'//',base:'a'}) === '///a'.
+    // root itself — e.g. posix format({root:'/',dir:'//',base:'a'}) === '///a'.
     const dir = pathObject.dir || pathObject.root || '';
     const ext = pathObject.ext ? (pathObject.ext.startsWith('.') ? pathObject.ext : `.${pathObject.ext}`) : '';
     const base = pathObject.base || `${pathObject.name ?? ''}${ext}`;
@@ -661,48 +662,72 @@ function formatImpl(pathObject: FormatInputPathObject, sep: '/' | '\\'): string 
 }
 
 /**
- * Node's win32 join: after concatenating, a *spurious* UNC prefix created by the
- * join itself must collapse to one separator. Only the FIRST argument decides —
- * `\\server` is a real UNC prefix (kept), a bare `\` or `//` is not.
- * join('/','a\\b') is `\a\b`, but normalize('/\\a\\b') is `\\a\b\`.
+ * Node's win32 join: a *spurious* UNC prefix created by the join itself
+ * collapses to one separator. Only the FIRST argument decides — `\\server` is a
+ * real UNC prefix (kept), a bare `\` or `//` is not.
  */
 function joinWin32(paths: string[]): string {
-    let joined: string | undefined;
-    let firstPart: string | undefined;
-    for (const part of paths) {
+    // Index loops and `+=` matter here: join is on every module resolve, and an
+    // iterator plus template concatenation costs ~100x Node's own join.
+    // (Empty parts are skipped above, so `joined === ''` means "no part yet".)
+    const count = paths.length;
+    let firstPart = '';
+    let joined = '';
+    for (let i = 0; i < count; i++) {
+        const part = paths[i];
         if (part.length === 0) continue;
-        if (joined === undefined) { joined = firstPart = part; }
-        else joined += `\\${part}`;
+        if (joined === '') {
+            firstPart = joined = part;
+        } else {
+            joined += '\\';
+            joined += part;
+        }
     }
-    if (joined === undefined || firstPart === undefined) return '.';
+    if (joined === '' || firstPart === '') return '.';
 
     let needsReplace = true;
     let slashCount = 0;
-    if (isWin32SepCode(firstPart.charCodeAt(0))) {
+    let code = firstPart.charCodeAt(0);
+    if (code === CHAR_FORWARD_SLASH || code === CHAR_BACKWARD_SLASH) {
         ++slashCount;
         const firstLen = firstPart.length;
-        if (firstLen > 1 && isWin32SepCode(firstPart.charCodeAt(1))) {
-            ++slashCount;
-            if (firstLen > 2) {
-                if (isWin32SepCode(firstPart.charCodeAt(2))) ++slashCount;
-                else needsReplace = false; // `\\server` — a genuine UNC root.
+        if (firstLen > 1) {
+            const second = firstPart.charCodeAt(1);
+            if (second === CHAR_FORWARD_SLASH || second === CHAR_BACKWARD_SLASH) {
+                ++slashCount;
+                if (firstLen > 2) {
+                    const third = firstPart.charCodeAt(2);
+                    if (third === CHAR_FORWARD_SLASH || third === CHAR_BACKWARD_SLASH) ++slashCount;
+                    else needsReplace = false; // `\\server` — a genuine UNC root.
+                }
             }
         }
     }
     if (needsReplace) {
-        while (slashCount < joined.length && isWin32SepCode(joined.charCodeAt(slashCount))) ++slashCount;
+        while (slashCount < joined.length) {
+            code = joined.charCodeAt(slashCount);
+            if (code !== CHAR_FORWARD_SLASH && code !== CHAR_BACKWARD_SLASH) break;
+            ++slashCount;
+        }
         if (slashCount >= 2) joined = `\\${joined.slice(slashCount)}`;
     }
     return normalizeWin32(joined);
 }
 
 function joinPosix(paths: string[]): string {
-    let joined: string | undefined;
-    for (const part of paths) {
+    let joined = '';
+    let needsNormalize = false;
+    for (let i = 0; i < paths.length; i++) {
+        const part = paths[i];
         if (part.length === 0) continue;
-        joined = joined === undefined ? part : `${joined}/${part}`;
+        if (hasPathSyntax(part)) needsNormalize = true;
+        if (joined === '') joined = part;
+        else {
+            joined += '/';
+            joined += part;
+        }
     }
-    return joined === undefined ? '.' : normalizePosix(joined);
+    return joined === '' ? '.' : needsNormalize ? normalizePosix(joined) : joined;
 }
 
 function isWinDeviceRoot(ch: string): boolean {
@@ -788,10 +813,8 @@ function parseWin32ResolvePart(path: string): { device: string; isAbsolute: bool
 function resolveImpl(paths: string[], windows: boolean): string {
     if (!windows) {
         const sep = '/';
-        // Node's posixCwd(): on Windows the cwd is translated to forward
-        // slashes AND the drive indicator is dropped, so posix.resolve('a')
-        // yields '/docs/.../a'. The path ARGUMENTS are never translated —
-        // for posix a backslash is an ordinary filename character.
+        // Node's posixCwd(): on Windows the cwd is translated to forward slashes
+        // AND the drive indicator is dropped. Path ARGUMENTS are never translated.
         const rawCwd = getCwd().replace(/\\/g, '/');
         const slash = rawCwd.indexOf('/');
         const cwd = slash === -1 ? rawCwd : rawCwd.slice(slash);
@@ -801,14 +824,11 @@ function resolveImpl(paths: string[], windows: boolean): string {
         let resolved = '';
         let resolvedAbsolute = false;
         for (let i = parts.length - 1; i >= 0 && !resolvedAbsolute; i--) {
-            // No `?? ''` here: it would mask null/undefined from assertString,
-            // so resolve('/a', null) would silently succeed instead of throwing.
+            // No `?? ''` here: it would mask null/undefined from assertString.
             const part = assertString(parts[i], i === 0 ? 'path' : `paths[${i - 1}]`);
             if (!part) continue;
-            // Node always appends the separator, so a trailing `/` on the last
-            // argument becomes an interior `//` that normalizeString collapses.
-            // Going through normalize() instead would PRESERVE it, making
-            // posix.resolve('/a/') wrongly return '/a/'.
+            // The separator is appended here so a trailing `/` becomes an interior
+            // `//` that normalizeString collapses; normalize() would PRESERVE it.
             resolved = `${part}${sep}${resolved}`;
             resolvedAbsolute = part.charCodeAt(0) === CHAR_FORWARD_SLASH;
         }
@@ -852,13 +872,16 @@ function resolveImpl(paths: string[], windows: boolean): string {
         }
     }
 
-    // Normalize only the tail segments (never run full path normalize — a
-    // leading `\\` would be misread as UNC).
+    // Normalize only the tail segments (a leading `\\` would be misread as UNC).
+    // A tail with no `.` is already its own normalization.
+    if (!resolvedTail.includes('.')) {
+        return resolvedAbsolute ? `${resolvedDevice}\\${resolvedTail}` : `${resolvedDevice}${resolvedTail}` || '.';
+    }
     const segments: string[] = [];
     for (const segment of splitSegments(resolvedTail, true)) {
         if (!segment || segment === '.') continue;
         if (segment === '..') {
-            if (segments.length > 0 && segments.at(-1) !== '..') {
+            if (segments.length > 0 && segments[segments.length - 1] !== '..') {
                 segments.pop();
                 continue;
             }
@@ -876,14 +899,9 @@ function resolveImpl(paths: string[], windows: boolean): string {
 /**
  * Faithful port of Node's `win32.relative`.
  *
- * Node compares the two *resolved* paths character by character after trimming
- * leading and trailing separators; it deliberately has **no root comparison**.
- * A segment model that bails out to the absolute `to` whenever the roots differ
- * gets `relative('\\\\srv\\share1\\a', '\\\\srv\\share2\\b')` wrong: Node walks
- * up out of the share (`..\..\share2\b`) because the leading `\\` is trimmed,
- * so `srv` is a common component like any other. The same applies to `\\?\` and
- * `\\.\` device paths. Node only returns `to` untouched when the paths diverge
- * *before* the first shared separator (e.g. `C:\a` vs `D:\b`).
+ * It has deliberately **no root comparison**: the leading `\\` is trimmed, so
+ * `srv` is a common component and `relative()` walks up out of a share rather
+ * than returning the absolute `to`. See docs/node-internals.md#path-relative.
  */
 function relativeWin32(from: string, to: string): string {
     if (from === to) return '';

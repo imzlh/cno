@@ -1,10 +1,6 @@
 import type { SocketOptions, TCPSocket, UDPSocket, UDPMessage, DirectSockets } from './types';
 import { concatChunks } from '../../utils/bytes';
 
-const stream = import.meta.use('streams');
-const udp = import.meta.use('udp');
-const os = import.meta.use('os');
-
 async function closeSocketHandleQuietly(handle: { close(): void | Promise<void> }): Promise<void> {
     try {
         await handle.close();
@@ -12,6 +8,10 @@ async function closeSocketHandleQuietly(handle: { close(): void | Promise<void> 
         // close() is best-effort once the stream side is being torn down.
     }
 }
+
+const stream = import.meta.use('streams');
+const udp = import.meta.use('udp');
+const os = import.meta.use('os');
 
 class TCPSocketImpl implements TCPSocket {
     private _tcp: CModuleStreams.TCP;

@@ -8,10 +8,7 @@
 import type { H2Header } from '@cnojs/http/h2-native';
 import { invalidArgType, invalidArgValue } from './errors';
 
-/* ── Node header-validation helpers (compat layer) ──────────────
- * These mirror node/lib/internal/http2/compat.js. Measured against node
- * v24.18.0 rather than ported blind; each divergence is commented.
- */
+/* Node header-validation helpers, mirroring node/lib/internal/http2/compat.js. */
 
 // Node: checkIsHttpToken() — RFC 7230 3.2.6 tchar set.
 export const HTTP_TOKEN_RE = /^[\^_`a-zA-Z\-0-9!#$%&'*+.|~]+$/;
@@ -100,23 +97,9 @@ export function toHeaderPairs(headers: Record<string, unknown>): H2Header[] {
 }
 
 /**
- * Declared `content-length`, or null when absent/unusable.
- *
- * Load-bearing for data integrity, not just a nicety. @cnojs/http/h2 records
- * end-of-body in a single `ended` flag that is set identically by a real
- * END_STREAM, by acceptEnd(), and by acceptClose() — and acceptClose() only
- * raises a stream error when the RST_STREAM code is non-zero. nghttp2's
- * cb_stream_close (http/ext-h2/http2.c:388) fires for every close with the wire
- * code verbatim, so a peer that sends HEADERS + partial DATA + RST_STREAM(0)
- * produces a stream that is byte-for-byte indistinguishable from a clean
- * finish: the consumer sees `end`, readableEnded === true, and no error.
- * nghttp2's own content-length validation cannot cover this — it only runs on a
- * real END_STREAM, and RST_STREAM is a legitimate early termination.
- *
- * Comparing delivered bytes against the declared length is therefore the only
- * signal available at this layer. It also catches the opposite direction: h2's
- * acceptData() guards on `closed` but not on `ended`, so DATA arriving after
- * END_STREAM is appended to a body the consumer has not read yet.
+ * Declared `content-length`, or null when absent/unusable. The only integrity
+ * signal here: HEADERS + partial DATA + RST_STREAM(0) otherwise reads as a clean
+ * finish. See node-internals.md "h2 body truncation".
  */
 export function declaredContentLength(pairs: H2Header[] | null): number | null {
     if (!pairs) return null;

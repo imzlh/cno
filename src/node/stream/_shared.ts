@@ -1,17 +1,7 @@
-/**
- * node:stream — helpers shared by more than one of the stream classes.
- *
- * Everything here has at least two consumers, or owns state that must exist
- * exactly once in the process:
- *   - `baseStreamStates`, the side table a bare Stream records emitClose/closed
- *     in. Written by initStream, read by Stream.prototype.destroy and the
- *     `closed` getter, so a second copy would split the state.
- *   - `defaultByteHighWaterMark` / `defaultObjectHighWaterMark`, reassigned by
- *     setDefaultHighWaterMark and read by every init*(); a duplicate would make
- *     setDefaultHighWaterMark a silent no-op for some streams.
- * The readable-state helpers are used by Duplex as well as Readable, and
- * maybeAutoDestroy / collectReadableToArray are used across all three, which is
- * why none of them can live in a class file.
+/*
+ * node:stream — helpers shared by more than one stream class. State here
+ * (`baseStreamStates`, the default high-water marks) must exist exactly once
+ * per process: a duplicate makes setDefaultHighWaterMark a silent no-op.
  */
 
 import { EventEmitter } from '../events';
@@ -483,12 +473,9 @@ export function unshiftReadableChunk(stream: Readable | Duplex, chunk: unknown, 
 }
 
 /* Node's unpipe() pauses the source once its last pipe is gone. Leaving
- * `flowing` true is what loses data: push() then takes its flowing branch and
- * emits 'data' to zero listeners, so every chunk produced after the unpipe is
- * dropped on the floor instead of staying buffered for the next consumer.
- * Only pauses when a pipe was actually removed (an unpipe() naming a
- * never-piped destination, or with nothing piped at all, is a no-op in node)
- * and only when no pipes remain (unpiping one of two keeps the source flowing). */
+ * `flowing` true drops every chunk produced after the unpipe: push() emits
+ * 'data' to zero listeners instead of buffering. Only when a pipe was actually
+ * removed and none remain. */
 export function unpipeDestinations(source: Readable | Duplex, destination?: Writable): void {
     const destinations = destination ? [destination] : [...source._pipedDestinations];
     let removedAny = false;
@@ -510,14 +497,9 @@ export function unpipeDestinations(source: Readable | Duplex, destination?: Writ
 }
 
 /**
- * node's errorOrDestroy(): a stream error tears the stream down rather than
- * merely announcing itself, which is what emits 'close' and releases the
- * underlying resource. Emitting 'error' alone (as this did) left the stream
- * alive — destroyed stayed false, 'close' never came, an fs WriteStream leaked
- * its fd, and the still-writable stream accepted the next chunk and emitted a
- * SECOND 'error'. Measured against node 24: destroy happens only under
- * autoDestroy; with autoDestroy:false node emits 'error' and leaves the stream
- * undestroyed.
+ * node's errorOrDestroy(): a stream error tears the stream down, emitting
+ * 'close' and releasing the resource; 'error' alone leaks (an fs WriteStream
+ * keeps its fd). Only under autoDestroy.
  */
 export function writableErrorOrDestroy(stream: Writable, err: Error): void {
     const state = stream._writableState;

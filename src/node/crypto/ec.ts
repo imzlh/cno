@@ -170,19 +170,10 @@ export function getCurves(): string[] {
 }
 
 /**
- * Node's one-shot key agreement. The algorithm comes from the keys, so this must
- * accept every agreement type Node does -- X25519/X448 and DH as well as EC --
- * in whatever encoding the KeyObject happens to hold.
- *
- * It previously required BOTH keys to be `raw` EC, which is only what our own
- * `generateKeyPairSync('ec')` produces. Every other origin failed: an X25519
- * pair (generated as PKCS#8/SPKI DER, and the only type some callers use) and
- * any key from `createPrivateKey`/`createPublicKey` on a PEM/DER both threw
- * "Only raw EC KeyObjects are supported by diffieHellman".
- *
- * Two paths, because `raw` is an internal format of ours that carries no
- * algorithm identifier -- for raw keys the curve is known only from
- * `asymmetricKeyDetails`, so those go to the curve-fixed native entry point.
+ * Node's one-shot key agreement: the algorithm comes from the keys, so X25519/
+ * X448 and DH work as well as EC. Raw keys carry no algorithm identifier, so
+ * their curve comes only from `asymmetricKeyDetails` and they use the
+ * curve-fixed native entry point; everything else is read by the native layer.
  */
 export function diffieHellman(options: { privateKey: KeyObject; publicKey: KeyObject }): Buffer {
     const privateKey = options?.privateKey;
@@ -209,18 +200,15 @@ export function diffieHellman(options: { privateKey: KeyObject; publicKey: KeyOb
         return Buffer.from(new Uint8Array(ecdhComputeSecret(privateCurve, privateKey[kKeyData], publicKey[kKeyData])));
     }
 
-    // A raw key paired with an encoded one still works: the native loaders fall
-    // back to raw EC parsing. That fallback infers the curve from the byte
-    // length, which cannot express secp256k1 (32 bytes, same as P-256), so
-    // refuse rather than silently deriving on the wrong curve.
+    // Mixed raw/encoded: the native raw fallback infers the curve from the byte
+    // length, which cannot express secp256k1 (32 bytes, same as P-256).
     for (const [key, raw] of [[privateKey, privateRaw], [publicKey, publicRaw]] as const) {
         if (raw && key.asymmetricKeyDetails?.namedCurve === 'secp256k1') {
             throw new TypeError('A raw secp256k1 KeyObject must be paired with another raw KeyObject');
         }
     }
 
-    // The native layer reads the algorithm out of the key material, which is what
-    // makes X25519/X448/DH work without special-casing each of them here.
+    // The native layer reads the algorithm out of the key material.
     return Buffer.from(new Uint8Array(crypto.deriveSharedSecret(privateKey[kKeyData], publicKey[kKeyData])));
 }
 

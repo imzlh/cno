@@ -6,6 +6,55 @@
 
 import { addPromiseHook, PromiseState } from '../_internal/promise-hook';
 
+const engine = import.meta.use('engine');
+
+// The promise builtin reports every continuation it registers (a `.then`
+// result) to the promise hook, but the hook itself cannot tell which promise a
+// new continuation runs after. This hook is the innermost link of the
+// dispatcher chain (see _internal/promise-hook) and only forwards the
+// continuation events to `_onContinuation`; the dispatcher replaces the engine
+// hook whenever it is (re)installed, so it asks async_hooks to wrap again.
+const CONTINUATION = 4;
+let continuationSink: ((result: Promise<unknown>, target: Promise<unknown>) => void) | null = null;
+const publishedHook = Reflect.get(globalThis, '__cnoPromiseHook');
+let installedHook: unknown = undefined;
+let installedContinuations = 0;
+const wrappedHook = (state: number, promise: Promise<unknown>, target?: Promise<unknown>, extra?: Promise<unknown>): void => {
+    if (state === CONTINUATION) {
+        installedContinuations++;
+        if (continuationSink !== null && typeof extra === 'object' && extra !== null) continuationSink(promise, extra);
+    } else {
+        installedContinuations = 0;
+    }
+    if (typeof publishedHook === 'function') publishedHook(state, promise, target, extra);
+};
+function ensureContinuationHook(): void {
+    const current = engine.promiseHook();
+    if (installedContinuations === 0 || current !== wrappedHook) {
+        installedContinuations = 0;
+        installedHook = current;
+        engine.promiseHook(wrappedHook);
+    }
+}
+function onContinuation(result: Promise<unknown>, target: Promise<unknown>): void {
+    ensureContinuationHook();
+    if (continuationSink !== null) continuationSink(result, target);
+}
+Reflect.set(globalThis, '__cnoOnContinuation', onContinuation);
+Reflect.set(globalThis, '__cnoOnPromiseHookThisInstalled', (): void => {
+    installedHook = undefined;
+    installedContinuations = 0;
+});
+
+/**
+ * The chain a continuation captured when it was registered (see the
+ * __cnoOnContinuation hook above). A continuation inherits from the promise it
+ * runs after, which may have been created in another context; the engine does
+ * not report that promise to the promise hook. An entry is dropped once the
+ * inherited chain is settled, and anything left is collected with its promise.
+ */
+const _continuationStores = new WeakMap<Promise<unknown>, StoreChain>();
+
 export type AsyncId = number;
 export type TriggerAsyncId = number;
 
@@ -27,7 +76,6 @@ export interface AsyncResourceOptions {
     requireManualDestroy?: boolean;
 }
 
-type StoreMap = Map<AsyncLocalStorage<unknown>, unknown>;
 type TimerHandle = unknown;
 type AnyCallable = (...args: unknown[]) => unknown;
 
@@ -36,7 +84,7 @@ interface AsyncState {
     type: string;
     triggerId: TriggerAsyncId;
     resource: object;
-    stores: StoreMap;
+    stores: StoreChain;
 }
 
 interface TimerState {
@@ -49,7 +97,7 @@ interface TimerState {
 let _nextId = 2;
 let _currentId: AsyncId = 1;
 let _currentTriggerId: TriggerAsyncId = 0;
-let _currentStores: StoreMap = new Map();
+let _currentStores = createStoreChain(null, null as unknown as AsyncLocalStorage<unknown>, undefined, false);
 let _currentResource: object = {};
 let _timersPatchInstalled = false;
 
@@ -88,8 +136,38 @@ function emitPromiseResolve(id: AsyncId): void {
     }
 }
 
-function snapshotStores(): StoreMap {
-    return new Map(_currentStores);
+type StoreChain = {
+    parent: StoreChain | null;
+    depth: number;
+    store: AsyncLocalStorage<unknown>;
+    value: unknown;
+    hasValue: boolean;
+};
+
+function createStoreChain(parent: StoreChain | null, store: AsyncLocalStorage<unknown>, value: unknown, hasValue: boolean): StoreChain {
+    return { parent, depth: parent === null ? 0 : parent.depth + 1, store, value, hasValue };
+}
+
+/**
+ * The active stores as a persistent chain of (store, value) links rather than
+ * a copied Map: `parent` is the chain an entry was derived from. run,
+ * enterWith, exit and disable then allocate one link instead of copying the
+ * whole map, and a captured state keeps its own chain, so a later write in
+ * another context cannot be observed through it.
+ */
+function lookupStore(chain: StoreChain, store: AsyncLocalStorage<unknown>): StoreChain | undefined {
+    for (let node: StoreChain | null = chain; node !== null; node = node.parent) {
+        if (node.store === store) return node;
+    }
+    return undefined;
+}
+
+function pushStore(chain: StoreChain, store: AsyncLocalStorage<unknown>, value: unknown, hasValue: boolean): StoreChain {
+    return createStoreChain(chain, store, value, hasValue);
+}
+
+function snapshotStores(): StoreChain {
+    return _currentStores;
 }
 
 function createState(
@@ -130,7 +208,7 @@ function runInState<T>(state: AsyncState, callback: AnyCallable, thisArg: unknow
 
     _currentId = state.id;
     _currentTriggerId = state.triggerId;
-    _currentStores = new Map(state.stores);
+    _currentStores = state.stores;
     _currentResource = state.resource;
     emitBefore(state.id);
 
@@ -147,10 +225,18 @@ function runInState<T>(state: AsyncState, callback: AnyCallable, thisArg: unknow
 
 function wrapCallback<T>(callback: T, state: AsyncState, finalize = false): T {
     if (!isCallable(callback)) return callback;
+    const callbackStores = state.stores;
     const wrapped = function(this: unknown, ...args: unknown[]) {
+        // The task wrapper would otherwise only restore this chain when the
+        // result settles. A callback that returns a promise leaves the
+        // microtasks queued by its synchronous part running under the caller's
+        // context instead of this one, so restore it first.
+        const prevStores = _currentStores;
+        _currentStores = callbackStores;
         try {
             return runInState(state, callback, this, args);
         } finally {
+            _currentStores = prevStores;
             if (finalize) {
                 emitPromiseResolve(state.id);
                 emitDestroy(state.id);
@@ -162,15 +248,29 @@ function wrapCallback<T>(callback: T, state: AsyncState, finalize = false): T {
 
 function installPromiseHook(): void {
     if (_promiseHookStop) return;
+    continuationSink = (result: Promise<unknown>, target: Promise<unknown>): void => {
+        const e = new Error();
+        console.log('SINK', _promiseStates.has(target), _continuationStores.has(target), String(e.stack).split(String.fromCharCode(10)).slice(2, 6).join(' <- '));
+        const captured = _continuationStores.get(target);
+        if (captured !== undefined) {
+            _continuationStores.delete(target);
+            _continuationStores.set(result, captured);
+            return;
+        }
+        const state = _promiseStates.get(target);
+        if (state) _continuationStores.set(result, state.stores);
+    };
     _promiseHookStop = addPromiseHook((nativeState, promise, parent) => {
         switch (nativeState) {
             case PromiseState.CONSTRUCT: {
                 const parentState = parent ? _promiseStates.get(parent) : undefined;
+                const captured = _continuationStores.get(promise);
+                if (captured !== undefined) _continuationStores.delete(promise);
                 const state = createState(
                     'PROMISE',
                     parentState?.id ?? _currentId,
                     promise,
-                    parentState ? new Map(parentState.stores) : snapshotStores(),
+                    captured ?? (parentState ? parentState.stores : snapshotStores()),
                 );
                 _promiseStates.set(promise, state);
                 break;
@@ -184,7 +284,7 @@ function installPromiseHook(): void {
                     const prevResource = _currentResource;
                     _currentId = state.id;
                     _currentTriggerId = state.triggerId;
-                    _currentStores = new Map(state.stores);
+                    _currentStores = state.stores;
                     _currentResource = state.resource;
                     emitBefore(state.id);
                     // Restore will happen in AFTER_THEN
@@ -220,6 +320,8 @@ function uninstallPromiseHook(): void {
     if (_hooks.length > 0) return;
     _promiseHookStop();
     _promiseHookStop = null;
+    continuationSink = null;
+    _continuationStores.clear();
 }
 
 function destroyTimer(entry: TimerState): void {
@@ -407,8 +509,7 @@ export class AsyncResource {
 export class AsyncLocalStorage<T = unknown> {
     run<R, A extends unknown[]>(store: T, callback: (...args: A) => R, ...args: A): R {
         const prevStores = _currentStores;
-        _currentStores = new Map(_currentStores);
-        _currentStores.set(this, store);
+        _currentStores = pushStore(_currentStores, this, store, true);
         try {
             return callback(...args);
         } finally {
@@ -418,8 +519,7 @@ export class AsyncLocalStorage<T = unknown> {
 
     exit<R, A extends unknown[]>(callback: (...args: A) => R, ...args: A): R {
         const prevStores = _currentStores;
-        _currentStores = new Map(_currentStores);
-        _currentStores.delete(this);
+        _currentStores = pushStore(_currentStores, this, undefined, false);
         try {
             return callback(...args);
         } finally {
@@ -428,17 +528,16 @@ export class AsyncLocalStorage<T = unknown> {
     }
 
     getStore(): T | undefined {
-        return _currentStores.get(this) as T | undefined;
+        const entry = lookupStore(_currentStores, this);
+        return (entry && entry.hasValue ? entry.value : undefined) as T | undefined;
     }
 
     enterWith(store: T): void {
-        _currentStores = new Map(_currentStores);
-        _currentStores.set(this, store);
+        _currentStores = pushStore(_currentStores, this, store, true);
     }
 
     disable(): void {
-        _currentStores = new Map(_currentStores);
-        _currentStores.delete(this);
+        _currentStores = pushStore(_currentStores, this, undefined, false);
     }
 
     destroy(): void {
@@ -449,7 +548,7 @@ export class AsyncLocalStorage<T = unknown> {
         const stores = snapshotStores();
         return (...args: unknown[]) => {
             const prevStores = _currentStores;
-            _currentStores = new Map(stores);
+            _currentStores = stores;
             try {
                 if (fn) return fn(...args);
                 const callback = args[0];
@@ -464,7 +563,7 @@ export class AsyncLocalStorage<T = unknown> {
         const stores = snapshotStores();
         return (function(this: unknown, ...args: Parameters<T>) {
             const prevStores = _currentStores;
-            _currentStores = new Map(stores);
+            _currentStores = stores;
             try {
                 return fn.apply(this, args);
             } finally {

@@ -1,7 +1,7 @@
 /**
  * Normalize Windows synchronous-fs errors where CRT and Win32 codes diverge.
- * Numeric remaps are Windows-only; asyncfs already reports libuv codes and
- * must never pass through them.
+ * Numeric remaps are Windows-only; asyncfs reports correct libuv codes and must
+ * never pass through them.
  */
 
 import { toErrnoException } from '../_internal/errno';
@@ -12,9 +12,8 @@ const error = import.meta.use('error');
 const os = import.meta.use('os');
 
 /**
- * Platform gate. Matches `fs/constants.ts` in this directory rather than
- * `process.platform` so the check stays inside the native-module layer and does
- * not pull `process` into an `fs` dependency.
+ * Platform gate. Reads `os.platform` rather than `process.platform` so this
+ * native-module layer does not pull `process` in.
  */
 const isWindows = os.platform === 'windows' || os.platform === 'win32';
 
@@ -63,8 +62,8 @@ const TWO_PATH_SYSCALLS = new Set(['rename', 'copyFile', 'link', 'symlink']);
 
 /**
  * Syscalls that read/write file contents, so a directory target is EISDIR.
- * `truncate` is deliberately NOT here: measured on v24.18.0, truncate of a
- * directory is EINVAL in Node, not EISDIR. It is handled by its own rule below.
+ * `truncate` is deliberately NOT here (its own rule below): truncate of a
+ * directory is EINVAL in Node.
  */
 const CONTENT_SYSCALLS = new Set(['readFile', 'writeFile', 'appendFile', 'open', 'read', 'write']);
 
@@ -119,12 +118,10 @@ const fdFromPath = (p?: string): number => {
 };
 
 /**
- * Is this fd definitely not an open descriptor? `fstat` is the discriminator:
- * the fd syscalls report a code left behind by a prior Win32 call, because the
- * failing step is `_get_osfhandle(fd)`, a CRT call that sets CRT errno and not
- * the Win32 last-error. Probing the fd is deterministic.
- *
- * Not platform-gated: EBADF for a closed descriptor is the POSIX answer too.
+ * Is this fd definitely not an open descriptor? The fd syscalls report a code
+ * left behind by a prior Win32 call (`_get_osfhandle` sets CRT errno, not the
+ * Win32 last-error), so `fstat` probes the fd directly. Not platform-gated:
+ * EBADF for a closed descriptor is the POSIX answer too.
  */
 const isBadFd = (fd: number): boolean => {
     if (fd < 0) return false;
@@ -164,8 +161,8 @@ export function correctSyncErrno(raw: number, syscall?: string, path?: string, d
     // Ungated: a provably-closed descriptor is EBADF on every platform. See failedOnBadFd.
     if (failedOnBadFd(syscall, path)) return UV_EBADF;
 
-    // Every rule below encodes a Windows-measured value; on POSIX the EXDEV,
-    // share-violation and read-only rules would each turn a correct errno wrong.
+    // Every rule below encodes a Windows-measured value; on POSIX it would turn
+    // a correct errno wrong.
     if (!isWindows) return raw;
 
     // readdir/opendir on a plain file reports the CRT's ENOENT; Node says ENOTDIR.
@@ -180,10 +177,9 @@ export function correctSyncErrno(raw: number, syscall?: string, path?: string, d
         return UV_EEXIST;
     }
 
-    // Since mod_fs.c decodes CRT errno correctly, `rename` onto an existing entry
-    // now arrives as a genuine UV_EEXIST rather than the mangled UV_EXDEV above.
-    // Node still reports EPERM when the blocker is a directory, so apply the same
-    // rule to an already-correct EEXIST.
+    // Since mod_fs.c decodes CRT errno correctly, rename onto an existing entry
+    // arrives as a genuine UV_EEXIST. Node still reports EPERM for a directory
+    // blocker, the same rule as the UV_EXDEV branch above.
     if (raw === UV_EEXIST && TWO_PATH_SYSCALLS.has(base)) {
         const blocking = dest ?? path;
         if (blocking && isDir(blocking)) return UV_EPERM;
@@ -212,8 +208,8 @@ export function correctSyncErrno(raw: number, syscall?: string, path?: string, d
     // Retained for the paths mod_fs.c does not route through fs_errno2uv (and
     // for CRT EPERM(1), which still decodes to ERROR_INVALID_FUNCTION).
     if (raw === UV_EINVAL) {
-        // rmdir of a non-directory: Windows says "not a directory", Node reports
-        // ENOENT — there is no *directory* of that name (measured v24.18.0).
+        // rmdir of a non-directory: Node reports ENOENT — no *directory* of that
+        // name.
         if (base === 'rmdir' && path && lexists(path) && !isDir(path)) return UV_ENOENT;
         if (UNLINK_SYSCALLS.has(base) && path && isDir(path)) return UV_EPERM;
         if (CONTENT_SYSCALLS.has(base) && path && isDir(path)) return UV_EISDIR;
@@ -226,8 +222,7 @@ export function correctSyncErrno(raw: number, syscall?: string, path?: string, d
     if (raw === UV_UNKNOWN) {
         if (path && isNonEmptyDir(path)) return UV_ENOTEMPTY;
         // symlink/link via GetLastError lose ERROR_ALREADY_EXISTS on this host.
-        // A directory already in the way is EPERM in Node, not EEXIST — same
-        // distinction as the UV_EXDEV branch above.
+        // A directory already in the way is EPERM in Node, not EEXIST.
         if (EEXIST_SYSCALLS.has(base) && path && lexists(path)) {
             return isDir(path) ? UV_EPERM : UV_EEXIST;
         }
@@ -248,51 +243,34 @@ export function fixSyncError(e: unknown, syscall?: string, path?: string, dest?:
 
     // Native readlink/symlink/copyFile failures arrive as a bare TypeError with a
     // localized message and no errno. Probe the filesystem — never parse the
-    // message (it is localized; this host reports Chinese).
-    //
-    // These C throw sites are NOT Windows-only (`mod_fs.c` throws a bare
-    // TypeError on the POSIX leg too, e.g. "Source is not a regular file" at the
-    // `!S_ISREG` check), so this block stays live on every platform. The *value*
-    // still differs per platform and is selected explicitly below.
+    // message. These throw sites exist on POSIX too; only the *value* below is
+    // platform-selected.
     if (raw === undefined) {
         const base = baseSyscall(syscall);
 
         // `mod_fs.c` rejects several fd operations with a bare TypeError carrying
-        // no errno (futimes, fchown). An errno-less throw on a provably-closed fd
-        // is EBADF. Checked first: it needs no path probing.
+        // no errno. Checked first: it needs no path probing.
         if (failedOnBadFd(syscall, path)) return rebuild(e, UV_EBADF, syscall, path);
 
-        // A directory already in the way is EPERM in Node on Windows; a file is
-        // EEXIST (measured v24.18.0: symlink onto a dir → EPERM even when empty).
-        // POSIX has no such split — `symlink(2)`/`link(2)`/`mkdir(2)` onto any
-        // existing name is EEXIST — so the isDir refinement is Windows-only.
+        // A directory already in the way is EPERM in Node on Windows; POSIX
+        // symlink(2)/link(2)/mkdir(2) report EEXIST for any existing name.
         if (path && EEXIST_SYSCALLS.has(base) && lexists(path)) {
             return rebuild(e, isWindows && isDir(path) ? UV_EPERM : UV_EEXIST, syscall, path);
         }
 
-        // readlink of a non-reparse-point is EINVAL; of a missing path, ENOENT.
-        // Holds for a plain file and for a directory (measured, empty or not).
-        // Ungated: EINVAL/ENOENT is also exactly what `readlink(2)` reports, so
-        // the rule is correct on POSIX. (It is unreachable there in practice —
-        // the POSIX leg of `tjs_syncfs_readlink` already routes through
-        // `tjs_throw_errno_path`, so `raw` is a number — but it costs nothing.)
+        // readlink of a non-reparse-point is EINVAL; of a missing path, ENOENT —
+        // also exactly what readlink(2) reports, so the rule is ungated.
         if (path && base === 'readlink' && !isSymlink(path)) {
             return rebuild(e, lexists(path) ? UV_EINVAL : UV_ENOENT, syscall, path);
         }
 
-        // copyFile onto a directory is EPERM on Windows; POSIX gets EISDIR from
-        // `uv__fs_copyfile` opening the destination `O_WRONLY|O_CREAT`
-        // (REASONED from vendored libuv, not measured). `path` is the SOURCE, so
-        // the blocker is read from `dest`.
+        // copyFile onto a directory is EPERM on Windows, EISDIR on POSIX (from
+        // libuv opening the destination). `path` is the SOURCE.
         if (base === 'copyFile' && dest && isDir(dest)) {
             return rebuild(e, isWindows ? UV_EPERM : UV_EISDIR, syscall, path);
         }
 
-        // copyFile *from* a directory is EPERM in Node on Windows; on POSIX Node
-        // gets EISDIR from reading the directory fd (REASONED, same libuv
-        // reading). Both C legs throw a bare errno-less TypeError before touching
-        // the FS, so it would arrive as code 'UNKNOWN'. Checked after the dest
-        // rule so a dir->dir copy still reports on the same footing.
+        // copyFile from a directory: same split, checked after the dest rule.
         if (base === 'copyFile' && path && isDir(path)) {
             return rebuild(e, isWindows ? UV_EPERM : UV_EISDIR, syscall, path);
         }
@@ -309,9 +287,8 @@ export function fixSyncError(e: unknown, syscall?: string, path?: string, dest?:
  * Rebuild so the message matches the corrected code, keeping the stack.
  *
  * An fd syscall's `path` is the synthetic `fd:N` form, which Node never puts in
- * a message — measured v24.18.0: `fsyncSync(9999)` reports exactly
- * "EBADF: bad file descriptor, fsync", with no path clause. So suppress the
- * clause for fd paths rather than quoting a string no real Node ever prints.
+ * a message (`fsyncSync(9999)` is "EBADF: bad file descriptor, fsync"), so
+ * suppress the path clause for fd paths.
  */
 function rebuild(e: Error, code: number, syscall?: string, path?: string): Error {
     const name = baseSyscall(syscall);
@@ -344,9 +321,9 @@ function toFsErrnoException(
 }
 
 /**
- * Drop-in replacement for `_internal/errno`'s toErrnoException for errors that
- * came out of the native *sync* fs module. Never use on asyncfs errors: those
- * already carry correct UV codes and a real EXDEV would be rewritten to EEXIST.
+ * Drop-in replacement for `_internal/errno`'s toErrnoException for errors from
+ * the native *sync* fs module. Never use on asyncfs errors: those carry correct
+ * UV codes and a real EXDEV would be rewritten to EEXIST.
  */
 export function toSyncErrnoException(
     e: unknown,
@@ -377,9 +354,9 @@ export function wrapSync<T>(
 /**
  * `syscall`-correcting wrapper for the **async** fs layers (callbacks, promises).
  *
- * Deliberately does NOT call `fixSyncError`: asyncfs goes through libuv and its
- * errno values are already correct, so the numeric corrections would corrupt
- * them (a genuine EXDEV would become EEXIST). Only the syscall name is fixed.
+ * Deliberately does NOT call `fixSyncError`: asyncfs errno values are already
+ * correct, and the numeric corrections would corrupt them. Only the name is
+ * fixed.
  */
 export function toAsyncFsErrnoException(
     e: unknown,
@@ -403,10 +380,9 @@ export function wrapFsPromise<T>(
 }
 
 /**
- * `normalizeErrnoError` for the async fs layers: preserves ordinary JS errors but
- * gives errno errors Node's shape *and* the libuv syscall name. Same reason
- * `toAsyncFsErrnoException` exists — the `_internal` version is shared with
- * modules whose syscall names must not be remapped.
+ * `normalizeErrnoError` for the async fs layers: preserves ordinary JS errors,
+ * gives errno errors Node's shape plus the libuv syscall name. Split from
+ * `_internal` because other modules must not have their syscall names remapped.
  */
 export function normalizeFsErrnoError(
     e: unknown,

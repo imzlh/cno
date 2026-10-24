@@ -11,7 +11,7 @@ import { matchesErrnoCode, normalizeErrnoError } from '../_internal/errno';
 import { onNetServerSocket } from '../diagnostics_channel/builtins';
 import {
     closeCounting,
-    closePipeQuietly,
+    closeQuietly,
     emitListenErrorAsync,
     emitListeningAsync,
     flattenPrototype,
@@ -269,7 +269,7 @@ Server.prototype.listen = function listen(
             emitListeningAsync(this);
         } catch (err) {
             this._handleClosed = true;
-            closePipeQuietly(this._pipe);
+            closeQuietly(this._pipe);
             emitListenErrorAsync(this, toListenError(err, pipePath));
         }
         return this;
@@ -336,7 +336,7 @@ Server.prototype.listen = function listen(
         // (ERR_SERVER_NOT_RUNNING) while _listening is false, so the standard
         // EADDRINUSE retry would otherwise leak this fd.
         this._handleClosed = true;
-        try { this._tcp?.close(); } catch { /* already gone */ }
+        closeQuietly(this._tcp ?? { close() {} });
         emitListenErrorAsync(this, toListenError(err, host, port ?? 0));
         return this;
     }

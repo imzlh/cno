@@ -83,21 +83,8 @@ export function normalizeHeaderValue(value: unknown): string | undefined {
 }
 
 /**
- * Node's duplicate-header merge rules for an *incoming* message's `headers`
- * object (`headersDistinct` always keeps every value, so it is unaffected).
- *
- * Measured against node v24 with a raw peer sending the same name twice
- * (/d/tmp/ag-http/p12-dup.js). Node has three behaviours, not one:
- *   - `set-cookie`  -> array of every value
- *   - the discard list below -> FIRST value wins, later copies dropped
- *   - `cookie`      -> joined with "; "
- *   - everything else -> joined with ", "
- * cno previously turned *every* duplicate into an array, so 28 of the 30 names
- * probed disagreed with node: `res.headers['content-type']` came back as
- * ["A","B"] where node gives "A", and `x-custom` as ["A","B"] where node gives
- * "A, B". Any consumer calling .split()/.toLowerCase()/.includes() on a header
- * value hit "not a function" only when a duplicate happened to arrive, which is
- * exactly the input a caller never tests with.
+ * Node's duplicate-header merge rules for `headers` (never turn every duplicate
+ * into an array). See node-internals.md "Duplicate header merge".
  */
 const SINGLE_VALUE_HEADERS = new Set([
     'age', 'authorization', 'content-length', 'content-type', 'etag', 'expires',

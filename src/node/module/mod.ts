@@ -70,11 +70,10 @@ type CommonJSWrapper = (
 ) => unknown;
 
 /**
- * Node exposes ONE `require.extensions` object process-wide: `Module._extensions`,
- * `require.extensions` and every `createRequire(...).extensions` are the same
- * reference. cts hands out a fresh object per mkRequire() call, so registering a
- * handler there is silently lost. Own the map here instead and have `_load`
- * consult it — that is what pirates / ts-node / @babel/register mutate.
+ * Node has ONE process-wide `require.extensions` object shared by
+ * `Module._extensions`, `require.extensions` and every `createRequire().extensions`;
+ * cts hands out a fresh object per mkRequire(), so handlers must live here and
+ * be consulted by `_load`.
  */
 const _extensionsStore: RequireExtensionMap = Object.create(null) as RequireExtensionMap;
 
@@ -288,27 +287,17 @@ export function _pathFilename(filename: string): string {
 }
 
 /**
- * Builtins Node exposes ONLY under the `node:` prefix, never bare. Measured on
- * v24.18.0: `builtinModules` contains the literal strings `node:sea`,
- * `node:sqlite`, `node:test`, `node:test/reporters`, and `isBuiltin('test')` is
- * **false** while `isBuiltin('node:test')` is true. The asymmetry is deliberate
- * upstream — a bare `test` would shadow a user's own `./test` module.
- *
- * cts's own builtin list is bare-name-only, so these were missing entirely:
- * `isBuiltin('node:sqlite')` was false even though `import('node:sqlite')`
- * works. That matters because bundlers and resolvers call `isBuiltin` to decide
- * what to externalise, so a false answer makes them try to fetch it from npm.
- *
- * Declared here rather than beside isBuiltin() because builtinModules' Proxy
- * (below) also needs it, and a `const` is not hoisted.
+ * Builtins exposed ONLY under the `node:` prefix (`isBuiltin('test')` is false,
+ * `isBuiltin('node:test')` is true). cts's builtin list is bare-name-only, and
+ * resolvers use `isBuiltin` to decide what to externalise. Defined here only
+ * because the builtinModules Proxy below needs it (a `const` is not hoisted).
  */
 const PREFIX_ONLY_BUILTINS = ['node:sea', 'node:sqlite', 'node:test', 'node:test/reporters'];
 
 const builtinModulesTarget: string[] = [];
 /**
- * Node's `builtinModules` lists bare names plus the four `node:`-prefixed-only
- * entries (see PREFIX_ONLY_BUILTINS below). cts tracks only bare names, so the
- * prefixed ones are appended here rather than being absent.
+ * Node's `builtinModules` lists bare names plus the PREFIX_ONLY_BUILTINS
+ * entries, which cts does not track.
  */
 function allBuiltinModules(): string[] {
     const bare = getBuiltinModules();
@@ -749,12 +738,10 @@ export function _resolveLookupPaths(request: string, parent?: { paths?: string[]
 }
 
 /**
- * The CJS load funnel. Patching this (require-in-the-middle, APM agents) is
- * observable for every require produced by `createRequire`.
- *
- * Fast path: with no hooks and a pristine extension table, delegate straight to
- * cts so the bytecode cache, TS transform and ESM interop all keep working.
- * Slow path: only once user code registers a hook or an extension handler.
+ * The CJS load funnel; patching this (require-in-the-middle, APM agents) is
+ * observable for every require from `createRequire`. With no hooks and a
+ * pristine extension table it delegates straight to cts, so the bytecode cache,
+ * TS transform and ESM interop keep working.
  */
 export function _load(request: string, parent?: { filename?: string } | null, isMain?: boolean): unknown {
     const rawParent = parent?.filename ?? join(os.cwd, '__cno_module__.js');

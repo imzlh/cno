@@ -235,12 +235,13 @@ export class Response implements globalThis.Response {
     }
 
     get [Symbol.toStringTag](): string { return 'Response'; }
+
+    /** Rebuild a 101 Switching Protocols response (see `server-response.ts`). */
+    static switchingProtocols(init: ResponseInit): Response {
+        return new Response(null, { ...init, status: 101, [allowSwitchingProtocols]: true } as InternalResponseInit);
+    }
 }
 
 export function setResponseMetadata(response: Response, metadata: InternalResponseMetadata): void {
     response[setResponseMetadataToken](metadata);
-}
-
-export function createSwitchingProtocolsResponse(init: ResponseInit): Response {
-    return new Response(null, { ...init, status: 101, [allowSwitchingProtocols]: true } as InternalResponseInit);
 }

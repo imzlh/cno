@@ -257,13 +257,8 @@ export function resolvesOnPath(command: string): boolean {
 }
 
 /**
- * A `cwd` that is not an existing directory is its own ENOENT, independent of
- * whether the command resolves. Node reports code ENOENT / errno -4058 for
- * `spawnSync('node', [...], { cwd: '<missing>' })`; the native sync spawn raises
- * a codeless InternalError ("CreateProcess failed: 267" = ERROR_DIRECTORY), and
- * because `node` itself resolves on PATH the command-resolution check below
- * cannot classify it. Returns true only when cwd was given and is missing or is
- * not a directory, so a stat failure on an existing path stays permissive.
+ * True only when cwd was given and is missing or not a directory; a stat failure
+ * on an existing path stays permissive. See node-internals.md "cwdIsMissing".
  */
 export function cwdIsMissing(cwd?: string): boolean {
     if (typeof cwd !== 'string' || cwd.length === 0) return false;

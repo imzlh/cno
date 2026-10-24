@@ -1,16 +1,9 @@
 import { requireQuic } from "../quic-native";
 import { bytesToArrayBuffer, toOwnedBytes } from "../utils/bytes";
 import { withSystemCaCerts } from "../utils/ca-certs";
+import { closeStreamQuietly } from "./pipe-streams";
 
 const DEFAULT_ALPN = "cno-quic";
-
-function closeQuicSocketQuietly(socket: CModuleExternalQuic.Socket): void {
-    try {
-        socket.close();
-    } catch {
-        // Closing an already-failed QUIC socket is best-effort.
-    }
-}
 
 function firstAlpn(protocols?: string[]): string {
     if (!protocols || protocols.length === 0) return DEFAULT_ALPN;
@@ -441,7 +434,7 @@ class QuicEndpointImpl implements Deno.QuicEndpoint {
         this.#closed = true;
         for (const conn of [...this.#connections]) conn.endpointClosed(info);
         if (this.socket) {
-            closeQuicSocketQuietly(this.socket);
+            closeStreamQuietly(this.socket);
             this.socket = undefined;
         }
     }

@@ -1455,7 +1455,32 @@ export class TextDecoderStream implements globalThis.TextDecoderStream {
     }
 }
 
-function createCompressionStreams(handle: CModuleZLib.Deflate | CModuleZLib.Inflate | null) {
+/** `true` when `chunk` starts with a zlib/gzip header zlib itself accepts. */
+function headerAccepted(chunk: BufferSource): boolean {
+    const bytes = ArrayBuffer.isView(chunk)
+        ? new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength)
+        : new Uint8Array(chunk);
+    if (bytes.byteLength < 2) {
+        // Too short to judge: let the handle decide (it reports Z_BUF_ERROR).
+        return true;
+    }
+    const [cmf, flg] = bytes;
+    // zlib: CM=8 (deflate), CINFO<=7 (window <= 32K), FCHECK makes the pair a
+    // multiple of 31, FDICT is not supported without a preset dictionary.
+    if ((cmf & 0x0f) === 8 && (cmf >> 4) <= 7 && ((cmf << 8) | flg) % 31 === 0 && (flg & 0x20) === 0) {
+        return true;
+    }
+    // gzip: ID1=0x1f, ID2=0x8b, CM=8.
+    return cmf === 0x1f && flg === 0x8b && bytes.byteLength >= 3 && bytes[2] === 8;
+}
+
+function createCompressionStreams(handle: CModuleZLib.Deflate | CModuleZLib.Inflate | null, format: CompressionFormat) {
+    // `progressed`: zlib only reports Z_DATA_ERROR once it moved an input byte; a
+    // header rejected outright would throw an uncatchable InternalError. See
+    // webapi-notes.md "CompressionStream".
+    let received = 0;
+    let progressed = false;
+    let inputRejected = false;
     const fail = (error: unknown): TypeError => {
         handle = null;
         const reason = error instanceof TypeError
@@ -1477,8 +1502,26 @@ function createCompressionStreams(handle: CModuleZLib.Deflate | CModuleZLib.Infl
     const writable = new WritableStream<BufferSource>({
         write(chunk) {
             if (!handle) throw new TypeError('Compression stream is closed');
+            if (inputRejected) throw new TypeError('incorrect header check');
             try {
-                enqueue('inflate' in handle ? handle.inflate(chunk) : handle.deflate(chunk));
+                const current = handle;
+                received += chunk.byteLength;
+                if ('inflate' in current) {
+                    // A zlib-wrapped member must start with a header zlib can
+                    // parse; a raw stream has no header to reject, so it may
+                    // legitimately consume nothing yet.
+                    if (!progressed && format !== 'deflate-raw' && !headerAccepted(chunk)) {
+                        inputRejected = true;
+                        throw new TypeError('incorrect header check');
+                    }
+                    const totalIn = () => typeof current.getTotalIn === 'function' ? current.getTotalIn() : 0;
+                    const before = totalIn();
+                    const output = current.inflate(chunk);
+                    if (before > 0 || totalIn() > before) progressed = true;
+                    enqueue(output);
+                } else {
+                    enqueue(current.deflate(chunk));
+                }
             } catch (error) {
                 throw fail(error);
             }
@@ -1486,6 +1529,19 @@ function createCompressionStreams(handle: CModuleZLib.Deflate | CModuleZLib.Infl
         close() {
             if (!handle) return;
             try {
+                // The native finish() throws (uncatchably) whenever no member
+                // ever completed in this stream: an empty stream (Z_BUF_ERROR),
+                // a truncated member (Z_BUF_ERROR) or input that is not gzip at
+                // all (Z_DATA_ERROR). Refuse those here so the stream fails like
+                // the spec says, with a TypeError, instead of ending the process.
+                if ('inflate' in handle && received === 0) throw new TypeError('unexpected end of file');
+                // Input the handle never accepted cannot end a member; finish()
+                // would raise the same uncatchable InternalError as write().
+                if ('inflate' in handle && !progressed && !(handle.finished === true)
+                    && format !== 'deflate-raw') {
+                    inputRejected = true;
+                    throw new TypeError('incorrect header check');
+                }
                 // inflate() may already have consumed the trailer; finish() would then throw.
                 if (!('finished' in handle && handle.finished)) enqueue(handle.finish());
                 controller.close();
@@ -1516,7 +1572,7 @@ export class CompressionStream implements globalThis.CompressionStream {
             case 'deflate-raw': handle = zlib.createDeflateRaw(); break;
             default: throw new TypeError(`Unsupported compression format: ${format}`);
         }
-        const streams = createCompressionStreams(handle);
+        const streams = createCompressionStreams(handle, format);
         this.readable = streams.readable;
         this.writable = streams.writable;
     }
@@ -1534,7 +1590,7 @@ export class DecompressionStream implements globalThis.DecompressionStream {
             case 'deflate-raw': handle = zlib.createInflateRaw(); break;
             default: throw new TypeError(`Unsupported decompression format: ${format}`);
         }
-        const streams = createCompressionStreams(handle);
+        const streams = createCompressionStreams(handle, format);
         this.readable = streams.readable;
         this.writable = streams.writable;
     }

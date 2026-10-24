@@ -14,50 +14,17 @@ const error = import.meta.use('error');
 import { dnsCache } from '@cnojs/http/dns-cache';
 import { errors } from "./01_errors";
 import { systemDnsServers } from "../utils/osdns";
+import { closeStreamQuietly } from "./pipe-streams";
 
 const DEFAULT_TCP_KEEPALIVE_INITIAL_DELAY = 60;
 
 const symbolTakePipe = Symbol('Stream.takePipe');
 type TakePipe = () => CModuleStreams.Stream;
 
-function closeStreamQuietly(pipe: CModuleStreams.Stream): void {
-    try {
-        pipe.close();
-    } catch {
-        // Closing stale pending sockets is best-effort during teardown/racing.
-    }
-}
-
-export const useWritable = (pipe: CModuleStreams.Stream) => new WritableStream({
-    write: async (chunk) => {
-        try {
-            await pipe.write(chunk);
-        } catch (e) {
-            closeStreamQuietly(pipe);
-            throw wrapFSErr(e);
-        }
-    },
-    close: () => pipe.close(),
-    abort: () => closeStreamQuietly(pipe),
-});
-
-export const useReadable = (pipe: CModuleStreams.Stream) => new ReadableStream({
-    async pull(controller) {
-        try {
-            const buf = malloc(controller);
-            const n = await pipe.read(buf);
-            if (n === 0) {
-                controller.close();
-            } else {
-                controller.enqueue(buf.slice(0, n));
-            }
-        } catch (e) {
-            closeStreamQuietly(pipe);
-            controller.error(wrapFSErr(e));
-        }
-    },
-    cancel: () => closeStreamQuietly(pipe),
-});
+// The implementations live in `pipe-streams.ts` so that `06_process.ts` (which
+// only needs these two) does not pull the whole net module into its graph.
+export { useWritable, useReadable } from "./pipe-streams";
+import { useWritable, useReadable } from "./pipe-streams";
 
 const kRawPipe = Symbol('Stream.rawPipe');
 
@@ -453,11 +420,7 @@ class TlsConn implements Deno.TlsConn {
         this.$closed = true;
         this.pauseEncryptedRead();
         Reflect.set(this.$rawPipe, 'onread', null);
-        try {
-            this.$rawPipe.close();
-        } catch {
-            // Ignore close errors from an already-closed socket.
-        }
+        closeStreamQuietly(this.$rawPipe);
     }
 
     get readable(): ReadableStream {

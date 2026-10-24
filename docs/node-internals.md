@@ -187,6 +187,36 @@ its own accept path.
   platforms read the conventional OpenSSL bundle paths. `rootCertificates`
   reports the platform store, one PEM per certificate.
 
+## dgram-send-layout
+
+`dgram/mod.ts` picks a send() layout from the types of the first three arguments
+after the message, and from whether the socket is connected:
+
+```
+slice          offset, length and port are numbers    (msg, offset, length, port, ...)
+connectedSlice two numbers and no port                (msg, offset, length, ...)
+destination    everything else                        (msg, port, ...)
+connected      connected socket, everything else      (msg, ...)
+```
+
+The layout decides which arguments are offset/length and which are
+port/address/callback; every layout then reads them through the same connected
+check, port validation and destination tail. For the connected layout the
+callback sits at the port position itself (`send(msg, cb)`), and the
+"already connected" destination check precedes every other check, buffer
+included.
+
+## path-relative
+
+Node's `path.relative` has **no root comparison**: it compares the two resolved
+paths character by character after trimming leading and trailing separators. A
+segment model that bails out to the absolute `to` whenever the roots differ gets
+`win32.relative('\\\\srv\\share1\\a', '\\\\srv\\share2\\b')` wrong — Node walks
+up out of the share (`..\..\share2\b`) because the leading `\\` is trimmed, so
+`srv` is a common component like any other. The same applies to `\\?\` and
+`\\.\` device paths. Only paths that diverge *before* the first shared separator
+(e.g. `C:\a` vs `D:\b`) return `to` untouched.
+
 ## Assert messages (`assert/mod.ts`)
 
 - Comparison assertions throw the caller's Error instance as-is; the
@@ -196,3 +226,76 @@ its own accept path.
 - `__proto__: null` on descriptor literals is required: `defineProperty`
   resolves fields through `HasProperty`, so a polluted `Object.prototype.get`
   would otherwise make `value` + accessor both specified.
+
+## cwdIsMissing (`child_process/command.ts`)
+
+A `cwd` that is not an existing directory is its own ENOENT, independent of
+whether the command resolves. Node reports ENOENT / errno -4058 for
+`spawnSync('node', ..., { cwd: '<missing>' })`; the native sync spawn raises a
+codeless InternalError ("CreateProcess failed: 267", ERROR_DIRECTORY), and when
+the command itself resolves on PATH the resolution check cannot classify it. The
+helper therefore returns true only when cwd was given and is missing or not a
+directory; a stat failure on an existing path stays permissive.
+
+## Child-process pipe delivery (`child_process/_shared.ts`)
+
+The native pipe is mid-read when `onread` fires, but `push()` re-enters `_read()`
+synchronously for 'data' listeners, and child `_read()` calls `startRead()`
+again, which throws "startRead already in progress" and destroys the stream
+(esbuild's service channel closed after the first message). While the pipe owns
+the read, `deliverPipeChunk` only appends to the buffer and lets
+`flowReadable()` deliver it.
+
+## Querystring parse (`querystring/mod.ts`)
+
+`parse()` is a single-pass state machine, not split()-based: separator matching
+wins over equals-slot matching (a char advancing the sep prefix is never tested
+as eq), so with `sep='ab'`, `eq='a'` the 'a' in `k%ad` does not split the pair.
+Custom decoders receive `%20` where the built-in one receives a space.
+
+## TLS secure contexts (`tls/`)
+
+- `mergeSuppliedSecureContext` cannot reuse a caller's context: `verify` and
+  `verifyHostname` live on the SSL_CTX, which `createSecureContext()` does not
+  set, so reuse would silently drop peer verification. It rebuilds from the
+  caller's material with this connection's mode and verify decision on top. A
+  supplied `secureContext` also means sibling top-level options are ignored.
+- OpenSSL aborts the handshake on a name mismatch (with `SSL_set1_host` armed)
+  and reports only "hostname/IP address mismatch". `nameFailureError` rebuilds
+  Node's ERR_TLS_CERT_ALTNAME_INVALID with `host`/`cert` from the peer cert.
+  X509 codes: 62 hostname, 63 email, 64 IP address.
+
+## BlockList mapped addresses (`net/blocklist.ts`)
+
+An IPv4-mapped IPv6 address is exactly `::ffff:0:0/96`. Rules are stored verbatim,
+and the mapped/plain equivalence is resolved at check time in both directions
+(v4 rule vs mapped v6 address and the reverse), for addAddress, addRange and
+addSubnet including range edges. A pure v6 rule never matches a v4 address. A
+miss here is an access-control bypass.
+
+## HTTP-owned socket write (`net/socket.ts`)
+
+A refused app write to an HTTP-owned socket facade must not be a stream fault:
+routing it through `_write`'s callback destroys the live connection (ECONNRESET
+mid-response). It is intercepted before the writable machinery so the callback
+gets ERR_SOCKET_HTTP_SERVER and 'error' is emitted without erroring the socket.
+
+## Duplicate header merge (`_internal/network-debug.ts`)
+
+For incoming `headers` (`headersDistinct` is unaffected): `set-cookie` becomes an
+array, the discard list keeps the first value, `cookie` joins with "; ", all else
+joins with ", ".
+
+## Incoming body truncation (`_internal/server-request-stream.ts`)
+
+`failIncomingRequest` must not mark the request complete or push null: that
+fires 'end' and makes a truncated upload look whole. Node yields no 'end',
+`complete === false`, `aborted === true`, `readableEnded === false`, `errored`
+set, and 'error' only when a listener exists (Node's `_http_incoming` rule).
+
+## H2 body truncation (`http2/headers.ts`)
+
+h2 marks end-of-body with one `ended` flag set identically by END_STREAM,
+`acceptEnd()` and `acceptClose()`, and `acceptClose()` only errors on a non-zero
+RST_STREAM code, so HEADERS + partial DATA + RST_STREAM(0) reads as a clean
+finish. The declared `content-length` is the only integrity signal available.

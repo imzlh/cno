@@ -1,8 +1,6 @@
-const sqlite3 = import.meta.use('sqlite3');
 import { getMemoryTier } from '../../utils/memory-tier';
 import { dirname } from '../../utils/path';
 import { ensureDirectorySync } from '../../utils/fs-path';
-
 import {
     type AtomicDbOperation,
     InternalEntry,
@@ -17,6 +15,7 @@ import {
 } from './types';
 import { KvU64, MAX_U64, isKvU64 } from './u64';
 
+const sqlite3 = import.meta.use('sqlite3');
 const { setInterval, clearInterval } = import.meta.use('timers');
 
 const CREATE_TABLE_SQL = `
@@ -441,3 +440,5 @@ export function getEndKeyForPrefix(prefix: RawKey): RawKey {
     }
     return new Uint8Array([...key, 0xFF]);
 }
+
+

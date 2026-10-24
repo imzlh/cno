@@ -1,17 +1,6 @@
-/* Node's stream iterator helpers (Readable.prototype.map/filter/forEach/reduce/
- * some/every/find/take/drop/flatMap/iterator/compose plus Duplex.from).
- *
- * Ported from the reference implementation in node's own
- * `internal/streams/operators` + `internal/streams/duplexify`, read out of the
- * installed v24 binary rather than reconstructed from docs, because the
- * ordering guarantees in map()'s pump loop are load-bearing and easy to get
- * subtly wrong. The queue-of-promises structure below is deliberately shaped
- * like node's: it is what makes `concurrency > 1` emit in *input* order while
- * still running N callbacks at once.
- *
- * Wired up from mod.ts via installStreamOperators() so that this file can
- * import nothing from mod.ts and avoid a circular import.
- */
+// The queue-of-promises shape is load-bearing: it makes `concurrency > 1` emit in
+// *input* order while running N callbacks at once. Installed from mod.ts via
+// installStreamOperators() to avoid a circular import.
 
 type AnyFn = (...args: unknown[]) => unknown;
 

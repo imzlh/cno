@@ -234,10 +234,8 @@ export class FsFile implements Deno.FsFile {
             try {
                 n = fs.pread(fno, p, this.fpointer);
             } catch (e) {
-                // Windows reports read-past-EOF as ERROR_HANDLE_EOF, which the
-                // native layer surfaces as UV_ENOENT. A live fd cannot really be
-                // ENOENT, so treat it as EOF: async read() and real Deno both
-                // return null here instead of throwing NotFound.
+                // Windows reports read-past-EOF as UV_ENOENT, which cannot be a
+                // live fd: treat it as EOF (null), as real Deno does.
                 if (!hasErrno(e, error.errno.ENOENT)) throw e;
                 return null;
             }

@@ -61,9 +61,7 @@ function followSignal(source: AbortSignal | null | undefined): AbortSignal {
 }
 
 /**
- * Spec: the Request constructor parses `input` as a URL and throws on failure.
- * The URL polyfill deliberately maps bare paths (`/foo`, `C:/x`) to `file:` for
- * path-to-URL conversion, so the scheme is required explicitly here.
+ * The scheme is required explicitly: the URL polyfill maps bare paths to `file:`.
  */
 function parseRequestUrl(value: string): string {
     if (!/^[A-Za-z][A-Za-z\d+.-]*:/.test(value)) throw new TypeError(`Failed to parse URL from ${value}`);

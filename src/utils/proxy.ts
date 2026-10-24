@@ -83,17 +83,9 @@ interface HttpHead {
 }
 
 /**
- * Read an HTTP head, stopping exactly at `\r\n\r\n`.
- *
- * Reads are 4096 bytes at a time, so the last one routinely returns bytes past the
- * terminator. For a CONNECT tunnel those bytes are the tunnelled stream's first
- * bytes, and returning them as part of the "head" silently destroyed them: whatever
- * the proxy pipelined behind `200 Connection Established` — a tunnelled response
- * body, or bytes injected by a tampering proxy — was consumed here and never
- * reached the tunnel. They are handed back as `leftover` so the caller can put them
- * back in front of the stream.
- *
- * @internal Exported for tests.
+ * Read an HTTP head, stopping exactly at `\r\n\r\n`. Bytes past the terminator
+ * come back as `leftover`: for a CONNECT tunnel they are the stream's first
+ * bytes. @internal Exported for tests.
  */
 export async function readHttpHead(socket: TcpSocket): Promise<HttpHead> {
     const chunks: Uint8Array[] = [];
@@ -133,12 +125,8 @@ function asBytes(buffer: CModuleStreams.BufferSource): Uint8Array {
 /**
  * A transport that serves `prefix` before anything from `inner`.
  *
- * Every read path in TcpSocket — `read`, `readRaw`, both handshake loops, the
- * `onread` callback path — funnels through its `SocketTransport`, so replacing the
- * transport is the one interception point that covers all of them. That is why
- * pushback happens here rather than in each caller: the over-read becomes invisible
- * to every consumer of the returned socket, including the TLS handshake that runs
- * next, and no consumer needs to know a tunnel was involved.
+ * Every TcpSocket read path funnels through its transport, so replacing it is
+ * the one interception point that also covers the TLS handshake that runs next.
  */
 class PrependTransport implements SocketTransport {
     private prefix: Uint8Array | null;
@@ -356,12 +344,9 @@ class SocketStreamAdapter implements SocketTransport {
 }
 
 /**
- * Wrap `socket` in TLS as a client, verifying the peer by default.
- *
- * Used for two distinct trust decisions: the connection to an `https` proxy
- * (verified against the *proxy's* hostname) and the tunnelled connection to the
- * target (verified against the *target's* hostname). Both go through the same
- * shared context builder so neither can silently end up unverified.
+ * Wrap `socket` in TLS as a client, verifying the peer by default. Used for the
+ * proxy connection and the tunnelled target connection; both go through the
+ * shared context builder so neither can end up unverified.
  */
 async function startTls(socket: TcpSocket, hostname: string, tls?: TlsOptions): Promise<TcpSocket> {
     await socket.clientHandshake(createClientTlsContext(['http/1.1'], tls, hostname), hostname);

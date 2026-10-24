@@ -1,22 +1,6 @@
 /**
- * Memory tier detection for buffer sizing adapted for NodeJS.
- *
- * Reads total system memory once at startup, classifies into a tier, and
- * exposes per-stream buffer limits so that 64 MB embedded devices and
- * 4 GB desktops can coexist in the same codebase.
- *
- * ┌──────────┬───────────────┬─────────────┬──────────────┬─────────────┬──────────────┐
- * │  Tier    │  Total RAM    │  HWM (BLS)  │  Pending cap │  Read buf   │  Hook cap    │
- * ├──────────┼───────────────┼─────────────┼──────────────┼─────────────┼──────────────┤
- * │  LOW     │  ≤ 128 MB     │   16 KB     │    16 KB     │   16 KB     │   16 KB      │
- * │  NORMAL  │  128 MB – 1 GB│   64 KB     │    64 KB     │   64 KB     │   64 KB      │
- * │  HIGH    │  > 1 GB       │  256 KB     │   256 KB     │  256 KB     │  256 KB      │
- * └──────────┴───────────────┴─────────────┴──────────────┴─────────────┴──────────────┘
- *
- * HWM = ReadableStream highWaterMark (ByteLengthQueuingStrategy)
- * Pending cap = MAX_PENDING_BODY_BYTES in performFetch (controller not yet attached)
- * Read buf   = fs / child_process / tty read loop buffer size
- * Hook cap   = hook payload base64 reporting + post-data buffer cap
+ * Memory tier detection for buffer sizing, read once at startup so small
+ * devices and desktops share one codebase. Tier limits are TIER_* below.
  */
 
 const os = import.meta.use('os');

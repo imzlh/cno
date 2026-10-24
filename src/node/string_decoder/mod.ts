@@ -3,11 +3,12 @@
  * Decodes buffer data into strings preserving multi-byte characters
  */
 
+import type { Buffer } from '../buffer';
+
 const { Decoder } = import.meta.use('text');
 const crypto = import.meta.use('crypto');
 const engine = import.meta.use('engine');
 const algorithm = import.meta.use('algorithm');
-import type { Buffer } from '../buffer';
 import { concatChunks, describeEncoding, utf8DecodeReplace } from '../_internal/buffer';
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;

@@ -4,28 +4,13 @@
 
 const algorithm = import.meta.use('algorithm');
 const engine = import.meta.use('engine');
-const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
-const typedArrayBufferGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')?.get;
-const typedArrayByteOffsetGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteOffset')?.get;
-const typedArrayByteLengthGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteLength')?.get;
-const uint8Subarray = Uint8Array.prototype.subarray;
-const arrayBufferSlice = ArrayBuffer.prototype.slice;
-
-function typedArraySlot<T>(getter: ((this: unknown) => T) | undefined, bytes: globalThis.Uint8Array): T {
-    if (!getter) throw new TypeError('TypedArray internal slot is unavailable');
-    return Reflect.apply(getter, bytes, []);
-}
 
 function byteView(bytes: globalThis.Uint8Array): { buffer: ArrayBufferLike; byteOffset: number; byteLength: number } {
-    return {
-        buffer: typedArraySlot(typedArrayBufferGetter, bytes),
-        byteOffset: typedArraySlot(typedArrayByteOffsetGetter, bytes),
-        byteLength: typedArraySlot(typedArrayByteLengthGetter, bytes),
-    };
+    return { buffer: bytes.buffer, byteOffset: bytes.byteOffset, byteLength: bytes.byteLength };
 }
 
 function subarray(bytes: globalThis.Uint8Array, start: number, end?: number): globalThis.Uint8Array {
-    return Reflect.apply(uint8Subarray, bytes, end === undefined ? [start] : [start, end]);
+    return bytes.subarray(start, end);
 }
 
 export function toOwnedBytes(bytes: globalThis.Uint8Array): globalThis.Uint8Array<ArrayBuffer> {
@@ -52,7 +37,7 @@ export function bytesToArrayBuffer(bytes: globalThis.Uint8Array, requestedLength
     const { buffer, byteOffset, byteLength } = byteView(bytes);
     const length = requestedLength ?? byteLength;
     if (engine.isArrayBuffer(buffer)) {
-        return Reflect.apply(arrayBufferSlice, buffer, [byteOffset, byteOffset + length]);
+        return (buffer as ArrayBuffer).slice(byteOffset, byteOffset + length);
     }
     return toOwnedBytes(subarray(bytes, 0, length)).buffer;
 }
@@ -80,14 +65,9 @@ function utf8SeqInfo(lead: number): { len: number; lo: number; hi: number } {
 }
 
 /**
- * WHATWG "UTF-8 decode": one U+FFFD per **maximal subpart**, then the byte that
- * broke the sequence is *reprocessed*. `engine.decodeString` is WTF-8-tolerant
- * (it hands back lone surrogates) and the native `text.Decoder` replaces per
- * byte and swallows the breaking byte, so neither matches on malformed input.
- *
- * `bytesIsUtf8` is a native validity gate cheaper than the decode, so valid
- * input — the hot path — is one native call and the JS loop only ever walks
- * malformed regions.
+ * WHATWG "UTF-8 decode": one U+FFFD per **maximal subpart**, then reprocess the
+ * byte that broke the sequence. Neither `engine.decodeString` nor the native
+ * `text.Decoder` matches that, so the JS loop handles malformed input only.
  */
 export function utf8Decode(bytes: globalThis.Uint8Array, fatal = false): string {
     if (algorithm.bytesIsUtf8(bytes)) return engine.decodeString(bytes);

@@ -1,11 +1,5 @@
-/**
- * Shared promise hook dispatcher for async_hooks and v8.promiseHooks.
- *
- * The native `engine.promiseHook()` is a single-slot replacement hook.
- * This module provides a cooperative chain-of-responsibility pattern so
- * multiple consumers (async_hooks, v8.promiseHooks, potential future CDP)
- * can register callbacks without clobbering each other.
- */
+// `engine.promiseHook()` is single-slot; this chains consumers (async_hooks,
+// v8.promiseHooks) so they cannot clobber each other.
 
 const engine = import.meta.use('engine');
 
@@ -55,6 +49,10 @@ function installDispatcher(): void {
         }
     };
     engine.promiseHook(dispatcher);
+    // The hook is replaced rather than chained, so tell async_hooks to wrap the
+    // dispatcher again (its continuation hook).
+    const rebind = Reflect.get(globalThis, '__cnoOnPromiseHookThisInstalled');
+    if (typeof rebind === 'function') Reflect.apply(rebind, globalThis, []);
 }
 
 function uninstallDispatcher(): void {

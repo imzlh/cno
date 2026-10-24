@@ -1,18 +1,6 @@
-/**
- * node:tls type definitions.
- *
- * Types only — no runtime code, no native modules, so importing this file
- * cannot affect module evaluation order. The `TLSSocket` / `Server` interfaces
- * here are the *shapes*; the merged type+value declarations that consumers see
- * as `tls.TLSSocket` / `tls.Server` live next to their implementations in
- * ./socket and ./server.
- *
- * The `import type { SecureContext } from './context'` below is the one edge
- * pointing back at an implementation file. `SecureContext` has a private field
- * (`#context`), so its type is nominal and cannot be restated structurally here.
- * Both directions of that edge are `import type`, so nothing is emitted and
- * there is no runtime cycle.
- */
+// Types only: importing this file cannot affect module evaluation order. The
+// merged type+value declarations live in ./socket and ./server. The `import type`
+// of SecureContext is nominal (private `#context`) and erased, so no runtime cycle.
 
 import type { EventEmitter } from '../events';
 import type { Duplex } from '../stream';

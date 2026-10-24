@@ -79,13 +79,8 @@ function isAbsolutePath(p: string): boolean {
 }
 
 /*
- * Resolve a guest-supplied path against a preopened host directory, rejecting
- * anything that leaves that directory. WASI capability semantics say a guest
- * may only name paths reachable from a directory fd it was granted, so an
- * absolute path or a ".." that climbs above the root must be refused rather
- * than passed to the host fs.
- *
- * Returns the host path to use, or a WASI errno on refusal.
+ * Resolve a guest path against a preopened host directory, rejecting anything
+ * that leaves it. Returns the host path, or a WASI errno on refusal.
  */
 function resolveWithinRoot(root: string, guestPath: string): { path: string } | { errno: number } {
     if (isAbsolutePath(guestPath)) {
@@ -606,16 +601,10 @@ export class WASI {
         if ('errno' in lexical) return lexical;
 
         /*
-         * The lexical check above cannot see symlinks or directory junctions: a
-         * link sitting inside the preopen names no ".." and is not absolute, yet
-         * resolves to an arbitrary host location. Canonicalise both sides and
-         * re-check containment so the link target -- not the link path -- decides.
-         *
-         * Note this does NOT contain hard links. A hard link is not a reference
-         * to another path but a second name for the same file, so it canonicalises
-         * to itself inside the preopen and no path-based check can detect it.
-         * Granting a directory that contains attacker-planted hard links is
-         * outside what preopen confinement can express.
+         * The lexical check cannot see symlinks or junctions: canonicalise both
+         * sides and re-check containment so the link target decides. Hard links
+         * cannot be contained: a second name for the same file canonicalises
+         * inside the preopen.
          */
         const rootReal = canonicalisePrefix(entry.hostPath);
         if (rootReal === null) return { errno: WASI_ENOENT };

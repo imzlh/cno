@@ -87,14 +87,9 @@ function isTransientTtyEio(value: unknown): value is Error {
 }
 
 /**
- * Blocking synchronous read of a stdio stream. libuv keeps the stdin fd
- * non-blocking, so a raw readSync returns EAGAIN when no input is buffered
- * (e.g. inside prompt(), especially after Deno.stdin.readable touched the fd).
- *   - POSIX  : flip the uv stream to blocking for the read, then restore. The
- *              caller pauses until input arrives (Deno/Node prompt semantics).
- *              Toggling via the uv stream keeps libuv's state consistent.
- *   - Windows: native stream.readSync throws; the fd is a real CONIN$ handle
- *              that blocks natively, so read it with fs.read.
+ * Blocking synchronous read of a stdio stream; libuv keeps stdin non-blocking, so
+ * a raw readSync returns EAGAIN. POSIX flips the uv stream to blocking around the
+ * read; Windows reads the blocking CONIN$ handle with fs.read.
  */
 function readSyncBlocking(stream: CModuleStreams.Stream, fd: number, buf: Uint8Array): number | null {
     if (isWindows && !isPosixCompatible) {

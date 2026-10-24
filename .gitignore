@@ -13,3 +13,4 @@ example/netease/netease.cookie
 test.ts
 lib.deno.d.ts
 types
+dist/

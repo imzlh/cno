@@ -1,6 +1,5 @@
 /**
- * Node.js dgram module
- * Based on CModuleUDP for UDP datagrams
+ * Node.js dgram module, over CModuleUDP for UDP datagrams.
  */
 
 const udp = import.meta.use('udp');
@@ -29,8 +28,8 @@ import {
 
 /*
  * IP-level socket option numbers. The native `socket` module only exposes
- * IPPROTO_IP/SOL_SOCKET/SO_*, and these are ABI values: Windows/BSD and Linux
- * differ (e.g. IP_TTL 4 vs 2), so the two tables cannot be shared.
+ * IPPROTO_IP/SOL_SOCKET/SO_*, and these are ABI values that differ between
+ * Windows/BSD and Linux (e.g. IP_TTL 4 vs 2), so the tables cannot be shared.
  */
 const _isLinux = os.platform === 'linux';
 
@@ -60,9 +59,8 @@ function ipOpt(self: Socket, v4: number, v6: number): [number, number] {
         : [sock.defines.IPPROTO_IP, v4];
 }
 
-// Helper: get a PosixSocket from UDP's fd for setsockopt
-// We cache the fd at init time since fileno() is async but socket options
-// are set via sync methods
+// Paths to a PosixSocket from UDP's fd. We cache the fd at init time since
+// fileno() is async but socket options are set via sync methods
 function _getFd(handle: CModuleUDP.UDP): number {
     return handle.fileno();
 }
@@ -131,11 +129,10 @@ function healthCheck(self: Socket): CModuleUDP.UDP {
 }
 
 /**
- * Socket options need a live OS socket. libuv's Windows backend returns
- * UV_EBADF from uv_udp_set_ttl/set_broadcast/set_multicast_* when the socket
- * has not been materialized yet, so an unbound socket reports EBADF like Node.
- * (uv_udp_set_membership and the buffer-size calls deferred-bind instead, so
- * they must NOT go through here.)
+ * Socket options need a live OS socket: libuv's Windows backend returns
+ * UV_EBADF from uv_udp_set_ttl/set_broadcast/set_multicast_* on an unmaterialized
+ * socket. uv_udp_set_membership and the buffer-size calls deferred-bind instead,
+ * so they must NOT go through here.
  */
 function boundOptionSocket(self: Socket, syscall: string): CModuleSocket.PosixSocket {
     healthCheck(self);
@@ -160,9 +157,8 @@ function setSockOpt(self: Socket, syscall: string, level: number, option: number
 
 /**
  * The `socket` C module reports setsockopt/getsockopt failures on Windows as a
- * bare `InternalError: WSA error <n>` with no .code/.errno, so the UV name has
- * to be recovered from the message. Only the codes these paths can actually
- * produce are listed; anything else falls through to UNKNOWN.
+ * bare `InternalError: WSA error <n>` with no .code/.errno, so the UV name is
+ * recovered from the message. Anything unlisted falls through to UNKNOWN.
  */
 const WSA_TO_UV: Record<number, string> = {
     10009: 'EBADF', // WSAEBADF
@@ -203,10 +199,8 @@ function normalizeSockOptError(err: unknown, syscall: string): NodeJS.ErrnoExcep
 /**
  * libuv's uv__udp_set_membership4/6 and the buffer-size calls run
  * uv__udp_maybe_bind() first, so joining a group on a never-bound socket
- * implicitly binds it to the wildcard address with SO_REUSEADDR. That is what
- * makes a subsequent setTTL/address() succeed in Node. Mirror it, but do NOT
- * emit 'listening' or start the recv loop: uv__udp_maybe_bind only sets
- * UV_HANDLE_BOUND, and Node's dgram wrapper still considers the socket unbound.
+ * implicitly binds it to the wildcard address with SO_REUSEADDR. Mirror it, but
+ * do NOT emit 'listening' or start the recv loop, and leave `_bound` false.
  */
 function maybeBind(self: Socket): void {
     if (self._materialized) return;
@@ -254,15 +248,12 @@ export interface Socket extends EventEmitter {
     _reuseAddr: boolean;
     _ipv6Only: boolean;
     _bound: boolean;
-    /**
-     * Whether the underlying OS socket exists, as opposed to whether the user
-     * called bind(). cno's `new udp.UDP(af)` passes a concrete address family
-     * to uv_udp_init_ex, so the SOCKET is created eagerly; Node passes
-     * AF_UNSPEC and leaves it INVALID_SOCKET until bind() or a deferred-bind
-     * option (set_membership, buffer sizes) materialises it. Socket options
-     * observe that distinction (EBADF while INVALID_SOCKET), so track it
-     * explicitly instead of reusing _bound.
-     */
+/**
+ * Whether the underlying OS socket exists, as opposed to whether bind() was
+ * called. cno creates the SOCKET eagerly in uv_udp_init_ex; Node leaves it
+ * INVALID_SOCKET until bind() or a deferred-bind option materialises it, and
+ * socket options observe that (EBADF). Track it instead of reusing _bound.
+ */
     _materialized: boolean;
     _binding: boolean;
     _bindPromise: Promise<void> | null;
@@ -318,9 +309,8 @@ export interface SocketConstructor {
 function initSocket(self: Socket, type: 'udp4' | 'udp6', reuseAddr?: boolean, ipv6Only?: boolean): void {
     validateSocketType(type);
     EventEmitter.call(self);
-    // Node creates the libuv handle in the constructor, so state-dependent
-    // errors (EBADF vs ERR_SOCKET_DGRAM_NOT_RUNNING) hinge on close(), not on
-    // whether the handle has been lazily materialized yet.
+    // State-dependent errors (EBADF vs ERR_SOCKET_DGRAM_NOT_RUNNING) hinge on
+    // close(), not on lazy materialization.
     self._handle = new udp.UDP(type === 'udp6' ? os.AF_INET6 : os.AF_INET);
     self._bound = false;
     self._materialized = false;
@@ -518,12 +508,8 @@ const isNumber = (value: unknown) => typeof value === 'number';
 
 /**
  * Node picks the layout from the types of the first three arguments after the
- * message, and from whether the socket is connected:
- *
- *   slice          offset, length and port are numbers   (msg, offset, length, port, ...)
- *   connectedSlice two numbers and no port             (msg, offset, length, ...)
- *   destination    everything else                     (msg, port, ...)
- *   connected      connected socket, everything else   (msg, ...)
+ * message, and from whether the socket is connected (see docs/node-internals.md
+ * #dgram-send-layout).
  */
 const SEND_LAYOUTS: Record<SendLayout, SendLayoutSpec & { matches: (args: readonly unknown[]) => boolean }> = {
     slice: {
@@ -824,11 +810,9 @@ Socket.prototype.dropSourceSpecificMembership = function dropSourceSpecificMembe
 };
 
 /**
- * Buffer-size accessors on a never-bound socket. libuv routes these through
- * uv__udp_maybe_bind, but on Windows the SOCKET is still INVALID at that point
- * and the call fails with ENOTSOCK, which Node rewraps as
- * ERR_SOCKET_BUFFER_SIZE. probe4's afterRecvBufSize_setTTL confirms the socket
- * is NOT left materialised, so this must not bind.
+ * Buffer-size accessors on a never-bound socket. On Windows the SOCKET is still
+ * INVALID, the call fails with ENOTSOCK, and Node rewraps it as
+ * ERR_SOCKET_BUFFER_SIZE. This must not bind.
  */
 function bufferSizeSocket(self: Socket, syscall: string): CModuleSocket.PosixSocket {
     const handle = healthCheck(self);

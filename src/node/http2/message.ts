@@ -6,25 +6,15 @@
 import { Readable, Writable } from '../stream';
 import type { H2Header } from '@cnojs/http/h2-native';
 import { invalidArgType, invalidArgValue } from './errors';
+import { closeQuietly } from '../_internal/close';
 import { headerObject } from './headers';
 import { sessionSocketFor } from './transport';
 import type { ServerHttp2Stream } from './stream';
 
 /**
- * Node-compatible request view layered over the protocol stream.
- *
- * Prototype accessors, not instance fields. Node exposes all of these as
- * getters on Http2ServerRequest.prototype, and the difference is observable in
- * three ways real code depends on:
- *   - `'method' in Object.getPrototypeOf(req)` — how some libraries feature-test
- *     an incoming-message-alike before deciding which adapter to use;
- *   - enumerability: instance fields land in Object.keys(req) / spreads /
- *     JSON.stringify(req), so a plain `{...req}` picked up a frozen snapshot of
- *     the headers instead of nothing;
- *   - write-through: Node backs `method`/`url` with `headers[':method']` and
- *     `headers[':path']`, so connect/express rewriting `req.url` is visible to
- *     anything that later reads the header object. With independent fields the
- *     two silently disagreed.
+ * Node-compatible request view over the protocol stream. Accessors live on the
+ * prototype (`'method' in Object.getPrototypeOf(req)`), never as instance
+ * fields, and `method`/`url` read through the header object.
  */
 export class Http2ServerRequest extends Readable {
     /** Backing state. Non-enumerable so it stays out of Object.keys/spread. */
@@ -264,11 +254,7 @@ export class Http2ServerResponse extends Writable {
     }
 
     destroy(error?: Error | null): this {
-        try {
-            this.stream.close();
-        } catch {
-            /* already closed */
-        }
+        closeQuietly(this.stream);
         return super.destroy(error) as this;
     }
 }

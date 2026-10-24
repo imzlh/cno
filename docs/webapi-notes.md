@@ -88,3 +88,69 @@ one-line pointer back to the relevant section.
 - Feature modules are lazy because embedded bytecode is decoded as one module:
   anything reachable from boot costs startup. `defineLazy` keeps the public shape
   and evaluates on first read, replacing the accessor with the data property.
+
+## `Intl` (`intl.ts`)
+
+- **Time zones.** No IANA tz database is available, so only zones with a
+  constant offset can be honoured: `UTC` and aliases,
+  `Etc/GMT{+0..+12,-0..-14}` (POSIX sign inversion), and offset literals
+  `+HH:MM`, `+HHMM`, `+HH`. Named IANA zones throw `RangeError` instead of
+  formatting in the host zone. Offset literals report back in literal form
+  (`+00:00`), never as `UTC`, because node does.
+- **Host zone.** The host's IANA name is not knowable, so the reported zone name
+  is the host's current offset. `TZ` is preferred only when it names a zone we
+  can honour.
+- **Number rounding.** Rounding runs on the value's shortest round-trip decimal
+  string, not `toFixed()` (`(1.005).toFixed(2)` is `"1.00"` but ICU prints
+  `"1.01"` for `maximumFractionDigits: 2`).
+- **`timeZoneName` output** (node):
+
+  | offset | `short` | `long` | `shortOffset` | `longOffset` |
+  | --- | --- | --- | --- | --- |
+  | 0 | `UTC` | `Coordinated Universal Time` | `GMT+0` | `GMT+00:00` |
+  | -300 | `GMT-5` | `GMT-05:00` | `GMT-5` | `GMT-05:00` |
+  | +330 | `GMT+5:30` | `GMT+05:30` | `GMT+5:30` | `GMT+05:30` |
+
+- **`toLocale*` options defaults.** `dateStyle`/`timeStyle` expand to node's
+  skeletons; with neither style nor any component, node defaults to numeric
+  year/month/day. ECMA-402 defaults are filled only when the caller asked for
+  nothing in that group: `toLocaleString('en-US', {year: 'numeric'})` is `"2021"`,
+  while `toLocaleDateString('en-US', {hour: 'numeric'})` is `"3/4/2021, 3 PM"`.
+- **Plain calls.** ECMA-402 allows `DateTimeFormat`, `NumberFormat` and
+  `Collator` to be called without `new`; the other constructors must throw
+  `TypeError`. The wrapper shares the class prototype so `instanceof` and statics
+  keep working.
+- **Prototype re-points.** quickjs implements `Date.prototype.toLocale*String`
+  (C `get_date_string`, magic `0x31`/`0x32`/`0x33`) and
+  `Number.prototype.toLocaleString` (`js_number_toString`) without consulting
+  `Intl`, so `date.toLocaleString('en-US', {timeZone: 'UTC'})` ignored both
+  arguments. All four descriptors are writable and configurable in the shipped
+  binary, so this layer re-points them.
+- `String.prototype.localeCompare` is deliberately not re-pointed: its live
+  callers are `cts/src/utils/misc.ts:291`, `src/commands/repl/completion.ts:83`
+  and `tests/deno/fs-upstream-compat.test.ts`, and root collation reorders
+  results relative to the current code-point compare.
+
+## Fetch helpers (`fetch/helpers.ts`)
+
+- `teeUntracked` exists because `tee()` goes through the public `getReader`:
+  `clone()` must temporarily bypass body-stream tracking, patch the stream to
+  keep its private fields, then track each branch separately. The original
+  descriptor is restored even when `tee()` throws on a locked stream.
+
+## Listener hooks (`events.ts`)
+
+`node:events` keeps listener bookkeeping for native EventTargets and reads its
+hooks from globals, since neither module may import the other; either may
+evaluate first, so `node:events` publishes an installer on a global and this
+module calls it once defined. Polyfill EventTargets are marked with
+`Symbol.for('cno.internal.webEventTarget')` so the hooks recognise and skip them
+in O(1); the class reports listener changes through `notifyListenerChange`.
+
+## CompressionStream (`streams.ts`)
+
+`progressed` tracks whether the decompressor handle ever moved an input byte.
+zlib only reports Z_DATA_ERROR for a damaged member once it has progressed; a
+header rejected outright (garbage in one chunk) makes `inflate()`/`finish()`
+throw an uncatchable InternalError that kills the process, so that case is
+refused before the call.

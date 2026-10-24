@@ -1,12 +1,3 @@
-// node:buffer polyfill for QuickJS (circu.js)
-//
-// Implements the Node.js 20+ `Buffer` API on top of `Uint8Array`, plus the
-// module-level helpers exported by `node:buffer` (transcode, isUtf8, isAscii,
-// atob/btoa, Blob/File re-exports, constants, ...).
-//
-// This module is registered onto the engine as `engine.__buffer` by
-// `_internal/inject.ts`; `node/buffer/index.ts` re-exports from there.
-
 import { base64ToBytes, describeEncoding, hexToBytes, utf8DecodeReplace } from '../_internal/buffer';
 
 const nativeCrypto = import.meta.use('crypto');
@@ -28,7 +19,6 @@ function isTypedArrayView(view: ArrayBufferView): view is TypedArrayView {
     return !(view instanceof DataView);
 }
 
-/** Canonicalise an encoding name, or return undefined if unknown. */
 function normalizeEncoding(encoding?: unknown): string | undefined {
     if (!encoding) return 'utf8';
     if (typeof encoding !== 'string') return 'utf8';
@@ -52,23 +42,15 @@ function unknownEncoding(encoding: unknown): never {
     throw err;
 }
 
-/**
- * Strict encoding check, used by `toString`/`write`/`indexOf` & friends. Node
- * coerces the value to a string and looks that up, so a `String` wrapper around
- * a valid name is accepted while `{}` (`"[object Object]"`) is not; anything
- * unknown is `ERR_UNKNOWN_ENCODING`. `Buffer.from`/`byteLength` are deliberately
- * looser and keep using `normalizeEncoding` directly — measured against Node
- * v24.18, `Buffer.from('ab', 42)` silently encodes as utf8.
- */
+// Strict check: coerces to string (a boxed name is accepted, `{}` is not) and
+// throws ERR_UNKNOWN_ENCODING. from/byteLength stay loose and use normalizeEncoding.
 function assertEncoding(encoding?: unknown): string {
     if (encoding === undefined) return 'utf8';
     if (typeof encoding === 'symbol') {
-        // QuickJS's own coercion message differs from Node's, so throw Node's.
+        // QuickJS's coercion message differs from Node's.
         throw new TypeError('Cannot convert a Symbol value to a string');
     }
     const coerced = `${encoding as string}`;
-    // `normalizeEncoding` maps every falsy value to utf8 for the looser callers;
-    // an explicit '' is an unknown encoding here.
     const e = coerced === '' ? undefined : normalizeEncoding(coerced);
     if (e === undefined) unknownEncoding(encoding);
     return e;
@@ -114,17 +96,8 @@ function base64ByteLength(str: string): number {
 
 // ── Encode a string to bytes for a given encoding ───────────────────────────
 
-/**
- * The native `engine.encodeString` emits WTF-8 for unpaired surrogates, but Node
- * (like the WHATWG encoding spec) substitutes U+FFFD.
- *
- * Both steps stay inside the regex engine — a per-character JS scan costs ~370x
- * a native encode in QuickJS. `LONE_SURROGATE` is one native pass that matches
- * only an unpaired unit (a high not followed by a low, or a low not preceded by
- * a high), so all-ASCII/BMP *and* well-formed astral text return the input
- * string untouched. `SURROGATE_SEQ` then relies on ordered alternation so a
- * valid pair is consumed as a pair and only a lone unit reaches the U+FFFD arm.
- */
+// engine.encodeString emits WTF-8 for lone surrogates; Node emits U+FFFD.
+// Must stay in the regex engine: a per-character JS scan is far slower.
 const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?:^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/;
 const SURROGATE_SEQ = /[\uD800-\uDBFF][\uDC00-\uDFFF]|[\uD800-\uDFFF]/g;
 
@@ -133,21 +106,33 @@ function sanitizeSurrogates(str: string): string {
     return str.replace(SURROGATE_SEQ, (m) => (m.length === 2 ? m : '�'));
 }
 
-function utf8Encode(str: string): Uint8Array {
-    return engine.encodeString(sanitizeSurrogates(str));
+// engine.encodeString returns a bare `0` on failure, which would make the write
+// a silent no-op; callers expect bytes or an ERR_STRING_TOO_LONG throw.
+function engineEncode(str: string): Uint8Array {
+    const bytes = engine.encodeString(str);
+    if (!(bytes instanceof Uint8Array)) {
+        const err = new RangeError('Invalid string length');
+        (err as { code?: string }).code = 'ERR_STRING_TOO_LONG';
+        throw err;
+    }
+    return bytes;
 }
 
 /**
- * The decode direction of the same defect: `engine.decodeString` is
- * WTF-8-tolerant, so `Buffer.from([0xED,0xA0,0x80]).toString()` handed back a
- * lone U+D800 where Node yields three U+FFFD.
- *
- * No native primitive is correct here — the `text.Decoder` replaces per byte
- * where WHATWG replaces per *maximal subpart*, and it swallows the byte that
- * broke a sequence instead of reprocessing it. `utf8DecodeReplace` implements
- * the spec's error handling and keeps the `bytesIsUtf8` gate, so well-formed
- * UTF-8 (which cannot encode a surrogate) stays on the native fast path.
+ * Only paths that can emit a lone surrogate need the U+FFFD substitution:
+ * `utf8Encode` must always sanitize; latin1/ascii mask to the low byte;
+ * `byteLength` counts code units; `utf16le` writes code units verbatim.
+ * The gates are single-shot regexes, far cheaper than always sanitizing.
  */
+const LONE_HIGH = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])/;
+const LONE_LOW = /[\uDC00-\uDFFF]/;
+
+function utf8Encode(str: string): Uint8Array {
+    return engineEncode(sanitizeSurrogates(str));
+}
+
+// engine.decodeString is WTF-8-tolerant (passes lone surrogates through);
+// utf8DecodeReplace implements WHATWG U+FFFD substitution.
 function utf8Decode(bytes: Uint8Array): string {
     return utf8DecodeReplace(bytes);
 }
@@ -155,10 +140,8 @@ function utf8Decode(bytes: Uint8Array): string {
 function stringToBytes(str: string, encoding: string): Uint8Array {
     switch (encoding) {
         case 'utf8': return utf8Encode(str);
-        // Node documents 'ascii' *encoding* as equivalent to latin1: it keeps the
-        // low byte and does not mask to 7 bits. Measured on v24.18,
-        // Buffer.from('hé','ascii') is [104,233], not [104,105].
-        // Only the decode direction masks (`asciiDecodeLoose`).
+        // Encoding-side 'ascii' is latin1: it keeps the low byte, no 7-bit
+        // mask. Only the decode direction masks (`asciiDecodeLoose`).
         case 'ascii': return algorithm.latin1EncodeLoose(str);
         case 'latin1': return algorithm.latin1EncodeLoose(str);
         case 'utf16le': {
@@ -195,6 +178,29 @@ function byteLengthOf(str: string, encoding: string): number {
     return utf8Encode(str).length;
 }
 
+// Shared by toString and the Slice helpers. Slice args: NaN/fractions go to 0,
+// anything out of range (or negative) throws ERR_OUT_OF_RANGE rather than
+// clamping, and an omitted `end` means the tail.
+function sliceToString(buf: Uint8Array, encoding: string, start: number, end: number): string {
+    const len = buf.length;
+    const from = toIndex(start) ?? 0;
+    const to = end === undefined ? len : toIndex(end) ?? 0;
+    if (from > len || to > len || from < 0 || to < 0) {
+        const err = new RangeError('Index out of range');
+        (err as { code?: string }).code = 'ERR_OUT_OF_RANGE';
+        throw err;
+    }
+    if (to <= from) return '';
+    return bytesToString(buf.subarray(from, to), encoding);
+}
+
+/** ToIntegerOrInfinity for the slice arguments; NaN becomes null (-> 0). */
+function toIndex(value: unknown): number | null {
+    const n = Number(value);
+    if (n !== n) return null;
+    return n < 0 ? Math.ceil(n) : Math.floor(n);
+}
+
 function utf8PrefixLength(bytes: Uint8Array, max: number): number {
     if (max <= 0) return 0;
     if (max >= bytes.length) return bytes.length;
@@ -214,22 +220,8 @@ function utf8PrefixLength(bytes: Uint8Array, max: number): number {
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
-// `kMaxLength` is the largest size a single Buffer/ArrayBuffer can actually
-// reach, and it is enforced by the engine, not by policy: QuickJS's array
-// buffer constructor rejects `len > INT32_MAX` outright
-// (`deps/quickjs/quickjs.c`, "invalid array buffer length"), and its
-// `JSArrayBuffer` stores the length in an `int byte_length` field, so 2 GiB - 1
-// is structural. Measured on this engine: `Buffer.alloc`/`allocUnsafe`/
-// `new ArrayBuffer`/`new Uint8Array` all succeed at exactly 2147483647 and all
-// throw at 2147483648, with a ceiling-sized buffer still live — a hard cap, not
-// memory pressure.
-//
-// Node advertises `Number.MAX_SAFE_INTEGER` here, but node does not honour that
-// either: `Buffer.alloc(buffer.kMaxLength)` throws "Array buffer allocation
-// failed" on node v24 too. Node's number is an argument-validation bound. Ours
-// is that bound *and* an allocability promise, which is the stronger and more
-// useful contract: `if (n <= kMaxLength) Buffer.alloc(n)` is a guard that works
-// here, whereas against node's value it always passes and then throws.
+// Engine-enforced: QuickJS stores ArrayBuffer length in an int, so 2 GiB - 1 is
+// structural and also an allocability promise.
 export const kMaxLength = 0x7FFFFFFF;            // 2 GiB - 1 (INT32_MAX)
 export const kStringMaxLength = 0x1FFFFFE8;      // (1 << 29) - 24
 export const constants = Object.freeze({
@@ -300,25 +292,14 @@ function invalidArgType(name: string, expected: string, actual: unknown): never 
     throw err;
 }
 
-/** Node words a class expectation as "must be an instance of", not "of type". */
 function invalidArgInstance(name: string, expected: string, actual: unknown): never {
     const err = new TypeError(`The "${name}" argument must be an instance of ${expected}. Received ${receivedOf(actual)}`);
     (err as { code?: string }).code = 'ERR_INVALID_ARG_TYPE';
     throw err;
 }
 
-/**
- * `fill`/`alloc` validate the encoding differently from `toString`: a non-string
- * is `ERR_INVALID_ARG_TYPE` rather than `ERR_UNKNOWN_ENCODING`, and `null` is
- * accepted as "use the default". Measured against Node v24.18.
- *
- * An empty string is also accepted here and means utf8. Node is genuinely
- * inconsistent about `''` across the family — OBSERVED on v24.18.0:
- *   toString('')  throws ERR_UNKNOWN_ENCODING     indexOf('')  throws
- *   write('')     -> utf8                         fill('')     -> utf8
- *   alloc(3,'a','') -> utf8                       from('a','') -> utf8
- * so the strict/loose split has to be per-call-site rather than one rule.
- */
+// fill/alloc differ from toString: a non-string is ERR_INVALID_ARG_TYPE, and
+// null or '' means utf8. (toString('') and indexOf('') throw.)
 function assertFillEncoding(encoding?: unknown): string {
     if (encoding === undefined || encoding === null) return 'utf8';
     if (typeof encoding !== 'string') invalidArgType('encoding', 'string', encoding);
@@ -335,22 +316,14 @@ function boundsError(value: number, length: number, type?: string): never {
     outOfRange(type ?? 'offset', `>= ${type ? 1 : 0} and <= ${length}`, value);
 }
 
-/**
- * Node's `checkInt`: validate `value` fits the target width, then bounds-check.
- * `byteLength` here is the *last byte index* (width - 1), matching Node.
- */
+/** Node's `checkInt`. `byteLength` is the *last byte index* (width - 1). */
 function checkInt(
     value: number | bigint, min: number | bigint, max: number | bigint,
     buf: Buffer, offset: number, byteLength: number,
 ): void {
-    // Node's precedence is NOT uniform, and an unconditional hoist here was
-    // measured wrong on 14 cases per 16/32-bit method: Node routes the 8-bit
-    // writes through a separate `writeU_Int8` that validates the offset's TYPE
-    // first, while the wider writes use `checkInt`, which tests the value's
-    // RANGE first and only then the bounds. So `writeUInt8(256, null)` names the
-    // null offset but `writeUInt16LE(65536, null)` names the 65536.
-    // `byteLength === 0` is exactly the 8-bit arm (and the byteLength-1 variable
-    // width write, which Node also dispatches to writeU_Int8).
+    // Error precedence differs by width: 8-bit writes validate the offset's
+    // type first, wider ones test the value's range first.
+    // `byteLength === 0` is exactly the 8-bit arm.
     if (byteLength === 0 && typeof offset !== 'number') {
         invalidArgType('offset', 'number', offset);
     }
@@ -371,18 +344,9 @@ function checkInt(
     checkBounds(buf, offset, byteLength + 1);
 }
 
-/**
- * The BigInt writers must reject a non-BigInt, but only *after* the offset has
- * been validated. Node reaches this via its own mixed-type arithmetic
- * (`value & 0xffffffffn`), which happens after `checkInt`, so
- * `writeBigUInt64LE('1', null)` reports the null offset while
- * `writeBigUInt64LE('1', 0)` reports the mixed types. The range test in
- * `checkInt` does not filter a string first: `'1' > 0n` is a legal comparison
- * that simply returns false, so control really does reach the offset check.
- *
- * Without this, QuickJS's `setBigUint64` coerced the string and silently wrote
- * 8 bytes, returning 8 where Node throws.
- */
+// The BigInt writers reject a non-BigInt only AFTER the offset is validated:
+// Node's mixed-type arithmetic (and QuickJS's coercing setBigUint64) runs later.
+// `'1' > 0n` is false, so a string really does reach the offset check.
 function requireBigInt(value: unknown): void {
     if (typeof value !== 'bigint') {
         throw new TypeError('Cannot mix BigInt and other types, use explicit conversions');
@@ -405,24 +369,18 @@ function checkBounds(buf: Buffer, offset: number, byteLength: number): void {
     }
 }
 
-/**
- * Node's `validateOffset`, used by `fill`/`write`/`copy`. It rejects
- * non-numbers outright rather than coercing, so an object with a hostile
- * `valueOf` can never run user JS between validation and the byte access —
- * that is what keeps a mid-call `transfer()`/`resize()` out of reach.
- */
+// Rejects non-numbers instead of coercing, so no user `valueOf` can run between
+// validation and the byte access (and resize/transfer a live buffer).
 function validateOffset(value: unknown, name: string, min = 0, max = Number.MAX_SAFE_INTEGER): number {
     if (typeof value !== 'number') invalidArgType(name, 'number', value);
     if (!Number.isInteger(value)) outOfRange(name, 'an integer', value);
-    // `copy`'s targetStart has no upper bound in Node — an out-of-range start
-    // just copies nothing — so an infinite max prints as a one-sided range.
+    // copy's targetStart is unbounded in Node, so an infinite max is one-sided.
     if (value < min || value > max) {
         outOfRange(name, max === Infinity ? `>= ${min}` : `>= ${min} && <= ${max}`, value);
     }
     return value;
 }
 
-/** Node's `ERR_INVALID_ARG_VALUE`: a fill value that encodes to zero bytes. */
 function invalidFillValue(value: unknown): never {
     const shown = typeof value === 'string'
         ? `'${value}'`
@@ -437,9 +395,8 @@ let dvCache: WeakMap<Uint8Array, DataView> | null = null;
 function viewOf(buf: Buffer): DataView {
     if (!dvCache) dvCache = new WeakMap();
     let dv = dvCache.get(buf);
-    // Reading `byteLength` on a cached DataView whose resizable backing store
-    // shrank throws in QuickJS, so a stale entry has to be detected defensively
-    // rather than compared — Node just reads the smaller buffer successfully.
+    // Reading byteLength on a cached DataView whose backing store shrank throws
+    // in QuickJS, so a stale entry is detected defensively rather than compared.
     let stale = dv === undefined;
     if (dv !== undefined) {
         try { stale = dv.byteLength !== buf.byteLength; } catch { stale = true; }
@@ -458,12 +415,8 @@ function attachBufferPrototype(view: Uint8Array<ArrayBufferLike>): asserts view 
 }
 
 export class Buffer extends Uint8Array {
-    // Inherits the Uint8Array constructors:
-    //   new Buffer(size) / new Buffer(arrayBuffer, byteOffset?, length?) / new Buffer(arrayLike)
-
-    // Node v24 reports 65536. Nothing is pooled here (every allocation gets its
-    // own ArrayBuffer), so this is the advertised value only — see the note on
-    // `allocUnsafe`.
+    // Node reports 65536. Nothing is pooled (each allocation gets its own
+    // ArrayBuffer), so this is advertised only — see `allocUnsafe`.
     static poolSize = 65536;
 
     // ── Allocation ──────────────────────────────────────────────────────────
@@ -471,8 +424,8 @@ export class Buffer extends Uint8Array {
     static alloc(size: number, fill?: string | Uint8Array | number, encoding?: Encoding): Buffer {
         assertSize(size);
         const buf = new Buffer(size);
-        // `encoding` must land in `fill`'s encoding slot; passing it positionally
-        // would be read as an offset and silently clamp the range to empty.
+        // `encoding` must use fill's encoding slot; positionally it would be
+        // read as an offset and silently clamp the range to empty.
         if (fill !== undefined && fill !== 0) buf.fill(fill, 0, size, encoding);
         return buf;
     }
@@ -497,13 +450,12 @@ export class Buffer extends Uint8Array {
         if (value instanceof ArrayBuffer) {
             const ab = value;
             const offset = encodingOrOffset === undefined ? 0 : Number(encodingOrOffset);
-            // Node reports its own bounds errors here; QuickJS's TypedArray
-            // constructor otherwise surfaces "invalid offset"/"invalid length"
-            // with no `.code`.
+            // Emit Node's bounds errors; QuickJS's TypedArray constructor would
+            // throw "invalid offset"/"invalid length" with no `.code`.
             if (offset < 0) throw new RangeError(`Start offset ${offset} is outside the bounds of the buffer`);
             if (offset > ab.byteLength) bufferBoundsFor('offset');
             // Omitting the length keeps the view length-tracking, so a resizable
-            // ArrayBuffer that later grows or shrinks stays in bounds as in Node.
+            // ArrayBuffer that grows or shrinks stays in bounds as in Node.
             if (length === undefined) return new Buffer(ab, offset);
             const len = Number(length);
             if (len > ab.byteLength - offset) bufferBoundsFor('length');
@@ -522,10 +474,8 @@ export class Buffer extends Uint8Array {
         }
 
         if (ArrayBuffer.isView(value)) {
-            // Uint8Array / Buffer -> copy bytes. Every other view is treated as an
-            // array-like of *element values*, so Buffer.from(new Uint16Array([1,2]))
-            // is [1,2] (2 bytes) and not the 4 raw memory bytes; a DataView has no
-            // `length` at all and yields an empty Buffer. Matches Node v24.18.
+            // Only Uint8Array copies raw bytes. Other views array-like by element:
+            // Buffer.from(new Uint16Array([1,2])) is [1,2], not 4 memory bytes.
             if (value instanceof Uint8Array) {
                 const buf = new Buffer(value.length);
                 buf.set(value);
@@ -538,15 +488,8 @@ export class Buffer extends Uint8Array {
             invalidFromValue(value);
         }
 
-        // Everything from here needs an object. A non-object that reached this
-        // point can only be a number/boolean/symbol/bigint/function, and Node
-        // throws for all of them.
-        //
-        // `function` is the one that mattered: a function's `.length` is its
-        // ARITY and is a number, so the array-like branch below used to accept
-        // it and hand back an arity-sized zero-filled Buffer. `Buffer.from(fn)`
-        // — the shape you get by forgetting `()` on a key/secret getter —
-        // silently produced an all-zero Buffer instead of throwing.
+        // Non-objects and functions (whose `.length` is arity) must throw, not
+        // be taken as array-likes.
         if (typeof value !== 'object') {
             invalidFromValue(value);
         }
@@ -560,18 +503,9 @@ export class Buffer extends Uint8Array {
 
         const objectValue = Object(value);
 
-        // `valueOf` is consulted BEFORE the array-like `length` path, which is
-        // the order Node uses (lib/buffer.js: the valueOf probe sits above
-        // fromObject). Getting this backwards corrupted every boxed string:
-        // `new String('ab')` has BOTH a numeric `length` and a string
-        // `valueOf`, so the array-like branch won and coerced the CHARACTERS
-        // to numbers — `Buffer.from(new String('ab'))` came back `0000`, and
-        // `Buffer.from(new String('6162'), 'hex')` came back `06010602`
-        // instead of `6162`, with no error either time.
-        //
-        // Node only takes the result when it is a *different* string-or-object,
-        // so `{ valueOf(){ return 5 } }` (a number) and `{ valueOf(){ return
-        // this } }` both fall through to the array-like path as they should.
+        // `valueOf` is consulted BEFORE the array-like `length` path (Node's
+        // order); `new String('ab')` has both, and only the valueOf result is a
+        // string. Taken only when it is a different string or object.
         const valueOf = Reflect.get(objectValue, 'valueOf');
         if (typeof valueOf === 'function') {
             const prim: unknown = valueOf.call(value);
@@ -585,12 +519,11 @@ export class Buffer extends Uint8Array {
         if (typeof lengthProp === 'number' || Symbol.iterator in objectValue) {
             return fromArrayLike(objectValue as ArrayLike<number> | Iterable<number>);
         }
-        // A `length` that is not a number yields an empty Buffer in Node rather
-        // than falling through to the valueOf/toPrimitive path.
+        // A non-numeric `length` yields an empty Buffer rather than falling
+        // through to the toPrimitive path.
         if ('length' in objectValue) return new Buffer(0);
 
-        // { [Symbol.toPrimitive]() } — only reached when there is no usable
-        // `valueOf` and no `length`, matching Node's ordering.
+        // Only reached when there is no usable valueOf and no length.
         const toPrim = Reflect.get(objectValue, Symbol.toPrimitive);
         if (typeof toPrim === 'function') {
             const r = toPrim.call(value, 'string');
@@ -628,9 +561,8 @@ export class Buffer extends Uint8Array {
             try {
                 bytes = algorithm.bytesConcat(liveList(list));
             } catch (e) {
-                // The native chunk check has no index or `.code`; name the
-                // offending element the way Node does. Only on the error path,
-                // so the common case keeps the single native pass.
+                // The native check has no index or `.code`; describe the member
+                // Node-style only on the error path.
                 throw concatMemberError(list, e);
             }
             return new Buffer(bytes.buffer as ArrayBuffer, bytes.byteOffset, bytes.byteLength);
@@ -656,12 +588,8 @@ export class Buffer extends Uint8Array {
     }
 
     static isEncoding(encoding: string): boolean {
-        // `normalizeEncoding` maps every falsy value to utf8 for the loose
-        // callers, so it cannot answer this question directly: it reported ''
-        // as valid while `toString('')` and `indexOf('')` throw
-        // ERR_UNKNOWN_ENCODING, which made the standard
-        // `if (Buffer.isEncoding(e)) buf.toString(e)` guard throw on the very
-        // input it had just approved. Node returns false for ''.
+        // normalizeEncoding maps falsy to utf8, but Node says '' is not an
+        // encoding — and toString('')/indexOf('') throw.
         if (encoding === '') return false;
         return typeof encoding === 'string' && normalizeEncoding(encoding) !== undefined;
     }
@@ -679,8 +607,7 @@ export class Buffer extends Uint8Array {
     }
 
     static compare(a: Uint8Array, b: Uint8Array): -1 | 0 | 1 {
-        // Without this, a non-Uint8Array argument reached `subarray` and surfaced
-        // as an opaque "TypeError: not a function".
+        // Otherwise subarray surfaces as an opaque "not a function".
         if (!(a instanceof Uint8Array)) invalidArgInstance('buf1', 'Buffer or Uint8Array', a);
         if (!(b instanceof Uint8Array)) invalidArgInstance('buf2', 'Buffer or Uint8Array', b);
         return compareBytes(a, 0, a.length, b, 0, b.length);
@@ -690,10 +617,7 @@ export class Buffer extends Uint8Array {
 
     toString(encoding?: Encoding, start = 0, end: number = this.length): string {
         const e = assertEncoding(encoding);
-        start = start < 0 ? 0 : start > this.length ? this.length : start | 0;
-        end = end > this.length ? this.length : end | 0;
-        if (end <= start) return '';
-        return bytesToString(this.subarray(start, end), e);
+        return sliceToString(this, e, start, end);
     }
 
     utf8Slice(start = 0, end: number = this.length): string {
@@ -771,8 +695,7 @@ export class Buffer extends Uint8Array {
         if (!(target instanceof Uint8Array)) {
             invalidArgInstance('target', 'Buffer or Uint8Array', target);
         }
-        // Node truncates the indices toward zero rather than rejecting them, and
-        // a NaN `sourceEnd` means "copy nothing" instead of returning NaN.
+        // Node truncates toward zero; NaN sourceEnd means "copy nothing".
         targetStart = validateOffset(Math.trunc(targetStart) || 0, 'targetStart', 0, Infinity);
         sourceStart = validateOffset(Math.trunc(sourceStart) || 0, 'sourceStart', 0, this.length);
         sourceEnd = Math.trunc(sourceEnd) || 0;
@@ -800,9 +723,8 @@ export class Buffer extends Uint8Array {
 
     fill(value: string | Uint8Array | number, offset?: unknown, end?: unknown, encoding?: Encoding): this {
         let fillEncoding: string | undefined = encoding;
-        // Argument shuffling: fill(value, encoding) / fill(value, offset, encoding).
-        // Node only reads a string in the offset slot as an encoding when `value`
-        // is itself a string; `fill(1, '2')` is an ERR_INVALID_ARG_TYPE offset.
+        // fill(value, encoding) / fill(value, offset, encoding): a string in the
+        // offset slot is an encoding only when `value` is a string too.
         if (typeof offset === 'string' && typeof value === 'string') {
             fillEncoding = offset;
             offset = 0;
@@ -812,16 +734,15 @@ export class Buffer extends Uint8Array {
             end = this.length;
         }
 
-        // Validated, never coerced — see `validateOffset`. `end` is additionally
-        // bounded by the current length, matching Node.
+        // `end` is additionally bounded by the current length, matching Node.
         const start = offset === undefined ? 0 : validateOffset(offset, 'offset');
         const stop = end === undefined ? this.length : validateOffset(end, 'end', 0, this.length);
         if (stop <= start) return this;
 
         if (typeof value === 'string') {
             const bytes = stringToBytes(value, assertFillEncoding(fillEncoding));
-            // An *empty* string means "fill with zero"; a non-empty string that
-            // encodes to nothing (e.g. 'zz' as hex) is ERR_INVALID_ARG_VALUE.
+            // Empty string fills zeros; a non-empty string encoding to nothing
+            // (e.g. 'zz' as hex) is ERR_INVALID_ARG_VALUE.
             if (bytes.length === 0) {
                 if (value.length === 0) {
                     super.fill(0, start, stop);
@@ -847,23 +768,21 @@ export class Buffer extends Uint8Array {
             return this;
         }
 
-        // Everything else is coerced to a byte: null/undefined/{}/NaN -> 0,
-        // true -> 1, { valueOf: () => 66 } -> 66. Node applies ToInteger then
-        // masks, so 0x100 -> 0 and -1 -> 255.
+        // ToInteger then mask: -1 -> 255, 0x100 -> 0.
         const n = Number(value);
         super.fill(Number.isNaN(n) ? 0 : n & 0xff, start, stop);
         return this;
     }
 
     write(string: string, offset?: unknown, length?: unknown, encoding?: Encoding): number {
-        // Native `encodeString` throws this message without a `.code`; Node sets one.
+        // Node sets a `.code` that the native error lacks.
         if (typeof string !== 'string') {
             const err = new TypeError('argument must be a string');
             (err as { code?: string }).code = 'ERR_INVALID_ARG_TYPE';
             throw err;
         }
         let writeEncoding: string | undefined = encoding;
-        // write(string, [offset], [length], [encoding]) with overloads
+        // write(string, [offset], [length], [encoding])
         if (offset === undefined) {
             offset = 0;
             length = this.length;
@@ -877,39 +796,32 @@ export class Buffer extends Uint8Array {
             length = undefined;
         }
 
-        // Validated, not coerced: a hostile `valueOf` cannot run here.
+        // Validated, not coerced: no user valueOf runs here.
         const start = validateOffset(offset, 'offset', 0, this.length);
         const remaining = this.length - start;
-        // Node bounds `length` by the whole buffer, then clamps the write to
-        // what is left after `offset` — hence `<= 4` in its error on a 4-byte
-        // buffer even when only 1 byte remains.
+        // `length` is validated against the whole buffer, then clamped to what
+        // is left after `offset`.
         let byteLength = length === undefined
             ? remaining
             : validateOffset(length, 'length', 0, this.length);
         if (byteLength > remaining) byteLength = remaining;
         if (byteLength === 0) return 0;
 
-        // `write` is one of the loose callers: Node accepts '' here and means
-        // utf8, unlike `toString`/`indexOf` which throw for it.
+        // write is a loose caller: '' means utf8, unlike toString/indexOf.
         const e = writeEncoding === '' ? 'utf8' : assertEncoding(writeEncoding);
         if (e === 'utf8') {
-            const bytes = utf8Encode(string);
-            const n = bytes.length <= byteLength ? bytes.length : utf8PrefixLength(bytes, byteLength);
-            this.set(bytes.subarray(0, n), start);
-            return n;
+            let bytes = utf8Encode(string);
+            // Only needed when the write is clamped.
+            if (bytes.length > byteLength) bytes = bytes.subarray(0, utf8PrefixLength(bytes, byteLength));
+            this.set(bytes, start);
+            return bytes.length;
         }
         const bytes = stringToBytes(string, e);
-        let n = Math.min(bytes.length, byteLength);
-        // A utf16le code unit is 2 bytes and Node never emits half of one, so a
-        // clamp that lands mid-unit rounds DOWN: write('ab', 0, 3, 'utf16le')
-        // returns 2 and leaves byte 3 alone, and a 1-byte buffer takes nothing
-        // at all. Without this, an odd `length` (or an odd amount of remaining
-        // space, which `buf.write(s, off, 'utf16le')` produces on its own) left
-        // a dangling low byte in the buffer and reported it as written —
-        // silent corruption, since decoding back drops or mis-pairs it.
-        // utf8 has `utf8PrefixLength` for the same reason.
+        let n = bytes.length;
+        if (n > byteLength) n = byteLength;
+        // A utf16le clamp mid-unit rounds DOWN: never write half a code unit.
         if (e === 'utf16le') n -= n & 1;
-        this.set(bytes.subarray(0, n), start);
+        this.set(n === bytes.length ? bytes : bytes.subarray(0, n), start);
         return n;
     }
 
@@ -1008,14 +920,8 @@ export class Buffer extends Uint8Array {
     // ── Variable-width reads (1..6 bytes) ───────────────────────────────────
 
     readUIntLE(offset: number, byteLength: number): number {
-        // Node's precedence here is irregular and was MEASURED, not derived: an
-        // `undefined` offset outranks an invalid byteLength, but every other bad
-        // offset loses to it.
-        //   readUIntLE(undefined, 0) -> offset     ERR_INVALID_ARG_TYPE
-        //   readUIntLE(null,      0) -> byteLength ERR_OUT_OF_RANGE
-        //   readUIntLE({},        0) -> byteLength ERR_OUT_OF_RANGE
-        // Checking the offset unconditionally first (the obvious reading of two
-        // samples) was wrong on 27 cases per method.
+        // `undefined` offset defers to the byteLength check; every other bad
+        // offset type loses to it.
         if (offset === undefined) invalidArgType('offset', 'number', offset);
         checkVarByteLength(byteLength);
         checkBounds(this, offset, byteLength);
@@ -1024,12 +930,6 @@ export class Buffer extends Uint8Array {
         return val;
     }
     readUIntBE(offset: number, byteLength: number): number {
-        // Same irregular precedence as `readUIntLE` above, measured separately:
-        //   readUIntBE(undefined, 0) -> offset     ERR_INVALID_ARG_TYPE
-        //   readUIntBE(null,      0) -> byteLength ERR_OUT_OF_RANGE
-        //   readUIntBE({},        0) -> byteLength ERR_OUT_OF_RANGE
-        // Checking the offset unconditionally first (the obvious reading of two
-        // samples) was wrong on 27 cases per method.
         if (offset === undefined) invalidArgType('offset', 'number', offset);
         checkVarByteLength(byteLength);
         checkBounds(this, offset, byteLength);
@@ -1166,7 +1066,6 @@ function invalidBufferSize(bits: string): never {
     throw err;
 }
 
-/** Node's `ERR_INVALID_ARG_TYPE` for a rejected `Buffer.from` first argument. */
 function invalidFromValue(value: unknown): never {
     const err = new TypeError(
         'The first argument must be of type string or an instance of Buffer, ArrayBuffer, '
@@ -1176,14 +1075,13 @@ function invalidFromValue(value: unknown): never {
     throw err;
 }
 
-/** Node's `ERR_BUFFER_OUT_OF_BOUNDS` for the `Buffer.from(ab, offset, length)` window. */
 function bufferBoundsFor(what: 'offset' | 'length'): never {
     const err = new RangeError(`"${what}" is outside of buffer bounds`);
     (err as { code?: string }).code = 'ERR_BUFFER_OUT_OF_BOUNDS';
     throw err;
 }
 
-/** Re-describe a native `bytesConcat` chunk rejection as Node's `list[i]` error. */
+// The native concat check cannot name the offending entry; only on the error path.
 function concatMemberError(list: readonly Uint8Array[], fallback: unknown): unknown {
     for (let i = 0; i < list.length; i++) {
         if (!(list[i] instanceof Uint8Array)) {
@@ -1197,18 +1095,8 @@ function concatMemberError(list: readonly Uint8Array[], fallback: unknown): unkn
 
 function assertSize(size: number): void {
     if (typeof size !== 'number') invalidArgType('size', 'number', size);
-    // Node validates against `kMaxLength` here (`validateNumber(size, 'size', 0,
-    // kMaxLength)`), and NaN lands in the same branch. Fractional sizes are
-    // accepted and truncated by the allocator.
-    //
-    // In node the bound and MAX_SAFE_INTEGER coincide, so the two readings are
-    // indistinguishable there; here they do not, and validating against
-    // `kMaxLength` is both the node-faithful choice and the useful one. Without
-    // it, a size above the engine's INT32_MAX ceiling escapes to QuickJS's array
-    // buffer constructor and surfaces as a bare `RangeError: invalid array
-    // buffer length` carrying no `code`, so a caller cannot catch it by code the
-    // way it would on node. Genuine allocation failure *below* the ceiling still
-    // comes from the engine, as on node.
+    // Validating against kMaxLength keeps an over-ceiling size from escaping to
+    // QuickJS as an uncoded "invalid array buffer length". Fractional sizes pass.
     if (Number.isNaN(size) || size < 0 || size > kMaxLength) {
         outOfRange('size', `>= 0 && <= ${kMaxLength}`, size);
     }
@@ -1221,12 +1109,8 @@ function validateIndex(value: number, name: string, max = Number.MAX_SAFE_INTEGE
     return value;
 }
 
-/**
- * `Buffer.from(string, encoding)` is looser than `toString`: only a real,
- * non-empty string is validated, and anything else silently means utf8 — even a
- * `String` wrapper or a Symbol, neither of which throws here. Measured against
- * Node v24.18.
- */
+// Loose like Buffer.from: only a real, non-empty string encoding is validated;
+// anything else (including '' and a Symbol) means utf8, with no throw.
 function fromString(string: string, encoding?: string): Buffer {
     const e = typeof encoding === 'string' && encoding !== ''
         ? assertEncoding(encoding)
@@ -1249,17 +1133,10 @@ function isArrayLike(value: ArrayLike<number> | Iterable<number>): value is Arra
 
 // ── Comparison / search helpers ─────────────────────────────────────────────
 
-/**
- * Native `JS_GetUint8Array` reports `ta->length` — the length captured when the
- * view was built — instead of the live length of a *length-tracking* view over a
- * resizable ArrayBuffer, and `typed_array_is_oob` deliberately returns false for
- * such views so nothing catches it (`quickjs.c` ~60093 vs ~60017).
- *
- * OBSERVED: shrinking a 4096-byte RAB to 8, then letting the freed tail be
- * reused, made `indexOf` report a byte at index 96 — a read of reclaimed heap.
- * Re-slicing rebuilds the view with current bounds, which the natives honour.
- * Only resizable/growable backings pay for the extra view.
- */
+// QuickJS's native array accessors report a length-tracking view's captured
+// length, not its live length, and do not flag it as out of bounds, so a view
+// over a shrunk resizable ArrayBuffer can read reclaimed memory. Re-slicing
+// rebuilds current bounds. Only resizable/growable backings pay for this.
 function isResizableBacked(view: Uint8Array): boolean {
     const ab = view.buffer as { resizable?: boolean; growable?: boolean };
     return ab.resizable === true || ab.growable === true;
@@ -1304,7 +1181,6 @@ function bidirectionalIndexOf(
     else offset = Math.trunc(offset);
     if (offset < 0) offset += buf.length;
 
-    // Normalise the needle to a byte sequence.
     let needle: Uint8Array;
     if (typeof value === 'number') {
         const byte = value & 0xff;
@@ -1341,12 +1217,11 @@ function bidirectionalIndexOf(
 export type TranscodeEncoding =
     | 'ascii' | 'utf8' | 'utf-8' | 'utf16le' | 'utf-16le' | 'ucs2' | 'ucs-2' | 'latin1' | 'binary';
 
-/** Re-encode a Buffer/Uint8Array from one encoding to another. */
 export function transcode(source: Uint8Array, fromEnc: TranscodeEncoding, toEnc: TranscodeEncoding): Buffer {
     const from = assertEncoding(fromEnc);
     const to = assertEncoding(toEnc);
     const str = bytesToString(source instanceof Buffer ? source : Buffer.from(source), from);
-    // Substitute unrepresentable characters for single-byte target encodings.
+    // U+FFFD substitution for single-byte targets; fromString would re-encode.
     if (to === 'ascii' || to === 'latin1') {
         const bytes = to === 'ascii'
             ? algorithm.asciiEncodeReplace(str)
@@ -1356,12 +1231,10 @@ export function transcode(source: Uint8Array, fromEnc: TranscodeEncoding, toEnc:
     return fromString(str, to);
 }
 
-/** True if `input` contains only valid UTF-8. */
 export function isUtf8(input: ArrayBuffer | ArrayBufferView): boolean {
     return algorithm.bytesIsUtf8(toBytes(input));
 }
 
-/** True if `input` contains only 7-bit ASCII bytes. */
 export function isAscii(input: ArrayBuffer | ArrayBufferView): boolean {
     return algorithm.bytesIsAscii(toBytes(input));
 }
@@ -1369,8 +1242,8 @@ export function isAscii(input: ArrayBuffer | ArrayBufferView): boolean {
 function toBytes(input: ArrayBuffer | ArrayBufferView): Uint8Array {
     if (input instanceof ArrayBuffer) return new Uint8Array(input);
     if (ArrayBuffer.isView(input)) return new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
-    // Node tags this `ERR_INVALID_ARG_TYPE` and names the three accepted types;
-    // without the `code` a caller branching on `err.code` sees undefined.
+    // Node tags this ERR_INVALID_ARG_TYPE; without the code a caller
+    // branching on `err.code` sees undefined.
     const err = new TypeError(
         'The "input" argument must be an instance of ArrayBuffer, Buffer, or TypedArray. '
         + `Received ${receivedOf(input)}`
@@ -1379,7 +1252,7 @@ function toBytes(input: ArrayBuffer | ArrayBufferView): Uint8Array {
     throw err;
 }
 
-/** Resolve a `blob:nodedata:...` URL — not supported in this runtime. */
+/** Not supported in this runtime; Node returns undefined. */
 export function resolveObjectURL(_id: string): undefined {
     return undefined;
 }
@@ -1403,13 +1276,12 @@ export const atob: (data: string) => string =
         ? globalThis.atob
         : (data: string) => latin1ToString(base64ToBytes(data));
 
-// Blob / File come from the web platform layer when available.
 export const Blob: typeof globalThis.Blob | undefined =
     typeof globalThis.Blob !== 'undefined' ? globalThis.Blob : undefined;
 export const File: typeof globalThis.File | undefined =
     typeof globalThis.File !== 'undefined' ? globalThis.File : undefined;
 
-/** Deprecated alias retained for compatibility — same as `Buffer.allocUnsafeSlow`. */
+/** Alias kept for compatibility — same as `Buffer.allocUnsafeSlow`. */
 export function SlowBuffer(length: number): Buffer {
     return Buffer.allocUnsafeSlow(length);
 }

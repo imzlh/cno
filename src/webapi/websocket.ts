@@ -20,15 +20,9 @@ const crypto = import.meta.use('crypto');
 const timers = import.meta.use('timers');
 const textMod = import.meta.use('text');
 const failWebSocket = Symbol('cno.failWebSocket');
-const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
-const typedArrayBufferGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')?.get;
-const typedArrayByteOffsetGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteOffset')?.get;
-const typedArrayByteLengthGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteLength')?.get;
-const dataViewBufferGetter = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer')?.get;
-const dataViewByteOffsetGetter = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset')?.get;
-const dataViewByteLengthGetter = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength')?.get;
-const blobSizeGetter = Object.getOwnPropertyDescriptor(Blob.prototype, 'size')?.get;
-const blobArrayBuffer = Blob.prototype.arrayBuffer;
+function getBlobSize(value: unknown): number | undefined {
+    return value instanceof Blob ? value.size : undefined;
+}
 
 /** RFC 6455 requires invalid UTF-8 to fail the connection with status 1007. */
 const decodeTextFrame = (payload: Uint8Array): string => new textMod.Decoder('utf-8', { fatal: true }).decode(payload);
@@ -52,50 +46,33 @@ function toError(error: unknown, fallback?: string): Error {
     return new Error(fallback ?? String(error));
 }
 
-function applySlotGetter<T>(getter: ((this: unknown) => T) | undefined, value: object): T {
-    if (!getter) throw new TypeError('Required WebSocket data slot is unavailable');
-    return Reflect.apply(getter, value, []);
-}
-
-function getBlobSize(value: unknown): number | undefined {
-    if (!value || typeof value !== 'object' || !blobSizeGetter) return undefined;
-    try { return Reflect.apply(blobSizeGetter, value, []); } catch { return undefined; }
-}
-
 function isArrayBufferView(value: unknown): value is ArrayBufferView {
-    if (!value || typeof value !== 'object') return false;
-    if (engine.isDataView(value)) return true;
-    if (!typedArrayBufferGetter) return false;
-    try { Reflect.apply(typedArrayBufferGetter, value, []); return true; } catch { return false; }
+    return ArrayBuffer.isView(value);
 }
 
 function viewBytes(value: ArrayBufferView): Uint8Array {
-    const isDataView = engine.isDataView(value);
-    const buffer = isDataView
-        ? applySlotGetter(dataViewBufferGetter, value)
-        : applySlotGetter(typedArrayBufferGetter, value);
-    const byteOffset = isDataView
-        ? applySlotGetter(dataViewByteOffsetGetter, value)
-        : applySlotGetter(typedArrayByteOffsetGetter, value);
-    const byteLength = isDataView
-        ? applySlotGetter(dataViewByteLengthGetter, value)
-        : applySlotGetter(typedArrayByteLengthGetter, value);
-    return toOwnedBytes(new Uint8Array(buffer, byteOffset, byteLength));
+    return toOwnedBytes(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
 }
 
-function closeConnectionQuietly(connection: { close(): void }): void {
+/** Closing a handle a racing teardown already closed is expected, not an error. */
+function closeReadableControllerQuietly(handle: { close(): unknown }): void {
     try {
-        connection.close();
+        handle.close();
     } catch {
-        // Closing is best-effort during terminal WebSocket state changes.
+        // Already closed.
     }
 }
 
-function closeReadableControllerQuietly(controller: { close(): void }): void {
+function closeConnectionQuietly(connection: { close(): void }): void {
+    closeQuietly(connection);
+}
+
+/** Closing a handle a racing teardown already closed is expected, not an error. */
+function closeQuietly(handle: { close(): unknown }): void {
     try {
-        controller.close();
+        handle.close();
     } catch {
-        // The stream may already be closed by the WebSocket terminal event.
+        // Already closed.
     }
 }
 
@@ -861,7 +838,7 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
         const blobSize = getBlobSize(data);
         if (blobSize !== undefined) {
             this.queueData(OpCode.BINARY, blobSize, async () => {
-                const buffer = await Reflect.apply(blobArrayBuffer, data, []) as ArrayBuffer;
+                const buffer = await (data as Blob).arrayBuffer();
                 return new Uint8Array(buffer);
             });
         } else if (engine.isArrayBuffer(data)) {
@@ -1302,7 +1279,7 @@ export class WebSocketStream {
                 if (typeof data === 'string') controller.enqueue(data);
                 else if (engine.isArrayBuffer(data)) controller.enqueue(new Uint8Array(data as ArrayBuffer));
                 else if (getBlobSize(data) !== undefined) {
-                    const buffer = await Reflect.apply(blobArrayBuffer, data, []) as ArrayBuffer;
+                    const buffer = await (data as Blob).arrayBuffer();
                     controller.enqueue(new Uint8Array(buffer));
                 }
             }).catch(err => {

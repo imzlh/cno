@@ -1,11 +1,5 @@
-/**
- * Node.js-compatible util.inspect implementation.
- *
- * Written in TS on top of plain ECMAScript reflection so the output matches
- * Node's `util.inspect` byte-for-byte for the shapes that matter (circular
- * refs, depth truncation, Map/Set/TypedArray/Error/Promise, getters, colors).
- * The native `console.inspect` binding is only consulted for promise state.
- */
+// Written on plain reflection so the output matches Node's byte-for-byte; the
+// native `console.inspect` binding is only consulted for promise state.
 
 const engine = import.meta.use('engine');
 

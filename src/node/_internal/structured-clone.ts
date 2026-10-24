@@ -4,7 +4,6 @@ const PIPE_ERROR_TAG = '__cno_structured_clone_error__';
 const PIPE_DATE_TAG = '__cno_structured_clone_date__';
 const PIPE_REGEXP_TAG = '__cno_structured_clone_regexp__';
 const PIPE_DATAVIEW_TAG = '__cno_structured_clone_dataview__';
-const arrayBufferByteLengthGetter = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength')?.get;
 const arrayBufferResizableGetter = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'resizable')?.get;
 const arrayBufferMaxByteLengthGetter = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'maxByteLength')?.get;
 const arrayBufferTransfer = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'transfer')?.value;
@@ -20,8 +19,7 @@ const mapSet = Map.prototype.set;
 const setForEach = Set.prototype.forEach;
 const setClear = Set.prototype.clear;
 const setAdd = Set.prototype.add;
-const regexpSourceGetter = Object.getOwnPropertyDescriptor(RegExp.prototype, 'source')?.get;
-const regexpFlagGetters = [
+const REGEXP_FLAGS = [
     ['hasIndices', 'd'],
     ['global', 'g'],
     ['ignoreCase', 'i'],
@@ -31,14 +29,6 @@ const regexpFlagGetters = [
     ['unicodeSets', 'v'],
     ['sticky', 'y'],
 ] as const;
-const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
-const typedArrayBufferGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')?.get;
-const typedArrayByteOffsetGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteOffset')?.get;
-const typedArrayLengthGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'length')?.get;
-const typedArrayTagGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, Symbol.toStringTag)?.get;
-const dataViewBufferGetter = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer')?.get;
-const dataViewByteOffsetGetter = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset')?.get;
-const dataViewByteLengthGetter = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength')?.get;
 const sharedArrayBufferByteLengthGetter = typeof SharedArrayBuffer === 'function'
     ? Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength')?.get
     : undefined;
@@ -48,7 +38,6 @@ const objectPrototype = Object.prototype;
 const arrayPrototype = Array.prototype;
 const objectGetPrototypeOf = Object.getPrototypeOf;
 const objectHasOwn = Object.prototype.hasOwnProperty;
-const arrayBufferIsView = typeof ArrayBuffer.isView === 'function' ? ArrayBuffer.isView : undefined;
 
 // Tag-based dispatch; see docs/node-internals.md#structured-clone-tagged-dispatch.
 const TAG_NUMBER = '[object Number]';
@@ -178,11 +167,6 @@ function throwIfNonSerializable(value: object): void {
     }
 }
 
-function arrayBufferByteLength(buffer: ArrayBuffer): number {
-    if (!arrayBufferByteLengthGetter) throw dataCloneError('ArrayBuffer byteLength is unavailable');
-    return Reflect.apply(arrayBufferByteLengthGetter, buffer, []);
-}
-
 function isResizableArrayBuffer(buffer: ArrayBuffer): boolean {
     return arrayBufferResizableGetter ? Reflect.apply(arrayBufferResizableGetter, buffer, []) : false;
 }
@@ -190,31 +174,17 @@ function isResizableArrayBuffer(buffer: ArrayBuffer): boolean {
 function arrayBufferMaxByteLength(buffer: ArrayBuffer): number {
     return arrayBufferMaxByteLengthGetter
         ? Reflect.apply(arrayBufferMaxByteLengthGetter, buffer, [])
-        : arrayBufferByteLength(buffer);
-}
-
-function applyGetter<T>(getter: ((this: unknown) => T) | undefined, receiver: object, name: string): T {
-    if (!getter) throw dataCloneError(`${name} is unavailable`);
-    return Reflect.apply(getter, receiver, []);
-}
-
-function isArrayBufferView(value: unknown): value is ArrayBufferView {
-    if (!value || typeof value !== 'object') return false;
-    if (arrayBufferIsView) return arrayBufferIsView(value);
-    if (engine.isDataView(value)) return true;
-    if (!typedArrayBufferGetter) return false;
-    try { Reflect.apply(typedArrayBufferGetter, value, []); return true; } catch { return false; }
+        : buffer.byteLength;
 }
 
 function regexpSource(value: RegExp): string {
-    return applyGetter(regexpSourceGetter, value, 'RegExp source');
+    return value.source;
 }
 
 function regexpFlags(value: RegExp): string {
     let flags = '';
-    for (const [property, flag] of regexpFlagGetters) {
-        const getter = Object.getOwnPropertyDescriptor(RegExp.prototype, property)?.get;
-        if (getter && Reflect.apply(getter, value, [])) flags += flag;
+    for (const [property, flag] of REGEXP_FLAGS) {
+        if (Reflect.get(value, property)) flags += flag;
     }
     return flags;
 }
@@ -225,11 +195,15 @@ function cloneArrayBuffer(buffer: ArrayBuffer): ArrayBuffer {
     }
     try {
         if (isResizableArrayBuffer(buffer)) {
-            const out = new ArrayBuffer(arrayBufferByteLength(buffer), { maxByteLength: arrayBufferMaxByteLength(buffer) });
+            const out = new ArrayBuffer(buffer.byteLength, { maxByteLength: arrayBufferMaxByteLength(buffer) });
             new Uint8Array(out).set(new Uint8Array(buffer));
             return out;
         }
-        return buffer.slice(0);
+        // Copy the bytes directly: setPrototypeOf on a view also replaces its buffer's
+        // prototype, so no ArrayBuffer.prototype method can be reached.
+        const out = new ArrayBuffer(buffer.byteLength);
+        new Uint8Array(out).set(new Uint8Array(buffer));
+        return out;
     } catch (e) {
         throw dataCloneError('An ArrayBuffer is detached and could not be cloned');
     }
@@ -261,26 +235,28 @@ function transferArrayBuffer(buffer: ArrayBuffer): void {
             engine.detachArrayBuffer(buffer);
         }
     } catch (e) {
-        if (arrayBufferByteLength(buffer) !== 0) throw e;
+        if (buffer.byteLength !== 0) throw e;
     }
 }
 
-function typedArrayConstructor(value: ArrayBufferView): TypedArrayConstructor {
-    const tag = applyGetter(typedArrayTagGetter, value, 'TypedArray tag');
-    switch (tag) {
-        case 'Int8Array': return Int8Array;
-        case 'Uint8Array': return Uint8Array;
-        case 'Uint8ClampedArray': return Uint8ClampedArray;
-        case 'Int16Array': return Int16Array;
-        case 'Uint16Array': return Uint16Array;
-        case 'Int32Array': return Int32Array;
-        case 'Uint32Array': return Uint32Array;
-        case 'Float32Array': return Float32Array;
-        case 'Float64Array': return Float64Array;
-        case 'BigInt64Array': return BigInt64Array as TypedArrayConstructor;
-        case 'BigUint64Array': return BigUint64Array as TypedArrayConstructor;
-        default: throw dataCloneError('Unsupported ArrayBuffer view');
-    }
+const typedArrayCtors: Record<string, [TypedArrayConstructor, number]> = {
+    Int8Array: [Int8Array, 1],
+    Uint8Array: [Uint8Array, 1],
+    Uint8ClampedArray: [Uint8ClampedArray, 1],
+    Int16Array: [Int16Array, 2],
+    Uint16Array: [Uint16Array, 2],
+    Int32Array: [Int32Array, 4],
+    Uint32Array: [Uint32Array, 4],
+    Float32Array: [Float32Array, 4],
+    Float64Array: [Float64Array, 8],
+    BigInt64Array: [BigInt64Array as TypedArrayConstructor, 8],
+    BigUint64Array: [BigUint64Array as TypedArrayConstructor, 8],
+};
+
+function typedArrayKind(value: ArrayBufferView): [TypedArrayConstructor, number] {
+    // A reprototyped view or a deleted shared tag reports [object Object], so the tag
+    // no longer names its kind: clone it as a byte view over its bytes.
+    return typedArrayCtors[Object.prototype.toString.call(value).slice(8, -1)] ?? [Uint8Array, 1];
 }
 
 function prepareTransfers<TPort extends object, TPortClone extends object = TPort>(
@@ -367,27 +343,22 @@ function cloneView<TPort extends object, TPortClone extends object>(
     seen: Map<object, unknown>,
 ): ArrayBufferView {
     const cached = seen.get(value);
-    if (isArrayBufferView(cached)) return cached;
+    if (ArrayBuffer.isView(cached)) return cached;
     const isDataView = engine.isDataView(value);
-    const source = isDataView
-        ? applyGetter(dataViewBufferGetter, value, 'DataView buffer')
-        : applyGetter(typedArrayBufferGetter, value, 'TypedArray buffer');
+    const source = value.buffer;
     const buffer = engine.isArrayBuffer(source)
-        ? state.buffers.get(source) ?? cloneBuffer(source, state)
-        : cloneSharedBuffer(source, state);
+        ? state.buffers.get(source as ArrayBuffer) ?? cloneBuffer(source as ArrayBuffer, state)
+        : cloneSharedBuffer(source as SharedArrayBuffer, state);
 
     if (isDataView) {
-        const byteOffset = applyGetter(dataViewByteOffsetGetter, value, 'DataView byteOffset');
-        const byteLength = applyGetter(dataViewByteLengthGetter, value, 'DataView byteLength');
-        const out = new DataView(buffer, byteOffset, byteLength);
+        const view = value as DataView;
+        const out = new DataView(buffer as ArrayBuffer, view.byteOffset, view.byteLength);
         seen.set(value, out);
         return out;
     }
 
-    const ctor = typedArrayConstructor(value);
-    const byteOffset = applyGetter(typedArrayByteOffsetGetter, value, 'TypedArray byteOffset');
-    const length = applyGetter(typedArrayLengthGetter, value, 'TypedArray length');
-    const out = new ctor(buffer, byteOffset, length);
+    const [ctor, bytesPerElement] = typedArrayKind(value);
+    const out = new ctor(buffer as ArrayBuffer, value.byteOffset, value.byteLength / bytesPerElement);
     seen.set(value, out);
     return out;
 }
@@ -575,7 +546,7 @@ function encodeForPipe(value: unknown, seen: Map<object, unknown>): unknown {
         seen.set(value, out);
         return out;
     }
-    if (isArrayBufferView(value)) return value;
+    if (ArrayBuffer.isView(value)) return value;
 
     seen.set(value, value);
     if (engine.isMap(value)) {
@@ -650,7 +621,7 @@ function decodeFromPipe(value: unknown, seen: Map<object, unknown>): unknown {
     if (engine.isDate(value) || engine.isRegExp(value) || engine.isArrayBuffer(value) || isSharedArrayBuffer(value)) {
         return value;
     }
-    if (isArrayBufferView(value)) return value;
+    if (ArrayBuffer.isView(value)) return value;
 
     seen.set(value, value);
     if (engine.isMap(value)) {
@@ -712,7 +683,7 @@ function cloneValue<T, TPort extends object, TPortClone extends object>(
         plainTag = Reflect.apply(objectToString, value, []) as string;
     }
 
-    if (isArrayBufferView(value)) return cloneView(value, state, seen);
+    if (ArrayBuffer.isView(value)) return cloneView(value, state, seen);
     if (engine.isDate(value)) {
         const out = new Date(Reflect.apply(dateGetTime, value, []));
         seen.set(value, out);

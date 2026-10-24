@@ -21,10 +21,10 @@ import {
     hasErrorCode,
     hasGzipMagic,
     isAlreadyFinished,
+    trailingIsPadding,
     NO_FLUSH,
     SYNC_FLUSH,
     toUint8Array,
-    trailingIsPadding,
     truncatedError,
     validateFlushFlag,
     validateOptions,
@@ -102,10 +102,12 @@ export function toTransformOptions(o?: ZlibOptions & TransformOptions): Transfor
 
 type ZlibStreamState = {
     compress: boolean;
+    // codec for decompressors; undefined for compressors
+    kind?: DecompressKind;
+    // flush mode requested on each feed (compressors only; decompressors are
+    // driven by finishFlush and the member walk)
     flush: number;
     finishFlush: number;
-    // Node counts every byte handed to the stream (uncompressed for compressors,
-    // compressed for decompressors) and exposes it as `bytesWritten`.
     bytesWritten: number;
     // gzip members concatenate; track leftovers across chunk boundaries
     multiMember: boolean;
@@ -129,6 +131,7 @@ function configureZlibStream(stream: object, compress: boolean, options?: ZlibOp
     });
     zlibStreamStates.set(stream, {
         compress,
+        kind,
         flush: options?.flush ?? NO_FLUSH,
         finishFlush: options?.finishFlush ?? FINISH,
         bytesWritten: 0,
@@ -143,17 +146,27 @@ function streamState(stream: object): ZlibStreamState {
     return state;
 }
 
-function concatBytes(a: Uint8Array, b: Uint8Array): Uint8Array {
-    const out = new Uint8Array(a.length + b.length);
-    out.set(a, 0);
-    out.set(b, a.length);
-    return out;
-}
+// Decodes one member from the start of `data`, leaving the bytes after it in a
+// variable-length encoding undecoded just as the streaming handle does. The
+// streaming handle cannot be used for this: it throws an uncatchable
+// InternalError as soon as a member ends inside the input, which the walk needs
+// to do on every member but the last. The finish flush keeps that behaviour
+// (a partial member returns what it decoded instead of failing). Each helper
+// has its own signature, so dispatch per codec.
+const NATIVE_DECOMPRESS: Record<DecompressKind, (data: Uint8Array) => Uint8Array> = {
+    inflate: (data) => zlib.inflate(data, zlib.NO_FLUSH),
+    inflateRaw: (data) => zlib.inflateRaw(data, zlib.NO_FLUSH),
+    gunzip: (data) => zlib.gunzip(data, zlib.NO_FLUSH),
+    unzip: (data) => zlib.unzip(data, zlib.NO_FLUSH),
+};
+
 /**
- * Feed one chunk into a decompression handle, walking gzip member boundaries and
- * buffering any bytes that need more input before they can be decoded.
+ * Feed one chunk into a decompressor, walking gzip member boundaries and
+ * buffering any bytes that need more input before they can be decoded. `kind`
+ * names the codec used for each complete member; `pending` holds the bytes of
+ * the member that is still incomplete.
  */
-function inflateChunk(state: ZlibStreamState, handle: ZlibInflateHandle, chunk: Uint8Array): Buffer {
+function inflateChunk(state: ZlibStreamState, kind: DecompressKind, chunk: Uint8Array): Buffer {
     // A NUL after a finished member closed the stream; everything after is discarded.
     if (state.trailingDone) return Buffer.alloc(0);
     const data = state.pending && state.pending.length > 0 ? concatBytes(state.pending, chunk) : chunk;
@@ -164,43 +177,34 @@ function inflateChunk(state: ZlibStreamState, handle: ZlibInflateHandle, chunk: 
     }
     const outputs: Buffer[] = [];
     let offset = 0;
-    while (offset <= data.length) {
-        const before = handle.getTotalIn?.() ?? 0;
-        let produced: Uint8Array;
+    while (offset < data.length) {
+        let member: Uint8Array | null = null;
         try {
-            produced = handle.inflate(data.subarray(offset), state.flush);
-        } catch (err) {
-            if (!isAlreadyFinished(err)) {
-                state.error = corruptError();
-                throw state.error;
-            }
-            // Current member ended; continue with the next one if input remains.
-            const rest = data.subarray(offset);
-            if (rest.length === 0) break;
-            // Only gzip concatenates members; trailing bytes elsewhere are ignored.
-            if (!state.multiMember) break;
-            if (trailingIsPadding(rest)) {
-                // NUL padding closes the stream: drop the rest and every later chunk.
-                state.trailingDone = true;
-                state.pending = undefined;
-                break;
-            }
-            if (!handle.reset) {
-                state.pending = rest;
-                break;
-            }
-            handle.reset();
-            continue;
+            member = NATIVE_DECOMPRESS[kind](data.subarray(offset));
+        } catch {
+            // The one-shot helpers reject every malformed input with the same
+            // InternalError, so the trailing bytes decide which case this is.
+            // Node reads them as the next member: a NUL closes the stream, gzip
+            // magic means the input stops mid-member, anything else is junk.
+            // (Nothing may be called in here: the engine treats the region of a
+            // pending native error as terminate-only, and any call aborts.)
         }
-        if (produced.length > 0) outputs.push(Buffer.from(produced));
-        const used = (handle.getTotalIn?.() ?? before) - before;
-        offset += used;
-        if (used === 0) {
-            // Needs more input than this chunk carries.
-            state.pending = data.subarray(offset);
+        if (member) {
+            outputs.push(Buffer.from(member));
             break;
         }
-        if (offset >= data.length) break;
+        const rest = data.subarray(offset);
+        if (state.multiMember && trailingIsPadding(rest)) {
+            // NUL padding closes the stream: drop the rest and every later chunk.
+            state.trailingDone = true;
+            break;
+        }
+        // Only gzip concatenates members; other codecs stop at the first one.
+        if (!state.multiMember) break;
+        if (offset > 0 && !hasGzipMagic(rest)) throw corruptError();
+        // A next member that is still incomplete waits for the next chunk.
+        state.pending = rest;
+        break;
     }
     return Buffer.concat(outputs);
 }
@@ -215,19 +219,23 @@ function _transform(this: NodeZlibTransform, chunk: ZlibInput, _encoding: Buffer
         state.bytesWritten += input.byteLength;
         const output = isDeflateHandle(handle)
             ? Buffer.from(handle.deflate(input, state.flush))
-            : inflateChunk(state, handle, input);
+            : inflateChunk(state, state.kind ?? 'inflate', input);
         cb(null, output.length > 0 ? output : undefined);
     } catch (err) { cb(asError(err)); }
 }
 
 function processChunk(handle: ZlibHandle, chunk: ZlibInput, flush?: number): Buffer {
+    // Once the member's trailer is consumed the native handle reports failure as
+    // an uncatchable InternalError, so a flush after the end of the stream
+    // produces nothing instead of ending the process.
+    if (handle.finished === true) return Buffer.alloc(0);
     try {
         const input = toUint8Array(chunk);
         return Buffer.from(isDeflateHandle(handle)
             ? handle.deflate(input, flush)
             : handle.inflate(input, flush));
     } catch (err) {
-        if (/already finished/i.test(asError(err).message)) {
+        if (isAlreadyFinished(err)) {
             return Buffer.alloc(0);
         }
         throw err;
@@ -248,26 +256,23 @@ function _flush(this: NodeZlibTransform, cb: TransformCallback): void {
             if (state.finishFlush === FINISH) throw truncatedError();
         }
         const handle = this._handle;
+        // Decompressors never touch the streaming handle: a member starts in one
+        // chunk and ends in another, and the handle cannot tell which call will
+        // end it, so the walk reports end-of-stream itself.
+        if (!state.compress) {
+            if (state.bytesWritten === 0 && state.finishFlush === FINISH) throw truncatedError();
+            cb(null);
+            return;
+        }
         const raw = state.finishFlush === FINISH
             ? handle.finish()
-            : isDeflateHandle(handle)
-                ? handle.deflate(new Uint8Array(), state.finishFlush)
-                : handle.inflate(new Uint8Array(), state.finishFlush);
+            : handle.deflate(new Uint8Array(), state.finishFlush);
         const output = Buffer.from(raw);
         cb(null, output.length > 0 ? output : undefined);
     } catch (err) {
         const state = zlibStreamStates.get(this);
         if (state?.error) {
             cb(state.error);
-            return;
-        }
-        if (isAlreadyFinished(err)) {
-            cb(null);
-            return;
-        }
-        // The native finish() reports a generic failure when input ended mid-member.
-        if (state && !state.compress && !hasErrorCode(err)) {
-            cb(truncatedError());
             return;
         }
         cb(asError(err));
@@ -403,11 +408,11 @@ const compressionOptions = (options?: ZlibOptions) => [
 ] as const;
 
 export const Deflate = defineZlibConstructor<Deflate>('Deflate', options => zlib.createDeflate(...compressionOptions(options)));
-export const Inflate = defineZlibConstructor<Inflate>('Inflate', () => zlib.createInflate());
+export const Inflate = defineZlibConstructor<Inflate>('Inflate', () => zlib.createInflate(), 'inflate');
 export const Gzip = defineZlibConstructor<Gzip>('Gzip', options => zlib.createGzip(...compressionOptions(options)));
 export const Gunzip = defineZlibConstructor<Gunzip>('Gunzip', () => zlib.createGunzip(), 'gunzip');
 export const DeflateRaw = defineZlibConstructor<DeflateRaw>('DeflateRaw', options => zlib.createDeflateRaw(...compressionOptions(options)));
-export const InflateRaw = defineZlibConstructor<InflateRaw>('InflateRaw', () => zlib.createInflateRaw());
+export const InflateRaw = defineZlibConstructor<InflateRaw>('InflateRaw', () => zlib.createInflateRaw(), 'inflateRaw');
 export const Unzip = defineZlibConstructor<Unzip>('Unzip', () => zlib.createUnzip(), 'unzip');
 
 // Factory functions

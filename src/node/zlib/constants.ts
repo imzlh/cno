@@ -1,25 +1,7 @@
 /**
- * Node.js zlib module — constants, error factories and validation.
- *
- * The flush-mode / level / strategy values come from the native `zlib` module;
- * the `constants` object and `codes` map are Node's published surface.
- *
- * The BROTLI_* operation and parameter numbers live here rather than in
- * `brotli.ts` because three consumers need them at once: the `constants` object
- * below, `validateBrotliOptions`'s range check and `brotli.ts` itself. Keeping
- * them here means this file stays the leaf of the dependency graph instead of
- * importing back out of `brotli.ts`.
- *
- * Node's `Received ...` clause, its ERR_OUT_OF_RANGE numeric-separator form,
- * and the `{ code, errno }` zlib error surface live here too, so that the
- * validation, sync, stream and brotli modules all shape errors identically.
- *
- * The option/input validators sit below the error factories they call.
- * `VALID_FLUSH_FLAGS` is the validator's own table; `streams.ts` reaches the
- * same check through `validateFlushFlag`. The gzip byte probes at the bottom
- * are shared by `sync.ts` (one-shot member walking) and `streams.ts` (chunked
- * member walking), so they sit in this lower-level module to keep those two
- * files free of a cycle.
+ * node:zlib — constants, error factories and validation. Kept a leaf with no
+ * cycles: the shared validators/error factories live here rather than in
+ * brotli.ts or streams.ts.
  */
 
 const zlib = import.meta.use('zlib');
@@ -108,8 +90,7 @@ export const constants = {
     BROTLI_PARAM_SIZE_HINT,
     BROTLI_PARAM_LARGE_WINDOW,
     BROTLI_DECODER_PARAM_LARGE_WINDOW: 1,
-    // Stream mode identifiers and the option bounds Node publishes. Values
-    // measured from Node v24.18.
+    // Stream mode identifiers and the option bounds Node publishes.
     DEFLATE: 1,
     INFLATE: 2,
     GZIP: 3,
@@ -130,10 +111,7 @@ export const constants = {
     Z_MAX_LEVEL: 9,
     Z_DEFAULT_LEVEL: -1,
 };
-/**
- * Node's `zlib.codes`: a bidirectional name<->number map, frozen. Was missing
- * entirely, so `zlib.codes.Z_DATA_ERROR` threw.
- */
+/** Node's `zlib.codes`: frozen bidirectional name<->number map. */
 const zlibCodeEntries: ReadonlyArray<readonly [string, number]> = [
     ['Z_OK', 0],
     ['Z_STREAM_END', 1],
@@ -163,9 +141,17 @@ export const codes: Readonly<Record<string, string | number>> = Object.freeze(
 // ---------------------------------------------------------------------------
 
 export function asError(error: unknown): Error {
-    return error instanceof Error ? error : new Error(String(error));
+    return isErrorLike(error) ? error : new Error(String(error));
 }
 
+// Native exceptions from `import.meta.use('zlib')` calls do not satisfy
+// `instanceof Error` in this realm, so duck-type instead of crossing realms.
+function isErrorLike(value: unknown): value is Error {
+    return typeof value === 'object' && value !== null && typeof Reflect.get(value, 'message') === 'string';
+}
+
+// Native exceptions raised inside `import.meta.use('zlib')` calls do not satisfy
+// `instanceof Error` in this realm, so duck-type instead of crossing realms.
 export function zlibInputTypeError(data: unknown): TypeError {
     return codedError(
         new TypeError(
@@ -176,7 +162,7 @@ export function zlibInputTypeError(data: unknown): TypeError {
     );
 }
 
-/** Node's `Received ...` clause. Verified against v24.18. */
+/** Node's `Received ...` clause. */
 function receivedOf(actual: unknown): string {
     if (actual === null) return 'null';
     if (actual === undefined) return 'undefined';
@@ -222,12 +208,9 @@ export function codedError<T extends Error>(err: T, code: string): T {
 }
 
 /**
- * Node's `checkRangesOrGetDefault`. Exact semantics, verified against v24.18:
- *   undefined  -> use the default
- *   non-number -> ERR_INVALID_ARG_TYPE (null included; null is not a number)
- *   NaN        -> ACCEPTED, because `NaN < min` and `NaN > max` are both false
- *   +/-Infinity-> ERR_OUT_OF_RANGE "must be a finite number"
- *   non-integer inside the range -> accepted (`{ level: 1.5 }` is legal)
+ * Node's `checkRangesOrGetDefault`: undefined -> default; non-number (null
+ * included) -> ERR_INVALID_ARG_TYPE; NaN and non-integers in range -> accepted;
+ * +/-Infinity -> ERR_OUT_OF_RANGE.
  */
 export function checkRange(value: unknown, name: string, min: number, max: number): void {
     if (value === undefined) return;
@@ -252,8 +235,8 @@ export function checkRange(value: unknown, name: string, min: number, max: numbe
     }
 }
 
-// Error shaping: the native layer reports generic InternalErrors, so classify
-// them into Node's `{ code, errno }` zlib error surface here.
+// Native zlib errors are generic InternalErrors; classify them into Node's
+// `{ code, errno }` surface here.
 
 interface ZlibNativeError extends Error {
     errno: number;
@@ -272,12 +255,16 @@ function zlibError(code: string, errno: number, message: string): ZlibNativeErro
 export const truncatedError = () => zlibError('Z_BUF_ERROR', -5, 'unexpected end of file');
 export const corruptError = () => zlibError('Z_DATA_ERROR', -3, 'incorrect header check');
 
+// The native inflate handle reports errors as engine-uncatchable
+// InternalErrors (JS `catch` never sees them; the process aborts), so the
+// inflate paths never let it throw and guard on `finished` instead.
 export function isAlreadyFinished(error: unknown): boolean {
-    return /already finished/i.test(asError(error).message);
+    if (hasErrorCode(error) || error instanceof RangeError) return false;
+    return isErrorLike(error);
 }
 
 export const hasErrorCode = (error: unknown): boolean =>
-    error instanceof Error && Object.hasOwn(error, 'code');
+    isErrorLike(error) && Object.hasOwn(error, 'code');
 
 // ---------------------------------------------------------------------------
 // Option/input validation and byte helpers.
@@ -346,8 +333,7 @@ export function validateOptions(options?: ZlibOptions | BrotliOptions): void {
     checkRange(zlibOptions?.strategy, 'options.strategy', 0, 4);
     checkRange(zlibOptions?.chunkSize, 'options.chunkSize', 64, Number.POSITIVE_INFINITY);
     // Node's range is [8,15] for deflate and [0,15] for inflate, but the native
-    // binding accepts no windowBits argument at all, so anything that would
-    // change the window is refused rather than silently ignored.
+    // binding takes no windowBits, so refuse anything that would change it.
     if (zlibOptions?.windowBits !== undefined) {
         checkRange(zlibOptions.windowBits, 'options.windowBits', 0, 15);
         if (zlibOptions.windowBits !== 0 && zlibOptions.windowBits !== 15) {
@@ -396,17 +382,23 @@ export function checkMaxOutputLength(output: Buffer, options?: { maxOutputLength
     return output;
 }
 
-// Input byte probes. Shared by the one-shot member walk in `sync.ts` and the
-// chunked member walk in `streams.ts`; they live in this lower-level module so
-// neither of those two has to import from the other.
+// Input byte probes shared by the one-shot walk in sync.ts and the chunked walk
+// in streams.ts; they live here so neither file imports the other.
 
 export const hasGzipMagic = (data: Uint8Array): boolean => data.length >= 2 && data[0] === 0x1f && data[1] === 0x8b;
 
 /**
- * Node stops walking gzip members as soon as the byte after a finished member is
- * NUL (`node_zlib.cc`: `... && next_in[0] != 0x00`) and discards everything that
- * follows, however many bytes there are and whatever they hold. Requiring the
- * whole remainder to be zero instead rejects NUL-padded gzip payloads that Node
- * decodes fine.
+ * Node stops walking gzip members at the first NUL byte after a finished
+ * member and discards the remainder, so only that byte (not a zero-filled
+ * tail) decides.
  */
 export const trailingIsPadding = (data: Uint8Array): boolean => data.length > 0 && data[0] === 0;
+
+export const concatBytes = (a: Uint8Array, b: Uint8Array): Uint8Array => {
+    if (a.length === 0) return b;
+    if (b.length === 0) return a;
+    const out = new Uint8Array(a.length + b.length);
+    out.set(a, 0);
+    out.set(b, a.length);
+    return out;
+};

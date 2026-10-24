@@ -767,14 +767,9 @@ Socket.prototype.destroy = function destroy(this: Socket, error?: Error): Socket
 };
 
 /**
- * An app write to an HTTP-owned socket facade is refused — core owns the wire.
- *
- * The refusal must not be a stream fault: delivering it through _write's
- * callback destroys the live connection (writes correctly destroy the stream,
- * matching Node), and the client sees ECONNRESET mid-response. So it is
- * intercepted before the writable machinery: the callback gets
- * ERR_SOCKET_HTTP_SERVER and 'error' is still emitted, but the socket is
- * neither errored nor destroyed.
+ * An app write to an HTTP-owned socket facade is refused, without making it a
+ * stream fault (that would ECONNRESET the live connection). See node-internals.md
+ * "HTTP-owned socket write".
  */
 const duplexWrite = Duplex.prototype.write;
 Socket.prototype.write = function write(

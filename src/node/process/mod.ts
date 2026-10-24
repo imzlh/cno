@@ -8,8 +8,10 @@ import { IPCChannel, type IPCSerialization } from '../ipc_channel';
 import { stdout, stderr, stdin } from './streams';
 import { hrtime, memoryUsage, cpuUsage, resourceUsage } from './metrics';
 import { normalizeErrnoError } from '../_internal/errno';
+import { withCode as codeError } from '../_internal/errors';
 import {
     loadNodeEnvFile,
+    readEnv,
     resolveEnvFilePath,
     type EnvFilePath,
 } from '../_internal/envfile';
@@ -51,25 +53,12 @@ const cno_args = processOs.__cno_args;
 export { stdout, stderr, stdin };
 export { hrtime, memoryUsage, cpuUsage, resourceUsage };
 
-function safeGetEnv(env: string): string | undefined {
-    try {
-        return os.getenv(env) ?? undefined;
-    } catch {
-        return undefined;
-    }
-}
-
 function unsetEnvQuietly(name: string): void {
     try {
         os.unsetenv(name);
     } catch {
         // Best-effort cleanup for inherited child-process bootstrap variables.
     }
-}
-
-function codeError<T extends Error>(error: T, code: string): T {
-    Reflect.set(error, 'code', code);
-    return error;
 }
 
 function normalizeUmask(mask: unknown): number {
@@ -242,7 +231,7 @@ const envProxy = new Proxy(envTarget, {
         if (typeof key !== 'string') {
             return Reflect.get(target, key, receiver);
         }
-        const value = safeGetEnv(key);
+        const value = readEnv(key);
         if (value !== undefined) return value;
         return Reflect.get(target, key, receiver);
     },
@@ -253,7 +242,7 @@ const envProxy = new Proxy(envTarget, {
     },
     has(target, key: string | symbol): boolean {
         if (typeof key !== 'string') return Reflect.has(target, key);
-        return safeGetEnv(key) !== undefined || Reflect.has(target, key);
+        return readEnv(key) !== undefined || Reflect.has(target, key);
     },
     deleteProperty(_target, key: string | symbol): boolean {
         if (typeof key !== 'string') return true;
@@ -267,7 +256,7 @@ const envProxy = new Proxy(envTarget, {
         if (typeof key !== 'string') {
             return Reflect.getOwnPropertyDescriptor(target, key);
         }
-        const value = safeGetEnv(key);
+        const value = readEnv(key);
         if (value === undefined) return undefined;
         return {
             value,
@@ -1418,9 +1407,7 @@ export function dlopen(module: { exports?: unknown }, filename: string, _flags?:
         module.exports = napi.dlopen(filename);
     } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
-        const err = new Error(`Error loading shared library ${filename}: ${msg}`);
-        Reflect.set(err, 'code', 'ERR_DLOPEN_FAILED');
-        throw err;
+        throw codeError(new Error(`Error loading shared library ${filename}: ${msg}`), 'ERR_DLOPEN_FAILED');
     }
 }
 
@@ -1908,12 +1895,12 @@ if (!existingProcessDefault) Object.assign(processDefault, { _setupIPC, send, di
 
 (function bootstrapChildIPC() {
     if (existingProcessDefault) return;
-    const fdStr = safeGetEnv('NODE_CHANNEL_FD');
+    const fdStr = readEnv('NODE_CHANNEL_FD');
     if (!fdStr) return;
     const fd = parseInt(fdStr, 10);
     if (!Number.isInteger(fd) || fd < 0) return;
     try {
-        const serialization = safeGetEnv('CNO_IPC_SERIALIZATION') === 'advanced' ? 'advanced' : 'json';
+        const serialization = readEnv('CNO_IPC_SERIALIZATION') === 'advanced' ? 'advanced' : 'json';
         const pipe = new streams.Pipe();
         pipe.open(fd);
         const ipcChannel = _setupIPC(pipe, serialization);

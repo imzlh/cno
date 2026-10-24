@@ -1,3 +1,6 @@
+import { concatChunks } from '../_internal/buffer';
+import { addPromiseHook, PromiseState } from '../_internal/promise-hook';
+
 /**
  * Node.js v8 module
  * Based on CModuleEngine (QuickJS) runtime introspection
@@ -6,8 +9,6 @@
 const engine = import.meta.use('engine');
 const os = import.meta.use('os');
 const algorithm = import.meta.use('algorithm');
-import { concatChunks } from '../_internal/buffer';
-import { addPromiseHook, PromiseState } from '../_internal/promise-hook';
 
 const WIRE_VERSION = 1;
 const HEADER_BYTES = Uint8Array.from([0x43, 0x54, 0x53, 0x56, 0x38, WIRE_VERSION]);
@@ -573,3 +574,4 @@ export const promiseHooks = {
         };
     },
 };
+

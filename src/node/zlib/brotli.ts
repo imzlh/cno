@@ -1,14 +1,5 @@
-/**
- * Node.js zlib module — Brotli.
- *
- * `brotli` is an optional native module (built with libbrotli), so the lookup
- * is tolerant of both null and a throwing `use()`. `nativeBrotli` is lazily
- * resolved once here and must stay a single binding.
- *
- * Owns the single `brotliStreamStates` WeakMap. Reuses the prototype/stream
- * plumbing from `./streams` (`_create`, `flattenPrototype`, `receiverOrCreate`,
- * `toTransformOptions`) and the callback wrapper from `./sync`.
- */
+// `brotli` is an optional native module, so the lookup tolerates null and a
+// throwing `use()`. `nativeBrotli` must stay a single lazily-resolved binding.
 
 import { Transform, TransformOptions } from '../stream';
 import {
@@ -23,6 +14,7 @@ import {
     BROTLI_PARAM_QUALITY,
     BROTLI_PARAM_SIZE_HINT,
     checkMaxOutputLength,
+    isAlreadyFinished,
     toUint8Array,
     validateBrotliOptions,
     type BrotliOptions,
@@ -177,7 +169,9 @@ BrotliCompress.prototype._flush = function _flush(this: BrotliCompress, cb: Tran
         try {
             return brotliCompressOperation(this._handle, state.finishFlush);
         } catch (error) {
-            if (/already finished/i.test(asError(error).message)) return Buffer.alloc(0);
+            // Native handle throws carry no code and reach here as a generic
+            // "not a function" TypeError; see `isAlreadyFinished`.
+            if (isAlreadyFinished(error)) return Buffer.alloc(0);
             throw error;
         }
     });

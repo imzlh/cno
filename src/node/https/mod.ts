@@ -525,14 +525,9 @@ export class Agent extends HttpAgent {
         // a private CA failed to verify, and one configured with
         // rejectUnauthorized:false still rejected.
         const agentOptions = (this as unknown as { options?: HttpsRequestOptions }).options ?? {};
-        // Object spread copies keys whose value is `undefined`, so a per-request
-        // option that is merely *present* and undefined erased the agent's value:
-        // `{ ...{ca: PEM}, ...{ca: undefined} }` yields `{ca: undefined}`. Real
-        // clients hit this constantly — `got` always sends a full option bag with
-        // ca/cert/key/passphrase/pfx/minVersion present and undefined, so
-        // `got(url, {agent: {https: new https.Agent({ca})}})` lost the CA and
-        // failed with UNABLE_TO_GET_ISSUER_CERT_LOCALLY while Node succeeded.
-        // Only defined values may override the agent's configuration.
+        // Only defined values may override the agent's configuration: a present
+        // but undefined per-request option (e.g. from `got`) must not erase the
+        // agent's CA.
         const merged: HttpsRequestOptions = { ...agentOptions };
         for (const [key, value] of Object.entries(options as Record<string, unknown>)) {
             if (value !== undefined) (merged as Record<string, unknown>)[key] = value;

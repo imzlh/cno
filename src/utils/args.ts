@@ -63,13 +63,7 @@ export type Subcommand = typeof SUBCOMMANDS[number];
 const SUBCOMMAND_SET = new Set<string>(SUBCOMMANDS);
 
 /**
- * Deno-like argv parse — the fallback used when the cno submodule runs on its
- * own (cno-cli overrides the result via setArgs). It only needs to get the
- * boundaries right:
- *
- *   cno --internal=x run --run-args=1 main.js --user-args=y zzz
- *        internalArgs   action actionArgs entry  ──── args ────
- *
+ * Deno-like argv parse — the fallback used when cno-cli does not setArgs first.
  * Once the entry is found, every remaining token (flags included) is a script
  * arg; `argv` excludes the binary (os.args[0]).
  */
@@ -140,14 +134,9 @@ function isFsEntry(entry: string): boolean {
     return !/^[a-z][a-z0-9+\-.]*:/i.test(entry);
 }
 
-// eval mode (-e / -p / --eval / --print)
-// Node treats eval source as a runtime flag: it lands in execArgv and argv is
-// [execPath, ...userArgs]. cno stores the source in `entry` with action 'eval',
-// so both Node derivations must special-case it.
-//
-//   node -e "CODE" a b  → argv [execPath, 'a', 'b']   execArgv ['-e', 'CODE']
-//
-// Deno.args is unaffected: it only ever exposes args.scriptArgs.
+// cno stores eval source in `entry` with action 'eval', while Node treats it as
+// a runtime flag: node -e "CODE" a b → argv [execPath, 'a', 'b'], execArgv
+// ['-e', 'CODE']. Deno.args only exposes args.scriptArgs and is unaffected.
 
 function isEvalMode(): boolean {
     return args.action === 'eval';

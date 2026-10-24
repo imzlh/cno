@@ -59,20 +59,9 @@ function isIpLiteral(hostname: string): boolean {
 }
 
 /**
- * Build the client SSL context for a raw TLS connection.
- *
- * `verify: true` makes OpenSSL fail on an untrusted chain and is also what arms
- * the hostname check (`SSL_set1_host` in `ssl.Pipe`), so chain and name are
- * enforced together.
- *
- * The CA bundle must be passed explicitly: OpenSSL's compile-time verify paths
- * are empty on Windows, so default verify paths alone reject every server.
- *
- * KNOWN WEAKNESS — IP-literal targets get chain verification but no name check.
- * `SSL_set1_host` matches DNS names only; matching an IP needs `SSL_set1_ip_asc`,
- * which the native layer never calls. Leaving the name check on would make every
- * `https://<ip>` fail even with a correct certificate, so it is off for those.
- * Node matches IP SANs; closing this needs a C-side change.
+ * Build the client SSL context for a raw TLS connection. The CA bundle must be
+ * explicit (OpenSSL's default verify paths are empty on Windows); IP literals get
+ * chain verification but no name check.
  */
 export function createClientTlsContext(alpn: string[], options?: TlsOptions, servername?: string): CModuleSSL.Context {
     const effective = options ?? defaultTls;
@@ -93,9 +82,7 @@ export function createClientTlsContext(alpn: string[], options?: TlsOptions, ser
  * Connect to the first reachable address for `hostname`.
  *
  * A fresh `streams.TCP` per candidate is required: a handle whose `connect`
- * failed cannot be reused. Measured with `['::1', '127.0.0.1']` against an
- * IPv4-only listener — a shared handle failed both candidates, fresh handles
- * connected via 127.0.0.1.
+ * failed cannot be reused for the next address.
  */
 export async function openTcp(hostname: string, port: number): Promise<TcpSocket> {
     const ips = await dnsCache.resolve(hostname);

@@ -47,11 +47,8 @@ function supportedLocalesOf(locales: string | string[]): string[] {
 }
 
 // ============ Time zone resolution ============
-// cno ships no IANA tz database, so only zones whose offset is a CONSTANT for all
-// instants can be honoured correctly. Everything else throws RangeError rather than
-// silently formatting in the host zone (a wrong answer that looks right).
-// Supported: UTC + aliases, Etc/GMT{+0..+12,-0..-14} (POSIX sign inversion), and
-// offset literals +HH:MM / +HHMM / +HH. Named IANA zones (America/New_York, ...) throw.
+// No IANA tz database: only constant-offset zones are honoured, everything else
+// throws RangeError rather than formatting in the host zone.
 
 const UTC_ALIASES = new Set<string>([
     'utc', 'etc/utc', 'uct', 'etc/uct', 'universal', 'etc/universal',
@@ -75,9 +72,7 @@ function offsetToZoneName(offsetMinutes: number): string {
 }
 
 /**
- * Canonical spelling of an offset literal. Always `+HH:MM`/`-HH:MM`, never 'UTC':
- * node reports an explicit `+00:00` (and `-00:00`) back as `+00:00`, so keeping the
- * literal form is what round-trips.
+ * Offset literal, never 'UTC': node reports an explicit `+00:00` back as `+00:00`.
  */
 function offsetLiteralName(offsetMinutes: number): string {
     const sign = offsetMinutes < 0 ? '-' : '+';
@@ -136,12 +131,7 @@ function resolveTimeZone(tz: unknown): ZoneRef {
     unsupportedZone(raw);
 }
 
-/**
- * The zone name to report for the host zone. cno cannot learn the host's IANA name
- * (TZ unset, no tzdata, no native API), so report the actual current offset, which is
- * truthful and round-trips through resolveTimeZone(). Prefer TZ when it names a zone
- * we can actually honour.
- */
+/** The host's IANA name is unknowable, so report the current offset instead. */
 function hostZoneName(): string {
     try {
         const tz = (globalThis as { process?: { env?: Record<string, string | undefined> } })
@@ -172,11 +162,8 @@ interface DateFields {
 }
 
 /**
- * Break an epoch time into calendar fields for `zone`.
- * - fixed zone: shift the epoch and read UTC getters. Exact, no tz data needed.
- * - local zone: use the engine's own local getters, so this is exactly as correct as
- *   `date.getHours()` in the same runtime (which on Windows is bounded by
- *   quickjs.c getTimezoneOffset() ignoring its `time` argument).
+ * Calendar fields for `zone`. Fixed zones shift the epoch and read UTC getters;
+ * the local zone uses the engine's local getters.
  */
 function dateFieldsFor(time: number, zone: ZoneRef): DateFields {
     if (zone.kind === 'fixed') {
@@ -213,14 +200,10 @@ function zoneOffsetAt(time: number, zone: ZoneRef): number {
 }
 
 // ============ Root collation (no CLDR needed) ============
-// Uses NFD + combining-mark stripping for the primary key, so German/French/Spanish
-// diacritics sort next to their base letter instead of after 'z'. This is DUCET-shaped
-// root collation, NOT locale-tailored: sv/da (where 'a-umlaut' sorts AFTER z) are wrong
-// by design, and stated as such.
+// DUCET-shaped root collation only: NOT locale-tailored, so sv/da sort wrongly.
 
-// Combining-mark test by NUMERIC code point. Deliberately not a regex character class:
-// raw combining bytes in a literal make `file` classify the source as binary `data`,
-// and \uXXXX escapes get normalised back to raw bytes by some editors.
+// Combining-mark test by NUMERIC code point; a raw-byte regex literal would make
+// `file` classify the source as binary `data`.
 function isCombiningMark(cp: number): boolean {
     return (cp >= 0x0300 && cp <= 0x036f) // Combining Diacritical Marks
         || (cp >= 0x1ab0 && cp <= 0x1aff) // Combining Diacritical Marks Extended
@@ -409,9 +392,8 @@ const localeData = {
 };
 
 // ============ Decimal number core ============
-// Rounding runs on the value's shortest round-trip DECIMAL string, not on toFixed().
-// (1.005).toFixed(2) is "1.00" because the double is 1.00499999999999989, but ICU
-// rounds the decimal literal and prints "1.01". OBSERVED node: 1.005 @maxFrac2 -> "1.01".
+// Rounding runs on the shortest round-trip DECIMAL string, not toFixed(), to match
+// ICU: (1.005) @maxFrac2 prints "1.01".
 
 /** ISO 4217 minor-unit counts that are not the default 2. */
 const CURRENCY_MINOR_0 = new Set<string>([
@@ -746,13 +728,7 @@ class NumberFormat implements Intl.NumberFormat {
 
 // ============ DateTimeFormat support ============
 
-/**
- * Render a zone offset the way node's `timeZoneName` option does (OBSERVED):
- *   offset 0: short 'UTC', long 'Coordinated Universal Time',
- *             shortOffset 'GMT+0', longOffset 'GMT+00:00'
- *   -300:     short/shortOffset 'GMT-5', long/longOffset 'GMT-05:00'
- *   +330:     short 'GMT+5:30', long 'GMT+05:30'
- */
+/** Render a zone offset in node's `timeZoneName` shapes (see webapi-notes.md). */
 function zoneDisplayName(offsetMinutes: number, style: string, utcLong: string): string {
     const wide = style === 'long' || style === 'longOffset' || style === 'longGeneric';
     if (offsetMinutes === 0) {
@@ -809,9 +785,8 @@ const DATE_KEYS = ['weekday', 'era', 'year', 'month', 'day'] as const;
 const TIME_KEYS = ['dayPeriod', 'hour', 'minute', 'second', 'fractionalSecondDigits'] as const;
 
 /**
- * Turn the requested options into a concrete component set.
- * dateStyle/timeStyle expand to the skeletons node uses (OBSERVED); with neither
- * style nor any component present, node defaults to numeric year/month/day.
+ * Resolve the options into a component set. With neither style nor any
+ * component, node defaults to numeric year/month/day.
  */
 function expandComponents(options: Intl.DateTimeFormatOptions, isZh: boolean): DTFComponents {
     const out: DTFComponents = {};
@@ -1265,11 +1240,7 @@ class Collator implements Intl.Collator {
         return supportedLocalesOf(locales);
     }
     
-    /**
-     * Three-level root collation: primary = base letters (case- and accent-folded),
-     * secondary = accents, tertiary = case. This is DUCET-shaped, NOT locale-tailored:
-     * correct for en/de/fr/es, WRONG for sv/da where a-umlaut sorts after z.
-     */
+    /** Three-level root collation (primary base letter, secondary accents, tertiary case); not locale-tailored. */
     private compareKeys(a: string, b: string): number {
         const sensitivity = this.options.sensitivity ?? 'variant';
         const primary = codepointCompare(primaryKey(a), primaryKey(b));
@@ -1502,11 +1473,8 @@ class Segmenter implements Intl.Segmenter {
 }
 
 // ============ Plain-call support ============
-// ECMA-402 allows DateTimeFormat, NumberFormat and Collator to be called without
-// `new`; the other seven constructors must throw TypeError. An ES2015 `class` binding
-// always throws on [[Call]], which is why `Intl.NumberFormat('en')` failed here. Wrap
-// the three permitted ones in an ordinary function that constructs either way and
-// shares the class prototype, so `instanceof` and the statics keep working.
+// ECMA-402 allows three of these constructors to be called without `new`; an
+// ES2015 `class` binding always throws on [[Call]], so wrap them in a function.
 function asCallable<T>(Cls: T, name: string): T {
     const Ctor = Cls as unknown as new (...args: unknown[]) => object;
     const wrapper = function (...args: unknown[]) {
@@ -1560,10 +1528,7 @@ export class CustomIntl {
         return out;
     }
     
-    /**
-     * Only the values cno can actually honour, and RangeError for an unknown key
-     * (node's message shape). Previously this returned the locale list for every key.
-     */
+    /** Only the values cno can honour; an unknown key is a RangeError (node's message shape). */
     supportedValuesOf(key: string): string[] {
         if (key === 'calendar') return ['gregory'];
         // ECMA-402 excludes 'default' from the collation list, and cno has nothing else.
@@ -1583,13 +1548,9 @@ export class CustomIntl {
 Reflect.set(globalThis, 'Intl', new CustomIntl());
 
 // ============ Date/Number prototype re-points ============
-// quickjs implements Date.prototype.toLocale*String in C (quickjs.c get_date_string,
-// magic 0x31/0x32/0x33) and Number.prototype.toLocaleString via js_number_toString.
-// None of them consult Intl, so `date.toLocaleString('en-US', {timeZone: 'UTC'})`
-// silently ignored BOTH arguments and formatted in the host zone. Fixing
-// Intl.DateTimeFormat alone therefore does not fix the most common call site.
-// OBSERVED in the shipped binary: all four descriptors are writable+configurable,
-// so re-pointing them from this layer works without touching the off-limits C.
+// quickjs implements Date.prototype.toLocale*String and
+// Number.prototype.toLocaleString in C without consulting Intl, so they must be
+// re-pointed here; the descriptors are writable+configurable in the shipped binary.
 
 const DATE_REQUEST_KEYS = ['weekday', 'year', 'month', 'day', 'dateStyle'] as const;
 const TIME_REQUEST_KEYS = [
@@ -1602,9 +1563,8 @@ function hasAnyKey(options: Record<string, unknown>, keys: readonly string[]): b
 }
 
 /**
- * ECMA-402 ToDateTimeOptions. Defaults are only filled in when the caller asked for
- * nothing in that group: toLocaleString('en-US', {year:'numeric'}) is just "2021",
- * while toLocaleDateString('en-US', {hour:'numeric'}) is "3/4/2021, 3 PM" (OBSERVED).
+ * ECMA-402 ToDateTimeOptions: defaults are filled only when the caller asked for
+ * nothing in that group.
  */
 function toDateTimeOptions(
     options: Intl.DateTimeFormatOptions | undefined,
@@ -1705,8 +1665,5 @@ definePrototypeMethod(BigInt.prototype, 'toLocaleString', function (
     return new NumberFormat(locale, options).format(value);
 } as (...args: never[]) => unknown);
 
-// Deliberately NOT re-pointed: String.prototype.localeCompare. It has three live
-// callers in this tree (cts/src/utils/misc.ts:291, src/commands/repl/completion.ts:83,
-// tests/deno/fs-upstream-compat.test.ts) and root collation reorders results relative
-// to the current codepoint compare, which would move a currently-green test for no
-// gain against the stated priorities.
+// String.prototype.localeCompare is deliberately NOT re-pointed: root collation
+// would reorder results against its live callers (see webapi-notes.md).

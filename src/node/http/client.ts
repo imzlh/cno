@@ -330,9 +330,9 @@ function isReusableSocket(socket: Socket): boolean {
 }
 
 /**
- * The options a request was queued under, stashed on the request itself so
- * `agent.requests` keeps Node's exact `name -> ClientRequest[]` shape (user code
- * and tests read it) while a cross-origin pump can still redispatch correctly.
+ * The options a request was queued under, stashed on the request so
+ * `agent.requests` keeps Node's `name -> ClientRequest[]` shape while the pump
+ * redispatches with the original key.
  */
 const QUEUED_AGENT_OPTIONS = Symbol('cno.agent.queuedOptions');
 
@@ -349,22 +349,15 @@ export class Agent extends EventEmitter {
     freeSockets: AgentSocketTable = newAgentTable<Socket>();
     requests: AgentRequestTable = newAgentTable<ClientRequestImpl>();
     /**
-     * Sockets counted across every origin, for maxTotalSockets. Node maintains
-     * the same counter; without it maxTotalSockets was assigned and never read.
+     * Sockets counted across every origin, for maxTotalSockets.
      */
     totalSocketCount: number = 0;
     private _freeTimers = new WeakMap<Socket, ReturnType<typeof setTimeout>>();
     /**
      * Slots reserved per origin between addRequest() and the connect callback.
-     *
-     * `sockets[name]` is only appended inside createSocket's async callback, so
-     * during a synchronous burst of requests — the normal case for any client
-     * that fires N requests in a loop — every one of them read length 0 and
-     * sailed past the `< maxSockets` comparison. OBSERVED: maxSockets:2 with 8
-     * burst requests reached 8 concurrent server-side, while node held 2 and
-     * queued 6. Pacing the same 8 requests 150ms apart DID hold at 2, which is
-     * what identified this as a counter-timing bug rather than a dead
-     * comparison. Reserving synchronously here closes the window.
+     * `sockets[name]` only grows in the async callback, so without this a
+     * synchronous burst of requests all see length 0 and all pass the
+     * `maxSockets` check.
      */
     private _pendingByName: Record<string, number> = Object.create(null);
     /** Sockets already counted in totalSocketCount, so release cannot double-count. */
@@ -380,10 +373,8 @@ export class Agent extends EventEmitter {
         if (options?.maxTotalSockets !== undefined) this.maxTotalSockets = options.maxTotalSockets;
     }
 
-    // Returns `Socket | null` and may pass null to the callback: a subclass
-    // (https.Agent) legitimately fails to produce a socket, and createSocket
-    // below already guards on `!socket`. The interface at the top of this file
-    // declares the same nullable contract.
+    // Returns `Socket | null` and may pass null: a subclass (https.Agent) can
+    // fail to produce a socket, and createSocket guards on `!socket`.
     createConnection(options: ClientRequestArgs, callback: (err: Error | null, socket: Socket | null) => void): Socket | null {
         const socket = new Socket();
         const port = typeof options.port === 'string' ? parseInt(options.port) : options.port || this.defaultPort;
@@ -411,16 +402,9 @@ export class Agent extends EventEmitter {
     }
 
     getName(options: ClientRequestArgs): string {
-        // Node's key is `host:port:localAddress:family` — the trailing segments
-        // are only appended when set, and `family` is part of the key because a
-        // v4 and a v6 connection to the same host:port are NOT interchangeable.
-        // cno appended an unconditional trailing ':' after localAddress and
-        // dropped `family` entirely, so (a) the key never matched node's and
-        // (b) requests differing only by `family` shared one pool entry.
-        // OBSERVED: node getName({host:'h',port:8080,family:6}) === "h:8080::6",
-        // cno gave "h:8080:". Also node leaves the port segment EMPTY when no
-        // port was supplied ("localhost::") rather than substituting
-        // defaultPort, and does not fall back to `hostname`.
+        // Node's key is `host:port:localAddress:family`: trailing segments are
+        // appended only when set, `family` is part of the key, and a missing
+        // port leaves the segment empty rather than substituting defaultPort.
         let name = options.host || 'localhost';
         name += ':';
         if (options.port) name += options.port;
@@ -486,11 +470,9 @@ export class Agent extends EventEmitter {
                 }
             });
         } else {
-            // Remember the exact options this request was queued under. The
-            // caller passes a derived object (host/hostname filled in), so
-            // recomputing getName() from req._options at pump time can land on a
-            // different key. Stashed on the request to keep `agent.requests`
-            // shaped exactly as Node's (name -> ClientRequest[]).
+            // Remember the exact options this request was queued under: the
+            // caller's object is derived, so recomputing getName() at pump time
+            // could land on a different key.
             Reflect.set(req, QUEUED_AGENT_OPTIONS, options);
             getRequestList(this.requests, name).push(req);
         }
@@ -518,11 +500,8 @@ export class Agent extends EventEmitter {
     /**
      * Hand a freed slot to the next queued request for `name`, then — when a
      * finite maxTotalSockets is in play — to any other origin waiting on the
-     * global budget. Without the second pass, a request queued for origin B
-     * because the *total* cap was full is never retried when a socket on origin
-     * A closes: its own origin's queue is empty, so nothing wakes it and the
-     * caller hangs forever. OBSERVED before this pass: the maxTotalSockets=2
-     * two-origin probe printed VERDICT HUNG.
+     * global budget, or a request queued only because the *total* cap was full
+     * never wakes when that cap frees.
      */
     private _pumpQueue(name: string, options: ClientRequestArgs): void {
         const queued = this.requests[name];
@@ -564,11 +543,9 @@ export class Agent extends EventEmitter {
         }
 
         const queued = this.requests[name];
-        // Only take a queued request once it is certain it can be served. The
-        // previous shape shifted unconditionally, so when the socket turned out
-        // to be non-reusable the shifted request was dropped on the floor and
-        // that caller waited forever; removeSocket's pump would then serve a
-        // *different* request, hiding the loss under a partial success.
+        // Only take a queued request once the socket is known to be served: a
+        // shift before the reuse check drops the request on the floor forever,
+        // and removeSocket's pump then hides the loss behind another request.
         const next = isReusableSocket(socket) ? queued?.shift() : undefined;
         deleteEmptyList(this.requests, name);
         if (next && isReusableSocket(socket)) {
@@ -586,9 +563,8 @@ export class Agent extends EventEmitter {
         }
 
         // A finite total budget must not be held by an idle keep-alive socket
-        // while a different origin is queued waiting for it: that origin's own
-        // queue is empty, so nothing would ever wake it. Retiring the idle
-        // socket releases the slot and its 'close' pumps the waiters.
+        // while another origin queues for it: that origin's own queue is empty,
+        // so only retiring this socket's 'close' can wake it.
         if (this.maxTotalSockets !== Infinity && this._hasQueuedOtherThan(name)) {
             socket.destroy();
             return;
@@ -605,8 +581,7 @@ export class Agent extends EventEmitter {
         socket.unref();
         freeSockets.push(socket);
         this._armFreeTimer(socket, options);
-        // Node emits 'free' when a socket returns to the pool; user code uses it
-        // to observe pool churn. cno never emitted it (OBSERVED 0 vs node's 1).
+        // Node emits 'free' when a socket returns to the pool.
         this.emit('free', socket, options);
     }
 

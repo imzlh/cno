@@ -87,15 +87,10 @@ function extraViewKeysEqual(
     return true;
 }
 
-// Unordered structural matching for Set/Map entries. Both are *multisets* once
-// object members are compared structurally, so a candidate that has already been
-// paired off must not be reused: Set{ {x:1}, {x:1} } is not equal to
-// Set{ {x:1}, {x:2} } even though every left element finds *some* right match.
-// Matching Node, this is greedy-with-removal rather than a full bipartite match.
-//
-// `fastEqual` reproduces Node's first pass, which asks the collection itself
-// (Set.has / Map.has) and therefore uses SameValueZero. That is why Node reports
-// Set([0]) equal to Set([-0]) while deepStrictEqual(0, -0) is unequal.
+// Unordered structural matching for Set/Map entries, which are multisets: a
+// matched candidate must not be reused, and matching is greedy-with-removal.
+// `fastEqual` is Node's first pass (Set.has / Map.has, i.e. SameValueZero), so
+// Set([0]) equals Set([-0]) while deepStrictEqual(0, -0) is unequal.
 function matchUnordered(
     left: unknown[],
     right: unknown[],
@@ -130,16 +125,11 @@ function matchUnordered(
 }
 
 /**
- * Cycle-detection state. Node's algorithm records, for each side, the *position*
- * at which an object was entered on the current comparison path — not a set of
- * every pair ever visited. Two cyclic structures are equal only if their
- * back-edges land at the same depth on both sides, which is what distinguishes
- * `a.self = a` from `b.self = { self: b }`.
- *
- * Entries are removed as the recursion unwinds, so this tracks the path rather
- * than the whole traversal. That matters: Node is *not* reference-topology
- * sensitive for acyclic values, and reports `[a, a]` deep-equal to
- * `[{x:1}, {x:1}]` even though the left side shares one reference.
+ * Cycle-detection state: per side, the *path depth* an object was entered at,
+ * not every pair visited, so back-edges must land at the same depth on both
+ * sides (`a.self = a` differs from `b.self = { self: b }`). Entries are removed
+ * on unwind, so acyclic values are not topology sensitive: `[a, a]` deep-equals
+ * `[{x:1}, {x:1}]`.
  */
 interface PathState {
     left: Map<object, number>;
@@ -150,9 +140,6 @@ interface PathState {
 /**
  * Deep equality check supporting strict mode, prototype comparison,
  * boxed primitives, and circular references.
- *
- * @param strict - When true, uses Object.is, compares prototypes and symbol keys
- * @param skipPrototype - When true, skips prototype identity check
  */
 export function deepEqual(
     a: unknown,
@@ -252,8 +239,8 @@ function compareObjects(
         if (av.length !== bv.length) return false;
         return algorithm.bytesEqual(av, bv);
     }
-    // TypedArray / DataView. Byte comparison is necessary but not sufficient:
-    // extra own properties still count, so this falls through to the key walk.
+    // TypedArray / DataView. Byte comparison must be followed by the key walk:
+    // extra own properties still count.
     if (ArrayBuffer.isView(a) && ArrayBuffer.isView(b)) {
         if (strict) {
             const av = new Uint8Array(a.buffer, a.byteOffset, a.byteLength);
@@ -267,8 +254,7 @@ function compareObjects(
         // only the non-index extras to avoid re-walking every element.
         return extraViewKeysEqual(a, b, strict, skipPrototype, seen);
     }
-    // Map. Keys are matched structurally, and a matched entry is consumed so an
-    // equal-looking key cannot satisfy two different left entries.
+    // Map. A matched entry is consumed so one key cannot satisfy two entries.
     if (a instanceof Map && b instanceof Map) {
         if (a.size !== b.size) return false;
         return matchUnordered(

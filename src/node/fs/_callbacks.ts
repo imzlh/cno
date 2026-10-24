@@ -1,17 +1,8 @@
 /**
  * The one argument parser behind the fs callback APIs in callbacks.ts.
  *
- * Every Node fs callback API takes positional arguments, an optional trailing
- * options value (string or object), and a callback that may stand where the
- * options would. A call site describes only the differences: its parameters,
- * whether it has an options slot, and which values come from it. `invokeSync`
- * and `invokeAsync` lay the arguments out, run the implementation, and hand the
- * callback the same `Call`.
- *
- * Validation order is Node's: an options value that is not an object throws
- * synchronously *before* the callback is looked at (`fs.mkdir(p, 0o777, cb)`),
- * then a non-function callback throws, and file-argument errors surface
- * through the callback.
+ * Validation order is Node's: a non-object options value throws synchronously
+ * before the callback is looked at, then a non-function callback throws.
  */
 import { toSyncErrnoException, toAsyncFsErrnoException } from './errno-fix';
 
@@ -20,8 +11,6 @@ export type Callback = (...args: any[]) => void;
 /**
  * A positional parameter.
  * - `default`: used when the argument list ends before this parameter.
- *   `fs.utimes(p, cb)` defaults both times; `fs.utimes(p, atime, cb)` reaches
- *   the options slot and passes `undefined`, which the time conversion rejects.
  * - `ref`: the parameter a string options value is spelled as
  *   (`fs.readdir(p, 'utf8', cb)`); such a call never reaches the options slot.
  * - `rest`: collects the remaining positional arguments.
@@ -45,9 +34,8 @@ export interface CallSpec {
 }
 
 /**
- * Positional values by name, then `options`. Deliberately `any`: the value of
- * `mode` stays whatever the caller passed, for `modeToNumber` and `parseFlags`
- * to coerce, exactly as before this parser existed.
+ * Positional values by name, then `options`. Deliberately `any`: `mode` stays
+ * whatever the caller passed, for `modeToNumber` and `parseFlags` to coerce.
  */
 export interface Call {
     [name: string]: any;

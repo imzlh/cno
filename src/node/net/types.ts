@@ -1,12 +1,5 @@
-/**
- * node:net type definitions.
- *
- * Types only — no runtime code, no native modules, so importing this file
- * cannot affect module evaluation order. The `Socket` / `Server` interfaces
- * here are the *shapes*; the merged type+value declarations that consumers see
- * as `net.Socket` / `net.Server` live next to their implementations in
- * ./socket and ./server.
- */
+// Types only: importing this file cannot affect module evaluation order. The
+// merged type+value declarations live in ./socket and ./server.
 
 import type { EventEmitter } from '../events';
 import type { Duplex } from '../stream';

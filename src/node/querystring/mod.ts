@@ -1,12 +1,5 @@
-/**
- * Node.js querystring module
- * URL query string parsing and stringifying
- *
- * Ported from Node's lib/querystring.js. parse() is a single-pass state machine
- * rather than a split()-based reimplementation, because Node's separator and
- * equals matching is order-dependent in ways split() cannot express (see the
- * sepIdx/eqIdx note inside parse()).
- */
+// parse() is a state machine, not split()-based: separator and equals matching is
+// order-dependent. See node-internals.md "Querystring parse".
 
 import { Buffer } from '../buffer';
 

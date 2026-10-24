@@ -36,11 +36,8 @@ export async function readFile(path: PathLike | number, options?: { encoding?: B
             ? await withAbort(w(asfs.readFile(target.path), 'readFile', target.path), signal)
             : await withAbort(readFileWithFlag(target.path, flag), signal);
     if (signal?.aborted) throw makeAbortError(signal);
-    // Node's promises API returns a Buffer when no encoding is requested.
-    // Supplying a synthetic UTF-8 default here changed the result into a
-    // string/Uint8Array path and made `fs.promises.readFile(path)` diverge
-    // from both callback and sync forms.  Let decodeBuffer's undefined
-    // encoding branch preserve the Buffer default.
+    // Node's promises API returns a Buffer when no encoding is requested; an
+    // undefined encoding lets decodeBuffer preserve that.
     return decodeBuffer(buffer, encoding);
 }
 
@@ -85,10 +82,9 @@ async function readFileWithFlag(path: string, flag: string | number): Promise<Ui
 }
 
 /**
- * Collect an Iterable/AsyncIterable (which includes a Readable stream) of
- * string/Buffer chunks into one buffer. Returns null when `data` is not one, so
- * the caller falls back to the normal single-value conversion. A string is
- * itself iterable, so it must be excluded before the protocol check.
+ * Collect an Iterable/AsyncIterable (including a Readable stream) of string/
+ * Buffer chunks into one buffer. Returns null when `data` is not one. A string
+ * is itself iterable, so it is excluded before the protocol check.
  */
 async function drainIterableData(
     data: unknown,
@@ -115,13 +111,10 @@ export async function writeFile(path: PathLike | number, data: string | Uint8Arr
     const mode = typeof options === 'object' ? modeToNumber(options?.mode) : typeof options === 'number' ? options : undefined;
     const flag = typeof options === 'object' && options?.flag !== undefined ? parseFlags(options.flag) : 'w';
     const encoding = typeof options === 'string' ? options : typeof options === 'object' ? options?.encoding : undefined;
-    // Node honours `signal` here; it was accepted and ignored, so an aborted
-    // write still hit the disk and resolved.
+    // Node honours `signal` here.
     const signal = typeof options === 'object' && options !== null ? (options as { signal?: AbortSignal }).signal : undefined;
     if (signal?.aborted) throw makeAbortError(signal);
-    // Node's promises API also accepts an Iterable / AsyncIterable / stream and
-    // streams its chunks into the file. These used to reach toUint8Array and
-    // produce a zero-length write, i.e. an empty file with no error.
+    // Node also accepts an Iterable / AsyncIterable / stream and streams its chunks.
     const chunks = await drainIterableData(data, encoding, signal);
     const buffer = chunks ?? toUint8Array(data, encoding);
     if ('fd' in target) {
@@ -203,9 +196,7 @@ export async function rmdir(path: PathLike, options?: { recursive?: boolean; max
     const pathStr = pathToString(path);
 
     if (options?.recursive) {
-        // Was unwrapped and unretried: measured before, fsp.rmdir(missing,
-        // {recursive}) rejected with a bare `-4058` (no code/syscall/path) where
-        // Node gives ENOENT. Node labels the recursive form `rm`.
+        // Was unwrapped and unretried: Node gives ENOENT and labels this `rm`.
         await retryOnBusy(
             () => w(removeRecursive(pathStr), 'rm', pathStr),
             options.maxRetries,
@@ -243,15 +234,13 @@ export async function readdir(path: PathLike, options?: { encoding?: BufferEncod
     validateReaddirOptions(options);
     const pathStr = pathToString(path);
     const withFileTypes = typeof options === 'object' ? options?.withFileTypes : false;
-    // Unlike readdirSync, fsp.readdir does not type-check `recursive` — a truthy
-    // value walks (measured against node v24.18.0).
+    // Unlike readdirSync, fsp.readdir does not type-check `recursive`.
     const recursive = typeof options === 'object' ? Boolean(options?.recursive) : false;
 
     try {
-        // The one place Node's two gates diverge: fsp.readdir descends into
-        // junctions and directory symlinks for plain names, but *not* when
-        // withFileTypes is set. Measured, and inconsistent with readdirSync,
-        // which follows in both modes.
+        // Node's two gates diverge here only: plain names descend into junctions
+        // and directory symlinks, withFileTypes does not (see
+        // docs/node-internals.md#fs-walk-gates).
         const entries = await readDirEntries(pathStr, recursive, '', withFileTypes ? 'strict' : 'follow');
         if (withFileTypes) {
             return entries.map(entry => {
@@ -271,10 +260,9 @@ export async function readdir(path: PathLike, options?: { encoding?: BufferEncod
 export async function opendir(path: PathLike, options?: { encoding?: BufferEncoding; bufferSize?: number; recursive?: boolean }): Promise<Dir> {
     validateOpendirOptions(options);
     const pathStr = pathToString(path);
-    // opendir does not type-check `recursive`; a truthy value walks (measured).
+    // opendir does not type-check `recursive`.
     if (options?.recursive) {
-        // Strict gate: opendir never descends into a junction or a directory
-        // symlink, unlike recursive readdirSync (measured against v24.18.0).
+        // Strict gate: opendir never descends into a junction or directory symlink.
         const entries = await w(readDirEntries(pathStr, true, '', 'strict'), 'opendir', pathStr);
         return createEagerAsyncDir(pathStr, entries);
     }
@@ -304,14 +292,11 @@ export async function copyFile(src: PathLike, dest: PathLike, mode?: number): Pr
 
 export async function truncate(path: PathLike, len?: number): Promise<void> {
     const pathStr = pathToString(path);
-    // Node opens first and reports a failure of that step as syscall 'open'
-    // (measured v24.18.0: fsp.truncate(missing) -> ENOENT, syscall 'open').
+    // Node opens first and reports a failure of that step as syscall 'open'.
     const handle = await w(asfs.open(pathStr, 'r+'), 'open', pathStr);
     try {
         // Must be wrapped: the ftruncate step fails for a directory target, and an
-        // unwrapped rejection escapes with `code` as the raw UV *number* (-4071),
-        // so every `err.code === 'EINVAL'` check silently fails. Node reports this
-        // step with syscall 'ftruncate'.
+        // unwrapped rejection escapes with `code` as the raw UV number.
         await w(handle.truncate(len ?? 0), 'ftruncate', pathStr);
     } finally {
         await handle.close();
@@ -390,14 +375,10 @@ export async function statfs(path: PathLike, options?: { bigint?: boolean }): Pr
 // Open file
 
 /**
- * Node's FileHandle carries four stream/iterator members that `createFileHandle`
- * cannot build itself: utils.ts is imported *by* streams.ts, so constructing a
- * ReadStream there would close an import cycle. They are attached here instead,
- * where `./streams` is already reachable.
- *
- * Ownership matches measured Node v24.18.0: a handle stream owns the handle and
- * closes it on 'close' (a later `handle.stat()` reports EBADF), while
- * `readableWebStream` leaves the handle open and refuses a second call.
+ * Node's FileHandle carries four stream/iterator members that cannot live in
+ * utils.ts (streams.ts imports it, so building a ReadStream there would close an
+ * import cycle). A handle stream owns the handle and closes it on 'close';
+ * `readableWebStream` leaves it open and refuses a second call.
  */
 function attachHandleStreams(handle: ReturnType<typeof createFileHandle>) {
     let webStreamTaken = false;

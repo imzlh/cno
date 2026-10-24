@@ -1,12 +1,3 @@
-/**
- * Node.js errno error wrapper utility
- * Wraps C module errno errors (CModuleError.Error with negative .code)
- * to Node.js ErrnoException (with string .code like "ENOENT")
- *
- * References Deno wrapFSErr implementation (src/utils/wrap.ts),
- * but outputs Node.js-style ErrnoException instead of Deno errors.
- */
-
 const error = import.meta.use('error');
 
 // Built from runtime UV table — never hand-maintain (platform-local values drift).
@@ -42,13 +33,9 @@ type NodeSystemError = Error & {
 };
 
 /**
- * Node's internal `SystemError`: `name === 'SystemError'`, an enumerable
- * `code`/`errno`/`syscall` and an `info` bag, with the message spelled
- * `<prefix>: <syscall> returned <UVCODE> (<description>)`.
- *
- * Both the numeric errno and the description come from the runtime UV table.
- * Hardcoding them (`errno = -4040`, `'no such process'`) is wrong on any other
- * platform and drifts whenever libuv renumbers.
+ * Node's internal `SystemError`, with the message spelled `<prefix>: <syscall>
+ * returned <UVCODE> (<description>)`. Take errno and description from the runtime
+ * UV table: hardcoding them is platform-wrong and drifts with libuv.
  */
 export function uvSystemError(uvCode: string, syscall: string, code: string, prefix: string): NodeSystemError {
     const errno = stringToErrno[uvCode] ?? error.errno.UNKNOWN;
@@ -68,10 +55,6 @@ export function uvSystemError(uvCode: string, syscall: string, code: string, pre
 
 /**
  * Convert C module errno error to Node.js ErrnoException
- * @param e - C module error (CModuleError.Error with negative .code errno)
- * @param syscall - optional, system call name (e.g. "open", "read")
- * @param path - optional, file path
- * @returns NodeJS.ErrnoException
  */
 export function toErrnoException(
     e: unknown,
@@ -135,7 +118,7 @@ export function normalizeErrnoError(
     syscall?: string,
     path?: string,
     dest?: string,
-): Error {
+): Error & { code?: string } {
     if (e instanceof Error) {
         const code = Reflect.get(e, 'code');
         if (typeof code === 'number' || typeof code === 'string') {

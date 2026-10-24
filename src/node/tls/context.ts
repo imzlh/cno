@@ -66,15 +66,7 @@ export class JSStreamSocketWrapper extends Duplex {
 export class SecureContext {
     #context: CModuleSSL.Context;
     /**
-     * The options this context was built from.
-     *
-     * `verify` / `verifyHostname` are per-connection decisions (they track
-     * `rejectUnauthorized` and `checkServerIdentity`) but the C layer stores them
-     * on the SSL_CTX, so a context built by `tls.createSecureContext()` cannot
-     * carry them. `tls.connect` therefore has to rebuild a context that combines
-     * the caller's material with the connection's verify decision — it needs the
-     * original options to do that, because the C context exposes no way to read
-     * the PEM back out or to change the verify mode after construction.
+     * The options this context was built from; see mergeSuppliedSecureContext.
      */
     readonly sourceOptions: InternalSecureContextOptions | undefined;
 
@@ -121,25 +113,7 @@ export class SecureContext {
 
 /**
  * Build the effective context for a connection, honouring a caller-supplied
- * `secureContext`.
- *
- * `tls.connect` used to build its own context unconditionally and never read
- * `options.secureContext`, so everything the caller configured through
- * `tls.createSecureContext()` was silently discarded. That lost the caller's CA
- * (a correct private CA reported UNABLE_TO_GET_ISSUER_CERT_LOCALLY) and — the
- * security half — it also lost `minVersion`, so a client pinned to TLSv1.3 via a
- * secureContext silently completed a TLSv1.2 handshake where Node refuses with
- * ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION.
- *
- * The caller's context object cannot be used as-is: `verify`/`verifyHostname`
- * live on the SSL_CTX and a context from `createSecureContext()` has neither, so
- * reusing it would drop peer verification entirely and turn a fail-closed bug
- * into a fail-open one. Rebuild instead, with the caller's material as the base
- * and this connection's mode and verify decision applied on top.
- *
- * Node's precedence is that a supplied secureContext provides the context-level
- * material and the sibling top-level options (ca/cert/key/ciphers/minVersion/…)
- * are ignored, which is what taking `sourceOptions` as the base reproduces.
+ * `secureContext`. See node-internals.md "TLS secure contexts".
  */
 export function mergeSuppliedSecureContext(
     supplied: SecureContext | undefined,

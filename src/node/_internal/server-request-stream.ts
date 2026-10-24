@@ -51,26 +51,8 @@ export function appendIncomingHeader(target: IncomingRequestTarget, key: string,
 }
 
 /**
- * The body stopped short of what its framing promised.
- *
- * `body()` only rejects when the protocol layer established real truncation —
- * H1's failBody() resolves null for a disconnect that arrived *after* the declared
- * length, and rejects ECONNRESET only when bodyRead < contentLength or a chunked
- * body never saw its 0-chunk (h1.ts bodyIncomplete). So a rejection here is a
- * fault, never a normal end-of-stream.
- *
- * This must therefore NOT mark the request complete or push null: doing so fired
- * 'end' and made a truncated upload
- * observationally identical to a whole one. A handler that commits on 'end' then
- * stored a partial payload with no error anywhere. Measured against Node v24.18.0:
- * a peer sending 400 of a declared 1000 bytes yields no 'end', `complete === false`,
- * `aborted === true`, `readableEnded === false`, and `errored` set.
- *
- * 'error' is emitted only when a listener exists. That is Node's own rule
- * (_http_incoming onError: "an error is emitted only if there are listeners
- * attached"), and it is load-bearing here — this stream's destroy() emits 'error'
- * unconditionally, so a handler that never attached one would take an unhandled
- * 'error' for a peer disconnect it cannot control.
+ * The body stopped short of what its framing promised. Must not look like a
+ * clean end; see node-internals.md "Incoming body truncation".
  */
 function failIncomingRequest(target: IncomingRequestStreamTarget, err: unknown): void {
     target.aborted = true;

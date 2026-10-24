@@ -128,13 +128,9 @@ export class Http2Server extends NetServer {
 }
 
 /**
- * TLS + ALPN h2 server (Node Http2SecureServer).
- *
- * Extends tls.Server so `instanceof tls.Server` holds and the TLS server
- * surface (listen/address/close/ref/unref/getConnections/maxConnections) is
- * inherited rather than re-implemented over a private delegate. Critically,
- * this class is the ONLY thing createSecureServer can return: a secure server
- * request must never be silently satisfied by a cleartext listener.
+ * TLS + ALPN h2 server. Extends tls.Server for the TLS server surface, and is the
+ * only class createSecureServer may return: never answer a secure request in
+ * cleartext.
  */
 export class Http2SecureServer extends tls.Server {
     private sessions = new Set<Http2Session>();

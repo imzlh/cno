@@ -1,12 +1,9 @@
 /**
  * Windows MAX_PATH ceiling: namespaced paths at the syscall boundary.
  *
- * A plain path is limited to `MAX_PATH` (260 chars); Node prefixes every fs path
- * with `\\?\` before libuv, and the native `mod_fs.c` does not, so the prefix
- * comes from here. `\\?\` disables Win32 normalisation (`.`, `..`, `/`), so the
- * path must be fully normalised first — `toNamespacedPath` resolves before
- * prefixing. Errors keep the ORIGINAL path: never hand a namespaced string to
- * `wrapSync`/`wrapAsync`.
+ * Node prefixes every fs path with `\\?\` before libuv and mod_fs.c does not.
+ * `\\?\` disables Win32 normalisation, so paths are resolved first. Errors keep
+ * the ORIGINAL path: never hand a namespaced string to `wrapSync`/`wrapAsync`.
  */
 
 import { toNamespacedPath } from '../path';
@@ -15,10 +12,7 @@ const isWindows = process.platform === 'win32';
 
 /**
  * Namespace a path for a syscall. No-op off Windows and for the empty string
- * (which callers pass through to get Node's ERR_INVALID_ARG_VALUE / ENOENT).
- *
- * Device paths (`\\.\pipe\…`, `\\.\NUL`) are returned resolved-but-unprefixed
- * by `toNamespacedPath`, matching Node — prefixing those would break them.
+ * (callers rely on Node's ERR_INVALID_ARG_VALUE / ENOENT for it).
  */
 export function sysPath(p: string): string {
     if (!isWindows || typeof p !== 'string' || p.length === 0) return p;
@@ -40,9 +34,8 @@ const PATHS_SYNC: Record<string, readonly number[]> = {
     truncate: [0], chmod: [0], chown: [0], utimes: [0], access: [0],
     realpath: [0], readlink: [0],
     copy: [0, 1], rename: [0, 1], link: [0, 1],
-    // symlink(target, linkPath): `target` is link *content*, not a path to
-    // resolve — a relative target must stay relative, so only linkPath is
-    // namespaced. Matches Node for every type except 'junction'.
+    // Device paths (`\\.\pipe\…`, `\\.\NUL`) are returned resolved-but-unprefixed
+    // by `toNamespacedPath`; prefixing those would break them.
     symlink: [1],
 };
 
@@ -52,6 +45,8 @@ const PATHS_ASYNC: Record<string, readonly number[]> = {
     readLink: [0], chmod: [0], chown: [0], lchown: [0], utime: [0],
     lutime: [0], statFs: [0], makeTempDir: [0], mkstemp: [0],
     rename: [0, 1], copyFile: [0, 1], link: [0, 1],
+    // symlink(target, linkPath): `target` is link *content*, so only linkPath is
+    // namespaced — a relative target must stay relative.
     symlink: [1],
 };
 
@@ -60,9 +55,8 @@ const RET_SYNC = new Set(['realpath']);
 const RET_ASYNC = new Set(['realPath', 'makeTempDir']);
 
 /**
- * `fswatch` is a THIRD binding, separate from fs/asyncfs, and it was the one
- * gap a pure fs/asyncfs wrap left behind: `fs.watch()` on a >259-char directory
- * threw ENOENT while Node watched it happily.
+ * `fswatch` is a THIRD binding, separate from fs/asyncfs: without it, `fs.watch()`
+ * on a >259-char directory fails with ENOENT.
  */
 const PATHS_FSWATCH: Record<string, readonly number[]> = { watch: [0] };
 
@@ -83,11 +77,10 @@ function wrapFn(fn: (...a: unknown[]) => unknown, positions: readonly number[], 
             const isThenable = out && typeof (out as Promise<unknown>).then === 'function';
             if (isThenable) {
                 const p = out as Promise<unknown>;
-                // `engine.waitIO()` drains the *native* promise handle and cannot
-                // see through a `.then()` chain, so return the original promise.
-                // `dePrefixError` mutates the Error in place, so our handler must
-                // run first; the trailing no-op catch keeps it from counting as a
-                // second unhandled rejection.
+                // `engine.waitIO()` drains the native promise and cannot see
+                // through a `.then()` chain, so return the original promise.
+                // `dePrefixError` mutates in place, so this handler runs first;
+                // the trailing catch stops it counting as a second rejection.
                 if (swaps.length > 0) {
                     p.catch((e: unknown) => { dePrefixError(e, swaps); }).catch(() => { /* bookkeeping only */ });
                 }
@@ -101,12 +94,9 @@ function wrapFn(fn: (...a: unknown[]) => unknown, positions: readonly number[], 
 }
 
 /**
- * `mod_fs.c` bakes whatever path string it was handed into the native error
- * message, and `_internal/errno.ts` reuses that message verbatim. Left alone
- * that surfaces `\\?\D:\…` to the user, which is its own regression — Node
- * always reports the path the caller passed. `err.path` is already correct
- * (`wrapSync` receives the original separately), so only the message and the
- * stack's first line need the namespaced form swapped back out.
+ * mod_fs.c bakes the path it was handed into the native error message, which
+ * would surface `\\?\D:\…` to the user. `err.path` is already correct, so only
+ * the message and stack's first line are swapped back.
  */
 function dePrefixError(e: unknown, swaps: Array<[string, string]>): unknown {
     if (swaps.length === 0 || !(e instanceof Error)) return e;
@@ -124,8 +114,7 @@ function dePrefixError(e: unknown, swaps: Array<[string, string]>): unknown {
 
 /**
  * Proxy the native binding so path arguments are namespaced on the way in.
- * A Proxy (rather than a rebuilt literal) keeps the numeric constants,
- * `S_IF*` masks and any future additions passing through untouched.
+ * A Proxy keeps numeric constants and `S_IF*` masks passing through untouched.
  */
 function wrapBinding<T extends object>(raw: T, positions: Record<string, readonly number[]>, rets: Set<string>): T {
     if (!isWindows) return raw;
