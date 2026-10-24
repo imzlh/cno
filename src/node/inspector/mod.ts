@@ -1,8 +1,8 @@
-import { Session } from './session'
-import { console } from './console'
-import { getInspectorBridge } from './state'
+import { Session, getInspectorBridge } from './session'
 
 const disposeSymbol: symbol = (Symbol as typeof Symbol & { dispose?: symbol }).dispose ?? Symbol.for('Symbol.dispose')
+
+const console = globalThis.console
 
 export { Session, console }
 

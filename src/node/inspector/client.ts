@@ -1,5 +1,5 @@
 import { EventEmitter } from '../events'
-import { getInspectorBridge } from './state'
+import { getInspectorBridge } from './session'
 
 const engine = import.meta.use('engine');
 

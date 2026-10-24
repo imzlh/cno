@@ -1,5 +1,4 @@
 import { InspectorSessionBase } from './session'
-import { open, close, url, waitForDebugger, console } from './mod'
 import type { ProtocolResponse } from './client'
 
 export class Session extends InspectorSessionBase {
@@ -8,13 +7,4 @@ export class Session extends InspectorSessionBase {
 	}
 }
 
-export { open, close, url, waitForDebugger, console }
-
-export default {
-	open,
-	close,
-	url,
-	waitForDebugger,
-	console,
-	Session,
-}
+export { open, close, url, waitForDebugger, console } from './mod'
