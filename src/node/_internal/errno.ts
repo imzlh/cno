@@ -34,6 +34,38 @@ const DISCONNECT_CODES = new Set([
 
 type NodeErrnoError = NodeJS.ErrnoException & { dest?: string };
 
+type NodeSystemError = Error & {
+    code: string;
+    errno: number;
+    syscall: string;
+    info: { errno: number; code: string; message: string; syscall: string };
+};
+
+/**
+ * Node's internal `SystemError`: `name === 'SystemError'`, an enumerable
+ * `code`/`errno`/`syscall` and an `info` bag, with the message spelled
+ * `<prefix>: <syscall> returned <UVCODE> (<description>)`.
+ *
+ * Both the numeric errno and the description come from the runtime UV table.
+ * Hardcoding them (`errno = -4040`, `'no such process'`) is wrong on any other
+ * platform and drifts whenever libuv renumbers.
+ */
+export function uvSystemError(uvCode: string, syscall: string, code: string, prefix: string): NodeSystemError {
+    const errno = stringToErrno[uvCode] ?? error.errno.UNKNOWN;
+    const described = error.strerror(errno);
+    const message = described.startsWith(`${uvCode}: `) ? described.slice(uvCode.length + 2) : described;
+
+    const err = new Error(`${prefix}: ${syscall} returned ${uvCode} (${message})`) as NodeSystemError;
+    err.code = code;
+    err.errno = errno;
+    err.syscall = syscall;
+    err.info = { errno, code: uvCode, message, syscall };
+    // Node's `name` is an own but non-enumerable property, so it stays out of
+    // Object.keys(err) / JSON round-trips while String(err) keeps the tag.
+    Object.defineProperty(err, 'name', { value: 'SystemError', writable: true, configurable: true, enumerable: false });
+    return err;
+}
+
 /**
  * Convert C module errno error to Node.js ErrnoException
  * @param e - C module error (CModuleError.Error with negative .code errno)

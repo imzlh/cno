@@ -12,7 +12,7 @@ const timers = import.meta.use('timers');
 
 import { EventEmitter } from '../events';
 import { Buffer } from '../buffer';
-import { toErrnoException } from '../_internal/errno';
+import { toErrnoException, uvSystemError } from '../_internal/errno';
 import { flattenPrototype } from '../_internal/prototype';
 import { lookup as dnsLookup } from '../dns';
 
@@ -33,7 +33,7 @@ import { lookup as dnsLookup } from '../dns';
  *   IP_ADD_MEMBERSHIP 12    35
  *   IP_DROP_MEMBERSHIP 13   36
  */
-const _isLinux = os.uname().sysname === 'Linux';
+const _isLinux = os.platform === 'linux';
 
 const IPPROTO_IPV6 = 41;
 
@@ -127,20 +127,43 @@ function makeError(message: string, code: string): Error & { code: string } {
 }
 
 /**
- * Node shapes libuv failures as `<syscall> <CODE>[ detail]` with a numeric
- * `.errno` from the platform UV table. Values differ per platform (EBADF is
- * -4083 on Windows, -9 on Linux), so read them from the runtime table.
+ * Node shapes libuv failures as `<syscall> <CODE>[ <address>[:<port>]]` with a
+ * numeric `.errno` from the platform UV table, and bind/connect failures also
+ * carry `address` / `port` own properties.
  */
-function errnoError(code: string, syscall: string, detail?: string): NodeJS.ErrnoException {
+function errnoError(
+    code: string,
+    syscall: string,
+    detail?: { address: string; port?: number },
+): NodeJS.ErrnoException {
     const table = uverror.errno as unknown as Record<string, number | undefined>;
-    const err: NodeJS.ErrnoException = new Error(
-        `${syscall} ${code}${detail === undefined ? '' : ` ${detail}`}`,
-    );
+    const where = detail === undefined
+        ? ''
+        : ` ${detail.port ? `${detail.address}:${detail.port}` : detail.address}`;
+    const err: NodeJS.ErrnoException & { address?: string; port?: number } =
+        new Error(`${syscall} ${code}${where}`);
     err.code = code;
     const errno = Reflect.get(table, code);
     if (typeof errno === 'number') err.errno = errno;
     err.syscall = syscall;
+    if (detail) {
+        err.address = detail.address;
+        if (detail.port) err.port = detail.port;
+    }
     return err;
+}
+
+/**
+ * Decorate a native bind/connect failure for delivery through a callback or an
+ * 'error' event: Node's shape carries `address`/`port`, unlike uvSystemError.
+ */
+function bindConnectError(err: unknown, code: string, syscall: string, detail: { address: string; port?: number }): NodeJS.ErrnoException {
+    const out = toErrnoException(err, syscall);
+    // Non-native failures (e.g. ERR_SOCKET_DGRAM_NOT_RUNNING) keep their own message.
+    const shaped = typeof Reflect.get(out, 'errno') === 'number' ? errnoError(code, syscall, detail) : out;
+    Reflect.set(shaped, 'address', detail.address);
+    if (detail.port) Reflect.set(shaped, 'port', detail.port);
+    return shaped;
 }
 
 /** `ERR_SOCKET_DGRAM_NOT_RUNNING` — the handle has been closed. */
@@ -572,8 +595,7 @@ Socket.prototype._doBind = async function _doBind(this: Socket, portOrOptions?: 
         try {
             handle.bind({ ip: address, port }, flags);
         } catch (err) {
-            const normalized = toErrnoException(err, 'bind');
-            throw errnoError(normalized.code ?? 'UNKNOWN', 'bind', `${address}:${port}`);
+            throw bindConnectError(err, toErrnoException(err, 'bind').code ?? 'UNKNOWN', 'bind', { address, port });
         }
         this._binding = false;
         this._bound = true;
@@ -792,8 +814,7 @@ Socket.prototype._doConnect = async function _doConnect(this: Socket, port: numb
         try {
             handle.connect({ ip: addr, port });
         } catch (err) {
-            const normalized = toErrnoException(err, 'connect');
-            throw errnoError(normalized.code ?? 'UNKNOWN', 'connect', `${addr}:${port}`);
+            throw bindConnectError(err, toErrnoException(err, 'connect').code ?? 'UNKNOWN', 'connect', { address: addr, port });
         }
         this._connecting = false;
         this._connected = true;
@@ -969,14 +990,7 @@ function bufferSizeSocket(self: Socket, syscall: string): CModuleSocket.PosixSoc
 }
 
 function bufferSizeError(code: string, syscall: string): NodeJS.ErrnoException {
-    const err = errnoError(code, syscall);
-    err.message = `Could not get or set buffer size: ${syscall} returned ${code}`;
-    err.code = 'ERR_SOCKET_BUFFER_SIZE';
-    err.syscall = syscall;
-    const table = uverror.errno as unknown as Record<string, number | undefined>;
-    const errno = Reflect.get(table, code);
-    if (typeof errno === 'number') err.errno = errno;
-    return err;
+    return uvSystemError(code, syscall, 'ERR_SOCKET_BUFFER_SIZE', 'Could not get or set buffer size');
 }
 
 Socket.prototype.getRecvBufferSize = function getRecvBufferSize(this: Socket): number {

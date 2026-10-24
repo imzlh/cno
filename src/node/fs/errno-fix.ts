@@ -16,7 +16,7 @@ const os = import.meta.use('os');
  * `process.platform` so the check stays inside the native-module layer and does
  * not pull `process` into an `fs` dependency.
  */
-const isWindows = os.platform == 'win32';
+const isWindows = os.platform === 'windows' || os.platform === 'win32';
 
 const UV_EXDEV = error.errno.EXDEV;
 const UV_EINVAL = error.errno.EINVAL;

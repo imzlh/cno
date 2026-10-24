@@ -5,10 +5,10 @@
 const fs = import.meta.use('fs');
 const os = import.meta.use('os');
 
-const sysname = os.uname().sysname;
-const isWindows = sysname === 'Windows_NT';
-const isDarwin = sysname === 'Darwin';
-const isLinux = sysname === 'Linux';
+const platform = os.platform;
+const isWindows = platform === 'windows' || platform === 'win32';
+const isDarwin = platform === 'darwin' || platform === 'macos';
+const isLinux = platform === 'linux';
 
 export const constants = {
     // File open flags

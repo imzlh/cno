@@ -18,7 +18,7 @@ const asfs = nsasfs;
 const engine = import.meta.use('engine');
 const os = import.meta.use('os');
 /** Matches fs/constants.ts; see fchownSync for why this file needs it. */
-const isWindows = os.platform == 'win32';
+const isWindows = os.platform === 'windows' || os.platform === 'win32';
 
 // File read/write
 

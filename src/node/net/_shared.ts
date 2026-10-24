@@ -1,12 +1,9 @@
 /**
- * node:net internal utilities shared by ./socket, ./server and ./blocklist.
+ * node:net internals shared by ./socket, ./server and ./blocklist: socket
+ * options, quiet cleanup, listen-error shaping, tick deferral, port/address
+ * normalisation, connect-time DNS, and the IP-literal utilities.
  *
- * Socket-option setters, quiet-cleanup wrappers, the listen-error shaper, the
- * nextTick deferral helpers, port validation / address-family normalisation /
- * connect-time DNS resolution, and the IP-literal utilities.
- *
- * Only `isIP` / `isIPv4` / `isIPv6` are part of the public `node:net` surface —
- * mod.ts deliberately re-exports nothing else from here.
+ * mod.ts re-exports only `isIP` / `isIPv4` / `isIPv6` from here.
  */
 
 const nativeError = import.meta.use('error');
@@ -49,46 +46,41 @@ export function setTcpKeepAlive(tcp: CModuleStreams.TCP, enabled: boolean, delay
     try { tcp.setKeepAlive(enabled, delay); }
     catch (error) {
         if (isUnsupportedSocketOption(error)) return;
-        // libuv rejects uv_tcp_keepalive(enable=1, delay=0) with EINVAL on
-        // Windows. Node hands the same 0 to the same libuv call and ignores its
-        // return value, so `socket.setKeepAlive()` / `setKeepAlive(true)` — both
-        // of which mean "delay 0" — are observable no-ops there rather than
-        // throws. Throwing breaks the single most common call form, so match
-        // node and swallow exactly that case.
+        // libuv rejects uv_tcp_keepalive(1, 0) with EINVAL on Windows, and Node
+        // ignores that return value, so `setKeepAlive(true)` with the default
+        // delay is a no-op there rather than a throw.
         if (enabled && delay === 0 && isInvalidArgument(error)) return;
         throw error;
     }
 }
 
+/* Destroy paths must finish cleaning up even when a handle is already closed. */
 export function stopPipeReadQuietly(pipe: CModuleStreams.Pipe): void {
-    try {
-        pipe.stopRead();
-    } catch {
-        // Ignore best-effort cleanup failures.
-    }
+    try { pipe.stopRead(); } catch { /* best-effort */ }
 }
 
 export function closeTcpQuietly(tcp: CModuleStreams.TCP): void {
-    try {
-        tcp.close();
-    } catch {
-        // Ignore best-effort cleanup failures.
-    }
+    try { tcp.close(); } catch { /* best-effort */ }
 }
 
 export function closePipeQuietly(pipe: CModuleStreams.Pipe): void {
-    try {
-        pipe.close();
-    } catch {
-        // Ignore best-effort cleanup failures.
-    }
+    try { pipe.close(); } catch { /* best-effort */ }
 }
 
 export function closeUpgradeHandleQuietly(handle: UpgradeHandle): void {
+    try { handle.close(); } catch { /* best-effort */ }
+}
+
+/**
+ * Close a stream handle and report completion exactly once: via `onclose` when
+ * libuv runs it, or synchronously when close() throws (handle already gone).
+ */
+export function closeCounting(handle: CModuleStreams.TCP | CModuleStreams.Pipe, onClosed: () => void): void {
+    handle.onclose = onClosed;
     try {
         handle.close();
     } catch {
-        // Ignore best-effort cleanup failures.
+        onClosed();
     }
 }
 
@@ -96,13 +88,12 @@ export function emitErrorQuietly(emitter: EventEmitter, error: Error): void {
     try {
         emitter.emit('error', error);
     } catch {
-        // Preserve destroy() cleanup even if an error listener throws.
+        // An error listener threw; destroy() cleanup must still run.
     }
 }
 
-// Node's bind/listen failures carry `syscall:'listen'` plus the address that
-// failed, and the message is `listen <CODE>: <desc> <address>[:<port>]`.
-// Verified against real Node v24.18 on Windows:
+// Node's listen failures carry `syscall:'listen'` and the message is
+// `listen <CODE>: <desc> <address>[:<port>]`. Verified on Node v24.18 Windows:
 //   listen EADDRINUSE: address already in use 127.0.0.1:49625
 //   listen EACCES: permission denied C:\...\x.sock
 export function toListenError(raw: unknown, address: string, port?: number): Error {
@@ -126,24 +117,18 @@ export function toListenError(raw: unknown, address: string, port?: number): Err
     return err;
 }
 
-// A read error is fatal in Node: `onStreamRead` calls `destroy(err)`, which
-// emits 'error' once and then 'close' with hadError=true. Emitting bare and
-// leaving the socket open was measured to produce, on a peer RST mid-write:
-//   cno: 35 'error' emissions, later ones raw native IOError objects whose
-//        `.code` is the NUMBER -4047 and which carry no own properties, and
-//        NO 'close' at all — `destroyed` stayed false, readyState 'open'.
-//   node: exactly 1 error (code 'ECONNRESET', string) then close(hadError=true).
-// A `err.code === 'ECONNRESET'` check — the standard idiom — silently fails
-// against a numeric code, so the repeats were also unclassifiable.
+// A read error is fatal in Node: destroy(err) emits one 'error' then 'close'
+// with hadError=true. Emitting bare and leaving the socket open was measured to
+// produce 35 'error' emissions on a peer RST mid-write (later ones raw native
+// errors with a numeric code) and no 'close' at all.
 export function destroyWithReadError(socket: Socket, raw: unknown): void {
     if (socket._destroyed) return;
     socket.destroy(normalizeErrnoError(raw, 'read'));
 }
 
-// Node runs 'listening' / listen-error emissions on the next tick so that
-// `server.listen(p); server.on('listening'|'error', h)` — the standard idiom —
-// still observes them. `process` is resolved lazily to avoid an import cycle
-// (same approach as stream/mod.ts's deferTick).
+// Node defers listen events to the next tick so `server.listen(p);
+// server.on('listening'|'error', h)` still observes them. `process` is resolved
+// lazily to avoid an import cycle.
 type NextTickHost = { nextTick?: (callback: () => void, ...args: unknown[]) => void };
 
 export function deferTick(callback: () => void): void {
@@ -155,23 +140,15 @@ export function deferTick(callback: () => void): void {
     queueMicrotask(callback);
 }
 
-// Node defers listen failures to nextTick, so `server.listen(p);
-// server.on('error', h)` still catches them. Emitting inline instead makes that
-// idiom (the standard EADDRINUSE retry) throw out of listen().
+// Emitting a listen failure inline makes the standard EADDRINUSE retry throw
+// out of listen() instead of reaching an 'error' listener.
 export function emitListenErrorAsync(server: Server, err: Error): void {
     deferTick(() => emitErrorQuietly(server, err));
 }
 
-// Measured against real Node v24.18: `listen()` NEVER emits 'listening' inline.
-//   listen(0):              AFTER-listen() listening=true > listening-event > listen-cb > nextTick
-//   listen(0,'127.0.0.1'):  AFTER-listen() listening=false > microtask > nextTick > listening-event
-// Emitting inline broke two things:
-//   1. `server.listen(p); server.on('listening', h)` never fired h at all — the
-//      event was already gone by the time the listener attached.
-//   2. A listen callback that calls `server.close()` ran *inside* listen(),
-//      which tripped a C-level bug where a handle closed from within another
-//      handle's close-callback delivery does not hold the loop alive, so the
-//      close callback was silently dropped and the process exited early.
+// Measured against Node v24.18: `listen()` never emits 'listening' inline, and
+// emitting inline broke both `listen(p); on('listening', h)` and listen
+// callbacks that close the server (the close callback was silently dropped).
 export function emitListeningAsync(server: Server): void {
     deferTick(() => {
         // close() between listen() and this tick means Node never emits.
@@ -180,17 +157,8 @@ export function emitListeningAsync(server: Server): void {
     });
 }
 
-// Flattens a prototype chain onto `target` for interop with consumers that
-// expect a single-level prototype (e.g. some npm packages walk own
-// properties). Must never clobber a property `target` already defines as its
-// own — doing so silently overwrites intentional subclass overrides with the
-// parent's version (see stream/mod.ts's flattenPrototype for the incident
-// this guards against: Readable.prototype.on/once auto-resume overrides were
-// being clobbered by a naive flatten call, hanging every HTTP response body).
-// ---------------------------------------------------------------------------
 // Port validation, address-family normalisation, and connect-time DNS
 // resolution. Internal to the net module — not re-exported from mod.ts.
-// ---------------------------------------------------------------------------
 
 type ResolvedConnectAddress = { address: string; family: 4 | 6 };
 
@@ -201,9 +169,8 @@ export function normalizeFamily(value: unknown): 0 | 4 | 6 {
     throw new TypeError(`The "family" option must be 0, 4, 6, "IPv4", or "IPv6". Received ${String(value)}`);
 }
 
-// Node's ERR_SOCKET_BAD_PORT text. Its `determineSpecificType` quotes strings and
-// reports the RAW value, so a numeric string stays `type string ('99999')` and is
-// NOT coerced to a number first. Measured v24.18.0.
+// Node's ERR_SOCKET_BAD_PORT text reports the RAW value, so a numeric string
+// stays `type string ('99999')` and is not coerced first. Measured v24.18.0.
 export function badPortError(value: unknown, name: string): RangeError {
     const shown = typeof value === 'string' ? `'${value}'` : String(value);
     return Object.assign(
@@ -213,19 +180,13 @@ export function badPortError(value: unknown, name: string): RangeError {
 }
 
 export function validatePort(value: unknown, name = 'Port'): number {
-    // Node's validatePort accepts a numeric string and returns `port | 0`, which is
-    // why `net.connect({ port: '8080' })` works there. undici passes the port through
-    // from URL parsing, where it is a string.
+    // Accepts a numeric string and returns `port | 0`, like Node; undici passes
+    // the port through from URL parsing, where it is a string.
     const bad = (typeof value !== 'number' && typeof value !== 'string')
         || (typeof value === 'string' && value.trim().length === 0)
         || +value !== (+value >>> 0)
         || +value > 0xFFFF;
-    if (bad) {
-        // Was a bare RangeError with no `.code`: a package branching on
-        // `err.code === 'ERR_SOCKET_BAD_PORT'` saw undefined and fell through to
-        // whatever its generic handler did. Node's default `name` is 'Port'.
-        throw badPortError(value, name);
-    }
+    if (bad) throw badPortError(value, name);
     return +value | 0;
 }
 
@@ -290,12 +251,8 @@ export function resolveConnectAddress(hostname: string, options: TcpNetConnectOp
     });
 }
 
-// ---------------------------------------------------------------------------
-// IP-literal utilities.
-//
-// `isIP` / `isIPv4` / `isIPv6` plus the IPv6 parser they share with BlockList.
-// No sibling imports, no native modules, no side effects.
-// ---------------------------------------------------------------------------
+// IP-literal utilities: `isIP` / `isIPv4` / `isIPv6` plus the IPv6 parser
+// shared with BlockList.
 
 export function isIP(input: string): number {
     if (isIPv4(input)) return 4;
@@ -314,9 +271,7 @@ export function isIPv4(input: string): boolean {
     });
 }
 
-// Module-private in the pre-split mod.ts. Exported here only so blocklist.ts
-// can reuse the one parser; it is deliberately NOT re-exported from mod.ts, so
-// the public `node:net` surface is unchanged.
+// Exported only so blocklist.ts reuses the one parser; not re-exported from mod.ts.
 export function parseIpv6Parts(input: string): number[] | null {
     if (typeof input !== 'string') return null;
     const zoneIndex = input.indexOf('%');

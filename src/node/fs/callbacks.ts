@@ -18,7 +18,7 @@ const fs = nsfs;
 const asfs = nsasfs;
 const os = import.meta.use('os');
 /** Matches fs/constants.ts; see fchown for why this file needs it. */
-const isWindows = os.platform == 'win32';
+const isWindows = os.platform === 'windows' || os.platform === 'win32';
 
 type NoParamCallback = (err: NodeJS.ErrnoException | null) => void;
 type OpendirCallback = (err: NodeJS.ErrnoException | null, dir?: Dir) => void;

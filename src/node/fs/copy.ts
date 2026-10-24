@@ -1,5 +1,5 @@
-import { matchesErrnoCode, normalizeErrnoError, wrapPromise } from '../_internal/errno';
-import { wrapSync } from './errno-fix';
+import { matchesErrnoCode } from '../_internal/errno';
+import { normalizeFsErrnoError as normalizeErrnoError, wrapFsPromise as wrapPromise, wrapSync } from './errno-fix';
 import path from '../path';
 import { assertCopyFileMode, mkdirRecursive, mkdirRecursiveSync } from './utils';
 

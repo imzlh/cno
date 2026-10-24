@@ -5,6 +5,8 @@ import { EventEmitter } from '../events';
 import { Writable, Readable, Duplex } from '../stream';
 import {
     asError,
+    clearHeldPipeBytes,
+    deliverPipeChunk,
     destroyChildStdin,
     flattenPrototype,
     startPipeReadQuietly,
@@ -228,12 +230,14 @@ ChildProcessImpl.prototype._createReadable = function _createReadable(this: Chil
             startPipeReadQuietly(pipe);
         },
         destroy(error: Error | null, callback: (error?: Error | null) => void) {
+            clearHeldPipeBytes(readable);
             try { pipe.close(); } catch { /* already closed by the exiting child */ }
             callback(error);
         },
     });
 
-    // Use callback-based read: pipe.onread pushes data into the Readable buffer
+    // Use callback-based read: pipe.onread pushes data into the Readable buffer.
+    // The chunk is delivered without re-entering _read() — see deliverPipeChunk.
     pipe.onread = (data: Uint8Array | null | undefined, err?: unknown) => {
         if (err) {
             readable.destroy(asError(err));
@@ -244,14 +248,10 @@ ChildProcessImpl.prototype._createReadable = function _createReadable(this: Chil
             stopPipeReadQuietly(pipe);
             return;
         }
-        const ok = readable.push(data);
-        if (!ok) {
-            // Back-pressure: stop reading until Readable drains
-            stopPipeReadQuietly(pipe);
-        }
+        deliverPipeChunk(readable, pipe, data);
     };
 
-    // Enter flowing mode so push() emits 'data' immediately.
+    // Enter flowing mode so delivered chunks reach 'data' immediately.
     // Must be after onread is set — resume() calls _read() → startRead().
     readable.resume();
     return readable;
@@ -269,6 +269,7 @@ ChildProcessImpl.prototype._createDuplex = function _createDuplex(this: ChildPro
             try { await pipe.shutdown(); } catch { try { pipe.close(); } catch {} } finally { callback(); }
         },
         destroy(error: Error | null, callback: (error?: Error | null) => void) {
+            clearHeldPipeBytes(duplex);
             try { pipe.close(); } catch { /* already closed by the exiting child */ }
             callback(error);
         },
@@ -284,7 +285,7 @@ ChildProcessImpl.prototype._createDuplex = function _createDuplex(this: ChildPro
             stopPipeReadQuietly(pipe);
             return;
         }
-        if (!duplex.push(data)) stopPipeReadQuietly(pipe);
+        deliverPipeChunk(duplex, pipe, data);
     };
 
     duplex.resume();

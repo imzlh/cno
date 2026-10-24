@@ -70,7 +70,6 @@ function initSocket(self: Socket, options?: SocketConstructorOpts): void {
     self._keepAlive = false;
     self._keepAliveDelay = 0;
     self._noDelay = false;
-    self._readBuffer = new Uint8Array(65536);
     self._allowHalfOpen = options?.allowHalfOpen ?? false;
     self._peerEnded = false;
     self._tcpReadStarted = false;
@@ -142,6 +141,25 @@ Socket.fromHttpOwned = function fromHttpOwned(
     return socket;
 };
 
+/**
+ * Shared body of every read pump (TCP, pipe, core upgrade handle): native read
+ * failures are fatal, EOF ends the readable side, data flows into `push`.
+ */
+function handleSocketRead(socket: Socket, result: NativeReadResult, error: NativeReadError): void {
+    if (error) {
+        if ((socket._destroyed || socket.readyState === 'closed') && matchesErrnoCode(error, 'ECANCELED', 'EBADF')) return;
+        destroyWithReadError(socket, error);
+        return;
+    }
+    if (result === null || result === undefined) {
+        handleSocketEof(socket);
+        return;
+    }
+    socket.bytesRead += result.byteLength;
+    armSocketTimeout(socket);
+    socket.push(result);
+}
+
 function handleSocketEof(socket: Socket): void {
     if (socket._peerEnded || socket._destroyed) return;
     socket._peerEnded = true;
@@ -200,9 +218,8 @@ Socket.prototype.connect = function connect(
     cb?: () => void
 ): Socket {
     // Node publishes net.client.socket at the top of connect(), before any
-    // resolution or connection work, with just `{ socket }`. The `{ path }`
-    // branch below re-enters connect(), so the flag keeps this exactly-once
-    // per user-initiated call rather than publishing twice for a pipe.
+    // resolution, with just `{ socket }`. The `{ path }` branch re-enters
+    // connect(), so the flag keeps this once per user-initiated call.
     if (onNetClientSocket.hasSubscribers && !Reflect.get(this, kNetClientSocketPublished)) {
         Reflect.set(this, kNetClientSocketPublished, true);
         onNetClientSocket.publish({ socket: this });
@@ -214,9 +231,9 @@ Socket.prototype.connect = function connect(
 
     if (typeof portOrPath === 'object' && portOrPath !== null) {
         if (portOrPath.signal && !watchSocketAbort(this, portOrPath.signal)) return this;
-        // Node selects the pipe branch on `!!options.path`, so a key that is merely
-        // present with an undefined/null value stays TCP. undici builds its connect
-        // options as `{...options, port, host}`, which carries `path: undefined`.
+        // Node selects the pipe branch on `!!options.path`, so a present-but-null
+        // key stays TCP. undici builds `{...options, port, host}`, carrying
+        // `path: undefined`.
         const pipePath = (portOrPath as { path?: unknown }).path;
         if (pipePath !== undefined && pipePath !== null && pipePath !== '') {
             return this.connect(pipePath as string, typeof hostOrCb === 'function' ? hostOrCb : undefined);
@@ -289,8 +306,8 @@ Socket.prototype.connect = function connect(
         resolvedAddress = address;
         if (!isIPv4(host) && !isIPv6(host)) this.emit('lookup', null, address, family, host);
 
-        // Node gates the local bind on truthiness (`if (localAddress || localPort)`),
-        // so null/'' means "no bind". undici passes `localAddress: null`.
+        // Node gates the local bind on truthiness (`if (localAddress || localPort)`);
+        // undici passes `localAddress: null`.
         const localAddress = options?.localAddress || undefined;
         const localPort = options?.localPort || undefined;
         if (localAddress !== undefined) {
@@ -334,7 +351,7 @@ Socket.prototype.connect = function connect(
 
         this.emit('connect');
         this.emit('ready');
-        // Listener may have handed the TCP to http/http2 (_httpOwned).
+        // A listener may have handed the TCP to http/http2.
         if (!this._destroyed && !this._httpOwned) this._startTcpRead();
     }).catch((err) => {
         if (!lookupSucceeded && !isIPv4(host) && !isIPv6(host) && !this._destroyed) {
@@ -359,26 +376,14 @@ Socket.prototype._startPipeRead = function _startPipeRead(this: Socket): void {
     if (this._connecting) return;
     this._pipeReadStarted = true;
     this._stream.onread = (result: NativeReadResult, error: NativeReadError) => {
-        if (error) {
-            if ((this._destroyed || this.readyState === 'closed') && matchesErrnoCode(error, 'ECANCELED', 'EBADF')) return;
-            destroyWithReadError(this, error);
-            return;
-        }
-        if (result === null || result === undefined) {
-            handleSocketEof(this);
-            return;
-        }
-        this.bytesRead += result.byteLength;
-        armSocketTimeout(this);
-        this.push(result);
+        handleSocketRead(this, result, error);
     };
     this._stream.startRead();
 };
 
 Socket.prototype.setEncoding = function setEncoding(this: Socket, encoding?: BufferEncoding): Socket {
-    // Delegate to Duplex: it installs the StringDecoder so 'data' yields
-    // strings and a multi-byte sequence split across TCP segments is rejoined.
-    // Setting only the public field left both behaviours broken.
+    // Delegate so the StringDecoder is installed and split multi-byte sequences
+    // are rejoined; setting only the public field breaks both.
     if (encoding) Duplex.prototype.setEncoding.call(this, encoding);
     return this;
 };
@@ -433,9 +438,8 @@ Socket.prototype.resume = function resume(this: Socket): Socket {
 };
 
 // NOTE: intentionally anonymous — a named function expression called
-// `setTimeout` would shadow the global `setTimeout` used in the body below
-// (globalThis.setTimeout is a real global in this runtime; see
-// src/webapi/basic.ts), turning the timer into infinite self-recursion.
+// `setTimeout` would shadow the global `setTimeout` used in the body below,
+// turning the timer into infinite self-recursion.
 Socket.prototype.setTimeout = function (this: Socket, timeout: number, callback?: () => void): Socket {
     if (!Number.isFinite(timeout) || timeout < 0) throw new RangeError('The value of "timeout" is out of range');
     this._timeout = Math.trunc(timeout);
@@ -475,8 +479,7 @@ Socket.prototype.address = function address(this: Socket): AddressInfo | {} {
 };
 
 // Node exposes `pending` as a prototype getter: true until the socket has a
-// handle and has finished connecting. It is documented API, and `undefined`
-// silently passes a falsy check while failing `=== false`.
+// handle and has finished connecting.
 Object.defineProperty(Socket.prototype, 'pending', {
     configurable: true,
     enumerable: false,
@@ -502,32 +505,19 @@ Socket.prototype.ref = function ref(this: Socket): Socket {
 /** Sustained TCP read loop driven by Duplex _read */
 Socket.prototype._startTcpRead = function _startTcpRead(this: Socket): void {
     if (!this._tcp || this._destroyed) return;
-    // Protocol layers (http/http2) steal the handle via _httpOwned; connect()
-    // still runs after the 'connect' listener — must not reinstall onread.
+    // http/http2 steal the handle via _httpOwned; connect() still runs after the
+    // 'connect' listener, so the read must not be reinstalled here.
     if (this._httpOwned) return;
-    // Duplex _read can be pulled before connect() resolves, racing the
-    // post-connect resume(). startRead() on an unconnected handle throws
-    // ENOTCONN — bail while still connecting; resume() starts the read once
-    // the connect promise settles.
+    // _read can be pulled before connect() resolves; startRead() on an
+    // unconnected handle throws ENOTCONN.
     if (this._connecting) return;
-    // The read loop is push-based and persists via `onread`/startRead(); a
-    // later _read()/resume() call must not restart it (=> EALREADY).
+    // The loop persists via onread/startRead; a later resume() must not restart
+    // it (EALREADY).
     if (this._tcpReadStarted) return;
     this._tcpReadStarted = true;
 
     this._tcp.onread = (result: NativeReadResult, error: NativeReadError) => {
-        if (error) {
-            if ((this._destroyed || this.readyState === 'closed') && matchesErrnoCode(error, 'ECANCELED', 'EBADF')) return;
-            destroyWithReadError(this, error);
-            return;
-        }
-        if (result === null || result === undefined) {
-            handleSocketEof(this);
-            return;
-        }
-        this.bytesRead += result.byteLength;
-        armSocketTimeout(this);
-        this.push(result);
+        handleSocketRead(this, result, error);
     };
 
     this._tcp.startRead();
@@ -542,13 +532,7 @@ Socket.prototype._startUpgradeRead = function _startUpgradeRead(this: Socket): v
     if (this._upgradeReadStarted) return;
     this._upgradeReadStarted = true;
     this._upgradeHandle.onReadable((data) => {
-        if (data === null) {
-            handleSocketEof(this);
-            return;
-        }
-        this.bytesRead += data.byteLength;
-        armSocketTimeout(this);
-        this.push(data);
+        handleSocketRead(this, data, undefined);
     }, (err) => {
         destroyWithReadError(this, err);
     });
@@ -613,7 +597,7 @@ Socket.prototype._write = function _write(this: Socket, chunk: string | Uint8Arr
 
     const buffer = typeof chunk === 'string' ? engine.encodeString(chunk) : chunk;
 
-    // Core owns the wire; app must not dual-write the same TCP as H1.
+    // Core owns the wire; an app write must not dual-write the same TCP as H1.
     if (this._httpOwned) {
         callback(Object.assign(new Error('Socket is owned by the HTTP server'), {
             code: 'ERR_SOCKET_HTTP_SERVER',
@@ -785,16 +769,14 @@ Socket.prototype.destroy = function destroy(this: Socket, error?: Error): Socket
 };
 
 /**
- * An app write to an HTTP-owned socket facade is REFUSED — core owns the wire.
+ * An app write to an HTTP-owned socket facade is refused — core owns the wire.
  *
- * That refusal must not be expressed as a stream fault. It used to be reported
- * by handing an error to _write's callback, which was harmless only because the
- * generic Writable merely emitted 'error' and left the stream alive. Now that a
- * write error correctly destroys the stream (matching node), the same path tore
- * down the live connection and the client saw ECONNRESET mid-response. So the
- * refusal is intercepted before it reaches the writable machinery: the write
- * callback gets ERR_SOCKET_HTTP_SERVER and 'error' is still emitted for
- * compatibility, but the socket is neither errored nor destroyed.
+ * The refusal must not be a stream fault: delivering it through _write's
+ * callback destroys the live connection (writes correctly destroy the stream,
+ * matching Node), and the client sees ECONNRESET mid-response. So it is
+ * intercepted before the writable machinery: the callback gets
+ * ERR_SOCKET_HTTP_SERVER and 'error' is still emitted, but the socket is
+ * neither errored nor destroyed.
  */
 const duplexWrite = Duplex.prototype.write;
 Socket.prototype.write = function write(
@@ -809,7 +791,7 @@ Socket.prototype.write = function write(
             code: 'ERR_SOCKET_HTTP_SERVER',
             syscall: 'write',
         });
-        // Callback first, then 'error' — the order the previous path produced.
+        // Callback first, then 'error' — the order of the previous path.
         queueMicrotask(() => {
             if (cb) cb(err);
             this.emit('error', err);

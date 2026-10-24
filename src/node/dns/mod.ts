@@ -141,6 +141,11 @@ function completeResolve(
     );
 }
 
+/** Answer synchronously known results (IP literal, loopback) off the next tick, as Node does. */
+function deferCallback<T extends unknown[]>(callback: (...args: T) => void, ...args: T): void {
+    timers.setTimeout(() => callback(...args), 0);
+}
+
 function resolveTyped(hostname: unknown, rrtype: Rrtype, callback: unknown, query: QuerySource): void {
     validateHostname(hostname);
     assertCallback(callback);
@@ -194,10 +199,8 @@ export function lookup(hostname: unknown, options?: unknown, callback?: unknown)
     const normalized = normalizeLookupOptions(options, getDefaultLookupOrder(), true);
 
     if (!hostname) {
-        timers.setTimeout(() => {
-            if (normalized.all) callback(null, []);
-            else callback(null, null, normalized.family === 6 ? 6 : 4);
-        }, 0);
+        if (normalized.all) deferCallback(callback, null, []);
+        else deferCallback(callback, null, null, normalized.family === 6 ? 6 : 4);
         return;
     }
     if (typeof hostname !== 'string') {
@@ -208,11 +211,8 @@ export function lookup(hostname: unknown, options?: unknown, callback?: unknown)
     }
     const matchedFamily = getAddressFamily(hostname);
     if (matchedFamily !== 0) {
-        timers.setTimeout(() => {
-            const result = { address: hostname, family: matchedFamily };
-            if (normalized.all) callback(null, [result]);
-            else callback(null, result.address, result.family);
-        }, 0);
+        if (normalized.all) deferCallback(callback, null, [{ address: hostname, family: matchedFamily }]);
+        else deferCallback(callback, null, hostname, matchedFamily);
         return;
     }
 
@@ -347,7 +347,7 @@ export function resolveTxt(hostname: string, callback: (err: NodeJS.ErrnoExcepti
 export function reverse(ip: string, callback: (err: NodeJS.ErrnoException | null, hostnames: string[]) => void): void {
     assertCallback(callback);
     if (ip === '127.0.0.1' || ip === '::1') {
-        timers.setTimeout(() => callback(null, ['localhost']), 0);
+        deferCallback(callback, null, ['localhost']);
         return;
     }
     const hostname = reverseName(ip);
@@ -504,7 +504,7 @@ export class Resolver {
     reverse(ip: string, callback: (err: NodeJS.ErrnoException | null, hostnames: string[]) => void): void {
         assertCallback(callback);
         if (ip === '127.0.0.1' || ip === '::1') {
-            timers.setTimeout(() => callback(null, ['localhost']), 0);
+            deferCallback(callback, null, ['localhost']);
             return;
         }
         resolveTyped(reverseName(ip), 'PTR', callback, this.query);

@@ -11,6 +11,7 @@ const signals = import.meta.use('signals');
 const engine = import.meta.use('engine');
 
 import { Readable, Writable } from '../stream';
+import { addReadableLength, subtractReadableLength } from '../stream/_shared';
 import { viewToUint8Array } from '../_internal/buffer';
 import { normalizeErrnoError } from '../_internal/errno';
 import { Buffer } from '../buffer';
@@ -26,6 +27,39 @@ export function startPipeReadQuietly(pipe: CModuleStreams.Pipe): void {
     } catch {
         // The pipe can already be closing while Readable asks for more data.
     }
+}
+
+/**
+ * Hand one stdio chunk to a child-process Readable.
+ *
+ * The native pipe is mid-read when onread fires, yet push() turns round and
+ * calls _read() synchronously for 'data' listeners, and child.ts' _read() then
+ * re-enters startRead() — which throws "startRead already in progress" and
+ * destroys the stream (observed: esbuild's service channel closed after the
+ * first message). Keep push() to a plain buffer append while the pipe owns the
+ * read; flowReadable() delivers the buffered chunk when it consumes.
+ */
+export function deliverPipeChunk(readable: Readable, pipe: CModuleStreams.Pipe, data: Uint8Array): void {
+    const state = readable._readableState;
+    if (!state.reading && !state.destroyed) {
+        if (!readable.push(data)) stopPipeReadQuietly(pipe);
+        return;
+    }
+    state.buffer.push(data);
+    addReadableLength(readable, data);
+    if (readable.readableLength >= state.highWaterMark) {
+        stopPipeReadQuietly(pipe);
+    } else {
+        queueMicrotask(() => {
+            if (!state.destroyed && !state.reading) startPipeReadQuietly(pipe);
+        });
+    }
+}
+
+export function clearHeldPipeBytes(readable: Readable): void {
+    const state = readable._readableState;
+    state.buffer.length = 0;
+    subtractReadableLength(readable, readable.readableLength);
 }
 
 export function stopPipeReadQuietly(pipe: CModuleStreams.Pipe): void {

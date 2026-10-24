@@ -104,19 +104,11 @@ export function createAttachedSocket(
 ): Socket {
     if (owned) return Socket.fromHttpOwned(tcp, owned);
 
-    const socket = new Socket();
-    const localInfo = tcp.sockname;
-    const remoteInfo = tcp.peername;
-
-    socket._tcp = tcp;
-    socket.readyState = 'open';
-    socket.localAddress = localInfo.ip;
-    socket.localPort = localInfo.port;
-    socket.remoteAddress = remoteInfo.ip;
-    socket.remotePort = remoteInfo.port;
-    socket.remoteFamily = `IPv${remoteInfo.family}`;
-
-    return socket;
+    // Without `owned` (clientError display) the socket is metadata only; it must
+    // not keep the TCP reachable for stream I/O, matching fromHttpOwned.
+    return Socket.fromHttpOwned(tcp, { close: () => {
+        try { tcp.close(); } catch { /* already closed */ }
+    } });
 }
 
 export function createServerRequestObjects(
