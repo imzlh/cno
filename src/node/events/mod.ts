@@ -32,38 +32,8 @@ type EventTargetPrototypeWithTracking = typeof EventTarget.prototype & {
     __cnoNodeEventsTracking?: true;
 };
 
-function arrayAppend<T>(array: T[], value: T): void {
-    array[array.length] = value;
-}
-
-function arrayPrepend<T>(array: T[], value: T): void {
-    array.length++;
-    array.copyWithin(1, 0);
-    array[0] = value;
-}
-
-function arrayRemoveAt<T>(array: T[], index: number): void {
-    array.copyWithin(index, index + 1);
-    array.length = Math.max(0, array.length - 1);
-}
-
-function arrayUnshift<T>(array: T[], value: T): void {
-    arrayPrepend(array, value);
-}
-
 function createEventStore(): EventStore {
-    // `{ __proto__: null }` is syntax, not a method call, so this keeps working
-    // when userland deletes Object.create — which the `does not depend on
-    // mutable Object helpers` guard deletes on purpose. The old `new Map()`
-    // sidestepped that dependency for free; Object.create(null) would not.
-    return { __proto__: null } as unknown as EventStore;
-}
-
-function arrayShift<T>(array: T[]): T | undefined {
-    if (array.length === 0) return undefined;
-    const first = array[0];
-    arrayRemoveAt(array, 0);
-    return first;
+    return Object.create(null);
 }
 
 function isPromiseLikeResult(value: unknown): value is PromiseLikeResult {
@@ -313,8 +283,8 @@ function addListenerTo(self: EventEmitter, eventName: EventName, rawListener: An
         events[eventName] = list;
     } else {
         list = existing;
-        if (prepend) arrayUnshift(list, listener);
-        else arrayAppend(list, listener);
+        if (prepend) list.unshift(listener);
+        else list.push(listener);
     }
 
     warnIfListenerLimitExceeded(self, eventName, list);
@@ -464,7 +434,7 @@ function removeTrackedEventTargetListener(
     const index = listeners.findIndex((entry) => entry.listener === listener && entry.capture === capture);
     if (index === -1) return;
     const entry = listeners[index];
-    arrayRemoveAt(listeners, index);
+    listeners.splice(index, 1);
     if (listeners.length === 0) {
         events!.delete(name);
         if (events!.size === 0) eventTargetListeners.delete(target);
@@ -485,76 +455,56 @@ function trackEventTargetListener(
     const bucket = eventTargetBucket(target, name);
     if (bucket.some((entry) => entry.listener === listener && entry.capture === capture)) return;
     const entry: EventTargetListenerEntry = { listener, capture, signal };
-    arrayAppend(bucket, entry);
+    bucket.push(entry);
     if (signal) {
         entry.onAbort = () => removeTrackedEventTargetListener(target, name, listener, capture);
         signal.addEventListener('abort', entry.onAbort, { once: true });
     }
 }
 
-function patchEventTargetTracking(): void {
-    const proto = typeof EventTarget === 'function' ? EventTarget.prototype as EventTargetPrototypeWithTracking : undefined;
-    if (!proto || proto.__cnoNodeEventsTracking) return;
+type TrackingInstall = {
+    track(target: EventTarget, name: EventName, listener: EventListenerOrEventListenerObject | null, options?: boolean | AddEventListenerOptions): void;
+    untrack(target: EventTarget, name: EventName, listener: EventListenerOrEventListenerObject | null, options?: boolean | EventListenerOptions): void;
+    patch(): void;
+};
 
-    const add = proto.addEventListener;
-    const remove = proto.removeEventListener;
-    Object.defineProperty(proto, '__cnoNodeEventsTracking', { value: true });
-    const trackedAddEventListener = function addEventListener(
-        this: EventTarget | typeof globalThis | null | undefined,
-        type: string,
+function isEventTargetPolyfill(target: unknown): boolean {
+    if (typeof target !== 'object' || target === null) return false;
+    const proto = Reflect.getPrototypeOf(target);
+    return proto !== null && Reflect.get(proto, Symbol.for('cno.internal.webEventTarget')) === true;
+}
+
+/**
+ * Installs the tracking hooks the EventTarget polyfill reads from globals.
+ * A polyfill EventTarget already reports its own listener changes, so the
+ * per-target bookkeeping map is only maintained for native EventTargets.
+ */
+function installTracking(install: TrackingInstall): void {
+    Reflect.set(globalThis, '__cnoTrackEventTargetListener', function trackEventTargetListenerFor(
+        target: EventTarget,
+        name: EventName,
         listener: EventListenerOrEventListenerObject | null,
         options?: boolean | AddEventListenerOptions,
     ): void {
-        const target = eventTargetReceiver(this);
-        if (!target) {
-            if (!listener) return;
-            return globalThis.addEventListener(type, listener, options);
-        }
-        trackEventTargetListener(target, type, listener, options);
-        return add.call(target, type, listener, options);
-    };
-    const trackedRemoveEventListener = function removeEventListener(
-        this: EventTarget | typeof globalThis | null | undefined,
-        type: string,
+        if (!listener || isEventTargetPolyfill(target)) return;
+        install.track(target, name, listener, options);
+    });
+
+    Reflect.set(globalThis, '__cnoUntrackEventTargetListener', function removeTrackedEventTargetListenerFor(
+        target: EventTarget,
+        name: EventName,
         listener: EventListenerOrEventListenerObject | null,
         options?: boolean | EventListenerOptions,
     ): void {
-        const target = eventTargetReceiver(this);
-        if (!target) {
-            if (!listener) return;
-            return globalThis.removeEventListener(type, listener, options);
-        }
-        removeTrackedEventTargetListener(target, type, listener, options);
-        return remove.call(target, type, listener, options);
-    };
-    Object.defineProperty(proto, 'addEventListener', {
-        value: trackedAddEventListener,
-        writable: true,
-        configurable: true,
+        if (isEventTargetPolyfill(target)) return;
+        install.untrack(target, name, listener, options);
     });
-    Object.defineProperty(proto, 'removeEventListener', {
-        value: trackedRemoveEventListener,
-        writable: true,
-        configurable: true,
-    });
+
+    Reflect.set(globalThis, '__cnoPatchEventTargetTracking', install.patch);
 }
 
-patchEventTargetTracking();
-
-Object.defineProperties(globalThis, {
-    __cnoPatchEventTargetTracking: {
-        value: patchEventTargetTracking,
-        configurable: true,
-    },
-    __cnoTrackEventTargetListener: {
-        value: trackEventTargetListener,
-        configurable: true,
-    },
-    __cnoUntrackEventTargetListener: {
-        value: removeTrackedEventTargetListener,
-        configurable: true,
-    },
-});
+// The hooks are ours to install; the polyfill only reads them after it loads.
+installTracking({ track: trackEventTargetListener, untrack: removeTrackedEventTargetListener, patch() {} });
 
 EventEmitter.prototype.ensureState = function ensureState(): void {
     ensureEventEmitterState(this);
@@ -609,7 +559,7 @@ EventEmitter.prototype.removeListener = function removeListener(eventName: Event
     }
     if (position < 0) return this;
 
-    arrayRemoveAt(stored, position);
+    stored.splice(position, 1);
     // Node collapses a single-element list back to a bare function.
     if (stored.length === 1) events[eventName] = stored[0];
     emitRemoveListener(this, eventName, originalListener ?? listener);
@@ -819,7 +769,7 @@ EventEmitter.on = function on(emitter: EventEmitter | EventTarget, eventName: st
     const closeNames: string[] = [];
     if (options?.close !== undefined && options.close !== null) {
         // Node iterates options.close directly, so a bare string yields its chars.
-        for (const name of options.close) arrayAppend(closeNames, name);
+        for (const name of options.close) closeNames.push(name);
     }
 
     const queue: EventArgs[] = [];
@@ -851,7 +801,7 @@ EventEmitter.on = function on(emitter: EventEmitter | EventTarget, eventName: st
         cleanup();
 
         while (waiters.length > 0) {
-            const waiter = arrayShift(waiters);
+            const waiter = waiters.shift();
             if (!waiter) break;
             if (err !== undefined) waiter.reject(err);
             else waiter.resolve({ done: true, value: undefined });
@@ -860,12 +810,12 @@ EventEmitter.on = function on(emitter: EventEmitter | EventTarget, eventName: st
 
     const onEvent = (...args: EventArgs) => {
         if (finished) return;
-        const waiter = arrayShift(waiters);
+        const waiter = waiters.shift();
         if (waiter) {
             waiter.resolve({ done: false, value: args });
             return;
         }
-        arrayAppend(queue, args);
+        queue.push(args);
         if (!paused && queue.length > high) {
             paused = true;
             callFlowControl('pause');
@@ -897,7 +847,7 @@ EventEmitter.on = function on(emitter: EventEmitter | EventTarget, eventName: st
         },
         async next() {
             if (queue.length > 0) {
-                const value = arrayShift(queue);
+                const value = queue.shift();
                 if (paused && queue.length < low) {
                     paused = false;
                     callFlowControl('resume');
@@ -913,7 +863,7 @@ EventEmitter.on = function on(emitter: EventEmitter | EventTarget, eventName: st
                 return { done: true, value: undefined };
             }
             return new Promise((resolve, reject) => {
-                arrayAppend(waiters, { resolve, reject });
+                waiters.push({ resolve, reject });
             });
         },
         async return() {
