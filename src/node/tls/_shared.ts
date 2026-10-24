@@ -1,16 +1,9 @@
-/**
- * node:tls shared helpers plus the CA trust state: byte/PEM conversions, the
- * ALPN list normaliser, the quiet-cleanup wrappers destroy() relies on, the
- * prototype flattener the two constructor files call, and the system-store
- * cache / override set / override flag behind `setDefaultCACertificates`.
- *
- * Pulls only ../net (for the NetSocket brand check) and ./types, so both
- * ./context and ./socket can depend on it.
- */
+/** node:tls shared helpers and the CA trust state (`../net` + `./types` only). */
 
 import type { Duplex } from '../stream';
 import type { PromiseLikeResult, TlsCertInput, TlsKeyInput, TlsPemValue } from './types';
 export { flattenPrototype } from '../_internal/prototype';
+import { closeQuietly } from '../_internal/close';
 
 const engine = import.meta.use('engine');
 const os = import.meta.use('os');
@@ -95,38 +88,17 @@ export function shutdownSslPipeQuietly(pipe: CModuleSSL.Pipe): void {
 }
 
 export function closeNativeStreamQuietly(stream: CModuleStreams.Stream): void {
-    try {
-        stream.close();
-    } catch {
-        // destroy() is best-effort once the TLS socket is already closing.
-    }
+    closeQuietly(stream);
 }
 
-/**
- * node:tls CA trust state.
- *
- * The lazy system-store cache (`systemCACertificates`), the override set
- * (`defaultCACertificates`) and the override flag (`defaultCAOverridden`) are a
- * single unit: every reader and writer of them lives in this file. Duplicating
- * any one of them in another module would silently break
- * `setDefaultCACertificates()`.
- */
+// One unit, read and written only here. Docs: docs/node-internals.md
 
 let defaultCACertificates: string[] = [];
 /** null = not probed yet; [] = probed, nothing found. */
 let systemCACertificates: string[] | null = null;
 let defaultCAOverridden = false;
 
-/**
- * Load the platform trust store, once, synchronously.
- *
- * SecureContext construction is synchronous, so this cannot await. On Windows
- * we read the OS cert stores directly; elsewhere we read the conventional
- * OpenSSL bundle paths. Without this, `verify: true` relies solely on
- * OpenSSL's compiled-in default verify paths, which on Windows point at
- * directories that do not exist — so verification failed closed against
- * every public server (see AGENT.md "TLS trust store").
- */
+// Synchronous (SecureContext ctor is); once. Windows OpenSSL has no usable default paths.
 function loadSystemCACertificates(): string[] {
     if (systemCACertificates !== null) return systemCACertificates;
     const collected: string[] = [];
@@ -187,13 +159,7 @@ export function effectiveDefaultCACertificates(): string[] {
     return loadSystemCACertificates();
 }
 
-/**
- * Split PEM text into individual certificate blocks.
- *
- * The Windows stores hand back one PEM per entry, but the POSIX bundle paths
- * are a single concatenated file, and `tls.rootCertificates` is specified as
- * one string per certificate.
- */
+/** POSIX bundles are concatenated; `tls.rootCertificates` needs one PEM per entry. */
 function splitPemCertificates(input: string): string[] {
     const blocks: string[] = [];
     const re = /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g;
@@ -201,14 +167,7 @@ function splitPemCertificates(input: string): string[] {
     return blocks;
 }
 
-/**
- * The platform trust anchors, one PEM per certificate.
- *
- * Node exposes its bundled Mozilla roots here; cno has no bundled set, so this
- * reports the platform store that `verify: true` actually uses. It was
- * previously a permanently empty array, which told callers no trust anchors
- * existed while the store held dozens.
- */
+/** Platform trust anchors, one PEM per certificate. */
 export const rootCertificates: string[] = (() => {
     try {
         const collected: string[] = [];

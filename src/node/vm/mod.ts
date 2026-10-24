@@ -1,11 +1,7 @@
 /**
- * Node.js vm module. Uses engine.Sandbox and mirrors a host context object.
- *
- * NOT A SECURITY BOUNDARY, and weaker than Node's: every intrinsic in
- * CONTEXT_GLOBAL_KEYS is the host's own object, so `Date.constructor('return
- * globalThis')()` reaches the host global and patching prototypes leaks out.
- * `options.timeout` never fires (no JS_SetInterruptHandler wiring), so an
- * infinite loop wedges the process. Use a worker or process for untrusted code.
+ * Node.js vm over engine.Sandbox. NOT A SECURITY BOUNDARY: context intrinsics
+ * are the host's objects and `options.timeout` does not fire. Use a worker or
+ * process for untrusted code.
  */
 
 const engine = import.meta.use('engine');
@@ -233,20 +229,8 @@ const RESERVED_GLOBAL_KEYS = new Set<PropertyKey>([
 ]);
 
 /**
- * Intrinsics the Sandbox realm does NOT get from the C constructor, copied in
- * from the host. js_sandbox_ctor (circu.js/src/mod_engine.c:495-496) calls only
- * JS_AddIntrinsicBaseObjects + JS_AddIntrinsicEval, which is exactly why the
- * RESERVED_GLOBAL_KEYS set above is per-realm and everything below is NOT:
- * these bindings are the host's own objects, shared by identity (OBSERVED).
- *
- * Consequence, measured: a script inside the sandbox that assigns to
- * `Date.prototype.getFullYear` or `Map.prototype.get` changes those methods FOR
- * THE HOST. This is a real prototype-pollution channel out of the sandbox, and
- * it cannot be closed from TypeScript — you cannot mint a fresh native `Date`
- * constructor from JS, and dropping these keys would leave `Date` undefined,
- * which is worse. The fix belongs in the C constructor (add the remaining
- * intrinsics to app->ctx). `vm` here is NOT a security boundary; see the module
- * doc comment.
+ * Host intrinsics shared by identity. Patching e.g. `Map.prototype.get` inside
+ * the sandbox changes it for the host; the fix belongs in the C sandbox ctor.
  */
 const CONTEXT_GLOBAL_KEYS = [
     'Date',
@@ -515,12 +499,8 @@ export function createScript(code: string, options?: ScriptOptions | string): Sc
 }
 
 /**
- * Enforce `createContext({ codeGeneration })`. Nodes throws EvalError /
- * CompileError; QuickJS has no switch for it, so each reachable path is closed by
- * hand: the `eval` binding (covers indirect `(0,eval)`), `Function` (also via
- * `Function.prototype.constructor`), and the generator/async constructors behind
- * `(function*(){}).constructor`. All are per-realm. Capability fence only, not an
- * escape-proof boundary (see CONTEXT_GLOBAL_KEYS).
+ * `createContext({ codeGeneration })`: QuickJS has no switch for it, so `eval`,
+ * the function constructors and wasm are fenced by hand, per realm.
  */
 const CODEGEN_MESSAGE = 'Code generation from strings disallowed for this context';
 const WASM_MESSAGE = 'WebAssembly.Module(): Wasm code generation disallowed by embedder';
@@ -534,12 +514,7 @@ function makeCodegenThrower(scope: Context): () => never {
             : new EvalError(CODEGEN_MESSAGE);
     };
 }
-/**
- * Every function constructor reachable inside the realm. `Function` has a global
- * binding; the generator and async variants do not, and are only reachable as
- * `(function*(){}).constructor`, so they are collected from samples minted inside
- * the realm itself.
- */
+/** Generator/async ctors have no global binding; sample them inside the realm. */
 function realmFunctionCtors(sandbox: ContextState['sandbox'], scope: Context): Set<VmCallable> {
     const ctors = new Set<VmCallable>();
     const globalFn = Reflect.get(scope, 'Function');
@@ -678,27 +653,10 @@ export function runInNewContext(code: string, contextObject?: Context, options?:
 }
 
 /**
- * Sandbox realms get their own native error constructors (they are in
- * RESERVED_GLOBAL_KEYS), so an error born inside one never passes through the
- * host's `Error` proxy in `webapi/basic.ts` and never gets a `stack` header —
- * QuickJS's own `stack` is frames-only. Real Node's stack for a cross-realm
- * error DOES carry the `Error: message` header (measured on v24.18.0), and
- * `util.inspect` renders it, so `console.log` of a cross-realm error printed
- * `[    at <eval> …]` instead of `Error: cross realm`.
- *
- * Mirrors the host's approach rather than inventing a second one: wrap the
- * realm's error constructors so each instance gets a lazy `stack` accessor that
- * synthesizes `name: message` above the captured frames on read. Lazy matters —
- * a setter lets a user-assigned stack win, which is what Node does (measured:
- * `q.stack = '    at custom (z.js:1:1)'` survives verbatim and headerless).
- *
- * `instanceof Error` stays false across the realm boundary because the proxy
- * keeps the sandbox constructor as its target and does not touch prototypes;
- * that divergence from the host realm is correct, Node behaves the same way.
- *
- * Not attempted: Node also prefixes an `evalmachine.<anonymous>:1\n<source>\n^`
- * source-excerpt preamble on vm errors. That is separate from the header.
+ * Realm errors bypass the host Error proxy (`webapi/basic.ts`), so wrap them
+ * here to add the same lazy `name: message` stack header.
  */
+
 const SANDBOX_ERROR_CTORS = [
     'Error', 'EvalError', 'RangeError', 'ReferenceError', 'SyntaxError',
     'TypeError', 'URIError', 'InternalError', 'AggregateError', 'SuppressedError',

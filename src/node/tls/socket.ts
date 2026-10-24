@@ -1,12 +1,4 @@
-/**
- * node:tls TLSSocket — the Duplex that owns the SSL pipe: handshake pumping,
- * the plaintext/ciphertext drains, and the authorization settlement.
- *
- * `TLSSocket` is a merged type+value name. The *shape* interface lives in
- * ./types; the empty `export interface TLSSocket extends TLSSocketShape {}`
- * below merges it with the constructor value, so the single
- * `export { TLSSocket }` in ./mod publishes both halves.
- */
+/** TLSSocket: the Duplex owning the SSL pipe (shape in ./types, merged below). */
 
 import { Duplex } from '../stream';
 import { Socket as NetSocket } from '../net';
@@ -68,13 +60,7 @@ function initTLSSocket(self: TLSSocket, socket: Duplex | CModuleStreams.Stream, 
     const contextOptions: InternalSecureContextOptions = {
         ...options,
         mode: self._isServer ? 'server' : 'client',
-        // A server only asks for a client certificate when requestCert is set,
-        // and the C layer's verify flag maps to
-        // SSL_VERIFY_PEER|SSL_VERIFY_FAIL_IF_NO_PEER_CERT — which both sends the
-        // CertificateRequest and fails the handshake on an anonymous client.
-        // Passing it only for clients meant `requestCert` never reached OpenSSL:
-        // the server sent no CertificateRequest, got no client certificate, and
-        // then reported authorized:true because nothing had failed.
+        // Server: requestCert must reach OpenSSL or no CertificateRequest is sent.
         verify: self._isServer
             ? (self._requestCert && self._rejectUnauthorized)
             : self._rejectUnauthorized,
@@ -83,6 +69,7 @@ function initTLSSocket(self: TLSSocket, socket: Duplex | CModuleStreams.Stream, 
         // refuse. SSL_set1_host fails the handshake in the C layer before any JS
         // runs, so stand it down and let _settleAuthorization run the callback.
         // The chain is still verified; only the name decision moves to JS.
+        // A custom checkServerIdentity replaces the C-layer name check.
         verifyHostname: !self._isServer && !!self._servername && !options?.checkServerIdentity,
         alpn: normalizeAlpnProtocols(options?.ALPNProtocols),
     };
@@ -173,15 +160,6 @@ TLSSocket.prototype._initTls = function _initTls(this: TLSSocket): void {
     }
 };
 
-/**
- * _feedEncrypted at a callback boundary.
- *
- * Both read pumps call in from outside JS control flow (a stream 'data' event,
- * or the native onread callback). Anything that escapes there surfaces as an
- * uncaught exception or an unhandled rejection that the application cannot
- * intercept, and the socket never settles — so faults are converted into an
- * 'error' on the socket, which is what Node does.
- */
 TLSSocket.prototype._feedEncryptedSafely = function _feedEncryptedSafely(this: TLSSocket, data: Uint8Array): void {
     try {
         this._feedEncrypted(data);
@@ -219,17 +197,7 @@ TLSSocket.prototype._feedEncrypted = function _feedEncrypted(this: TLSSocket, da
     this._sslPipe.feed(data);
 
     if (!this._handshakeComplete) {
-        // Drive handshake: flush output, then check if complete.
-        // We limit iterations to avoid an infinite loop when the handshake
-        // needs more network data (multi-round-trip). After flushing, we
-        // break and wait for the next _feedEncrypted call with new data.
-        //
-        // pipe.handshake() THROWS on a fatal handshake fault (e.g. OpenSSL
-        // "certificate verify failed"). This runs inside the underlying
-        // stream's onread/'data' callback, so an escaping throw becomes an
-        // unhandled job exception and the socket never settles — the peer
-        // hangs until its own timeout. Node instead emits 'error' on the
-        // TLSSocket. Convert, emit, and tear down.
+        // Bounded so a multi-round-trip handshake resumes on the next feed.
         let iterations = 0;
         const MAX_HANDSHAKE_ITERATIONS = 16;
         try {
@@ -307,21 +275,6 @@ TLSSocket.prototype._feedEncrypted = function _feedEncrypted(this: TLSSocket, da
     this._drainPlaintext();
 };
 
-/**
- * Drain decrypted plaintext out of the SSL pipe.
- *
- * pipe.read() THROWS on a fatal record — a peer that rejects our certificate and
- * drops the connection produces "shutdown while in init" from SSL_read. This
- * runs inside the underlying stream's data callback, so an escaping throw became
- * an unhandled job exception: the process printed an uncaught error the caller
- * had no way to intercept, and the socket never settled.
- *
- * A peer teardown detected during a read is end-of-stream, not an application
- * fault — Node surfaces it as EOF. Emitting 'error' unconditionally would also
- * re-throw whenever the last listener had already detached (a finished
- * keep-alive request), which is how the leak survived the first fix. So report
- * it only when someone is listening, and otherwise close the readable side.
- */
 TLSSocket.prototype._drainPlaintext = function _drainPlaintext(this: TLSSocket): void {
     try {
         for (;;) {
@@ -369,28 +322,6 @@ TLSSocket.prototype._drainWriteQueue = function _drainWriteQueue(this: TLSSocket
     }
 };
 
-/**
- * Decide `authorized` / `authorizationError`, and run the hostname identity
- * check. Returns the identity error, if any, so the caller can reject.
- *
- * Two holes this closes:
- *
- *  1. Server side. OpenSSL's verify result is X509_V_OK when verification never
- *     ran, so a server that asked for a client certificate and received none
- *     reported `authorized: true`. Authorized now requires a peer certificate
- *     to actually be present.
- *
- *  2. Client side with rejectUnauthorized:false. The C layer only calls
- *     SSL_set1_host when verifyHostname is set, so the name was never checked
- *     and a certificate issued for another host reported `authorized: true`.
- *     The name check now runs in JS whenever OpenSSL did not run it, so
- *     `authorized` reflects it. Node's contract is that rejectUnauthorized:false
- *     still connects but reports authorized:false with the reason.
- *
- *  3. checkServerIdentity was accepted as an option and never called. It now
- *     runs on every client handshake, and a returned Error rejects the
- *     connection when rejectUnauthorized is set.
- */
 TLSSocket.prototype._settleAuthorization = function _settleAuthorization(this: TLSSocket): Error | null {
     const pipe = this._sslPipe;
     if (!pipe) return null;
@@ -442,12 +373,7 @@ TLSSocket.prototype._settleAuthorization = function _settleAuthorization(this: T
     const expectedName = this._servername;
     const custom = this._checkServerIdentity;
 
-    // Did OpenSSL already check the name? The C layer calls SSL_set1_host only
-    // when the context has verifyHostname set, which tracks rejectUnauthorized.
-    // When it did check, its result is authoritative AND more complete than
-    // anything reproducible here: the C layer exposes only dNSName SANs
-    // (mod_ssl.c, GEN_DNS branch), so iPAddress SANs are invisible to JS and a
-    // second built-in check would wrongly reject a valid IP certificate.
+    // C exposes only dNSName SANs, so a JS recheck would reject valid IP certs.
     const opensslCheckedName = this._rejectUnauthorized && !!expectedName;
 
     if (custom && expectedName) {
@@ -531,12 +457,7 @@ TLSSocket.prototype.getPeerCertificate = function getPeerCertificate(this: TLSSo
         return result;
     };
 
-    // The C layer hands back bare names. Node's `subjectaltname` is a
-    // comma-separated list of *typed* entries ("DNS:a, IP Address:1.2.3.4"), and
-    // checkServerIdentity parses those prefixes. Emitting bare names made the
-    // SAN filter match nothing and silently fall back to the CN — so a
-    // certificate whose SAN covered only another host could be accepted on its
-    // CN alone.
+    // Typed entries required: bare names make the SAN filter fall back to the CN.
     const rawNames = cert.subjectAltNames ?? [];
     const isIp = (v: string) => /^[0-9.]+$/.test(v) || v.includes(':');
     const typed = rawNames.map(n => (n.startsWith('DNS:') || n.startsWith('IP Address:') || n.startsWith('URI:') || n.startsWith('email:'))

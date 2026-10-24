@@ -4,6 +4,8 @@ import { ensureDirectory } from "../utils/fs-path";
 import { basename, dirname, resolvePath, toFsPath } from "../utils/path";
 import { wrapFSErr } from "../utils/wrap";
 import { errors } from "./01_errors";
+import { defineLazy } from "../utils/lazy-accessor";
+import { getEnv } from "../utils/env";
 
 const os = import.meta.use('os');
 const engine = import.meta.use('engine');
@@ -14,14 +16,7 @@ const asyncfs = import.meta.use('asyncfs');
 
 const kInternal = Symbol('Deno.internal');
 
-/**
- * Lifecycle event dispatch, via the shared multiplexer.
- *
- * Loaded dynamically and tolerantly for the same reason webapi does it
- * (cno/src/webapi/index.ts): cno/src/deno has no build-time dependency on cts,
- * and a standalone cno without the cts layer must still run its test harness —
- * just without the 'load'/'unload' events, which is the pre-existing behaviour.
- */
+/** Loaded tolerantly: no build-time cts dependency. See docs/webapi-notes.md */
 type LifecycleMux = {
     dispatchLoadEvent(): boolean;
     dispatchUnloadEvent(): boolean;
@@ -289,12 +284,7 @@ function normalizeSignalName(sig: unknown): string {
 }
 
 function safeGetEnv(env: unknown): string | undefined {
-    const key = toEnvKey(env);
-    try {
-        return os.getenv(key) ?? undefined;
-    } catch {
-        return undefined;
-    }
+    return getEnv(toEnvKey(env));
 }
 
 const customInspectSymbol = Symbol.for('Deno.customInspect');
@@ -708,25 +698,9 @@ function createBenchFunction(): BenchFunction {
 }
 
 export async function startTest(contextName = '<core>', test = true, bench = true, options: StartTestOptions = {}) {
-    // Deno fires the global 'load' event before the suite runs and 'unload'
-    // after it finishes (measured against 2.9.3: `load`, then the test bodies,
-    // then `unload`). Neither happened here.
-    //
-    // 'load' was not merely displaced by the single-slot engine.onEvent setter —
-    // it was unreachable. The native EV_LOAD is dispatched by
-    // TJS_EvalModuleContent (circu.js/src/utils.c:469) for the C-level main
-    // module, i.e. cno's own bootstrap, long before a test file exists. And
-    // 'unload' rides on EV_EXIT, which only fires via os.exit/TJS_Stop
-    // (mod_os.c:87, vm.c:282) — never on loop drain — so a test run that simply
-    // finished never produced one.
-    //
-    // Both helpers are idempotent, so reaching this alongside the dispatch in
-    // src/commands/run.ts cannot double-fire, and dispatchUnloadEvent() stands
-    // down if a test called Deno.exit() and webapi already fired 'unload' off
-    // EV_EXIT.
-    //
-    // This is what makes `addEventListener('load')` able to arm state (a timer,
-    // a server) that the tests then rely on, and 'unload' able to release it.
+    // 'load' before the suite, 'unload' after; evaluate lazy feature modules
+    // before the first test body. Docs: docs/webapi-notes.md
+    await Promise.all(lazyModules);
     if (test) (await loadLifecycleMux())?.dispatchLoadEvent();
 
     // reportError / uncaught errors during a test fail the suite (specs/test/report_error).
@@ -910,15 +884,7 @@ export async function startTest(contextName = '<core>', test = true, bench = tru
     } finally {
         if (test) {
             try { globalThis.removeEventListener('error', onSuiteError); } catch { /* */ }
-            // 'unload' after the suite, matching Deno. In the finally so it also
-            // fires when the suite throws.
-            //
-            // This is load-bearing beyond event parity: a 'load' listener that
-            // armed a setInterval pins the event loop, and clearing it is
-            // exactly what the 'unload' listener exists to do. With no unload,
-            // such a run hangs instead of exiting
-            // (tests/deno/test-harness.test.ts 'load before suite and unload
-            // after').
+            // Mandatory: a 'load' listener's setInterval would hang the run.
             try { lifecycleMux?.dispatchUnloadEvent(); } catch { /* a listener threw; not fatal */ }
         }
     }
@@ -948,6 +914,22 @@ function getTimerID(timer: unknown): number {
 const uname = os.uname();
 let denoExitCode = 0;
 
+// cno brings up `process` lazily: boot only records its loader through
+// `_internal/process-lazy.ts`, so this read installs the getter and returns the
+// real singleton.
+type LazyProcessSlot = {
+    /** Installs the getter under the name Deno published `globalThis.process` as. */
+    installLazyProcessGlobal(globalName?: string): void;
+};
+
+/** Publish `globalThis.process` over Deno's placeholder; a no-op without cno. */
+function installProcessGlobal(): void {
+    const slot = Reflect.get(globalThis, Symbol.for('cno.node.process.lazy')) as LazyProcessSlot | undefined;
+    if (typeof slot?.installLazyProcessGlobal !== 'function') return;
+    const descriptor = Reflect.getOwnPropertyDescriptor(globalThis, 'process');
+    slot.installLazyProcessGlobal(descriptor?.get?.name || 'process');
+}
+
 function syncProcessExitCode(value: number): void {
     const proc = Reflect.get(globalThis, 'process');
     if ((typeof proc === 'object' || typeof proc === 'function') && proc !== null) {
@@ -965,6 +947,8 @@ function setDenoExitCode(value: unknown): void {
     denoExitCode = value;
     syncProcessExitCode(value);
 }
+
+installProcessGlobal();
 
 Object.defineProperty(globalThis, "Deno", {
     value: {
@@ -1185,19 +1169,88 @@ Reflect.defineProperty(Deno, 'args', {
     configurable: true,
 });
 
-// then import polyfills
-await import('./00_permission');
-await import('./02_fs');
-await import('./03_fopen');
+// Staged first: its exports are a requested field of this module. Docs: docs/webapi-notes.md
 export const { stdin, stdout, stderr } = await import('./04_stdio');
-await import('./05_net');
-await import('./06_process');
-await import('./07_http');
-await import('./08_serve');
-await import('./09_cron');
-// QUIC — loads always; native gate fails closed on listen/connect
-await import('./10_quic');
+await Promise.all([
+    import('./00_permission'),
+    import('./02_fs'),
+    import('./03_fopen'),
+    import('./07_http'),
+]);
 
-// unstable APIs
-await import('./kv');
-await import('./ffi');
+// Lazy: boot-reachable bytecode costs startup. See docs/webapi-notes.md
+const netNamespace: Promise<Record<string, unknown>> = import('./05_net');
+const processNamespace: Promise<Record<string, unknown>> = import('./06_process');
+const serveNamespace: Promise<Record<string, unknown>> = import('./08_serve');
+const quicNamespace: Promise<Record<string, unknown>> = import('./10_quic');
+const kvNamespace: Promise<Record<string, unknown>> = import('./kv');
+const ffiNamespace: Promise<Record<string, unknown>> = import('./ffi');
+// Cron starts no timer until a job is added, but `Deno.cron` is probed by `typeof`
+// in user code, so it keeps loading at boot.
+const cronNamespace: Promise<Record<string, unknown>> = import('./09_cron');
+
+function namespaceValues(namespace: Promise<Record<string, unknown>>, ...names: string[]): Promise<Map<string, unknown>> {
+    return namespace.then((mod) => new Map(names.map(name => [name, Reflect.get(mod, name)])));
+}
+
+// Net: free functions, plus the QUIC entry points that live in their own module
+// (its native gate still fails closed on listen/connect).
+const NET_ENTRIES = ['connect', 'connectTls', 'listen', 'listenTls', 'startTls', 'listenDatagram', 'networkInterfaces', 'resolveDns'] as const;
+const netLazy: Promise<void> = defineLazy(Deno, [
+    ...NET_ENTRIES.map(name => ({ name, kind: 'fn' as const })),
+    { name: 'QuicEndpoint', kind: 'ctor' as const },
+    { name: 'connectQuic', kind: 'fn' as const },
+], async () => {
+    const [values, quic] = await Promise.all([namespaceValues(netNamespace, ...NET_ENTRIES), quicNamespace]);
+    values.set('QuicEndpoint', Reflect.get(quic, 'QuicEndpoint'));
+    values.set('connectQuic', Reflect.get(quic, 'connectQuic'));
+    return values;
+});
+
+// Process: `umask` keeps a value between calls, so its stand-in must reach the
+// module's current function instead of freezing one.
+const PROCESS_ENTRIES = ['Command', 'ChildProcess', 'Process', 'kill', 'umask', 'spawn', 'spawnAndWait', 'spawnAndWaitSync'] as const;
+const processLazy: Promise<void> = defineLazy(Deno, [
+    { name: 'Command', kind: 'ctor' as const },
+    { name: 'ChildProcess', kind: 'ctor' as const },
+    { name: 'Process', kind: 'ctor' as const },
+    { name: 'kill', kind: 'fn' as const },
+    { name: 'umask', kind: 'fn' as const },
+    { name: 'spawn', kind: 'fn' as const },
+    { name: 'spawnAndWait', kind: 'fn' as const },
+    { name: 'spawnAndWaitSync', kind: 'fn' as const },
+], () => namespaceValues(processNamespace, ...PROCESS_ENTRIES));
+
+// Serve: the HTTP server object is only built once a request arrives.
+const serveLazy: Promise<void> = defineLazy(Deno, [
+    { name: 'serve', kind: 'fn' as const },
+    { name: 'upgradeWebSocket', kind: 'fn' as const },
+], () => namespaceValues(serveNamespace, 'serve', 'upgradeWebSocket'));
+
+// KV and FFI (unstable APIs): constructors plus a function apiece.
+const KV_ENTRIES = ['openKv', 'Kv', 'KvListIterator', 'KvU64', 'AtomicOperation'] as const;
+const kvLazy: Promise<void> = defineLazy(Deno, [
+    { name: 'openKv', kind: 'fn' as const },
+    { name: 'Kv', kind: 'ctor' as const },
+    { name: 'KvListIterator', kind: 'ctor' as const },
+    { name: 'KvU64', kind: 'ctor' as const },
+    { name: 'AtomicOperation', kind: 'ctor' as const },
+], () => namespaceValues(kvNamespace, ...KV_ENTRIES));
+
+const FFI_ENTRIES = ['dlopen', 'UnsafePointer', 'UnsafePointerView', 'UnsafeCallback', 'UnsafeFnPointer'] as const;
+const ffiLazy: Promise<void> = defineLazy(Deno, [
+    { name: 'dlopen', kind: 'fn' as const },
+    { name: 'UnsafePointer', kind: 'ctor' as const },
+    { name: 'UnsafePointerView', kind: 'ctor' as const },
+    { name: 'UnsafeCallback', kind: 'ctor' as const },
+    { name: 'UnsafeFnPointer', kind: 'ctor' as const },
+], () => namespaceValues(ffiNamespace, ...FFI_ENTRIES));
+
+// Test harness (`__startTest`): a suite reads feature globals as soon as its file
+// loads, so `startTest` evaluates every module that the eager boot used to load
+// before the first test body runs. Non-test programs pay only when they read.
+export const lazyModules: readonly Promise<unknown>[] = [
+    netLazy, processLazy, serveLazy, kvLazy, ffiLazy, cronNamespace.then(() => undefined),
+];
+
+

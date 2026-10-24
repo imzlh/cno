@@ -19,20 +19,8 @@ const console = import.meta.use('console');
 const NativeError = globalThis.Error;
 const nativeCaptureStackTrace = NativeError.captureStackTrace;
 
-/**
- * QuickJS exposes an error's frames through a `stack` CGETSET accessor on
- * `Error.prototype` (quickjs.c `js_error_proto_funcs`), reading the frames out
- * of the instance's internal `[[ErrorData]]` slot. Two consequences:
- *
- *  - No error instance has an *own* `stack`. V8 defines one on every error at
- *    construction, so `Object.getOwnPropertyNames(e)` includes `'stack'` there
- *    and not here — which breaks own-property walks and `inspect(showHidden)`.
- *  - The engine's frames are headerless. Node's `.stack` starts with
- *    `Name: message`.
- *
- * Capture the native accessor before anything below replaces it: it is the only
- * way back to the raw frames once our own getter shadows it.
- */
+// Capture before anything replaces it: the only path back to raw frames.
+// Why the shape/header differ from Node: docs/webapi-notes.md#errors-basicts
 const nativeStackDescriptor = Object.getOwnPropertyDescriptor(NativeError.prototype, 'stack');
 const nativeStackGetter = typeof nativeStackDescriptor?.get === 'function' ? nativeStackDescriptor.get : undefined;
 
@@ -53,25 +41,9 @@ function formatErrorStackHeader(error: { name?: unknown; message?: unknown }): s
     return `${name}: ${message}`;
 }
 
-/**
- * Errors whose `stack` value came out of an `Error.prepareStackTrace` hook.
- *
- * The hook's return value is the stack, whatever it is — Node never touches it.
- * A shape heuristic cannot decide this reliably (a hook returning `''` or a
- * frame-looking string is indistinguishable from engine output), so record it at
- * the point the hook runs instead. Populated by `prepareStackTraceWrapper`.
- */
+// A shape heuristic cannot tell a hook result from engine frames.
 const hookFormattedErrors = new WeakSet<object>();
 
-/**
- * Prepend `Name: message` to headerless engine frames.
- *
- * Only engine frames get a header. A value produced by an
- * `Error.prepareStackTrace` hook is returned verbatim — re-heading it is wrong
- * and `tests/cts/sourcemap-stack-position.test.ts` pins it.
- *
- * Node's `.stack` has no trailing newline; QuickJS's frames always end in one.
- */
 function headerizeErrorStack(error: object, raw: unknown): unknown {
     if (typeof raw !== 'string') return raw;
     if (hookFormattedErrors.has(error)) return raw;
@@ -85,14 +57,6 @@ function headerizeErrorStack(error: object, raw: unknown): unknown {
     return frames === '' ? header : `${header}\n${frames}`;
 }
 
-/**
- * True when the frame starting at `from` (after indentation) is one of the proxy
- * trap's own frames.
- *
- * Compared in place against the source string. Slicing the line, calling
- * `trimStart()`, then testing four prefixes costs more than the rest of the
- * getter combined because it allocates twice per call.
- */
 function isInternalErrorProxyFrameAt(stack: string, from: number, lineEnd: number): boolean {
     let rest: number;
     if (stack.startsWith('at construct (', from)) {
@@ -106,12 +70,6 @@ function isInternalErrorProxyFrameAt(stack: string, from: number, lineEnd: numbe
     return stack.startsWith('<core>:', rest);
 }
 
-/**
- * Strip the proxy trap's own frames off the front, and any trailing newline.
- *
- * Allocates nothing unless something is actually stripped: `.stack` is read on
- * error paths that are often already hot.
- */
 function stripInternalErrorProxyFrames(stack: string): string {
     let end = stack.length;
     while (end > 0 && stack.charCodeAt(end - 1) === 10 /* \n */) end--;
@@ -132,15 +90,6 @@ function stripInternalErrorProxyFrames(stack: string): string {
     return start === 0 && end === stack.length ? stack : stack.slice(start, end);
 }
 
-/**
- * The same internal frames, on the `CallSite` side.
- *
- * `build_backtrace` (quickjs.c) has two branches: it builds a string, or — when a
- * `prepareStackTrace` hook is installed — an array of CallSite objects.
- * `stripInternalErrorProxyFrames` only cleans the string, so the proxy's trap
- * frames must also be dropped here, at `sites[0]`/`sites[1]` where every
- * CallSite-consuming library looks for the throw site.
- */
 function isInternalErrorProxyCallSite(site: unknown): boolean {
     if (!site || typeof site !== 'object') return false;
     const cs = site as { getFunctionName?: () => unknown; getFileName?: () => unknown };
@@ -168,32 +117,16 @@ function stripInternalErrorProxyCallSites(sites: unknown): unknown {
 
 /** Drop our lazy stack so native capture can write frames again. */
 function clearLazyErrorStack(error: object): void {
+    // Drop our lazy stack so native capture can write frames again.
     const own = Object.getOwnPropertyDescriptor(error, 'stack');
     if (own && typeof own.get === 'function' && own.configurable) {
         try { delete (error as { stack?: unknown }).stack; } catch { /* */ }
     }
 }
 
-/**
- * Give `error` an own, lazily-computed `stack` — matching V8's shape
- * (own accessor, non-enumerable, configurable) rather than QuickJS's
- * prototype-only one.
- *
- * Laziness is load-bearing in both directions: computing frames at construction
- * costs ~2x per error on paths that never read `.stack`, and the setter must
- * latch a user-assigned value verbatim because V8 does not re-header an assigned
- * stack.
- *
- * `mode` distinguishes the two callers, which need different sources:
- *  - `'construct'`: a brand-new error from a constructor trap. It cannot already
- *    carry an own `stack` (so the descriptor probe is skipped) and its frames live
- *    in the engine's `[[ErrorData]]` slot, read on demand.
- *  - `'capture'`: after native `Error.captureStackTrace`, which has just written
- *    an own *data* property. Those frames are headerless and still need a header,
- *    so they must NOT be latched as if a user had assigned them; the target is
- *    often a plain object with no `[[ErrorData]]` slot, so the value has to be
- *    carried in the closure.
- */
+/** V8-shaped own stack: lazy (frames cost), user-assigned values kept verbatim.
+ *  `'capture'`: after native captureStackTrace, whose headerless value must not
+ *  latch as user-assigned. */
 function installLazyErrorStack<T>(error: T, mode: 'construct' | 'capture'): T {
     if (!error || (typeof error !== 'object' && typeof error !== 'function')) return error;
     const target = error as object;
@@ -253,15 +186,8 @@ function installLazyErrorStack<T>(error: T, mode: 'construct' | 'capture'): T {
     return error;
 }
 
-/**
- * Every native error constructor needs wrapping, not just `Error`: unwrapped
- * ones render frames-only under `util.inspect` (`[ at <anonymous> (…)]`)
- * instead of `TypeError: m`. `src/node/vm/mod.ts` wraps the same list for
- * sandbox realms; this mirrors it for the host realm.
- *
- * `InternalError` is QuickJS-only and has no Node counterpart, but it is a real
- * global here and errors thrown from it deserve the same header.
- */
+// Every native ctor, not just Error: unwrapped ones print frames-only under
+// util.inspect. InternalError is QuickJS-only. See node/vm/mod.ts (same list).
 const NATIVE_ERROR_CTOR_NAMES = [
     'Error', 'EvalError', 'RangeError', 'ReferenceError', 'SyntaxError',
     'TypeError', 'URIError', 'InternalError', 'AggregateError', 'SuppressedError',
@@ -314,18 +240,7 @@ Object.defineProperty(ErrorProxy, 'captureStackTrace', {
 });
 Reflect.set(globalThis, 'Error', ErrorProxy);
 
-/**
- * Intercept `Error.prepareStackTrace` so the hook sees a clean CallSite array and
- * its return value is recorded as authoritative.
- *
- * QuickJS keeps the hook in `ctx->error_prepare_stack` behind a CGETSET on the
- * `Error` constructor (quickjs.c `js_error_set_prepareStackTrace`) and calls it
- * from C with `(error_obj, sites)`. There is no way to filter the array from
- * inside the construct trap — the array is built after the trap returns — so the
- * hook itself is where it has to happen. Assigning a wrapper into the native slot
- * while reporting the user's own function back through the getter keeps the
- * substitution invisible: `Error.prepareStackTrace === myHook` stays true.
- */
+// The proxied Error must keep reporting the user's hook, not the wrapper.
 if (nativeStackGetter) {
     const nativePrepareDescriptor = Object.getOwnPropertyDescriptor(NativeError, 'prepareStackTrace');
     const nativePrepareGet = nativePrepareDescriptor?.get;
@@ -381,14 +296,8 @@ for (const name of NATIVE_ERROR_CTOR_NAMES) {
 }
 repointConstructorProperty(NativeError, ErrorProxy);
 
-/**
- * Engine-thrown errors (`null.x`, a failed `JSON.parse`, anything raised from C)
- * never pass through a JS constructor, so the traps above cannot reach them.
- * Their frames are still headerless, so patch the prototype accessor they fall
- * back to. This fixes the *content* for that population; their own-property
- * shape still differs from Node and needs an engine fix (see quickjs.c
- * `build_backtrace`).
- */
+// C-thrown errors never pass through a JS constructor, so patch the prototype
+// accessor they fall back to (content only; own shape needs an engine fix).
 if (nativeStackDescriptor && nativeStackDescriptor.configurable && nativeStackGetter) {
     const nativeStackSetter = nativeStackDescriptor.set;
     // Same format-once-then-cache semantics as the own accessor above. A WeakMap
@@ -541,11 +450,7 @@ function nextCodePoint(input: string, index: number): { codePoint: number; read:
     return { codePoint: 0xfffd, read: 1, size: 3 };
 }
 
-/**
- * `engine.encodeString` emits WTF-8 for unpaired surrogates; the encoding spec
- * substitutes U+FFFD. `sanitizeSurrogates` lives in utils/bytes so the wire
- * paths (fetch bodies, FormData, WebSocket) share one implementation.
- */
+/** WTF-8 surrogates would leak; sanitize first. Docs/webapi-notes.md#streams-basicts */
 class TextEncoder {
     get encoding() {
         return 'utf-8';
@@ -575,13 +480,7 @@ class TextEncoder {
 
 }
 
-/**
- * WHATWG "get an encoding": a label maps to a *canonical* encoding name, and the
- * label is stripped of leading/trailing HTTP whitespace and ASCII-lowercased
- * first. The native `text.Decoder` is iconv-backed, so it reports the raw label
- * as `encoding` (`ucs-2`, not `utf-16le`) and rejects labels it does not know
- * verbatim — hence the table rather than passing the label straight through.
- */
+/** WHATWG label -> canonical name. Docs/webapi-notes.md#encoding-basicts */
 const ENCODING_LABELS: Record<string, string> = {};
 const addLabels = (canonical: string, labels: string) => {
     for (const label of labels.split(' ')) ENCODING_LABELS[label] = canonical;
@@ -658,16 +557,20 @@ const JS_DECODED = new Set<string>(['utf-8', 'windows-1252', 'x-user-defined', '
  */
 function decoderInputBytes(input?: AllowSharedBufferSource | null): Uint8Array {
     if (input === undefined) return new Uint8Array(0);
-    const isBuffer = input instanceof ArrayBuffer
-        || (typeof SharedArrayBuffer === 'function' && input instanceof SharedArrayBuffer);
-    if (!isBuffer && !ArrayBuffer.isView(input)) {
+    // A typed-array view on an ArrayBuffer is already the bytes: pass it
+    // through instead of copying. Only a plain ArrayBuffer, a
+    // SharedArrayBuffer or a DataView needs a wrapping view.
+    if (ArrayBuffer.isView(input)) {
+        const view = input as ArrayBufferView;
+        return view instanceof Uint8Array && engine.isArrayBuffer(view.buffer)
+            ? view
+            : arrayBufferBackedBytes(new Uint8Array(view.buffer, view.byteOffset, view.byteLength));
+    }
+    if (!(input instanceof ArrayBuffer) && !(typeof SharedArrayBuffer === 'function' && input instanceof SharedArrayBuffer)) {
         throw new TypeError('The "input" argument must be an instance of SharedArrayBuffer, ArrayBuffer or ArrayBufferView');
     }
     try {
-        const view = isBuffer
-            ? new Uint8Array(input as ArrayBuffer)
-            : new Uint8Array((input as ArrayBufferView).buffer, (input as ArrayBufferView).byteOffset, (input as ArrayBufferView).byteLength);
-        return new Uint8Array(arrayBufferBackedBytes(view));
+        return arrayBufferBackedBytes(new Uint8Array(input as ArrayBuffer));
     } catch {
         return new Uint8Array(0);   // detached backing store
     }
@@ -877,14 +780,8 @@ class Immediate extends Number {
 
 type TimerCallback = string | ((...args: unknown[]) => void);
 
-// No receiver ("brand") check on any timer entry point: Node exposes the very
-// same function objects as both the globals and the `node:timers` exports, so
-// `timers.setTimeout(...)` calls a non-global receiver by design and Node
-// accepts every receiver for all timer functions alike.
-//
-// This is load-bearing: sinon, @sinonjs/fake-timers and jest's useFakeTimers
-// copy these functions onto a table and call them as methods.
-
+// No receiver check on any timer entry point: fake-timer libraries call these as
+// methods. Docs/webapi-notes.md#timers-basicts
 function toTimerDelay(value: unknown): number {
     if (value === undefined) return 0;
     if (typeof value === 'bigint') throw new TypeError('Cannot convert a BigInt value to a number');
@@ -982,10 +879,7 @@ Reflect.set(globalThis, 'clearImmediate', function(id: Immediate | number | unde
 });
 
 globalThis.structuredClone = function(v, opt){
-    // The public API always treats its second argument as an options dictionary.
-    // The shared clone helper also accepts a bare transfer list for MessagePort
-    // and worker internals, so keep arrays on this boundary from selecting that
-    // internal overload.
+    // An array must not reach the helper's bare transfer-list overload.
     const options = Array.isArray(opt)
         ? { transfer: Reflect.get(opt, 'transfer') as Transferable[] | undefined }
         : opt;

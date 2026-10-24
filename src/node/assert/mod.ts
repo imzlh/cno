@@ -1,6 +1,3 @@
-/**
- * Node.js assert module
- */
 
 const console = import.meta.use('console');
 import { deepEqual as _deepEqual } from '../_internal/deep-equal';
@@ -13,13 +10,6 @@ import { inspectDiff, inspectForAssert } from '../util/diff';
 
 type PropertyRecord = Record<PropertyKey, unknown>;
 
-/**
- * Message extractor for the comparison assertions. When the caller supplies an
- * Error, Node throws *that instance* rather than wrapping it in an
- * AssertionError, so `catch (e) { e instanceof MyError }` keeps working. This
- * throws from the argument position, which is always evaluated immediately
- * before the AssertionError would have been thrown.
- */
 function messageOrThrow(m?: unknown): string | undefined {
     if (m instanceof Error) throw m;
     return typeof m === 'string' ? m : undefined;
@@ -32,13 +22,6 @@ function matcherMessage(m?: unknown): string | undefined {
     return undefined;
 }
 
-/**
- * The parenthesised name in "Missing expected exception (TypeError)."
- *
- * Node names constructors and named predicate functions, and an Error *instance*
- * by its constructor. RegExps, plain-object matchers and anonymous functions get
- * no suffix, since there is no useful name to report.
- */
 function matcherName(error: unknown): string {
     if (typeof error === 'function') return error.name ? ` (${error.name})` : '';
     if (error instanceof Error) {
@@ -127,15 +110,6 @@ const NEGATED_HEADERS: Record<string, string> = {
     notDeepEqual: 'Expected "actual" not to be loosely deep-equal to:',
 };
 
-/**
- * How the negated assertions attach their single rendered value.
- *
- * The strict forms inline it after the colon only when it is short and fits on
- * one line, and add a trailing newline when it is multi-line. Thresholds
- * measured on v24.18.0: 5 characters inline, 6 block ('xxx' inlines, 'xxxx'
- * does not). Loose `notDeepEqual` is different again — always block, never a
- * trailing newline, whatever the length.
- */
 function attachNegatedValue(header: string, rendered: string, loose: boolean): string {
     if (loose) return `${header}\n\n${rendered}`;
     if (rendered.includes('\n')) return `${header}\n\n${rendered}\n`;
@@ -143,10 +117,6 @@ function attachNegatedValue(header: string, rendered: string, loose: boolean): s
     return `${header}\n\n${rendered}`;
 }
 
-/**
- * The inspect options Node's assert uses, and the Myers-diff composer built to
- * match `createErrDiff`.
- */
 function inspectForDiff(value: unknown): string {
     try {
         return inspectForAssert(value);
@@ -157,11 +127,6 @@ function inspectForDiff(value: unknown): string {
     }
 }
 
-/**
- * Node's `+ actual - expected` structural diff, composed exactly as
- * createErrDiff does. This block is what a developer reads to find out what
- * differed, so it is worth far more than the one-line form it replaces.
- */
 function buildStructuralDiff(header: string, actual: unknown, expected: unknown): string {
     let result;
     try {
@@ -174,23 +139,6 @@ function buildStructuralDiff(header: string, actual: unknown, expected: unknown)
     return `${header}\n${legend}${skipped}\n${result.message}\n`;
 }
 
-/**
- * Builds Node's generated message for a failed comparison.
- *
- * The `+ actual - expected` form is used when the two values *look* alike, which
- * is what makes an otherwise-baffling failure readable: `strictEqual(0, -0)`
- * previously rendered as "0 strictEqual 0", reporting two identical-looking
- * values as unequal.
- *
- * Node renders object operands as a multi-line structural diff; that requires
- * util.inspect's indented output, so objects are rendered on one line here.
- */
-/**
- * `strictEqual` and `deepStrictEqual` keep the generated detail even when the
- * caller supplies a message, so the custom text explains *why* the assertion
- * matters while the detail still shows what differed. Node does this only for
- * these two; every other assertion replaces the message entirely.
- */
 function withDetail(custom: string | undefined, actual: unknown, expected: unknown, operator: string): string | undefined {
     if (custom === undefined) return undefined;
     const generated = buildGeneratedMessage(actual, expected, operator);
@@ -202,6 +150,8 @@ function withDetail(custom: string | undefined, actual: unknown, expected: unkno
     return `${custom}${detail}`;
 }
 
+// strictEqual/deepStrictEqual keep this detail alongside a custom message; all
+// other assertions replace the message entirely.
 function buildGeneratedMessage(actual: unknown, expected: unknown, operator: string): string {
     const negated = NEGATED_HEADERS[operator];
     if (negated) {
@@ -275,14 +225,8 @@ export class AssertionError extends Error {
             message = buildGeneratedMessage(options.actual, options.expected, options.operator || '');
         }
         super(message ?? 'Assertion failed');
-        // Node carries `name` on the instance but leaves it non-enumerable, so
-        // Object.keys(err) lists only the assertion fields.
-        // `__proto__: null` is load-bearing, not defensive style: `defineProperty`
-        // resolves descriptor fields with HasProperty, which walks the prototype
-        // chain, so a plain literal carrying `value`/`writable` also picks up any
-        // `get`/`set` polluted onto `Object.prototype` and dies with "Cannot both
-        // specify accessors and a value or writable attribute". Node and Deno both
-        // survive `Object.prototype.get = fn` here (OBSERVED).
+        // `__proto__: null` is load-bearing: HasProperty lookup would pick up a
+        // polluted Object.prototype get/set. Non-enumerable name matches Node.
         Object.defineProperty(this, 'name', {
             __proto__: null,
             value: 'AssertionError',

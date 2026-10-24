@@ -1,15 +1,3 @@
-/**
- * WebAssembly JavaScript API Polyfill for txiki.js
- *
- * Bridges the low-level WAMR C backend (CModuleWASM) to the standard
- * WebAssembly global, implementing the WebAssembly JS API specification.
- *
- * The WAMR API requires explicit import resolution before building instances,
- * unlike the standard API which accepts an importObject at instantiation.
- * This polyfill handles the conversion automatically.
- *
- * @see {@link https://webassembly.github.io/spec/js-api/}
- */
 
 const wasmModule = import.meta.use('wasm');
 if (!wasmModule) throw new Error('WASM support is not available in this build');
@@ -41,13 +29,7 @@ type WasmErrorLike = {
     message?: unknown;
     name?: unknown;
     code?: unknown;
-    /*
-     * The C layer tags every wasm error with the JS class it should surface as:
-     * tjs_throw_wasm_error() (circu.js/src/mod_wasm.c) throws a plain Error
-     * carrying `wasmError: "RuntimeError" | "CompileError" | "LinkError" |
-     * "RangeError" | "TypeError"`. It cannot set `name`, because the thrown
-     * object is a bare JS_NewError, so this marker is the only channel.
-     */
+    /** Native error class tag; the C layer cannot set `name` on a bare Error. */
     wasmError?: unknown;
 };
 
@@ -75,15 +57,6 @@ function toUint8Array(source: BufferSource): Uint8Array {
     return new Uint8Array(source.buffer, source.byteOffset, source.byteLength);
 }
 
-/*
- * Re-throw a native wasm failure as the class the WebAssembly JS API specifies.
- *
- * The classification MUST come from the `wasmError` marker the C layer sets:
- * tjs_throw_wasm_error() builds a bare Error, so `name` is always "Error" and
- * `code` is absent. Reading only those left every trap surfacing as a plain
- * Error, so `catch (e) { e instanceof WebAssembly.RuntimeError }` never matched
- * and a trap was indistinguishable from an ordinary JS bug.
- */
 function wrapWasmError<T>(fn: () => T): T {
     try {
         return fn();
@@ -94,38 +67,19 @@ function wrapWasmError<T>(fn: () => T): T {
         if (tag.includes('Compile')) throw new CompileError(msg);
         if (tag.includes('Link')) throw new LinkError(msg);
         if (tag.includes('Runtime')) throw new RuntimeError(msg);
-        /* RangeError/TypeError are real JS classes; only re-wrap when the native
-         * side asked for them but could not construct them itself. */
         if (tag === 'RangeError' && !(e instanceof RangeError)) throw new RangeError(msg);
         if (tag === 'TypeError' && !(e instanceof TypeError)) throw new TypeError(msg);
         throw e;
     }
 }
 
-/*
- * All custom sections with the given name, in module order.
- *
- * A name that is not present must yield an EMPTY array. Returning a
- * zero-length ArrayBuffer instead made `customSections(m, 'nope').length` equal
- * 1, so every presence test succeeded for every name.
- */
+// Absent section name must yield [], not one zero-length buffer.
 function customSectionsByName(module: CModuleWASM.Module, sectionName: string): ArrayBuffer[] {
     const section = wasm.moduleCustomSections(module, sectionName);
     return Array.isArray(section) ? section : section ? [section] : [];
 }
 
-/*
- * funcref bridging for Tables.
- *
- * The C layer represents a funcref table slot as a raw function index and
- * documents "JS side wraps it" (mod_wasm.c tjs_wasm_tableget), but nothing did,
- * so Table.get() returned a Number where the spec requires a callable. Worse,
- * tjs_wasm_tableset coerces with JS_ToUint32, so a plain JS function became
- * NaN -> 0 and silently aliased table slot 0 to function index 0 instead of
- * being rejected.
- *
- * A wrapper carries its index under this symbol so set() can recover it.
- */
+// Table.get returns a callable wrapper carrying its native index under this symbol.
 const FUNCREF_INDEX = Symbol('wasmFuncrefIndex');
 const FUNCREF_INSTANCE = Symbol('wasmFuncrefInstance');
 const funcrefCache = new WeakMap<CModuleWASM.Instance, Map<number, FuncrefWrapper>>();
@@ -533,14 +487,7 @@ function validateGlobalValue(type: string, value: CModuleWASM.WasmGlobalValue): 
     }
 }
 
-/*
- * Round an f32 global's value to f32 precision.
- *
- * A JS number is f64. Storing 0.1 in an f32 global and reading it back must
- * yield 0.10000000149011612, the nearest f32; returning 0.1 unchanged reports a
- * value the global cannot actually hold, and the discrepancy only surfaces once
- * wasm reads the same global and disagrees with JS.
- */
+// f32 globals must read back at f32 precision (Math.fround).
 function coerceGlobalValue(type: string, value: CModuleWASM.WasmGlobalValue): CModuleWASM.WasmGlobalValue {
     if (type === 'i32') {
         return toWasmNumber(value) | 0;
