@@ -7,31 +7,30 @@ const udp = import.meta.use('udp');
 const os = import.meta.use('os');
 const sock = import.meta.use('socket');
 const engine = import.meta.use('engine');
-const uverror = import.meta.use('error');
-const timers = import.meta.use('timers');
 
 import { EventEmitter } from '../events';
 import { Buffer } from '../buffer';
 import { toErrnoException, uvSystemError } from '../_internal/errno';
 import { flattenPrototype } from '../_internal/prototype';
-import { lookup as dnsLookup } from '../dns';
+import { tryCloseQuietly } from '../_internal/close';
+import {
+    errnoError,
+    makeError,
+    normalizeMessage,
+    notRunning,
+    sliceBuffer,
+    validateBufferList,
+    validateNumber,
+    validatePort,
+    validateSocketType,
+    validateString,
+    viewToBytes,
+} from '../util/dgram-validate';
 
 /*
- * Platform-specific IP/IPv6 socket option numbers.
- *
- * These are ABI values, not portable constants, and the `socket` C module only
- * exposes IPPROTO_IP / SOL_SOCKET / SO_*, so the IP-level numbers have to live
- * here. Windows (winsock2.h / ws2ipdef.h) and macOS/BSD (netinet/in.h) agree on
- * every option below; only Linux (linux/in.h) differs, so this is a two-way
- * split rather than three.
- *
- *              win/bsd   linux
- *   IP_TTL           4       2
- *   IP_MULTICAST_IF  9      32
- *   IP_MULTICAST_TTL 10     33
- *   IP_MULTICAST_LOOP 11    34
- *   IP_ADD_MEMBERSHIP 12    35
- *   IP_DROP_MEMBERSHIP 13   36
+ * IP-level socket option numbers. The native `socket` module only exposes
+ * IPPROTO_IP/SOL_SOCKET/SO_*, and these are ABI values: Windows/BSD and Linux
+ * differ (e.g. IP_TTL 4 vs 2), so the two tables cannot be shared.
  */
 const _isLinux = os.platform === 'linux';
 
@@ -113,46 +112,6 @@ export interface SocketOptions {
 
 // Socket class
 
-function validateSocketType(type: unknown): asserts type is 'udp4' | 'udp6' {
-    if (type !== 'udp4' && type !== 'udp6') {
-        throw Object.assign(
-            new TypeError('Bad socket type specified. Valid types are: udp4, udp6'),
-            { code: 'ERR_SOCKET_BAD_TYPE' },
-        );
-    }
-}
-
-function makeError(message: string, code: string): Error & { code: string } {
-    return Object.assign(new Error(message), { code });
-}
-
-/**
- * Node shapes libuv failures as `<syscall> <CODE>[ <address>[:<port>]]` with a
- * numeric `.errno` from the platform UV table, and bind/connect failures also
- * carry `address` / `port` own properties.
- */
-function errnoError(
-    code: string,
-    syscall: string,
-    detail?: { address: string; port?: number },
-): NodeJS.ErrnoException {
-    const table = uverror.errno as unknown as Record<string, number | undefined>;
-    const where = detail === undefined
-        ? ''
-        : ` ${detail.port ? `${detail.address}:${detail.port}` : detail.address}`;
-    const err: NodeJS.ErrnoException & { address?: string; port?: number } =
-        new Error(`${syscall} ${code}${where}`);
-    err.code = code;
-    const errno = Reflect.get(table, code);
-    if (typeof errno === 'number') err.errno = errno;
-    err.syscall = syscall;
-    if (detail) {
-        err.address = detail.address;
-        if (detail.port) err.port = detail.port;
-    }
-    return err;
-}
-
 /**
  * Decorate a native bind/connect failure for delivery through a callback or an
  * 'error' event: Node's shape carries `address`/`port`, unlike uvSystemError.
@@ -164,11 +123,6 @@ function bindConnectError(err: unknown, code: string, syscall: string, detail: {
     Reflect.set(shaped, 'address', detail.address);
     if (detail.port) Reflect.set(shaped, 'port', detail.port);
     return shaped;
-}
-
-/** `ERR_SOCKET_DGRAM_NOT_RUNNING` — the handle has been closed. */
-function notRunning(): Error & { code: string } {
-    return makeError('Not running', 'ERR_SOCKET_DGRAM_NOT_RUNNING');
 }
 
 function healthCheck(self: Socket): CModuleUDP.UDP {
@@ -192,13 +146,16 @@ function boundOptionSocket(self: Socket, syscall: string): CModuleSocket.PosixSo
     return s;
 }
 
-function setSockOpt(self: Socket, syscall: string, level: number, option: number, value: Uint8Array): void {
-    const s = boundOptionSocket(self, syscall);
+function applySockOpt(s: CModuleSocket.PosixSocket, syscall: string, level: number, option: number, value: Uint8Array): void {
     try {
         s.setopt(level, option, value);
     } catch (err) {
         throw normalizeSockOptError(err, syscall);
     }
+}
+
+function setSockOpt(self: Socket, syscall: string, level: number, option: number, value: Uint8Array): void {
+    applySockOpt(boundOptionSocket(self, syscall), syscall, level, option, value);
 }
 
 /**
@@ -271,150 +228,15 @@ function asError(error: unknown): Error {
     return error instanceof Error ? error : new Error(String(error));
 }
 
-function validateTTLNumber(ttl: unknown, name: string): number {
-    if (typeof ttl !== 'number') {
-        throw Object.assign(
-            new TypeError(`The "${name}" argument must be of type number. Received ${determineSpecificType(ttl)}`),
-            { code: 'ERR_INVALID_ARG_TYPE' },
-        );
-    }
-    return ttl;
-}
-
 /**
  * `uv_udp_set_ttl` range-checks 1..255 before touching the socket, so an
  * out-of-range value reports EINVAL even on an unbound socket. Multicast TTL
  * has no such check on Windows — Node happily returns 0/-1 there.
  */
 function validateTTL(ttl: unknown): number {
-    const value = validateTTLNumber(ttl, 'ttl');
-    if (value < 1 || value > 255) {
-        throw errnoError('EINVAL', 'setTTL');
-    }
-    return value;
-}
-
-/**
- * Mirrors Node's internal `determineSpecificType()`, used verbatim in its
- * argument-validation messages: primitives are rendered as
- * `type <typeof> (<inspected>)`, while null/undefined render bare.
- */
-function determineSpecificType(value: unknown): string {
-    if (value === null) return 'null';
-    if (value === undefined) return 'undefined';
-    if (typeof value === 'string') return `type string ('${value}')`;
-    if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') {
-        return `type ${typeof value} (${String(value)})`;
-    }
-    if (typeof value === 'symbol') return `type symbol (${String(value)})`;
-    if (typeof value === 'function') return `function ${value.name}`;
-    const ctor = (value as object).constructor;
-    if (typeof ctor === 'function' && ctor.name) return `an instance of ${ctor.name}`;
-    return `type ${typeof value}`;
-}
-
-function validateSendPort(port: unknown): number {
-    const value = typeof port === 'string' && port.trim() !== '' ? Number(port) : port;
-    if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0 || value >= 65536) {
-        throw Object.assign(
-            new RangeError(`Port should be > 0 and < 65536. Received ${determineSpecificType(port)}.`),
-            { code: 'ERR_SOCKET_BAD_PORT' },
-        );
-    }
-    return value;
-}
-
-function validateAddress(address: unknown, name = 'address'): asserts address is string {
-    if (typeof address !== 'string') {
-        throw Object.assign(
-            new TypeError(`The "${name}" argument must be of type string. Received ${determineSpecificType(address)}`),
-            { code: 'ERR_INVALID_ARG_TYPE' },
-        );
-    }
-}
-
-function isView(value: unknown): value is ArrayBufferView {
-    return ArrayBuffer.isView(value);
-}
-
-function viewToBytes(view: ArrayBufferView): Uint8Array {
-    return view instanceof Uint8Array
-        ? view
-        : new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
-}
-
-function badBufferArg(value: unknown, name = 'buffer'): TypeError & { code: string } {
-    return Object.assign(
-        new TypeError(
-            `The "${name}" argument must be of type string or an instance of Buffer, `
-            + `TypedArray, or DataView. Received ${determineSpecificType(value)}`,
-        ),
-        { code: 'ERR_INVALID_ARG_TYPE' },
-    );
-}
-
-function outOfBounds(name: 'offset' | 'length'): RangeError & { code: string } {
-    return Object.assign(
-        new RangeError(`"${name}" is outside of buffer bounds`),
-        { code: 'ERR_BUFFER_OUT_OF_BOUNDS' },
-    );
-}
-
-/**
- * Node's internal `sliceBuffer` bounds check, applied to already-encoded bytes.
- *
- * Node coerces both values with `>>> 0` *before* comparing, so a negative
- * offset becomes huge and trips the `offset` check, while a negative length
- * trips the `length` check via `offset + length > byteLength`. Reproducing that
- * coercion is what makes -1 report 'offset' and -5 report 'length' rather than
- * the other way round. Verified against node v24.18.0 for
- * offset=-1/20, length=99/-5 and offset=5+length=6.
- */
-function checkSendBounds(bytes: Uint8Array, offset: unknown, length: unknown): Uint8Array {
-    const off = (offset as number) >>> 0;
-    const len = (length as number) >>> 0;
-    if (off > bytes.byteLength) throw outOfBounds('offset');
-    if (off + len > bytes.byteLength) throw outOfBounds('length');
-    return bytes.subarray(off, off + len);
-}
-
-/**
- * Node's internal `sliceBuffer`: coerce the message to bytes, then bounds-check
- * `offset` and `length` against it. Non-numeric/NaN values coerce to 0, so only
- * genuinely out-of-range integers throw — `>>> 0` would turn -1 into 4294967295
- * and report the wrong one of the two errors.
- */
-function sliceSendBuffer(msg: string | ArrayBufferView, offset: unknown, length: unknown): Uint8Array {
-    const bytes = typeof msg === 'string' ? engine.encodeString(msg) : viewToBytes(msg);
-    const off = Number(offset) || 0;
-    const len = Number(length) || 0;
-    if (off > bytes.byteLength || off < 0) throw outOfBounds('offset');
-    if (len > bytes.byteLength - off || len < 0) throw outOfBounds('length');
-    return bytes.subarray(off, off + len);
-}
-
-function validateSendMessage(msg: unknown): void {
-    if (typeof msg === 'string' || isView(msg)) return;
-    if (Array.isArray(msg)) {
-        // Node reports the *list* under the name "buffer list arguments", not the
-        // offending element under "buffer" (internal fixBufferList returns false
-        // and the caller throws with the whole array as the received value).
-        for (const item of msg) {
-            if (typeof item !== 'string' && !isView(item)) throw badBufferArg(msg, 'buffer list arguments');
-        }
-        return;
-    }
-    throw badBufferArg(msg);
-}
-
-function validateMulticastAddress(address: unknown, name: string): asserts address is string {
-    if (address === undefined) {
-        throw Object.assign(
-            new TypeError(`The "${name}" argument must be specified`),
-            { code: 'ERR_MISSING_ARGS' },
-        );
-    }
-    validateAddress(address);
+    validateNumber(ttl, 'ttl');
+    if (ttl < 1 || ttl > 255) throw errnoError('EINVAL', 'setTTL');
+    return ttl;
 }
 
 /** Pack an IPv4 dotted quad into `offset..offset+4` of `target`. */
@@ -572,7 +394,7 @@ Socket.prototype._doBind = async function _doBind(this: Socket, portOrOptions?: 
         cb = addressOrCallback as (() => void) | undefined;
         if (portOrOptions.signal) {
             portOrOptions.signal.addEventListener('abort', () => {
-                try { this.close(); } catch { /* already closed */ }
+                tryCloseQuietly(this);
             });
         }
     } else {
@@ -652,16 +474,10 @@ Socket.prototype._startRecv = async function _startRecv(this: Socket): Promise<v
     }
 };
 
-Socket.prototype.send = function send(this: Socket, msg: string | Uint8Array | Array<string | Uint8Array>, ...args: unknown[]): void {
-    healthCheck(this);
-    this._doSend(normalizeSendArgs(this, msg, args));
-};
+const DEFAULT_ADDRESS = '127.0.0.1';
+const DEFAULT_ADDRESS6 = '::1';
 
 type SendCallback = (error: Error | null, bytes?: number) => void;
-
-function isSendCallback(value: unknown): value is SendCallback {
-    return typeof value === 'function';
-}
 
 interface SendRequest {
     data: Uint8Array;
@@ -671,95 +487,131 @@ interface SendRequest {
     callback?: SendCallback;
 }
 
+function encodeMessage(msg: unknown): Uint8Array {
+    return joinChunks(normalizeMessage(msg));
+}
+
+/** Copies each chunk: the result must not alias the caller's memory. */
+function joinChunks(list: readonly Uint8Array[]): Uint8Array {
+    let total = 0;
+    for (const chunk of list) total += chunk.byteLength;
+    const data = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of list) {
+        data.set(chunk, offset);
+        offset += chunk.byteLength;
+    }
+    return data;
+}
+
+/** A send() argument list, named by the layout Node's positional dispatch selects. */
+type SendLayout = 'slice' | 'destination' | 'connectedSlice' | 'connected';
+
+interface SendLayoutSpec {
+    /** Position of the port, or of `length` in the offset/length forms. */
+    portIndex: number;
+    /** Whether `send()` passes the message through `sliceBuffer` first. */
+    sliced: boolean;
+}
+
+const isNumber = (value: unknown) => typeof value === 'number';
+
+/**
+ * Node picks the layout from the types of the first three arguments after the
+ * message, and from whether the socket is connected:
+ *
+ *   slice          offset, length and port are numbers   (msg, offset, length, port, ...)
+ *   connectedSlice two numbers and no port             (msg, offset, length, ...)
+ *   destination    everything else                     (msg, port, ...)
+ *   connected      connected socket, everything else   (msg, ...)
+ */
+const SEND_LAYOUTS: Record<SendLayout, SendLayoutSpec & { matches: (args: readonly unknown[]) => boolean }> = {
+    slice: {
+        portIndex: 2,
+        sliced: true,
+        matches: ([first, second, third]) => isNumber(first) && isNumber(second) && isNumber(third),
+    },
+    destination: { portIndex: 0, sliced: false, matches: () => true },
+    connectedSlice: {
+        portIndex: 2,
+        sliced: true,
+        matches: ([first, second, third]) => isNumber(first) && isNumber(second) && !isNumber(third),
+    },
+    connected: { portIndex: 0, sliced: false, matches: () => true },
+};
+
+function sendLayout(args: readonly unknown[], connected: boolean): SendLayoutSpec {
+    const candidates: SendLayout[] = connected ? ['connectedSlice', 'connected'] : ['slice', 'destination'];
+    return SEND_LAYOUTS[candidates.find((name) => SEND_LAYOUTS[name].matches(args))!];
+}
+
+function readAddressAndCallback(args: readonly unknown[], after: number): {
+    address?: string;
+    callback?: SendCallback;
+} {
+    const next = args[after];
+    if (typeof next === 'string') {
+        const fn = args[after + 1];
+        return { address: next, callback: typeof fn === 'function' ? fn : undefined };
+    }
+    if (typeof next === 'function') return { callback: next };
+    if (next !== undefined) validateString(next, 'address');
+    return {};
+}
+
+/** Node's `sliceBuffer`, over the message as a string or a view. */
+function sliceSendMessage(msg: string | ArrayBufferView, offset: unknown, length: unknown): Uint8Array {
+    const bytes = typeof msg === 'string' ? engine.encodeString(msg) : viewToBytes(msg);
+    return sliceBuffer(bytes, offset, length);
+}
+
+/** Resolves the address and callback of a send that names a destination. */
+function readDestination(next: unknown, tail: unknown): { address: string; callback?: SendCallback } {
+    const target = (typeof next === 'string' ? next : undefined) || DEFAULT_ADDRESS;
+    const callback = typeof next === 'function' ? next : typeof tail === 'function' ? tail : undefined;
+
+    validateString(target, 'address');
+    return { address: target, callback };
+}
+
+/**
+ * Node's `send()` dispatch. The layout decides which arguments were meant as
+ * offset/length and which as port/address/callback; every layout is then read
+ * with the same connected check, port validation and destination tail.
+ */
 function normalizeSendArgs(
     socket: Socket,
     msg: string | Uint8Array | Array<string | Uint8Array>,
     args: unknown[],
 ): SendRequest {
-    validateSendMessage(msg);
-
-    // A connected socket rejects any attempt to re-specify the destination.
-    // The offset/length form stays legal, so only treat a trailing numeric
-    // argument (or a non-numeric second argument) as a supplied port.
-    if (socket._connected || socket._connecting) {
-        const suppliesDestination = typeof args[0] === 'number'
-            ? (typeof args[1] === 'number' ? typeof args[2] === 'number' : true)
-            : args[0] !== undefined && typeof args[0] !== 'function';
-        if (suppliesDestination) {
-            throw makeError('Already connected', 'ERR_SOCKET_DGRAM_IS_CONNECTED');
-        }
-    }
-
-    let address = socket._remoteAddress?.address
-        ?? (socket._type === 'udp6' ? '::1' : '127.0.0.1');
-    let callback: SendCallback | undefined;
-    let data: Uint8Array;
-    let port: number;
-
-    if (typeof msg === 'string') {
-        data = engine.encodeString(msg);
-    } else if (Array.isArray(msg)) {
-        const buffers = msg.map((item) => typeof item === 'string' ? engine.encodeString(item) : viewToBytes(item));
-        data = Buffer.concat(buffers);
-    } else {
-        data = viewToBytes(msg);
-    }
-
-    if (
-        typeof args[0] === 'number' &&
-        typeof args[1] === 'number' &&
-        typeof args[2] === 'number'
-    ) {
-        const offset = args[0];
-        const length = args[1];
-        port = args[2];
-        if (typeof args[3] === 'string') {
-            address = args[3];
-            if (isSendCallback(args[4])) callback = args[4];
-        } else if (isSendCallback(args[3])) {
-            callback = args[3];
-        } else if (args[3] !== undefined) {
-            validateAddress(args[3]);
-        } else {
-            callback = undefined;
-        }
-        data = checkSendBounds(data, offset, length);
-        port = validateSendPort(port);
-        validateAddress(address);
-        return { data, port, address, callback };
-    }
-
     const connected = socket._connected || socket._connecting;
+    const { portIndex, sliced } = sendLayout(args, connected);
+    const next = args[portIndex + 1];
+    const tail = args[portIndex + 2];
 
-    if (
-        connected &&
-        typeof args[0] === 'number' &&
-        typeof args[1] === 'number' &&
-        typeof args[2] !== 'number'
-    ) {
-        data = checkSendBounds(data, args[0], args[1]);
-        return { data, connected: true, callback: isSendCallback(args[2]) ? args[2] : undefined };
+    if (connected) {
+        // The destination check precedes every other check, buffer included.
+        const destination = portIndex === 0
+            ? next !== undefined && typeof next !== 'function'
+            : tail !== undefined;
+        if (destination) throw makeError('Already connected', 'ERR_SOCKET_DGRAM_IS_CONNECTED');
+        if (sliced) msg = sliceSendMessage(msg, args[0], args[1]) as typeof msg;
+        // The callback sits at `portIndex` itself for the connected layout
+        // (`send(msg, cb)`) and after the destination otherwise.
+        const cb = portIndex === 0 ? args[0] : args[portIndex + 1];
+        return { data: encodeMessage(msg), connected: true, callback: typeof cb === 'function' ? cb : undefined };
     }
 
-    if (connected && (args[0] === undefined || typeof args[0] === 'function')) {
-        return { data, connected: true, callback: isSendCallback(args[0]) ? args[0] : undefined };
-    }
-
-    port = validateSendPort(args[0]);
-    if (typeof args[1] === 'string') {
-        address = args[1];
-        if (isSendCallback(args[2])) callback = args[2];
-    } else if (isSendCallback(args[1])) {
-        callback = args[1];
-    } else if (args[1] !== undefined) {
-        validateAddress(args[1]);
-    } else {
-        callback = undefined;
-    }
-
-    validateAddress(address);
-    return { data, port, address, callback };
+    if (sliced) msg = sliceSendMessage(msg, args[0], args[1]) as typeof msg;
+    else validateBufferList(msg);
+    const data = encodeMessage(msg);
+    const port = validatePort(args[portIndex], 'Port', false);
+    return { data, port, ...readDestination(next, tail) };
 }
+
+Socket.prototype.send = function send(this: Socket, msg: string | Uint8Array | Array<string | Uint8Array>, ...args: unknown[]): void {
+    this._doSend(normalizeSendArgs(this, msg, args));
+};
 
 Socket.prototype._doSend = async function _doSend(this: Socket, request: SendRequest): Promise<void> {
     const { data, port, address, callback, connected } = request;
@@ -795,8 +647,8 @@ Socket.prototype.connect = function connect(this: Socket, port: number, address?
     if (this._connected || this._connecting) {
         throw makeError('Already connected', 'ERR_SOCKET_DGRAM_IS_CONNECTED');
     }
-    const validatedPort = validateSendPort(port);
-    if (address !== undefined && typeof address !== 'function') validateAddress(address);
+    const validatedPort = validatePort(port, 'Port', false);
+    if (address !== undefined && typeof address !== 'function') validateString(address, 'address');
     this._connecting = true;
     this._doConnect(validatedPort, typeof address === 'function' ? undefined : address, typeof address === 'function' ? address : callback);
 };
@@ -809,7 +661,7 @@ Socket.prototype._doConnect = async function _doConnect(this: Socket, port: numb
         const handle = this._handle;
         if (!handle) throw notRunning();
 
-        const addr = address ?? (this._type === 'udp6' ? '::1' : '127.0.0.1');
+        const addr = address ?? (this._type === 'udp6' ? DEFAULT_ADDRESS6 : DEFAULT_ADDRESS);
 
         try {
             handle.connect({ ip: addr, port });
@@ -886,34 +738,33 @@ Socket.prototype.setMulticastTTL = function setMulticastTTL(this: Socket, ttl: n
     // libuv's Windows SOCKOPT_SETTER validates BEFORE the INVALID_SOCKET check,
     // and VALIDATE_MULTICAST_TTL accepts -1..255 (wider than unicast TTL's
     // 1..255), so an out-of-range value yields EINVAL even when unbound.
-    const value = validateTTLNumber(ttl, 'ttl');
-    if (value < -1 || value > 255) throw errnoError('EINVAL', 'setMulticastTTL');
+    validateNumber(ttl, 'ttl');
+    if (ttl < -1 || ttl > 255) throw errnoError('EINVAL', 'setMulticastTTL');
     const [level, option] = ipOpt(this, IP_MULTICAST_TTL, IPV6_MULTICAST_HOPS);
-    setSockOpt(this, 'setMulticastTTL', level, option, uint32le(value));
-    return value;
+    setSockOpt(this, 'setMulticastTTL', level, option, uint32le(ttl));
+    return ttl;
 };
 
 Socket.prototype.setMulticastInterface = function setMulticastInterface(this: Socket, multicastInterface?: string): void {
-    const [level, option] = ipOpt(this, IP_MULTICAST_IF, IPV6_MULTICAST_IF);
+    healthCheck(this);
     // IPv4 takes an in_addr; IPv6 takes an unsigned interface index. Node
     // accepts a scoped literal like "::%2" for udp6 -- take the scope id.
-    let buf: Uint8Array;
     if (this._type === 'udp6') {
         let index = 0;
         if (multicastInterface !== undefined) {
-            validateAddress(multicastInterface);
+            validateString(multicastInterface, 'interfaceAddress');
             const scope = multicastInterface.lastIndexOf('%');
             if (scope !== -1) index = parseInt(multicastInterface.slice(scope + 1), 10) || 0;
         }
-        buf = uint32le(index);
+        setSockOpt(this, 'setMulticastInterface', IPPROTO_IPV6, IPV6_MULTICAST_IF, uint32le(index));
     } else {
-        buf = new Uint8Array(4);
+        const addr = new Uint8Array(4);
         if (multicastInterface !== undefined) {
-            validateAddress(multicastInterface);
-            packIPv4(buf, 0, multicastInterface);
+            validateString(multicastInterface, 'interfaceAddress');
+            packIPv4(addr, 0, multicastInterface);
         }
+        setSockOpt(this, 'setMulticastInterface', sock.defines.IPPROTO_IP, IP_MULTICAST_IF, addr);
     }
-    setSockOpt(this, 'setMulticastInterface', level, option, buf);
 };
 
 Socket.prototype.setMulticastLoopback = function setMulticastLoopback(this: Socket, flag: boolean): boolean {
@@ -922,56 +773,54 @@ Socket.prototype.setMulticastLoopback = function setMulticastLoopback(this: Sock
     return flag;
 };
 
-Socket.prototype.addMembership = function addMembership(this: Socket, multicastAddress: string, multicastInterface?: string): void {
-    validateMulticastAddress(multicastAddress, 'multicastAddress');
-    const handle = healthCheck(this);
+function membershipRequest(self: Socket, multicastAddress: unknown, multicastInterface: unknown): Uint8Array {
+    healthCheck(self);
+    if (!multicastAddress) {
+        throw Object.assign(
+            new TypeError('The "multicastAddress" argument must be specified'),
+            { code: 'ERR_MISSING_ARGS' },
+        );
+    }
+    validateString(multicastAddress, 'multicastAddress');
     const mreq = new Uint8Array(8);
     packIPv4(mreq, 0, multicastAddress);
     if (multicastInterface !== undefined) {
-        validateAddress(multicastInterface);
+        validateString(multicastInterface, 'interfaceAddress');
         packIPv4(mreq, 4, multicastInterface);
     }
+    return mreq;
+}
+
+function modifyMembership(self: Socket, syscall: string, v4: number, v6: number, mreq: Uint8Array): void {
     // uv__udp_set_membership4 deferred-binds before the setsockopt.
-    maybeBind(this);
+    maybeBind(self);
+    const handle = healthCheck(self);
     const s = _getSocket(handle);
-    if (!s) throw errnoError('EBADF', 'addMembership');
-    const [level, option] = ipOpt(this, IP_ADD_MEMBERSHIP, IPV6_ADD_MEMBERSHIP);
-    try {
-        s.setopt(level, option, mreq);
-    } catch (err) {
-        throw normalizeSockOptError(err, 'addMembership');
-    }
+    if (!s) throw errnoError('EBADF', syscall);
+    const [level, option] = ipOpt(self, v4, v6);
+    applySockOpt(s, syscall, level, option, mreq);
+}
+
+Socket.prototype.addMembership = function addMembership(this: Socket, multicastAddress: string, multicastInterface?: string): void {
+    modifyMembership(this, 'addMembership', IP_ADD_MEMBERSHIP, IPV6_ADD_MEMBERSHIP, membershipRequest(this, multicastAddress, multicastInterface));
 };
 
 Socket.prototype.dropMembership = function dropMembership(this: Socket, multicastAddress: string, multicastInterface?: string): void {
-    validateMulticastAddress(multicastAddress, 'multicastAddress');
-    const handle = healthCheck(this);
-    const mreq = new Uint8Array(8);
-    packIPv4(mreq, 0, multicastAddress);
-    if (multicastInterface !== undefined) {
-        validateAddress(multicastInterface);
-        packIPv4(mreq, 4, multicastInterface);
-    }
-    maybeBind(this);
-    const s = _getSocket(handle);
-    if (!s) throw errnoError('EBADF', 'dropMembership');
-    const [level, option] = ipOpt(this, IP_DROP_MEMBERSHIP, IPV6_DROP_MEMBERSHIP);
-    try {
-        s.setopt(level, option, mreq);
-    } catch (err) {
-        throw normalizeSockOptError(err, 'dropMembership');
-    }
+    modifyMembership(this, 'dropMembership', IP_DROP_MEMBERSHIP, IPV6_DROP_MEMBERSHIP, membershipRequest(this, multicastAddress, multicastInterface));
 };
+
+function unsupportedMembership(this: Socket, name: string): void {
+    const emitWarning = Reflect.get(process, 'emitWarning');
+    if (typeof emitWarning === 'function') Reflect.apply(emitWarning, process, [`dgram.${name}() is not fully supported in this runtime`, 'UnsupportedWarning']);
+}
 
 Socket.prototype.addSourceSpecificMembership = function addSourceSpecificMembership(this: Socket, _sourceAddress: string, _groupAddress: string, _multicastInterface?: string): void {
     // MCAST_JOIN_SOURCE_GROUP - C layer doesn't expose this constant
-    const emitWarning = Reflect.get(process, 'emitWarning');
-    if (typeof emitWarning === 'function') Reflect.apply(emitWarning, process, ['dgram.addSourceSpecificMembership() is not fully supported in this runtime', 'UnsupportedWarning']);
+    unsupportedMembership(this, 'addSourceSpecificMembership');
 };
 
 Socket.prototype.dropSourceSpecificMembership = function dropSourceSpecificMembership(this: Socket, _sourceAddress: string, _groupAddress: string, _multicastInterface?: string): void {
-    const emitWarning = Reflect.get(process, 'emitWarning');
-    if (typeof emitWarning === 'function') Reflect.apply(emitWarning, process, ['dgram.dropSourceSpecificMembership() is not fully supported in this runtime', 'UnsupportedWarning']);
+    unsupportedMembership(this, 'dropSourceSpecificMembership');
 };
 
 /**
@@ -993,44 +842,45 @@ function bufferSizeError(code: string, syscall: string): NodeJS.ErrnoException {
     return uvSystemError(code, syscall, 'ERR_SOCKET_BUFFER_SIZE', 'Could not get or set buffer size');
 }
 
-Socket.prototype.getRecvBufferSize = function getRecvBufferSize(this: Socket): number {
-    const s = bufferSizeSocket(this, 'uv_recv_buffer_size');
+const BUFFER_SIZE_OPTIONS = {
+    recv: { syscall: 'uv_recv_buffer_size', option: sock.defines.SO_RCVBUF, field: '_recvBufferSize' },
+    send: { syscall: 'uv_send_buffer_size', option: sock.defines.SO_SNDBUF, field: '_sendBufferSize' },
+} as const;
+
+function readBufferSize(self: Socket, { syscall, option }: typeof BUFFER_SIZE_OPTIONS[keyof typeof BUFFER_SIZE_OPTIONS]): number {
+    const s = bufferSizeSocket(self, syscall);
     try {
-        const val = s.getopt(sock.defines.SOL_SOCKET, sock.defines.SO_RCVBUF, 4);
+        const val = s.getopt(sock.defines.SOL_SOCKET, option, 4);
         return new DataView(val.buffer, val.byteOffset, val.byteLength).getUint32(0, true);
     } catch (err) {
-        throw bufferSizeError(sockErrCode(err, 'uv_recv_buffer_size'), 'uv_recv_buffer_size');
+        throw bufferSizeError(sockErrCode(err, syscall), syscall);
     }
+}
+
+function writeBufferSize(self: Socket, { syscall, option, field }: typeof BUFFER_SIZE_OPTIONS[keyof typeof BUFFER_SIZE_OPTIONS], size: number): void {
+    const s = bufferSizeSocket(self, syscall);
+    try {
+        s.setopt(sock.defines.SOL_SOCKET, option, uint32le(size));
+    } catch (err) {
+        throw bufferSizeError(sockErrCode(err, syscall), syscall);
+    }
+    self[field] = size;
+}
+
+Socket.prototype.getRecvBufferSize = function getRecvBufferSize(this: Socket): number {
+    return readBufferSize(this, BUFFER_SIZE_OPTIONS.recv);
 };
 
 Socket.prototype.setRecvBufferSize = function setRecvBufferSize(this: Socket, size: number): void {
-    const s = bufferSizeSocket(this, 'uv_recv_buffer_size');
-    try {
-        s.setopt(sock.defines.SOL_SOCKET, sock.defines.SO_RCVBUF, uint32le(size));
-    } catch (err) {
-        throw bufferSizeError(sockErrCode(err, 'uv_recv_buffer_size'), 'uv_recv_buffer_size');
-    }
-    this._recvBufferSize = size;
+    writeBufferSize(this, BUFFER_SIZE_OPTIONS.recv, size);
 };
 
 Socket.prototype.getSendBufferSize = function getSendBufferSize(this: Socket): number {
-    const s = bufferSizeSocket(this, 'uv_send_buffer_size');
-    try {
-        const val = s.getopt(sock.defines.SOL_SOCKET, sock.defines.SO_SNDBUF, 4);
-        return new DataView(val.buffer, val.byteOffset, val.byteLength).getUint32(0, true);
-    } catch (err) {
-        throw bufferSizeError(sockErrCode(err, 'uv_send_buffer_size'), 'uv_send_buffer_size');
-    }
+    return readBufferSize(this, BUFFER_SIZE_OPTIONS.send);
 };
 
 Socket.prototype.setSendBufferSize = function setSendBufferSize(this: Socket, size: number): void {
-    const s = bufferSizeSocket(this, 'uv_send_buffer_size');
-    try {
-        s.setopt(sock.defines.SOL_SOCKET, sock.defines.SO_SNDBUF, uint32le(size));
-    } catch (err) {
-        throw bufferSizeError(sockErrCode(err, 'uv_send_buffer_size'), 'uv_send_buffer_size');
-    }
-    this._sendBufferSize = size;
+    writeBufferSize(this, BUFFER_SIZE_OPTIONS.send, size);
 };
 
 Socket.prototype.ref = function ref(this: Socket): Socket {
@@ -1117,7 +967,7 @@ export function createSocket(typeOrOptions: 'udp4' | 'udp6' | SocketOptions, cal
 
     if (signal) {
         signal.addEventListener('abort', () => {
-            try { socket.close(); } catch { /* already closed */ }
+            tryCloseQuietly(socket);
         });
     }
 
