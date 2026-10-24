@@ -11,7 +11,7 @@ const signals = import.meta.use('signals');
 const engine = import.meta.use('engine');
 
 import { Readable, Writable } from '../stream';
-import { addReadableLength, subtractReadableLength } from '../stream/_shared';
+import { addReadableLength, decoderBytes, flowReadable, scheduleReadableFlow, subtractReadableLength } from '../stream/_shared';
 import { viewToUint8Array } from '../_internal/buffer';
 import { normalizeErrnoError } from '../_internal/errno';
 import { Buffer } from '../buffer';
@@ -45,8 +45,17 @@ export function deliverPipeChunk(readable: Readable, pipe: CModuleStreams.Pipe, 
         if (!readable.push(data)) stopPipeReadQuietly(pipe);
         return;
     }
+    // push() would decode through state.decoder and then run flowReadable()
+    // via _read(); writing the buffer directly must do both itself.
+    const bytes = decoderBytes(data);
+    if (state.decoder && bytes) {
+        const decoded = state.decoder.write(bytes);
+        if (decoded.length === 0) return;
+        data = decoded as unknown as Uint8Array;
+    }
     state.buffer.push(data);
     addReadableLength(readable, data);
+    scheduleReadableFlow(readable, () => flowReadable(readable));
     if (readable.readableLength >= state.highWaterMark) {
         stopPipeReadQuietly(pipe);
     } else {
