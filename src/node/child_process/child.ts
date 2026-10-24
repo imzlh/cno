@@ -2,6 +2,7 @@ const nativeError = import.meta.use('error');
 
 import { IPCChannel, type IPCSerialization } from '../ipc_channel';
 import { EventEmitter } from '../events';
+import { closeQuietly, tryCloseQuietly } from '../_internal/close';
 import { Writable, Readable, Duplex } from '../stream';
 import {
     asError,
@@ -214,11 +215,11 @@ ChildProcessImpl.prototype._createWritable = function _createWritable(this: Chil
             pipe.write(stdioChunkBytes(chunk)).then(() => callback()).catch(callback);
         },
         async final(callback: (error?: Error | null) => void) {
-            try { await pipe.shutdown(); } catch { try { pipe.close(); } catch {} } finally { callback(); }
+            try { await pipe.shutdown(); } catch { closeQuietly(pipe); } finally { callback(); }
         },
         // destroy() skips final(), so it must close the native pipe itself.
         destroy(error: Error | null, callback: (error?: Error | null) => void) {
-            try { pipe.close(); } catch { /* already closed by the exiting child */ }
+            closeQuietly(pipe);
             callback(error);
         },
     });
@@ -270,7 +271,7 @@ ChildProcessImpl.prototype._createDuplex = function _createDuplex(this: ChildPro
         },
         destroy(error: Error | null, callback: (error?: Error | null) => void) {
             clearHeldPipeBytes(duplex);
-            try { pipe.close(); } catch { /* already closed by the exiting child */ }
+            closeQuietly(pipe);
             callback(error);
         },
     });

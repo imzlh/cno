@@ -171,18 +171,10 @@ export function resolveAgainstCwd(command: string, cwd?: string): string {
 }
 
 // The native layer resolves a relative command against the PARENT's cwd, not the
-// requested one: mod_process.c calls CreateProcessW(NULL, wcmd, …) so Windows
-// parses the program out of the command line and resolves it against the parent's
-// current directory, while lpCurrentDirectory only sets where the *child* starts
-// (the PTY path has the same bug via SearchPathW at mod_process.c:1197). libuv,
-// which Node uses, resolves against the child's cwd instead — measured divergence:
-// `spawnSync('./where.exe', ['/?'], { cwd: dir })` is status 0 on Node and
-// "CreateProcess failed: 2" on the raw native call.
-//
-// Fixing that is a C change needing a rebuild, so pre-resolve here instead: an
-// absolute path makes the native call cwd-independent, and it was verified to run
-// correctly with cwd set. Bare names are left alone — they must keep going through
-// the native PATH lookup.
+// requested one (mod_process.c calls CreateProcessW(NULL, wcmd, …); libuv resolves
+// against the child's cwd). Pre-resolve to an absolute path, which makes the
+// native call cwd-independent. Bare names are left alone — they must keep going
+// through the native PATH lookup.
 export function resolveCommandForCwd(command: string, cwd?: string): string {
     if (!cwd || !isPathLikeCommand(command) || isAbsoluteCommandPath(command)) return command;
     return resolveCommandFile(command, cwd) ?? command;
@@ -190,12 +182,6 @@ export function resolveCommandForCwd(command: string, cwd?: string): string {
 
 // Returns the path the pre-flight actually found, or null. Callers that only
 // need existence use commandFileExists.
-//
-// The PATHEXT probe deliberately skips .bat/.cmd: CreateProcess cannot launch a
-// batch file, so an extensionless spec that only matches `build.bat` is ENOENT
-// to Node (measured), and treating it as resolved would both diverge from Node
-// and let a batch file reach the native spawn. Direct .bat/.cmd specs are caught
-// earlier by isBatchFileCommand.
 export function resolveCommandFile(command: string, cwd?: string): string | null {
     const target = resolveAgainstCwd(command, cwd);
     if (isRunnableFile(target)) return target;
@@ -215,36 +201,15 @@ export function commandFileExists(command: string, cwd?: string): boolean {
     return resolveCommandFile(command, cwd) !== null;
 }
 
-// CVE-2024-27980. cmd.exe re-parses a batch file's argument string, so a `&` in
-// any argument runs as a separate command: spawning `hello.bat` with
-// `a" & echo INJECTED & rem "b` executed `echo INJECTED` (measured — the output
-// landed outside the script's own `args=[%*]` brackets, and the native spawnSync
-// still reproduces it when called directly, so this guard is load-bearing).
-// libuv's quote_cmd_arg() cannot prevent it, because cmd.exe undoes that quoting.
-//
-// Node refuses the spawn instead (EINVAL) unless `shell` is set, and so do we.
-// The guard lives here rather than in the native layer because buildShellInvocation
-// rewrites command/args to `cmd.exe /d /s /c …` for `shell: true`, so by the time
-// tjs_spawn runs, options.file is cmd.exe and the "user asked for a shell" vs
-// "user spawned a .bat directly" distinction — the whole basis of the fix — is
-// gone. Node makes the same choice (normalizeSpawnArguments, not C++).
-//
-// Measured on Node v24.18/Windows: the test is the RAW spec's suffix and it runs
-// BEFORE any existence check — a nonexistent `D:/nope/missing.bat` is EINVAL, not
-// ENOENT, and windowsVerbatimArguments does not exempt it. Extensionless specs
-// that would only match a `.bat` are ENOENT instead; resolveCommandFile keeps
-// them unresolved so they can never reach the native spawn either.
-//
-// exec/execSync are exempt because they pass `shell: options?.shell ?? true`,
-// which is exactly how Node exempts them too.
+// CVE-2024-27980. cmd.exe re-parses batch args, so a `&` runs as a separate
+// command; Node throws EINVAL for a .bat/.cmd spec unless `shell` is set.
+// Extensionless specs that only match a .bat stay ENOENT (resolveCommandFile
+// keeps them unresolved).
 export function isBatchFileCommand(command: string): boolean {
     if (!isWindowsHost()) return false;
     return /\.(?:bat|cmd)$/i.test(command);
 }
 
-// Node's shape, measured on v24.18/Windows. The sync form carries the command in
-// the message/syscall plus path/spawnargs; the async form throws a bare
-// `spawn EINVAL` with only errno/code/syscall.
 export function makeBatchFileError(command: string, args: string[], syscall: string | null): NodeJS.ErrnoException {
     if (syscall === null) {
         return Object.assign(new Error('spawn EINVAL'), {

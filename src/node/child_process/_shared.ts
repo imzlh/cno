@@ -41,6 +41,8 @@ export function startPipeReadQuietly(pipe: CModuleStreams.Pipe): void {
  */
 export function deliverPipeChunk(readable: Readable, pipe: CModuleStreams.Pipe, data: Uint8Array): void {
     const state = readable._readableState;
+    // Native pipe reads are Uint8Array views; Node's streams hand out Buffers.
+    if (!(data instanceof Buffer)) data = Buffer.from(data.buffer, data.byteOffset, data.byteLength);
     if (!state.reading && !state.destroyed) {
         if (!readable.push(data)) stopPipeReadQuietly(pipe);
         return;

@@ -113,19 +113,12 @@ export function spawnSync(command: string, argsOrOptions?: string[] | SpawnOptio
         let signal = result.signal;
         let error = result.error ? normalizeSpawnFailure(result.error, command, 'spawnSync', optsSource.cwd, args) : undefined;
 
-        // maxBuffer: the child cannot be killed mid-stream (spawnSync runs to
-        // completion in the C layer), but every observable field can still be
-        // made Node-exact because the full output is already in hand.
-        //
-        // Node's measured rule (v24.18/Windows) is NOT "truncate to maxBuffer":
-        // it reads 64KiB chunks and keeps everything read, including the chunk
-        // that crossed the limit, so
+        // maxBuffer: spawnSync cannot be killed mid-stream (the C layer runs it
+        // to completion), but the fields can still match Node because the output
+        // is already captured. Node is not "truncate to maxBuffer": it reads
+        // 64KiB chunks and keeps the chunk that crossed the limit, so
         //     captured = min(totalLen, (floor(maxBuffer/65536)+1)*65536)
-        // Verified on mb=1000->65536, 10->65536, 65536->131072, 70000->131072,
-        // 100000->131072, default 1MiB->1114112 (=17*65536), and on the
-        // total-below-one-chunk case mb=1000/out=2000 -> 2000.
-        //
-        // Node also treats 0 as "no limit" rather than "capture nothing".
+        // Node also treats 0 as "no limit", not "capture nothing".
         // (Range validation happens before the try — see validateMaxBuffer.)
         const maxBuffer = optsSource.maxBuffer;
         // 0 and Infinity both mean unlimited, so neither enters the check below.
