@@ -1,9 +1,10 @@
-﻿/** RSA-OAEP encrypt/decrypt and the RSA-PSS one-shot wrappers. */
-
-const crypto = import.meta.use('crypto');
 import { Buffer } from '../buffer';
 import type { BinaryInput, KeyInput, KeyWithOptions } from './types';
 import { toBuffer, readAsymmetricCipherArgs } from './helpers';
+
+/** RSA-OAEP encrypt/decrypt and the RSA-PSS one-shot wrappers. */
+
+const crypto = import.meta.use('crypto');
 
 // RSA-OAEP
 

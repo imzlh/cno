@@ -1,13 +1,14 @@
-﻿/**
+import { normalizeHashAlgorithm, oneShotHmac, toBuffer } from './helpers';
+import { Buffer } from '../buffer';
+import type { BinaryInput } from './types';
+import { asError, assertCallback, withCode } from './errors';
+
+/**
  * Node.js crypto module - random, pbkdf2, hkdf functions
  */
 
 const crypto = import.meta.use('crypto');
 const algorithm = import.meta.use('algorithm');
-import { normalizeHashAlgorithm, oneShotHmac, toBuffer } from './helpers';
-import { Buffer } from '../buffer';
-import type { BinaryInput } from './types';
-import { asError, assertCallback, withCode } from './errors';
 
 type RandomFillBuffer = ArrayBuffer | ArrayBufferView;
 

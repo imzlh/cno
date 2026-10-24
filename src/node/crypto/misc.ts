@@ -1,8 +1,9 @@
-﻿/** Encoding helpers, padding constants, algorithm enumeration and randomUUID. */
-
-const crypto = import.meta.use('crypto');
 import type { CipherInfo } from './types';
 import { toBuffer } from './helpers';
+
+/** Encoding helpers, padding constants, algorithm enumeration and randomUUID. */
+
+const crypto = import.meta.use('crypto');
 
 // CRC32
 

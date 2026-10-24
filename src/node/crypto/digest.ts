@@ -1,11 +1,12 @@
-﻿/** Hash and Hmac: the Transform-based classes plus the one-shot native wrappers. */
-
-const crypto = import.meta.use('crypto');
 import { Buffer } from '../buffer';
 import { Transform, type TransformOptions } from '../stream';
 import type { BinaryInput, Hash, Hmac, KeyInput } from './types';
 import { toBuffer, encodeOutput, concatBuffers, normalizeHashAlgorithm, oneShotHmac, isSupportedHmacAlgorithm, getKeyBytes } from './helpers';
 import { createDigestAlreadyCalledError, asError } from './errors';
+
+/** Hash and Hmac: the Transform-based classes plus the one-shot native wrappers. */
+
+const crypto = import.meta.use('crypto');
 
 type DigestState = {
     update(data: Uint8Array): void;

@@ -1,11 +1,12 @@
-﻿/** ECDSA, ECDH and the one-shot key agreement (diffieHellman). */
-
-const crypto = import.meta.use('crypto');
 import { Buffer } from '../buffer';
 import type { BinaryInput } from './types';
 import { toBuffer, toExactArrayBuffer, encodeOutput, kKeyData, kKeyFormat, isKeyObject } from './helpers';
 import { KeyObject } from './keys';
 import { resolveCurve, resolveEcdhCurve, type EcdhCurve } from './curves';
+
+/** ECDSA, ECDH and the one-shot key agreement (diffieHellman). */
+
+const crypto = import.meta.use('crypto');
 
 // ECDSA
 

@@ -1,12 +1,13 @@
-﻿/** createCipheriv / createDecipheriv and the GCM + one-shot AES surface. */
-
-const crypto = import.meta.use('crypto');
 import { Buffer } from '../buffer';
 import { Transform, type TransformOptions } from '../stream';
 import type { BinaryInput, KeyInput, Cipheriv, Decipheriv, CipherGCM, DecipherGCM, GcmEncryptResult, GcmDecryptResult } from './types';
 import { toBuffer, toExactArrayBuffer, encodeOutput, isGcmAlgorithm } from './helpers';
 import { createInvalidIvError, createInvalidKeyLengthError, createUnknownCipherError, createAuthenticationFailedError, createCipherInvalidStateError, createInvalidGcmAuthTagLengthError, validateGcmAuthTagLength, asError } from './errors';
 import { type CipherCore, GCM_KEY_LENGTHS, toCipherKey, getEcbFns, getCbcFns, validateCbcKeyIv, makeEcbCipher, makeEcbDecipher, makeCbcCipher, makeCbcDecipher } from './cipher-modes';
+
+/** createCipheriv / createDecipheriv and the GCM + one-shot AES surface. */
+
+const crypto = import.meta.use('crypto');
 
 class CipherTransform extends Transform implements CipherGCM, DecipherGCM {
     private readonly core: CipherCore;

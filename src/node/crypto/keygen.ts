@@ -1,11 +1,12 @@
-﻿/** generateKeyPair / generateKeyPairSync, including the RFC 8410 PKCS#8 builder. */
-
-const crypto = import.meta.use('crypto');
 import type { AsymmetricKeyType } from './types';
 import { KeyObject, type KeyEncodingSpec, type GenerateKeyPairOptions } from './keys';
 import { resolveCurve } from './curves';
 import { assertCallback, asError, withCode } from './errors';
 import { randomBytes } from './random';
+
+/** generateKeyPair / generateKeyPairSync, including the RFC 8410 PKCS#8 builder. */
+
+const crypto = import.meta.use('crypto');
 
 /* ---------------------------------------------------------------------------
  * RFC 8410 key generation (X25519, X448, Ed25519, Ed448).

@@ -1,9 +1,10 @@
-﻿/** createSign / createVerify and the one-shot sign / verify functions. */
-
-const crypto = import.meta.use('crypto');
 import type { BinaryInput, KeyInput, KeyWithOptions, Sign, Verify } from './types';
 import { toBuffer, concatBuffers, readKeyOptions, rejectUnsupportedPadding } from './helpers';
 import { maybeEncodeSignatureForSign, normalizeSignatureForVerify } from './sigcodec';
+
+/** createSign / createVerify and the one-shot sign / verify functions. */
+
+const crypto = import.meta.use('crypto');
 
 const signatureAlgorithms = new Map([
     ['sha224', { sign: crypto.signSha224, verify: crypto.verifySha224 }],

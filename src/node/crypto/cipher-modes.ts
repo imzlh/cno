@@ -1,12 +1,13 @@
-﻿/**
+import type { BinaryInput, KeyInput } from './types';
+import { toBuffer, toExactArrayBuffer, encodeOutput, concatBuffers, getKeyBytes, kKeyData, isKeyObject } from './helpers';
+import { createInvalidIvError, createInvalidKeyLengthError, createUnknownCipherError, createAuthenticationFailedError, createCipherInvalidStateError, withCode } from './errors';
+
+/**
  * ECB/CBC mode plumbing: the native function tables and the incremental
  * cipher/decipher cores that createCipheriv and createDecipheriv build on.
  */
 
 const crypto = import.meta.use('crypto');
-import type { BinaryInput, KeyInput } from './types';
-import { toBuffer, toExactArrayBuffer, encodeOutput, concatBuffers, getKeyBytes, kKeyData, isKeyObject } from './helpers';
-import { createInvalidIvError, createInvalidKeyLengthError, createUnknownCipherError, createAuthenticationFailedError, createCipherInvalidStateError, withCode } from './errors';
 
 // createCipher / createDecipher
 
