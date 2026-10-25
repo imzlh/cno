@@ -99,41 +99,32 @@ export function spawnSync(command: string, argsOrOptions?: string[] | SpawnOptio
         // Node defaults spawnSync to raw Buffers — only an explicit encoding
         // (other than 'buffer') turns stdout/stderr into strings.
         const encoding = optsSource.encoding;
-        const convert = (value: ArrayBuffer | null): Buffer | string | null => {
-            if (value === null) return null;
-            const bytes = new Uint8Array(value);
+        const convert = (bytes: Uint8Array | null): Buffer | string | null => {
+            if (bytes === null) return null;
             if (encoding === undefined || encoding === 'buffer' || encoding === null) {
                 return Buffer.from(bytes);
             }
             return decodeOutput(bytes, encoding);
         };
-        let stdout = convert(result.stdout);
-        let stderr = convert(result.stderr);
+        let stdoutBytes = result.stdout === null ? null : new Uint8Array(result.stdout);
+        let stderrBytes = result.stderr === null ? null : new Uint8Array(result.stderr);
         let status = result.status;
         let signal = result.signal;
         let error = result.error ? normalizeSpawnFailure(result.error, command, 'spawnSync', optsSource.cwd, args) : undefined;
 
-        // maxBuffer: spawnSync cannot be killed mid-stream (the C layer runs it
-        // to completion), but the fields can still match Node because the output
-        // is already captured. Node is not "truncate to maxBuffer": it reads
-        // 64KiB chunks and keeps the chunk that crossed the limit, so
-        //     captured = min(totalLen, (floor(maxBuffer/65536)+1)*65536)
-        // Node also treats 0 as "no limit", not "capture nothing".
-        // (Range validation happens before the try — see validateMaxBuffer.)
-        const maxBuffer = optsSource.maxBuffer;
+        // Native sync spawn currently captures to completion. Keep the existing
+        // chunk-rounded capture limit, but count the combined raw bytes before
+        // decoding: UTF-8, hex and base64 strings have different lengths.
+        const maxBuffer = Object.prototype.hasOwnProperty.call(optsSource, 'maxBuffer')
+            ? optsSource.maxBuffer
+            : 1024 * 1024;
         // 0 and Infinity both mean unlimited, so neither enters the check below.
         if (error === undefined && typeof maxBuffer === 'number' && maxBuffer > 0 && Number.isFinite(maxBuffer)) {
             const CHUNK = 65536;
-            const lengthOf = (value: Buffer | string | null) => value === null ? 0 : value.length;
-            const over = (value: Buffer | string | null) => lengthOf(value) > maxBuffer;
-            if (over(stdout) || over(stderr)) {
+            if ((stdoutBytes?.byteLength ?? 0) + (stderrBytes?.byteLength ?? 0) > maxBuffer) {
                 const limit = (Math.floor(maxBuffer / CHUNK) + 1) * CHUNK;
-                const truncate = (value: Buffer | string | null) =>
-                    value === null || lengthOf(value) <= limit
-                        ? value
-                        : (typeof value === 'string' ? value.slice(0, limit) : value.subarray(0, limit));
-                stdout = truncate(stdout);
-                stderr = truncate(stderr);
+                stdoutBytes = stdoutBytes?.subarray(0, limit) ?? null;
+                stderrBytes = stderrBytes?.subarray(0, limit) ?? null;
                 error = Object.assign(new Error(`spawnSync ${command} ENOBUFS`), {
                     code: 'ENOBUFS',
                     errno: nativeError.errno.ENOBUFS,
@@ -146,6 +137,9 @@ export function spawnSync(command: string, argsOrOptions?: string[] | SpawnOptio
                 signal = 'SIGTERM';
             }
         }
+
+        const stdout = convert(stdoutBytes);
+        const stderr = convert(stderrBytes);
 
         // `error` is attached only when there is one. Node omits the key entirely
         // on success (measured v24.18: Object.keys is output,pid,signal,status,

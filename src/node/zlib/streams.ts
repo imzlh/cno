@@ -14,11 +14,11 @@ import { flattenPrototype } from '../_internal/prototype';
 export { flattenPrototype };
 import {
     asError,
+    concatBytes,
     corruptError,
     DEFAULT_COMPRESSION,
     DEFAULT_STRATEGY,
     FINISH,
-    hasErrorCode,
     hasGzipMagic,
     isAlreadyFinished,
     trailingIsPadding,
@@ -47,6 +47,7 @@ type ZlibHandleBase = {
     reset?: () => void;
     getTotalIn?: () => number;
     getTotalOut?: () => number;
+    readonly finished?: boolean;
 };
 type ZlibDeflateHandle = ZlibHandleBase & {
     deflate(input: Uint8Array, flush?: number): Uint8Array;
@@ -104,15 +105,16 @@ type ZlibStreamState = {
     compress: boolean;
     // codec for decompressors; undefined for compressors
     kind?: DecompressKind;
-    // flush mode requested on each feed (compressors only; decompressors are
-    // driven by finishFlush and the member walk)
+    // flush mode requested on each feed
     flush: number;
     finishFlush: number;
     bytesWritten: number;
     // gzip members concatenate; track leftovers across chunk boundaries
     multiMember: boolean;
     autoDetect: boolean;
+    // Input the native handle has not consumed yet.
     pending?: Uint8Array;
+    headerFirst?: number;
     // a NUL byte after a finished gzip member ends the stream; later chunks are dropped
     trailingDone?: boolean;
     // sticky classification so a later flush cannot downgrade it
@@ -146,65 +148,50 @@ function streamState(stream: object): ZlibStreamState {
     return state;
 }
 
-// Decodes one member from the start of `data`, leaving the bytes after it in a
-// variable-length encoding undecoded just as the streaming handle does. The
-// streaming handle cannot be used for this: it throws an uncatchable
-// InternalError as soon as a member ends inside the input, which the walk needs
-// to do on every member but the last. The finish flush keeps that behaviour
-// (a partial member returns what it decoded instead of failing). Each helper
-// has its own signature, so dispatch per codec.
-const NATIVE_DECOMPRESS: Record<DecompressKind, (data: Uint8Array) => Uint8Array> = {
-    inflate: (data) => zlib.inflate(data, zlib.NO_FLUSH),
-    inflateRaw: (data) => zlib.inflateRaw(data, zlib.NO_FLUSH),
-    gunzip: (data) => zlib.gunzip(data, zlib.NO_FLUSH),
-    unzip: (data) => zlib.unzip(data, zlib.NO_FLUSH),
-};
-
-/**
- * Feed one chunk into a decompressor, walking gzip member boundaries and
- * buffering any bytes that need more input before they can be decoded. `kind`
- * names the codec used for each complete member; `pending` holds the bytes of
- * the member that is still incomplete.
- */
-function inflateChunk(state: ZlibStreamState, kind: DecompressKind, chunk: Uint8Array): Buffer {
-    // A NUL after a finished member closed the stream; everything after is discarded.
+/** Keep one native handle across writes, resetting only between gzip members. */
+function inflateChunk(state: ZlibStreamState, handle: ZlibInflateHandle, chunk: Uint8Array): Buffer {
     if (state.trailingDone) return Buffer.alloc(0);
-    const data = state.pending && state.pending.length > 0 ? concatBytes(state.pending, chunk) : chunk;
-    state.pending = undefined;
-    if (state.autoDetect && data.length >= 2) {
-        state.multiMember = hasGzipMagic(data);
-        state.autoDetect = false;
+    // Unzip's two-byte header may arrive in separate writes.
+    if (state.autoDetect && chunk.length > 0) {
+        if (state.headerFirst !== undefined) {
+            state.multiMember = state.headerFirst === 0x1f && chunk[0] === 0x8b;
+            state.autoDetect = false;
+        } else if (chunk.length >= 2) {
+            state.multiMember = hasGzipMagic(chunk);
+            state.autoDetect = false;
+        } else {
+            state.headerFirst = chunk[0];
+        }
     }
+    const data = state.pending?.length ? concatBytes(state.pending, chunk) : chunk;
+    state.pending = undefined;
     const outputs: Buffer[] = [];
     let offset = 0;
     while (offset < data.length) {
-        let member: Uint8Array | null = null;
-        try {
-            member = NATIVE_DECOMPRESS[kind](data.subarray(offset));
-        } catch {
-            // The one-shot helpers reject every malformed input with the same
-            // InternalError, so the trailing bytes decide which case this is.
-            // Node reads them as the next member: a NUL closes the stream, gzip
-            // magic means the input stops mid-member, anything else is junk.
-            // (Nothing may be called in here: the engine treats the region of a
-            // pending native error as terminate-only, and any call aborts.)
-        }
-        if (member) {
-            outputs.push(Buffer.from(member));
-            break;
-        }
         const rest = data.subarray(offset);
-        if (state.multiMember && trailingIsPadding(rest)) {
-            // NUL padding closes the stream: drop the rest and every later chunk.
-            state.trailingDone = true;
+        if (handle.finished === true) {
+            if (!state.multiMember) break;
+            if (trailingIsPadding(rest)) {
+                state.trailingDone = true;
+                break;
+            }
+            handle.reset?.();
+        }
+        const before = handle.getTotalIn?.() ?? 0;
+        let output: Uint8Array;
+        try {
+            output = handle.inflate(rest, state.flush);
+        } catch {
+            state.error = corruptError();
+            throw state.error;
+        }
+        if (output.length > 0) outputs.push(Buffer.from(output));
+        const used = handle.getTotalIn ? handle.getTotalIn() - before : rest.length;
+        offset += used;
+        if (used === 0) {
+            state.pending = rest;
             break;
         }
-        // Only gzip concatenates members; other codecs stop at the first one.
-        if (!state.multiMember) break;
-        if (offset > 0 && !hasGzipMagic(rest)) throw corruptError();
-        // A next member that is still incomplete waits for the next chunk.
-        state.pending = rest;
-        break;
     }
     return Buffer.concat(outputs);
 }
@@ -219,7 +206,7 @@ function _transform(this: NodeZlibTransform, chunk: ZlibInput, _encoding: Buffer
         state.bytesWritten += input.byteLength;
         const output = isDeflateHandle(handle)
             ? Buffer.from(handle.deflate(input, state.flush))
-            : inflateChunk(state, state.kind ?? 'inflate', input);
+            : inflateChunk(state, handle, input);
         cb(null, output.length > 0 ? output : undefined);
     } catch (err) { cb(asError(err)); }
 }
@@ -247,21 +234,15 @@ function _flush(this: NodeZlibTransform, cb: TransformCallback): void {
         if (state.error) throw state.error;
         // A NUL after a finished member already completed the stream.
         if (state.trailingDone) { cb(null); return; }
-        // Leftover bytes that never formed a decodable member mean the stream was cut
-        // short; NUL padding after a complete member is handled by `trailingDone`.
-        if (!state.compress && state.pending && state.pending.length > 0) {
-            const pending = state.pending;
-            state.pending = undefined;
-            if (pending.every((byte) => byte === 0)) { cb(null); return; }
-            if (state.finishFlush === FINISH) throw truncatedError();
-        }
         const handle = this._handle;
-        // Decompressors never touch the streaming handle: a member starts in one
-        // chunk and ends in another, and the handle cannot tell which call will
-        // end it, so the walk reports end-of-stream itself.
-        if (!state.compress) {
-            if (state.bytesWritten === 0 && state.finishFlush === FINISH) throw truncatedError();
-            cb(null);
+        if (!isDeflateHandle(handle)) {
+            if (state.finishFlush === FINISH && handle.finished !== true) throw truncatedError();
+            // A finished member has already emitted all output. Calling its
+            // native finish() again raises an uncatchable terminal-state error.
+            const output = handle.finished === true ? Buffer.alloc(0)
+                : Buffer.from(handle.inflate(state.pending ?? new Uint8Array(), state.finishFlush));
+            state.pending = undefined;
+            cb(null, output.length > 0 ? output : undefined);
             return;
         }
         const raw = state.finishFlush === FINISH
@@ -309,7 +290,13 @@ function flushStream(this: NodeZlibTransform, kindOrCallback?: number | (() => v
 
 function resetStream(this: NodeZlibTransform): void {
     this._handle.reset?.();
-    streamState(this);
+    const state = streamState(this);
+    state.pending = undefined;
+    state.headerFirst = undefined;
+    state.trailingDone = false;
+    state.error = undefined;
+    state.multiMember = state.kind === 'gunzip';
+    state.autoDetect = state.kind === 'unzip';
 }
 
 function paramsStream(this: NodeZlibTransform, level: number, strategy: number, callback?: () => void): NodeZlibTransform {

@@ -29,6 +29,9 @@ const REGEXP_FLAGS = [
     ['unicodeSets', 'v'],
     ['sticky', 'y'],
 ] as const;
+const typedArrayTagGetter = Object.getOwnPropertyDescriptor(
+    Object.getPrototypeOf(Uint8Array.prototype), Symbol.toStringTag,
+)?.get;
 const sharedArrayBufferByteLengthGetter = typeof SharedArrayBuffer === 'function'
     ? Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength')?.get
     : undefined;
@@ -254,9 +257,11 @@ const typedArrayCtors: Record<string, [TypedArrayConstructor, number]> = {
 };
 
 function typedArrayKind(value: ArrayBufferView): [TypedArrayConstructor, number] {
-    // A reprototyped view or a deleted shared tag reports [object Object], so the tag
-    // no longer names its kind: clone it as a byte view over its bytes.
-    return typedArrayCtors[Object.prototype.toString.call(value).slice(8, -1)] ?? [Uint8Array, 1];
+    // A subclass may override its display tag without changing its element type.
+    const tag = typedArrayTagGetter ? Reflect.apply(typedArrayTagGetter, value, []) : undefined;
+    const kind = typeof tag === 'string' ? typedArrayCtors[tag] : undefined;
+    if (!kind) throw dataCloneError('Unsupported ArrayBuffer view');
+    return kind;
 }
 
 function prepareTransfers<TPort extends object, TPortClone extends object = TPort>(

@@ -67,8 +67,7 @@ function engineDecode(bytes: Uint8Array): string {
 
 // Decode well-formed runs natively and write out only the maximal invalid
 // subpart at each fault. A stray continuation byte or a truncated tail is one
-// U+FFFD; a valid lead swallows its valid continuations into one, except a
-// surrogate encoding (`ed a0`), whose bytes Node replaces one by one.
+// U+FFFD; only continuations valid for the current lead belong to that subpart.
 function replaceMalformed(bytes: Uint8Array): string {
     let out = '';
     let start = 0;
@@ -79,25 +78,15 @@ function replaceMalformed(bytes: Uint8Array): string {
         if (at > start) out += engineDecode(bytes.subarray(start, at));
         const lead = bytes[at];
         if (lead >= 0xc2 && lead <= 0xf4) {
-            // A valid lead swallows its continuation bytes into ONE U+FFFD
-            // (`e4 bd` is one replacement); a UTF-16 surrogate encoding is
-            // structurally invalid, so Node replaces those bytes one by one.
+            // Invalid first-continuation bounds include overlong encodings,
+            // surrogate code points, and values above U+10FFFF.
             const need = lead < 0xe0 ? 1 : lead < 0xf0 ? 2 : 3;
-            if (lead === 0xed && at + 1 < bytes.length && bytes[at + 1] >= 0xa0) {
-                out += '�';
-                start = at + 1;
-                continue;
-            }
-            // `f4 90`.. is above U+10FFFF; it is not a 4-byte prefix at all.
-            if (lead === 0xf4 && at + 1 < bytes.length && bytes[at + 1] > 0x8f) {
-                out += '�';
-                start = at + 1;
-                continue;
-            }
+            const lower = lead === 0xe0 ? 0xa0 : lead === 0xf0 ? 0x90 : 0x80;
+            const upper = lead === 0xed ? 0x9f : lead === 0xf4 ? 0x8f : 0xbf;
             let consumed = 0;
             while (consumed < need && at + 1 + consumed < bytes.length) {
                 const next = bytes[at + 1 + consumed];
-                if (next < 0x80 || next > 0xbf) break;
+                if (next < (consumed === 0 ? lower : 0x80) || next > (consumed === 0 ? upper : 0xbf)) break;
                 consumed++;
             }
             out += '�';

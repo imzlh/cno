@@ -255,12 +255,11 @@ function zlibError(code: string, errno: number, message: string): ZlibNativeErro
 export const truncatedError = () => zlibError('Z_BUF_ERROR', -5, 'unexpected end of file');
 export const corruptError = () => zlibError('Z_DATA_ERROR', -3, 'incorrect header check');
 
-// The native inflate handle reports errors as engine-uncatchable
-// InternalErrors (JS `catch` never sees them; the process aborts), so the
-// inflate paths never let it throw and guard on `finished` instead.
+// Native errors have no code. Only the explicit terminal-state messages mean
+// that there is no more output; malformed input also throws an uncoded error.
 export function isAlreadyFinished(error: unknown): boolean {
-    if (hasErrorCode(error) || error instanceof RangeError) return false;
-    return isErrorLike(error);
+    if (!isErrorLike(error) || hasErrorCode(error)) return false;
+    return /^(?:Deflate|Inflate|Brotli (?:compress|decompress)) stream already finished$/.test(error.message);
 }
 
 export const hasErrorCode = (error: unknown): boolean =>

@@ -873,10 +873,6 @@ function resolveImpl(paths: string[], windows: boolean): string {
     }
 
     // Normalize only the tail segments (a leading `\\` would be misread as UNC).
-    // A tail with no `.` is already its own normalization.
-    if (!resolvedTail.includes('.')) {
-        return resolvedAbsolute ? `${resolvedDevice}\\${resolvedTail}` : `${resolvedDevice}${resolvedTail}` || '.';
-    }
     const segments: string[] = [];
     for (const segment of splitSegments(resolvedTail, true)) {
         if (!segment || segment === '.') continue;

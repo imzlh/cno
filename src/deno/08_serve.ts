@@ -645,8 +645,9 @@ function createWebSocketFromISocket(conn: Promise<ISocket>): globalThis.WebSocke
 /* Export to Deno namespace                                           */
 /* ------------------------------------------------------------------ */
 
-Object.assign(Deno, wrapFSns({
+export const SERVE_EXPORTS = wrapFSns({
     // @ts-ignore - serve cast
     serve,
     upgradeWebSocket
-}));
+});
+Object.assign(Deno, SERVE_EXPORTS);

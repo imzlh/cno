@@ -25,7 +25,7 @@ export type LazyLoader = () => Promise<ReadonlyMap<string, unknown>>;
 export type LazyGlobal = Record<string, unknown>;
 
 /** Final values by name once the loader has resolved. */
-const resolvedValues = new WeakMap<object, ReadonlyMap<string, unknown>>();
+const resolvedValues = new WeakMap<object, Map<string, unknown>>();
 
 /** The in-flight (or settled) load installed by `defineLazy`, by target and name. */
 const pendingLoads = new Map<object, Map<string, Promise<void>>>();
@@ -84,15 +84,15 @@ function forwardingClass(owner: object, name: string, proto: object | undefined)
             if (typeof value !== 'function') {
                 throw new Error(`${name} is not available yet: its module is still loading`);
             }
-            return Reflect.construct(value as new (...a: never[]) => object, args);
+            return Reflect.construct(value as new (...a: never[]) => object, args, new.target);
         }
     };
     Object.defineProperty(Forwarding, 'name', { value: name });
-    if (proto !== undefined) Object.defineProperty(Forwarding, 'prototype', { value: proto });
+    if (proto !== undefined) Object.setPrototypeOf(Forwarding.prototype, proto);
     return Forwarding;
 }
 
-function standIn(owner: object, name: string, spec: LazySpec, load: LazyLoader, lazyLoads?: ReadonlySet<string>): unknown {
+function standIn(owner: object, name: string, spec: LazySpec): unknown {
     switch (spec.kind) {
         case 'fn':
             return forwardingFunction(owner, name);
@@ -101,7 +101,6 @@ function standIn(owner: object, name: string, spec: LazySpec, load: LazyLoader, 
         case 'prototype': {
             if (spec.finalPrototype !== undefined) return forwardingClass(owner, name, spec.finalPrototype);
             const shared = sharedPrototype(name);
-            adoptShared(shared, load, lazyLoads);
             return forwardingClass(owner, name, shared.proto);
         }
         case 'instance':
@@ -110,22 +109,10 @@ function standIn(owner: object, name: string, spec: LazySpec, load: LazyLoader, 
         case 'deferred': {
             const out: Record<string, unknown> = {};
             for (const member of spec.members ?? []) {
-                out[member.name] = standIn(owner, member.name, { name: member.name, kind: member.kind }, load, lazyLoads);
+                out[member.name] = standIn(owner, member.name, { name: member.name, kind: member.kind });
             }
             return out;
         }
-    }
-}
-
-/** Point a shared prototype at the real class once its module has loaded. */
-function adoptShared(shared: { adopt(final: object): void }, load: LazyLoader, lazyLoads?: ReadonlySet<string>): void {
-    if (lazyLoads === undefined) return;
-    for (const [name, isLazy] of lazyLoads.entries()) {
-        if (!isLazy) continue;
-        void load().then((values) => {
-            const value = values.get(name);
-            if (typeof value === 'function') shared.adopt((value as { prototype: object }).prototype);
-        }, () => { /* a failed load leaves the stand-in empty */ });
     }
 }
 
@@ -141,6 +128,24 @@ function mirrorStatics(pending: unknown, value: unknown): void {
         const descriptor = Object.getOwnPropertyDescriptor(value, key);
         if (descriptor !== undefined) Object.defineProperty(pending, key, { ...descriptor, configurable: true });
     }
+}
+
+/** Update saved stand-ins as soon as their exports become available. */
+function settleStandIn(pending: unknown, spec: LazySpec, values: ReadonlyMap<string, unknown>): void {
+    if (spec.kind === 'props' || spec.kind === 'deferred') {
+        for (const member of spec.members ?? []) {
+            settleStandIn((pending as Record<string, unknown>)[member.name], member, values);
+        }
+        return;
+    }
+    const value = values.get(spec.name);
+    if (typeof pending !== 'function' || typeof value !== 'function' || pending === value) return;
+    if (spec.kind === 'ctor') {
+        Object.setPrototypeOf(pending.prototype, value.prototype);
+    } else if (spec.kind === 'prototype' && spec.finalPrototype === undefined) {
+        sharedPrototype(spec.name).adopt(value.prototype);
+    }
+    mirrorStatics(pending, value);
 }
 
 function defineData(target: LazyGlobal, name: string, value: unknown): void {
@@ -167,14 +172,19 @@ export function whenLazy(target: object, name: string): Promise<void> {
  * observe rejection: on failure they stay installed and the next read retries,
  * so an optional module that cannot load degrades to "not available yet".
  */
-export function defineLazy(target: LazyGlobal, specs: readonly LazySpec[], load: LazyLoader, lazyLoads?: ReadonlySet<string>): Promise<void> {
+export function defineLazy(target: LazyGlobal, specs: readonly LazySpec[], load: LazyLoader): Promise<void> {
     if (specs.length === 0) return Promise.resolve();
     let loading: Promise<void> | null = null;
+    const standIns = new Map<string, unknown>();
     const settle = (values: ReadonlyMap<string, unknown>): void => {
-        resolvedValues.set(target, values);
+        let resolved = resolvedValues.get(target);
+        if (resolved === undefined) {
+            resolved = new Map();
+            resolvedValues.set(target, resolved);
+        }
+        for (const [name, value] of values) resolved.set(name, value);
         for (const spec of specs) {
-            const pending = (target as Record<string, unknown>)[spec.name];
-            mirrorStatics(pending, values.get(spec.name));
+            settleStandIn(standIns.get(spec.name), spec, values);
             defineData(target, spec.name, values.get(spec.name));
         }
     };
@@ -191,7 +201,8 @@ export function defineLazy(target: LazyGlobal, specs: readonly LazySpec[], load:
         pendingLoads.set(target, loads);
     }
     for (const spec of specs) {
-        const value = standIn(target, spec.name, spec, load, lazyLoads);
+        const value = standIn(target, spec.name, spec);
+        standIns.set(spec.name, value);
         Object.defineProperty(target, spec.name, {
             get(): unknown {
                 start();

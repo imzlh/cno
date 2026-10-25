@@ -56,7 +56,7 @@ export class KvClosedError extends KvError {
     }
 }
 
-async function openKv(path?: string): Promise<Deno.Kv> {
+export async function openKv(path?: string): Promise<Deno.Kv> {
     const kv = new Kv(normalizeKvPath(path));
     await kv.open();
     return kv;

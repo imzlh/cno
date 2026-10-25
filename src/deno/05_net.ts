@@ -1214,4 +1214,5 @@ const denoNetNs = {
     }
 };
 
-Object.assign(Deno, wrapFSns(denoNetNs));
+export const NET_EXPORTS = wrapFSns(denoNetNs);
+Object.assign(Deno, NET_EXPORTS);

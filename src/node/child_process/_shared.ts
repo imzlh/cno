@@ -4,8 +4,8 @@ const os = import.meta.use('os');
 const signals = import.meta.use('signals');
 const engine = import.meta.use('engine');
 
-import { Readable, Writable } from '../stream';
-import { addReadableLength, decoderBytes, flowReadable, scheduleReadableFlow, subtractReadableLength } from '../stream/_shared';
+import { Readable, Writable, type Duplex } from '../stream';
+import { addReadableLength, decoderBytes, flowReadable, scheduleReadableEmit, scheduleReadableFlow, subtractReadableLength } from '../stream/_shared';
 import { viewToUint8Array } from '../_internal/buffer';
 import { normalizeErrnoError } from '../_internal/errno';
 import { Buffer } from '../buffer';
@@ -15,10 +15,18 @@ export function asError(error: unknown, syscall?: string, path?: string): Error 
     return normalizeErrnoError(error, syscall, path);
 }
 
+// A Readable's pending read ends with each chunk, while the native pipe keeps
+// watching until stopRead(). Track those lifetimes separately to avoid starting
+// an already active native read when a consumer drains or resumes the stream.
+const activePipeReads = new WeakSet<object>();
+
 export function startPipeReadQuietly(pipe: CModuleStreams.Pipe): void {
+    if (activePipeReads.has(pipe)) return;
+    activePipeReads.add(pipe);
     try {
         pipe.startRead();
     } catch {
+        activePipeReads.delete(pipe);
         // The pipe can already be closing while Readable asks for more data.
     }
 }
@@ -27,16 +35,14 @@ export function startPipeReadQuietly(pipe: CModuleStreams.Pipe): void {
  * Hand one stdio chunk to a child-process Readable. While the pipe owns the
  * read, only append to the buffer: push() would re-enter startRead().
  */
-export function deliverPipeChunk(readable: Readable, pipe: CModuleStreams.Pipe, data: Uint8Array): void {
+export function deliverPipeChunk(readable: Readable | Duplex, pipe: CModuleStreams.Pipe, data: Uint8Array): void {
     const state = readable._readableState;
+    if (state.destroyed || state.ended) return;
+    state.reading = false;
     // Native pipe reads are Uint8Array views; Node's streams hand out Buffers.
     if (!(data instanceof Buffer)) data = Buffer.from(data.buffer, data.byteOffset, data.byteLength);
-    if (!state.reading && !state.destroyed) {
-        if (!readable.push(data)) stopPipeReadQuietly(pipe);
-        return;
-    }
-    // push() would decode through state.decoder and then run flowReadable()
-    // via _read(); writing the buffer directly must do both itself.
+    // Defer delivery until the native callback returns, including readable-mode
+    // notifications; a later read() can then restart a pipe stopped for pressure.
     const bytes = decoderBytes(data);
     if (state.decoder && bytes) {
         const decoded = state.decoder.write(bytes);
@@ -45,23 +51,24 @@ export function deliverPipeChunk(readable: Readable, pipe: CModuleStreams.Pipe, 
     }
     state.buffer.push(data);
     addReadableLength(readable, data);
-    scheduleReadableFlow(readable, () => flowReadable(readable));
+    if (state.flowing && !state.readableListening) {
+        scheduleReadableFlow(readable, () => flowReadable(readable));
+    } else {
+        scheduleReadableEmit(readable);
+    }
     if (readable.readableLength >= state.highWaterMark) {
         stopPipeReadQuietly(pipe);
-    } else {
-        queueMicrotask(() => {
-            if (!state.destroyed && !state.reading) startPipeReadQuietly(pipe);
-        });
     }
 }
 
-export function clearHeldPipeBytes(readable: Readable): void {
+export function clearHeldPipeBytes(readable: Readable | Duplex): void {
     const state = readable._readableState;
     state.buffer.length = 0;
     subtractReadableLength(readable, readable.readableLength);
 }
 
 export function stopPipeReadQuietly(pipe: CModuleStreams.Pipe): void {
+    activePipeReads.delete(pipe);
     try {
         pipe.stopRead();
     } catch {

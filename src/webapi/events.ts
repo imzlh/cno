@@ -15,7 +15,7 @@ export class Event implements globalThis.Event {
 
     target: EventTarget | null = null;
     currentTarget: EventTarget | null = null;
-    timeStamp: number = 0;
+    timeStamp: number = performance.now();
 
     private _stopped = false;
     private _immediateStopped = false;
@@ -115,24 +115,14 @@ function notifyListenerChange(target: EventTarget, type: string, bucket: Listene
 const captureOption = (options?: AddEventListenerOptions | boolean): boolean =>
     typeof options === 'boolean' ? options : !!options?.capture;
 
-/*
- * node:events keeps listener bookkeeping (getEventListeners and friends) and
- * reads its hooks from globals: the polyfill never imports node:events. The
- * hooks are installed before user code runs, but either module may evaluate
- * first, so node:events publishes an installer on a global and this module
- * calls it once it is defined.
- */
+// node:events owns listener bookkeeping; the hooks avoid a module dependency.
+function callTrackingHook(name: string, ...args: unknown[]): void {
+    const hook = Reflect.get(globalThis, name);
+    if (typeof hook === 'function') Reflect.apply(hook, globalThis, args);
+}
 
 export class EventTarget implements globalThis.EventTarget {
     #listeners = new Map<string, ListenerEntry[]>();
-    /**
-     * Version of #listeners, bumped on every structural change. A dispatch
-     * only needs the entry-identity check below when a callback ran and the
-     * version moved — Node's rule (a listener added mid-dispatch is not
-     * called, one removed mid-dispatch is skipped, re-adding appends) holds
-     * either way, so the untouched fast path skips it.
-     */
-    #version = 0;
 
     static #receiver(receiver: EventTarget | typeof globalThis | null | undefined): EventTarget | null {
         if (receiver === undefined || receiver === null || receiver === globalThis) return null;
@@ -167,14 +157,14 @@ export class EventTarget implements globalThis.EventTarget {
             && Reflect.get(listener, internalListener) === true;
         const entry: ListenerEntry = { listener, once: !!opts.once, capture, passive: !!opts.passive, internal, signal: opts.signal };
         bucket.push(entry);
-        target.#version++;
+        callTrackingHook('__cnoTrackEventTargetListener', target, eventType, listener, options);
         if (!entry.internal) notifyListenerChange(target, eventType, bucket);
         if (opts.signal) {
             entry.abortHandler = () => {
                 const idx = bucket.indexOf(entry);
                 if (idx !== -1) {
                     bucket.splice(idx, 1);
-                    target.#version++;
+                    callTrackingHook('__cnoUntrackEventTargetListener', target, eventType, listener, entry.capture);
                     if (!entry.internal) notifyListenerChange(target, eventType, bucket);
                 }
             };
@@ -203,8 +193,8 @@ export class EventTarget implements globalThis.EventTarget {
         if (idx !== -1) {
             const entry = bucket[idx];
             bucket.splice(idx, 1);
-            target.#version++;
             if (entry?.signal && entry.abortHandler) entry.signal.removeEventListener('abort', entry.abortHandler);
+            callTrackingHook('__cnoUntrackEventTargetListener', target, eventType, listener, options);
             if (!entry?.internal) notifyListenerChange(target, eventType, bucket);
         }
     }
@@ -226,30 +216,19 @@ export class EventTarget implements globalThis.EventTarget {
         const bucket = listeners.get(event.type);
         event.eventPhase = Event.AT_TARGET;
         event._setDispatching(true);
-        let version = target.#version;
         try {
             if (bucket) {
-                // No copy by default. When a `once` entry self-removes or a
-                // callback mutates the bucket (version bumps), iterate a
-                // snapshot so an added listener is not called and a removed one
-                // is skipped — Node's semantics either way.
-                let list: ListenerEntry[] = bucket;
-                for (let i = 0; i < list.length; i++) {
+                // Keep original entry identities: additions wait for the next
+                // dispatch, while removals (including once) cannot shift the loop.
+                const snapshot = bucket.slice();
+                for (const entry of snapshot) {
                     if (event.immediatePropagationStopped) break;
-                    if (version !== target.#version) {
-                        version = target.#version;
-                        list = bucket.slice();
-                    }
-                    if (i >= list.length) break;
-                    const entry = list[i];
-                    // A snapshot element may have been removed by an earlier
-                    // callback; a `once` entry removes itself and re-enters the
-                    // callback at its own index, so only identity can tell.
-                    if (entry.once && bucket.indexOf(entry) === -1) continue;
+                    const index = bucket.indexOf(entry);
+                    if (index === -1) continue;
                     if (entry.once) {
-                        bucket.splice(bucket.indexOf(entry), 1);
-                        target.#version++;
+                        bucket.splice(index, 1);
                         if (entry.signal && entry.abortHandler) entry.signal.removeEventListener('abort', entry.abortHandler);
+                        callTrackingHook('__cnoUntrackEventTargetListener', target, event.type, entry.listener, entry.capture);
                         if (!entry.internal) notifyListenerChange(target, event.type, bucket);
                     }
                     const fn = entry.listener;

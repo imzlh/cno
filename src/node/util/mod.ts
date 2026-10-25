@@ -1,7 +1,6 @@
 import * as types from './types';
 import { deepEqual as _deepEqual } from '../_internal/deep-equal';
 import { parseNodeEnv } from '../_internal/dotenv';
-export { inspect } from './inspect';
 import { inspect, defaultInspectOptions, formatNumberNoColor, formatBigIntNoColor, hasBuiltInToString } from './inspect';
 import type { InspectOptions } from './inspect';
 
@@ -12,10 +11,7 @@ import type { InspectOptions } from './inspect';
 
 const console = import.meta.use('console');
 const os = import.meta.use('os');
-import * as types from './types';
 export { types };
-import { deepEqual as _deepEqual } from '../_internal/deep-equal';
-import { parseNodeEnv } from '../_internal/dotenv';
 
 type AnyCallable = { bivarianceHack(...args: unknown[]): unknown }['bivarianceHack'];
 type InheritableFunction = AnyCallable & { prototype: object };
@@ -387,9 +383,6 @@ export {
     printMyersDiff,
 } from './diff';
 export type { DiffEntry, DiffOperation } from './diff';
-import { inspect, defaultInspectOptions, formatNumberNoColor, formatBigIntNoColor, hasBuiltInToString } from './inspect';
-import type { InspectOptions } from './inspect';
-
 // Inheritance
 
 export function inherits(constructor: InheritableFunction, superConstructor: InheritableFunction): void {

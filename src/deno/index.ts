@@ -1179,9 +1179,9 @@ await Promise.all([
 ]);
 
 // Lazy: boot-reachable bytecode costs startup. See docs/webapi-notes.md
-const netNamespace: Promise<Record<string, unknown>> = import('./05_net');
-const processNamespace: Promise<Record<string, unknown>> = import('./06_process');
-const serveNamespace: Promise<Record<string, unknown>> = import('./08_serve');
+const netNamespace = import('./05_net').then(mod => mod.NET_EXPORTS);
+const processNamespace = import('./06_process').then(mod => mod.PROCESS_EXPORTS);
+const serveNamespace = import('./08_serve').then(mod => mod.SERVE_EXPORTS);
 const quicNamespace: Promise<Record<string, unknown>> = import('./10_quic');
 const kvNamespace: Promise<Record<string, unknown>> = import('./kv');
 const ffiNamespace: Promise<Record<string, unknown>> = import('./ffi');
@@ -1189,7 +1189,7 @@ const ffiNamespace: Promise<Record<string, unknown>> = import('./ffi');
 // in user code, so it keeps loading at boot.
 const cronNamespace: Promise<Record<string, unknown>> = import('./09_cron');
 
-function namespaceValues(namespace: Promise<Record<string, unknown>>, ...names: string[]): Promise<Map<string, unknown>> {
+function namespaceValues(namespace: Promise<object>, ...names: string[]): Promise<Map<string, unknown>> {
     return namespace.then((mod) => new Map(names.map(name => [name, Reflect.get(mod, name)])));
 }
 

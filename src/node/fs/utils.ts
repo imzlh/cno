@@ -673,7 +673,7 @@ function joinWalk(dir: string, name: string): string {
     // did the URL/leading-slash work once) and is passed to the binding
     // pre-namespaced, so the syscall wrapper's per-level `resolve` is skipped.
     const last = dir.charCodeAt(dir.length - 1);
-    if (last === 47 || last === 92) return dir + name;
+    if (last === 47 || (isWindows && last === 92)) return dir + name;
     return isWindows ? `${dir}\\${name}` : `${dir}/${name}`;
 }
 let walkNeedsSysDir = false;

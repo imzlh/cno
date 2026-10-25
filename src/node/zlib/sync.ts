@@ -129,11 +129,8 @@ function decompressSync(kind: DecompressKind, buffer: ZlibInput, options?: ZlibO
     let consumed = 0;
 
     while (true) {
-        // `inflate()` validates its input and throws a catchable TypeError for
-        // anything that is not a byte view. Every other failure it raises is an
-        // uncatchable InternalError, so refuse those inputs here: bytes after a
-        // finished member are read as the start of the next one, and Node
-        // reports that as Z_DATA_ERROR rather than ending the process.
+        // The native handle reports malformed compressed data as a TypeError;
+        // expose Node's Z_DATA_ERROR instead of treating it as a completed member.
         const rest = input.subarray(offset);
         if (!ArrayBuffer.isView(rest)) throw corruptError();
         let produced: Uint8Array;
@@ -165,8 +162,7 @@ function decompressSync(kind: DecompressKind, buffer: ZlibInput, options?: ZlibO
         // Trailing NUL padding after a complete member is not an error in Node.
         if (trailingIsPadding(input.subarray(offset))) break;
         // Anything else is read as the start of a new member and rejected by
-        // Node with Z_DATA_ERROR. Handing those bytes to the native handle
-        // raises an uncatchable InternalError instead, so reject them here.
+        // Node with Z_DATA_ERROR.
         if (!hasGzipMagic(input.subarray(offset))) throw corruptError();
         if (!handle.reset) break;
         handle.reset();

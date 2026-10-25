@@ -169,8 +169,7 @@ BrotliCompress.prototype._flush = function _flush(this: BrotliCompress, cb: Tran
         try {
             return brotliCompressOperation(this._handle, state.finishFlush);
         } catch (error) {
-            // Native handle throws carry no code and reach here as a generic
-            // "not a function" TypeError; see `isAlreadyFinished`.
+            // Ignore only the native handle's explicit already-finished error.
             if (isAlreadyFinished(error)) return Buffer.alloc(0);
             throw error;
         }

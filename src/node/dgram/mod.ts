@@ -531,20 +531,6 @@ function sendLayout(args: readonly unknown[], connected: boolean): SendLayoutSpe
     return SEND_LAYOUTS[candidates.find((name) => SEND_LAYOUTS[name].matches(args))!];
 }
 
-function readAddressAndCallback(args: readonly unknown[], after: number): {
-    address?: string;
-    callback?: SendCallback;
-} {
-    const next = args[after];
-    if (typeof next === 'string') {
-        const fn = args[after + 1];
-        return { address: next, callback: typeof fn === 'function' ? fn : undefined };
-    }
-    if (typeof next === 'function') return { callback: next };
-    if (next !== undefined) validateString(next, 'address');
-    return {};
-}
-
 /** Node's `sliceBuffer`, over the message as a string or a view. */
 function sliceSendMessage(msg: string | ArrayBufferView, offset: unknown, length: unknown): Uint8Array {
     const bytes = typeof msg === 'string' ? engine.encodeString(msg) : viewToBytes(msg);
@@ -552,12 +538,13 @@ function sliceSendMessage(msg: string | ArrayBufferView, offset: unknown, length
 }
 
 /** Resolves the address and callback of a send that names a destination. */
-function readDestination(next: unknown, tail: unknown): { address: string; callback?: SendCallback } {
-    const target = (typeof next === 'string' ? next : undefined) || DEFAULT_ADDRESS;
+function readDestination(next: unknown, tail: unknown, type: 'udp4' | 'udp6'): { address: string; callback?: SendCallback } {
+    if (next != null && typeof next !== 'function') validateString(next, 'address');
+    const target = (typeof next === 'string' ? next : undefined) || (type === 'udp6' ? DEFAULT_ADDRESS6 : DEFAULT_ADDRESS);
     const callback = typeof next === 'function' ? next : typeof tail === 'function' ? tail : undefined;
 
     validateString(target, 'address');
-    return { address: target, callback };
+    return { address: target, callback: callback as SendCallback | undefined };
 }
 
 /**
@@ -582,21 +569,22 @@ function normalizeSendArgs(
             : tail !== undefined;
         if (destination) throw makeError('Already connected', 'ERR_SOCKET_DGRAM_IS_CONNECTED');
         if (sliced) msg = sliceSendMessage(msg, args[0], args[1]) as typeof msg;
-        // The callback sits at `portIndex` itself for the connected layout
-        // (`send(msg, cb)`) and after the destination otherwise.
-        const cb = portIndex === 0 ? args[0] : args[portIndex + 1];
-        return { data: encodeMessage(msg), connected: true, callback: typeof cb === 'function' ? cb : undefined };
+        // Connected sends put the callback where an unconnected send puts its port.
+        const cb = args[portIndex];
+        return { data: encodeMessage(msg), connected: true, callback: typeof cb === 'function' ? cb as SendCallback : undefined };
     }
 
     if (sliced) msg = sliceSendMessage(msg, args[0], args[1]) as typeof msg;
     else validateBufferList(msg);
     const data = encodeMessage(msg);
     const port = validatePort(args[portIndex], 'Port', false);
-    return { data, port, ...readDestination(next, tail) };
+    return { data, port, ...readDestination(next, tail, socket._type) };
 }
 
 Socket.prototype.send = function send(this: Socket, msg: string | Uint8Array | Array<string | Uint8Array>, ...args: unknown[]): void {
-    this._doSend(normalizeSendArgs(this, msg, args));
+    const request = normalizeSendArgs(this, msg, args);
+    healthCheck(this);
+    this._doSend(request);
 };
 
 Socket.prototype._doSend = async function _doSend(this: Socket, request: SendRequest): Promise<void> {

@@ -178,18 +178,11 @@ function byteLengthOf(str: string, encoding: string): number {
     return utf8Encode(str).length;
 }
 
-// Shared by toString and the Slice helpers. Slice args: NaN/fractions go to 0,
-// anything out of range (or negative) throws ERR_OUT_OF_RANGE rather than
-// clamping, and an omitted `end` means the tail.
+// String conversion clamps byte offsets to the buffer, unlike indexed reads.
 function sliceToString(buf: Uint8Array, encoding: string, start: number, end: number): string {
     const len = buf.length;
-    const from = toIndex(start) ?? 0;
-    const to = end === undefined ? len : toIndex(end) ?? 0;
-    if (from > len || to > len || from < 0 || to < 0) {
-        const err = new RangeError('Index out of range');
-        (err as { code?: string }).code = 'ERR_OUT_OF_RANGE';
-        throw err;
-    }
+    const from = Math.min(len, Math.max(0, toIndex(start) ?? 0));
+    const to = end === undefined ? len : Math.min(len, Math.max(0, toIndex(end) ?? 0));
     if (to <= from) return '';
     return bytesToString(buf.subarray(from, to), encoding);
 }

@@ -53,7 +53,7 @@ Reflect.set(globalThis, '__cnoOnPromiseHookThisInstalled', (): void => {
  * not report that promise to the promise hook. An entry is dropped once the
  * inherited chain is settled, and anything left is collected with its promise.
  */
-const _continuationStores = new WeakMap<Promise<unknown>, StoreChain>();
+let _continuationStores = new WeakMap<Promise<unknown>, StoreChain>();
 
 export type AsyncId = number;
 export type TriggerAsyncId = number;
@@ -149,11 +149,9 @@ function createStoreChain(parent: StoreChain | null, store: AsyncLocalStorage<un
 }
 
 /**
- * The active stores as a persistent chain of (store, value) links rather than
- * a copied Map: `parent` is the chain an entry was derived from. run,
- * enterWith, exit and disable then allocate one link instead of copying the
- * whole map, and a captured state keeps its own chain, so a later write in
- * another context cannot be observed through it.
+ * A captured state keeps its own immutable chain. Updating the current context
+ * removes an older entry for that store, so repeated enterWith() calls do not
+ * retain values that no captured context still needs.
  */
 function lookupStore(chain: StoreChain, store: AsyncLocalStorage<unknown>): StoreChain | undefined {
     for (let node: StoreChain | null = chain; node !== null; node = node.parent) {
@@ -163,7 +161,21 @@ function lookupStore(chain: StoreChain, store: AsyncLocalStorage<unknown>): Stor
 }
 
 function pushStore(chain: StoreChain, store: AsyncLocalStorage<unknown>, value: unknown, hasValue: boolean): StoreChain {
-    return createStoreChain(chain, store, value, hasValue);
+    const prefix: StoreChain[] = [];
+    let previous: StoreChain | null = chain;
+    while (previous !== null && previous.store !== store) {
+        prefix.push(previous);
+        previous = previous.parent;
+    }
+    if (previous === null) return hasValue ? createStoreChain(chain, store, value, true) : chain;
+
+    // The root sentinel is never an AsyncLocalStorage, so this parent exists.
+    let next = previous.parent!;
+    for (let i = prefix.length - 1; i >= 0; i--) {
+        const entry = prefix[i];
+        next = createStoreChain(next, entry.store, entry.value, entry.hasValue);
+    }
+    return hasValue ? createStoreChain(next, store, value, true) : next;
 }
 
 function snapshotStores(): StoreChain {
@@ -249,8 +261,6 @@ function wrapCallback<T>(callback: T, state: AsyncState, finalize = false): T {
 function installPromiseHook(): void {
     if (_promiseHookStop) return;
     continuationSink = (result: Promise<unknown>, target: Promise<unknown>): void => {
-        const e = new Error();
-        console.log('SINK', _promiseStates.has(target), _continuationStores.has(target), String(e.stack).split(String.fromCharCode(10)).slice(2, 6).join(' <- '));
         const captured = _continuationStores.get(target);
         if (captured !== undefined) {
             _continuationStores.delete(target);
@@ -321,7 +331,7 @@ function uninstallPromiseHook(): void {
     _promiseHookStop();
     _promiseHookStop = null;
     continuationSink = null;
-    _continuationStores.clear();
+    _continuationStores = new WeakMap();
 }
 
 function destroyTimer(entry: TimerState): void {

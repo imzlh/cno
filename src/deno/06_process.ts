@@ -479,12 +479,7 @@ class Command implements Deno.Command {
     }
 }
 
-/** The command surface, exported so `index.ts` can resolve its lazy accessors
- *  with the values the registration below installs. */
-const COMMAND_EXPORTS = Object.freeze({ Command, ChildProcess, Process });
-export { COMMAND_EXPORTS };
-
-Object.assign(Deno, wrapFSns({
+const processFunctions = wrapFSns({
     kill(pid: number, signo?: number | Deno.Signal): void {
         proc.kill(pid, normalizeSignal(signo));
     },
@@ -511,9 +506,9 @@ Object.assign(Deno, wrapFSns({
         const { args, options } = commandArgs(optOrArgs, opt);
         return new Command(command, { ...options, args }).outputSync();
     },
-}));
+});
 
-// class constructor should NEVER being wrapped
-Reflect.set(Deno, "Command", Command);
-Reflect.set(Deno, "ChildProcess", ChildProcess);
-Reflect.set(Deno, "Process", Process);
+// Export exactly the installed surface: functions translate native errors, while
+// constructors must remain unwrapped so their private fields and prototypes work.
+export const PROCESS_EXPORTS = { ...processFunctions, Command, ChildProcess, Process };
+Object.assign(Deno, PROCESS_EXPORTS);

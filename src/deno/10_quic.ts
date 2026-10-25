@@ -508,6 +508,8 @@ function connectQuic(options: Deno.ConnectQuicOptions<boolean>): Promise<Deno.Qu
     return conn.handshake.then(() => conn);
 }
 
+export { QuicEndpointImpl as QuicEndpoint, connectQuic };
+
 Object.assign(Deno, {
     QuicEndpoint: QuicEndpointImpl,
     connectQuic,
