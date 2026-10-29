@@ -109,6 +109,13 @@ export async function buffer(stream: Consumable): Promise<InstanceType<typeof Bu
     return await readAll(stream);
 }
 
+export async function bytes(stream: Consumable): Promise<Uint8Array> {
+    const data = await readAll(stream);
+    const result = new Uint8Array(data.byteLength);
+    result.set(data);
+    return result;
+}
+
 export async function arrayBuffer(stream: Consumable): Promise<ArrayBuffer> {
     const data = await readAll(stream);
     return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
@@ -131,6 +138,7 @@ export default {
     arrayBuffer,
     blob,
     buffer,
+    bytes,
     json,
     text,
 };

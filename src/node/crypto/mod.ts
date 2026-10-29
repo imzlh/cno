@@ -3,6 +3,7 @@
 
 export type { BinaryInput, KeyInput, KeyWithOptions, KeyExportOptions, SecretJwk, AsymmetricKeyType, Hash, Hmac, Cipheriv, Decipheriv, CipherGCM, DecipherGCM, GcmEncryptResult, GcmDecryptResult, CipherInfo, Sign, Verify } from './types';
 export type { ScryptOptions } from './random';
+export type { RandomUUIDV7Options } from './misc';
 
 export { KeyObject, createPrivateKey, createPublicKey, createSecretKey } from './keys';
 
@@ -56,7 +57,7 @@ export {
 } from './random';
 
 export {
-    constants, getHashes, getCiphers, getCipherInfo, randomUUID,
+    constants, getHashes, getCiphers, getCipherInfo, randomUUID, randomUUIDv7,
     crc32, base64Encode, base64Decode, hexEncode, hexDecode,
 } from './misc';
 

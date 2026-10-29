@@ -546,6 +546,23 @@ export class AsyncLocalStorage<T = unknown> {
         _currentStores = pushStore(_currentStores, this, store, true);
     }
 
+    withScope(store: T): { dispose(): void; [Symbol.dispose](): void } {
+        const previous = lookupStore(_currentStores, this);
+        _currentStores = pushStore(_currentStores, this, store, true);
+        let active = true;
+        const dispose = (): void => {
+            if (!active) return;
+            active = false;
+            _currentStores = pushStore(
+                _currentStores,
+                this,
+                previous?.value,
+                previous?.hasValue ?? false,
+            );
+        };
+        return { dispose, [Symbol.dispose]: dispose };
+    }
+
     disable(): void {
         _currentStores = pushStore(_currentStores, this, undefined, false);
     }

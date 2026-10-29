@@ -11,6 +11,7 @@ import type { InspectOptions } from './inspect';
 
 const console = import.meta.use('console');
 const os = import.meta.use('os');
+const signalBinding = import.meta.use('signals');
 export { types };
 
 type AnyCallable = { bivarianceHack(...args: unknown[]): unknown }['bivarianceHack'];
@@ -84,6 +85,31 @@ export function isPrimitive(value: unknown): value is string | number | boolean 
 
 export function isBuffer(value: unknown): value is Uint8Array {
     return value instanceof Uint8Array;
+}
+
+const POSIX_SIGNALS: Record<string, number> = {
+    SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGILL: 4, SIGTRAP: 5,
+    SIGABRT: 6, SIGIOT: 6, SIGBUS: 7, SIGFPE: 8, SIGKILL: 9,
+    SIGUSR1: 10, SIGSEGV: 11, SIGUSR2: 12, SIGPIPE: 13, SIGALRM: 14,
+    SIGTERM: 15, SIGSTKFLT: 16, SIGCHLD: 17, SIGCONT: 18, SIGSTOP: 19,
+    SIGTSTP: 20, SIGTTIN: 21, SIGTTOU: 22, SIGURG: 23, SIGXCPU: 24,
+    SIGXFSZ: 25, SIGVTALRM: 26, SIGPROF: 27, SIGWINCH: 28,
+    SIGIO: 29, SIGPOLL: 29, SIGPWR: 30, SIGSYS: 31,
+};
+
+export function convertProcessSignalToExitCode(signal: NodeJS.Signals): number {
+    if (typeof signal !== 'string') {
+        const error = new TypeError(`The argument 'signalCode' is invalid. Received ${String(signal)}`) as TypeError & { code: string };
+        error.code = 'ERR_INVALID_ARG_VALUE';
+        throw error;
+    }
+    const signalNumber = signalBinding?.signals[signal] ?? POSIX_SIGNALS[signal];
+    if (typeof signalNumber !== 'number') {
+        const error = new TypeError(`The argument 'signalCode' is invalid. Received '${signal}'`) as TypeError & { code: string };
+        error.code = 'ERR_INVALID_ARG_VALUE';
+        throw error;
+    }
+    return 128 + signalNumber;
 }
 
 // Formatting
@@ -998,6 +1024,7 @@ export default {
     isDate,
     isPrimitive,
     isBuffer,
+    convertProcessSignalToExitCode,
     format,
     formatWithOptions,
     stripVTControlCharacters,

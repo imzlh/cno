@@ -31,6 +31,17 @@ export interface DatabaseSyncOptions {
     enableDoubleQuotedStringLiterals?: boolean;
     allowExtension?: boolean;
     timeout?: number;
+    readBigInts?: boolean;
+    returnArrays?: boolean;
+    allowBareNamedParameters?: boolean;
+    allowUnknownNamedParameters?: boolean;
+}
+
+export interface PrepareOptions {
+    readBigInts?: boolean;
+    returnArrays?: boolean;
+    allowBareNamedParameters?: boolean;
+    allowUnknownNamedParameters?: boolean;
 }
 
 export interface StatementColumnMetadata {
@@ -150,6 +161,17 @@ function optionalBoolean(options: object, name: string): boolean {
         });
     }
     return value === true;
+}
+
+function booleanOption(options: object, name: string, defaultValue: boolean): boolean {
+    const value = Reflect.get(options, name);
+    if (value === undefined) return defaultValue;
+    if (typeof value !== 'boolean') {
+        throw Object.assign(new TypeError(`The "options.${name}" argument must be a boolean.`), {
+            code: 'ERR_INVALID_ARG_TYPE',
+        });
+    }
+    return value;
 }
 
 function normalizeLocation(location: DatabaseLocation): string {
@@ -273,8 +295,13 @@ export class StatementSync {
         this.assertUsable();
         runStmt(this.stmt, this.normalizeParams(paramsFrom(anonymousParameters)));
         const rowid = nativeCall(() => this.db.raw().lastInsertRowid(this.readBigInts));
+        const changes = nativeCall(() => this.db.raw().changes());
         return {
-            changes: nativeCall(() => this.db.raw().changes()),
+            changes: this.readBigInts
+                ? (typeof changes === 'bigint'
+                    ? changes
+                    : Number.isSafeInteger(changes) ? BigInt(changes) : throwOutOfRange(changes))
+                : changes,
             // Same narrowing as convertCell: only an exact integer may be widened.
             lastInsertRowid: this.readBigInts
                 ? (typeof rowid === 'bigint'
@@ -423,7 +450,7 @@ export class StatementSync {
         if (!isBindRecord(params)) return params;
 
         const known = this.getNamedParameters();
-        if (known.size === 0) return params;
+        if (known.size === 0) return this.allowUnknownNamedParameters ? {} : params;
 
         const out: Record<string, unknown> = {};
         for (const [key, value] of Object.entries(params)) {
@@ -459,12 +486,19 @@ export class DatabaseSync {
     private handle: Sqlite3Handle | null = null;
     private readonly dbPath: string;
     private readonly allowExtension: boolean;
+    private readonly statementDefaults: Required<PrepareOptions>;
     private extensionLoadingEnabled: boolean;
     private mainLocation: string | null = null;
 
     constructor(location: DatabaseLocation, options: DatabaseSyncOptions = {}) {
         this.dbPath = normalizeLocation(location);
         this.allowExtension = optionalBoolean(options, 'allowExtension');
+        this.statementDefaults = {
+            readBigInts: booleanOption(options, 'readBigInts', false),
+            returnArrays: booleanOption(options, 'returnArrays', false),
+            allowBareNamedParameters: booleanOption(options, 'allowBareNamedParameters', true),
+            allowUnknownNamedParameters: booleanOption(options, 'allowUnknownNamedParameters', false),
+        };
         this.extensionLoadingEnabled = this.allowExtension;
         if (options.open === false) return;
         this.open(options.readOnly ? native.O_READONLY : DEFAULT_FLAGS);
@@ -528,8 +562,33 @@ export class DatabaseSync {
         nativeCall(() => this.raw().exec(sql));
     }
 
-    prepare(sql: string): StatementSync {
-        return new StatementSync(this, nativeCall(() => this.raw().prepare(sql)), sql);
+    prepare(sql: string, options: PrepareOptions = {}): StatementSync {
+        const handle = this.raw();
+        if (options === null || (typeof options !== 'object' && typeof options !== 'function')) {
+            throw Object.assign(new TypeError('The "options" argument must be an object.'), {
+                code: 'ERR_INVALID_ARG_TYPE',
+            });
+        }
+        const statementOptions: Required<PrepareOptions> = {
+            readBigInts: booleanOption(options, 'readBigInts', this.statementDefaults.readBigInts),
+            returnArrays: booleanOption(options, 'returnArrays', this.statementDefaults.returnArrays),
+            allowBareNamedParameters: booleanOption(
+                options,
+                'allowBareNamedParameters',
+                this.statementDefaults.allowBareNamedParameters,
+            ),
+            allowUnknownNamedParameters: booleanOption(
+                options,
+                'allowUnknownNamedParameters',
+                this.statementDefaults.allowUnknownNamedParameters,
+            ),
+        };
+        const statement = new StatementSync(this, nativeCall(() => handle.prepare(sql)), sql);
+        statement.setReadBigInts(statementOptions.readBigInts);
+        statement.setReturnArrays(statementOptions.returnArrays);
+        statement.setAllowBareNamedParameters(statementOptions.allowBareNamedParameters);
+        statement.setAllowUnknownNamedParameters(statementOptions.allowUnknownNamedParameters);
+        return statement;
     }
 
     /**

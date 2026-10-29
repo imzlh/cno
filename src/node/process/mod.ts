@@ -418,8 +418,10 @@ function resolveProcessEmitter(): ProcessEventEmitter {
 const processEE: ProcessEventEmitter = resolveProcessEmitter();
 type NextTickCallback = (...args: unknown[]) => void;
 type UncaughtCaptureCallback = (error: Error) => void;
+type AdditionalUncaughtCaptureCallback = (error: unknown) => boolean;
 type UncaughtCaptureState = {
     callback: UncaughtCaptureCallback | null;
+    callbacks: AdditionalUncaughtCaptureCallback[];
     dispatchInstalled: boolean;
     listenerInstalled: boolean;
     listener: () => void;
@@ -430,6 +432,7 @@ const UNCAUGHT_CAPTURE_SLOT = Symbol.for('cno.node.process.uncaughtCapture.v1');
 function resolveUncaughtCaptureState(): UncaughtCaptureState {
     const fresh: UncaughtCaptureState = {
         callback: null,
+        callbacks: [],
         dispatchInstalled: false,
         listenerInstalled: false,
         listener: () => void 0,
@@ -438,22 +441,41 @@ function resolveUncaughtCaptureState(): UncaughtCaptureState {
     try {
         const slots = globalThis as unknown as Record<symbol, UncaughtCaptureState | undefined>;
         const existing = slots[UNCAUGHT_CAPTURE_SLOT];
-        if (existing && 'callback' in existing) return existing;
+        if (existing && 'callback' in existing) {
+            existing.callbacks ??= [];
+            return existing;
+        }
         slots[UNCAUGHT_CAPTURE_SLOT] = fresh;
     } catch { /* fall back to per-copy state */ }
     return fresh;
 }
 
 const uncaughtCaptureState = resolveUncaughtCaptureState();
+const uncaughtCaptureFailures = new Set<unknown>();
+
+function markUncaughtCaptureFailure(error: unknown): void {
+    uncaughtCaptureFailures.add(error);
+}
+
+function runAdditionalUncaughtCaptureCallbacks(error: unknown): boolean {
+    const callbacks = uncaughtCaptureState.callbacks;
+    for (let i = callbacks.length - 1; i >= 0; i--) {
+        if (Reflect.apply(callbacks[i], undefined, [error]) === true) return true;
+    }
+    return false;
+}
 
 function installUncaughtCaptureDispatch(): void {
     if (uncaughtCaptureState.dispatchInstalled) return;
     const emit = processEE.emit;
     uncaughtCaptureState.rawEmit = emit;
     Reflect.set(processEE, 'emit', function (event: string | symbol, ...args: unknown[]): boolean {
-        if (event === 'uncaughtException' && uncaughtCaptureState.callback) {
-            Reflect.apply(uncaughtCaptureState.callback, undefined, [args[0]]);
-            return true;
+        if (event === 'uncaughtException') {
+            if (runAdditionalUncaughtCaptureCallbacks(args[0])) return true;
+            if (uncaughtCaptureState.callback) {
+                Reflect.apply(uncaughtCaptureState.callback, undefined, [args[0]]);
+                return true;
+            }
         }
         return Reflect.apply(emit, processEE, [event, ...args]);
     });
@@ -461,13 +483,19 @@ function installUncaughtCaptureDispatch(): void {
 }
 
 function syncUncaughtCaptureListener(): void {
-    if (uncaughtCaptureState.callback && !uncaughtCaptureState.listenerInstalled) {
+    const active = uncaughtCaptureState.callback !== null || uncaughtCaptureState.callbacks.length > 0;
+    if (active && !uncaughtCaptureState.listenerInstalled) {
         processEE.prependListener('uncaughtException', uncaughtCaptureState.listener);
         uncaughtCaptureState.listenerInstalled = true;
-    } else if (!uncaughtCaptureState.callback && uncaughtCaptureState.listenerInstalled) {
+    } else if (!active && uncaughtCaptureState.listenerInstalled) {
         processEE.off('uncaughtException', uncaughtCaptureState.listener);
         uncaughtCaptureState.listenerInstalled = false;
     }
+}
+
+function hasUserUncaughtExceptionListener(): boolean {
+    const internal = uncaughtCaptureState.listenerInstalled ? 1 : 0;
+    return processEE.listenerCount('uncaughtException') > internal;
 }
 
 installUncaughtCaptureDispatch();
@@ -532,12 +560,24 @@ const nativeTickDrain: boolean = installNativeTickDrain();
 
 function handleUncaughtException(error: unknown): void {
     processEE.emit('uncaughtExceptionMonitor', error, 'uncaughtException');
+    if (uncaughtCaptureFailures.delete(error)) throw error;
+    try {
+        if (runAdditionalUncaughtCaptureCallbacks(error)) return;
+    } catch (captureError) {
+        markUncaughtCaptureFailure(captureError);
+        throw captureError;
+    }
     if (uncaughtCaptureState.callback) {
-        Reflect.apply(uncaughtCaptureState.callback, undefined, [error]);
+        try {
+            Reflect.apply(uncaughtCaptureState.callback, undefined, [error]);
+        } catch (captureError) {
+            markUncaughtCaptureFailure(captureError);
+            throw captureError;
+        }
         return;
     }
-    if (processEE.listenerCount('uncaughtException') > 0) {
-        processEE.emit('uncaughtException', error, 'uncaughtException');
+    if (hasUserUncaughtExceptionListener()) {
+        emitUserProcessEvent('uncaughtException', error, 'uncaughtException');
         return;
     }
     throw error;
@@ -651,20 +691,35 @@ function ensureEventBridge(): void {
 
         if (name === ET.JOB_EXCEPTION) {
             processEE.emit('uncaughtExceptionMonitor', data, 'uncaughtException');
+            if (uncaughtCaptureFailures.delete(data)) return undefined;
+            try {
+                if (runAdditionalUncaughtCaptureCallbacks(data)) {
+                    ctx.handled = true;
+                    return true;
+                }
+            } catch (captureError) {
+                markUncaughtCaptureFailure(captureError);
+                ctx.handled = true;
+                queueMicrotask(() => { throw captureError; });
+                return true;
+            }
             if (uncaughtCaptureState.callback) {
                 try {
                     Reflect.apply(uncaughtCaptureState.callback, undefined, [data]);
-                } catch {
-                    return undefined;
+                } catch (captureError) {
+                    markUncaughtCaptureFailure(captureError);
+                    ctx.handled = true;
+                    queueMicrotask(() => { throw captureError; });
+                    return true;
                 }
                 ctx.handled = true;
                 return true;
             }
-            if (processEE.listenerCount('uncaughtException') === 0) {
+            if (!hasUserUncaughtExceptionListener()) {
                 return undefined;
             }
             try {
-                processEE.emit('uncaughtException', data, 'uncaughtException');
+                emitUserProcessEvent('uncaughtException', data, 'uncaughtException');
             } catch {
             }
             ctx.handled = true;
@@ -845,16 +900,16 @@ export const execPath: string = os.exePath;
 
 export let title: string = 'node';
 
-export const version: string = 'v24.1.0';
+export const version: string = 'v26.6.0';
 type CnoProcessVersions = NodeJS.ProcessVersions & {
     typescript: string;
 };
 
 const llhttpVersion = engine.versions.llhttp ?? '9.2.1';
 export const versions: CnoProcessVersions = {
-    node: '24.1.0',
+    node: '26.6.0',
     v8: engine.versions.quickjs,
-    modules: '127',
+    modules: '144',
     http_parser: llhttpVersion,
     llhttp: llhttpVersion,
     uv: engine.versions.uv,
@@ -869,7 +924,7 @@ export const versions: CnoProcessVersions = {
     unicode: '16.0',
     nghttp2: '1.62.1',
     acorn: '8.14.0',
-    typescript: '5.9.2',
+    typescript: '6.0.3',
 };
 
 export const config: NodeJS.ProcessConfig = {
@@ -901,7 +956,6 @@ export const config: NodeJS.ProcessConfig = {
 
 export const release: NodeJS.ProcessRelease = {
     name: 'node',
-    lts: 'Iron',
 };
 
 export const features: NodeJS.ProcessFeatures = {
@@ -913,8 +967,8 @@ export const features: NodeJS.ProcessFeatures = {
     tls_ocsp: true,
     tls_sni: true,
     cached_builtins: true,
-    inspector: false,
-    require_module: false,
+    inspector: true,
+    require_module: true,
     typescript: false,
 };
 
@@ -1614,6 +1668,16 @@ export function setUncaughtExceptionCaptureCallback(cb: ((err: Error) => void) |
     syncUncaughtCaptureListener();
 }
 
+export function addUncaughtExceptionCaptureCallback(cb: (err: unknown) => boolean): void {
+    if (typeof cb !== 'function') {
+        throw codeError(new TypeError(
+            `The "fn" argument must be of type function. Received ${String(cb)}`,
+        ), 'ERR_INVALID_ARG_TYPE');
+    }
+    uncaughtCaptureState.callbacks.push(cb);
+    syncUncaughtCaptureListener();
+}
+
 export function hasUncaughtExceptionCaptureCallback(): boolean {
     return uncaughtCaptureState.callback !== null;
 }
@@ -1688,6 +1752,7 @@ const processDefault = existingProcessDefault ?? {
     threadCpuUsage,
     constrainedMemory,
     availableMemory,
+    addUncaughtExceptionCaptureCallback,
     setUncaughtExceptionCaptureCallback,
     hasUncaughtExceptionCaptureCallback,
     traceDeprecation,
@@ -1728,7 +1793,10 @@ if (!existingProcessDefault && hasCredentialApi) Object.assign(processDefault, {
 });
 
 if (existingProcessDefault) {
+    Reflect.set(processDefault, 'version', version);
     Reflect.set(processDefault, 'versions', versions);
+    Reflect.set(processDefault, 'release', release);
+    Reflect.set(processDefault, 'features', features);
     Reflect.set(processDefault, 'report', report);
     Reflect.set(processDefault, 'umask', umask);
     Reflect.set(processDefault, 'getBuiltinModule', getBuiltinModule);
@@ -1738,6 +1806,7 @@ if (existingProcessDefault) {
     Reflect.set(processDefault, 'setSourceMapsEnabled', setSourceMapsEnabled);
     Reflect.set(processDefault, 'sourceMapsEnabled', sourceMapsEnabled);
     Reflect.set(processDefault, 'kill', kill);
+    Reflect.set(processDefault, 'addUncaughtExceptionCaptureCallback', addUncaughtExceptionCaptureCallback);
     Reflect.set(processDefault, 'setUncaughtExceptionCaptureCallback', setUncaughtExceptionCaptureCallback);
     Reflect.set(processDefault, 'hasUncaughtExceptionCaptureCallback', hasUncaughtExceptionCaptureCallback);
     Reflect.set(processDefault, 'emit', emit);

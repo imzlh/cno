@@ -109,3 +109,30 @@ export function getCipherInfo(nameOrNid: string | number): CipherInfo | undefine
 export function randomUUID(): string {
     return crypto.randomUUID();
 }
+
+export interface RandomUUIDV7Options {
+    disableEntropyCache?: boolean;
+}
+
+export function randomUUIDv7(options?: RandomUUIDV7Options): string {
+    if (options !== undefined && (options === null || typeof options !== 'object')) {
+        throw new TypeError('The "options" argument must be of type object.');
+    }
+    if (options?.disableEntropyCache !== undefined && typeof options.disableEntropyCache !== 'boolean') {
+        throw new TypeError('The "options.disableEntropyCache" property must be of type boolean.');
+    }
+
+    const bytes = new Uint8Array(16);
+    crypto.randomFill(bytes);
+
+    let timestamp = Date.now();
+    for (let i = 5; i >= 0; i--) {
+        bytes[i] = timestamp % 256;
+        timestamp = Math.floor(timestamp / 256);
+    }
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+
+    const hex = Array.from(bytes, byte => byte.toString(16).padStart(2, '0'));
+    return `${hex.slice(0, 4).join('')}-${hex.slice(4, 6).join('')}-${hex.slice(6, 8).join('')}-${hex.slice(8, 10).join('')}-${hex.slice(10).join('')}`;
+}

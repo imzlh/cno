@@ -281,6 +281,7 @@ declare namespace NodeJS {
             bigint(): bigint;
         };
         dlopen(module: { exports?: unknown }, filename: string, flags?: number): void;
+        addUncaughtExceptionCaptureCallback(fn: (err: unknown) => boolean): void;
         [key: string]: unknown;
     }
 }

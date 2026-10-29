@@ -60,6 +60,8 @@ function getBuiltinModules(): string[] {
     return getCtsInternal()?.builtinModules ?? [];
 }
 
+const PREFIX_ONLY_BUILTINS = ['node:sqlite', 'node:test'];
+
 type RequireExtensionMap = Record<string, ((module: Module, filename: string) => unknown) | undefined>;
 type CommonJSWrapper = (
     exports: unknown,
@@ -286,23 +288,11 @@ export function _pathFilename(filename: string): string {
     return filename;
 }
 
-/**
- * Builtins exposed ONLY under the `node:` prefix (`isBuiltin('test')` is false,
- * `isBuiltin('node:test')` is true). cts's builtin list is bare-name-only, and
- * resolvers use `isBuiltin` to decide what to externalise. Defined here only
- * because the builtinModules Proxy below needs it (a `const` is not hoisted).
- */
-const PREFIX_ONLY_BUILTINS = ['node:sea', 'node:sqlite', 'node:test', 'node:test/reporters'];
-
 const builtinModulesTarget: string[] = [];
-/**
- * Node's `builtinModules` lists bare names plus the PREFIX_ONLY_BUILTINS
- * entries, which cts does not track.
- */
 function allBuiltinModules(): string[] {
-    const bare = getBuiltinModules();
-    const missing = PREFIX_ONLY_BUILTINS.filter((name) => !bare.includes(name));
-    return missing.length === 0 ? bare : [...bare, ...missing];
+    const names = getBuiltinModules();
+    const missing = PREFIX_ONLY_BUILTINS.filter(name => !names.includes(name));
+    return missing.length === 0 ? names : [...names, ...missing];
 }
 export const builtinModules: string[] = new Proxy(builtinModulesTarget, {
     get: (_t, key) => Reflect.get(allBuiltinModules(), key),
@@ -699,7 +689,23 @@ function defaultCompileCacheDir(): string {
 
 let compileCacheDir: string | undefined;
 
-export function enableCompileCache(cacheDir?: string): { status: number; directory?: string; message?: string } {
+export function enableCompileCache(options?: string | { directory?: string; portable?: boolean }): { status: number; directory?: string; message?: string } {
+    if (options !== undefined && typeof options !== 'string' && (options === null || typeof options !== 'object')) {
+        throw Object.assign(new TypeError('The "options" argument must be a string or object'), {
+            code: 'ERR_INVALID_ARG_TYPE',
+        });
+    }
+    if (typeof options === 'object' && options.directory !== undefined && typeof options.directory !== 'string') {
+        throw Object.assign(new TypeError('The "options.directory" property must be a string'), {
+            code: 'ERR_INVALID_ARG_TYPE',
+        });
+    }
+    if (typeof options === 'object' && options.portable !== undefined && typeof options.portable !== 'boolean') {
+        throw Object.assign(new TypeError('The "options.portable" property must be a boolean'), {
+            code: 'ERR_INVALID_ARG_TYPE',
+        });
+    }
+    const cacheDir = typeof options === 'string' ? options : options?.directory;
     const status = compileCacheDir !== undefined
         ? constants.compileCacheStatus.ALREADY_ENABLED
         : constants.compileCacheStatus.ENABLED;
@@ -713,16 +719,13 @@ export function getCompileCacheDir(): string | undefined {
 
 export function flushCompileCache(): void {}
 
-/** See PREFIX_ONLY_BUILTINS near builtinModules for why the bare form is false. */
 export function isBuiltin(moduleName: string): boolean {
     if (typeof moduleName !== 'string') return false;
-    if (PREFIX_ONLY_BUILTINS.includes(moduleName)) return true;
-    // A bare name matching a prefix-only builtin is NOT a builtin, per Node.
-    if (!moduleName.startsWith('node:') && PREFIX_ONLY_BUILTINS.includes(`node:${moduleName}`)) {
-        return false;
-    }
+    const names = allBuiltinModules();
+    if (names.includes(moduleName)) return true;
+    if (!moduleName.startsWith('node:') && names.includes(`node:${moduleName}`)) return false;
     const bare = moduleName.startsWith('node:') ? moduleName.slice(5) : moduleName;
-    return getBuiltinModules().includes(bare);
+    return moduleName.startsWith('node:') && names.includes(bare);
 }
 
 export function syncBuiltinESMExports(): void {}
