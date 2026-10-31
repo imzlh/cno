@@ -184,7 +184,8 @@ function needsEventBridge(event: string | symbol): boolean {
     return event === 'exit' ||
         event === 'beforeExit' ||
         event === 'uncaughtException' ||
-        event === 'uncaughtExceptionMonitor';
+        event === 'uncaughtExceptionMonitor' ||
+        event === 'unhandledRejection';
 }
 
 function retryEventBridge(event: string | symbol): void {
@@ -588,7 +589,7 @@ function handleUncaughtException(error: unknown): void {
 
 const EVENT_MUX_SLOT = Symbol.for('cno.engine.eventMux.v1');
 
-type MuxEventContext = { handled: boolean; dispatched: boolean };
+type MuxEventContext = { handled: boolean; dispatched: boolean; rejectionEmitted?: boolean };
 type MuxReceiver = (name: number, data: unknown, ctx: MuxEventContext) => boolean | undefined;
 type MuxRegistry = {
     install(role: string, fn: MuxReceiver, priority?: number): () => void;
@@ -687,6 +688,15 @@ function ensureEventBridge(): void {
         if (name === beforeExitEventId()) {
             emitBeforeExit(typeof data === 'number' ? data : (exitCode ?? 0));
             return undefined;
+        }
+
+        if (name === ET.UNHANDLED_REJECTION) {
+            if (ctx.rejectionEmitted || processEE.listenerCount('unhandledRejection') === 0) return undefined;
+            const [promise, reason] = Array.isArray(data) ? data : [undefined, data];
+            ctx.rejectionEmitted = true;
+            try { emitUserProcessEvent('unhandledRejection', reason, promise); } catch { /* listener errors do not abort this dispatch */ }
+            ctx.handled = true;
+            return false;
         }
 
         if (name === ET.JOB_EXCEPTION) {

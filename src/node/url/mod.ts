@@ -8,6 +8,7 @@
 
 import { Buffer } from '../buffer';
 import path from '../path';
+import { getCtsBridge } from '../_internal/cts-bridge';
 
 export const URLSearchParams = globalThis.URLSearchParams;
 export const URLPattern = globalThis.URLPattern;
@@ -841,7 +842,7 @@ function assertFileUrl(value: URL): void {
 
 function runtimeSpecToLocalPath(spec: string): string | null {
     try {
-        const cts = Reflect.get(globalThis, Symbol.for('cts.internal'));
+        const cts = getCtsBridge();
         const specToLocalPath = cts && (typeof cts === 'object' || typeof cts === 'function')
             ? Reflect.get(cts, 'specToLocalPath')
             : undefined;

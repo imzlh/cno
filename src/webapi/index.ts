@@ -116,6 +116,7 @@ function bridgeEvent(
 ): boolean | undefined {
     // beforeunload returns its cancellation decision directly to the native loop.
     if (eventName === EV_BEFORE_UNLOAD) {
+        if (inWorker()) return undefined;
         const event = new Event('beforeunload', { cancelable: true });
         // Listener throws propagate so native teardown fails consistently.
         globalEvent.dispatchEvent(event);
@@ -158,14 +159,13 @@ function bridgeEvent(
     return undefined;
 }
 
-await installWebApiEventReceiver(bridgeEvent, () => {
-    // Standalone embeddings own the raw single-slot receiver.
-    onEvent((eventName: number, eventData: unknown) => {
-        const ctx: BridgeCtx = { handled: false, dispatched: false };
-        const ret = bridgeEvent(eventName, eventData, ctx);
-        if (eventName === EV_BEFORE_UNLOAD) return ret === true;
-        return eventName === EventType.JOB_EXCEPTION;
-    });
+await installWebApiEventReceiver(bridgeEvent, (dispatch) => {
+    // Standalone embeddings still share one receiver with the process bridge.
+    const marker = Object.getOwnPropertyDescriptor(globalThis, 'isWorker');
+    if (marker && typeof marker.value === 'boolean' && !marker.writable && !marker.configurable
+        && Object.getPrototypeOf(onEvent) === Function.prototype) {
+        onEvent(dispatch);
+    }
 });
 
 // worker

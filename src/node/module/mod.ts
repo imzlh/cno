@@ -5,6 +5,7 @@
 
 import { fileURLToPath, pathToFileURL } from '../url';
 import path from '../path';
+import { getCtsBridge, registerNodeModuleInterop } from '../_internal/cts-bridge';
 const { basename, dirname, isAbsolute: isAbsolutePath, join, resolve: resolvePath } = path;
 const os = import.meta.use('os');
 const fs = import.meta.use('fs');
@@ -53,7 +54,8 @@ type CtsInternal = {
 };
 
 function getCtsInternal(): CtsInternal | undefined {
-    return Reflect.get(globalThis, Symbol.for('cts.internal')) as CtsInternal | undefined;
+    const bridge = getCtsBridge();
+    return typeof bridge?.mkRequire === 'function' ? bridge as CtsInternal : undefined;
 }
 
 function getBuiltinModules(): string[] {
@@ -995,8 +997,8 @@ Object.defineProperty(Module, 'extensions', {
  * `Module._extensions`, and every `require()` created by CTS must observe the
  * replacement just like `createRequire()` does.
  */
-const ctsNodeModuleInterop = getCtsInternal()?.nodeModuleInterop;
-if (ctsNodeModuleInterop) {
+registerNodeModuleInterop((interop) => {
+    const ctsNodeModuleInterop = interop as NonNullable<CtsInternal['nodeModuleInterop']>;
     ctsNodeModuleInterop.getCache = () => _cacheRef();
     ctsNodeModuleInterop.getExtensions = () => _extensionsRef();
     ctsNodeModuleInterop.setCache = (value) => setCacheRef(value);
@@ -1008,7 +1010,7 @@ if (ctsNodeModuleInterop) {
         '.json': defaultJsonExtension,
         '.node': defaultNodeExtension,
     };
-}
+});
 
 // Baseline for patch detection. Must be read after the class body exists, and
 // after the statics are installed, or every load takes the JS path.
