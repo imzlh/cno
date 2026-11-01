@@ -19,19 +19,27 @@ const mapSet = Map.prototype.set;
 const setForEach = Set.prototype.forEach;
 const setClear = Set.prototype.clear;
 const setAdd = Set.prototype.add;
+const regexpSourceGetter = Object.getOwnPropertyDescriptor(RegExp.prototype, 'source')?.get;
 const REGEXP_FLAGS = [
-    ['hasIndices', 'd'],
-    ['global', 'g'],
-    ['ignoreCase', 'i'],
-    ['multiline', 'm'],
-    ['dotAll', 's'],
-    ['unicode', 'u'],
-    ['unicodeSets', 'v'],
-    ['sticky', 'y'],
+    [Object.getOwnPropertyDescriptor(RegExp.prototype, 'hasIndices')?.get, 'd'],
+    [Object.getOwnPropertyDescriptor(RegExp.prototype, 'global')?.get, 'g'],
+    [Object.getOwnPropertyDescriptor(RegExp.prototype, 'ignoreCase')?.get, 'i'],
+    [Object.getOwnPropertyDescriptor(RegExp.prototype, 'multiline')?.get, 'm'],
+    [Object.getOwnPropertyDescriptor(RegExp.prototype, 'dotAll')?.get, 's'],
+    [Object.getOwnPropertyDescriptor(RegExp.prototype, 'unicode')?.get, 'u'],
+    [Object.getOwnPropertyDescriptor(RegExp.prototype, 'unicodeSets')?.get, 'v'],
+    [Object.getOwnPropertyDescriptor(RegExp.prototype, 'sticky')?.get, 'y'],
 ] as const;
 const typedArrayTagGetter = Object.getOwnPropertyDescriptor(
     Object.getPrototypeOf(Uint8Array.prototype), Symbol.toStringTag,
 )?.get;
+const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype);
+const typedArrayBufferGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')?.get;
+const typedArrayByteOffsetGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteOffset')?.get;
+const typedArrayByteLengthGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteLength')?.get;
+const dataViewBufferGetter = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer')?.get;
+const dataViewByteOffsetGetter = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset')?.get;
+const dataViewByteLengthGetter = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength')?.get;
 const sharedArrayBufferByteLengthGetter = typeof SharedArrayBuffer === 'function'
     ? Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength')?.get
     : undefined;
@@ -181,13 +189,14 @@ function arrayBufferMaxByteLength(buffer: ArrayBuffer): number {
 }
 
 function regexpSource(value: RegExp): string {
-    return value.source;
+    if (!regexpSourceGetter) throw dataCloneError('RegExp could not be cloned');
+    return Reflect.apply(regexpSourceGetter, value, []) as string;
 }
 
 function regexpFlags(value: RegExp): string {
     let flags = '';
-    for (const [property, flag] of REGEXP_FLAGS) {
-        if (Reflect.get(value, property)) flags += flag;
+    for (const [getter, flag] of REGEXP_FLAGS) {
+        if (getter && Reflect.apply(getter, value, [])) flags += flag;
     }
     return flags;
 }
@@ -262,6 +271,11 @@ function typedArrayKind(value: ArrayBufferView): [TypedArrayConstructor, number]
     const kind = typeof tag === 'string' ? typedArrayCtors[tag] : undefined;
     if (!kind) throw dataCloneError('Unsupported ArrayBuffer view');
     return kind;
+}
+
+function viewSlot<T>(getter: ((this: unknown) => T) | undefined, value: ArrayBufferView): T {
+    if (!getter) throw dataCloneError('Unsupported ArrayBuffer view');
+    return Reflect.apply(getter, value, []) as T;
 }
 
 function prepareTransfers<TPort extends object, TPortClone extends object = TPort>(
@@ -350,20 +364,23 @@ function cloneView<TPort extends object, TPortClone extends object>(
     const cached = seen.get(value);
     if (ArrayBuffer.isView(cached)) return cached;
     const isDataView = engine.isDataView(value);
-    const source = value.buffer;
+    const source = viewSlot<ArrayBufferLike>(isDataView ? dataViewBufferGetter : typedArrayBufferGetter, value);
     const buffer = engine.isArrayBuffer(source)
         ? state.buffers.get(source as ArrayBuffer) ?? cloneBuffer(source as ArrayBuffer, state)
         : cloneSharedBuffer(source as SharedArrayBuffer, state);
 
     if (isDataView) {
-        const view = value as DataView;
-        const out = new DataView(buffer as ArrayBuffer, view.byteOffset, view.byteLength);
+        const byteOffset = viewSlot<number>(dataViewByteOffsetGetter, value);
+        const byteLength = viewSlot<number>(dataViewByteLengthGetter, value);
+        const out = new DataView(buffer as ArrayBuffer, byteOffset, byteLength);
         seen.set(value, out);
         return out;
     }
 
     const [ctor, bytesPerElement] = typedArrayKind(value);
-    const out = new ctor(buffer as ArrayBuffer, value.byteOffset, value.byteLength / bytesPerElement);
+    const byteOffset = viewSlot<number>(typedArrayByteOffsetGetter, value);
+    const byteLength = viewSlot<number>(typedArrayByteLengthGetter, value);
+    const out = new ctor(buffer as ArrayBuffer, byteOffset, byteLength / bytesPerElement);
     seen.set(value, out);
     return out;
 }
