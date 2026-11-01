@@ -229,7 +229,9 @@ class Blob implements globalThis.Blob {
         const chunks: Uint8Array[] = [];
 
         for (const part of this.#parts) {
-            if (part instanceof Blob) chunks.push(part.#toBuffer());
+            // Blob subclasses can provide lazy/native storage through the same
+            // internal byte protocol used by structured clone and object URLs.
+            if (part instanceof Blob) chunks.push(part[blobBytesSymbol]());
             else chunks.push(blobPartBytes(part));
         }
 
