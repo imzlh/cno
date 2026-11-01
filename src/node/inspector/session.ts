@@ -2,8 +2,6 @@ import { EventEmitter } from '../events'
 import { isMainThread } from '../worker_threads'
 import { InspectorProtocolClient, type ProtocolResponse } from './client'
 
-const INSPECTOR_BRIDGE = Symbol.for('cno.inspector.bridge')
-
 export interface InspectorBridge {
 	open(options?: { port?: number; host?: string; wait?: boolean }): Promise<string>
 	close(): Promise<void>
@@ -24,7 +22,13 @@ function isInspectorBridge(value: unknown): value is InspectorBridge {
 }
 
 export function getInspectorBridge(): InspectorBridge | null {
-	const value = Reflect.get(globalThis, INSPECTOR_BRIDGE)
+	// The CLI inspector publishes itself on the `cno.inspector` evbus channel.
+	let value: unknown
+	try {
+		value = import.meta.use('evbus')?.get('cno.inspector', 'bridge')
+	} catch {
+		return null
+	}
 	return isInspectorBridge(value) ? value : null
 }
 

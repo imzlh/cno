@@ -12,12 +12,14 @@ const os = import.meta.use('os');
 const fs = import.meta.use('fs');
 const console = import.meta.use('console');
 const engine = import.meta.use('engine');
+const evbus = import.meta.use('evbus');
 const smap = import.meta.use('sourcemap');
 
-engine.onEvent((e, r) => {
-    if (e == engine.EventType.UNHANDLED_REJECTION)
-        console.error('Uncaught (in promise):', r[1]);
-    return true;
+evbus.on(evbus.RUNTIME_NAMESPACE, evbus.RUNTIME_EVENT, ({ name, data }) => {
+    if (name != engine.EventType.UNHANDLED_REJECTION) return undefined;
+    console.error('Uncaught (in promise):', data[1]);
+    // Native rejection dispatch continues only for an explicit false result.
+    return false;
 });
 
 // ── Helpers ────────────────────────────────────────────────────────────────

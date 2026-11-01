@@ -6,6 +6,7 @@ import { wrapFSErr } from "../utils/wrap";
 import { errors } from "./01_errors";
 import { defineLazy } from "../utils/lazy-accessor";
 import { getEnv } from "../utils/env";
+import { dispatchLoadEvent, dispatchUnloadEvent } from "../webapi/event-mux-bootstrap";
 
 const os = import.meta.use('os');
 const engine = import.meta.use('engine');
@@ -16,22 +17,21 @@ const asyncfs = import.meta.use('asyncfs');
 
 const kInternal = Symbol('Deno.internal');
 
-/** Loaded tolerantly: no build-time cts dependency. See docs/webapi-notes.md */
-type LifecycleMux = {
-    dispatchLoadEvent(): boolean;
-    dispatchUnloadEvent(): boolean;
-};
+// ─── CLI runtime channel ─────────────────────────────────────────────────────
 
-let lifecycleMux: LifecycleMux | null | undefined;
-
-async function loadLifecycleMux(): Promise<LifecycleMux | null> {
-    if (lifecycleMux !== undefined) return lifecycleMux;
+/** Read one value from the CLI-owned `cno.runtime` evbus channel. */
+function readRuntimeChannel<T>(key: string): T | undefined {
     try {
-        lifecycleMux = await import('../../../cts/src/runtime/event-mux') as LifecycleMux;
+        return import.meta.use('evbus')?.get('cno.runtime', key) as T | undefined;
     } catch {
-        lifecycleMux = null;
+        return undefined;
     }
-    return lifecycleMux;
+}
+
+/** Entry URL the CLI published before dispatch; absent in library embeddings. */
+function mainScriptUrl(): string | undefined {
+    const value = readRuntimeChannel<string>('mainScript');
+    return typeof value === 'string' ? value : undefined;
 }
 
 // ─── Snapshot helpers ────────────────────────────────────────────────────────
@@ -701,7 +701,7 @@ export async function startTest(contextName = '<core>', test = true, bench = tru
     // 'load' before the suite, 'unload' after; evaluate lazy feature modules
     // before the first test body. Docs: docs/webapi-notes.md
     await Promise.all(lazyModules);
-    if (test) (await loadLifecycleMux())?.dispatchLoadEvent();
+    if (test) dispatchLoadEvent();
 
     // reportError / uncaught errors during a test fail the suite (specs/test/report_error).
     // Listeners may preventDefault on cancelable ErrorEvents (reportError is cancelable).
@@ -885,7 +885,7 @@ export async function startTest(contextName = '<core>', test = true, bench = tru
         if (test) {
             try { globalThis.removeEventListener('error', onSuiteError); } catch { /* */ }
             // Mandatory: a 'load' listener's setInterval would hang the run.
-            try { lifecycleMux?.dispatchUnloadEvent(); } catch { /* a listener threw; not fatal */ }
+            try { dispatchUnloadEvent(); } catch { /* a listener threw; not fatal */ }
         }
     }
 }
@@ -914,22 +914,6 @@ function getTimerID(timer: unknown): number {
 const uname = os.uname();
 let denoExitCode = 0;
 
-// cno brings up `process` lazily: boot only records its loader through
-// `_internal/process-lazy.ts`, so this read installs the getter and returns the
-// real singleton.
-type LazyProcessSlot = {
-    /** Installs the getter under the name Deno published `globalThis.process` as. */
-    installLazyProcessGlobal(globalName?: string): void;
-};
-
-/** Publish `globalThis.process` over Deno's placeholder; a no-op without cno. */
-function installProcessGlobal(): void {
-    const slot = Reflect.get(globalThis, Symbol.for('cno.node.process.lazy')) as LazyProcessSlot | undefined;
-    if (typeof slot?.installLazyProcessGlobal !== 'function') return;
-    const descriptor = Reflect.getOwnPropertyDescriptor(globalThis, 'process');
-    slot.installLazyProcessGlobal(descriptor?.get?.name || 'process');
-}
-
 function syncProcessExitCode(value: number): void {
     const proc = Reflect.get(globalThis, 'process');
     if ((typeof proc === 'object' || typeof proc === 'function') && proc !== null) {
@@ -947,8 +931,6 @@ function setDenoExitCode(value: unknown): void {
     denoExitCode = value;
     syncProcessExitCode(value);
 }
-
-installProcessGlobal();
 
 Object.defineProperty(globalThis, "Deno", {
     value: {
@@ -991,7 +973,8 @@ Object.defineProperty(globalThis, "Deno", {
         cwd: denoCwd,
         chdir: denoChdir,
         get mainModule() {
-            return String(Reflect.get(globalThis, '__mainScript') ?? '');
+            // The CLI publishes the entry URL on its `cno.runtime` channel.
+            return String(mainScriptUrl() ?? '');
         },
         execPath: () => os.exePath,
         noColor: safeGetEnv("NO_COLOR") ? true : false,

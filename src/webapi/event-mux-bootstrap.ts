@@ -1,145 +1,114 @@
-type EventContext = { handled: boolean; dispatched: boolean };
-type EventReceiver = (eventName: number, eventData: unknown, ctx: EventContext) => boolean | undefined;
-type NativeReceiver = (eventName: number, eventData: unknown) => boolean;
-
-type Entry = { role: string; fn: EventReceiver; priority: number; seq: number };
-type Registry = {
-    version: 1;
-    entries: Entry[];
-    seq: number;
-    native: boolean;
-    dispatchDepth: number;
-    loadFired: boolean;
-    unloadFired: boolean;
-    nativeReceiver?: NativeReceiver;
-    install(role: string, fn: EventReceiver, priority?: number): () => void;
-    has(role: string): boolean;
-    roles(): string[];
-    dispatch: NativeReceiver;
+export type RuntimeEventContext = {
+    handled: boolean;
+    dispatched: boolean;
+    rejectionEmitted?: boolean;
 };
 
-interface EventMuxModule {
-    WEBAPI_ROLE: string;
-    PRIORITY_WEBAPI: number;
-    installEventReceiver(role: string, receiver: EventReceiver, priority?: number): () => void;
+export type RuntimeEventReceiver = (
+    eventName: number,
+    eventData: unknown,
+    context: RuntimeEventContext,
+) => boolean | undefined;
+
+export type RuntimeEventFrame = {
+    name: number;
+    data: unknown;
+    context: RuntimeEventContext;
+};
+
+export interface RuntimeEventBus {
+    readonly RUNTIME_NAMESPACE: string;
+    readonly RUNTIME_EVENT: string;
+    on(
+        namespace: string,
+        event: string,
+        listener: (frame: RuntimeEventFrame) => boolean | undefined,
+        priority?: number,
+    ): () => void;
 }
 
-type MuxLoader = () => Promise<EventMuxModule>;
+export const PRIORITY_WEBAPI = 100;
 
-const MUX_SPECIFIER = '../../../cts/src/runtime/event-mux';
-const MUX_SLOT = Symbol.for('cno.engine.eventMux.v1');
+const runtimeEventBus = import.meta.use('evbus') as RuntimeEventBus;
+const LIFECYCLE_STATE_SLOT = Symbol.for('cno.runtime.lifecycle.v1');
 
-function hasMuxRegistry(): boolean {
-    if (Reflect.get(globalThis, MUX_SLOT) != null) return true;
+type LifecycleState = {
+    loadFired: boolean;
+    unloadFired: boolean;
+};
+
+const fallbackLifecycleState: LifecycleState = { loadFired: false, unloadFired: false };
+const INTERNAL_EVENT_LISTENER = Symbol.for('cno.internal.eventTargetListener');
+
+function lifecycleState(): LifecycleState {
+    const target = globalThis as unknown as Record<symbol, unknown>;
+    const existing = target[LIFECYCLE_STATE_SLOT];
+    if (existing && typeof existing === 'object') {
+        const state = existing as Partial<LifecycleState>;
+        if (typeof state.loadFired === 'boolean' && typeof state.unloadFired === 'boolean') {
+            return state as LifecycleState;
+        }
+    }
+    const state = fallbackLifecycleState;
     try {
-        const use = (import.meta as ImportMeta & { use?: (name: string) => unknown }).use;
-        const bus = use?.('evbus') as { has?: (namespace: string, key: string) => boolean } | null;
-        return bus?.has?.('cno.engine.eventMux.v1', 'state') === true;
+        target[LIFECYCLE_STATE_SLOT] = state;
+    } catch {
+        // An exotic global can reject symbol properties; this copy still stays idempotent.
+    }
+    return state;
+}
+
+/** Track lifecycle events dispatched by another bundle without importing it. */
+export function installLifecycleEventObserver(
+    subscribe: (type: 'load' | 'unload', listener: () => void) => void,
+): void {
+    const onLoad = () => { lifecycleState().loadFired = true; };
+    const onUnload = () => { lifecycleState().unloadFired = true; };
+    Reflect.set(onLoad, INTERNAL_EVENT_LISTENER, true);
+    Reflect.set(onUnload, INTERNAL_EVENT_LISTENER, true);
+    subscribe('load', onLoad);
+    subscribe('unload', onUnload);
+}
+
+/** Subscribe Web APIs directly to the runtime event stream. */
+export function installWebApiEventReceiver(
+    receiver: RuntimeEventReceiver,
+    bus: RuntimeEventBus = runtimeEventBus,
+): () => void {
+    return bus.on(
+        bus.RUNTIME_NAMESPACE,
+        bus.RUNTIME_EVENT,
+        ({ name, data, context }) => receiver(name, data, context),
+        PRIORITY_WEBAPI,
+    );
+}
+
+function dispatchLifecycleEvent(type: 'load' | 'unload'): boolean {
+    try {
+        globalThis.dispatchEvent(new Event(type));
+        return true;
     } catch {
         return false;
     }
 }
 
-function isMissingMuxModule(error: unknown): boolean {
-    if (!(error instanceof Error)) return false;
-    const code = Reflect.get(error, 'code');
-    return (code === 'ERR_MODULE_NOT_FOUND' || code === 'MODULE_NOT_FOUND')
-        && Reflect.get(error, 'url') === new URL(MUX_SPECIFIER, import.meta.url).href;
+/** Fire the test harness load event once without depending on CTS. */
+export function dispatchLoadEvent(): boolean {
+    const state = lifecycleState();
+    if (state.loadFired) return false;
+    state.loadFired = true;
+    return dispatchLifecycleEvent('load');
 }
 
-function loadMuxModule(): Promise<EventMuxModule> {
-    return import('../../../cts/src/runtime/event-mux');
+/** Claim this realm's unload event before either native exit or the test harness fires it. */
+export function claimUnloadEvent(): boolean {
+    const state = lifecycleState();
+    if (Reflect.get(globalThis, 'isWorker') === true || state.unloadFired) return false;
+    state.unloadFired = true;
+    return true;
 }
 
-function eventId(name: string, fallback: number): number {
-    try {
-        const use = (import.meta as ImportMeta & { use?: (name: string) => unknown }).use;
-        const engine = use?.('engine') as { EventType?: Record<string, unknown> } | null;
-        const id = engine?.EventType?.[name];
-        return typeof id === 'number' ? id : fallback;
-    } catch {
-        return fallback;
-    }
-}
-
-/** Minimal same-realm registry when CNO is embedded without CTS. */
-function createStandaloneMux(): Registry {
-    const jobException = eventId('JOB_EXCEPTION', 1);
-    const beforeUnload = eventId('BEFORE_UNLOAD', 4);
-    const beforeExit = eventId('BEFORE_EXIT', 5);
-    const mux: Registry = {
-        version: 1, entries: [], seq: 0, native: false, dispatchDepth: 0,
-        loadFired: false, unloadFired: false,
-        install(role, fn, priority = 0) {
-            const index = mux.entries.findIndex((entry) => entry.role === role);
-            if (index !== -1) mux.entries.splice(index, 1);
-            const entry = { role, fn, priority, seq: mux.seq++ };
-            mux.entries.push(entry);
-            mux.entries.sort((a, b) => (b.priority - a.priority) || (a.seq - b.seq));
-            return () => {
-                const index = mux.entries.indexOf(entry);
-                if (index !== -1) mux.entries.splice(index, 1);
-            };
-        },
-        has(role) { return mux.entries.some((entry) => entry.role === role); },
-        roles() { return mux.entries.map((entry) => entry.role); },
-        dispatch(name, data) {
-            const ctx: EventContext = { handled: false, dispatched: false };
-            let result: boolean | undefined;
-            mux.dispatchDepth++;
-            try {
-                for (const entry of mux.entries.slice()) {
-                    let value: boolean | undefined;
-                    try {
-                        value = entry.fn(name, data, ctx);
-                    } catch (error) {
-                        if (name === beforeUnload || name === beforeExit) throw error;
-                        continue;
-                    }
-                    if (typeof value === 'boolean') {
-                        result = name === beforeUnload ? result === true || value : value;
-                    }
-                }
-                return result ?? (name === jobException);
-            } finally {
-                mux.dispatchDepth--;
-            }
-        },
-    };
-    return mux;
-}
-
-/** Install through CTS when present; otherwise retain a shared local registry. */
-export async function installWebApiEventReceiver(
-    receiver: EventReceiver,
-    installStandalone: (dispatch: NativeReceiver) => void,
-    loadMux: MuxLoader = loadMuxModule,
-): Promise<void> {
-    let mux: EventMuxModule;
-    try {
-        mux = await loadMux();
-    } catch (error) {
-        if (!isMissingMuxModule(error)) throw error;
-        const existing = Reflect.get(globalThis, MUX_SLOT) as Registry | undefined;
-        if (existing?.version === 1 && typeof existing.install === 'function') {
-            existing.install('webapi', receiver, 100);
-            return;
-        }
-        if (hasMuxRegistry()) throw error;
-        const standalone = createStandaloneMux();
-        standalone.install('webapi', receiver, 100);
-        standalone.nativeReceiver = (name, data) => standalone.dispatch(name, data);
-        Reflect.set(globalThis, MUX_SLOT, standalone);
-        try {
-            installStandalone(standalone.nativeReceiver);
-            standalone.native = true;
-        } catch (installError) {
-            if (Reflect.get(globalThis, MUX_SLOT) === standalone) Reflect.deleteProperty(globalThis, MUX_SLOT);
-            throw installError;
-        }
-        return;
-    }
-
-    // Do not fall back after this point: onEvent() would replace the mux slot.
-    mux.installEventReceiver(mux.WEBAPI_ROLE, receiver, mux.PRIORITY_WEBAPI);
+/** Fire the test harness unload event once without depending on CTS. */
+export function dispatchUnloadEvent(): boolean {
+    return claimUnloadEvent() && dispatchLifecycleEvent('unload');
 }

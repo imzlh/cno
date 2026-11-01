@@ -43,9 +43,7 @@ import { IOpaque } from '../_internal/inject';
 import { flattenPrototype } from '../_internal/prototype';
 import { STATUS_CODES } from './constants';
 export type { IncomingHttpHeaders, OutgoingHttpHeader, OutgoingHttpHeaders, IncomingMessage, OutgoingMessage, ServerResponse, ListenOptions, Server, RequestListener } from './types';
-type NativeHttpModule = typeof http & { __cno: IOpaque };
-
-const { createServer: createHttpServer } = (http as NativeHttpModule).__cno;
+const { createServer: createHttpServer } = (import.meta.use('evbus')?.get('cno.node', 'httpInternals') ?? {}) as IOpaque;
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 

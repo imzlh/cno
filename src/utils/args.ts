@@ -1,4 +1,5 @@
 const os = import.meta.use('os');
+const evbus = import.meta.use('evbus');
 
 import { isAbsolutePath, isDrivePath, resolvePath } from './path';
 
@@ -111,7 +112,7 @@ let args: NormalizedArgs = parseArgs(os.args.slice(1), os.args[0]);
 
 export default function setArgs(usrargs: Args) {
     args = normalizeArgs(usrargs);
-    const refresh = Reflect.get(os, '__cno_process_args_refresh');
+    const refresh = evbus.get<() => void>('cno.args', 'refresh');
     if (typeof refresh === 'function') refresh();
 }
 
@@ -174,9 +175,9 @@ export function buildNodeExecArgv(): string[] {
     return [...args.kernelArgs, ...evalExecArgvTokens(args.entry)];
 }
 
-// Shared namespace on `os` so cno/src/node/* can reach these without importing
-// across the node/ boundary (see AGENT.md).
-Reflect.set(os, '__cno_args', {
+// Shared with the node process polyfill through evbus: cache-installed node
+// modules cannot import across the node/ boundary (see AGENT.md).
+evbus.set('cno.args', 'surface', {
     set: setArgs,
     get: getArgs,
     denoArgs: buildDenoArgs,

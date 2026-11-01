@@ -2,17 +2,15 @@ import { createServer } from "@cnojs/http/server";
 import processDefault from '../process';
 import { Buffer } from '../buffer';
 
-const http = import.meta.use('http');
+const http = import.meta.use('evbus') && import.meta.use('http');
 
 export interface IOpaque {
     createServer: typeof createServer;
 }
 
-// http.__cno for node:http/server
-const httpInternals: IOpaque = {
-    createServer
-};
-Reflect.set(http, '__cno', httpInternals);
+// node:http/server is cache-installed and cannot import @cnojs/http, so the
+// bootstrap publishes the binding on the `cno.node` evbus channel.
+import.meta.use('evbus').set('cno.node', 'httpInternals', { createServer });
 
 // global process inject
 Object.defineProperties(globalThis, {

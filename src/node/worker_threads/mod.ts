@@ -101,8 +101,9 @@ function createReadyToken(threadId: number): string {
 
 // Worker os.args omits the parent's CLI flags, so forward the resolved config.
 function currentRuntimeConfig(): unknown {
+    // Resolved config published by the CLI on its `cno.runtime` channel.
     try {
-        return Reflect.get(globalThis, '__cno_worker_runtime_config');
+        return import.meta.use('evbus')?.get('cno.runtime', 'workerRuntimeConfig');
     } catch {
         return undefined;
     }

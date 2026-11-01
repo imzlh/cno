@@ -1,8 +1,12 @@
 import { fromError, PromiseRejectionEvent, EventTarget } from './events';
-import { installWebApiEventReceiver } from './event-mux-bootstrap';
+import {
+    claimUnloadEvent,
+    installLifecycleEventObserver,
+    installWebApiEventReceiver,
+} from './event-mux-bootstrap';
 import { defineLazy } from '../utils/lazy-accessor';
 
-const { onEvent, EventType } = import.meta.use('engine');
+const { EventType } = import.meta.use('engine');
 
 // basic polyfills
 Object.defineProperties(globalThis, {
@@ -58,11 +62,15 @@ await import('./navigator');
 // abort-signal polyfill
 await import('./abort');
 
+// scheduler.postTask / TaskController
+await import('./scheduler');
+
 // messaging (MessageChannel, MessagePort)
 await import('./messaging');
 
 // global event
 const globalEvent = new EventTarget();
+installLifecycleEventObserver((type, listener) => globalEvent.addEventListener(type, listener));
 Reflect.set(globalThis, 'addEventListener', globalEvent.addEventListener.bind(globalEvent));
 Reflect.set(globalThis,'removeEventListener', globalEvent.removeEventListener.bind(globalEvent));
 Reflect.set(globalThis, 'dispatchEvent', globalEvent.dispatchEvent.bind(globalEvent));
@@ -88,13 +96,10 @@ defineGlobalHandler('onload', 'load');
 defineGlobalHandler('onunload', 'unload');
 defineGlobalHandler('onbeforeunload', 'beforeunload');
 
-// Web lifecycle events share the CTS event multiplexer when available.
+// Web lifecycle events subscribe directly to the runtime event bus.
 type BridgeCtx = { handled: boolean; dispatched: boolean };
 
-/**
- * EV_BEFORE_UNLOAD, read from the runtime enum (fallback 4): the hand-maintained
- * `types/engine.d.ts` enum stops at LOAD and drifts from the binary.
- */
+/** EV_BEFORE_UNLOAD, with a fallback for older type/runtime bundles. */
 const EV_BEFORE_UNLOAD: number = (() => {
     const v = (EventType as unknown as Record<string, unknown>)?.BEFORE_UNLOAD;
     return typeof v === 'number' ? v : 4;
@@ -114,19 +119,23 @@ function bridgeEvent(
     eventData: unknown,
     ctx: BridgeCtx,
 ): boolean | undefined {
+    if (ctx.dispatched) return undefined;
+
     // beforeunload returns its cancellation decision directly to the native loop.
     if (eventName === EV_BEFORE_UNLOAD) {
         if (inWorker()) return undefined;
         const event = new Event('beforeunload', { cancelable: true });
         // Listener throws propagate so native teardown fails consistently.
         globalEvent.dispatchEvent(event);
+        ctx.dispatched = true;
+        if (event.defaultPrevented) ctx.handled = true;
         return event.defaultPrevented;
     }
 
     let event;
     switch (eventName) {
         case EventType.EXIT:
-            if (!inWorker()) globalEvent.dispatchEvent(new Event('unload'));
+            if (claimUnloadEvent()) globalEvent.dispatchEvent(new Event('unload'));
             event = new Event('exit');
             break;
         case EventType.JOB_EXCEPTION:
@@ -159,14 +168,7 @@ function bridgeEvent(
     return undefined;
 }
 
-await installWebApiEventReceiver(bridgeEvent, (dispatch) => {
-    // Standalone embeddings still share one receiver with the process bridge.
-    const marker = Object.getOwnPropertyDescriptor(globalThis, 'isWorker');
-    if (marker && typeof marker.value === 'boolean' && !marker.writable && !marker.configurable
-        && Object.getPrototypeOf(onEvent) === Function.prototype) {
-        onEvent(dispatch);
-    }
-});
+installWebApiEventReceiver(bridgeEvent);
 
 // worker
 await import('./worker');

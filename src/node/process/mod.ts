@@ -27,6 +27,7 @@ const streams = import.meta.use('streams');
 const console = import.meta.use('console');
 const errMod = import.meta.use('error');
 const napi = import.meta.use('nodeapi');
+const evbus = import.meta.use('evbus');
 // import.meta.use is transformed statically and must remain at module scope.
 const workerBinding = import.meta.use('worker');
 
@@ -37,7 +38,6 @@ interface CnoProcessArgs {
 }
 
 type ProcessOsModule = typeof os & {
-    __cno_args: CnoProcessArgs;
     umask?: (mask?: number) => number;
     getgroups?: () => number[];
 };
@@ -48,7 +48,8 @@ const isWindows = os.platform === 'windows' || os.platform === 'win32';
 const emulatedUmaskBits = isWindows ? 0o600 : 0o777;
 let emulatedUmask = isWindows ? 0 : 0o022;
 
-const cno_args = processOs.__cno_args;
+// Args shapes are published by cno/src/utils/args.ts on the `cno.args` channel.
+const cno_args = evbus.get<CnoProcessArgs>('cno.args', 'surface')!;
 
 export { stdout, stderr, stdin };
 export { hrtime, memoryUsage, cpuUsage, resourceUsage };
@@ -179,19 +180,6 @@ function shouldRefIpcForProcessEvent(event: string | symbol): boolean {
     return event === 'message' || event === 'disconnect';
 }
 
-// Retry bridge installation when a relevant listener is registered late.
-function needsEventBridge(event: string | symbol): boolean {
-    return event === 'exit' ||
-        event === 'beforeExit' ||
-        event === 'uncaughtException' ||
-        event === 'uncaughtExceptionMonitor' ||
-        event === 'unhandledRejection';
-}
-
-function retryEventBridge(event: string | symbol): void {
-    if (needsEventBridge(event)) ensureEventBridge();
-}
-
 function hasIpcRefListener(emitter: EventEmitter): boolean {
     return emitter.listenerCount('message') > 0 || emitter.listenerCount('disconnect') > 0;
 }
@@ -305,14 +293,12 @@ class ProcessEventEmitter extends EventEmitter {
         if (typeof event === 'string' && (event.startsWith('SIG') || event.startsWith('sig'))) {
             addSignalListener(event, listener);
         }
-        retryEventBridge(event);
         const result = super.on(event, listener);
         if (shouldRefIpcForProcessEvent(event)) syncIpcRef(this);
         return result;
     }
 
     override once(event: string | symbol, listener: ProcessListener): this {
-        retryEventBridge(event);
         if (typeof event === 'string' && (event.startsWith('SIG') || event.startsWith('sig'))) {
             // Keep native and EventEmitter once listeners in sync.
             const onceListener = () => {
@@ -330,14 +316,12 @@ class ProcessEventEmitter extends EventEmitter {
     }
 
     override prependListener(event: string | symbol, listener: ProcessListener): this {
-        retryEventBridge(event);
         const result = super.prependListener(event, listener);
         if (shouldRefIpcForProcessEvent(event)) syncIpcRef(this);
         return result;
     }
 
     override prependOnceListener(event: string | symbol, listener: ProcessListener): this {
-        retryEventBridge(event);
         const result = super.prependOnceListener(event, listener);
         if (shouldRefIpcForProcessEvent(event)) syncIpcRef(this);
         return result;
@@ -584,52 +568,17 @@ function handleUncaughtException(error: unknown): void {
     throw error;
 }
 
-// engine.onEvent() is single-slot. Node modules cannot import CTS because they
-// are copied independently into the polyfill cache, so use its Symbol registry.
-
-const EVENT_MUX_SLOT = Symbol.for('cno.engine.eventMux.v1');
-
-type MuxEventContext = { handled: boolean; dispatched: boolean; rejectionEmitted?: boolean };
-type MuxReceiver = (name: number, data: unknown, ctx: MuxEventContext) => boolean | undefined;
-type MuxRegistry = {
-    install(role: string, fn: MuxReceiver, priority?: number): () => void;
-    has?(role: string): boolean;
-};
-
-function eventMux(): MuxRegistry | null {
-    try {
-        const slot = (globalThis as unknown as Record<symbol, unknown>)[EVENT_MUX_SLOT];
-        if (slot && typeof (slot as MuxRegistry).install === 'function') return slot as MuxRegistry;
-    } catch { /* treat an exotic global as absent */ }
-    return null;
-}
+type RuntimeEventContext = { handled: boolean; dispatched: boolean; rejectionEmitted?: boolean };
+type RuntimeEventFrame = { name: number; data: unknown; context: RuntimeEventContext };
 
 let exitEmitted = false;
-
-// The CLI reads this slot to avoid rearming deferred exit during teardown.
-const IN_TEARDOWN_SLOT = Symbol.for('cno.runtime.inTeardown');
-
-function withTeardownFlag<T>(fn: () => T): T {
-    const g = globalThis as unknown as Record<symbol, unknown>;
-    const previous = g[IN_TEARDOWN_SLOT];
-    try {
-        g[IN_TEARDOWN_SLOT] = true;
-    } catch {
-        return fn();
-    }
-    try {
-        return fn();
-    } finally {
-        try { g[IN_TEARDOWN_SLOT] = previous; } catch { /* ignore an unwritable global */ }
-    }
-}
 
 function emitProcessExit(code: number): void {
     if (exitEmitted) return;
     exitEmitted = true;
     _exiting = true;
     try {
-        withTeardownFlag(() => processEE.emit('exit', code));
+        processEE.emit('exit', code);
     } catch {
         // Preserve the exit path when a listener throws.
     }
@@ -649,7 +598,7 @@ function beforeExitEventId(): number {
 function emitBeforeExit(code: number): void {
     if (exitEmitted) return;
     if (processEE.listenerCount('beforeExit') === 0) return;
-    withTeardownFlag(() => processEE.emit('beforeExit', code));
+    processEE.emit('beforeExit', code);
 }
 
 // Keep natural-drain exit status synchronized when the native binding supports it.
@@ -662,82 +611,80 @@ function pushExitCodeToRuntime(value: number | undefined): void {
     }
 }
 
-let eventBridgeInstalled = false;
-
-const NODE_PROCESS_ROLE = 'node-process';
+const PROCESS_EVENT_BRIDGE_SLOT = Symbol.for('cno.node.process.eventBridge.v2');
+const PRIORITY_NODE_PROCESS = 50;
 
 function ensureEventBridge(): void {
-    if (eventBridgeInstalled) return;
-    const mux = eventMux();
-    if (!mux) return;
+    const emitter = processEE as ProcessEventEmitter & Record<symbol, unknown>;
+    if (typeof emitter[PROCESS_EVENT_BRIDGE_SLOT] === 'function') return;
 
-    if (mux.has?.(NODE_PROCESS_ROLE)) {
-        eventBridgeInstalled = true;
-        return;
-    }
-    eventBridgeInstalled = true;
+    const unsubscribe = evbus.on(
+        evbus.RUNTIME_NAMESPACE,
+        evbus.RUNTIME_EVENT,
+        ({ name, data, context: ctx }: RuntimeEventFrame) => {
+            const ET = engine.EventType;
 
-    mux.install(NODE_PROCESS_ROLE, (name, data, ctx) => {
-        const ET = engine.EventType;
-
-        if (name === ET.EXIT) {
-            emitProcessExit(typeof data === 'number' ? data : (exitCode ?? 0));
-            return undefined;
-        }
-
-        if (name === beforeExitEventId()) {
-            emitBeforeExit(typeof data === 'number' ? data : (exitCode ?? 0));
-            return undefined;
-        }
-
-        if (name === ET.UNHANDLED_REJECTION) {
-            if (ctx.rejectionEmitted || processEE.listenerCount('unhandledRejection') === 0) return undefined;
-            const [promise, reason] = Array.isArray(data) ? data : [undefined, data];
-            ctx.rejectionEmitted = true;
-            try { emitUserProcessEvent('unhandledRejection', reason, promise); } catch { /* listener errors do not abort this dispatch */ }
-            ctx.handled = true;
-            return false;
-        }
-
-        if (name === ET.JOB_EXCEPTION) {
-            processEE.emit('uncaughtExceptionMonitor', data, 'uncaughtException');
-            if (uncaughtCaptureFailures.delete(data)) return undefined;
-            try {
-                if (runAdditionalUncaughtCaptureCallbacks(data)) {
-                    ctx.handled = true;
-                    return true;
-                }
-            } catch (captureError) {
-                markUncaughtCaptureFailure(captureError);
-                ctx.handled = true;
-                queueMicrotask(() => { throw captureError; });
-                return true;
+            if (name === ET.EXIT) {
+                emitProcessExit(typeof data === 'number' ? data : (exitCode ?? 0));
+                return undefined;
             }
-            if (uncaughtCaptureState.callback) {
+
+            if (name === beforeExitEventId()) {
+                emitBeforeExit(typeof data === 'number' ? data : (exitCode ?? 0));
+                return undefined;
+            }
+
+            if (name === ET.UNHANDLED_REJECTION) {
+                if (ctx.rejectionEmitted || processEE.listenerCount('unhandledRejection') === 0) return undefined;
+                const [promise, reason] = Array.isArray(data) ? data : [undefined, data];
+                ctx.rejectionEmitted = true;
+                try { emitUserProcessEvent('unhandledRejection', reason, promise); } catch { /* listener errors do not abort this dispatch */ }
+                ctx.handled = true;
+                return false;
+            }
+
+            if (name === ET.JOB_EXCEPTION) {
+                processEE.emit('uncaughtExceptionMonitor', data, 'uncaughtException');
+                if (uncaughtCaptureFailures.delete(data)) return undefined;
                 try {
-                    Reflect.apply(uncaughtCaptureState.callback, undefined, [data]);
+                    if (runAdditionalUncaughtCaptureCallbacks(data)) {
+                        ctx.handled = true;
+                        return true;
+                    }
                 } catch (captureError) {
                     markUncaughtCaptureFailure(captureError);
                     ctx.handled = true;
                     queueMicrotask(() => { throw captureError; });
                     return true;
                 }
+                if (uncaughtCaptureState.callback) {
+                    try {
+                        Reflect.apply(uncaughtCaptureState.callback, undefined, [data]);
+                    } catch (captureError) {
+                        markUncaughtCaptureFailure(captureError);
+                        ctx.handled = true;
+                        queueMicrotask(() => { throw captureError; });
+                        return true;
+                    }
+                    ctx.handled = true;
+                    return true;
+                }
+                if (!hasUserUncaughtExceptionListener()) {
+                    return undefined;
+                }
+                try {
+                    emitUserProcessEvent('uncaughtException', data, 'uncaughtException');
+                } catch {
+                }
                 ctx.handled = true;
                 return true;
             }
-            if (!hasUserUncaughtExceptionListener()) {
-                return undefined;
-            }
-            try {
-                emitUserProcessEvent('uncaughtException', data, 'uncaughtException');
-            } catch {
-            }
-            ctx.handled = true;
-            return true;
-        }
 
-        return undefined;
-    }, 50);
+            return undefined;
+        },
+        PRIORITY_NODE_PROCESS,
+    );
+    emitter[PROCESS_EVENT_BRIDGE_SLOT] = unsubscribe;
 }
 
 // The native hook gives nextTick priority over promise jobs; older cores use a
@@ -812,7 +759,7 @@ function refreshProcessArgs(): void {
 }
 
 refreshProcessArgs();
-Reflect.set(os, '__cno_process_args_refresh', refreshProcessArgs);
+evbus.set('cno.args', 'refresh', refreshProcessArgs);
 
 export const pid: number = os.pid;
 export const ppid: number = os.ppid;

@@ -1,7 +1,7 @@
 import { viewToUint8Array } from './buffer';
 import type { FetchHook, NetworkCallFrame, ServeHook } from './network-hooks';
 
-const debug = import.meta.use('debug');
+const evbus = import.meta.use('evbus');
 
 let nodeRequestSeq = 0;
 
@@ -45,7 +45,7 @@ export function nextNodeRequestId(prefix: string): string {
 
 export function captureNodeNetworkCallFrames(): NetworkCallFrame[] | undefined {
     try {
-        const hooks = Reflect.get(debug, '__cnoNetworkHooks');
+        const hooks = evbus?.get('cno.inspector', 'networkHooks');
         if (!hooks || typeof hooks !== 'object') return undefined;
         const captureCallFrames = Reflect.get(hooks, 'captureCallFrames');
         return typeof captureCallFrames === 'function' ? captureCallFrames() : undefined;
@@ -56,7 +56,7 @@ export function captureNodeNetworkCallFrames(): NetworkCallFrame[] | undefined {
 
 export function getNodeFetchHook(): FetchHook | null {
     try {
-        const hooks = Reflect.get(debug, '__cnoNetworkHooks');
+        const hooks = evbus?.get('cno.inspector', 'networkHooks');
         if (!hooks || typeof hooks !== 'object') return null;
         const getFetchHook = Reflect.get(hooks, 'getFetchHook');
         return typeof getFetchHook === 'function' ? getFetchHook() ?? null : null;
@@ -67,7 +67,7 @@ export function getNodeFetchHook(): FetchHook | null {
 
 export function getNodeServeHook(): ServeHook | null {
     try {
-        const hooks = Reflect.get(debug, '__cnoNetworkHooks');
+        const hooks = evbus?.get('cno.inspector', 'networkHooks');
         if (!hooks || typeof hooks !== 'object') return null;
         const getServeHook = Reflect.get(hooks, 'getServeHook');
         return typeof getServeHook === 'function' ? getServeHook() ?? null : null;

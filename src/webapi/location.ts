@@ -113,4 +113,6 @@ export function applyLocation(href: string): void {
     });
 }
 
-Reflect.set(globalThis, '__cno_applyLocation', applyLocation);
+// The CLI kernel re-applies --location after flag parsing through the
+// `cno.runtime` evbus channel.
+import.meta.use('evbus').set('cno.runtime', 'applyLocation', applyLocation);
