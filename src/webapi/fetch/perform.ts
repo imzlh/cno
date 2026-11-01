@@ -417,9 +417,10 @@ export async function performFetch(request: Request, url: URL): Promise<Response
         if (netHook) {
             const hdrs: Record<string, string> = {};
             for (const [k, v] of parseHeaders(headers)) hdrs[k] = v;
+            const responseUrl = readFinalUrl(curl, url.href);
             emitFetchHookQuietly(() => {
                 netHook.onResponse?.({
-                    requestId, url: url.href, status, headers: hdrs,
+                    requestId, url: responseUrl, status, headers: hdrs,
                     requestHeaders: objHeaders,
                     resourceType: 'Fetch',
                     connection: buildConnectionInfo(curl, reqStartTime, curlTrace), timestamp: ts()
