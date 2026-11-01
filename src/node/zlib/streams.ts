@@ -52,7 +52,7 @@ type ZlibHandleBase = {
 type ZlibDeflateHandle = ZlibHandleBase & {
     deflate(input: Uint8Array, flush?: number): Uint8Array;
     inflate?: undefined;
-    params?: (level: number, strategy: number) => void;
+    params?: (level: number, strategy: number) => Uint8Array;
 };
 type ZlibInflateHandle = ZlibHandleBase & {
     inflate(input: Uint8Array, flush?: number): Uint8Array;
@@ -308,7 +308,9 @@ function paramsStream(this: NodeZlibTransform, level: number, strategy: number, 
     streamState(this);
     const drained = processChunk(handle, Buffer.alloc(0), SYNC_FLUSH);
     if (drained.length > 0) this.push(drained);
-    handle.params(level, strategy);
+    // deflateParams() can flush buffered data; keep those bytes in the stream.
+    const flushed = handle.params(level, strategy);
+    if (flushed.length > 0) this.push(Buffer.from(flushed));
     if (callback) queueMicrotask(callback);
     return this;
 }
