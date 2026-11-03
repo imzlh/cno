@@ -1,9 +1,12 @@
 const engine = import.meta.use('engine');
 
-const PIPE_ERROR_TAG = '__cno_structured_clone_error__';
-const PIPE_DATE_TAG = '__cno_structured_clone_date__';
-const PIPE_REGEXP_TAG = '__cno_structured_clone_regexp__';
-const PIPE_DATAVIEW_TAG = '__cno_structured_clone_dataview__';
+// The pipe is a second serialization layer (the native serializer does not know
+// about Date/Error/DataView/Blob).  Keep the discriminator in a versioned tuple,
+// rather than in a user-visible object field: ordinary records can consequently
+// contain names such as "__cno_structured_clone_date__" without being revived.
+// The long namespace and exact tuple arities make accidental user collisions
+// exceedingly unlikely while keeping the wire format portable between workers.
+const PIPE_PROTOCOL = '__cno_structured_clone_pipe_v1_7f3e2a91__';
 const arrayBufferResizableGetter = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'resizable')?.get;
 const arrayBufferMaxByteLengthGetter = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'maxByteLength')?.get;
 const arrayBufferTransfer = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'transfer')?.value;
@@ -14,10 +17,8 @@ const stringValueOf = String.prototype.valueOf;
 const bigintValueOf = BigInt.prototype.valueOf;
 const symbolValueOf = Symbol.prototype.valueOf;
 const mapForEach = Map.prototype.forEach;
-const mapClear = Map.prototype.clear;
 const mapSet = Map.prototype.set;
 const setForEach = Set.prototype.forEach;
-const setClear = Set.prototype.clear;
 const setAdd = Set.prototype.add;
 const regexpSourceGetter = Object.getOwnPropertyDescriptor(RegExp.prototype, 'source')?.get;
 const REGEXP_FLAGS = [
@@ -502,52 +503,114 @@ function cloneError<TPort extends object, TPortClone extends object>(
     return out;
 }
 
-function isPipeEncodedError(value: unknown): value is CloneRecord {
-    return !!value && typeof value === 'object' && (value as CloneRecord)[PIPE_ERROR_TAG] === true;
+type PipeTuple = unknown[];
+
+function pipeTuple(value: unknown, kind: string, length: number): value is PipeTuple {
+    return Array.isArray(value)
+        && value.length === length
+        && value[0] === PIPE_PROTOCOL
+        && value[1] === kind;
 }
 
-function isPipeEncodedDate(value: unknown): value is CloneRecord {
-    return !!value && typeof value === 'object' && (value as CloneRecord)[PIPE_DATE_TAG] === true;
+
+function copyPipeProperties(
+    source: object,
+    target: object,
+    seen: Map<object, unknown>,
+    visit: (value: unknown, seen: Map<object, unknown>) => unknown,
+): void {
+    const sourceRecord = source as CloneRecord;
+    for (const key of Object.keys(source)) {
+        const descriptor = Object.getOwnPropertyDescriptor(source, key);
+        if (!descriptor) continue;
+        const child = 'value' in descriptor ? descriptor.value : Reflect.get(sourceRecord, key);
+        // defineProperty keeps an enumerable `__proto__` field as data rather than a setter call.
+        Object.defineProperty(target, key, {
+            value: visit(child, seen),
+            writable: true,
+            enumerable: true,
+            configurable: true,
+        });
+    }
 }
 
-function isPipeEncodedRegExp(value: unknown): value is CloneRecord {
-    return !!value && typeof value === 'object' && (value as CloneRecord)[PIPE_REGEXP_TAG] === true;
+function pipeBlobInfo(value: object): [Uint8Array<ArrayBuffer>, boolean, string, string?, number?] | null {
+    const BlobCtor = globalThis.Blob;
+    if (typeof BlobCtor !== 'function' || !(value instanceof BlobCtor)) return null;
+    const getBytes = Reflect.get(value, blobBytesSymbol);
+    if (typeof getBytes !== 'function') throw dataCloneError('Blob could not be cloned.');
+    const bytes = Reflect.apply(getBytes, value, []);
+    if (!(bytes instanceof Uint8Array)) throw dataCloneError('Blob could not be cloned.');
+    const FileCtor = globalThis.File;
+    if (typeof FileCtor === 'function' && value instanceof FileCtor) {
+        const file = value as unknown as File;
+        return [bytes as Uint8Array<ArrayBuffer>, true, file.type, file.name, file.lastModified];
+    }
+    return [bytes as Uint8Array<ArrayBuffer>, false, (value as unknown as Blob).type];
 }
 
-function isPipeEncodedDataView(value: unknown): value is CloneRecord {
-    return !!value && typeof value === 'object' && (value as CloneRecord)[PIPE_DATAVIEW_TAG] === true;
+function boxedPrimitiveInfo(value: object, plainTag: string | undefined):
+    { kind: 'boolean' | 'number' | 'string' | 'bigint'; value: boolean | number | string | bigint } | null {
+    try {
+        if (plainTag === TAG_BOOLEAN) return { kind: 'boolean', value: Reflect.apply(booleanValueOf, value, []) };
+        if (plainTag === TAG_NUMBER) return { kind: 'number', value: Reflect.apply(numberValueOf, value, []) };
+        if (plainTag === TAG_STRING) return { kind: 'string', value: Reflect.apply(stringValueOf, value, []) };
+    } catch {
+        return null;
+    }
+    try { return { kind: 'boolean', value: Reflect.apply(booleanValueOf, value, []) }; } catch {}
+    try { return { kind: 'number', value: Reflect.apply(numberValueOf, value, []) }; } catch {}
+    try { return { kind: 'string', value: Reflect.apply(stringValueOf, value, []) }; } catch {}
+    try { return { kind: 'bigint', value: Reflect.apply(bigintValueOf, value, []) }; } catch {}
+    try {
+        Reflect.apply(symbolValueOf, value, []);
+        throw dataCloneError('Symbol object could not be cloned.');
+    } catch (error) {
+        if (error instanceof Error && error.name === 'DataCloneError') throw error;
+    }
+    return null;
 }
 
 function encodeForPipe(value: unknown, seen: Map<object, unknown>): unknown {
-    if (!value || typeof value !== 'object') return value;
+    // Do this before the object fast path.  Leaving either value for the native
+    // queue makes the error asynchronous (and therefore uncaught by postMessage).
+    if (typeof value === 'function' || typeof value === 'symbol') {
+        throw dataCloneError(`${String(value)} could not be cloned.`);
+    }
+    if (value === null || typeof value !== 'object') return value;
+    // No operation below this point is allowed to touch a Proxy.  In particular,
+    // Object.keys/Reflect.get can run arbitrary traps.
+    if (engine.isProxy(value)) throw dataCloneError('Proxy objects cannot be cloned');
+    if (isUnsupportedObject(value)) throw dataCloneError(`${String(value)} could not be cloned.`);
     if (seen.has(value)) return seen.get(value);
 
     if (engine.isError(value)) {
         const error = value as Error;
-        const out: CloneRecord = {
-            [PIPE_ERROR_TAG]: true,
-            name: error.name,
-        };
-        seen.set(value, out);
         const message = Object.getOwnPropertyDescriptor(error, 'message');
-        if (message && 'value' in message) out.message = String(message.value);
-        const stack = error.stack;
-        out.stack = typeof stack === 'string' ? stack : undefined;
         const cause = Object.getOwnPropertyDescriptor(error, 'cause');
+        const out: PipeTuple = [
+            PIPE_PROTOCOL, 'error', error.name,
+            message && 'value' in message ? String(message.value) : undefined,
+            typeof error.stack === 'string' ? error.stack : undefined,
+            message && 'value' in message,
+            undefined,
+            cause && 'value' in cause,
+        ];
+        seen.set(value, out);
         if (cause && 'value' in cause) {
-            out.cause = encodeForPipe(cause.value, seen);
+            out[6] = encodeForPipe(cause.value, seen);
         }
         return out;
     }
 
     if (engine.isDate(value)) {
-        const out = { [PIPE_DATE_TAG]: true, value: Reflect.apply(dateGetTime, value, []) };
+        const out: PipeTuple = [PIPE_PROTOCOL, 'date', Reflect.apply(dateGetTime, value, [])];
         seen.set(value, out);
         return out;
     }
     if (engine.isRegExp(value)) {
         const regexp = value as RegExp;
-        const out = { [PIPE_REGEXP_TAG]: true, source: regexpSource(regexp), flags: regexpFlags(regexp) };
+        const out: PipeTuple = [PIPE_PROTOCOL, 'regexp', regexpSource(regexp), regexpFlags(regexp)];
         seen.set(value, out);
         return out;
     }
@@ -559,62 +622,96 @@ function encodeForPipe(value: unknown, seen: Map<object, unknown>): unknown {
     // where no caller try/catch can reach it. Format: docs/node-internals.md#dataview-pipe-tag.
     if (engine.isDataView(value)) {
         const view = value as DataView;
-        const out: CloneRecord = {
-            [PIPE_DATAVIEW_TAG]: true,
-            buffer: encodeForPipe(view.buffer, seen),
-            byteOffset: view.byteOffset,
-            byteLength: view.byteLength,
-        };
+        const out: PipeTuple = [PIPE_PROTOCOL, 'dataview',
+            viewSlot(dataViewByteOffsetGetter, view), viewSlot(dataViewByteLengthGetter, view), undefined];
         seen.set(value, out);
+        out[4] = encodeForPipe(viewSlot(dataViewBufferGetter, view), seen);
         return out;
     }
     if (ArrayBuffer.isView(value)) return value;
 
-    seen.set(value, value);
     if (engine.isMap(value)) {
         const map = value as Map<unknown, unknown>;
-        const entries: Array<[unknown, unknown]> = [];
-        Reflect.apply(mapForEach, map, [(item: unknown, key: unknown) => entries.push([key, item])]);
-        Reflect.apply(mapClear, map, []);
-        for (const [key, item] of entries) {
-            Reflect.apply(mapSet, map, [encodeForPipe(key, seen), encodeForPipe(item, seen)]);
-        }
-        return map;
+        const out = new Map<unknown, unknown>();
+        seen.set(value, out);
+        Reflect.apply(mapForEach, map, [(item: unknown, key: unknown) => {
+            Reflect.apply(mapSet, out, [encodeForPipe(key, seen), encodeForPipe(item, seen)]);
+        }]);
+        return out;
     }
     if (engine.isSet(value)) {
         const set = value as Set<unknown>;
-        const items: unknown[] = [];
-        Reflect.apply(setForEach, set, [(item: unknown) => items.push(item)]);
-        Reflect.apply(setClear, set, []);
-        for (const item of items) Reflect.apply(setAdd, set, [encodeForPipe(item, seen)]);
-        return set;
+        const out = new Set<unknown>();
+        seen.set(value, out);
+        Reflect.apply(setForEach, set, [(item: unknown) => {
+            Reflect.apply(setAdd, out, [encodeForPipe(item, seen)]);
+        }]);
+        return out;
     }
-    const record = value as CloneRecord;
-    for (const key of Object.keys(value)) {
-        record[key] = encodeForPipe(record[key], seen);
+    const blob = pipeBlobInfo(value);
+    if (blob) {
+        const [bytes, isFile, type, name, lastModified] = blob;
+        const out: PipeTuple = [PIPE_PROTOCOL, 'blob', bytes, isFile, type, name, lastModified];
+        seen.set(value, out);
+        return out;
     }
-    return value;
+
+    // BigInt/Number/String/Boolean wrappers are not reliably retained by the
+    // native pipe serializer.  Encode their internal value explicitly; Symbol
+    // wrappers are rejected by boxedPrimitiveInfo just like cloneValue.
+    let plainTag: string | undefined;
+    const tagState = tagPropertyState(value);
+    if (tagState === false && tagDispatchIsSound()) {
+        plainTag = Reflect.apply(objectToString, value, []) as string;
+    }
+    const boxed = boxedPrimitiveInfo(value, plainTag);
+    if (boxed) {
+        const out: PipeTuple = [PIPE_PROTOCOL, 'boxed', boxed.kind, boxed.value];
+        seen.set(value, out);
+        return out;
+    }
+
+    if (Array.isArray(value)) {
+        // Arrays get an envelope too.  This prevents an ordinary user array from
+        // ever being mistaken for one of the special tuples during decode.
+        const out: PipeTuple = [PIPE_PROTOCOL, 'array', value.length, []];
+        seen.set(value, out);
+        const entries = out[3] as unknown[];
+        for (const key of Object.keys(value)) {
+            const descriptor = Object.getOwnPropertyDescriptor(value, key);
+            if (!descriptor) continue;
+            const item = 'value' in descriptor ? descriptor.value : Reflect.get(value, key);
+            entries.push([key, encodeForPipe(item, seen)]);
+        }
+        return out;
+    }
+
+    throwIfNonSerializable(value);
+    const out = Array.isArray(value) ? new Array(value.length) : {};
+    seen.set(value, out);
+    copyPipeProperties(value, out, seen, encodeForPipe);
+    return out;
 }
 
 function decodeFromPipe(value: unknown, seen: Map<object, unknown>): unknown {
     if (!value || typeof value !== 'object') return value;
     if (seen.has(value)) return seen.get(value);
 
-    if (isPipeEncodedError(value)) {
-        const Ctor = errorConstructorByName(String(value.name));
-        const out = Object.prototype.hasOwnProperty.call(value, 'message')
-            ? new Ctor(String(value.message))
+    if (pipeTuple(value, 'error', 8)) {
+        const Ctor = errorConstructorByName(String(value[2]));
+        const out = value[5] === true
+            ? new Ctor(String(value[3]))
             : new Ctor();
         seen.set(value, out);
         Object.defineProperty(out, 'stack', {
-            value: typeof value.stack === 'string' ? value.stack : undefined,
+            value: typeof value[4] === 'string' ? value[4] : undefined,
             writable: true,
             enumerable: false,
             configurable: true,
         });
-        if (Object.prototype.hasOwnProperty.call(value, 'cause')) {
+        if (value[7] === true) {
             Object.defineProperty(out, 'cause', {
-                value: decodeFromPipe(value.cause, seen),
+                value: decodeFromPipe(value[6], seen),
                 writable: true,
                 enumerable: false,
                 configurable: true,
@@ -623,21 +720,70 @@ function decodeFromPipe(value: unknown, seen: Map<object, unknown>): unknown {
         return out;
     }
 
-    if (isPipeEncodedDate(value)) {
-        const out = new Date(Number(value.value));
+    if (pipeTuple(value, 'date', 3)) {
+        const out = new Date(Number(value[2]));
         seen.set(value, out);
         return out;
     }
-    if (isPipeEncodedRegExp(value)) {
-        const out = new RegExp(String(value.source), String(value.flags ?? ''));
+    if (pipeTuple(value, 'regexp', 4)) {
+        const out = new RegExp(String(value[2]), String(value[3] ?? ''));
         seen.set(value, out);
         return out;
     }
-    if (isPipeEncodedDataView(value)) {
+    if (pipeTuple(value, 'dataview', 5)) {
         // Through decodeFromPipe so sibling views decode onto ONE buffer (ArrayBuffer is identity).
-        const buffer = decodeFromPipe(value.buffer, seen) as ArrayBuffer;
-        const out = new DataView(buffer, Number(value.byteOffset), Number(value.byteLength));
+        const buffer = decodeFromPipe(value[4], seen) as ArrayBuffer;
+        const out = new DataView(buffer, Number(value[2]), Number(value[3]));
         seen.set(value, out);
+        return out;
+    }
+    if (pipeTuple(value, 'blob', 7)) {
+        const bytes = value[2] as BlobPart;
+        const isFile = value[3] === true;
+        const type = typeof value[4] === 'string' ? value[4] : '';
+        const name = typeof value[5] === 'string' ? value[5] : '';
+        const BlobCtor = globalThis.Blob;
+        if (typeof BlobCtor !== 'function') throw dataCloneError('Blob could not be cloned.');
+        let out: Blob;
+        const FileCtor = globalThis.File;
+        if (isFile && typeof FileCtor === 'function') {
+            out = new FileCtor([bytes], name, {
+                type,
+                lastModified: typeof value[6] === 'number' ? value[6] : undefined,
+            });
+        } else {
+            out = new BlobCtor([bytes], { type });
+        }
+        seen.set(value, out);
+        return out;
+    }
+    if (pipeTuple(value, 'boxed', 4)) {
+        let out: object;
+        switch (value[2]) {
+            case 'boolean': out = new Boolean(value[3]); break;
+            case 'number': out = new Number(value[3]); break;
+            case 'string': out = new String(value[3]); break;
+            case 'bigint': out = Object(value[3] as bigint); break;
+            default: return value;
+        }
+        seen.set(value, out);
+        return out;
+    }
+    if (pipeTuple(value, 'array', 4)) {
+        const out = new Array(Number(value[2]));
+        seen.set(value, out);
+        const entries = value[3];
+        if (Array.isArray(entries)) {
+            for (const entry of entries) {
+                if (!Array.isArray(entry) || entry.length !== 2 || typeof entry[0] !== 'string') continue;
+                Object.defineProperty(out, entry[0], {
+                    value: decodeFromPipe(entry[1], seen),
+                    writable: true,
+                    enumerable: true,
+                    configurable: true,
+                });
+            }
+        }
         return out;
     }
     if (engine.isDate(value) || engine.isRegExp(value) || engine.isArrayBuffer(value) || isSharedArrayBuffer(value)) {
@@ -645,30 +791,28 @@ function decodeFromPipe(value: unknown, seen: Map<object, unknown>): unknown {
     }
     if (ArrayBuffer.isView(value)) return value;
 
-    seen.set(value, value);
     if (engine.isMap(value)) {
         const map = value as Map<unknown, unknown>;
-        const entries: Array<[unknown, unknown]> = [];
-        Reflect.apply(mapForEach, map, [(item: unknown, key: unknown) => entries.push([key, item])]);
-        Reflect.apply(mapClear, map, []);
-        for (const [key, item] of entries) {
-            Reflect.apply(mapSet, map, [decodeFromPipe(key, seen), decodeFromPipe(item, seen)]);
-        }
-        return map;
+        const out = new Map<unknown, unknown>();
+        seen.set(value, out);
+        Reflect.apply(mapForEach, map, [(item: unknown, key: unknown) => {
+            Reflect.apply(mapSet, out, [decodeFromPipe(key, seen), decodeFromPipe(item, seen)]);
+        }]);
+        return out;
     }
     if (engine.isSet(value)) {
         const set = value as Set<unknown>;
-        const items: unknown[] = [];
-        Reflect.apply(setForEach, set, [(item: unknown) => items.push(item)]);
-        Reflect.apply(setClear, set, []);
-        for (const item of items) Reflect.apply(setAdd, set, [decodeFromPipe(item, seen)]);
-        return set;
+        const out = new Set<unknown>();
+        seen.set(value, out);
+        Reflect.apply(setForEach, set, [(item: unknown) => {
+            Reflect.apply(setAdd, out, [decodeFromPipe(item, seen)]);
+        }]);
+        return out;
     }
-    const record = value as CloneRecord;
-    for (const key of Object.keys(value)) {
-        record[key] = decodeFromPipe(record[key], seen);
-    }
-    return value;
+    const out = Array.isArray(value) ? new Array(value.length) : {};
+    seen.set(value, out);
+    copyPipeProperties(value, out, seen, decodeFromPipe);
+    return out;
 }
 
 function cloneValue<T, TPort extends object, TPortClone extends object>(

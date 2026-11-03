@@ -19,6 +19,7 @@ import {
 const wk = import.meta.use('worker');
 const osmod = import.meta.use('os');
 const error = import.meta.use('error');
+const engine = import.meta.use('engine');
 
 const INTERNAL_KEYS = new Set([
     '__cts_entry',
@@ -50,7 +51,13 @@ type MessagePortEvent = { type: string; data: unknown; ports?: MessagePort[] };
 type MessagePortEventHandler = (this: MessagePort, ev: MessagePortEvent) => unknown;
 type MessagePortErrorEvent = { type: string; data: unknown };
 type MessagePortErrorHandler = (this: MessagePort, ev: MessagePortErrorEvent) => unknown;
-type MessagePipeWithRef = CModuleWorker.MessagePipe & { ref?: () => void; unref?: () => void };
+// Keep this local widening until older generated worker.d.ts files catch up
+// with the native transfer-list overload.
+type NativeMessagePipe = CModuleWorker.MessagePipe & {
+    postMessage(data: unknown, transferList?: unknown[]): void;
+};
+type MessagePipeWithRef = NativeMessagePipe & { ref?: () => void; unref?: () => void };
+type NativeWorkerConstructor = new (userData: unknown, transferList?: unknown[]) => CModuleWorker.Worker;
 type RawWorkerData = {
     __node_workerData?: unknown;
     __node_threadId?: unknown;
@@ -201,16 +208,6 @@ function commitTransferredPort(port: MessagePort, clone: MessagePort): void {
     port[messageQueueSymbol] = [];
 }
 
-function cloneForTransfer<T>(value: T, transferList?: readonly unknown[]): T {
-    return structuredCloneWithTransfer(value, transferList, {
-        isPort: isMessagePort,
-        createPortClone: createTransferredPort,
-        commitPortTransfer: commitTransferredPort,
-        isUncloneable: (item) => uncloneableObjects.has(item),
-        isUntransferable: (item) => untransferableObjects.has(item) || (isMessagePort(item) && item[closedSymbol]),
-    });
-}
-
 function cloneForMessage<T>(value: T, transferList?: readonly unknown[]): QueuedMessage {
     const portClones = new Map<MessagePort, MessagePort>();
     const data = structuredCloneWithTransfer(value, transferList, {
@@ -230,11 +227,32 @@ function cloneForMessage<T>(value: T, transferList?: readonly unknown[]): Queued
     return { data, ports };
 }
 
-// Native thread pipes cannot serialize MessagePort; reject before cloning detaches transfers.
-function assertNoPortsAcrossThreads(value: unknown, transferList?: readonly unknown[]): void {
-    for (const item of getTransferList(transferList)) {
+// Native thread pipes own serialization and transfer commit. Keep the JS-side
+// checks that are specific to this MessagePort implementation, but never clone
+// or detach here: a native serialization failure must leave the transfer list
+// untouched.
+function assertNoPortsAcrossThreads(value: unknown, transferList?: readonly unknown[]): unknown[] {
+    const transfers = Array.from(getTransferList(transferList));
+    const transferSeen = new Set<object>();
+    for (const item of transfers) {
+        if (!item || typeof item !== 'object') {
+            throw dataCloneError('Value not transferable');
+        }
+        if (engine.isProxy(item)) {
+            throw dataCloneError('Proxy objects cannot be transferred');
+        }
+        if (transferSeen.has(item)) {
+            throw dataCloneError('Transfer list contains duplicate object');
+        }
+        transferSeen.add(item);
+        if (untransferableObjects.has(item)) {
+            throw dataCloneError('Object cannot be transferred');
+        }
         if (isMessagePort(item)) {
             throw dataCloneError('MessagePort cannot be transferred to another thread in this runtime');
+        }
+        if (!engine.isArrayBuffer(item)) {
+            throw dataCloneError('Value not transferable');
         }
     }
 
@@ -242,9 +260,18 @@ function assertNoPortsAcrossThreads(value: unknown, transferList?: readonly unkn
     const stack: unknown[] = [value];
     while (stack.length > 0) {
         const current = stack.pop();
+        if (typeof current === 'function' || typeof current === 'symbol') {
+            throw dataCloneError('Object cannot be cloned');
+        }
         if (!current || typeof current !== 'object') continue;
         if (seen.has(current)) continue;
+        if (engine.isProxy(current)) {
+            throw dataCloneError('Proxy objects cannot be cloned');
+        }
         seen.add(current);
+        if (uncloneableObjects.has(current)) {
+            throw dataCloneError('Object cannot be cloned');
+        }
         if (isMessagePort(current)) {
             throw dataCloneError('MessagePort cannot be transferred to another thread in this runtime');
         }
@@ -262,6 +289,7 @@ function assertNoPortsAcrossThreads(value: unknown, transferList?: readonly unkn
         if (ArrayBuffer.isView(current) || current instanceof ArrayBuffer) continue;
         for (const key of Object.keys(current)) stack.push(Reflect.get(current, key));
     }
+    return transfers;
 }
 
 function createPortEvent(type: string, data: unknown, ports?: MessagePort[]): MessagePortEvent {
@@ -364,7 +392,7 @@ export class MessagePort extends EventEmitter {
     // A port holds the loop only after start().
     [refedSymbol] = false;
     [pipeRefedSymbol] = true;
-    __pipe?: CModuleWorker.MessagePipe;
+    __pipe?: NativeMessagePipe;
 
     get onmessage(): MessagePortEventHandler | null {
         return this[onMessageSymbol];
@@ -387,8 +415,8 @@ export class MessagePort extends EventEmitter {
     postMessage(value: unknown, transferList?: unknown[]): boolean {
         const pipe = this.__pipe;
         if (pipe) {
-            assertNoPortsAcrossThreads(value, transferList);
-            pipe.postMessage(encodeStructuredCloneForPipe(cloneForTransfer(value, transferList)));
+            const transfers = assertNoPortsAcrossThreads(value, transferList);
+            pipe.postMessage(encodeStructuredCloneForPipe(value), transfers);
             return true;
         }
 
@@ -511,9 +539,7 @@ export class Worker extends EventEmitter {
     private _exited = false;
     private _exitCode = 0;
     private _refed = true;
-    private _ready = false;
     private _readyToken: string;
-    private _outgoingQueue: unknown[] = [];
     private _stdout: PassThrough | null = null;
     private _stderr: PassThrough | null = null;
     // Wait for pipe EOF before synchronously joining the native worker.
@@ -530,10 +556,11 @@ export class Worker extends EventEmitter {
         const entry = options?.eval
             ? `eval:${filename.toString()}`
             : filename.toString();
-        assertNoPortsAcrossThreads(options?.workerData, options?.transferList);
-        const workerData = encodeStructuredCloneForPipe(cloneForTransfer(options?.workerData, options?.transferList));
+        const transfers = assertNoPortsAcrossThreads(options?.workerData, options?.transferList);
+        const workerData = encodeStructuredCloneForPipe(options?.workerData);
 
-        this._native = new wk.Worker({
+        const NativeWorker = wk.Worker as NativeWorkerConstructor;
+        this._native = new NativeWorker({
             __cts_entry: entry,
             __cts_runtime_config: runtimeConfigWithResourceLimits(currentRuntimeConfig(), this.resourceLimits),
             __node_workerData: workerData,
@@ -542,7 +569,7 @@ export class Worker extends EventEmitter {
             __node_resourceLimits: this.resourceLimits,
             __node_envData: Array.from(envDataMap.entries()),
             __node_readyToken: this._readyToken,
-        });
+        }, transfers);
         if (options?.stdout) this._stdout = new PassThrough();
         if (options?.stderr) this._stderr = new PassThrough();
         this._port = wrapMessagePipe(this._native.messagePipe);
@@ -553,8 +580,6 @@ export class Worker extends EventEmitter {
         };
         this._port.on('message', (data: unknown) => {
             if (isWorkerReadyMessage(data, this._readyToken)) {
-                this._ready = true;
-                this._flushOutgoingQueue();
                 return;
             }
             if (isWorkerErrorMessage(data)) {
@@ -588,16 +613,11 @@ export class Worker extends EventEmitter {
 
     postMessage(value: unknown, transferList?: unknown[]): void {
         if (this._exited) return;
-        assertNoPortsAcrossThreads(value, transferList);
-        this._outgoingQueue.push(encodeStructuredCloneForPipe(cloneForTransfer(value, transferList)));
-        this._flushOutgoingQueue();
-    }
-
-    private _flushOutgoingQueue(): void {
-        if (!this._ready || this._exited) return;
-        while (this._outgoingQueue.length > 0 && !this._exited) {
-            this._native.messagePipe.postMessage(this._outgoingQueue.shift());
-        }
+        const transfers = assertNoPortsAcrossThreads(value, transferList);
+        // The native pipe exists from the constructor and buffers before the
+        // worker installs its listener, so readiness must not gate user sends.
+        (this._native.messagePipe as NativeMessagePipe)
+            .postMessage(encodeStructuredCloneForPipe(value), transfers);
     }
 
     private _reap(): void {
@@ -616,7 +636,6 @@ export class Worker extends EventEmitter {
         this._exited = true;
         this._exitCode = code;
         workerRegistry.delete(this.threadId);
-        this._outgoingQueue = [];
         if (this._joinPending) {
             // EOF drives the pending native join without keeping the loop alive.
             this._port.unref();
@@ -643,7 +662,6 @@ export class Worker extends EventEmitter {
         this._exited = true;
         this._exitCode = 1;
         workerRegistry.delete(this.threadId);
-        this._outgoingQueue = [];
 
         // Native terminate() joins synchronously; request a stop and join after
         // EOF so an unresponsive worker cannot block the parent event loop.
