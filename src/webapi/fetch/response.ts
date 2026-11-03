@@ -1,7 +1,7 @@
 import { Headers } from "../headers";
 import { type NetworkCallFrame } from "../../utils/network-hooks";
 import { bytesToArrayBuffer } from "../../utils/bytes";
-import { bodyContentType, Decoder, ensureFormDataContentType, engine, isBodyIterable, isNullBodyStatus, isReadableStreamLike, iterableBodyToStream, parseFormData, readStreamBody, serializeBody, serializeFormData, teeUntracked, trackBodyStream } from "./helpers";
+import { bodyContentType, ensureFormDataContentType, engine, isBodyIterable, isNullBodyStatus, isReadableStreamLike, iterableBodyToStream, parseFormData, readStreamBody, serializeBody, serializeFormData, teeUntracked, trackBodyStream, utf8Decoder } from "./helpers";
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 type ResponseBodySource = BodyInit | ReadableStream<Uint8Array> | Uint8Array | null;
@@ -197,7 +197,7 @@ export class Response implements globalThis.Response {
     async json<T = unknown>(): Promise<T> { return JSON.parse(await this.text()); }
     /** Spec: always UTF-8, regardless of the content-type charset (only XHR honours charset). */
     async text(): Promise<string> {
-        return new Decoder().decode(await this.arrayBuffer());
+        return utf8Decoder.decode(await this.arrayBuffer());
     }
     static error(): Response {
         const r = new Response(null);

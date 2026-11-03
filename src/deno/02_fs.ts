@@ -294,18 +294,15 @@ Object.assign(Deno, wrapFSns({
     async readFile(path, opt) {
         const pathStr = toString(path);
         throwIfAborted(opt?.signal);
-        const st = await asfs.stat(pathStr);
-        throwIfAborted(opt?.signal);
-        if (st.isDirectory) throw new errors.IsADirectory(`Is a directory: ${pathStr}`);
+        // A directory read already fails with EISDIR in the native readFile,
+        // which wrapFSErr maps to errors.IsADirectory — no pre-stat needed.
         const data = await asfs.readFile(pathStr);
         throwIfAborted(opt?.signal);
         return data;
     },
 
     readFileSync(path) {
-        const pathStr = toString(path);
-        if (fs.stat(pathStr).isDirectory) throw new errors.IsADirectory(`Is a directory: ${pathStr}`);
-        return new Uint8Array(fs.readFile(pathStr));
+        return new Uint8Array(fs.readFile(toString(path)));
     },
 
     readTextFile(path, opt) {

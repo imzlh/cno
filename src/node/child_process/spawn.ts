@@ -34,7 +34,7 @@ export function spawn(command: string, argsOrOptions?: string[] | SpawnOptions, 
     let [args, opts] = normalizeSpawnArgs(argsOrOptions, options);
 
     // Reject unrecognised stdio entries the way Node does, before anything is
-    // spawned. Previously every unknown value fell through to 'inherit'.
+    // spawned.
     validateStdio(opts.stdio);
     validateStdioFdRedirects(opts.stdio);
     validateTimeout(opts.timeout);

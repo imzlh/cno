@@ -42,15 +42,6 @@ export function getRawConnectionHook(): RawConnectionHook | null {
     return rawConnectionHook;
 }
 
-/**
- * True once `setRawConnectionHook()` has run, with any value — including the
- * `null` installed by `stopNetwork()` at exit. Used by accessors installed at
- * boot to tell "a proxy manager owns raw connections now" from "nobody does".
- */
-export function isRawConnectionHookInstalled(): boolean {
-    return rawConnectionHook !== null || rawConnectionHookInstalled;
-}
-
 // ---- CURL initialization hook ----------------------------------------------
 
 export type CurlInitHook = (handle: CModuleCURL.CURL, url: URL) => void;

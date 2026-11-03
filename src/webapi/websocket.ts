@@ -24,8 +24,10 @@ function getBlobSize(value: unknown): number | undefined {
     return value instanceof Blob ? value.size : undefined;
 }
 
-/** RFC 6455 requires invalid UTF-8 to fail the connection with status 1007. */
-const decodeTextFrame = (payload: Uint8Array): string => new textMod.Decoder('utf-8', { fatal: true }).decode(payload);
+/** RFC 6455 requires invalid UTF-8 to fail the connection with status 1007.
+ *  Kept separate from non-fatal decoders: different options must not share. */
+const utf8FatalDecoder = new textMod.Decoder('utf-8', { fatal: true });
+const decodeTextFrame = (payload: Uint8Array): string => utf8FatalDecoder.decode(payload);
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 type IWSSocket = Omit<ISocket, 'serverHandshake' | 'alpnProtocol' | 'read'>;

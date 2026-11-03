@@ -470,14 +470,6 @@ function serve(
                 requestAbort.abort(Object.assign(new Error('HTTP request peer disconnected'), { code: 'ECONNRESET' }));
             });
             try {
-                const addr = coreServer.address();
-                const denoAddr: Deno.Addr = addr && 'path' in addr
-                    ? { transport: 'unix', path: addr.path }
-                    : {
-                        hostname: addr?.ip || '0.0.0.0',
-                        port: addr?.port ?? options.port ?? 8000,
-                        transport: 'tcp'
-                    };
                 const webRequest = createWebRequest(req, {
                     hostname: denoAddr.transport === 'tcp' ? denoAddr.hostname : 'localhost',
                     port: denoAddr.transport === 'tcp' ? denoAddr.port : 80,
@@ -545,6 +537,17 @@ function serve(
 
     // Start listening
     coreServer.listen();
+    // address() is a getsockname syscall; the listen address is constant for
+    // the listener's lifetime, so compute the Deno.Addr shape once here
+    // instead of per request.
+    const listenAddr = coreServer.address();
+    const denoAddr: Deno.Addr = listenAddr && 'path' in listenAddr
+        ? { transport: 'unix', path: listenAddr.path }
+        : {
+            hostname: listenAddr?.ip || '0.0.0.0',
+            port: listenAddr?.port ?? options.port ?? 8000,
+            transport: 'tcp'
+        };
     coreServer.acceptLoop();
 
     const httpServer = new DenoHttpServer(coreServer);

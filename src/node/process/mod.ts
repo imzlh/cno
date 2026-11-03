@@ -1,9 +1,4 @@
-﻿/**
- * Node.js process module
- * Provides current Node.js process information and control
- */
-
-import { EventEmitter } from '../events';
+﻿import { EventEmitter } from '../events';
 import { IPCChannel, type IPCSerialization } from '../ipc_channel';
 import { stdout, stderr, stdin } from './streams';
 import { hrtime, memoryUsage, cpuUsage, resourceUsage } from './metrics';
@@ -279,12 +274,13 @@ type SendCallback = (error: Error | null) => void;
 
 class ProcessEventEmitter extends EventEmitter {
     override emit(event: string | symbol, ...args: unknown[]): boolean {
-        let emitted: boolean;
-        if (typeof event == 'string' && (event.startsWith('SIG') || event.startsWith('sig'))) {
-            emitted = super.emit(event, ...args);
-        } else {
-            emitted = super.emit(event.toString(), ...args);
-        }
+        // Signal wiring happens in on/once/off; emit-side, a string's
+        // toString() is identity, so the key is passed through untouched and
+        // symbols keep their historical string-keyed lookup.
+        const emitted = super.emit(
+            typeof event === 'string' ? event : event.toString(),
+            ...args,
+        );
         if (shouldRefIpcForProcessEvent(event)) syncIpcRef(this);
         return emitted;
     }
@@ -438,7 +434,10 @@ function resolveUncaughtCaptureState(): UncaughtCaptureState {
 const uncaughtCaptureState = resolveUncaughtCaptureState();
 const uncaughtCaptureFailures = new Set<unknown>();
 
+// The set only prevents rethrowing the same capture error twice, so the same
+// >20 sweep the CTS diagnostics trace uses bounds it without losing correctness.
 function markUncaughtCaptureFailure(error: unknown): void {
+    if (uncaughtCaptureFailures.size > 20) uncaughtCaptureFailures.clear();
     uncaughtCaptureFailures.add(error);
 }
 
@@ -455,14 +454,17 @@ function installUncaughtCaptureDispatch(): void {
     const emit = processEE.emit;
     uncaughtCaptureState.rawEmit = emit;
     Reflect.set(processEE, 'emit', function (event: string | symbol, ...args: unknown[]): boolean {
-        if (event === 'uncaughtException') {
-            if (runAdditionalUncaughtCaptureCallbacks(args[0])) return true;
-            if (uncaughtCaptureState.callback) {
-                Reflect.apply(uncaughtCaptureState.callback, undefined, [args[0]]);
-                return true;
-            }
+        if (event !== 'uncaughtException') {
+            // Only 'uncaughtException' needs interception; reusing the caller's
+            // arguments keeps the pass-through allocation-free per emit.
+            return Reflect.apply(emit, processEE, arguments);
         }
-        return Reflect.apply(emit, processEE, [event, ...args]);
+        if (runAdditionalUncaughtCaptureCallbacks(args[0])) return true;
+        if (uncaughtCaptureState.callback) {
+            Reflect.apply(uncaughtCaptureState.callback, undefined, [args[0]]);
+            return true;
+        }
+        return Reflect.apply(emit, processEE, arguments);
     });
     uncaughtCaptureState.dispatchInstalled = true;
 }

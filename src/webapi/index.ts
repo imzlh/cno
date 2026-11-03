@@ -7,6 +7,7 @@ import {
 import { defineLazy } from '../utils/lazy-accessor';
 
 const { EventType } = import.meta.use('engine');
+const evbus = import.meta.use('evbus');
 
 // basic polyfills
 Object.defineProperties(globalThis, {
@@ -169,6 +170,10 @@ function bridgeEvent(
 }
 
 installWebApiEventReceiver(bridgeEvent);
+// Must run after the install: the CTS runtime skips its compat bridge
+// (cts/src/runtime/index.ts hookEvents) when this key is present, so publishing
+// it first would drop events if the install threw.
+evbus.set('cno.runtime', 'webapiEventReceiver', true);
 
 // worker
 await import('./worker');

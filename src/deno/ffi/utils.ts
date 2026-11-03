@@ -72,33 +72,6 @@ export function getTypeSize(type: Deno.NativeType): number {
     return 8;
 }
 
-export function isNativeNumberType(type: Deno.NativeType): type is Deno.NativeNumberType {
-    return typeof type === 'string' && [
-        'u8', 'i8', 'u16', 'i16', 'u32', 'i32',
-        'f32', 'f64', 'usize', 'isize'
-    ].includes(type);
-}
-
-export function isNativeBigIntType(type: Deno.NativeType): type is Deno.NativeBigIntType {
-    return type === 'u64' || type === 'i64';
-}
-
-export function isNativeBooleanType(type: Deno.NativeType): type is Deno.NativeBooleanType {
-    return type === 'bool';
-}
-
-export function isNativePointerType(type: Deno.NativeType): type is Deno.NativePointerType {
-    return type === 'pointer';
-}
-
-export function isNativeVoidType(type: Deno.NativeResultType): type is Deno.NativeVoidType {
-    return type === 'void';
-}
-
-export function isNativeStructType(type: Deno.NativeType): type is Deno.NativeStructType {
-    return typeof type === 'object' && 'struct' in type;
-}
-
 export function isForeignFunction(sym: Deno.ForeignFunction | Deno.ForeignStatic): sym is Deno.ForeignFunction {
     return 'parameters' in sym;
 }

@@ -66,6 +66,8 @@ export type HeadersGuard = 'none' | 'immutable' | 'request' | 'response';
 export class Headers implements globalThis.Headers {
     #map = new Map<string, string[]>();
     #guard: HeadersGuard = 'none';
+    /* The flattened list is shared by live iterators until a mutation. */
+    #flattenedEntries: Array<[string, string]> | null = null;
 
     /** `immutable` makes every mutation throw, as the spec requires. */
     static setGuard(headers: Headers, guard: HeadersGuard): void {
@@ -119,6 +121,7 @@ export class Headers implements globalThis.Headers {
         } else {
             this.#map.set(key, [next]);
         }
+        this.#flattenedEntries = null;
     }
 
     set(name: string, value: string): void {
@@ -127,6 +130,7 @@ export class Headers implements globalThis.Headers {
         const next = normalizeHeaderValue(value);
         this.#checkMutable();
         this.#map.set(key, [next]);
+        this.#flattenedEntries = null;
     }
 
     get(name: string): string | null {
@@ -145,6 +149,7 @@ export class Headers implements globalThis.Headers {
         const key = normalizeHeaderName(name);
         this.#checkMutable();
         this.#map.delete(key);
+        this.#flattenedEntries = null;
     }
 
     forEach<ThisArg = this>(
@@ -160,22 +165,28 @@ export class Headers implements globalThis.Headers {
     }
 
     *entries(): IterableIterator<[string, string]> {
-        let index = 0;
-        while (true) {
-            const entries: Array<[string, string]> = [];
-            const names = Array.from(this.#map.keys()).sort((a, b) => a.localeCompare(b));
-            for (const name of names) {
-                const values = this.#map.get(name);
-                if (values === undefined) continue;
-                if (name === 'set-cookie') {
-                    for (const value of values) entries.push([name, value]);
-                } else {
-                    entries.push([name, values[0] ?? '']);
+        // Keep one position in the flattened list. A mutation rebuilds that
+        // list, but does not move the iterator's position within it.
+        let cursor = 0;
+        for (;;) {
+            if (this.#flattenedEntries === null) {
+                const entries: Array<[string, string]> = [];
+                const keys = Array.from(this.#map.keys()).sort((a, b) => a.localeCompare(b));
+                for (const key of keys) {
+                    const values = this.#map.get(key);
+                    if (values === undefined) continue;
+                    if (key === 'set-cookie') {
+                        for (const value of values) entries.push([key, value]);
+                    } else {
+                        entries.push([key, values[0] ?? '']);
+                    }
                 }
+                this.#flattenedEntries = entries;
             }
-            const entry = entries[index++];
-            if (!entry) return;
-            yield entry;
+            const entries = this.#flattenedEntries;
+            if (cursor >= entries.length) return;
+            const entry = entries[cursor++];
+            yield [entry[0], entry[1]];
         }
     }
 

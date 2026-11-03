@@ -41,11 +41,6 @@ export function disableRawCertVerify(): void {
     defaultTls = { ...defaultTls, rejectUnauthorized: false };
 }
 
-/** Add trust roots used by every subsequent raw connection. */
-export function setRawCaCerts(caCerts: string[] | undefined): void {
-    defaultTls = { ...defaultTls, caCerts };
-}
-
 /** Current policy, for tests and for callers that need to report it. */
 export function getRawTlsOptions(): Readonly<TlsOptions> {
     return defaultTls;

@@ -1,7 +1,7 @@
 import { Headers } from "../headers";
 import { type NetworkCallFrame } from "../../utils/network-hooks";
 import { bytesToArrayBuffer } from "../../utils/bytes";
-import { bodyContentType, Decoder, ensureFormDataContentType, isBodyIterable, isReadableStreamLike, iterableBodyToStream, markRequestBodyUsed, parseFormData, readStreamBody, serializeBody, serializeFormData, teeUntracked, trackBodyStream } from "./helpers";
+import { bodyContentType, ensureFormDataContentType, isBodyIterable, isReadableStreamLike, iterableBodyToStream, markRequestBodyUsed, parseFormData, readStreamBody, serializeBody, serializeFormData, teeUntracked, trackBodyStream, utf8Decoder } from "./helpers";
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 type RequestBodySource = BodyInit | ReadableStream<Uint8Array> | Uint8Array | null;
@@ -297,7 +297,7 @@ export class Request implements globalThis.Request {
         if (!buf) throw new TypeError('Request body is empty');
         return parseFormData(buf, this.headers.get('content-type') ?? '');
     }
-    async text(): Promise<string> { return new Decoder().decode(new Uint8Array(await this.arrayBuffer())); }
+    async text(): Promise<string> { return utf8Decoder.decode(new Uint8Array(await this.arrayBuffer())); }
     async json<T = unknown>(): Promise<T> { return JSON.parse(await this.text()); }
 
     /** Consuming an already-buffered upload still disturbs the Request even

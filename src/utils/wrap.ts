@@ -102,15 +102,19 @@ export function __wrap_fs_func<This, Args extends unknown[], Return>(
     obj: (this: This, ...args: Args) => Return
 ): (this: This, ...args: Args) => Return {
     function wrappedFsFunc(this: This, ...args: Args): Return {
-        const stack = new Error().stack ?? '';
         try {
             const ret = obj.apply(this, args);
             if (ret instanceof Promise) {
+                // Async rejections must capture the stack synchronously: the
+                // caller frames are gone by the time .catch runs. Sync paths
+                // pay nothing on success — the catch frame carries the same
+                // caller frames, and __rethrow strips the wrap frame itself.
+                const stack = new Error().stack ?? '';
                 return ret.catch(e => __rethrow(wrapFSErr(e), stack)) as Return;
-            } else {
-                return ret;
             }
+            return ret;
         } catch (e) {
+            const stack = new Error().stack ?? '';
             return __rethrow(wrapFSErr(e), stack);
         }
     }

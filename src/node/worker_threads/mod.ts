@@ -392,11 +392,15 @@ export class MessagePort extends EventEmitter {
             return true;
         }
 
+        // Node still validates and performs transfers when a local port is
+        // closed; only delivery is a no-op. Clone first so invalid payloads
+        // throw and transfer-list entries are detached consistently.
+        const message = cloneForMessage(value, transferList);
         if (this[closedSymbol]) return true;
         const otherPort = this[otherPortSymbol];
         if (!otherPort || otherPort[closedSymbol]) return true;
 
-        enqueuePortMessage(otherPort, cloneForMessage(value, transferList));
+        enqueuePortMessage(otherPort, message);
         return true;
     }
 
@@ -790,8 +794,12 @@ export function postMessageToThread(
     }
 
     if (targetThreadId === 0 && parentPort) {
-        parentPort.postMessage(value, transferList);
-        return Promise.resolve();
+        try {
+            parentPort.postMessage(value, transferList);
+            return Promise.resolve();
+        } catch (error) {
+            return Promise.reject(error);
+        }
     }
 
     const target = workerRegistry.get(targetThreadId);
@@ -799,6 +807,10 @@ export function postMessageToThread(
         return Promise.reject(new Error(`Worker thread ${targetThreadId} is not running`));
     }
 
-    target.postMessage(value, transferList);
-    return Promise.resolve();
+    try {
+        target.postMessage(value, transferList);
+        return Promise.resolve();
+    } catch (error) {
+        return Promise.reject(error);
+    }
 }

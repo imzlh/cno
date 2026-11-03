@@ -4,7 +4,7 @@ import { getFetchHook, getUserAgentOverride, getExtraHTTPHeaders, getFetchInterc
 import { type HttpClient } from "../../deno/07_http";
 import { Request } from "./request";
 import { Response, setResponseMetadata } from "./response";
-import { abortError, attachCurlDebugTrace, buildConnectionInfo, compressionAcceptEncoding, curlMod, engine, getCurlPool, isCurlTimeoutError, isNullBodyStatus, maxPendingBodyBytes, parseHeaders, prepareRequestBody, rawHeadersToHeaders, streamHighWaterMark, throwIfAborted, timeoutError, toCurlBody, truncateHookPostData } from "./helpers";
+import { abortError, attachCurlDebugTrace, buildConnectionInfo, compressionAcceptEncoding, curlMod, engine, getCurlPool, headerPairsToHeaders, isCurlTimeoutError, isNullBodyStatus, maxPendingBodyBytes, parseHeaders, prepareRequestBody, streamHighWaterMark, throwIfAborted, timeoutError, toCurlBody, truncateHookPostData } from "./helpers";
 import { isLocalFetchProtocol, loadLocalProtocol } from "./protocols";
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
@@ -41,9 +41,9 @@ function getCurlProxyType(protocol: string): CurlProxyType {
     throw new Error(`Unsupported proxy protocol: ${protocol}`);
 }
 
-function isFollowedRedirect(status: number, rawHeaders: string): boolean {
+function isFollowedRedirect(status: number, headerPairs: Array<[string, string]>): boolean {
     if (status !== 301 && status !== 302 && status !== 303 && status !== 307 && status !== 308) return false;
-    return parseHeaders(rawHeaders).some(([name, value]) => name === 'location' && value.length > 0);
+    return headerPairs.some(([name, value]) => name === 'location' && value.length > 0);
 }
 
 function getEffectiveUrl(curl: CModuleCURL.CURL, fallback: string): string {
@@ -259,7 +259,7 @@ export async function performFetch(request: Request, url: URL): Promise<Response
     };
 
     // Resolve immediately when headers arrive; stream body via ReadableStream.
-    const headersDone = Promise.withResolvers<{ status: number; headers: string }>();
+    const headersDone = Promise.withResolvers<{ status: number; headers: Array<[string, string]> }>();
     inFlightFetchFrames.add(headersDone.promise);
     let streamController: FetchStreamController | null = null;
     let bodyCanceled = false;
@@ -391,7 +391,10 @@ export async function performFetch(request: Request, url: URL): Promise<Response
     let waitingForFinalHeaders = false; // true between a redirect hop and the final onHeadersComplete
 
     curl.onHeadersComplete((status, headers) => {
-        const isRedirectStatus = isFollowedRedirect(status, headers);
+        // Parse the raw block once; the redirect decision, netHook record and
+        // the response Headers all derive from these pairs.
+        const headerPairs = parseHeaders(headers);
+        const isRedirectStatus = isFollowedRedirect(status, headerPairs);
 
         // When curl follows redirects, onHeadersComplete fires for each hop.
         // Skip intermediate redirect responses entirely — the netHook and
@@ -416,7 +419,7 @@ export async function performFetch(request: Request, url: URL): Promise<Response
         // Parse headers into object only for the final response.
         if (netHook) {
             const hdrs: Record<string, string> = {};
-            for (const [k, v] of parseHeaders(headers)) hdrs[k] = v;
+            for (const [k, v] of headerPairs) hdrs[k] = v;
             const responseUrl = readFinalUrl(curl, url.href);
             emitFetchHookQuietly(() => {
                 netHook.onResponse?.({
@@ -428,7 +431,7 @@ export async function performFetch(request: Request, url: URL): Promise<Response
             });
         }
 
-        headersDone.resolve({ status, headers });
+        headersDone.resolve({ status, headers: headerPairs });
     });
 
     curl.onData((chunk: ArrayBuffer) => {
@@ -540,11 +543,11 @@ export async function performFetch(request: Request, url: URL): Promise<Response
     }
 
     try {
-        const { status, headers: rawHeaders } = await headersDone.promise;
+        const { status, headers: headerPairs } = await headersDone.promise;
         throwIfAborted(request.signal);
 
-        const responseHeaders = rawHeadersToHeaders(rawHeaders);
-        const isRedirect = isFollowedRedirect(status, rawHeaders);
+        const responseHeaders = headerPairsToHeaders(headerPairs);
+        const isRedirect = isFollowedRedirect(status, headerPairs);
 
         if (request.redirect === 'error' && isRedirect) {
             abortCurl();

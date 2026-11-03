@@ -15,6 +15,9 @@ export const engine = import.meta.use("engine");
 const algorithm = import.meta.use("algorithm");
 export const { Decoder } = import.meta.use("text");
 
+// Whole-buffer decode is stateless; shared to avoid a native allocation per call.
+export const utf8Decoder = new Decoder();
+
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 type BodyIterable = Iterable<unknown> | AsyncIterable<unknown>;
 
@@ -197,9 +200,9 @@ export function mergeChunks(chunks: Uint8Array[]): Uint8Array {
     return toOwnedBytes(algorithm.bytesConcat(chunks));
 }
 
-export function rawHeadersToHeaders(raw: string): Headers {
+export function headerPairsToHeaders(pairs: Array<[string, string]>): Headers {
     const h = new Headers();
-    for (const [k, v] of parseHeaders(raw)) h.append(k, v);
+    for (const [k, v] of pairs) h.append(k, v);
     return h;
 }
 
@@ -226,10 +229,6 @@ export function parseHeaders(raw: string): Array<[string, string]> {
     return out;
 }
 
-/**
- * Convert array of header pairs to Record for curl.setHeaders().
- * Note: duplicates are merged (last wins) — curl API limitation.
- */
 export function responseBodyToBytes(body?: string | ArrayBuffer): Uint8Array {
     if (!body) return new Uint8Array(0);
     if (typeof body === "string") return engine.encodeString(body);
@@ -508,7 +507,7 @@ export function parseFormData(body: Uint8Array, contentType: string): FormData {
 }
 
 export function parseUrlEncoded(body: Uint8Array): FormData {
-    const str = new Decoder().decode(body);
+    const str = utf8Decoder.decode(body);
     const params = new URLSearchParams(str);
     const fd = new FormData();
     for (const [key, value] of params) fd.append(key, value);
@@ -534,7 +533,7 @@ export function parseMultipart(body: Uint8Array, boundary: string): FormData {
 
         const hdrEnd = algorithm.bytesIndexOf(body, CRLF2, pos);
         if (hdrEnd < 0) break;
-        const hdrStr = new Decoder().decode(body.subarray(pos, hdrEnd));
+        const hdrStr = utf8Decoder.decode(body.subarray(pos, hdrEnd));
         pos = hdrEnd + 4;
 
         const nameMatch = hdrStr.match(/name="([^"]+)"/);
@@ -555,7 +554,7 @@ export function parseMultipart(body: Uint8Array, boundary: string): FormData {
             fd.append(name, blob, filenameMatch[1]);
         } else {
             // Field values are UTF-8 decoded per spec, so malformed bytes become U+FFFD.
-            fd.append(name, new Decoder().decode(partBody));
+            fd.append(name, utf8Decoder.decode(partBody));
         }
     }
     return fd;

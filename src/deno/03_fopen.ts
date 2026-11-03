@@ -273,7 +273,8 @@ export class FsFile implements Deno.FsFile {
     @wrap
     async seek(offset: number | bigint, whence: Deno.SeekMode): Promise<number> {
         this.assertOpen();
-        const size = (await this.$handle.stat()).size;
+        // The file size is only needed to resolve SeekMode.End.
+        const size = whence === Deno.SeekMode.End ? (await this.$handle.stat()).size : 0;
         this.fpointer = seekPosition(size, this.fpointer, offset, whence);
         return this.fpointer;
     }
@@ -281,7 +282,7 @@ export class FsFile implements Deno.FsFile {
     @wrap
     seekSync(offset: number | bigint, whence: Deno.SeekMode): number {
         this.assertOpen();
-        const size = fs.lstat(this.$handle.path).size;
+        const size = whence === Deno.SeekMode.End ? fs.lstat(this.$handle.path).size : 0;
         this.fpointer = seekPosition(size, this.fpointer, offset, whence);
         return this.fpointer;
     }
