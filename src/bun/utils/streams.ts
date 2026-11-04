@@ -1,3 +1,5 @@
+const engine = import.meta.use('engine');
+
 type BinaryChunk = ArrayBufferView | ArrayBufferLike;
 type StreamChunk = BinaryChunk | string;
 
@@ -56,8 +58,7 @@ export async function readableStreamToBlob(stream: ReadableStream<StreamChunk>):
 
 export async function readableStreamToArrayBuffer(stream: ReadableStream<StreamChunk>): Promise<ArrayBuffer> {
     const chunks = await readChunks(stream);
-    const encoder = new TextEncoder();
-    return concatArrayBuffers(chunks.map(chunk => typeof chunk === 'string' ? encoder.encode(chunk) : bytesOf(chunk)));
+    return concatArrayBuffers(chunks.map(chunk => typeof chunk === 'string' ? engine.encodeString(chunk) : bytesOf(chunk)));
 }
 
 export async function readableStreamToBytes(stream: ReadableStream<StreamChunk>): Promise<Uint8Array<ArrayBuffer>> {
@@ -70,7 +71,7 @@ export async function readableStreamToText(stream: ReadableStream<StreamChunk>):
     let binary: Uint8Array[] = [];
     const flush = () => {
         if (binary.length) {
-            result += new TextDecoder().decode(concatArrayBuffers(binary));
+            result += engine.decodeString(concatArrayBuffers(binary));
             binary = [];
         }
     };
@@ -93,7 +94,6 @@ export async function readableStreamToJSON(stream: ReadableStream<StreamChunk>):
 type FormBoundary = string | ArrayBufferView;
 
 const CRLF = [13, 10];
-const utf8 = new TextDecoder('utf-8', { ignoreBOM: true });
 
 function formError(message: string): TypeError {
     return new TypeError(`Invalid form data: ${message}`);
@@ -144,14 +144,14 @@ function parseUrlEncoded(data: Uint8Array, form: FormData): void {
             const eq = pair.indexOf(0x3d);
             const name = eq === -1 ? pair : pair.subarray(0, eq);
             const value = eq === -1 ? pair.subarray(0, 0) : pair.subarray(eq + 1);
-            form.append(utf8.decode(percentDecode(name)), utf8.decode(percentDecode(value)));
+            form.append(engine.decodeString(percentDecode(name)), engine.decodeString(percentDecode(value)));
         }
         start = end + 1;
     }
 }
 
 function boundaryBytes(boundary: FormBoundary): Uint8Array {
-    const bytes = typeof boundary === 'string' ? new TextEncoder().encode(boundary) : bytesOf(boundary);
+    const bytes = typeof boundary === 'string' ? engine.encodeString(boundary) : bytesOf(boundary);
     if (bytes.length === 0) throw new TypeError('Multipart boundary must not be empty');
     if (bytes.includes(13) || bytes.includes(10)) throw new TypeError('Multipart boundary must not contain line breaks');
     return bytes;
@@ -242,7 +242,7 @@ function parseMultipart(data: Uint8Array, boundary: Uint8Array, form: FormData):
         if (split === -1) throw formError('multipart part has no header block');
         let disposition: ReturnType<typeof parseHeaderParams> | undefined;
         let contentType = 'text/plain';
-        for (const line of utf8.decode(part.subarray(0, split)).split('\r\n')) {
+        for (const line of engine.decodeString(part.subarray(0, split)).split('\r\n')) {
             const colon = line.indexOf(':');
             if (colon === -1) throw formError('malformed multipart header');
             const header = line.slice(0, colon).trim().toLowerCase();
@@ -257,7 +257,7 @@ function parseMultipart(data: Uint8Array, boundary: Uint8Array, form: FormData):
         const body = part.subarray(split + headerEnd.length);
         const filename = disposition.params.get('filename');
         if (filename === undefined) {
-            form.append(name, utf8.decode(body));
+            form.append(name, engine.decodeString(body));
         } else {
             form.append(name, new Blob([body.slice()], { type: contentType }), unescapeFormName(filename));
         }

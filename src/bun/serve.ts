@@ -12,6 +12,8 @@ export interface BunServeServer {
     readonly url: URL;
     /** Graceful shutdown; force-close is intentionally unsupported. */
     stop(closeActiveConnections?: boolean): Promise<void>;
+    /** Replace request/error handlers without rebinding the listener. */
+    reload(options: BunServeReloadOptions): BunServeServer;
 }
 
 export type BunServeHandler = (
@@ -23,6 +25,15 @@ export type BunServeHandler = (
 export interface BunServeOptions {
     fetch: BunServeHandler;
     error?: (this: BunServeServer, error: unknown) => Response | Promise<Response>;
+    port?: number | string;
+    hostname?: string;
+}
+
+/** The handler subset accepted by server.reload(). */
+export interface BunServeReloadOptions {
+    fetch?: BunServeHandler;
+    error?: (this: BunServeServer, error: unknown) => Response | Promise<Response>;
+    // Bun accepts these on reload but leaves the existing listener unchanged.
     port?: number | string;
     hostname?: string;
 }
@@ -40,7 +51,7 @@ interface HostHttpServer {
 interface HostServeOptions {
     port: number;
     hostname: string;
-    onError?: (error: unknown) => Response | Promise<Response>;
+    onError?: (error: unknown) => Response | Promise<Response> | undefined;
 }
 
 interface HostDeno {
@@ -55,6 +66,11 @@ interface ParsedOptions {
     error?: (error: unknown) => Response | Promise<Response>;
     port: number;
     hostname: string;
+}
+
+interface ParsedReloadOptions {
+    fetch?: BunServeHandler;
+    error?: (error: unknown) => Response | Promise<Response>;
 }
 
 const DEFAULT_PORT = 3000;
@@ -134,6 +150,46 @@ function parseOptions(value: unknown): ParsedOptions {
     };
 }
 
+function parseReloadOptions(value: unknown): ParsedReloadOptions {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+        throw new TypeError('Bun.serve: reload options must be an object.');
+    }
+
+    const options = value as Record<PropertyKey, unknown>;
+    for (const key of Reflect.ownKeys(options)) {
+        if (typeof key !== 'string' || !SUPPORTED_OPTIONS.has(key)) {
+            throw unsupportedOption(String(key));
+        }
+    }
+
+    const fetch = options.fetch;
+    if (fetch != null && typeof fetch !== 'function') {
+        throw new TypeError('Bun.serve: reload fetch must be a function.');
+    }
+    const error = options.error;
+    if (error != null && typeof error !== 'function') {
+        throw new TypeError('Bun.serve: reload error must be a function.');
+    }
+    // Bun validates a supplied port even though reload never rebinds it.
+    const port = options.port;
+    if (port !== undefined) validateReloadPort(port);
+
+    return {
+        fetch: fetch == null ? undefined : fetch as BunServeHandler,
+        error: error == null ? undefined : error as ParsedReloadOptions['error'],
+    };
+}
+
+function validateReloadPort(value: unknown): void {
+    const port = Number(value);
+    if (!Number.isInteger(port) || port < 0 || port > 65535) {
+        throw Object.assign(
+            new RangeError('Bun.serve: reload port must coerce to an integer from 0 through 65535.'),
+            { code: 'ERR_OUT_OF_RANGE' },
+        );
+    }
+}
+
 function hostRuntime(): HostDeno {
     const runtime = (globalThis as unknown as { Deno?: Partial<HostDeno> }).Deno;
     if (!runtime || typeof runtime.serve !== 'function') {
@@ -165,13 +221,19 @@ class BunServeServerImpl implements BunServeServer {
     private stopPromise: Promise<void> | undefined;
     private currentPort: number;
     private currentUrl: URL;
+    private fetchHandler: BunServeHandler;
+    private errorHandler: ((error: unknown) => Response | Promise<Response>) | undefined;
 
     constructor(
         private readonly configuredHostname: string,
         requestedPort: number,
+        fetchHandler: BunServeHandler,
+        errorHandler: ((error: unknown) => Response | Promise<Response>) | undefined,
     ) {
         this.currentPort = requestedPort;
         this.currentUrl = serverUrl(configuredHostname, requestedPort);
+        this.fetchHandler = fetchHandler;
+        this.errorHandler = errorHandler;
     }
 
     get port(): number {
@@ -184,6 +246,28 @@ class BunServeServerImpl implements BunServeServer {
 
     get url(): URL {
         return this.currentUrl;
+    }
+
+    handleFetch(request: Request): Response | Promise<Response> {
+        return this.fetchHandler.call(this, request, this);
+    }
+
+    handleError(error: unknown): Response | Promise<Response> | undefined {
+        if (this.errorHandler) return this.errorHandler.call(this, error);
+        try {
+            console.error('Bun.serve request error:', error);
+        } catch {
+            // Diagnostics must not replace the original request failure.
+        }
+        return undefined;
+    }
+
+    reload(options: BunServeReloadOptions): BunServeServer {
+        const parsed = parseReloadOptions(options);
+        // Validation is complete before either field is changed.
+        if (parsed.fetch !== undefined) this.fetchHandler = parsed.fetch;
+        if (parsed.error !== undefined) this.errorHandler = parsed.error;
+        return this;
     }
 
     attach(hostServer: HostHttpServer): void {
@@ -224,23 +308,23 @@ class BunServeServerImpl implements BunServeServer {
 export function serve(options: BunServeOptions): BunServeServer {
     const parsed = parseOptions(options);
     const runtime = hostRuntime();
-    const exposedServer = new BunServeServerImpl(parsed.hostname, parsed.port);
+    const exposedServer = new BunServeServerImpl(parsed.hostname, parsed.port, parsed.fetch, parsed.error);
     const hostOptions: HostServeOptions = {
         port: parsed.port,
         // The host's native TCP bind only accepts literal IP addresses. Keep
         // Bun's public default while binding localhost on its IPv4 loopback.
         hostname: parsed.hostname === DEFAULT_HOSTNAME ? DEFAULT_BIND_HOSTNAME : parsed.hostname,
     };
-    if (parsed.error) {
-        hostOptions.onError = error => parsed.error!.call(exposedServer, error);
-    }
+    // Keep the callback installed so reload() can replace handlers without
+    // restarting Deno.serve. Without a custom handler the host still emits 500.
+    hostOptions.onError = error => exposedServer.handleError(error);
 
     let hostServer: HostHttpServer;
     try {
         hostServer = runtime.serve.call(
             runtime,
             hostOptions,
-            request => parsed.fetch.call(exposedServer, request, exposedServer),
+            request => exposedServer.handleFetch(request),
         );
     } catch (error) {
         throw error;

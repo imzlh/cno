@@ -20,10 +20,7 @@ const blobBytesSymbol = Symbol.for('cno.blob.bytes');
 // The shared Node Stats class also supports bigint stats; Bun.file.stat does not.
 type BunFileStats = { [K in keyof Stats]: Stats[K] extends number | bigint ? number : Stats[K] };
 
-export interface BunFileWriteOptions {
-    mode?: number;
-    createPath?: boolean;
-}
+export type BunFileWriteOptions = NonNullable<Parameters<typeof import('bun').write>[2]>;
 
 export interface BunFileLike extends Blob {
     readonly name?: string;
@@ -213,6 +210,10 @@ function toArrayBufferBytes(value: ArrayBufferView | ArrayBufferLike): Uint8Arra
     }
     const bytes = new Uint8Array(value);
     return copy(bytes);
+}
+
+function bytePathError(message: string, code: 'ERR_INVALID_ARG_TYPE' | 'ERR_INVALID_ARG_VALUE'): TypeError {
+    return Object.assign(new TypeError(message), { code });
 }
 
 function validateWriteOptions(value: unknown): BunFileWriteOptions {
@@ -612,7 +613,33 @@ export async function write(
     }
 }
 
-export function file(path: string | URL, options?: BlobPropertyBag): BunFile {
+export function file(
+    path: string | URL | ArrayBufferLike | Uint8Array<ArrayBufferLike> | DataView<ArrayBufferLike>,
+    options?: BlobPropertyBag,
+): BunFile {
     const parsed = parseFileOptions(options);
+    if (path instanceof Uint8Array || path instanceof DataView || isArrayBufferLike(path)) {
+        const bytes = toArrayBufferBytes(path);
+        if (bytes.byteLength === 0) {
+            throw bytePathError("Invalid path buffer: can't be empty", 'ERR_INVALID_ARG_TYPE');
+        }
+        if (bytes.includes(0)) {
+            throw bytePathError(
+                "The argument 'path' must be a string, Uint8Array, or URL without null bytes.",
+                'ERR_INVALID_ARG_VALUE',
+            );
+        }
+        // Host filesystem paths are strings, so arbitrary non-UTF-8 names cannot round-trip.
+        let decoded: string;
+        try {
+            decoded = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+        } catch {
+            throw bytePathError(
+                'Bun.file byte paths must contain valid UTF-8 in this runtime.',
+                'ERR_INVALID_ARG_VALUE',
+            );
+        }
+        return new BunFile(decoded, parsed);
+    }
     return new BunFile(pathFromValue(path), parsed);
 }

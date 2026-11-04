@@ -9,25 +9,16 @@
  * or the window start when nothing was committed.
  */
 
-export interface JSONLParseChunkResult {
-    /** Top-level values committed before the first incomplete or invalid input. */
-    values: unknown[];
-    /** Absolute offset past the last committed value. */
-    read: number;
-    /** True when all input in the window was consumed without error or pending value. */
-    done: boolean;
-    /** SyntaxError for invalid input, otherwise null. */
-    error: SyntaxError | null;
-}
+const engine = import.meta.use('engine');
 
-export type JSONLInput = string | ArrayBufferView | ArrayBufferLike;
+export type JSONLParseChunkResult = import('bun').JSONL.ParseChunkResult;
+export type JSONLInput = Parameters<typeof import('bun').JSONL.parse>[0];
 
 const FAILURE_MESSAGE = 'Failed to parse JSONL';
 const INCOMPLETE = -1;
 const ERROR = -2;
 // Single punctuation that the oracle leaves pending when it is the final byte.
-const PENDING_PUNCTUATION = new Set([',', ':', ';', '=', '(', ')', '.', '-', '[', '{', ']', '}'].map((c) => c.charCodeAt(0)));
-const UTF8 = new TextDecoder('utf-8', { ignoreBOM: true });
+const PENDING_PUNCTUATION = new Set([',', ':', ';', '=', '(', ')', '.', '-', '[', '{', ']', '}'].map((c) => c.charCodeAt(0)));;
 
 function isDigit(code: number): boolean {
     return code >= 0x30 && code <= 0x39;
@@ -64,7 +55,7 @@ class Scanner {
     slice(start: number, stop: number): string {
         return typeof this.source === 'string'
             ? this.source.slice(start, stop)
-            : UTF8.decode(this.source.subarray(start, stop));
+            : engine.decodeString(this.source.subarray(start, stop));
     }
 
     skipSpace(index: number): number {

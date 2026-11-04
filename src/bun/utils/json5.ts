@@ -1,3 +1,5 @@
+const engine = import.meta.use('engine');
+
 const identifierStart = /[$_\p{ID_Start}]/u;
 const identifierPart = /[$_\u200c\u200d\p{ID_Continue}]/u;
 
@@ -112,8 +114,8 @@ class Parser {
 export function parseJSON5(input: unknown): any {
     if (input == null) throw new TypeError('input must be a string, ArrayBuffer, ArrayBufferView or Blob');
     let text: string;
-    if (input instanceof ArrayBuffer) text = new TextDecoder().decode(input);
-    else if (ArrayBuffer.isView(input)) text = new TextDecoder().decode(new Uint8Array(input.buffer, input.byteOffset, input.byteLength));
+    if (input instanceof ArrayBuffer) text = engine.decodeString(input);
+    else if (ArrayBuffer.isView(input)) text = engine.decodeString(new Uint8Array(input.buffer, input.byteOffset, input.byteLength));
     else text = `${input}`;
     return new Parser(text).parse();
 }

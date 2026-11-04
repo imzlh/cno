@@ -10,8 +10,11 @@ that every declared API exists at runtime.
 | Surface | Status | Notes |
 | --- | --- | --- |
 | `globalThis.Bun`, `bun` | Partial | One shared namespace for lifecycle, file, HTTP, process and the helpers listed below; not the full Bun namespace |
-| `Bun.file`, `Bun.write` | Partial | Local paths and file URL objects, lazy file blobs, slices, reads, stats, deletion, and instance writes. `Bun.write` accepts strings, bytes, Blob and Response; `BunFile.write` also accepts Request and ReadableStream. FileSink/`writer()` and special stdio/S3 files are unsupported. |
-| `Bun.serve` | Partial | HTTP over `Deno.serve` with `fetch`, `error`, `port` and `hostname`; no TLS, WebSocket, routes, hot reload, or forceful stop |
+| `Bun.fetch` | Partial | Reuses cno's global Web fetch; Bun-specific fetch options are rejected rather than silently ignored. |
+| `Bun.isMainThread` | Supported | Reports whether the current runtime is a worker. |
+| `Bun.file`, `Bun.write` | Partial | Local paths, file URL objects and UTF-8 byte paths, lazy file blobs, slices, reads, stats, deletion, and instance writes. Invalid UTF-8 byte paths are rejected because the string-based host filesystem API cannot represent them safely. `Bun.write` accepts strings, bytes, Blob and Response; `BunFile.write` also accepts Request and ReadableStream. File descriptors, FileSink/`writer()` and special stdio/S3 files are unsupported. |
+| `Bun.dns` | Partial | `lookup` and resolver flag constants use asynchronous system getaddrinfo with TTL 0. Explicit c-ares selection is rejected; UDP socket type and port do not affect resolution. Prefetch and shared connection cache statistics are unsupported. |
+| `Bun.serve` | Partial | HTTP over `Deno.serve` with `fetch`, `error`, `port` and `hostname`; `server.reload()` updates fetch/error handlers without rebinding. No TLS, WebSocket, routes, automatic hot reload, or forceful stop. |
 | `Bun.spawn`, `Bun.spawnSync` | Partial | Native subprocess adapter with stdio and exit handling; IPC, cgroups and terminals are unsupported. Sync also rejects `signal`, `timeout`, `maxBuffer`, and `argv0`; async per-child `resourceUsage` is unavailable. |
 | `bun:sqlite` | Partial | Database and Statement queries, bindings, transactions, caching, and close semantics; `Statement.raw` and `columnTypes` are unsupported. |
 | `Bun.gzipSync`, `gunzipSync`, `deflateSync`, `inflateSync` | Partial | One-shot gzip and raw-DEFLATE helpers over the native zlib binding; zstd is not implemented. |

@@ -1,4 +1,40 @@
-import { Temporal } from 'temporal-polyfill';
+const engine = import.meta.use('engine');
+
+const TOML_TEMPORAL = Symbol('cno.bun.toml.temporal');
+
+class TomlTemporalValue {
+    readonly [TOML_TEMPORAL] = true;
+    constructor(private readonly value: string) {}
+    toString(): string { return this.value; }
+}
+
+function validDate(year: number, month: number, day: number): boolean {
+    if (month < 1 || month > 12 || day < 1) return false;
+    const days = [31, year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0) ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    return day <= days[month - 1];
+}
+
+function parseTomlTemporal(value: string): TomlTemporalValue {
+    const normalized = value.replace(/[t ]/, 'T').replace(/z$/, 'Z');
+    const match = normalized.match(/^(?:(\d{4})-(\d\d)-(\d\d)(?:T(\d\d):(\d\d):(\d\d)(\.\d{1,9})?(Z|[+-]\d\d:\d\d)?)?|(\d\d):(\d\d):(\d\d)(\.\d{1,9})?)$/);
+    if (!match) throw new RangeError('Invalid date or time');
+    if (match[9] !== undefined) {
+        const hour = Number(match[9]), minute = Number(match[10]), second = Number(match[11]);
+        if (hour > 23 || minute > 59 || second > 59) throw new RangeError('Invalid time');
+        return new TomlTemporalValue(`${match[9]}:${match[10]}:${match[11]}${match[12] ?? ''}`);
+    }
+    const year = Number(match[1]), month = Number(match[2]), day = Number(match[3]);
+    if (!validDate(year, month, day)) throw new RangeError('Invalid date');
+    const date = `${match[1]}-${match[2]}-${match[3]}`;
+    if (match[4] === undefined) return new TomlTemporalValue(date);
+    const hour = Number(match[4]), minute = Number(match[5]), second = Number(match[6]);
+    if (hour > 23 || minute > 59 || second > 59) throw new RangeError('Invalid time');
+    const local = `${date}T${match[4]}:${match[5]}:${match[6]}${match[7] ?? ''}`;
+    if (!match[8]) return new TomlTemporalValue(local);
+    const epoch = Date.parse(local + match[8]);
+    if (!Number.isFinite(epoch)) throw new RangeError('Invalid instant');
+    return new TomlTemporalValue(new Date(epoch).toISOString().replace('.000Z', 'Z'));
+}
 
 const own = (o: object, k: string) => Object.prototype.hasOwnProperty.call(o, k);
 const put = (o: Record<string, any>, k: string, v: any) => Object.defineProperty(o, k, { value: v, enumerable: true, configurable: true, writable: true });
@@ -61,7 +97,7 @@ class Parser {
         if (c === '[') { this.i++; const a: any[] = []; this.ws(); while (this.peek() !== ']') { if (!this.peek()) fail('Unterminated array'); a.push(this.value()); this.ws(); if (this.peek() !== ',') break; this.i++; this.ws(); } this.expect(']'); return a; }
         if (c === '{') { this.i++; const o = {}; this.ws(); while (this.peek() !== '}') { const k = this.key(); this.expect('='); this.assign(o, k, this.value()); this.ws(); if (this.peek() !== ',') break; this.i++; this.ws(); } this.expect('}'); const seal = (x: any) => { if (x && typeof x === 'object' && !Array.isArray(x)) { this.sealed.add(x); Object.values(x).forEach(seal); } }; seal(o); return o; }
         const rest = this.s.slice(this.i); const date = rest.match(/^\d{4}-\d\d-\d\d(?:[Tt ]\d\d:\d\d:\d\d(?:\.\d+)?(?:[Zz]|[+-]\d\d:\d\d)?)?|^\d\d:\d\d:\d\d(?:\.\d+)?/);
-        if (date) { const token = date[0]; this.i += token.length; const normalized = token.replace(/(\.\d{9})\d+/, '$1'); try { if (/^\d{4}-/.test(normalized)) { if (!/[Tt ]/.test(normalized)) return Temporal.PlainDate.from(normalized); if (/[Zz]|[+-]\d\d:\d\d$/.test(normalized.slice(10))) return Temporal.Instant.from(normalized.replace(' ', 'T')); return Temporal.PlainDateTime.from(normalized.replace(' ', 'T')); } return Temporal.PlainTime.from(normalized); } catch { return fail('Invalid date or time'); } }
+        if (date) { const token = date[0]; this.i += token.length; const normalized = token.replace(/(\.\d{9})\d+/, '$1'); try { return parseTomlTemporal(normalized); } catch { return fail('Invalid date or time'); } }
         const m = rest.match(/^[^\s,#\]}]+/); if (!m) return fail('Expected a value'); const token = m[0]; this.i += token.length;
         if (token === 'true') return true; if (token === 'false') return false;
         if (/^[+-]?(inf|nan)$/.test(token)) return token.endsWith('nan') ? NaN : token[0] === '-' ? -Infinity : Infinity;
@@ -85,8 +121,8 @@ class Parser {
 export function parseTOML(input: unknown): Record<string, any> {
     if (input == null || typeof input === 'symbol') throw new TypeError('input must be a string, ArrayBuffer, ArrayBufferView or Blob');
     let s: string;
-    if (input instanceof ArrayBuffer) s = new TextDecoder().decode(input);
-    else if (ArrayBuffer.isView(input)) s = new TextDecoder().decode(new Uint8Array(input.buffer, input.byteOffset, input.byteLength));
+    if (input instanceof ArrayBuffer) s = engine.decodeString(input);
+    else if (ArrayBuffer.isView(input)) s = engine.decodeString(new Uint8Array(input.buffer, input.byteOffset, input.byteLength));
     else s = String(input);
     return new Parser(s).parse();
 }
@@ -95,7 +131,7 @@ const quoteText = (text: string) => JSON.stringify(text).replace(/\x7f/g, '\\u00
 const keyText = (key: string) => /^[A-Za-z0-9_-]+$/.test(key) ? key : quoteText(key);
 const temporalValue = (value: any): string | undefined => {
     if (value instanceof Date) return value.toISOString().replace(/\.000Z$/, 'Z');
-    for (const cls of [Temporal.Instant, Temporal.PlainDate, Temporal.PlainDateTime, Temporal.PlainTime]) if (value instanceof cls) return value.toString();
+    if (value instanceof TomlTemporalValue) return value.toString();
     return undefined;
 };
 const tableValue = (v: any) => v !== null && typeof v === 'object' && !Array.isArray(v) && temporalValue(v) === undefined;

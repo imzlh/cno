@@ -12,6 +12,7 @@ import { ArrayBufferSink, type ArrayBufferSinkStartOptions } from './array-buffe
 import { CookieMap, type CookieInit, type CookieSameSite, type CookieStoreDeleteOptions } from './cookie';
 import { Cookie, type CookieOptions } from './cookie/cookie';
 import { CryptoHasher } from './crypto';
+import { dns } from './dns';
 import {
     MD4,
     MD5,
@@ -33,7 +34,13 @@ import { inspect as inspectValue, inspectCustom, inspectTable, type InspectOptio
 import { spawn, spawnSync } from './process';
 import { resolve, resolveSync } from './resolve';
 import { bunSemver as semver } from './semver';
-import { serve, type BunServeHandler, type BunServeOptions, type BunServeServer } from './serve';
+import {
+    serve,
+    type BunServeHandler,
+    type BunServeOptions,
+    type BunServeReloadOptions,
+    type BunServeServer,
+} from './serve';
 import { sleepSync } from './sleep-sync';
 import { allocUnsafe } from './utils/alloc-unsafe';
 import { deepEquals } from './utils/deep-equals';
@@ -71,11 +78,39 @@ import { TOML } from './utils/toml';
 import { randomUUIDv7 } from './uuid';
 import { randomUUIDv5 } from './uuid/v5';
 
+const webFetch = globalThis.fetch;
+const UNSUPPORTED_FETCH_OPTIONS = [
+    'tls',
+    'verbose',
+    'proxy',
+    'session',
+    's3',
+    'unix',
+    'protocol',
+    'decompress',
+    'compress',
+    'maxRedirects',
+    'timeout',
+] as const;
+
+export const fetch: typeof globalThis.fetch = function fetch(input, init = undefined) {
+    if (init !== undefined && init !== null) {
+        for (const name of UNSUPPORTED_FETCH_OPTIONS) {
+            if (Reflect.get(init, name) !== undefined) {
+                throw new TypeError(`Bun.fetch: unsupported Bun-specific option "${name}".`);
+            }
+        }
+    }
+    return webFetch(input, init);
+};
+export const isMainThread = !import.meta.use('worker').isWorker;
+
 export {
     ArrayBufferSink,
     Cookie,
     CookieMap,
     CryptoHasher,
+    dns,
     Glob,
     JSONC,
     JSON5,
@@ -137,8 +172,8 @@ export type {
     BunHash,
     BunServeHandler,
     BunServeOptions,
+    BunServeReloadOptions,
     BunServeServer,
-    BunInspect,
     BunWriteInput,
     CompressionInput,
     CompressionOptions,
@@ -167,6 +202,8 @@ export interface BunApi {
     readonly argv: string[];
     readonly env: Record<string, string | undefined>;
     readonly main: string;
+    readonly fetch: typeof fetch;
+    readonly isMainThread: boolean;
     readonly sleep: typeof sleep;
     readonly sleepSync: typeof sleepSync;
     readonly ArrayBufferSink: typeof ArrayBufferSink;
@@ -182,6 +219,7 @@ export interface BunApi {
     readonly deflateSync: typeof deflateSync;
     readonly inflateSync: typeof inflateSync;
     readonly CryptoHasher: typeof CryptoHasher;
+    readonly dns: typeof dns;
     readonly SHA1: typeof SHA1;
     readonly MD5: typeof MD5;
     readonly MD4: typeof MD4;
@@ -299,6 +337,8 @@ const Bun: BunApi = {
     get main(): string {
         return mainPath();
     },
+    fetch,
+    isMainThread,
     sleep,
     sleepSync,
     ArrayBufferSink,
@@ -314,6 +354,7 @@ const Bun: BunApi = {
     deflateSync,
     inflateSync,
     CryptoHasher,
+    dns,
     SHA1,
     MD5,
     MD4,
@@ -359,5 +400,14 @@ const Bun: BunApi = {
     resolve,
     resolveSync,
 };
+
+for (const name of ['fetch', 'isMainThread', 'dns'] as const) {
+    Object.defineProperty(Bun, name, {
+        value: Bun[name],
+        writable: false,
+        configurable: false,
+        enumerable: true,
+    });
+}
 
 export default Bun;
