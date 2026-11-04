@@ -1,21 +1,11 @@
-import { Buffer } from '../../node/buffer';
+import { Buffer } from 'node:buffer';
+import type { LibdeflateCompressionOptions, ZlibCompressionOptions } from 'bun';
 
 const zlib = import.meta.use('zlib');
 
 export type CompressionInput = string | ArrayBuffer | ArrayBufferView;
 
-export interface ZlibCompressionOptions {
-    level?: number;
-    memLevel?: number;
-    windowBits?: number;
-    strategy?: number;
-    library?: 'zlib';
-}
-
-export interface LibdeflateCompressionOptions {
-    level?: number;
-    library?: 'libdeflate';
-}
+export type { LibdeflateCompressionOptions, ZlibCompressionOptions };
 
 export type CompressionOptions = ZlibCompressionOptions | LibdeflateCompressionOptions;
 
@@ -249,18 +239,14 @@ function decompress(defaultFormat: 'raw' | 'gzip', data: unknown, options?: unkn
     return new Uint8Array(output.buffer, output.byteOffset, output.byteLength);
 }
 
-export function gzipSync(data: CompressionInput, options?: CompressionOptions): Uint8Array<ArrayBuffer> {
-    return compress('gzip', data, options) as Uint8Array<ArrayBuffer>;
-}
+export const gzipSync = (data: CompressionInput, options?: CompressionOptions): Uint8Array<ArrayBuffer> =>
+    compress('gzip', data, options) as Uint8Array<ArrayBuffer>;
 
-export function gunzipSync(data: CompressionInput, options?: CompressionOptions): Uint8Array<ArrayBuffer> {
-    return decompress('gzip', data, options) as Uint8Array<ArrayBuffer>;
-}
+export const gunzipSync = (data: CompressionInput, options?: CompressionOptions): Uint8Array<ArrayBuffer> =>
+    decompress('gzip', data, options) as Uint8Array<ArrayBuffer>;
 
-export function deflateSync(data: CompressionInput, options?: CompressionOptions): Uint8Array<ArrayBuffer> {
-    return compress('deflateRaw', data, options) as Uint8Array<ArrayBuffer>;
-}
+export const deflateSync = (data: CompressionInput, options?: CompressionOptions): Uint8Array<ArrayBuffer> =>
+    compress('deflateRaw', data, options) as Uint8Array<ArrayBuffer>;
 
-export function inflateSync(data: CompressionInput, options?: CompressionOptions): Uint8Array<ArrayBuffer> {
-    return decompress('raw', data, options) as Uint8Array<ArrayBuffer>;
-}
+export const inflateSync = (data: CompressionInput, options?: CompressionOptions): Uint8Array<ArrayBuffer> =>
+    decompress('raw', data, options) as Uint8Array<ArrayBuffer>;

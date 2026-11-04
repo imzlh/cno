@@ -1,15 +1,11 @@
 import { isAbsolutePath, join, resolvePath } from '../../utils/path';
 import { isWindows } from '../../utils/platform';
+import type { WhichOptions } from 'bun';
 
 const fs = import.meta.use('fs');
 const os = import.meta.use('os');
 
-export interface WhichOptions {
-    /** Search path. Defaults to the PATH environment variable. */
-    PATH?: string;
-    /** Base for relative PATH entries and relative command paths. Defaults to the current directory. */
-    cwd?: string;
-}
+export type { WhichOptions };
 
 function getEnv(name: string): string | undefined {
     try {

@@ -1,10 +1,10 @@
-import type { Buffer } from '../../node/buffer';
-import type { BunFileLike } from '../file';
+import type * as BunTypes from 'bun';
 
 export type BunSignal = NodeJS.Signals | number;
-export type BunReadableMode = 'pipe' | 'inherit' | 'ignore' | null | undefined | BunFileLike | ArrayBufferView | number;
-export type BunWritableMode = BunReadableMode | ReadableStream<Uint8Array> | Blob | Response | Request;
+export type BunReadableMode = BunTypes.Spawn.Readable;
+export type BunWritableMode = BunTypes.Spawn.Writable;
 
+// The native adapter implements only the FileSink operations used by spawn.
 export interface BunProcessFileSink {
     write(chunk: string | ArrayBufferView | ArrayBuffer | SharedArrayBuffer): number | Promise<number>;
     flush(): number | Promise<number>;
@@ -14,147 +14,36 @@ export interface BunProcessFileSink {
     unref(): void;
 }
 
-export interface BunProcessResourceUsage {
-    contextSwitches: { voluntary: number; involuntary: number };
-    cpuTime: { user: bigint; system: bigint; total: bigint };
-    maxRSS: number;
-    messages: { sent: number; received: number };
-    ops: { in: number; out: number };
-    shmSize: number;
-    signalCount: number;
-    swapCount: number;
-}
-
-export interface BunSpawnOptions<
+export type BunProcessResourceUsage = BunTypes.ResourceUsage;
+export type BunSpawnOptions<
     In extends BunWritableMode = BunWritableMode,
     Out extends BunReadableMode = BunReadableMode,
     Err extends BunReadableMode = BunReadableMode,
-> {
-    cwd?: string;
-    detached?: boolean;
-    uid?: number;
-    gid?: number;
-    cgroup?: string | number;
-    env?: Record<string, string | undefined>;
-    stdio?: [In, Out, Err, ...(BunReadableMode | 'socket-fd')[]];
-    stdin?: In;
-    stdout?: Out;
-    stderr?: Err;
-    onExit?(
-        subprocess: BunSubprocess<In, Out, Err>,
-        exitCode: number | null,
-        signalCode: BunSignal | null,
-        error?: Error,
-    ): void | Promise<void>;
-    ipc?: (message: unknown, subprocess: BunSubprocess<In, Out, Err>, handle?: unknown) => void;
-    onDisconnect?(): void | Promise<void>;
-    serialization?: 'json' | 'advanced';
-    windowsHide?: boolean;
-    windowsVerbatimArguments?: boolean;
-    argv0?: string;
-    signal?: AbortSignal;
-    timeout?: number;
-    killSignal?: BunSignal;
-    maxBuffer?: number;
-    lazy?: boolean;
-    terminal?: unknown;
-}
-
-export interface BunSpawnSyncOptions<
+> = BunTypes.Spawn.SpawnOptions<In, Out, Err>;
+export type BunSpawnSyncOptions<
     In extends BunWritableMode = BunWritableMode,
     Out extends BunReadableMode = BunReadableMode,
     Err extends BunReadableMode = BunReadableMode,
-> extends Omit<BunSpawnOptions<In, Out, Err>, 'lazy' | 'terminal' | 'onExit'> {
-    onExit?: never;
-}
-
-type ReadableToIO<X extends BunReadableMode> = X extends 'pipe' | undefined
-    ? BunReadableStream
-    : X extends BunFileLike | ArrayBufferView | number
-        ? number
-        : undefined;
-
-type WritableToIO<X extends BunWritableMode> = X extends 'pipe'
-    ? BunProcessFileSink
-    : X extends BunFileLike | ArrayBufferView | Blob | Request | Response | number
-        ? number
-        : X extends ReadableStream<Uint8Array>
-            ? X
-            : undefined;
-
-type ReadableToSyncIO<X extends BunReadableMode> = X extends 'pipe' | undefined ? Buffer : undefined;
-
-export type BunReadableStream = ReadableStream<Uint8Array<ArrayBuffer>> & {
+> = BunTypes.Spawn.SpawnSyncOptions<In, Out, Err> & { onExit?: never };
+// Bun adds these methods to its process pipes; keep them local to avoid
+// augmenting Deno's global ReadableStream type.
+export type BunReadableStream = BunTypes.Spawn.ReadableToIO<'pipe'> & {
     blob(): Promise<Blob>;
     bytes(): Promise<Uint8Array<ArrayBuffer>>;
     text(): Promise<string>;
     json<T = unknown>(): Promise<T>;
 };
-
-export interface BunSubprocess<
+export type BunSubprocess<
     In extends BunWritableMode = BunWritableMode,
     Out extends BunReadableMode = BunReadableMode,
     Err extends BunReadableMode = BunReadableMode,
-> extends AsyncDisposable {
-    readonly stdin: WritableToIO<In>;
-    readonly stdout: ReadableToIO<Out>;
-    readonly stderr: ReadableToIO<Err>;
-    readonly terminal: undefined;
-    readonly stdio: [null, null, null, ...(number | null)[]];
-    readonly readable: ReadableToIO<Out>;
-    readonly pid: number;
-    readonly exited: Promise<number>;
-    readonly exitCode: number | null;
-    readonly signalCode: BunSignal | null;
-    readonly killed: boolean;
-    kill(signal?: BunSignal): void;
-    ref(): void;
-    unref(): void;
-    send(message: unknown): void;
-    disconnect(): void;
-    resourceUsage(): BunProcessResourceUsage | undefined;
-}
-
-export interface BunSyncSubprocess<
+> = BunTypes.Subprocess<In, Out, Err>;
+export type BunSyncSubprocess<
     Out extends BunReadableMode = BunReadableMode,
     Err extends BunReadableMode = BunReadableMode,
-> {
-    stdout: ReadableToSyncIO<Out>;
-    stderr: ReadableToSyncIO<Err>;
-    exitCode: number | null;
-    success: boolean;
-    resourceUsage: BunProcessResourceUsage;
-    signalCode?: BunSignal;
-    exitedDueToTimeout?: boolean;
-    exitedDueToMaxBuffer?: boolean;
-    pid: number;
-}
-
-export interface BunSpawnFunction {
-    <
-        const In extends BunWritableMode = 'ignore',
-        const Out extends BunReadableMode = 'pipe',
-        const Err extends BunReadableMode = 'inherit',
-    >(options: BunSpawnOptions<In, Out, Err> & { cmd: string[] }): BunSubprocess<In, Out, Err>;
-    <
-        const In extends BunWritableMode = 'ignore',
-        const Out extends BunReadableMode = 'pipe',
-        const Err extends BunReadableMode = 'inherit',
-    >(cmd: string[], options?: BunSpawnOptions<In, Out, Err>): BunSubprocess<In, Out, Err>;
-}
-
-export interface BunSpawnSyncFunction {
-    <
-        const In extends BunWritableMode = 'ignore',
-        const Out extends BunReadableMode = 'pipe',
-        const Err extends BunReadableMode = 'pipe',
-    >(options: BunSpawnSyncOptions<In, Out, Err> & { cmd: string[] }): BunSyncSubprocess<Out, Err>;
-    <
-        const In extends BunWritableMode = 'ignore',
-        const Out extends BunReadableMode = 'pipe',
-        const Err extends BunReadableMode = 'pipe',
-    >(cmd: string[], options?: BunSpawnSyncOptions<In, Out, Err>): BunSyncSubprocess<Out, Err>;
-}
+> = BunTypes.SyncSubprocess<Out, Err>;
+export type BunSpawnFunction = typeof BunTypes.spawn;
+export type BunSpawnSyncFunction = typeof BunTypes.spawnSync;
 
 export type CommandInput = string[] | (BunSpawnOptions & { cmd: string[] });
 export type SyncCommandInput = string[] | (BunSpawnSyncOptions & { cmd: string[] });

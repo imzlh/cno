@@ -1,5 +1,4 @@
-import { Buffer } from '../../node/buffer';
-import { sanitizeSurrogates } from '../../utils/bytes';
+import { Buffer } from 'node:buffer';
 import { BunFile } from '../file';
 import { CryptoHasher } from './index';
 import { md4 } from './md4';
@@ -14,10 +13,10 @@ import { md4 } from './md4';
  */
 
 const engine = import.meta.use('engine');
-const blobBytesSymbol = Symbol.for('cno.blob.bytes');
+const kBlobBytes = Symbol.for('cno.blob.bytes');
 
-export type HashDigestEncoding = 'utf8' | 'ucs2' | 'utf16le' | 'latin1' | 'ascii' | 'base64' | 'base64url' | 'hex';
-export type HashClassInput = string | ArrayBufferView | ArrayBufferLike | Blob;
+export type HashDigestEncoding = import('bun').DigestEncoding;
+export type HashClassInput = import('bun').BlobOrStringOrBuffer | DataView;
 export type HashClassOutput = ArrayBufferLike | ArrayBufferView;
 
 export interface HashClassInstance<Self> {
@@ -77,20 +76,15 @@ function bytesOfBuffer(value: ArrayBufferLike | ArrayBufferView): Uint8Array {
         : new Uint8Array(value);
 }
 
-function encodeText(text: string): Uint8Array {
-    // Bun replaces unpaired surrogates with U+FFFD; the engine would emit WTF-8.
-    return engine.encodeString(sanitizeSurrogates(text));
-}
-
 /** Bytes of an accepted input, or a TypeError carrying `invalidMessage`. */
 function inputBytes(input: unknown, invalidMessage: string): Uint8Array {
-    if (typeof input === 'string') return encodeText(input);
+    if (typeof input === 'string') return engine.encodeString(input);
     if (typeof input === 'object' && input !== null) {
         if (isRawBuffer(input) || ArrayBuffer.isView(input)) return bytesOfBuffer(input);
-        if (input instanceof String) return encodeText(input.valueOf());
+        if (input instanceof String) return engine.encodeString(input.valueOf());
         if (input instanceof BunFile) throw invalidArgType('File blob cannot be used here');
         if (typeof Blob !== 'undefined' && input instanceof Blob) {
-            const getBytes = Reflect.get(input, blobBytesSymbol);
+            const getBytes = Reflect.get(input, kBlobBytes);
             if (typeof getBytes !== 'function') throw new TypeError('Blob byte access is unavailable');
             return Reflect.apply(getBytes, input, []) as Uint8Array;
         }
@@ -116,7 +110,7 @@ function planOutput(
         }
         return digest => {
             const buffer = Buffer.from(digest);
-            return encoding === 'buffer' ? buffer : buffer.toString(encoding === 'binary' ? 'latin1' : encoding as BufferEncoding);
+            return encoding === 'buffer' ? buffer : buffer.toString();
         };
     }
     if (typeof output === 'object' && output !== null && (isRawBuffer(output) || ArrayBuffer.isView(output))) {
@@ -162,10 +156,6 @@ function md4Engine(): HashEngine {
     };
 }
 
-function setLength(fn: Function, length: number): void {
-    Object.defineProperty(fn, 'length', { value: length, configurable: true });
-}
-
 interface HashState {
     engine: HashEngine;
     done: boolean;
@@ -202,7 +192,6 @@ function defineHashClass(name: string, size: number, createEngine: () => HashEng
         states.set(this, { engine: createEngine(), done: false });
     }
     Object.defineProperty(Hasher, 'name', { value: name, configurable: true });
-    setLength(Hasher, 0);
 
     function update(this: unknown, input: unknown): unknown {
         const state = stateOf(this);
@@ -219,7 +208,6 @@ function defineHashClass(name: string, size: number, createEngine: () => HashEng
         state.done = true;
         return render(result);
     }
-    setLength(digest, 0);
 
     function hash(input: unknown, output?: unknown): unknown {
         const bytes = inputBytes(input, 'expected blob, string or buffer');
@@ -277,4 +265,3 @@ export function sha<T extends HashClassOutput>(input: HashClassInput, hashInto: 
 export function sha(input: HashClassInput, output?: unknown): unknown {
     return (SHA512_256.hash as (input: unknown, output?: unknown) => unknown)(input, output);
 }
-setLength(sha, 1);

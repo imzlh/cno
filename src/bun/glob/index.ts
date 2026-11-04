@@ -1,5 +1,6 @@
-import { join, normalize, resolve } from '../../node/path';
+import { join, normalize, resolve } from 'node:path';
 import { nsasfs, nsfs } from '../../node/fs/syspath';
+import type { GlobScanOptions } from 'bun';
 import {
     assertGlobMatchValue,
     compileGlobPattern,
@@ -12,14 +13,7 @@ import {
 const fs = nsfs;
 const asyncfs = nsasfs;
 
-export interface GlobScanOptions {
-    cwd?: string;
-    dot?: boolean;
-    absolute?: boolean;
-    followSymlinks?: boolean;
-    throwErrorOnBrokenSymlink?: boolean;
-    onlyFiles?: boolean;
-}
+export type { GlobScanOptions };
 
 interface ResolvedScanOptions {
     cwd: string;

@@ -7,6 +7,7 @@
   "scripts": {
     "type-check": "node scripts/prepare-types.mjs && tsc --noEmit",
     "type-check:bundle": "node scripts/prepare-types.mjs && tsc --noEmit --project tsconfig.bundle.json",
+    "type-check:types": "node scripts/prepare-types.mjs && tsc --noEmit --project tests/typecheck/tsconfig.json",
     "build": "esbuild src/main.ts --bundle --platform=node --target=es2024 --format=esm --outfile=dist.js",
     "min-build": "esbuild src/main.ts --bundle --platform=node --target=es2024 --format=esm --minify --outfile=dist.min.js",
     "bundle": "cjsc -b cjs -s -e dist.js",
@@ -35,6 +36,7 @@
   },
   "devDependencies": {
     "@types/node": "^26.1.1",
+    "bun-types": "1.4.4",
     "esbuild": "^0.27.0",
     "typescript": "6.0.3"
   }

@@ -19,7 +19,7 @@ function read(value: unknown): PromiseRead {
 
     let result: unknown;
     try {
-        result = engine.promiseResult(value);
+        result = engine.promiseResult(value as Promise<unknown>);
     } catch (reason) {
         return { status: 'rejected', value: reason };
     }

@@ -1,8 +1,8 @@
-import { Buffer } from '../../node/buffer';
+import { Buffer } from 'node:buffer';
 import { toBuffer } from '../../node/crypto/helpers';
 import { sanitizeSurrogates } from '../../utils/bytes';
 
-const blobBytesSymbol = Symbol.for('cno.blob.bytes');
+const kblobBytes = Symbol.for('cno.blob.bytes');
 
 const native = import.meta.use('crypto');
 type Hash = (data: BufferSource) => ArrayBuffer;
@@ -32,7 +32,7 @@ type Output = string | ArrayBuffer | ArrayBufferView | null;
 function ownedBytes(input: Input, encoding?: string): Uint8Array<ArrayBuffer> {
     let source: Uint8Array;
     if (typeof Blob !== 'undefined' && input instanceof Blob) {
-        const getBytes = Reflect.get(input, blobBytesSymbol);
+        const getBytes = Reflect.get(input, kblobBytes);
         if (typeof getBytes !== 'function') throw new TypeError('Blob byte access is unavailable');
         source = Reflect.apply(getBytes, input, []) as Uint8Array;
     }
@@ -129,7 +129,7 @@ export class CryptoHasher {
             return output;
         }
         const buffer = Buffer.from(result);
-        return !output || output.toLowerCase() === 'buffer' ? buffer : buffer.toString(output as BufferEncoding);
+        return !output || output.toLowerCase() === 'buffer' ? buffer : buffer.toString();
     }
 
     private assertUsable(): void {

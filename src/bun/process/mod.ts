@@ -1,4 +1,4 @@
-import { Buffer } from '../../node/buffer';
+import { Buffer } from 'node:buffer';
 import { normalizeErrnoError } from '../../node/_internal/errno';
 import { parseSpawn, parseSpawnSync, assertSyncExecutable, nativeMode, syncInput } from './options';
 import { FileSink, copyInputBytes, isBufferInput, pipeInput, readablePipe } from './streams';
@@ -6,7 +6,6 @@ import type {
     BunProcessResourceUsage,
     BunSignal,
     BunSpawnFunction,
-    BunSpawnOptions,
     BunSpawnSyncFunction,
     BunSubprocess,
     BunSyncSubprocess,

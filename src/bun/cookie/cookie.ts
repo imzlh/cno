@@ -1,16 +1,7 @@
-export type CookieSameSite = 'strict' | 'lax' | 'none';
-export interface CookieOptions {
-    name?: string;
-    value?: string;
-    domain?: string;
-    path?: string;
-    expires?: Date | number | string;
-    maxAge?: number;
-    secure?: boolean;
-    httpOnly?: boolean;
-    sameSite?: CookieSameSite;
-    partitioned?: boolean;
-}
+import type { CookieInit, CookieSameSite } from 'bun';
+
+export type { CookieSameSite };
+export type CookieOptions = CookieInit;
 
 const invalidName = /[^!#$%&'*+\-.^_`|~0-9A-Za-z]/;
 const invalidPath = /[^\x20-\x7e]|;/;
@@ -193,23 +184,6 @@ export class Cookie {
         parts.push(`SameSite=${this.#sameSite[0].toUpperCase()}${this.#sameSite.slice(1)}`);
         return parts.join('; ');
     }
+
+    static [Symbol.toStringTag] = 'Cookie';
 }
-for (const name of Object.getOwnPropertyNames(Cookie.prototype)) {
-    if (name === 'constructor') continue;
-    const descriptor = Object.getOwnPropertyDescriptor(Cookie.prototype, name)!;
-    const wrap = (fn: Function): Function => {
-        const wrapped = function (this: object, ...args: unknown[]) {
-            if (!instances.has(this)) throw Object.assign(new TypeError(`Can only call Cookie.${name} on instances of Cookie`), { code: 'ERR_INVALID_THIS' });
-            return fn.apply(this, args);
-        };
-        Object.defineProperty(wrapped, 'name', { value: name, configurable: true });
-        Object.defineProperty(wrapped, 'length', { value: fn.length, configurable: true });
-        return wrapped;
-    };
-    if (descriptor.value) descriptor.value = wrap(descriptor.value);
-    if (descriptor.get) descriptor.get = wrap(descriptor.get) as () => unknown;
-    if (descriptor.set) descriptor.set = wrap(descriptor.set) as (value: unknown) => void;
-    descriptor.enumerable = true;
-    Object.defineProperty(Cookie.prototype, name, descriptor);
-}
-Object.defineProperty(Cookie.prototype, Symbol.toStringTag, { value: 'Cookie', configurable: true });

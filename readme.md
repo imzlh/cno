@@ -19,6 +19,20 @@ cno/index
 node/_internal/inject
 ```
 
+## Type Checking
+
+After installing dependencies, run `node scripts/prepare-types.mjs` before
+opening the project in an editor. The type-check scripts also run it
+automatically. It prepares the pinned Deno declarations and filtered entry
+points for `@types/node` and `bun-types`: Node and Bun modules remain available,
+while Deno supplies the Web API globals instead of Node's and Bun's overlapping
+declarations. Run the preparation script again after changing either package.
+
+`npm run type-check:types` checks that Node and Bun modules and Deno globals
+resolve without merging runtime-specific Web API members into the global types.
+The Bun declarations describe Bun's full API, not just the subset implemented
+by this runtime; see `src/bun/README.md` for implementation status.
+
 ## Directory Layout
 
 | Path | Role |

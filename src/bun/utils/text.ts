@@ -1,8 +1,6 @@
-export interface StringWidthOptions {
-    ambiguousIsNarrow?: boolean;
-    countAnsiEscapeCodes?: boolean;
-    perCodePoint?: boolean;
-}
+import type { SliceAnsiOptions, StringWidthOptions, WrapAnsiOptions } from 'bun';
+
+export type { SliceAnsiOptions, StringWidthOptions, WrapAnsiOptions };
 
 /** Strip terminal control sequences, including OSC hyperlinks and C1 CSI. */
 export function stripANSI(text: string): string {
@@ -180,18 +178,6 @@ export function stringWidth(text: string, options: StringWidthOptions = {}): num
         start = end;
     }
     return width;
-}
-
-export interface SliceAnsiOptions {
-    ellipsis?: string;
-    ambiguousIsNarrow?: boolean;
-}
-
-export interface WrapAnsiOptions {
-    hard?: boolean;
-    wordWrap?: boolean;
-    trim?: boolean;
-    ambiguousIsNarrow?: boolean;
 }
 
 /** A tokenized piece of input: an escape sequence (zero width) or one grapheme cluster. */

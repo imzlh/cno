@@ -7,7 +7,8 @@
         "moduleResolution": "bundler",
         "resolveJsonModule": true,
         "allowSyntheticDefaultImports": true,
-        "typeRoots": [],
+        "typeRoots": ["./node_modules/.cache/cno-types"],
+        "types": ["node", "bun-types"],
         "lib": [
             "esnext"
         ],
@@ -29,9 +30,13 @@
         "skipLibCheck": true,
         "allowJs": true
     },
+    "files": [
+        "./node_modules/.cache/cno-types/lib.deno.d.ts"
+    ],
     "include": [
         "src/**/*",
         "src/type/**/*.d.ts",
+        "types/*.d.ts",
         "../circu.js/types/**/*.d.ts"
     ],
     "exclude": [

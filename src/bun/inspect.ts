@@ -8,9 +8,9 @@ import { stringWidth } from './utils/text';
 
 export const inspectCustom: symbol = Symbol.for('nodejs.util.inspect.custom');
 
-export interface InspectOptions {
-    depth?: number | null;
-}
+export type InspectOptions = {
+    depth?: import('bun').BunInspectOptions['depth'] | null;
+};
 
 interface State {
     seen: object[];

@@ -48,6 +48,9 @@ importers:
       '@types/node':
         specifier: ^26.1.1
         version: 26.6.4
+      bun-types:
+        specifier: 1.4.4
+        version: 1.4.4
       esbuild:
         specifier: ^0.27.0
         version: 0.27.7
@@ -267,6 +270,9 @@ packages:
 
   buffer@6.0.3:
     resolution: {integrity: sha512-FTiCpNxtwiZZHEZbcbTIcZjERVICn9yq/pDFkTl95/AxzD1naBctN7YO68riM/gLSDY7sdrMby8hofADYuuqOA==}
+
+  bun-types@1.4.4:
+    resolution: {integrity: sha512-yjrJh5oGX7mMPKGd19YXyIjmEuj4G4zNC30bs7PM9Az7NQ3ndF3j6hbeRdvJTRQEhJ/FYQwW0a2moweEi2hMxQ==}
 
   commander@4.1.1:
     resolution: {integrity: sha512-NOKm8xhkzAjzFx8B2v5OAHT+u5pRQc2UCa2Vq9jYL/31o2wi9mxBA7LIFs3sV5VSC49z6pEhfbMULvShKj26WA==}
@@ -493,6 +499,11 @@ snapshots:
     dependencies:
       base64-js: 1.5.1
       ieee754: 1.2.1
+
+  bun-types@1.4.4:
+    dependencies:
+      '@types/node': 26.6.4
+      undici-types: 8.9.0
 
   commander@4.1.1: {}
 

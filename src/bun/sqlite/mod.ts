@@ -6,6 +6,10 @@
  * those differences here instead of making the Node adapter serve two APIs.
  */
 
+import type { Changes, DatabaseOptions } from 'bun:sqlite';
+
+export type { Changes, DatabaseOptions };
+
 const native = import.meta.use('sqlite3');
 
 type Sqlite3Handle = CModuleSQLite3.Sqlite3Handle;
@@ -14,28 +18,7 @@ type SqliteRow = Record<string, unknown> | unknown[];
 type BindingRecord = Record<string, unknown>;
 type NativeParams = CModuleSQLite3.SqliteParams;
 
-export type SQLQueryBindings =
-    | string
-    | bigint
-    | ArrayBufferView
-    | ArrayBufferLike
-    | number
-    | boolean
-    | null
-    | BindingRecord;
-
-export interface DatabaseOptions {
-    readonly?: boolean;
-    create?: boolean;
-    readwrite?: boolean;
-    safeIntegers?: boolean;
-    strict?: boolean;
-}
-
-export interface Changes {
-    changes: number;
-    lastInsertRowid: number | bigint;
-}
+export type SQLQueryBindings = import('bun:sqlite').SQLQueryBindings | DataView | BindingRecord;
 
 export type RunResult = Changes;
 

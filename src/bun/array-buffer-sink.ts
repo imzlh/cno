@@ -12,19 +12,15 @@
  * - `end()` returns everything not yet flushed and resets the sink.
  */
 
-export interface ArrayBufferSinkStartOptions {
-    asUint8Array?: boolean;
-    /** Preallocate an internal buffer of this size. */
-    highWaterMark?: number;
-    /** On `flush()`, return the written data and restart from the beginning of the buffer. */
-    stream?: boolean;
-}
+import type { ArrayBufferSink as BunArrayBufferSink } from 'bun';
+
+const engine = import.meta.use('engine');
+
+export type ArrayBufferSinkStartOptions = NonNullable<Parameters<BunArrayBufferSink['start']>[0]>;
 
 /** Preallocation is only a hint; cap it so a huge value cannot throw or exhaust memory. */
 const MAX_PREALLOCATION = 16 * 1024 * 1024;
 const MIN_GROWTH = 64;
-
-const encoder = new TextEncoder();
 
 // Brand checks through the intrinsic getters work across realms, unlike instanceof.
 const arrayBufferByteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength')!.get!;
@@ -82,7 +78,7 @@ export class ArrayBufferSink {
     write(chunk: string | ArrayBufferView | ArrayBuffer | SharedArrayBuffer): number {
         let source: Uint8Array;
         if (typeof chunk === 'string') {
-            source = encoder.encode(chunk);
+            source = engine.encodeString(chunk);
         } else if (typeof chunk === 'object' && chunk !== null) {
             if (ArrayBuffer.isView(chunk)) {
                 source = new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);

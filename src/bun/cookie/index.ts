@@ -1,29 +1,9 @@
 // Bun.CookieMap subset: header parsing, get/set/delete/has, iteration, and
 // Set-Cookie generation for changed entries.
 
-export type CookieSameSite = 'strict' | 'lax' | 'none';
+import type { CookieInit, CookieSameSite, CookieStoreDeleteOptions } from 'bun';
 
-export interface CookieInit {
-    name?: string;
-    value?: string;
-    domain?: string;
-    /** Defaults to '/'. An empty string leaves the path to the browser. */
-    path?: string;
-    /** Milliseconds since the epoch, or a Date, or a date string. */
-    expires?: number | Date | string;
-    secure?: boolean;
-    /** Defaults to 'lax'. */
-    sameSite?: CookieSameSite;
-    httpOnly?: boolean;
-    partitioned?: boolean;
-    maxAge?: number;
-}
-
-export interface CookieStoreDeleteOptions {
-    name: string;
-    domain?: string | null;
-    path?: string;
-}
+export type { CookieInit, CookieSameSite, CookieStoreDeleteOptions };
 
 interface CookieRecord {
     name: string;
