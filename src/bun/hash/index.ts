@@ -1,22 +1,54 @@
-import { adler32, crc32 } from './checksums';
-import { cityHash32, cityHash64 } from './city';
-import type { HashInput } from './input';
-import { murmur32v2, murmur32v3, murmur64v2 } from './murmur';
-import { xxHash32, xxHash64 } from './xxhash';
-import { wyhash } from './wyhash';
+import { hashInputBytes, seed32, seed64, type HashInput } from './input';
 
-export interface BunHash {
-    (data: HashInput, seed?: number | bigint): bigint;
-    wyhash(data: HashInput, seed?: bigint): bigint;
-    adler32(data: HashInput): number;
-    crc32(data: HashInput, seed?: number): number;
-    cityHash32(data: HashInput): number;
-    cityHash64(data: HashInput, seed?: bigint): bigint;
-    xxHash32(data: HashInput, seed?: number): number;
-    xxHash64(data: HashInput, seed?: bigint): bigint;
-    murmur32v2(data: HashInput, seed?: number): number;
-    murmur64v2(data: HashInput, seed?: bigint): bigint;
-    murmur32v3(data: HashInput, seed?: number): number;
+const algo = import.meta.use('algorithm');
+const zlib = import.meta.use('zlib');
+
+type OfficialHash = typeof import('bun').hash;
+export type BunHash = ((...args: Parameters<OfficialHash>) => ReturnType<OfficialHash>)
+    & Pick<OfficialHash,
+        | 'wyhash' | 'adler32' | 'crc32' | 'cityHash32' | 'cityHash64'
+        | 'xxHash32' | 'xxHash64' | 'murmur32v2' | 'murmur64v2' | 'murmur32v3'>;
+
+/** Zig's Wyhash-compatible implementation used by Bun.hash. */
+export function wyhash(data: HashInput, seed?: bigint): bigint {
+    const state0 = typeof seed === 'number' && seed < 0 ? 0n : seed64(seed);
+    return algo.wyhash(hashInputBytes(data), state0);
+}
+
+export function adler32(data: HashInput): number {
+    return zlib.adler32(hashInputBytes(data));
+}
+
+export function crc32(data: HashInput, seed?: number): number {
+    return zlib.crc32(hashInputBytes(data), seed32(seed));
+}
+
+export function cityHash32(data: HashInput): number {
+    return algo.cityHash32(hashInputBytes(data));
+}
+
+export function cityHash64(data: HashInput, seed?: bigint): bigint {
+    return algo.cityHash64(hashInputBytes(data), seed64(seed));
+}
+
+export function xxHash32(data: HashInput, seed?: number): number {
+    return algo.xxHash32(hashInputBytes(data), seed32(seed));
+}
+
+export function xxHash64(data: HashInput, seed?: bigint): bigint {
+    return algo.xxHash64(hashInputBytes(data), seed64(seed));
+}
+
+export function murmur32v2(data: HashInput, seed?: number): number {
+    return algo.murmur32v2(hashInputBytes(data), seed32(seed));
+}
+
+export function murmur64v2(data: HashInput, seed?: bigint): bigint {
+    return algo.murmur64v2(hashInputBytes(data), seed64(seed));
+}
+
+export function murmur32v3(data: HashInput, seed?: number): number {
+    return algo.murmur3(hashInputBytes(data), seed32(seed));
 }
 
 function hash(data: HashInput, seed?: number | bigint): bigint {
@@ -36,7 +68,6 @@ Object.defineProperties(hash, {
     murmur32v3: { configurable: true, enumerable: true, value: murmur32v3, writable: true },
 });
 
-export { adler32, crc32, cityHash32, cityHash64, xxHash32, xxHash64, murmur32v2, murmur32v3, murmur64v2, wyhash };
 export type { HashInput };
 export const bunHash = hash as BunHash;
 export default bunHash;

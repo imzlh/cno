@@ -1,6 +1,6 @@
 import { sanitizeSurrogates } from '../../utils/bytes';
 
-export type HashInput = string | ArrayBufferView | ArrayBuffer | SharedArrayBuffer;
+export type HashInput = Parameters<typeof import('bun').hash>[0];
 
 const engine = import.meta.use('engine');
 const blobBytesSymbol = Symbol.for('cno.blob.bytes');
@@ -46,24 +46,4 @@ export function seed64(value: unknown): bigint {
     if (typeof value === 'bigint') return BigInt.asUintN(64, value);
     if (typeof value !== 'number' || !Number.isInteger(value) || value <= -0x8000_0000 || value >= 2 ** 51) return 0n;
     return BigInt.asUintN(64, BigInt(Math.trunc(value)));
-}
-
-export function readUint32LE(bytes: Uint8Array, offset: number): number {
-    return (
-        bytes[offset]
-        | (bytes[offset + 1] << 8)
-        | (bytes[offset + 2] << 16)
-        | (bytes[offset + 3] << 24)
-    ) >>> 0;
-}
-
-export function readUint64LE(bytes: Uint8Array, offset: number): bigint {
-    return BigInt(bytes[offset])
-        | (BigInt(bytes[offset + 1]) << 8n)
-        | (BigInt(bytes[offset + 2]) << 16n)
-        | (BigInt(bytes[offset + 3]) << 24n)
-        | (BigInt(bytes[offset + 4]) << 32n)
-        | (BigInt(bytes[offset + 5]) << 40n)
-        | (BigInt(bytes[offset + 6]) << 48n)
-        | (BigInt(bytes[offset + 7]) << 56n);
 }
