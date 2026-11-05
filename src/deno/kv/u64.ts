@@ -26,7 +26,11 @@ export class KvU64 implements Deno.KvU64 {
         return `[Deno.KvU64: ${this.value}n]`;
     }
 
-    static [Symbol.toStringTag] = 'Deno.KvU64';
+    // Prototype-level tag: Object.prototype.toString.call(instance) must report
+    // '[object Deno.KvU64]' (a static tag only labels the constructor).
+    get [Symbol.toStringTag](): string {
+        return 'Deno.KvU64';
+    }
 }
 export function isKvU64(value: unknown): value is KvU64 {
     return value instanceof KvU64;
