@@ -30,7 +30,9 @@ export function arrayBufferBackedBytes(bytes: globalThis.Uint8Array): globalThis
 }
 
 export function concatChunks(chunks: globalThis.Uint8Array[]): globalThis.Uint8Array<ArrayBuffer> {
-    return toOwnedBytes(algorithm.bytesConcat(chunks));
+    // bytesConcat returns a freshly allocated ArrayBuffer-backed result, so
+    // the view is safe and this saves a full result-sized copy.
+    return arrayBufferBackedBytes(algorithm.bytesConcat(chunks));
 }
 
 export function bytesToArrayBuffer(bytes: globalThis.Uint8Array, requestedLength?: number): ArrayBuffer {

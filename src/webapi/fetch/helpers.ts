@@ -2,7 +2,7 @@ import { Headers } from "../headers";
 import { DOMException } from "../events";
 import { type FetchConnectionInfo } from "../../utils/network-hooks";
 import { getTierLimits } from "../../utils/memory-tier";
-import { toOwnedBytes, sanitizeSurrogates } from "../../utils/bytes";
+import { arrayBufferBackedBytes, sanitizeSurrogates, toOwnedBytes } from "../../utils/bytes";
 import type { Request } from "./request";
 
 const { maxPendingBodyBytes, streamHighWaterMark, hookPayloadCap } = getTierLimits();
@@ -197,7 +197,8 @@ export function mergeChunks(chunks: Uint8Array[]): Uint8Array {
     if (chunks.length === 0) return new Uint8Array(0);
     const first = chunks[0];
     if (chunks.length === 1 && first !== undefined) return first;
-    return toOwnedBytes(algorithm.bytesConcat(chunks));
+    // bytesConcat's output is freshly allocated; view it without the extra copy.
+    return arrayBufferBackedBytes(algorithm.bytesConcat(chunks));
 }
 
 export function headerPairsToHeaders(pairs: Array<[string, string]>): Headers {
