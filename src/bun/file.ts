@@ -20,6 +20,9 @@ const filePaths = new WeakMap<BunFile, string>();
 // webapi/formdata would bundle a second Blob into the payload, and that module
 // overwrites globalThis.Blob/File/FormData when evaluated.
 const blobBytesSymbol = Symbol.for('cno.blob.bytes');
+// Serve-route recognition protocol (serve-routes.ts): lets Bun.serve treat a
+// BunFile as a static file target without importing this module there.
+const bunFileServeSymbol = Symbol.for('cno.bun-file.serve-target');
 
 // The shared Node Stats class also supports bigint stats; Bun.file.stat does not.
 type BunFileStats = { [K in keyof Stats]: Stats[K] extends number | bigint ? number : Stats[K] };
@@ -516,6 +519,22 @@ export class BunFile extends Blob implements BunFileLike {
         );
     }
 
+    /**
+     * Serve-route protocol hook: describes this file as a static route target
+     * (see serve-routes.ts). The existence probe is a synchronous stat so the
+     * route table can decide 404 behavior at registration time.
+     */
+    [bunFileServeSymbol](): { path: string; exists: boolean; contentType: string; stream(): ReadableStream<Uint8Array<ArrayBuffer>> } {
+        let exists = false;
+        try {
+            const stat = fs.stat(this.#path);
+            exists = stat.isFile === true || stat.isFIFO === true;
+        } catch {
+            exists = false;
+        }
+        return { path: this.#path, exists, contentType: this.#contentType, stream: () => this.stream() };
+    }
+
     async write(data: BunFileWriteInput, options?: { highWaterMark?: number }): Promise<number> {
         if (options != null && !isObject(options)) {
             throw new TypeError('Bun.file.write: options must be an object');
@@ -610,6 +629,29 @@ async function writeStream(
     }
 }
 
+/**
+ * Stream a Request body into a fixed stdio descriptor chunk by chunk. Unlike
+ * file destinations there is no staging file or truncation: each read chunk is
+ * written through immediately, and a mid-stream failure cancels the body.
+ */
+async function writeStdioStream(stdio: StdioFile, stream: ReadableStream): Promise<number> {
+    const reader = stream.getReader();
+    let written = 0;
+    try {
+        while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            written += await stdio.write(value as string | ArrayBufferView | ArrayBufferLike | Blob);
+        }
+        return written;
+    } catch (error) {
+        await reader.cancel(error).catch(() => {});
+        throw error;
+    } finally {
+        reader.releaseLock();
+    }
+}
+
 export async function write(
     destination: string | URL | BunFile | StdioFile,
     input: BunWriteInput,
@@ -617,9 +659,17 @@ export async function write(
 ): Promise<number> {
     const stdio = stdioDestination(destination);
     if (stdio) {
+        if (isRequest(input)) {
+            if (input.bodyUsed || input.body?.locked) {
+                throw new TypeError('Bun.write: Request body is already used or locked');
+            }
+            // Bodyless Requests truncate files; for pipes they simply write nothing.
+            if (!input.body) return 0;
+            return writeStdioStream(stdio, input.body);
+        }
         // mode/createPath are file-path concepts; Bun ignores them for pipes.
-        if (isResponse(input) || isRequest(input) || isReadableStream(input)) {
-            throw new TypeError('Bun.write: Response, Request, and ReadableStream input is not supported for stdio files');
+        if (isResponse(input) || isReadableStream(input)) {
+            throw new TypeError('Bun.write: Response and ReadableStream input is not supported for stdio files');
         }
         return stdio.write(input as string | ArrayBufferView | ArrayBufferLike | Blob);
     }

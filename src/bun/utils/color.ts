@@ -12,6 +12,14 @@ const formats = ['[r,g,b,a]', '[rgb]', '[rgba]', '{r,g,b}', '{rgb}', '{rgba}', '
 const clamp = (x: number, max: number) => Math.max(0, Math.min(max, Number.isNaN(x) ? 0 : x));
 const byte = (x: number) => Math.trunc(clamp(x, 255));
 const xtermCubeLevels = [0, 95, 135, 175, 215, 255];
+// xterm's default 16-entry palette: the reference colors Bun's ansi-16 output
+// approximates. Entries 8-15 are the bright variants mapped to SGR 90-97.
+const ansi16Palette: readonly (readonly [number, number, number])[] = [
+    [0x00, 0x00, 0x00], [0xcd, 0x00, 0x00], [0x00, 0xcd, 0x00], [0xcd, 0xcd, 0x00],
+    [0x00, 0x00, 0xee], [0xcd, 0x00, 0xcd], [0x00, 0xcd, 0xcd], [0xe5, 0xe5, 0xe5],
+    [0x7f, 0x7f, 0x7f], [0xff, 0x00, 0x00], [0x00, 0xff, 0x00], [0xff, 0xff, 0x00],
+    [0x5c, 0x5c, 0xff], [0xff, 0x00, 0xff], [0x00, 0xff, 0xff], [0xff, 0xff, 0xff],
+];
 // Unlike `instanceof`, this intrinsic recognizes typed arrays from another
 // realm. DataView has no indexed color channels and remains an object input.
 const arrayBufferIsView = ArrayBuffer.isView;
@@ -36,21 +44,25 @@ function cssNumber(s: string, scale: number): number | null {
     return Number.isFinite(result) ? result : null;
 }
 
+/** The fixed xterm palette RGB triple behind a 16-255 palette index. */
+function xterm256Entry(index: number): readonly [number, number, number] {
+    if (index < 232) {
+        const cube = index - 16;
+        return [
+            xtermCubeLevels[Math.floor(cube / 36)]!,
+            xtermCubeLevels[Math.floor(cube / 6) % 6]!,
+            xtermCubeLevels[cube % 6]!,
+        ];
+    }
+    const gray = 8 + (index - 232) * 10;
+    return [gray, gray, gray];
+}
+
 function ansi256Index(r: number, g: number, b: number): number {
     let closest = 16;
     let closestDistance = Infinity;
     for (let index = 16; index <= 255; index++) {
-        let pr: number;
-        let pg: number;
-        let pb: number;
-        if (index < 232) {
-            const cube = index - 16;
-            pr = xtermCubeLevels[Math.floor(cube / 36)]!;
-            pg = xtermCubeLevels[Math.floor(cube / 6) % 6]!;
-            pb = xtermCubeLevels[cube % 6]!;
-        } else {
-            pr = pg = pb = 8 + (index - 232) * 10;
-        }
+        const [pr, pg, pb] = xterm256Entry(index);
         const dr = r - pr;
         const dg = g - pg;
         const db = b - pb;
@@ -62,6 +74,25 @@ function ansi256Index(r: number, g: number, b: number): number {
         }
     }
     return closest;
+}
+
+/** SGR foreground code (30-37 or 90-97) for the nearest of the 16 ANSI colors. */
+function ansi16Code(r: number, g: number, b: number): number {
+    // Bun chains through ansi-256 before picking the 16-color entry, which
+    // keeps the two formats consistent for colors the 256-palette rounds
+    // together.
+    const [pr, pg, pb] = xterm256Entry(ansi256Index(r, g, b));
+    let index = 0;
+    let closestDistance = Infinity;
+    for (let candidate = 0; candidate < 16; candidate++) {
+        const [cr, cg, cb] = ansi16Palette[candidate]!;
+        const distance = (pr - cr) * (pr - cr) + (pg - cg) * (pg - cg) + (pb - cb) * (pb - cb);
+        if (distance < closestDistance) {
+            closestDistance = distance;
+            index = candidate;
+        }
+    }
+    return index < 8 ? 30 + index : 82 + index;
 }
 
 function parseString(input: string): RGBA | null {
@@ -188,6 +219,58 @@ function parse(input: unknown): RGBA | null {
     }
     return parseObjectInput(input as Record<string, unknown>);
 }
+/** 0 disables ANSI output, 1 selects ansi-16, 2 ansi-256, 3 truecolor. */
+export type AnsiColorDepth = 0 | 1 | 2 | 3;
+
+/**
+ * The color depth Bun's "ansi" format selects for stdout, following Bun's
+ * env-based detection: FORCE_COLOR overrides everything (including without a
+ * TTY, per force-color.org), then NO_COLOR, then the TERM/TMUX/CI/COLORTERM
+ * table which only applies when stdout actually is a terminal. An unrecognized
+ * terminal yields depth 0, matching Bun's compute_color_depth fallthrough.
+ */
+export function ansiColorDepth(env: Record<string, string | undefined>, stdoutTty: boolean): AnsiColorDepth {
+    const force = env.FORCE_COLOR;
+    if (force !== undefined) {
+        if (force === '0') return 0;
+        if (force === '1' || force === 'true' || force === '') return 1;
+        if (force === '2') return 2;
+        return 3;
+    }
+    const noColor = env.NO_COLOR;
+    if (noColor !== undefined && noColor !== '0' && noColor !== '') return 0;
+    if (!stdoutTty) return 0;
+    if (env.TERM === 'dumb') return 0;
+    if (env.TMUX !== undefined) return 3;
+    if (env.CI !== undefined) return 1;
+    const termProgram = env.TERM_PROGRAM;
+    if (termProgram === 'ghostty' || termProgram === 'MacTerm' || termProgram === 'WezTerm'
+        || termProgram === 'HyperTerm' || termProgram === 'iTerm.app') return 3;
+    const colorterm = env.COLORTERM;
+    if (colorterm === 'truecolor' || colorterm === '24bit') return 3;
+    const term = env.TERM;
+    if (term !== undefined && term.startsWith('xterm-256')) return 2;
+    if (term !== undefined) {
+        const exact: Record<string, AnsiColorDepth> = {
+            st: 1, hurd: 1, eterm: 1, gnome: 1, kterm: 1, mosh: 3, putty: 1,
+            cons25: 1, cygwin: 1, dtterm: 1, mlterm: 1, console: 1, jfbterm: 1,
+            konsole: 1, terminator: 3, 'xterm-ghostty': 3, 'rxvt-unicode-24bit': 3,
+        };
+        const exactDepth = Object.prototype.hasOwnProperty.call(exact, term) ? exact[term] : undefined;
+        if (exactDepth !== undefined) return exactDepth;
+        if (/con|ansi|rxvt|color|linux|vt100|xterm|screen/.test(term)) return 1;
+    }
+    if (colorterm !== undefined) return 1;
+    return 0;
+}
+
+let stdoutColorDepth: (() => AnsiColorDepth) | undefined;
+
+/** Installed by the bun namespace bootstrap; the pure unit lane leaves it unset. */
+export function setStdoutColorDepthProvider(provider: () => AnsiColorDepth): void {
+    stdoutColorDepth = provider;
+}
+
 export function color(input: unknown, format?: unknown): unknown {
     if (format != null && typeof format !== 'string') throw new TypeError("Expected format to be a string for 'color'.");
     const f = format ?? 'css';
@@ -208,6 +291,16 @@ export function color(input: unknown, format?: unknown): unknown {
         case 'rgba': return `rgba(${r}, ${g}, ${b}, ${f32String(a / 255)})`;
         case 'ansi_16m': case 'ansi-16m': case 'ansi-24bit': case 'ansi-truecolor': return `\x1b[38;2;${r};${g};${b}m`;
         case 'ansi_256': case 'ansi-256': case 'ansi256': return `\x1b[38;5;${ansi256Index(r, g, b)}m`;
+        case 'ansi_16': case 'ansi-16': return `\x1b[${ansi16Code(r, g, b)}m`;
+        case 'ansi': {
+            // "ansi" is Bun's automatic format: pick the depth stdout supports
+            // and return an empty string when it supports none.
+            const depth = stdoutColorDepth ? stdoutColorDepth() : 0;
+            if (depth === 0) return '';
+            if (depth === 1) return `\x1b[${ansi16Code(r, g, b)}m`;
+            if (depth === 2) return `\x1b[38;5;${ansi256Index(r, g, b)}m`;
+            return `\x1b[38;2;${r};${g};${b}m`;
+        }
         case 'css': {
             const full = hex + (a === 255 ? '' : a.toString(16).padStart(2, '0'));
             const short = full.match(/^(.)\1(.)\2(.)\3(?:(.)\4)?$/);

@@ -1,18 +1,74 @@
+import type { BunFileLike } from './file';
 import type { BunServeHandler } from './serve';
 
 export type BunServeHttpMethod = 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH' | 'HEAD' | 'OPTIONS';
-export type BunServeRoute = Response | BunServeHandler | false
+export type BunServeRoute = Response | BunServeHandler | false | BunFileLike | BunServeDirectoryRoute
     | Partial<Record<BunServeHttpMethod, Response | BunServeHandler>>;
 export type BunServeRoutes = Record<string, BunServeRoute>;
 
+/** Bun's DirectoryRouteOptions subset; the route key must end in "/*". */
+export interface BunServeDirectoryRoute {
+    dir: string;
+    /** Accepted for Bun parity. This adapter resolves per request instead of caching stat results. */
+    statCache?: boolean;
+}
+
+export interface CompiledRouteMatch {
+    handler: BunServeHandler;
+    params: Record<string, string>;
+}
+
 export interface CompiledRoutes {
-    match(request: Request): BunServeHandler | undefined;
+    resolve(request: Request): CompiledRouteMatch | undefined;
     dispose(): void;
 }
 
 type Target = Response | BunServeHandler;
-type ValidatedRoute = Target | false | Map<string, Target>;
+type ValidatedRoute = Target | false | Map<string, Target> | { readonly bunFile: BunFileServeDescriptor };
 type CompiledRoute = BunServeHandler | false | Map<string, BunServeHandler>;
+
+/** A route value the built-in set does not recognize; resolved once per table. */
+export type ResolvedRouteValue = Target | false | Map<string, Target>;
+
+export type ServeRouteValueResolver = (
+    value: Record<PropertyKey, unknown>,
+    path: string,
+) => ResolvedRouteValue | undefined;
+
+let routeValueResolver: ServeRouteValueResolver | undefined;
+
+/**
+ * Installed by the static-file support module (serve-static.ts) so that
+ * serve.ts stays free of filesystem imports and can be bundled into pure-JS
+ * unit test lanes.
+ */
+export function setServeRouteValueResolver(resolver: ServeRouteValueResolver | undefined): void {
+    routeValueResolver = resolver;
+}
+
+/**
+ * Cross-module BunFile recognition over a registered symbol protocol, the same
+ * pattern as cno.blob.bytes: importing the BunFile class here would pull the
+ * filesystem bindings into the pure-JS serve bundle.
+ */
+const bunFileServeTarget = Symbol.for('cno.bun-file.serve-target');
+
+export interface BunFileServeDescriptor {
+    readonly path: string;
+    /** Registration-time existence snapshot; missing files stay 404 routes. */
+    readonly exists: boolean;
+    readonly contentType: string;
+    stream(): ReadableStream<Uint8Array<ArrayBuffer>>;
+}
+
+function bunFileServeTargetOf(value: unknown): BunFileServeDescriptor | undefined {
+    if (value === null || typeof value !== 'object') return undefined;
+    const targeter = Reflect.get(value, bunFileServeTarget);
+    if (typeof targeter !== 'function') return undefined;
+    const descriptor = Reflect.apply(targeter, value, []) as unknown;
+    if (descriptor === null || typeof descriptor !== 'object') return undefined;
+    return descriptor as BunFileServeDescriptor;
+}
 
 const METHODS = new Set(['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS']);
 // Static routes are retained in memory; larger or streaming bodies belong in a handler.
@@ -25,6 +81,30 @@ const STATIC_RESPONSE_CHUNK_BYTES = 64 * 1024;
 // Keep route-table snapshots bounded even when many static routes are present.
 // This process-wide budget also covers the brief overlap during reload().
 const MAX_STATIC_SNAPSHOT_BYTES = 32 * 1024 * 1024;
+// Parameter and wildcard patterns match by a linear scan, so their count is
+// bounded to keep per-request matching work and table memory predictable.
+const MAX_ROUTE_PATTERNS = 1024;
+
+type PatternSegment = { readonly kind: 'static'; readonly value: string }
+    | { readonly kind: 'param'; readonly name: string };
+
+/** Matching data shared by the pending and compiled pattern shapes. */
+interface RoutePatternData {
+    readonly segments: readonly PatternSegment[];
+    readonly wildcard: boolean;
+    readonly staticCount: number;
+    readonly order: number;
+    /** Reused match scratch: [start, end) spans per param segment. */
+    readonly spans: number[];
+}
+
+interface PendingPattern extends RoutePatternData {
+    route: ValidatedRoute;
+}
+
+interface CompiledPattern extends RoutePatternData {
+    readonly route: CompiledRoute;
+}
 
 interface FinalizableResponseState {
     finish(): void;
@@ -99,7 +179,7 @@ function validateTarget(value: unknown, path: string): Target {
         }
         return value;
     }
-    throw new TypeError(`Bun.serve: route "${path}" must contain a function or Response.`);
+    throw new TypeError(`Bun.serve: route "${path}" must contain a function, Response, or BunFile.`);
 }
 
 async function readStaticBody(
@@ -226,24 +306,28 @@ function snapshotResponseStream(
     return { stream, state };
 }
 
-function compileTarget(target: Target, disposers: Array<() => void>): BunServeHandler {
-    if (typeof target === 'function') return target;
-    const init = {
-        status: target.status,
-        statusText: target.statusText,
-        headers: new Headers(target.headers),
-    };
-    const snapshot = target.clone();
-    if (snapshot.body === null) return () => new Response(null, init);
+interface StaticTargetInit {
+    status: number;
+    statusText: string;
+    headers: Headers;
+}
 
-    const reader = snapshot.body.getReader();
+/** Compile a finite stream body into the eagerly buffered, budgeted snapshot handler. */
+function compileSnapshotTarget(
+    init: StaticTargetInit,
+    body: ReadableStream | null,
+    disposers: Array<() => void>,
+): BunServeHandler {
+    if (body === null) return () => new Response(null, init);
+
+    const reader = body.getReader();
     const reservation = new SnapshotReservation();
-    let body: Uint8Array<ArrayBuffer> | undefined;
+    let bytes: Uint8Array<ArrayBuffer> | undefined;
     let activeRequests = 0;
     let disposed = false;
     const release = () => {
         if (!disposed || activeRequests !== 0) return;
-        body = undefined;
+        bytes = undefined;
         reservation.releaseAll();
     };
     // Drain eagerly so a caller reading the original cannot fill an idle tee.
@@ -252,7 +336,7 @@ function compileTarget(target: Target, disposers: Array<() => void>): BunServeHa
             reservation.releaseAll();
             return;
         }
-        body = result.bytes;
+        bytes = result.bytes;
     }).finally(() => {
         release();
     });
@@ -267,11 +351,11 @@ function compileTarget(target: Target, disposers: Array<() => void>): BunServeHa
         let streamOwned = false;
         try {
             await pending;
-            if (!body) throw new Error('Bun.serve: static response body was released.');
+            if (!bytes) throw new Error('Bun.serve: static response body was released.');
             // HEAD preserves the static status/headers without allocating a
             // throwaway copy that the HTTP host would discard immediately.
             if (request.method === 'HEAD') return new Response(null, init);
-            const responseState = snapshotResponseStream(body, () => {
+            const responseState = snapshotResponseStream(bytes, () => {
                 activeRequests--;
                 release();
             });
@@ -302,6 +386,30 @@ function compileTarget(target: Target, disposers: Array<() => void>): BunServeHa
     };
 }
 
+function compileTarget(target: Target, disposers: Array<() => void>): BunServeHandler {
+    if (typeof target === 'function') return target;
+    const init = {
+        status: target.status,
+        statusText: target.statusText,
+        headers: new Headers(target.headers),
+    };
+    const snapshot = target.clone();
+    return compileSnapshotTarget(init, snapshot.body, disposers);
+}
+
+function compileBunFileTarget(descriptor: BunFileServeDescriptor, disposers: Array<() => void>): BunServeHandler {
+    // BunFile routes 404 for files missing at registration, mirroring Bun's
+    // per-request missing-file behavior for the common case.
+    if (!descriptor.exists) return () => new Response(null, { status: 404 });
+    const init: StaticTargetInit = {
+        status: 200,
+        statusText: 'OK',
+        headers: new Headers(),
+    };
+    if (descriptor.contentType) init.headers.set('content-type', descriptor.contentType);
+    return compileSnapshotTarget(init, descriptor.stream(), disposers);
+}
+
 class RouteResources {
     readonly disposers: Array<() => void> = [];
     readonly finalizerToken = {};
@@ -316,15 +424,139 @@ const routeFinalizer = typeof FinalizationRegistry === 'function'
     ? new FinalizationRegistry<RouteResources>(resources => resources.dispose())
     : undefined;
 
+/**
+ * Parse a pattern key into whole-segment matchers. Bun supports ":" parameters
+ * that capture one segment and a trailing "*" wildcard; mixed segments such as
+ * "/a:b" or mid-path wildcards are unsupported by its router.
+ */
+function parseRoutePattern(key: string): { segments: PatternSegment[]; wildcard: boolean; staticCount: number } {
+    const parts = key.split('/');
+    const segments: PatternSegment[] = [];
+    let wildcard = false;
+    const names = new Set<string>();
+    for (let index = 1; index < parts.length; index++) {
+        const part = parts[index]!;
+        const last = index === parts.length - 1;
+        if (part === '*') {
+            if (!last) {
+                throw new TypeError(`Bun.serve: route "${key}" supports "*" only as the final segment.`);
+            }
+            wildcard = true;
+            continue;
+        }
+        if (part.length === 0) {
+            throw new TypeError(`Bun.serve: route "${key}" cannot contain empty segments.`);
+        }
+        if (part.startsWith(':')) {
+            const name = part.slice(1);
+            if (name.length === 0 || /[:*%]/.test(name)) {
+                throw new TypeError(
+                    `Bun.serve: route "${key}" parameter names must be non-empty and cannot contain ":", "*", or "%".`,
+                );
+            }
+            if (names.has(name)) {
+                throw new TypeError(`Bun.serve: route "${key}" repeats the parameter ":${name}".`);
+            }
+            names.add(name);
+            segments.push({ kind: 'param', name });
+            continue;
+        }
+        if (part.includes(':') || part.includes('*')) {
+            throw new TypeError(`Bun.serve: route "${key}" supports ":" parameters and "*" wildcards only as whole segments.`);
+        }
+        segments.push({ kind: 'static', value: part });
+    }
+    let staticCount = 0;
+    for (const segment of segments) {
+        if (segment.kind === 'static') staticCount++;
+    }
+    return { segments, wildcard, staticCount };
+}
+
+/**
+ * Walk the pathname against the pattern without allocating: static segments
+ * compare in place and param spans are recorded into reused scratch, so a
+ * non-matching request leaves no garbage behind.
+ */
+function matchPattern(pathname: string, pattern: CompiledPattern): boolean {
+    const { segments, spans } = pattern;
+    let spanCount = 0;
+    let position = 1; // pathname always starts with '/'
+    for (let index = 0; index < segments.length; index++) {
+        const segment = segments[index]!;
+        const separator = pathname.indexOf('/', position);
+        const end = separator === -1 ? pathname.length : separator;
+        if (end === position) return false;
+        if (segment.kind === 'param') {
+            spans[spanCount * 2] = position;
+            spans[spanCount * 2 + 1] = end;
+            spanCount++;
+        } else if (!pathname.startsWith(segment.value, position) || position + segment.value.length !== end) {
+            return false;
+        }
+        position = end;
+        if (index < segments.length - 1) {
+            if (position >= pathname.length || pathname.charCodeAt(position) !== 47 /* '/' */) return false;
+            position++;
+        }
+    }
+    if (pattern.wildcard) {
+        // The pattern's "/*" contributes its own '/' separator, so '/files/*'
+        // matches '/files/' and everything under it but not the bare '/files';
+        // the catch-all '/*' has no preceding segments and matches every path.
+        if (segments.length === 0) return true;
+        return position < pathname.length && pathname.charCodeAt(position) === 47;
+    }
+    return position === pathname.length;
+}
+
+function decodeParamSegment(raw: string): string {
+    if (!raw.includes('%')) return raw;
+    try {
+        return decodeURIComponent(raw);
+    } catch {
+        // Malformed escapes stay raw instead of failing the whole match.
+        return raw;
+    }
+}
+
+function capturedParams(pathname: string, pattern: CompiledPattern): Record<string, string> {
+    const params: Record<string, string> = {};
+    let spanIndex = 0;
+    for (const segment of pattern.segments) {
+        if (segment.kind !== 'param') continue;
+        const start = pattern.spans[spanIndex * 2]!;
+        const end = pattern.spans[spanIndex * 2 + 1]!;
+        spanIndex++;
+        params[segment.name] = decodeParamSegment(pathname.slice(start, end));
+    }
+    return params;
+}
+
+function selectMethodHandler(route: CompiledRoute, method: string): BunServeHandler | undefined {
+    if (route instanceof Map) {
+        return route.get(method) ?? (method === 'HEAD' ? route.get('GET') : undefined);
+    }
+    return route || undefined;
+}
+
+// More specific patterns win: Bun matches exact routes, then parameter routes,
+// then wildcards, and among equals keeps registration order.
+function patternOrder(left: CompiledPattern, right: CompiledPattern): number {
+    return right.staticCount - left.staticCount || left.order - right.order;
+}
+
 export function compileRoutes(value: unknown): CompiledRoutes {
     if (!isRecord(value)) {
         throw new TypeError('Bun.serve: routes must be an object.');
     }
-    const validated = new Map<string, ValidatedRoute>();
+    const exact = new Map<string, ValidatedRoute>();
+    const patterns: PendingPattern[] = [];
+    let order = 0;
     for (const path of Reflect.ownKeys(value)) {
-        if (typeof path !== 'string' || !path.startsWith('/') || /[:*?#]/.test(path)) {
-            throw new TypeError('Bun.serve: routes support only exact paths beginning with "/"; '
-                + 'parameters, wildcards, queries, and fragments are unsupported.');
+        if (typeof path !== 'string' || !path.startsWith('/') || /[?#]/.test(path)) {
+            throw new TypeError('Bun.serve: route keys must be paths beginning with "/" — '
+                + 'exact, `:param`, or trailing `*` — without queries or fragments.');
         }
         // Request URLs normalize dot segments and escape non-path characters.
         if (/%(?![0-9A-Fa-f]{2})/.test(path)
@@ -332,55 +564,134 @@ export function compileRoutes(value: unknown): CompiledRoutes {
             throw new TypeError(`Bun.serve: route "${path}" must be a canonical, percent-encoded URL pathname.`);
         }
         const route: unknown = Reflect.get(value, path);
+        const patternKey = path.includes(':') || path.includes('*');
+        const parsed = patternKey ? parseRoutePattern(path) : undefined;
+        let validatedRoute: ValidatedRoute;
         if (route === false) {
-            validated.set(path, false);
-        } else if (typeof route === 'function' || route instanceof Response) {
-            validated.set(path, validateTarget(route, path));
-        } else if (isRecord(route)) {
-            const methods = new Map<string, Target>();
-            for (const method of Reflect.ownKeys(route)) {
-                if (typeof method !== 'string' || !METHODS.has(method)) {
-                    throw new TypeError(`Bun.serve: unsupported route method "${String(method)}" for "${path}". `
-                        + 'BunFile, HTML bundles, and directory routes are not supported.');
-                }
-                methods.set(method, validateTarget(Reflect.get(route, method), path));
-            }
-            validated.set(path, methods);
+            validatedRoute = false;
+        } else if (typeof route === 'function') {
+            validatedRoute = route as BunServeHandler;
+        } else if (route instanceof Response) {
+            validatedRoute = validateTarget(route, path);
         } else {
-            throw new TypeError(`Bun.serve: route "${path}" must be a function, Response, method map, or false.`);
+            const descriptor = bunFileServeTargetOf(route);
+            if (descriptor) {
+                validatedRoute = { bunFile: descriptor };
+            } else if (isRecord(route)) {
+                let methodMap = Reflect.ownKeys(route).length > 0;
+                for (const key of Reflect.ownKeys(route)) {
+                    if (typeof key !== 'string' || !METHODS.has(key)) {
+                        methodMap = false;
+                        break;
+                    }
+                }
+                if (methodMap) {
+                    const methods = new Map<string, Target>();
+                    for (const method of Reflect.ownKeys(route)) {
+                        methods.set(method as string, validateTarget(Reflect.get(route, method), path));
+                    }
+                    validatedRoute = methods;
+                } else {
+                    const resolved = routeValueResolver?.(route, path);
+                    if (resolved === undefined) {
+                        throw new TypeError('Bun.serve: route values must be a function, Response, BunFile, '
+                            + `method map, directory value, or false; "${path}" is none of these.`);
+                    }
+                    validatedRoute = resolved;
+                }
+            } else {
+                throw new TypeError(`Bun.serve: route "${path}" must be a function, Response, BunFile, `
+                    + 'method map, directory value, or false.');
+            }
+        }
+        if (parsed) {
+            if (patterns.length >= MAX_ROUTE_PATTERNS) {
+                throw new RangeError('Bun.serve: more than 1024 parameter and wildcard routes; '
+                    + 'use fewer dynamic patterns or a fetch handler.');
+            }
+            patterns.push({
+                segments: parsed.segments,
+                wildcard: parsed.wildcard,
+                staticCount: parsed.staticCount,
+                order: order++,
+                route: validatedRoute,
+                spans: [],
+            });
+        } else {
+            exact.set(path, validatedRoute);
         }
     }
 
-    // Validate the whole table before cloning a body or installing any handler.
-    const routes = new Map<string, CompiledRoute>();
+    // Validate and compile the whole table before cloning a body or installing any handler.
     const resources = new RouteResources();
+    const compiledExact = new Map<string, CompiledRoute>();
+    const paramPatterns: CompiledPattern[] = [];
+    const wildcardPatterns: CompiledPattern[] = [];
     try {
-        for (const [path, route] of validated) {
-            if (route === false) routes.set(path, false);
-            else if (route instanceof Map) {
-                const methods = new Map<string, BunServeHandler>();
-                for (const [method, target] of route) {
-                    methods.set(method, compileTarget(target, resources.disposers));
-                }
-                routes.set(path, methods);
-            } else routes.set(path, compileTarget(route, resources.disposers));
+        for (const [path, route] of exact) {
+            compiledExact.set(path, compileValidatedRoute(route, resources.disposers));
         }
+        for (const pattern of patterns) {
+            const compiled: CompiledPattern = {
+                segments: pattern.segments,
+                wildcard: pattern.wildcard,
+                staticCount: pattern.staticCount,
+                order: pattern.order,
+                spans: pattern.spans,
+                route: compileValidatedRoute(pattern.route, resources.disposers),
+            };
+            (compiled.wildcard ? wildcardPatterns : paramPatterns).push(compiled);
+        }
+        paramPatterns.sort(patternOrder);
+        wildcardPatterns.sort(patternOrder);
     } catch (error) {
         resources.dispose();
         throw error;
     }
+
     const compiled: CompiledRoutes = {
         dispose: () => resources.dispose(),
-        match(request) {
-            const route = routes.get(new URL(request.url).pathname);
-            if (route instanceof Map) {
-                return route.get(request.method) ?? (request.method === 'HEAD' ? route.get('GET') : undefined);
+        resolve(request) {
+            const pathname = new URL(request.url).pathname;
+            const exactRoute = compiledExact.get(pathname);
+            if (exactRoute !== undefined) {
+                const handler = selectMethodHandler(exactRoute, request.method);
+                // A disabled route falls through to fetch without consulting
+                // lower-priority patterns, so "false" keeps disabling the path.
+                return handler ? { handler, params: {} } : undefined;
             }
-            return route || undefined;
+            for (const pattern of paramPatterns) {
+                if (!matchPattern(pathname, pattern)) continue;
+                const handler = selectMethodHandler(pattern.route, request.method);
+                if (!handler) return undefined;
+                return { handler, params: capturedParams(pathname, pattern) };
+            }
+            for (const pattern of wildcardPatterns) {
+                if (!matchPattern(pathname, pattern)) continue;
+                const handler = selectMethodHandler(pattern.route, request.method);
+                if (!handler) return undefined;
+                return { handler, params: capturedParams(pathname, pattern) };
+            }
+            return undefined;
         },
     };
     // The held resources never reference `compiled`, so the finalizer remains
     // a valid fallback when callers abandon a server without stopping it.
     routeFinalizer?.register(compiled, resources, resources.finalizerToken);
     return compiled;
+}
+
+function compileValidatedRoute(route: ValidatedRoute, disposers: Array<() => void>): CompiledRoute {
+    if (route === false) return false;
+    if (route instanceof Map) {
+        const methods = new Map<string, BunServeHandler>();
+        for (const [method, target] of route) {
+            methods.set(method, compileTarget(target, disposers));
+        }
+        return methods;
+    }
+    if (typeof route === 'object' && 'bunFile' in route) {
+        return compileBunFileTarget(route.bunFile, disposers);
+    }
+    return compileTarget(route, disposers);
 }

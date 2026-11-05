@@ -54,6 +54,7 @@ import {
     type BunServeRoutes,
     type BunServeServer,
 } from './serve';
+import { installServeStaticDirectoryRoutes } from './serve-static';
 import { sleepSync } from './sleep-sync';
 import { stderr, stdin, stdout, type StdioFile } from './stdio';
 import { allocUnsafe } from './utils/alloc-unsafe';
@@ -67,7 +68,7 @@ import { JSONC } from './utils/jsonc';
 import { JSONL, type JSONLInput, type JSONLParseChunkResult } from './utils/jsonl';
 import { nanoseconds } from './utils/nanoseconds';
 import { peek, type PeekStatus } from './utils/peek';
-import { color } from './utils/color';
+import { ansiColorDepth, color, setStdoutColorDepthProvider } from './utils/color';
 import { shrink, unsafe } from './utils/unsafe';
 import {
     concatArrayBuffers,
@@ -352,6 +353,12 @@ export function gc(force?: boolean): void {
 const osModule = import.meta.use('os');
 /** Whether stdout is a terminal, i.e. whether ANSI colors are enabled. */
 export const enableANSIColors: boolean = osModule.guessHandle(1) === 'tty';
+
+// Bun.color's automatic "ansi" format reads the same stdout snapshot Bun
+// captures at startup. Directory routes need the host filesystem, and wiring
+// them here keeps serve.ts bundleable without runtime bindings.
+installServeStaticDirectoryRoutes();
+setStdoutColorDepthProvider(() => ansiColorDepth(processBridge().env, enableANSIColors));
 
 function processBridge(): {
     argv: string[];

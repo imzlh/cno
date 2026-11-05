@@ -232,6 +232,18 @@ function shutdownQuietly(server: HostHttpServer | undefined): void {
     }
 }
 
+function defineRequestParams(request: Request, params: Record<string, string>): void {
+    // Bun's BunRequest exposes params on every route-dispatched request, empty
+    // for exact and wildcard routes. Defined non-enumerably to keep Request
+    // itself the same observable object the host handed over.
+    Object.defineProperty(request, 'params', {
+        value: params,
+        writable: false,
+        enumerable: false,
+        configurable: true,
+    });
+}
+
 class BunServeServerImpl implements BunServeServer {
     private hostServer: HostHttpServer | undefined;
     private stopPromise: Promise<void> | undefined;
@@ -268,7 +280,12 @@ class BunServeServerImpl implements BunServeServer {
     }
 
     handleFetch(request: Request): Response | Promise<Response> {
-        const handler = this.routes?.match(request) ?? this.fetchHandler;
+        const matched = this.routes?.resolve(request);
+        if (matched) {
+            defineRequestParams(request, matched.params);
+            return matched.handler.call(this, request, this);
+        }
+        const handler = this.fetchHandler;
         return handler ? handler.call(this, request, this) : new Response('Not Found', { status: 404 });
     }
 

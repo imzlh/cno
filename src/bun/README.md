@@ -15,7 +15,7 @@ that every declared API exists at runtime.
 | `Bun.isStandaloneExecutable`, `Bun.embeddedFiles` | Supported | cno does not produce Bun `--compile` executables, so these feature-detection values are permanently `false` and a frozen empty list. |
 | `Bun.file`, `Bun.write` | Partial | Local paths, file URL objects and UTF-8 byte paths, lazy file blobs, slices, reads, stats, deletion, and instance writes. Invalid UTF-8 byte paths are rejected because the string-based host filesystem API cannot represent them safely. `Bun.write` accepts strings, bytes, Blob, Response, Request and ReadableStream bodies; `BunFile.write` also accepts Request and ReadableStream. File-descriptor destinations, remote/S3 files, mmap, and optimized sendfile are unsupported. Path-based FileSink/`writer()` and the fixed stdio handles are covered below. |
 | `Bun.dns` | Partial | `lookup` and resolver flag constants use asynchronous system getaddrinfo with TTL 0. Explicit c-ares selection is rejected; UDP socket type and port do not affect resolution. Prefetch and shared connection cache statistics are unsupported. |
-| `Bun.serve` | Partial | HTTP over `Deno.serve` with `fetch`, `error`, exact-path `routes`, `port` and `hostname`; routes support handlers, static Response values, method maps and fallback. `server.reload()` replaces handlers/route tables without rebinding. Static bodies are buffered once at registration, up to 16 MiB and 16,384 chunks each, with a 32 MiB aggregate cached-backing-store budget across overlapping tables. A stream whose size is not known up front can fail asynchronously during snapshotting. No TLS, WebSocket, parameter/wildcard routes, automatic hot reload, or forceful stop. |
+| `Bun.serve` | Partial | HTTP over `Deno.serve` with `fetch`, `error`, `routes`, `port` and `hostname`; routes support handlers, static Response values, BunFile values, directory values (`{ dir }` on `/*` keys), `:param` and trailing `/*` patterns, method maps and fallback. Matching prefers exact paths, then parameter patterns, then wildcards, with longer static prefixes first. Route-dispatched handlers receive a non-enumerable `params` property (captured `:name` segments, percent-decoded once; empty for exact and wildcard routes). `server.reload()` replaces handlers/route tables without rebinding. Static bodies are buffered once at registration, up to 16 MiB and 16,384 chunks each, with a 32 MiB aggregate cached-backing-store budget across overlapping tables; dynamic patterns are capped at 1024 per table. A stream whose size is not known up front can fail asynchronously during snapshotting. BunFile routes snapshot the file at registration and 404 for files missing then. Directory routes stream per request, reject non-canonical remainders, redirect directory requests to the trailing-slash URL, serve `index.html` for trailing-slash directories, and reject symlink escapes instead of clamping them. No TLS, WebSocket, automatic hot reload, or forceful stop. |
 | `Bun.spawn`, `Bun.spawnSync` | Partial | Native subprocess adapter with stdio and exit handling; IPC, cgroups and terminals are unsupported. Sync also rejects `signal`, `timeout`, `maxBuffer`, and `argv0`; async per-child `resourceUsage` is unavailable. |
 | `bun:sqlite` | Partial | Database and Statement queries, bindings, transactions, caching, and close semantics; `Statement.raw` and `columnTypes` are unsupported. |
 | `Bun.gzipSync`, `gunzipSync`, `deflateSync`, `inflateSync` | Partial | One-shot gzip and raw-DEFLATE helpers over the native zlib binding; zstd is not implemented. |
@@ -43,7 +43,7 @@ that every declared API exists at runtime.
 | `Bun.JSON5` | Partial | JSON5 parsing and serialization, including comments, unquoted keys, byte inputs and JSON5 numeric syntax. Synchronous Blob input and some proxy-array serialization differ from Bun. |
 | `Bun.JSONL` | Partial | Parses complete and streaming JSON Lines from strings and typed-array byte windows, including partial-value and error offsets. |
 | `Bun.TOML` | Partial | TOML parsing and serialization for tables, arrays, inline tables, arrays of tables, dates and times. Synchronous Blob input and lone-surrogate replacement differ from Bun. |
-| `Bun.color` | Partial | Common CSS names, hex, RGB(A), HSL(A), numeric, array, numeric typed-array (3/4 channel), StringLike and object inputs with common outputs, including truecolor and foreground ANSI 256 (`ansi-256`, `ansi_256`, `ansi256`). ANSI 256 uses deterministic nearest-color mapping to fixed xterm palette entries 16-255. ANSI 16, automatic ANSI, and HSL/Lab output are unsupported and throw. |
+| `Bun.color` | Partial | Common CSS names, hex, RGB(A), HSL(A), numeric, array, numeric typed-array (3/4 channel), StringLike and object inputs with common outputs, including truecolor, foreground ANSI 256 (`ansi-256`, `ansi_256`, `ansi256`) and foreground ANSI 16 (`ansi-16`, `ansi_16`). ANSI 256 uses deterministic nearest-color mapping to fixed xterm palette entries 16-255, and ANSI 16 chains through that mapping to the nearest fixed xterm 16-color entry. The automatic `ansi` format picks ansi-16m/ansi-256/ansi-16 from Bun's environment detection (`FORCE_COLOR`, `NO_COLOR`, `TERM`, `TMUX`, `CI`, `TERM_PROGRAM`, `COLORTERM`) against the stdout TTY snapshot and returns an empty string when stdout supports no ANSI color. HSL/Lab output remain unsupported and throw. |
 | `Bun.stripANSI`, `Bun.stringWidth`, `Bun.sliceAnsi`, `Bun.wrapAnsi` | Partial | ANSI-aware terminal width, slicing and wrapping, including SGR/OSC 8 preservation and `perCodePoint`; East Asian ambiguous widths use a subset table. |
 | `Bun.which` | Partial | Executable lookup through `PATH` and `cwd` options, with `PATHEXT` handling on Windows. |
 | `Bun.inspect`, `Bun.inspect.custom`, `Bun.inspect.table` | Partial | Primitives, arrays, plain objects, cycles, the custom hook, and table layouts. Special-object and nested table cell formatting inherits the bounded inspector and does not fully match Bun. |
@@ -79,16 +79,30 @@ const server = Bun.serve({
 });
 ```
 
-Routes match exact, case-sensitive URL pathnames, ignoring the request query.
-Keys must be canonical URL-encoded pathnames beginning with `/`; raw spaces,
-non-ASCII characters, backslashes, and paths requiring dot-segment normalization
-are rejected, as are `:`, `*`, `?`, and `#` in route keys.
-Method maps accept `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`, and `OPTIONS`;
-`HEAD` uses `GET` when no explicit `HEAD` handler exists. A `false` route,
-unmatched path, or unmatched method falls through to `fetch`, or returns 404
-when `fetch` is omitted. Routes-only servers are supported. Passing `routes`
-to `server.reload()` replaces the whole table after validation; omitted or
-`undefined` routes retain it, while `{}` clears it.
+Routes match case-sensitive URL pathnames, ignoring the request query. Matching
+prefers exact paths, then parameter patterns (`/users/:id`, one captured segment
+each), then wildcard patterns (`/files/*`, everything under the prefix including
+`/files/` itself but not the bare `/files`), and among equals the pattern with
+more static segments wins, then registration order. The wildcard remainder is
+not exposed as a parameter: `params` stays empty for wildcard routes, matching
+Bun's current router. Keys must be canonical URL-encoded pathnames beginning
+with `/`; raw spaces, non-ASCII characters, backslashes, and paths requiring
+dot-segment normalization are rejected, as are `?` and `#`, empty pattern
+segments, mid-path wildcards, mixed segments such as `/a:b`, and repeated or
+malformed parameter names. Route-dispatched handlers receive a non-enumerable
+read-only `params` property holding the decoded `:name` captures (an empty
+object for exact and wildcard routes); the fallback `fetch` handler receives a
+plain Request. Method maps accept `GET`, `POST`, `PUT`, `DELETE`, `PATCH`,
+`HEAD`, and `OPTIONS`; `HEAD` uses `GET` when no explicit `HEAD` handler exists.
+An empty object route value is rejected like any other malformed value (earlier
+builds silently treated it as an empty method table falling through to fetch).
+A `false` route, unmatched path, or unmatched method falls through to `fetch`,
+or returns 404 when `fetch` is omitted. A disabled route also stops matching,
+so `false` keeps shadowing lower-priority patterns for the same path.
+Routes-only servers are supported. Passing `routes` to `server.reload()`
+replaces the whole table after validation; omitted or `undefined` routes retain
+it, while `{}` clears it. Parameter and wildcard patterns are precompiled and
+capped at 1024 entries per table.
 
 Static Response headers are captured at registration, and body buffering starts
 once at registration using a single clone. Each cached response is limited to
@@ -99,10 +113,29 @@ reported through the route error path after snapshotting starts rather than by
 making `serve()` itself asynchronous.
 A failed body snapshot reaches the server's error handler when its route is
 requested. Finite stream bodies are buffered rather than streamed; use a
-function handler for larger or streaming responses. Route handlers receive
-ordinary Request objects, without Bun's `params` or `cookies` extensions.
-BunFile, HTML bundle, and directory route values are unsupported. These are
-the adapter's supported rules and limits, not a claim of full Bun route parity.
+function handler for larger or streaming responses. `cookies` extensions are
+not provided. These are the adapter's supported rules and limits, not a claim
+of full Bun route parity.
+
+BunFile route values (`Bun.file('./favicon.ico')`) reuse the static snapshot
+mechanism: the file body is buffered once at registration into the same 16 MiB
+and 32 MiB budgets, `content-type` comes from the file's inferred type, `HEAD`
+serves headers without a body copy, and a file missing at registration becomes
+a 404 route. A file deleted after registration keeps serving the snapshot.
+
+Directory route values (`{ dir: './public' }` on a key ending in `/*`) stream
+each file per request instead of buffering. The remainder after the prefix is
+percent-decoded once; remainders with dot or empty segments, encoded
+separators, malformed escapes, or NUL are rejected with 404, and the resolved
+path must stay inside the root, so symlinks escaping the root 404 instead of
+clamping like Bun's `openat2(RESOLVE_IN_ROOT)`. Responses carry `content-type`
+from the file extension, `last-modified`, and a weak ETag over the stat pair;
+conditional requests (`If-None-Match`) and `Range` requests are outside the
+subset and receive full responses. Directory requests without a trailing slash
+redirect (301) to the trailing-slash URL, with a trailing slash serve that
+directory's `index.html`, and missing files 404. Only GET and HEAD are served;
+other methods fall through. The `statCache` option is accepted for Bun parity
+but no cache is kept.
 
 ```ts
 import { Database } from 'bun:sqlite';
