@@ -13,6 +13,7 @@
  */
 
 import type { ArrayBufferSink as BunArrayBufferSink } from 'bun';
+import { sanitizeSurrogates } from '../utils/bytes';
 
 const engine = import.meta.use('engine');
 
@@ -78,7 +79,9 @@ export class ArrayBufferSink {
     write(chunk: string | ArrayBufferView | ArrayBuffer | SharedArrayBuffer): number {
         let source: Uint8Array;
         if (typeof chunk === 'string') {
-            source = engine.encodeString(chunk);
+            // Lone surrogates become U+FFFD, matching the WHATWG UTF-8 encode
+            // every other Bun string input uses.
+            source = engine.encodeString(sanitizeSurrogates(chunk));
         } else if (typeof chunk === 'object' && chunk !== null) {
             if (ArrayBuffer.isView(chunk)) {
                 source = new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);

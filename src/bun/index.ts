@@ -31,6 +31,16 @@ import { file, type BunFileLike, type BunFileWriteOptions, type BunWriteInput, w
 import { Glob, type GlobScanOptions } from './glob';
 import { bunHash as hash, type BunHash, type HashInput } from './hash';
 import { inspect as inspectValue, inspectCustom, inspectTable, type InspectOptions } from './inspect';
+import {
+    connect,
+    listen,
+    type BunConnectOptions,
+    type BunListenOptions,
+    type BunSocket,
+    type BunSocketData,
+    type BunSocketHandler,
+    type BunTcpSocketListener,
+} from './net';
 import { spawn, spawnSync } from './process';
 import { resolve, resolveSync } from './resolve';
 import { bunSemver as semver } from './semver';
@@ -42,6 +52,7 @@ import {
     type BunServeServer,
 } from './serve';
 import { sleepSync } from './sleep-sync';
+import { stderr, stdin, stdout, type StdioFile } from './stdio';
 import { allocUnsafe } from './utils/alloc-unsafe';
 import { deepEquals } from './utils/deep-equals';
 import { deepMatch } from './utils/deep-match';
@@ -126,6 +137,7 @@ export {
     allocUnsafe,
     color,
     concatArrayBuffers,
+    connect,
     deepEquals,
     deepMatch,
     deflateSync,
@@ -137,6 +149,7 @@ export {
     hash,
     indexOfLine,
     inflateSync,
+    listen,
     nanoseconds,
     pathToFileURL,
     peek,
@@ -156,6 +169,9 @@ export {
     sleepSync,
     spawn,
     spawnSync,
+    stderr,
+    stdin,
+    stdout,
     stringWidth,
     stripANSI,
     TOML,
@@ -167,13 +183,19 @@ export {
 };
 export type {
     ArrayBufferSinkStartOptions,
+    BunConnectOptions,
     BunFileLike,
     BunFileWriteOptions,
     BunHash,
+    BunListenOptions,
     BunServeHandler,
     BunServeOptions,
     BunServeReloadOptions,
     BunServeServer,
+    BunSocket,
+    BunSocketData,
+    BunSocketHandler,
+    BunTcpSocketListener,
     BunWriteInput,
     CompressionInput,
     CompressionOptions,
@@ -192,6 +214,7 @@ export type {
     LibdeflateCompressionOptions,
     PeekStatus,
     SliceAnsiOptions,
+    StdioFile,
     StringWidthOptions,
     WhichOptions,
     WrapAnsiOptions,
@@ -206,6 +229,13 @@ export interface BunApi {
     readonly isMainThread: boolean;
     readonly sleep: typeof sleep;
     readonly sleepSync: typeof sleepSync;
+    readonly gc: typeof gc;
+    readonly enableANSIColors: boolean;
+    readonly connect: typeof connect;
+    readonly listen: typeof listen;
+    readonly stdout: StdioFile;
+    readonly stderr: StdioFile;
+    readonly stdin: StdioFile;
     readonly ArrayBufferSink: typeof ArrayBufferSink;
     readonly Cookie: typeof Cookie;
     readonly CookieMap: typeof CookieMap;
@@ -291,6 +321,21 @@ export function sleep(milliseconds: number | Date): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, Number.isFinite(delay) ? Math.max(0, delay) : 0));
 }
 
+/**
+ * Manual engine GC. Bun distinguishes eden (`false`) from full (`true`)
+ * collection; the engine binding only exposes one sweep, so both run it.
+ */
+export function gc(force?: boolean): void {
+    if (force !== undefined && typeof force !== 'boolean') {
+        throw new TypeError('Bun.gc: force must be a boolean when an argument is provided');
+    }
+    import.meta.use('engine').gc.run();
+}
+
+const osModule = import.meta.use('os');
+/** Whether stdout is a terminal, i.e. whether ANSI colors are enabled. */
+export const enableANSIColors: boolean = osModule.guessHandle(1) === 'tty';
+
 function processBridge(): {
     argv: string[];
     env: Record<string, string | undefined>;
@@ -341,6 +386,13 @@ const Bun: BunApi = {
     isMainThread,
     sleep,
     sleepSync,
+    gc,
+    enableANSIColors,
+    connect,
+    listen,
+    stdout,
+    stderr,
+    stdin,
     ArrayBufferSink,
     Cookie,
     CookieMap,
@@ -401,7 +453,15 @@ const Bun: BunApi = {
     resolveSync,
 };
 
-for (const name of ['fetch', 'isMainThread', 'dns'] as const) {
+// The whole Bun namespace is exposed as non-writable value members in real
+// Bun; fetch/isMainThread/dns were locked first, and the newer namespace
+// members follow the same rule so `Bun` stays identical to its named exports.
+for (const name of [
+    'fetch', 'isMainThread', 'dns',
+    'connect', 'listen',
+    'stdout', 'stderr', 'stdin',
+    'gc', 'enableANSIColors',
+] as const) {
     Object.defineProperty(Bun, name, {
         value: Bun[name],
         writable: false,

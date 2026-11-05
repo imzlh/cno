@@ -2,6 +2,7 @@ import { Buffer } from 'node:buffer';
 import { BunFile } from '../file';
 import { CryptoHasher } from './index';
 import { md4 } from './md4';
+import { sanitizeSurrogates } from '../../utils/bytes';
 
 /**
  * `Bun.SHA1`, `Bun.MD5`, `Bun.MD4`, `Bun.SHA224`, `Bun.SHA256`, `Bun.SHA384`,
@@ -78,10 +79,10 @@ function bytesOfBuffer(value: ArrayBufferLike | ArrayBufferView): Uint8Array {
 
 /** Bytes of an accepted input, or a TypeError carrying `invalidMessage`. */
 function inputBytes(input: unknown, invalidMessage: string): Uint8Array {
-    if (typeof input === 'string') return engine.encodeString(input);
+    if (typeof input === 'string') return engine.encodeString(sanitizeSurrogates(input));
     if (typeof input === 'object' && input !== null) {
         if (isRawBuffer(input) || ArrayBuffer.isView(input)) return bytesOfBuffer(input);
-        if (input instanceof String) return engine.encodeString(input.valueOf());
+        if (input instanceof String) return engine.encodeString(sanitizeSurrogates(input.valueOf()));
         if (input instanceof BunFile) throw invalidArgType('File blob cannot be used here');
         if (typeof Blob !== 'undefined' && input instanceof Blob) {
             const getBytes = Reflect.get(input, kBlobBytes);
@@ -110,7 +111,9 @@ function planOutput(
         }
         return digest => {
             const buffer = Buffer.from(digest);
-            return encoding === 'buffer' ? buffer : buffer.toString();
+            return encoding === 'buffer'
+                ? buffer
+                : Reflect.apply(buffer.toString, buffer, [encoding]) as string;
         };
     }
     if (typeof output === 'object' && output !== null && (isRawBuffer(output) || ArrayBuffer.isView(output))) {
@@ -200,10 +203,12 @@ function defineHashClass(name: string, size: number, createEngine: () => HashEng
         return this;
     }
 
-    function digest(this: unknown, output?: unknown): unknown {
+    // `digest` must report length 0 (Bun shape), so the output argument is
+    // variadic; `hash` keeps its declared (input, output) arity of 2.
+    function digest(this: unknown, ...args: unknown[]): unknown {
         const state = stateOf(this);
         assertOpen(state, 'digest again');
-        const render = planOutput(output, size, true);
+        const render = planOutput(args[0], size, true);
         const result = state.engine.digest();
         state.done = true;
         return render(result);
@@ -258,10 +263,10 @@ export const SHA384: HashClassConstructor<SHA384> = defineHashClass('SHA384', 48
 export const SHA512: HashClassConstructor<SHA512> = defineHashClass('SHA512', 64, () => nativeEngine('sha512'));
 export const SHA512_256: HashClassConstructor<SHA512_256> = defineHashClass('SHA512_256', 32, () => nativeEngine('sha512-256'));
 
-/** `Bun.sha(input, output?)`: SHA-512/256 of `input`. */
+/** `Bun.sha(input, output?)`: SHA-512/256 of `input`. Bun's sha.length is 1. */
 export function sha(input: HashClassInput): Uint8Array<ArrayBuffer>;
 export function sha(input: HashClassInput, encoding: HashDigestEncoding): string;
 export function sha<T extends HashClassOutput>(input: HashClassInput, hashInto: T): T;
-export function sha(input: HashClassInput, output?: unknown): unknown {
-    return (SHA512_256.hash as (input: unknown, output?: unknown) => unknown)(input, output);
+export function sha(input: HashClassInput, ...rest: unknown[]): unknown {
+    return (SHA512_256.hash as (input: unknown, output?: unknown) => unknown)(input, rest[0]);
 }

@@ -201,7 +201,7 @@ export function readdirSync(path: PathLike, options?: { encoding?: BufferEncodin
 export function opendirSync(path: PathLike, options?: { encoding?: BufferEncoding; bufferSize?: number; recursive?: boolean }): import('fs').Dir {
     validateOpendirOptions(options);
     // opendir does not type-check `recursive`; a truthy value walks (measured).
-    return new Dir(pathToString(path), Boolean(options?.recursive)) as import('fs').Dir;
+    return new Dir(pathToString(path), Boolean(options?.recursive)) as unknown as import('fs').Dir;
 }
 
 // File operations

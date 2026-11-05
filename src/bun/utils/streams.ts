@@ -1,3 +1,5 @@
+import { utf8Decode } from '../../utils/bytes';
+
 const engine = import.meta.use('engine');
 
 type BinaryChunk = ArrayBufferView | ArrayBufferLike;
@@ -69,9 +71,18 @@ export async function readableStreamToText(stream: ReadableStream<StreamChunk>):
     const chunks = await readChunks(stream);
     let result = '';
     let binary: Uint8Array[] = [];
+    let firstRun = true;
     const flush = () => {
         if (binary.length) {
-            result += engine.decodeString(concatArrayBuffers(binary));
+            let bytes = new Uint8Array(concatArrayBuffers(binary));
+            if (firstRun) {
+                // TextDecoder strips one leading BOM at the stream start; it
+                // may span chunks because the run is concatenated first.
+                if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) bytes = bytes.subarray(3);
+            }
+            firstRun = false;
+            // WHATWG replacement semantics for invalid sequences.
+            result += utf8Decode(bytes);
             binary = [];
         }
     };

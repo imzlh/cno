@@ -15,6 +15,16 @@ const instances = new WeakSet<object>();
 function missingArguments(): TypeError {
     return Object.assign(new TypeError('Not enough arguments'), { code: 'ERR_MISSING_ARGS' });
 }
+// Bun's native getters report the bare property name and reject foreign
+// receivers with a coded TypeError instead of a private-field failure.
+function assertInstance(value: unknown, property: string): void {
+    if (typeof value !== 'object' || value === null || !instances.has(value)) {
+        throw Object.assign(
+            new TypeError(`Can only call Cookie.${property} on instances of Cookie`),
+            { code: 'ERR_INVALID_THIS' },
+        );
+    }
+}
 
 export class Cookie {
     #name: string;
@@ -107,22 +117,22 @@ export class Cookie {
         if (arguments.length < 2) throw missingArguments();
         return new Cookie(name, value, options);
     }
-    get name(): string { return this.#name; }
-    get value(): string { return this.#value; }
+    get name(): string { assertInstance(this, 'name'); return this.#name; }
+    get value(): string { assertInstance(this, 'value'); return this.#value; }
     set value(value: string) { this.#value = asString(value); }
-    get domain(): string | undefined { return this.#domain; }
+    get domain(): string | undefined { assertInstance(this, 'domain'); return this.#domain; }
     set domain(value: string | undefined) {
         const string = asString(value);
         if (invalidDomain.test(string)) throw new TypeError('Invalid cookie domain: contains invalid characters');
         this.#domain = string || undefined;
     }
-    get path(): string { return this.#path; }
+    get path(): string { assertInstance(this, 'path'); return this.#path; }
     set path(value: string) {
         const string = asString(value);
         if (invalidPath.test(string)) throw new TypeError('Invalid cookie path: contains invalid characters');
         this.#path = string;
     }
-    get expires(): Date | undefined { return this.#expires && new Date(this.#expires.getTime()); }
+    get expires(): Date | undefined { assertInstance(this, 'expires'); return this.#expires && new Date(this.#expires.getTime()); }
     set expires(value: Date | number | string | undefined) {
         if (value == null) { this.#expires = undefined; return; }
         let date: Date;
@@ -138,24 +148,24 @@ export class Cookie {
         } else throw new TypeError(`The argument 'expires' Invalid expires value. Must be a Date or a number. Received ${typeof value === 'symbol' ? String(value) : JSON.stringify(value)}`);
         this.#expires = Number.isNaN(date.getTime()) ? undefined : date;
     }
-    get maxAge(): number | undefined { return this.#maxAge; }
+    get maxAge(): number | undefined { assertInstance(this, 'maxAge'); return this.#maxAge; }
     set maxAge(value: number | undefined) {
         if (value == null) { this.#maxAge = undefined; return; }
         const n = +value;
         if (!Number.isFinite(n)) throw new TypeError('The provided value is non-finite');
         this.#maxAge = n;
     }
-    get secure(): boolean { return this.#secure; }
+    get secure(): boolean { assertInstance(this, 'secure'); return this.#secure; }
     set secure(value: boolean) { this.#secure = Boolean(value); }
-    get httpOnly(): boolean { return this.#httpOnly; }
+    get httpOnly(): boolean { assertInstance(this, 'httpOnly'); return this.#httpOnly; }
     set httpOnly(value: boolean) { this.#httpOnly = Boolean(value); }
-    get sameSite(): CookieSameSite { return this.#sameSite; }
+    get sameSite(): CookieSameSite { assertInstance(this, 'sameSite'); return this.#sameSite; }
     set sameSite(value: CookieSameSite) {
         const s = asString(value).toLowerCase();
         if (s !== 'strict' && s !== 'lax' && s !== 'none') throw new TypeError(sameSiteError);
         this.#sameSite = s;
     }
-    get partitioned(): boolean { return this.#partitioned; }
+    get partitioned(): boolean { assertInstance(this, 'partitioned'); return this.#partitioned; }
     set partitioned(value: boolean) { this.#partitioned = Boolean(value); }
     isExpired(): boolean { return this.#maxAge !== undefined && !Number.isNaN(this.#maxAge) ? this.#maxAge <= 0 : this.#expires !== undefined && this.#expires.getTime() <= Date.now(); }
     toString(): string { return this.#serialize(); }
@@ -185,5 +195,30 @@ export class Cookie {
         return parts.join('; ');
     }
 
-    static [Symbol.toStringTag] = 'Cookie';
+}
+
+// Instances print as [object Cookie]; the tag lives on the prototype, and the
+// transformer emits class accessors without `enumerable`, so both are restored
+// to spec shape here.
+Object.defineProperty(Cookie.prototype, Symbol.toStringTag, {
+    value: 'Cookie',
+    configurable: true,
+});
+
+// Class getter functions carry the "get " prefix by spec, and the transformer
+// emits accessors without `enumerable`; both are restored to spec shape here.
+for (const property of [
+    'name', 'value', 'domain', 'path', 'expires',
+    'maxAge', 'secure', 'httpOnly', 'sameSite', 'partitioned',
+] as const) {
+    const descriptor = Object.getOwnPropertyDescriptor(Cookie.prototype, property);
+    if (!descriptor) continue;
+    Object.defineProperty(Cookie.prototype, property, {
+        ...descriptor,
+        enumerable: true,
+        configurable: true,
+    });
+    if (descriptor.get) {
+        Object.defineProperty(descriptor.get, 'name', { value: property, configurable: true });
+    }
 }

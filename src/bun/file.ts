@@ -1,6 +1,8 @@
 import { arrayBufferBackedBytes, sanitizeSurrogates } from '../utils/bytes';
 import { basename, dirname, join, toFsPath } from '../utils/path';
 import { ensureDirectory } from '../utils/fs-path';
+import { filePathSink, type FileSink as BunFileSink } from './file-sink';
+import { stdioDestination, type StdioFile } from './stdio';
 import { stat as nodeStat, unlink as nodeUnlink } from '../node/fs/_promises';
 import type { Stats } from '../node/fs/utils';
 
@@ -8,6 +10,7 @@ const fs = import.meta.use('fs');
 const asyncfs = import.meta.use('asyncfs');
 const engine = import.meta.use('engine');
 const os = import.meta.use('os');
+const algorithm = import.meta.use('algorithm');
 
 const BUN_FILE_CHUNK_SIZE = 64 * 1024;
 const MISSING_LAST_MODIFIED = 2 ** 52 - 1;
@@ -35,6 +38,8 @@ export interface BunFileLike extends Blob {
     unlink(): Promise<void>;
     delete(): Promise<void>;
     write(data: BunFileWriteInput, options?: { highWaterMark?: number }): Promise<number>;
+    /** Incremental sink that truncates the file on first flush (BunFile.writer). */
+    writer(options?: { highWaterMark?: number }): BunFileSink;
 }
 
 export type BunFileWriteInput = BunWriteInput | Request | ReadableStream;
@@ -45,6 +50,7 @@ export type BunWriteInput =
     | ArrayBufferLike
     | Blob
     | Response
+    | ReadableStream
     | BunFileLike;
 
 interface FileRange {
@@ -75,7 +81,7 @@ function isResponse(value: unknown): value is Response {
     return typeof Response !== 'undefined' && value instanceof Response;
 }
 
-function isReadableStream(value: unknown): boolean {
+function isReadableStream(value: unknown): value is ReadableStream {
     return typeof ReadableStream !== 'undefined' && value instanceof ReadableStream;
 }
 
@@ -280,6 +286,16 @@ export class BunFile extends Blob implements BunFileLike {
         } catch {
             return MISSING_LAST_MODIFIED;
         }
+    }
+
+    /**
+     * Incremental writer for this path. The sink opens (and truncates) the
+     * file on its first flush and owns the descriptor until end().
+     */
+    writer(options?: { highWaterMark?: number }): BunFileSink {
+        const sink = filePathSink(this.#path);
+        sink.start(options);
+        return sink;
     }
 
     #resolveRange(size: number): FileRange {
@@ -504,7 +520,7 @@ export class BunFile extends Blob implements BunFileLike {
             if (data.bodyUsed || data.body?.locked) throw new TypeError('Bun.file.write: Request body is already used or locked');
             return data.body ? writeStream(this.#path, data.body, {}) : write(this, '');
         }
-        if (isReadableStream(data)) return writeStream(this.#path, data as ReadableStream, {});
+        if (isReadableStream(data)) return writeStream(this.#path, data, {});
         if (data == null) throw new TypeError('Bun.file.write: missing input');
         if (typeof data !== 'string' && !ArrayBuffer.isView(data) && !isArrayBufferLike(data)
             && !(data instanceof Blob) && !isResponse(data)) {
@@ -590,10 +606,18 @@ async function writeStream(
 }
 
 export async function write(
-    destination: string | URL | BunFile,
+    destination: string | URL | BunFile | StdioFile,
     input: BunWriteInput,
     options?: BunFileWriteOptions,
 ): Promise<number> {
+    const stdio = stdioDestination(destination);
+    if (stdio) {
+        // mode/createPath are file-path concepts; Bun ignores them for pipes.
+        if (isResponse(input) || isReadableStream(input)) {
+            throw new TypeError('Bun.write: Response and ReadableStream input is not supported for stdio files');
+        }
+        return stdio.write(input as string | ArrayBufferView | ArrayBufferLike | Blob);
+    }
     const path = destinationPath(destination);
     const parsed = validateWriteOptions(options);
     if (isResponse(input)) {
@@ -601,6 +625,8 @@ export async function write(
         if (input.body) return writeStream(path, input.body, parsed);
     } else if (input instanceof Blob) {
         return writeStream(path, input.stream(), parsed);
+    } else if (isReadableStream(input)) {
+        return writeStream(path, input, parsed);
     }
     const bytes = isResponse(input) ? new Uint8Array(0) : await inputBytes(input);
 
@@ -630,16 +656,14 @@ export function file(
             );
         }
         // Host filesystem paths are strings, so arbitrary non-UTF-8 names cannot round-trip.
-        let decoded: string;
-        try {
-            decoded = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
-        } catch {
+        // Native validation keeps the fatal-decode semantics without TextDecoder.
+        if (!algorithm.bytesIsUtf8(bytes)) {
             throw bytePathError(
                 'Bun.file byte paths must contain valid UTF-8 in this runtime.',
                 'ERR_INVALID_ARG_VALUE',
             );
         }
-        return new BunFile(decoded, parsed);
+        return new BunFile(engine.decodeString(bytes), parsed);
     }
     return new BunFile(pathFromValue(path), parsed);
 }

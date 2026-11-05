@@ -1,14 +1,24 @@
 import { Buffer } from 'node:buffer';
 import { toBuffer } from '../../node/crypto/helpers';
 import { sanitizeSurrogates } from '../../utils/bytes';
+import { blake2b, blake2b256 } from './blake2b';
 
 const kblobBytes = Symbol.for('cno.blob.bytes');
 
 const native = import.meta.use('crypto');
 type Hash = (data: BufferSource) => ArrayBuffer;
 type Hmac = (key: BufferSource, data: BufferSource) => ArrayBuffer;
+
+/** The BLAKE2b implementation reads plain bytes and owns its copies. */
+function asBytes(data: BufferSource): Uint8Array<ArrayBuffer> {
+    return ownedBytes(data);
+}
 const hashes: Record<string, [number, Hash, Hmac?]> = {
-    blake2b512: [64, native.blake2b512, native.hmacBlake2b512],
+    // BLAKE2b has no native keyed mode and Bun's second argument is BLAKE2b
+    // keying rather than HMAC, so both widths run the JS core when a key is
+    // present; the unkeyed digests stay on the native path.
+    blake2b256: [32, data => blake2b256(asBytes(data)).buffer, (key, data) => blake2b256(asBytes(data), asBytes(key)).buffer],
+    blake2b512: [64, native.blake2b512, (key, data) => blake2b(64, asBytes(data), asBytes(key)).buffer],
     blake2s256: [32, native.blake2s256],
     md5: [16, native.md5, native.hmacMd5],
     ripemd160: [20, native.ripemd160, native.hmacRipemd160],
@@ -129,7 +139,8 @@ export class CryptoHasher {
             return output;
         }
         const buffer = Buffer.from(result);
-        return !output || output.toLowerCase() === 'buffer' ? buffer : buffer.toString();
+        if (!output || output.toLowerCase() === 'buffer') return buffer;
+        return Reflect.apply(buffer.toString, buffer, [output.toLowerCase()]) as string;
     }
 
     private assertUsable(): void {
