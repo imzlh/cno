@@ -93,6 +93,26 @@ async function resolveWithin(root: string, path: string): Promise<string | undef
     return resolved;
 }
 
+/** Split a validator list on commas that sit outside quoted tags: an opaque
+ *  ETag may itself contain commas and even a `*`, which must not read as the
+ *  wildcard. */
+function validatorList(headerValue: string): string[] {
+    const out: string[] = [];
+    let current = '';
+    let inQuotes = false;
+    for (const ch of headerValue) {
+        if (ch === '"') inQuotes = !inQuotes;
+        if (ch === ',' && !inQuotes) {
+            if (current.trim() !== '') out.push(current.trim());
+            current = '';
+        } else {
+            current += ch;
+        }
+    }
+    if (current.trim() !== '') out.push(current.trim());
+    return out;
+}
+
 /** True when the request's conditional headers say the copy is still fresh.
  *  Only the two common validators are honored (ETag, then mtime); Range is
  *  outside this subset, so a matching conditional is a plain 304. */
@@ -102,16 +122,14 @@ function notModified(request: Request, etag: string, mtime: Date): boolean {
         // The client echoes the validator as sent (weak form) or as a strong
         // tag; either match — or a wildcard — means "send 304".
         const strong = `"${etag.slice(3, -1)}"`;
-        return ifNoneMatch.split(',').some(candidate => {
-            const tag = candidate.trim();
-            return tag === '*' || tag === etag || tag === strong;
-        });
+        return validatorList(ifNoneMatch).some(tag => tag === '*' || tag === etag || tag === strong);
     }
     const ifModifiedSince = request.headers.get('if-modified-since');
     if (ifModifiedSince !== null) {
         const since = Date.parse(ifModifiedSince);
-        // HTTP dates have second granularity, so the comparison floors mtime.
-        return Number.isFinite(since) && Math.trunc(mtime.getTime() / 1000) * 1000 <= since;
+        // HTTP dates have second granularity; floor (not truncate) so
+        // pre-epoch fractional timestamps compare correctly.
+        return Number.isFinite(since) && Math.floor(mtime.getTime() / 1000) * 1000 <= since;
     }
     return false;
 }
@@ -125,9 +143,11 @@ function fileResponse(request: Request, path: string, mtime: Date, size: number)
     // so the value drives the conditional GET below and manual inspection.
     const etag = `W/"${size.toString(16)}-${Math.trunc(mtime.getTime()).toString(16)}"`;
     headers.set('etag', etag);
-    // The size is known from the stat, so pin content-length like Bun's static
-    // serving: it lets the host skip chunked framing on keep-alive responses.
-    headers.set('content-length', String(size));
+    // Pin content-length like Bun's static serving so the host can skip
+    // chunked framing — but only for sizes the stat can trust: procfs-style
+    // files report size 0 while streaming real bytes, and a pinned 0 would
+    // truncate them. Size 0 keeps EOF framing, which also serves empty files.
+    if (size > 0) headers.set('content-length', String(size));
     if (notModified(request, etag, mtime)) {
         headers.delete('content-length');
         return new Response(null, { status: 304, headers });
