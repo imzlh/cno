@@ -6,6 +6,7 @@
 
 import { EventEmitter } from '../events';
 import { StringDecoder } from '../string_decoder';
+import { Buffer } from '../buffer';
 const os = import.meta.use('os');
 export { flattenPrototype } from '../_internal/prototype';
 import type {

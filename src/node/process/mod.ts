@@ -979,6 +979,7 @@ export function setMaxListeners(n: number): typeof process {
 
 export const permission: NodeJS.ProcessPermission = {
     has: () => true,
+    drop: () => {},
 };
 
 let reportSeq = 0;
