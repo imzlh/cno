@@ -34,13 +34,26 @@ function chunkBytes(chunk: unknown): Uint8Array<ArrayBuffer> {
 interface SinkTarget {
     /** Returns the descriptor to write to, opening it on first use. */
     open(): number;
+    /** Writes at the sink's current logical offset. */
+    write(fd: number, bytes: Uint8Array): number;
     /** Releases the descriptor; must tolerate being called once only. */
     close(fd: number): void;
 }
 
 function pathTarget(path: string): SinkTarget {
+    let position = 0;
     return {
-        open: () => fs.open(path, 'w', 0o664),
+        // Bun's FileSink overwrites from byte zero without truncating a longer
+        // existing file. Create missing files, then reopen read/write.
+        open() {
+            if (!fs.exists(path)) fs.close(fs.open(path, 'w', 0o664));
+            return fs.open(path, 'r+');
+        },
+        write(fd, bytes) {
+            const written = fs.pwrite(fd, bytes, position);
+            position += written;
+            return written;
+        },
         close: fd => fs.close(fd),
     };
 }
@@ -48,6 +61,7 @@ function pathTarget(path: string): SinkTarget {
 function fdTarget(fd: number): SinkTarget {
     return {
         open: () => fd,
+        write: (targetFd, bytes) => fs.write(targetFd, bytes),
         close: () => {
             // stdio descriptors are process-owned and never closed here.
         },
@@ -121,7 +135,7 @@ export class FileSink {
         while (this.#pending.length > 0) {
             const head = this.#pending[0]!;
             while (head.offset < head.chunk.byteLength) {
-                const written = fs.write(fd, head.chunk.subarray(head.offset));
+                const written = this.#target.write(fd, head.chunk.subarray(head.offset));
                 if (written <= 0) throw new Error('FileSink write made no progress');
                 head.offset += written;
                 this.#buffered -= written;
@@ -153,6 +167,8 @@ export class FileSink {
             sinkFinalizer?.unregister(this);
             const fd = this.#fd;
             this.#fd = undefined;
+            this.#pending = [];
+            this.#buffered = 0;
             if (fd !== undefined) {
                 try {
                     this.#target.close(fd);
