@@ -44,12 +44,21 @@ await Promise.all([
     import('./events'),
 ]);
 
+// urlpattern (+ its ~18 KB vendor polyfill) sits behind the same deferral as
+// WebSocket below: nothing but a program constructing a URLPattern reaches it.
+// node:url re-exports the forwarding stand-in and converges with the real
+// class once the load settles (constructor forwards, prototype adopted).
+void defineLazy(globalThis as unknown as Record<string, unknown>, [
+    { name: 'URLPattern', kind: 'ctor' },
+], () => import('./urlpattern').then(() => new Map<string, unknown>([
+    ['URLPattern', Reflect.get(globalThis, 'URLPattern')],
+])));
+
 await Promise.all([
     import('./streams'),
     import('./url'),
     import('./location'),
     import('./formdata'),
-    import('./urlpattern'),
 ]);
 
 await Promise.all([

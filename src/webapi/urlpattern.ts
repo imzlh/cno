@@ -1,6 +1,8 @@
-await import('urlpattern-polyfill');
+// Import the vendor class directly: the module evaluates behind the lazy
+// globalThis.URLPattern accessor, so reading the global here would capture
+// the forwarding stand-in and recurse through SafeURLPattern forever.
+import { URLPattern as URLPatternCtor } from 'urlpattern-polyfill';
 
-const URLPatternCtor = Reflect.get(globalThis, 'URLPattern') as typeof URLPattern;
 const originalRegExpExec = RegExp.prototype.exec;
 
 function withOriginalRegExpExec<T>(callback: () => T): T {
