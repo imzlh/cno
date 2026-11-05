@@ -24,7 +24,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: imzlh/circu.js
-          ref: 8df0b515762350a1cb29731655c9ecca39edc098
+          ref: d4ad1b5ae718262659cf85053d54aee8f49af979
           path: circu.js
           sparse-checkout: types
           persist-credentials: false
@@ -33,8 +33,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: imzlh/cno-stdhttp
-          # Publish this HTTP commit before updating the dependent workflow.
-          ref: 958bc1954096dac5851d9a7951ec1dcc36d2bea4
+          ref: 94114402c7c1d68f3a48ece6b4e84280ac924bbb
           path: http
           persist-credentials: false
 
@@ -42,7 +41,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: imzlh/cno-ext-quic
-          ref: 0b7e6f7c97f9b25b6fe6110a66385586019849d1
+          ref: 32afd507d4f4b52b26bb1ef9449f3606c9aaae3f
           path: ext-quic
           sparse-checkout: |
             native.d.ts
@@ -54,7 +53,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: imzlh/cts
-          ref: 9c3117af92d43fc9f049bcfa4e23c2f7db9e84ec
+          ref: dd2741052b7254f2650666dc0255c06e2c54f7f7
           path: cts
           sparse-checkout: src/runtime/event-mux.ts
           sparse-checkout-cone-mode: false
