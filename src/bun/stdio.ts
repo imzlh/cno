@@ -1,14 +1,14 @@
 /**
  * Bun.stdin/stdout/stderr as BunFile-like handles over the process stdio
- * descriptors. I/O is synchronous through the native fs binding; FileSink
- * (`writer()`) and non-blocking stdin are not part of this subset.
+ * descriptors. Ordinary reads and writes reuse the runtime's shared stdio
+ * streams so pipe I/O stays asynchronous and ordered with Deno/Node stdio.
  */
 
 import { concatChunks } from '../utils/bytes';
 import { fileDescriptorSink, sinkChunkBytes, type FileSink } from './file-sink';
 
 const engine = import.meta.use('engine');
-const fs = import.meta.use('fs');
+const streams = import.meta.use('streams');
 
 const STDIO_CHUNK_SIZE = 64 * 1024;
 
@@ -25,12 +25,12 @@ function inputToBytes(value: unknown): Uint8Array<ArrayBuffer> {
     }
 }
 
-function readAllSync(fd: number): Uint8Array<ArrayBuffer> {
+async function readAll(stream: CModuleStreams.StdioStream): Promise<Uint8Array<ArrayBuffer>> {
     const chunks: Uint8Array<ArrayBuffer>[] = [];
     while (true) {
         const buffer = new Uint8Array(STDIO_CHUNK_SIZE);
-        const count = fs.read(fd, buffer);
-        if (count <= 0) break;
+        const count = await stream.read(buffer);
+        if (count === null || count <= 0) break;
         chunks.push(buffer.slice(0, count));
     }
     return concatChunks(chunks);
@@ -39,11 +39,13 @@ function readAllSync(fd: number): Uint8Array<ArrayBuffer> {
 /** A fixed-descriptor file handle backing Bun.stdin/stdout/stderr. */
 export class StdioFile {
     readonly #fd: number;
+    readonly #stream: CModuleStreams.StdioStream;
     readonly #readable: boolean;
     readonly #label: string;
 
-    constructor(fd: number, label: string, readable: boolean) {
+    constructor(fd: number, stream: CModuleStreams.StdioStream, label: string, readable: boolean) {
         this.#fd = fd;
+        this.#stream = stream;
         this.#label = label;
         this.#readable = readable;
     }
@@ -55,7 +57,7 @@ export class StdioFile {
         const bytes = inputToBytes(data);
         let written = 0;
         while (written < bytes.byteLength) {
-            const count = fs.write(this.#fd, bytes.subarray(written));
+            const count = await this.#stream.write(bytes.subarray(written));
             if (count <= 0) throw new Error(`Bun.${this.#label}: write failed`);
             written += count;
         }
@@ -63,15 +65,15 @@ export class StdioFile {
     }
 
     async text(): Promise<string> {
-        return engine.decodeString(this.#readBytes());
+        return engine.decodeString(await this.#readBytes());
     }
 
     async bytes(): Promise<Uint8Array<ArrayBuffer>> {
-        return this.#readBytes();
+        return await this.#readBytes();
     }
 
     async arrayBuffer(): Promise<ArrayBuffer> {
-        return this.#readBytes().buffer;
+        return (await this.#readBytes()).buffer;
     }
 
     async json<T = unknown>(): Promise<T> {
@@ -82,18 +84,7 @@ export class StdioFile {
         if (!this.#readable) {
             throw new TypeError(`Bun.${this.#label} is not readable`);
         }
-        const fd = this.#fd;
-        return new ReadableStream<Uint8Array<ArrayBuffer>>({
-            pull(controller) {
-                const buffer = new Uint8Array(STDIO_CHUNK_SIZE);
-                const count = fs.read(fd, buffer);
-                if (count <= 0) {
-                    controller.close();
-                    return;
-                }
-                controller.enqueue(buffer.slice(0, count));
-            },
-        });
+        return this.#stream.createReadStream() as ReadableStream<Uint8Array<ArrayBuffer>>;
     }
 
     async exists(): Promise<boolean> {
@@ -113,11 +104,11 @@ export class StdioFile {
         return sink;
     }
 
-    #readBytes(): Uint8Array<ArrayBuffer> {
+    async #readBytes(): Promise<Uint8Array<ArrayBuffer>> {
         if (!this.#readable) {
             throw new TypeError(`Bun.${this.#label} is not readable`);
         }
-        return readAllSync(this.#fd);
+        return await readAll(this.#stream);
     }
 }
 
@@ -126,6 +117,6 @@ export function stdioDestination(value: unknown): StdioFile | undefined {
     return value instanceof StdioFile ? value : undefined;
 }
 
-export const stdout = new StdioFile(1, 'stdout', false);
-export const stderr = new StdioFile(2, 'stderr', false);
-export const stdin = new StdioFile(0, 'stdin', true);
+export const stdout = new StdioFile(1, streams.stdout, 'stdout', false);
+export const stderr = new StdioFile(2, streams.stderr, 'stderr', false);
+export const stdin = new StdioFile(0, streams.stdin, 'stdin', true);
