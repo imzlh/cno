@@ -23,10 +23,12 @@ export type ArrayBufferSinkStartOptions = NonNullable<Parameters<BunArrayBufferS
 const MAX_PREALLOCATION = 16 * 1024 * 1024;
 const MIN_GROWTH = 64;
 
-// Brand checks through the intrinsic getters work across realms, unlike instanceof.
+// Brand checks through the intrinsic getters work across realms, unlike
+// `instanceof`. They also keep arbitrary array-like objects out of the binary
+// input path (`new Uint8Array(value)` would otherwise silently coerce them).
 const arrayBufferByteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength')!.get!;
 const sharedArrayBufferByteLength = typeof SharedArrayBuffer === 'function'
-    ? Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength')!.get!
+    ? Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength')?.get
     : undefined;
 
 function hasBrand(getter: (() => number) | undefined, value: object): boolean {

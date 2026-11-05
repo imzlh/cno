@@ -32,9 +32,6 @@ importers:
       headers-polyfill:
         specifier: ^4.0.3
         version: 4.0.3
-      node-buffer:
-        specifier: npm:buffer@^6.0.3
-        version: buffer@6.0.3
       sucrase:
         specifier: ^3.35.1
         version: 3.35.1

@@ -1,7 +1,14 @@
 // URL API Polyfill for QuickJS ng
 // Full implementation of URL and URLSearchParams, supports special path formats
 
-import { Blob, blobBytesSymbol } from './formdata';
+import { Blob } from './formdata';
+import {
+    createObjectUrlId,
+    registerObjectURL,
+    setObjectURLConstructor,
+    unregisterObjectURL,
+} from './object-url';
+export { resolveObjectURL, resolveObjectURLBytes } from './object-url';
 import { sanitizeSurrogates } from '../utils/bytes';
 
 const textMod = import.meta.use('text');
@@ -44,8 +51,6 @@ const PATH_ENCODE_SET = /[^\w.~!$&'()*+,;=:@\/%-]/g;
 // non-special URL it is ordinary path data and serializes literally.
 const NON_SPECIAL_PATH_ENCODE_SET = /[^\w.~!$&'()*+,;=:@\/%\\-]/g;
 const FRAGMENT_ENCODE_SET = /[^\w.~!$&'()*+,;=:@\/?%-]/g;
-const objectUrlStore = new Map<string, Blob>();
-let objectUrlCounter = 0;
 const denoCustomInspect = Symbol.for('Deno.customInspect');
 
 const isWindowsDriveLetter = (str: string): boolean => {
@@ -76,25 +81,6 @@ const percentEncode = (str: string, encodeSet: RegExp): string => {
     }
     return result;
 };
-
-function createObjectUrlId(): string {
-    objectUrlCounter++;
-    return `blob:/cno-${Date.now().toString(36)}-${objectUrlCounter.toString(36)}-${Math.random().toString(36).slice(2)}`;
-}
-
-export function resolveObjectURL(url: string | globalThis.URL): Blob | null {
-    try {
-        return objectUrlStore.get(new URL(String(url)).href) ?? null;
-    } catch {
-        return null;
-    }
-}
-
-export function resolveObjectURLBytes(url: string | globalThis.URL): { type: string; bytes: Uint8Array } | null {
-    const blob = resolveObjectURL(url);
-    if (!blob) return null;
-    return { type: blob.type, bytes: blob[blobBytesSymbol]() };
-}
 
 const percentDecode = (str: string): string => {
     try {
@@ -963,16 +949,12 @@ class URL implements globalThis.URL {
             throw new TypeError('URL.createObjectURL requires a Blob');
         }
         const url = new URL(createObjectUrlId()).href;
-        objectUrlStore.set(url, blob);
+        registerObjectURL(url, blob);
         return url;
     }
 
     static revokeObjectURL(url: string): void {
-        try {
-            objectUrlStore.delete(new URL(String(url)).href);
-        } catch {
-            // Browser-compatible no-op for invalid or unknown object URLs.
-        }
+        unregisterObjectURL(url);
     }
     
     get [Symbol.toStringTag]() {
@@ -996,6 +978,7 @@ class URL implements globalThis.URL {
     }
 }
 
+setObjectURLConstructor(URL);
 Reflect.set(globalThis, 'URL', URL);
 Reflect.set(globalThis, 'URLSearchParams', URLSearchParams);
 

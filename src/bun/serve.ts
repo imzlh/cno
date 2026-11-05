@@ -6,13 +6,16 @@
  * rejecting transport features that the host cannot represent faithfully.
  */
 
+import { compileRoutes, type BunServeRoutes, type CompiledRoutes } from './serve-routes';
+export type { BunServeHttpMethod, BunServeRoute, BunServeRoutes } from './serve-routes';
+
 export interface BunServeServer {
     readonly port: number;
     readonly hostname: string;
     readonly url: URL;
     /** Graceful shutdown; force-close is intentionally unsupported. */
     stop(closeActiveConnections?: boolean): Promise<void>;
-    /** Replace request/error handlers without rebinding the listener. */
+    /** Replace request/error handlers and route tables without rebinding the listener. */
     reload(options: BunServeReloadOptions): BunServeServer;
 }
 
@@ -22,16 +25,16 @@ export type BunServeHandler = (
     server: BunServeServer,
 ) => Response | Promise<Response>;
 
-export interface BunServeOptions {
-    fetch: BunServeHandler;
+export type BunServeOptions = {
     error?: (this: BunServeServer, error: unknown) => Response | Promise<Response>;
     port?: number | string;
     hostname?: string;
-}
+} & ({ fetch: BunServeHandler; routes?: BunServeRoutes } | { fetch?: BunServeHandler; routes: BunServeRoutes });
 
 /** The handler subset accepted by server.reload(). */
 export interface BunServeReloadOptions {
     fetch?: BunServeHandler;
+    routes?: BunServeRoutes;
     error?: (this: BunServeServer, error: unknown) => Response | Promise<Response>;
     // Bun accepts these on reload but leaves the existing listener unchanged.
     port?: number | string;
@@ -62,7 +65,8 @@ interface HostDeno {
 }
 
 interface ParsedOptions {
-    fetch: BunServeHandler;
+    fetch?: BunServeHandler;
+    routes?: CompiledRoutes;
     error?: (error: unknown) => Response | Promise<Response>;
     port: number;
     hostname: string;
@@ -70,18 +74,18 @@ interface ParsedOptions {
 
 interface ParsedReloadOptions {
     fetch?: BunServeHandler;
+    routes?: CompiledRoutes;
     error?: (error: unknown) => Response | Promise<Response>;
 }
 
 const DEFAULT_PORT = 3000;
 const DEFAULT_HOSTNAME = 'localhost';
 const DEFAULT_BIND_HOSTNAME = '127.0.0.1';
-const SUPPORTED_OPTIONS = new Set(['fetch', 'error', 'port', 'hostname']);
+const SUPPORTED_OPTIONS = new Set(['fetch', 'routes', 'error', 'port', 'hostname']);
 
 const UNSUPPORTED_OPTION_DETAILS = new Map<string, string>([
     ['websocket', 'WebSocket upgrades are not part of the HTTP-only subset.'],
     ['tls', 'TLS is not part of the HTTP-only subset.'],
-    ['routes', 'route tables are not supported; dispatch in fetch instead.'],
     ['development', 'development/hot-reload mode is not supported.'],
     ['reload', 'hot-reload options are not supported.'],
     ['hotReload', 'hot-reload options are not supported.'],
@@ -93,7 +97,7 @@ const UNSUPPORTED_OPTION_DETAILS = new Map<string, string>([
 
 function unsupportedOption(name: string): TypeError {
     const detail = UNSUPPORTED_OPTION_DETAILS.get(name)
-        ?? 'This subset supports only fetch, error, port, and hostname.';
+        ?? 'This subset supports only fetch, routes, error, port, and hostname.';
     return new TypeError(`Bun.serve: unsupported option "${name}". ${detail}`);
 }
 
@@ -128,8 +132,12 @@ function parseOptions(value: unknown): ParsedOptions {
     }
 
     const fetch = options.fetch;
-    if (typeof fetch !== 'function') {
+    const routes = options.routes;
+    if (fetch !== undefined && typeof fetch !== 'function') {
         throw new TypeError('Bun.serve: fetch must be a function.');
+    }
+    if (fetch === undefined && routes === undefined) {
+        throw new TypeError('Bun.serve: a fetch handler or routes table is required.');
     }
 
     const hostname = options.hostname === undefined ? DEFAULT_HOSTNAME : options.hostname;
@@ -142,15 +150,18 @@ function parseOptions(value: unknown): ParsedOptions {
         throw new TypeError('Bun.serve: error must be a function.');
     }
 
+    const port = parsePort(options.port);
+    serverUrl(hostname, port);
     return {
-        fetch: fetch as BunServeHandler,
+        fetch: fetch as ParsedOptions['fetch'],
         error: error as ParsedOptions['error'],
-        port: parsePort(options.port),
+        routes: routes === undefined ? undefined : compileRoutes(routes),
+        port,
         hostname,
     };
 }
 
-function parseReloadOptions(value: unknown): ParsedReloadOptions {
+function parseReloadOptions(value: unknown, stopped: boolean): ParsedReloadOptions {
     if (value === null || typeof value !== 'object' || Array.isArray(value)) {
         throw new TypeError('Bun.serve: reload options must be an object.');
     }
@@ -173,10 +184,15 @@ function parseReloadOptions(value: unknown): ParsedReloadOptions {
     // Bun validates a supplied port even though reload never rebinds it.
     const port = options.port;
     if (port !== undefined) validateReloadPort(port);
+    const routes = options.routes;
+    if (stopped && routes !== undefined) {
+        throw new TypeError('Bun.serve: cannot replace routes on a stopped server.');
+    }
 
     return {
         fetch: fetch == null ? undefined : fetch as BunServeHandler,
         error: error == null ? undefined : error as ParsedReloadOptions['error'],
+        routes: routes === undefined ? undefined : compileRoutes(routes),
     };
 }
 
@@ -221,19 +237,22 @@ class BunServeServerImpl implements BunServeServer {
     private stopPromise: Promise<void> | undefined;
     private currentPort: number;
     private currentUrl: URL;
-    private fetchHandler: BunServeHandler;
+    private fetchHandler: BunServeHandler | undefined;
     private errorHandler: ((error: unknown) => Response | Promise<Response>) | undefined;
+    private routes: CompiledRoutes | undefined;
 
     constructor(
         private readonly configuredHostname: string,
         requestedPort: number,
-        fetchHandler: BunServeHandler,
+        fetchHandler: BunServeHandler | undefined,
         errorHandler: ((error: unknown) => Response | Promise<Response>) | undefined,
+        routes: CompiledRoutes | undefined,
     ) {
         this.currentPort = requestedPort;
         this.currentUrl = serverUrl(configuredHostname, requestedPort);
         this.fetchHandler = fetchHandler;
         this.errorHandler = errorHandler;
+        this.routes = routes;
     }
 
     get port(): number {
@@ -249,7 +268,8 @@ class BunServeServerImpl implements BunServeServer {
     }
 
     handleFetch(request: Request): Response | Promise<Response> {
-        return this.fetchHandler.call(this, request, this);
+        const handler = this.routes?.match(request) ?? this.fetchHandler;
+        return handler ? handler.call(this, request, this) : new Response('Not Found', { status: 404 });
     }
 
     handleError(error: unknown): Response | Promise<Response> | undefined {
@@ -263,10 +283,13 @@ class BunServeServerImpl implements BunServeServer {
     }
 
     reload(options: BunServeReloadOptions): BunServeServer {
-        const parsed = parseReloadOptions(options);
-        // Validation is complete before either field is changed.
+        const parsed = parseReloadOptions(options, this.stopPromise !== undefined);
+        const previousRoutes = this.routes;
+        // Validation is complete before any live handler or route table is changed.
         if (parsed.fetch !== undefined) this.fetchHandler = parsed.fetch;
         if (parsed.error !== undefined) this.errorHandler = parsed.error;
+        if (parsed.routes !== undefined) this.routes = parsed.routes;
+        if (parsed.routes !== undefined) previousRoutes?.dispose();
         return this;
     }
 
@@ -300,6 +323,7 @@ class BunServeServerImpl implements BunServeServer {
         } catch (error) {
             this.stopPromise = Promise.reject(error);
         }
+        this.routes?.dispose();
         return this.stopPromise;
     }
 }
@@ -307,39 +331,29 @@ class BunServeServerImpl implements BunServeServer {
 /** Start the supported HTTP subset of Bun.serve. */
 export function serve(options: BunServeOptions): BunServeServer {
     const parsed = parseOptions(options);
-    const runtime = hostRuntime();
-    const exposedServer = new BunServeServerImpl(parsed.hostname, parsed.port, parsed.fetch, parsed.error);
-    const hostOptions: HostServeOptions = {
-        port: parsed.port,
-        // The host's native TCP bind only accepts literal IP addresses. Keep
-        // Bun's public default while binding localhost on its IPv4 loopback.
-        hostname: parsed.hostname === DEFAULT_HOSTNAME ? DEFAULT_BIND_HOSTNAME : parsed.hostname,
-    };
-    // Keep the callback installed so reload() can replace handlers without
-    // restarting Deno.serve. Without a custom handler the host still emits 500.
-    hostOptions.onError = error => exposedServer.handleError(error);
-
-    let hostServer: HostHttpServer;
+    let hostServer: HostHttpServer | undefined;
     try {
+        const runtime = hostRuntime();
+        const exposedServer = new BunServeServerImpl(parsed.hostname, parsed.port, parsed.fetch, parsed.error, parsed.routes);
+        const hostOptions: HostServeOptions = {
+            port: parsed.port,
+            // The host's native TCP bind only accepts literal IP addresses.
+            hostname: parsed.hostname === DEFAULT_HOSTNAME ? DEFAULT_BIND_HOSTNAME : parsed.hostname,
+            onError: error => exposedServer.handleError(error),
+        };
         hostServer = runtime.serve.call(
             runtime,
             hostOptions,
             request => exposedServer.handleFetch(request),
         );
-    } catch (error) {
-        throw error;
-    }
-
-    if (!hostServer || typeof hostServer.shutdown !== 'function') {
-        shutdownQuietly(hostServer);
-        throw new Error('Bun.serve: host server does not expose graceful shutdown.');
-    }
-
-    try {
+        if (!hostServer || typeof hostServer.shutdown !== 'function') {
+            throw new Error('Bun.serve: host server does not expose graceful shutdown.');
+        }
         exposedServer.attach(hostServer);
+        return exposedServer;
     } catch (error) {
         shutdownQuietly(hostServer);
+        parsed.routes?.dispose();
         throw error;
     }
-    return exposedServer;
 }

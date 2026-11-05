@@ -18,7 +18,7 @@ import {
     handleBroadcastDelivery,
     handleWorkerBroadcastControl,
 } from './broadcast-channel';
-import { resolveObjectURLBytes } from './url';
+import { resolveObjectURLBytes } from './object-url';
 
 const worker = import.meta.use('worker');
 const crypto = import.meta.use('crypto');

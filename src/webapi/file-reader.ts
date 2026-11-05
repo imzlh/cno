@@ -1,5 +1,6 @@
-import { Buffer } from "node-buffer";
 import { DOMException, EventTarget, ProgressEvent } from "./events";
+
+const crypto = import.meta.use('crypto');
 
 type FileReaderHandler = ((this: FileReader, ev: ProgressEvent<FileReader>) => unknown) | null;
 
@@ -68,8 +69,8 @@ class FileReader extends EventTarget {
     readAsDataURL(blob: Blob): void {
         this.#startRead(blob, async (source) => {
             const mediaType = source.type || 'application/octet-stream';
-            const bytes = new Uint8Array(await source.arrayBuffer());
-            return `data:${mediaType};base64,${Buffer.from(bytes).toString('base64')}`;
+            const bytes = await source.arrayBuffer();
+            return `data:${mediaType};base64,${crypto.base64Encode(bytes)}`;
         });
     }
 

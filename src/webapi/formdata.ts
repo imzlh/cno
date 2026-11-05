@@ -1,16 +1,17 @@
 import { malloc } from "../utils/malloc";
-import { Buffer } from "node-buffer";
-import { bytesToArrayBuffer, sanitizeSurrogates } from "../utils/bytes";
+import { sanitizeSurrogates } from "../utils/bytes";
 import { basename } from "../utils/path";
+import { blobBytesSymbol } from "./object-url";
+
+export { blobBytesSymbol } from "./object-url";
 
 const engine = import.meta.use('engine');
 const textMod = import.meta.use('text');
 const os = import.meta.use('os');
 const asfs = import.meta.use('asyncfs');
-const fs = import.meta.use('fs');
 
 type FormDataEntryValue = globalThis.File | string;
-type BlobPartSnapshot = Blob | Uint8Array<ArrayBuffer> | ArrayBuffer | string;
+type BlobPartSnapshot = Blob | Uint8Array;
 
 const nativeLineEnding = os.platform === 'windows' || os.platform === 'win32' ? '\r\n' : '\n';
 
@@ -143,7 +144,6 @@ class FormData implements globalThis.FormData {
 // ==================== Blob ====================
 
 const denoCustomInspect = Symbol.for('Deno.customInspect');
-export const blobBytesSymbol = Symbol.for('cno.blob.bytes');
 
 class Blob implements globalThis.Blob {
     #parts: BlobPartSnapshot[];
@@ -186,56 +186,65 @@ class Blob implements globalThis.Blob {
         const relativeEnd = end === undefined ? this.#size : normalizeIndex(toLongLong(end), this.#size);
         const span = Math.max(relativeEnd - relativeStart, 0);
 
-        const buffer = this.#toBuffer();
+        const buffer = this.#toBytes();
         const sliced = new Uint8Array(buffer.buffer, buffer.byteOffset + relativeStart, span);
 
         return new Blob([sliced], { type: contentType ?? '' });
     }
 
     async arrayBuffer(): Promise<ArrayBuffer> {
-        const buffer = this.#toBuffer();
-        return bytesToArrayBuffer(buffer);
+        return this.#toBytes().buffer;
     }
 
     bytes(): Promise<Uint8Array<ArrayBuffer>> {
-        return Promise.resolve(new Uint8Array(this.#toBuffer()));
+        return Promise.resolve(this.#toBytes());
     }
 
     [blobBytesSymbol](): Uint8Array<ArrayBuffer> {
-        return new Uint8Array(this.#toBuffer());
+        return this.#toBytes();
     }
 
     async text(): Promise<string> {
-        const buffer = this.#toBuffer();
+        const buffer = this.#toBytes();
         // Spec requires UTF-8 decode (U+FFFD for malformed input); engine.decodeString
         // is WTF-8-tolerant and would leak a lone surrogate back out.
         return new textMod.Decoder().decode(buffer);
     }
 
     stream(): ReadableStream<Uint8Array<ArrayBuffer>> {
-        const buffer = this.#toBuffer();
+        const buffer = this.#toBytes();
 
         return new ReadableStream({
             start(controller) {
                 // An empty Blob must close with no chunk at all; enqueuing a
                 // zero-length one makes the first read report `done: false`.
-                if (buffer.byteLength > 0) controller.enqueue(new Uint8Array(buffer));
+                if (buffer.byteLength > 0) controller.enqueue(buffer);
                 controller.close();
             }
         });
     }
 
-    #toBuffer(): Buffer {
+    #toBytes(): Uint8Array<ArrayBuffer> {
         const chunks: Uint8Array[] = [];
+        let length = 0;
 
         for (const part of this.#parts) {
             // Blob subclasses can provide lazy/native storage through the same
             // internal byte protocol used by structured clone and object URLs.
-            if (part instanceof Blob) chunks.push(part[blobBytesSymbol]());
-            else chunks.push(blobPartBytes(part));
+            const chunk = part instanceof Blob ? part[blobBytesSymbol]() : part;
+            chunks.push(chunk);
+            length += chunk.byteLength;
         }
 
-        return Buffer.concat(chunks);
+        // A lazy Blob's bytes can differ from its earlier stat-derived size.
+        // Allocate once from the materialized lengths; readers own this output.
+        const bytes = new Uint8Array(length);
+        let offset = 0;
+        for (const chunk of chunks) {
+            bytes.set(chunk, offset);
+            offset += chunk.byteLength;
+        }
+        return bytes;
     }
 
     get [Symbol.toStringTag]() {
@@ -435,32 +444,19 @@ const snapshotBlobPart = (part: unknown, endings: EndingType): BlobPartSnapshot 
     if (ArrayBuffer.isView(part)) {
         return new Uint8Array(part.buffer, part.byteOffset, part.byteLength).slice();
     }
-    if (part instanceof ArrayBuffer) return part.slice(0);
+    if (part instanceof ArrayBuffer) return new Uint8Array(part.slice(0));
     const string = String(part);
-    return endings === 'native' ? normalizeLineEndings(string) : string;
-};
-
-const blobPartBytes = (part: Exclude<BlobPartSnapshot, Blob>): Uint8Array => {
-    // Blob parts are UTF-8 encoded: lone surrogates become U+FFFD, not WTF-8.
-    if (typeof part === 'string') return engine.encodeString(sanitizeSurrogates(part));
-    if (ArrayBuffer.isView(part)) return new Uint8Array(part.buffer, part.byteOffset, part.byteLength);
-    if (part instanceof ArrayBuffer) return new Uint8Array(part);
-    return engine.encodeString(sanitizeSurrogates(String(part)));
+    const normalized = endings === 'native' ? normalizeLineEndings(string) : string;
+    // Snapshot UTF-8 once without depending on TextEncoder global installation.
+    // The engine emits WTF-8, so replace lone surrogates before native encoding.
+    return engine.encodeString(sanitizeSurrogates(normalized));
 };
 
 const calculateSize = (parts: BlobPartSnapshot[]): number => {
     let size = 0;
 
     for (const part of parts) {
-        if (part instanceof Blob) {
-            size += part.size;
-        } else if (ArrayBuffer.isView(part)) {
-            size += part.byteLength;
-        } else if (part instanceof ArrayBuffer) {
-            size += part.byteLength;
-        } else {
-            size += Buffer.byteLength(String(part), 'utf-8');
-        }
+        size += part instanceof Blob ? part.size : part.byteLength;
     }
 
     return size;

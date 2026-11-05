@@ -47,8 +47,11 @@ import { bunSemver as semver } from './semver';
 import {
     serve,
     type BunServeHandler,
+    type BunServeHttpMethod,
     type BunServeOptions,
     type BunServeReloadOptions,
+    type BunServeRoute,
+    type BunServeRoutes,
     type BunServeServer,
 } from './serve';
 import { sleepSync } from './sleep-sync';
@@ -65,6 +68,7 @@ import { JSONL, type JSONLInput, type JSONLParseChunkResult } from './utils/json
 import { nanoseconds } from './utils/nanoseconds';
 import { peek, type PeekStatus } from './utils/peek';
 import { color } from './utils/color';
+import { shrink, unsafe } from './utils/unsafe';
 import {
     concatArrayBuffers,
     readableStreamToArray,
@@ -115,6 +119,10 @@ export const fetch: typeof globalThis.fetch = function fetch(input, init = undef
     return webFetch(input, init);
 };
 export const isMainThread = !import.meta.use('worker').isWorker;
+// cno does not produce Bun-style `--compile` standalone executables. Keep
+// these feature-detection values truthful and allocation-free in normal runs.
+export const isStandaloneExecutable = false;
+export const embeddedFiles: ReadonlyArray<Blob> = Object.freeze([] as Blob[]);
 
 export {
     ArrayBufferSink,
@@ -167,6 +175,7 @@ export {
     sha,
     sliceAnsi,
     sleepSync,
+    shrink,
     spawn,
     spawnSync,
     stderr,
@@ -175,6 +184,7 @@ export {
     stringWidth,
     stripANSI,
     TOML,
+    unsafe,
     wrapAnsi,
     which,
     write,
@@ -189,8 +199,11 @@ export type {
     BunHash,
     BunListenOptions,
     BunServeHandler,
+    BunServeHttpMethod,
     BunServeOptions,
     BunServeReloadOptions,
+    BunServeRoute,
+    BunServeRoutes,
     BunServeServer,
     BunSocket,
     BunSocketData,
@@ -229,8 +242,11 @@ export interface BunApi {
     readonly isMainThread: boolean;
     readonly sleep: typeof sleep;
     readonly sleepSync: typeof sleepSync;
+    readonly shrink: typeof shrink;
     readonly gc: typeof gc;
     readonly enableANSIColors: boolean;
+    readonly isStandaloneExecutable: boolean;
+    readonly embeddedFiles: ReadonlyArray<Blob>;
     readonly connect: typeof connect;
     readonly listen: typeof listen;
     readonly stdout: StdioFile;
@@ -290,6 +306,7 @@ export interface BunApi {
     readonly nanoseconds: typeof nanoseconds;
     readonly peek: typeof peek;
     readonly allocUnsafe: typeof allocUnsafe;
+    readonly unsafe: typeof unsafe;
     readonly indexOfLine: typeof indexOfLine;
     readonly inspect: typeof inspect;
     readonly resolve: typeof resolve;
@@ -386,8 +403,11 @@ const Bun: BunApi = {
     isMainThread,
     sleep,
     sleepSync,
+    shrink,
     gc,
     enableANSIColors,
+    isStandaloneExecutable,
+    embeddedFiles,
     connect,
     listen,
     stdout,
@@ -447,6 +467,7 @@ const Bun: BunApi = {
     nanoseconds,
     peek,
     allocUnsafe,
+    unsafe,
     indexOfLine,
     inspect,
     resolve,
@@ -460,7 +481,9 @@ for (const name of [
     'fetch', 'isMainThread', 'dns',
     'connect', 'listen',
     'stdout', 'stderr', 'stdin',
-    'gc', 'enableANSIColors',
+    'gc', 'shrink', 'enableANSIColors',
+    'isStandaloneExecutable', 'embeddedFiles',
+    'unsafe',
 ] as const) {
     Object.defineProperty(Bun, name, {
         value: Bun[name],

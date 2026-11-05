@@ -1,6 +1,7 @@
 import { arrayBufferBackedBytes, sanitizeSurrogates } from '../utils/bytes';
 import { basename, dirname, join, toFsPath } from '../utils/path';
 import { ensureDirectory } from '../utils/fs-path';
+import { isBunBytePath } from './file-path';
 import { filePathSink, type FileSink as BunFileSink } from './file-sink';
 import { stdioDestination, type StdioFile } from './stdio';
 import { stat as nodeStat, unlink as nodeUnlink } from '../node/fs/_promises';
@@ -50,6 +51,7 @@ export type BunWriteInput =
     | ArrayBufferLike
     | Blob
     | Response
+    | Request
     | ReadableStream
     | BunFileLike;
 
@@ -73,12 +75,15 @@ function isObject(value: unknown): value is Record<PropertyKey, unknown> {
 }
 
 function isArrayBufferLike(value: unknown): value is ArrayBufferLike {
-    if (typeof ArrayBuffer !== 'undefined' && value instanceof ArrayBuffer) return true;
-    return typeof SharedArrayBuffer !== 'undefined' && value instanceof SharedArrayBuffer;
+    return isBunBytePath(value) && !ArrayBuffer.isView(value);
 }
 
 function isResponse(value: unknown): value is Response {
     return typeof Response !== 'undefined' && value instanceof Response;
+}
+
+function isRequest(value: unknown): value is Request {
+    return typeof Request !== 'undefined' && value instanceof Request;
 }
 
 function isReadableStream(value: unknown): value is ReadableStream {
@@ -613,22 +618,25 @@ export async function write(
     const stdio = stdioDestination(destination);
     if (stdio) {
         // mode/createPath are file-path concepts; Bun ignores them for pipes.
-        if (isResponse(input) || isReadableStream(input)) {
-            throw new TypeError('Bun.write: Response and ReadableStream input is not supported for stdio files');
+        if (isResponse(input) || isRequest(input) || isReadableStream(input)) {
+            throw new TypeError('Bun.write: Response, Request, and ReadableStream input is not supported for stdio files');
         }
         return stdio.write(input as string | ArrayBufferView | ArrayBufferLike | Blob);
     }
     const path = destinationPath(destination);
     const parsed = validateWriteOptions(options);
-    if (isResponse(input)) {
-        if (input.bodyUsed || input.body?.locked) throw new TypeError('Bun.write: Response body is already used or locked');
+    if (isResponse(input) || isRequest(input)) {
+        const name = isRequest(input) ? 'Request' : 'Response';
+        if (input.bodyUsed || input.body?.locked) {
+            throw new TypeError(`Bun.write: ${name} body is already used or locked`);
+        }
         if (input.body) return writeStream(path, input.body, parsed);
     } else if (input instanceof Blob) {
         return writeStream(path, input.stream(), parsed);
     } else if (isReadableStream(input)) {
         return writeStream(path, input, parsed);
     }
-    const bytes = isResponse(input) ? new Uint8Array(0) : await inputBytes(input);
+    const bytes = isResponse(input) || isRequest(input) ? new Uint8Array(0) : await inputBytes(input);
 
     if (parsed.createPath !== false) await ensureDirectory(dirname(path));
     const handle = await asyncfs.open(path, 'w', parsed.mode);
@@ -644,7 +652,7 @@ export function file(
     options?: BlobPropertyBag,
 ): BunFile {
     const parsed = parseFileOptions(options);
-    if (path instanceof Uint8Array || path instanceof DataView || isArrayBufferLike(path)) {
+    if (isBunBytePath(path)) {
         const bytes = toArrayBufferBytes(path);
         if (bytes.byteLength === 0) {
             throw bytePathError("Invalid path buffer: can't be empty", 'ERR_INVALID_ARG_TYPE');
