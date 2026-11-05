@@ -11,7 +11,6 @@ import { errors } from "./01_errors";
 const os = import.meta.use('os');
 const fs = import.meta.use('fs');
 const proc = import.meta.use('process');
-const pty = import.meta.use('pty');
 const engine = import.meta.use('engine');
 const signal = import.meta.use('signals');
 const crypto = import.meta.use('crypto');
@@ -85,9 +84,16 @@ function normalizeSignal(signo?: number | Deno.Signal): number | undefined {
 }
 
 function outputOptions(options?: Deno.CommandOptions): Deno.CommandOptions {
-    // Stdio variants are validated by pipe() at spawn/spawnSync time.
     if (options?.stdin === 'piped') {
         throw new TypeError("Piped stdin is not supported for this function, use 'Deno.Command.spawn()' instead");
+    }
+
+    // Defaults must not erase invalid raw variants (real Deno rejects
+    // {stdout: null} rather than spawning with it); pipe() stays the single
+    // validation point, this pass just closes the null-via-?? gap.
+    for (const name of ['stdin', 'stdout', 'stderr'] as const) {
+        const raw = options?.[name];
+        if (raw !== undefined) pipe(raw, name);
     }
 
     return {

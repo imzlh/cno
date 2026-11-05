@@ -47,6 +47,9 @@ export class EventSource extends EventTarget {
     private dataBuffer: string[] = [];
     /** Total chars buffered across `data:` lines, bounded like lineBuffer. */
     private dataBufferedChars: number = 0;
+    /** Set when the data buffer overflows; the connection fails instead of
+     *  dispatching a truncated event as if it were complete. */
+    private dataOverflow: boolean = false;
     private idBuffer: string | null = null;
     private lineBuffer: string = '';
     private decoder = new text.Decoder();
@@ -140,6 +143,7 @@ export class EventSource extends EventTarget {
         this.lineBuffer = '';
         this.dataBuffer = [];
         this.dataBufferedChars = 0;
+        this.dataOverflow = false;
         this.eventTypeBuffer = '';
         this.idBuffer = null;
         this.decoder = new text.Decoder();
@@ -186,6 +190,7 @@ export class EventSource extends EventTarget {
                 // must not grow the queue without limit (same bound as lineBuffer).
                 this.dataBufferedChars += value.length;
                 if (this.dataBufferedChars <= 1024 * 1024) this.dataBuffer.push(value);
+                else this.dataOverflow = true;
                 break;
             }
             case 'id': if (!value.includes('\0')) this.idBuffer = value; break;
@@ -209,6 +214,15 @@ export class EventSource extends EventTarget {
     }
 
     private dispatchBufferedEvent(): void {
+        // Never present a truncated event as complete: overflow of the data
+        // buffer is a protocol violation, so fail the connection (spec: no
+        // reconnection after a failed connection).
+        if (this.dataOverflow) {
+            this.dataOverflow = false;
+            this.resetParseState();
+            this.fail();
+            return;
+        }
         if (this.dataBuffer.length === 0) return;
         if (this.idBuffer !== null) this.lastEventId = this.idBuffer;
         const data = this.dataBuffer.join('\n');

@@ -15,15 +15,13 @@ import {
     headerEntriesToRecord,
     nextNodeRequestId,
     nodeTs,
-    normalizeHeaderRecord,
-    toUint8Array,
+        toUint8Array,
 } from '../_internal/network-debug';
 import { isTransportDisconnectError, normalizeErrnoError } from '../_internal/errno';
 import { arrayBufferBackedBytes, viewToUint8Array } from '../_internal/buffer';
 import {
     createHeadersSentError,
-    isBodyForbiddenStatus,
-    ServerResponseAdapter,
+        ServerResponseAdapter,
     type ResponseAdapterServeHook,
 } from '../_internal/server-response-adapter';
 import { dispatchServerRequest } from '../_internal/server-request-runtime';
@@ -38,7 +36,7 @@ import {
     onServerResponseCreated,
     onServerResponseFinish,
 } from '../diagnostics_channel/builtins';
-import type { IncomingHttpHeaders, OutgoingHttpHeader, OutgoingHttpHeaders, IncomingMessage, OutgoingMessage, ServerResponse, ListenOptions, Server, RequestListener, MessageSocket } from './types';
+import type { OutgoingHttpHeader, OutgoingHttpHeaders, IncomingMessage, OutgoingMessage, ServerResponse, ListenOptions, Server, RequestListener, MessageSocket } from './types';
 import { IOpaque } from '../_internal/inject';
 import { flattenPrototype } from '../_internal/prototype';
 import { STATUS_CODES } from './constants';

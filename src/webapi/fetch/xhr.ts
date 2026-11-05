@@ -2,13 +2,12 @@ import { DOMException, EventTarget, ProgressEvent } from "../events";
 import { bytesToArrayBuffer } from "../../utils/bytes";
 import { basicAuth } from "../../utils/http";
 import { getFetchHook, getFetchInterceptHook, captureUserNetworkCallFrames, getCurlInitHook, type InterceptResult, type NetworkCallFrame } from "../../utils/network-hooks";
-import { attachCurlDebugTrace, buildConnectionInfo, CHARSET_RE, type CurlDebugTrace, curlMod, Decoder, engine, getCurlPool, parseHeaders, responseBodyToBytes, serializeBody, toCurlBody, truncateHookPostData, utf8Decoder } from "./helpers";
+import { attachCurlDebugTrace, buildConnectionInfo, CHARSET_RE, type CurlDebugTrace, curlMod, Decoder, getCurlPool, parseHeaders, responseBodyToBytes, serializeBody, toCurlBody, truncateHookPostData, utf8Decoder } from "./helpers";
 import { isLocalFetchProtocol, loadLocalProtocol, type LocalProtocolResponse } from "./protocols";
 import { clearReferenceIfCurrent } from "./reference";
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
-const crypto = import.meta.use('crypto');
 
 let _xhrRequestIdCounter = 0;
 function newRequestId(): string {

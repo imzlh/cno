@@ -25,18 +25,23 @@ function reasonPhrase(code: number, explicit?: string): string {
 
 /** Encoding → encoder cache. The label set is closed and small, and the native
  *  encoder is stateless for encoding, so one instance per label serves every
- *  response instead of constructing one per chunk. */
+ *  response instead of constructing one per chunk. Construction stays lazy:
+ *  byte chunks never encode, so an exotic label on a byte-only write must not
+ *  fail the response. The cache clears when adversarial labels churn it. */
 const encoderCache = new Map<string, InstanceType<typeof text.Encoder>>();
 
 export function encoderForEncoding(encoding?: string): (value: string) => ReturnType<typeof engine.encodeString> {
     if (!encoding) return engine.encodeString;
-    let encoder = encoderCache.get(encoding);
-    if (encoder === undefined) {
-        if (!text) throw new Error('text encoding module is not available');
-        encoder = new text.Encoder(encoding);
-        encoderCache.set(encoding, encoder);
-    }
-    return encoder.encode.bind(encoder);
+    return (value: string) => {
+        let encoder = encoderCache.get(encoding);
+        if (encoder === undefined) {
+            if (!text) throw new Error('text encoding module is not available');
+            encoder = new text.Encoder(encoding);
+            if (encoderCache.size >= 32) encoderCache.clear();
+            encoderCache.set(encoding, encoder);
+        }
+        return encoder.encode(value);
+    };
 }
 
 export interface ResponseAdapterTarget {

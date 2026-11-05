@@ -98,13 +98,24 @@ class Permissions implements Deno.Permissions {
         if (token !== permissionToken) throw new TypeError('Illegal constructor');
     }
 
+    /** descriptor → status identity cache. Statuses stay 'granted' forever and
+     *  never emit change events, but callers rely on the same descriptor
+     *  resolving to the same PermissionStatus object; the FIFO bound keeps the
+     *  otherwise unbounded descriptor-key space capped. */
+    #statuses = new Map<string, PermissionStatus>();
+
     #status(desc: Deno.PermissionDescriptor): Deno.PermissionStatus {
         // descriptorKey doubles as validation of the descriptor.
-        descriptorKey(desc);
-        // Statuses stay 'granted' forever and never emit change events, so the
-        // descriptor-keyed identity cache was an unbounded leak; real Deno also
-        // returns a fresh PermissionStatus per query.
-        return new PermissionStatus(permissionToken);
+        const key = descriptorKey(desc);
+        let status = this.#statuses.get(key);
+        if (status === undefined) {
+            status = new PermissionStatus(permissionToken);
+            if (this.#statuses.size >= 256) {
+                this.#statuses.delete(this.#statuses.keys().next().value!);
+            }
+            this.#statuses.set(key, status);
+        }
+        return status;
     }
 
     querySync(desc: Deno.PermissionDescriptor): Deno.PermissionStatus {

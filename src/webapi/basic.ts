@@ -8,7 +8,6 @@ import { stdin, stdout } from "../utils/stdio";
 
 type TimerOptions = { signal?: AbortSignal };
 
-const crypto = import.meta.use('crypto');
 const engine = import.meta.use('engine');
 const text = import.meta.use('text');
 const os = import.meta.use('os');

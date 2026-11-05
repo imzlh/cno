@@ -82,7 +82,7 @@ const percentDecode = (str: string): string => {
     }
 };
 
-const URL_TEXT_ENCODE_SET = /[^\x21-\x7E]/;
+const URL_TEXT_ENCODE_SET = /[^\x21-\x7E]/gu;
 
 // Lone surrogates make encodeURIComponent throw; the URL spec UTF-8-encodes
 // them as U+FFFD instead.

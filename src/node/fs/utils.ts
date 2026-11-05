@@ -3,13 +3,11 @@
  */
 
 import path from '../path';
-const { dirname, join } = path;
+const { join } = path;
 import { fileURLToPath } from '../url';
 import { Buffer } from '../buffer';
 import { arrayBufferBackedBytes, base64ToBytes, concatChunks, hexToBytes } from '../_internal/buffer';
 import { withCode } from '../_internal/errors';
-import { toErrnoException } from '../_internal/errno';
-import { wrapSync } from './errno-fix';
 
 import { nsfs, nsasfs, sysPath } from './syspath';
 export const fs = nsfs;

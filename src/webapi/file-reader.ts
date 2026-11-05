@@ -1,7 +1,6 @@
 import { DOMException, EventTarget, ProgressEvent } from "./events";
 
 const crypto = import.meta.use('crypto');
-const text = import.meta.use('text');
 
 type FileReaderHandler = ((this: FileReader, ev: ProgressEvent<FileReader>) => unknown) | null;
 
@@ -81,7 +80,10 @@ class FileReader extends EventTarget {
     readAsText(blob: Blob, encoding?: string): void {
         this.#startRead(blob, async (source) => {
             const buffer = await source.arrayBuffer();
-            return new text.Decoder(encoding).decode(buffer);
+            // The WHATWG decoder owns the label table (latin1 → windows-1252,
+            // x-user-defined, …); the raw native decoder would decode latin1
+            // as ISO-8859-1 and lose the Web mappings.
+            return new TextDecoder(encoding).decode(buffer);
         });
     }
 

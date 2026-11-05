@@ -1,4 +1,3 @@
-import { assert } from "../utils/assert";
 import { ensureDirectorySync } from "../utils/fs-path";
 import { dirname, join } from "../utils/path";
 import { DOMException, StorageEvent } from "./events";

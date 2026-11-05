@@ -2,7 +2,7 @@
  * Node.js fs module - callback-style API
  * All async operations support callback functions
  */
-import { toUint8Array, normalizeRwArgs, decodeBuffer, encodePathResult, toNodeStat, toNodeStatFs, toNodeDirentAsync, parseFlags, pathToString, splitPathOrFd, describeFd, removeRecursive, retryOnBusy, mkdirRecursive, modeToNumber, timeToUnixSeconds, timeToUnixMs, readFileFromFdSync, readFileFromHandle, randomHex, createAsyncDir, createEagerAsyncDir, readDirEntries, validateOpendirOptions, validateReaddirOptions, validateFd, errorFromUnknown, assertCopyFileMode, makeAbortError, rmIsDirectoryError, lchmodEnosysError, writeAllHandle, writeAllSync, type PathLike, type TimeLike, type Mode, type Stats, type StatsFs, type Dirent, type Dir } from './utils';
+import { toUint8Array, normalizeRwArgs, decodeBuffer, encodePathResult, toNodeStat, toNodeStatFs, toNodeDirentAsync, parseFlags, pathToString, splitPathOrFd, describeFd, removeRecursive, retryOnBusy, mkdirRecursive, modeToNumber, timeToUnixSeconds, timeToUnixMs, readFileFromFdSync, readFileFromHandle, randomHex, createAsyncDir, createEagerAsyncDir, readDirEntries, validateOpendirOptions, validateReaddirOptions, validateFd, errorFromUnknown, assertCopyFileMode, makeAbortError, rmIsDirectoryError, lchmodEnosysError, writeAllHandle, writeAllSync, type PathLike, type TimeLike, type Mode, type Stats, type StatsFs, type Dir } from './utils';
 // `toAsyncFsErrnoException` is `toErrnoException` plus the JS-name -> libuv-name
 // correction for `err.syscall` (readdir -> scandir, utimes -> utime). Aliased so
 // every existing call site gets it; see fs/syscall-names.ts for why it is needed.
