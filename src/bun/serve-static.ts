@@ -93,14 +93,45 @@ async function resolveWithin(root: string, path: string): Promise<string | undef
     return resolved;
 }
 
+/** True when the request's conditional headers say the copy is still fresh.
+ *  Only the two common validators are honored (ETag, then mtime); Range is
+ *  outside this subset, so a matching conditional is a plain 304. */
+function notModified(request: Request, etag: string, mtime: Date): boolean {
+    const ifNoneMatch = request.headers.get('if-none-match');
+    if (ifNoneMatch !== null) {
+        // The client echoes the validator as sent (weak form) or as a strong
+        // tag; either match — or a wildcard — means "send 304".
+        const strong = `"${etag.slice(3, -1)}"`;
+        return ifNoneMatch.split(',').some(candidate => {
+            const tag = candidate.trim();
+            return tag === '*' || tag === etag || tag === strong;
+        });
+    }
+    const ifModifiedSince = request.headers.get('if-modified-since');
+    if (ifModifiedSince !== null) {
+        const since = Date.parse(ifModifiedSince);
+        // HTTP dates have second granularity, so the comparison floors mtime.
+        return Number.isFinite(since) && Math.trunc(mtime.getTime() / 1000) * 1000 <= since;
+    }
+    return false;
+}
+
 function fileResponse(request: Request, path: string, mtime: Date, size: number): Response {
     const target = newBunFile(path);
     const headers = new Headers();
     if (target.type) headers.set('content-type', target.type);
     headers.set('last-modified', mtime.toUTCString());
-    // Weak ETag over the stat pair; conditional and range requests are outside
-    // this subset, so the value only aids manual cache inspection.
-    headers.set('etag', `W/"${size.toString(16)}-${Math.trunc(mtime.getTime()).toString(16)}"`);
+    // Weak ETag over the stat pair; range requests are outside this subset,
+    // so the value drives the conditional GET below and manual inspection.
+    const etag = `W/"${size.toString(16)}-${Math.trunc(mtime.getTime()).toString(16)}"`;
+    headers.set('etag', etag);
+    // The size is known from the stat, so pin content-length like Bun's static
+    // serving: it lets the host skip chunked framing on keep-alive responses.
+    headers.set('content-length', String(size));
+    if (notModified(request, etag, mtime)) {
+        headers.delete('content-length');
+        return new Response(null, { status: 304, headers });
+    }
     if (request.method === 'HEAD') return new Response(null, { status: 200, headers });
     return new Response(target.stream(), { status: 200, headers });
 }
