@@ -2,11 +2,11 @@ const ssl = import.meta.use('ssl');
 const streams = import.meta.use('streams');
 const engine = import.meta.use('engine');
 const os = import.meta.use('os');
-const crypto = import.meta.use('crypto');
 const error = import.meta.use('error');
 
 import type { DnsAddressType } from '@cnojs/http/dns-cache';
 import { dnsCache } from '@cnojs/http/dns-cache';
+import { basicAuth } from '../utils/http';
 import { wrapFsClassDec as wrap } from '../utils/wrap';
 import { shouldBypassProxy } from '../utils/proxy';
 import { getEnv } from '../utils/env';
@@ -26,7 +26,7 @@ function proxyPort(proxyUrl: URL): number {
 
 async function dialTcp(hostname: string, port: number, viaProxy = false): Promise<CModuleStreams.TCP> {
     const addrs = await dnsCache.resolve(hostname, { family: os.AF_UNSPEC });
-    if (!addrs || !addrs.length) {
+    if (!addrs.length) {
         throw new Error(`DNS resolution failed for ${viaProxy ? 'proxy ' : ''}${hostname}`);
     }
     const socket = new streams.TCP();
@@ -149,7 +149,7 @@ export class HttpClient {
     getProxyAuth(): string | null {
         if (!this.options.proxy?.basicAuth) return null;
         const { username, password } = this.options.proxy.basicAuth;
-        return `Basic ${crypto.base64Encode(engine.encodeString(`${username}:${password}`))}`;
+        return basicAuth(username, password);
     }
 
     @wrap

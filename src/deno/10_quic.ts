@@ -5,6 +5,11 @@ import { closeStreamQuietly } from "./utils/pipe-streams";
 
 const DEFAULT_ALPN = "cno-quic";
 
+// Receive-side backpressure mirrors real Deno: quinn bounds its datagram
+// receive buffer and quic listeners never surface an unbounded accept backlog.
+const MAX_QUEUED_DATAGRAMS = 1024;
+const MAX_QUEUED_INCOMING = 1024;
+
 function firstAlpn(protocols?: string[]): string {
     if (!protocols || protocols.length === 0) return DEFAULT_ALPN;
     return protocols[0];
@@ -192,7 +197,14 @@ class QuicConnImpl implements Deno.QuicConn {
             const chunk = toOwnedBytes(data);
             const waiter = this.#datagramWaiters.shift();
             if (waiter) waiter.resolve(chunk);
-            else this.#datagrams.push(chunk);
+            else if (this.#datagrams.length >= MAX_QUEUED_DATAGRAMS) {
+                // Datagrams are unreliable; real Deno (quinn) bounds the receive
+                // buffer, so drop the oldest and keep the freshest data.
+                this.#datagrams.shift();
+                this.#datagrams.push(chunk);
+            } else {
+                this.#datagrams.push(chunk);
+            }
         };
         this.#conn.onstream = (id: number, bidirectional: boolean) => {
             const entry = this.#ensureStream(id, bidirectional);
@@ -351,6 +363,12 @@ class QuicListenerImpl implements Deno.QuicListener {
         socket.onconnection = (nativeConn: CModuleExternalQuic.Connection) => {
             if (this.#stopped) {
                 nativeConn.close(0, "listener stopped");
+                return;
+            }
+            // Bound the accept backlog like real Deno (quinn); the newest native
+            // conn is closed instead of queued so queued ones stay reachable.
+            if (this.#waiters.length === 0 && this.#incoming.length >= MAX_QUEUED_INCOMING) {
+                nativeConn.close(0, "accept backlog full");
                 return;
             }
             const conn = new QuicConnImpl(

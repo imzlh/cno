@@ -1191,7 +1191,7 @@ function bidirectionalIndexOf(
     }
 
     if (needle.length === 0) {
-        return forward ? Math.min(Math.max(offset, 0), buf.length) : Math.min(Math.max(offset, 0), buf.length);
+        return Math.min(Math.max(offset, 0), buf.length);
     }
     if (needle.length > buf.length) return -1;
 
@@ -1258,7 +1258,7 @@ export const btoa: (data: string) => string =
             const bytes = new Uint8Array(data.length);
             for (let i = 0; i < data.length; i++) {
                 const c = data.charCodeAt(i);
-                if (c > 0xff) throw new DOMException('Invalid character', 'InvalidCharacterError') ?? new Error('Invalid character');
+                if (c > 0xff) throw new DOMException('Invalid character', 'InvalidCharacterError');
                 bytes[i] = c;
             }
             return bytesToBase64(bytes, false);

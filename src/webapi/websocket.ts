@@ -65,10 +65,6 @@ function closeReadableControllerQuietly(handle: { close(): unknown }): void {
     }
 }
 
-function closeConnectionQuietly(connection: { close(): void }): void {
-    closeQuietly(connection);
-}
-
 /** Closing a handle a racing teardown already closed is expected, not an error. */
 function closeQuietly(handle: { close(): unknown }): void {
     try {
@@ -95,10 +91,6 @@ function hookBase64(payload: Uint8Array): string {
     // Use a dedicated ArrayBuffer copy so byteOffset is always 0.
     const buf = toOwnedBytes(src).buffer;
     return crypto.base64Encode(buf);
-}
-
-function captureWebSocketCallFrames(): NetworkCallFrame[] | undefined {
-    return captureUserNetworkCallFrames();
 }
 
 function toWebSocketUrl(url: string): string {
@@ -390,9 +382,6 @@ class SendQueue {
     close(): void { this.connection = null; this.flushQueue(new Error('WebSocket closed')); }
     buildControlFrame(opcode: OpCode, payload: Uint8Array): Uint8Array { return this.buildFrame(opcode, payload, true, this.isClient); }
 
-    get [Symbol.toStringTag]() {
-        return 'SendQueue';
-    }
 }
 
 export class WebSocket extends EventTarget implements globalThis.WebSocket {
@@ -512,7 +501,7 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
             (urlOrConnection as Promise<IWSSocket>).then(conn => {
                 serverMetaReady.then(() => {
                 if (this._readyState !== WebSocketReadyState.CONNECTING) {
-                    closeConnectionQuietly(conn);
+                    closeQuietly(conn);
                     return;
                 }
                 this._readyState = WebSocketReadyState.OPEN; this.connection = conn; this.sendQueue.setConnection(conn);
@@ -531,12 +520,12 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
             const wsHook = getWebSocketHook();
             if (wsHook) {
                 this._netRequestId = `ws-${++_wsIdCounter}`;
-                this._initiatorCallFrames = captureWebSocketCallFrames();
+                this._initiatorCallFrames = captureUserNetworkCallFrames();
             }
 
             const connection = await connectHttp(url);
             if (this._readyState !== WebSocketReadyState.CONNECTING) {
-                closeConnectionQuietly(connection.socket);
+                closeQuietly(connection.socket);
                 return;
             }
             this.connection = connection.socket;
@@ -544,7 +533,7 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
             await this.sendHandshake(url, connection.requestTarget, connection.proxyAuthorization);
             await this.receiveHandshake();
             if (this._readyState !== WebSocketReadyState.CONNECTING) {
-                closeConnectionQuietly(connection.socket);
+                closeQuietly(connection.socket);
                 this.connection = null;
                 return;
             }
@@ -1082,7 +1071,7 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
         this.stopPingTimer();
         this.sendQueue.close();
         if (this.connection) {
-            closeConnectionQuietly(this.connection);
+            closeQuietly(this.connection);
             this.connection = null;
         }
         // Release accumulated fragment data so it can be GC'd.
@@ -1162,8 +1151,10 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
         if (this._netRequestId) {
             const wsHook = getWebSocketHook();
             if (wsHook) {
+                // `data` already holds the decoded TEXT payload; decode again
+                // would re-pay a full O(n) UTF-8 pass per frame.
                 const hookPayload = opcode === OpCode.TEXT
-                    ? decodeTextFrame(payload)
+                    ? (data as string)
                     : hookBase64(payload);
                 const frame: WSFrameInfo = {
                     source: this.isClient ? 'fetch' : 'serve',

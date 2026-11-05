@@ -139,6 +139,8 @@ export interface FetchResponseInfo {
 
 export interface FetchDataInfo {
     requestId: string;
+    /** Shared with the response body queue — observe only; writing to it
+     *  corrupts the stream the hook fired for. */
     data: Uint8Array;
     timestamp: number;
 }

@@ -748,30 +748,28 @@ export function domainToASCII(domain: string): string {
     if (stop !== -1) input = input.slice(0, stop);
     if (input === '') return '';
 
-    try {
-        const labels = splitDomain(input);
-        let invalid = false;
-        const converted = labels.map(label => {
-            if (label === '') return '';
-            if (/^xn--/i.test(label) && decodeALabel(label) === null) {
-                invalid = true;
-                return '';
-            }
-            if (/^[\x00-\x7F]+$/.test(label)) {
-                // Node runs UTS-46 with VerifyDnsLength=false, so a long ASCII label passes.
-                if (validAsciiLabel(label)) return label.toLowerCase();
-                invalid = true;
-                return '';
-            }
-            const ascii = `xn--${punyEncode(label)}`;
-            if (ascii.length <= 63) return ascii.toLowerCase();
+    // Every callee is non-throwing (punyDecode's catch lives in decodeALabel),
+    // so failures flow through the `invalid` flag instead of an exception.
+    const labels = splitDomain(input);
+    let invalid = false;
+    const converted = labels.map(label => {
+        if (label === '') return '';
+        if (/^xn--/i.test(label) && decodeALabel(label) === null) {
             invalid = true;
             return '';
-        });
-        return invalid ? '' : converted.join('.');
-    } catch {
+        }
+        if (/^[\x00-\x7F]+$/.test(label)) {
+            // Node runs UTS-46 with VerifyDnsLength=false, so a long ASCII label passes.
+            if (validAsciiLabel(label)) return label.toLowerCase();
+            invalid = true;
+            return '';
+        }
+        const ascii = `xn--${punyEncode(label)}`;
+        if (ascii.length <= 63) return ascii.toLowerCase();
+        invalid = true;
         return '';
-    }
+    });
+    return invalid ? '' : converted.join('.');
 }
 
 export function domainToUnicode(domain: string): string {

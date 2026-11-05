@@ -23,10 +23,20 @@ function reasonPhrase(code: number, explicit?: string): string {
     return STATUS_CODES[code] ?? 'unknown';
 }
 
-function encodeStringForEncoding(encoding?: string): (value: string) => Uint8Array {
+/** Encoding → encoder cache. The label set is closed and small, and the native
+ *  encoder is stateless for encoding, so one instance per label serves every
+ *  response instead of constructing one per chunk. */
+const encoderCache = new Map<string, InstanceType<typeof text.Encoder>>();
+
+export function encoderForEncoding(encoding?: string): (value: string) => ReturnType<typeof engine.encodeString> {
     if (!encoding) return engine.encodeString;
-    if (!text) throw new Error('text encoding module is not available');
-    return (value: string) => new text.Encoder(encoding).encode(value);
+    let encoder = encoderCache.get(encoding);
+    if (encoder === undefined) {
+        if (!text) throw new Error('text encoding module is not available');
+        encoder = new text.Encoder(encoding);
+        encoderCache.set(encoding, encoder);
+    }
+    return encoder.encode.bind(encoder);
 }
 
 export interface ResponseAdapterTarget {
@@ -548,7 +558,7 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
         }
 
         try {
-            const encodeString = encodeStringForEncoding(encoding);
+            const encodeString = encoderForEncoding(encoding);
             const data = toUint8Array(chunk, encodeString);
             if (this.shouldSuppressBody()) {
                 callback?.();
@@ -608,7 +618,7 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
             this.writeHead(this.response.statusCode);
         } else if (chunk !== undefined && !this.response.headersSent) {
             const encoding = typeof encodingOrCb === 'string' ? encodingOrCb : undefined;
-            const encodeString = encodeStringForEncoding(encoding);
+            const encodeString = encoderForEncoding(encoding);
             const data = toUint8Array(chunk, encodeString);
             if (
                 !this.shouldSuppressBody() &&
@@ -625,7 +635,7 @@ export class ServerResponseAdapter<TResponse extends ResponseAdapterTarget> {
             async () => {
                 if (chunk !== undefined && !this.shouldSuppressBody()) {
                     const encoding = typeof encodingOrCb === 'string' ? encodingOrCb : undefined;
-                    const encodeString = encodeStringForEncoding(encoding);
+                    const encodeString = encoderForEncoding(encoding);
                     const data = chunk instanceof Uint8Array ? chunk : toUint8Array(chunk, encodeString);
                     try { this.serveHook?.onData?.({ requestId: this.requestId, timestamp: nodeTs(), data }); } catch {}
                     await this.writeBody(data);

@@ -11,6 +11,7 @@ import { connectHttp, buildRequest, readHeaders, type IHttpSocket } from "../uti
 import { MessageEvent } from "./events";
 
 const timers = import.meta.use('timers');
+const text = import.meta.use('text');
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
@@ -44,9 +45,11 @@ export class EventSource extends EventTarget {
     private lastEventId: string = '';
     private eventTypeBuffer: string = '';
     private dataBuffer: string[] = [];
+    /** Total chars buffered across `data:` lines, bounded like lineBuffer. */
+    private dataBufferedChars: number = 0;
     private idBuffer: string | null = null;
     private lineBuffer: string = '';
-    private decoder = new TextDecoder();
+    private decoder = new text.Decoder();
 
     constructor(url: string | URL, eventSourceInitDict?: EventSourceInit) {
         super();
@@ -136,9 +139,10 @@ export class EventSource extends EventTarget {
         // Per spec, reconnect resets the buffers but preserves lastEventId.
         this.lineBuffer = '';
         this.dataBuffer = [];
+        this.dataBufferedChars = 0;
         this.eventTypeBuffer = '';
         this.idBuffer = null;
-        this.decoder = new TextDecoder();
+        this.decoder = new text.Decoder();
     }
 
     private processChunk(chunk: Uint8Array): void {
@@ -177,7 +181,13 @@ export class EventSource extends EventTarget {
 
         switch (field) {
             case 'event': this.eventTypeBuffer = value; break;
-            case 'data': this.dataBuffer.push(value); break;
+            case 'data': {
+                // A hostile server streaming `data:` lines without a blank line
+                // must not grow the queue without limit (same bound as lineBuffer).
+                this.dataBufferedChars += value.length;
+                if (this.dataBufferedChars <= 1024 * 1024) this.dataBuffer.push(value);
+                break;
+            }
             case 'id': if (!value.includes('\0')) this.idBuffer = value; break;
             case 'retry': {
                 if (/^\d+$/.test(value)) {
@@ -210,6 +220,7 @@ export class EventSource extends EventTarget {
         if (eventType === 'message' && this.onmessage) this.onmessage.call(this, event);
         this.eventTypeBuffer = '';
         this.dataBuffer = [];
+        this.dataBufferedChars = 0;
         this.idBuffer = null;
     }
 

@@ -12,7 +12,7 @@ import { resolve } from '../path';
 import { copyPath, validateCopyOptions, type CopyOptions } from './copy';
 import { globPaths, type GlobOptions, type GlobResult } from './glob';
 import { ReadStream, WriteStream } from './streams';
-import { createAsyncDir, createEagerAsyncDir, createFileHandle, decodeBuffer, encodePathResult, mkdirRecursive, modeToNumber, parseFlags, pathToString, randomHex, readDirEntries, readFileFromFdSync, removeRecursive, retryOnBusy, splitPathOrFd, timeToUnixMs, toNodeDirentAsync, toNodeStat, toNodeStatFs, toUint8Array, validateOpendirOptions, validateReaddirOptions, assertCopyFileMode, makeAbortError, rmIsDirectoryError, writeAllHandle, writeAllSync, type Mode, type PathLike, type TimeLike } from './utils';
+import { createAsyncDir, createEagerAsyncDir, createFileHandle, decodeBuffer, encodePathResult, mkdirRecursive, modeToNumber, parseFlags, pathToString, randomHex, readDirEntries, readFileFromFdSync, readFileFromHandle, removeRecursive, retryOnBusy, splitPathOrFd, timeToUnixMs, toNodeDirentAsync, toNodeStat, toNodeStatFs, toUint8Array, validateOpendirOptions, validateReaddirOptions, assertCopyFileMode, makeAbortError, rmIsDirectoryError, lchmodEnosysError, writeAllHandle, writeAllSync, type Mode, type PathLike, type TimeLike } from './utils';
 
 import type { Stats, Dirent, Dir, StatsFs } from 'node:fs';
  
@@ -67,15 +67,7 @@ async function withAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<
 async function readFileWithFlag(path: string, flag: string | number): Promise<Uint8Array<ArrayBuffer>> {
     const handle = await w(asfs.open(path, parseFlags(flag)), 'readFile', path);
     try {
-        const st = await handle.stat();
-        const buf = new Uint8Array(st.size);
-        let off = 0;
-        while (off < st.size) {
-            const n = await handle.read(buf.subarray(off));
-            if (n === 0) break;
-            off += n;
-        }
-        return buf;
+        return await readFileFromHandle(handle);
     } finally {
         await handle.close();
     }
@@ -460,11 +452,7 @@ export async function lchmod(path: PathLike, mode: Mode): Promise<void> {
     const pathStr = pathToString(path);
     const st = await w(asfs.lstat(pathStr), 'lstat', pathStr);
     if (st.isSymbolicLink) {
-        const err = new Error(`ENOSYS: function not implemented, lchmod '${pathStr}'`) as NodeJS.ErrnoException;
-        err.code = 'ENOSYS';
-        err.syscall = 'lchmod';
-        err.path = pathStr;
-        throw err;
+        throw lchmodEnosysError(pathStr);
     }
     await chmod(path, mode);
 }
@@ -520,9 +508,12 @@ export function watch(path: PathLike, options?: { persistent?: boolean; recursiv
         }
     };
 
+    const onAbort = (): void => { void close(); };
+
     const close = async () => {
         if (closed) return;
         closed = true;
+        if (signal) signal.removeEventListener('abort', onAbort);
         if (watcher) {
             watcher.close();
             watcher = null;
@@ -542,7 +533,7 @@ export function watch(path: PathLike, options?: { persistent?: boolean; recursiv
     }
 
     if (signal) {
-        signal.addEventListener('abort', () => { close(); }, { once: true });
+        signal.addEventListener('abort', onAbort, { once: true });
         if (signal.aborted) close();
     }
 

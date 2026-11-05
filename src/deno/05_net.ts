@@ -478,7 +478,6 @@ class TlsConn implements Deno.TlsConn {
         let copied = 0;
         while (copied < p.byteLength && this.$readQueue.length > 0) {
             const chunk = this.$readQueue[0];
-            if (!chunk) break;
             const n = Math.min(chunk.byteLength, p.byteLength - copied);
             p.set(chunk.subarray(0, n), copied);
             copied += n;
@@ -1003,6 +1002,22 @@ function interfaceCidr(info: ReturnType<typeof os.networkInterfaces>[number]): s
     return `${info.address}/${prefix}`;
 }
 
+// resolveDns rebuilds this table on every call; the mapping is constant.
+const DNS_TYPE_MAP: Record<string, number> = {
+    A: dns.A,
+    AAAA: dns.AAAA,
+    ANAME: dns.CNAME,
+    CAA: dns.CAA,
+    CNAME: dns.CNAME,
+    MX: dns.MX,
+    NAPTR: dns.NAPTR,
+    NS: dns.NS,
+    PTR: dns.PTR,
+    SOA: dns.SOA,
+    SRV: dns.SRV,
+    TXT: dns.TXT,
+};
+
 const denoNetNs = {
     networkInterfaces() {
         const intf = os.networkInterfaces();
@@ -1027,21 +1042,7 @@ const denoNetNs = {
                 throw new RangeError('Invalid DNS nameServer port');
         }
 
-        const typeMap: Record<string, number> = {
-            A: dns.A,
-            AAAA: dns.AAAA,
-            ANAME: dns.CNAME,
-            CAA: dns.CAA,
-            CNAME: dns.CNAME,
-            MX: dns.MX,
-            NAPTR: dns.NAPTR,
-            NS: dns.NS,
-            PTR: dns.PTR,
-            SOA: dns.SOA,
-            SRV: dns.SRV,
-            TXT: dns.TXT,
-        };
-        const nativeType = typeMap[type];
+        const nativeType = DNS_TYPE_MAP[type];
         if (!nativeType) throw new Error(`Unsupported DNS record type: ${type}`);
 
         if (!opt?.nameServer && (type === 'A' || type === 'AAAA')) {

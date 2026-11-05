@@ -101,26 +101,29 @@ export class Kv implements Deno.Kv {
         this.close();
     }
 
-    get<T = unknown>(key: KvKey, options?: { consistency?: Deno.KvConsistencyLevel }): Promise<Deno.KvEntryMaybe<T>> {
-        this.checkClosed();
-        validateKey(key);
-        
-        const rawKey = serializeKey(key);
-        const entry = this.db.get(rawKey);
-        
+    // Shared by get/getMany: maps a stored entry (or its absence) onto the
+    // KvEntryMaybe shape callers expect.
+    private entryMaybe<T>(key: KvKey): Deno.KvEntryMaybe<T> {
+        const entry = this.db.get(serializeKey(key));
         if (entry) {
-            return Promise.resolve({
+            return {
                 key,
                 value: deserializeValue<T>(entry.value),
                 versionstamp: entry.versionstamp,
-            });
-        } else {
-            return Promise.resolve({
-                key,
-                value: null,
-                versionstamp: null,
-            });
+            };
         }
+        return {
+            key,
+            value: null,
+            versionstamp: null,
+        };
+    }
+
+    get<T = unknown>(key: KvKey, options?: { consistency?: Deno.KvConsistencyLevel }): Promise<Deno.KvEntryMaybe<T>> {
+        this.checkClosed();
+        validateKey(key);
+
+        return Promise.resolve(this.entryMaybe<T>(key));
     }
 
     async getMany<T extends readonly unknown[]>(
@@ -131,30 +134,13 @@ export class Kv implements Deno.Kv {
         if (keys.length > 10) {
             throw new TypeError('Too many ranges (max 10)');
         }
-        
+
         for (const key of keys) {
             validateKey(key);
         }
-        
-        const results = keys.map(key => {
-            const rawKey = serializeKey(key);
-            const entry = this.db.get(rawKey);
-            
-            if (entry) {
-                return {
-                    key,
-                    value: deserializeValue(entry.value),
-                    versionstamp: entry.versionstamp,
-                };
-            } else {
-                return {
-                    key,
-                    value: null,
-                    versionstamp: null,
-                };
-            }
-        });
-        
+
+        const results = keys.map(key => this.entryMaybe(key));
+
         return results as KvEntryTuple<T>;
     }
 

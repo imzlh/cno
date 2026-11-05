@@ -2,7 +2,7 @@
  * Node.js fs module - sync operations
  */
 
-import { Dir, toUint8Array, normalizeRwArgs, decodeBuffer, encodePathResult, toNodeStat, toNodeStatFs, toNodeDirent, parseFlags, pathToString, splitPathOrFd, describeFd, removeRecursiveSync, mkdirRecursiveSync, modeToNumber, timeToUnixSeconds, timeToUnixMs, readFileFromFdSync, randomHex, readDirEntriesSync, validateOpendirOptions, validateReaddirOptions, validateFd, assertCopyFileMode, rmIsDirectoryError, writeAllSync, errorCode, type PathLike, type TimeLike, type Mode } from './utils';
+import { Dir, toUint8Array, normalizeRwArgs, decodeBuffer, encodePathResult, toNodeStat, toNodeStatFs, toNodeDirent, parseFlags, pathToString, splitPathOrFd, describeFd, removeRecursiveSync, mkdirRecursiveSync, modeToNumber, timeToUnixSeconds, timeToUnixMs, readFileFromFdSync, randomHex, readDirEntriesSync, validateOpendirOptions, validateReaddirOptions, validateFd, assertCopyFileMode, rmIsDirectoryError, lchmodEnosysError, writeAllSync, errorCode, type PathLike, type TimeLike, type Mode } from './utils';
 import { wrapSync } from './errno-fix';
 import { getTierLimits } from '../_internal/memory';
 import { resolve } from '../path';
@@ -291,11 +291,7 @@ export function lchmodSync(path: PathLike, mode: Mode): void {
         const st = fs.lstat(pathStr);
         if (st.isSymbolicLink) {
             // Linux lchmod is unsupported; Node throws ENOSYS — match when link.
-            const err = new Error(`ENOSYS: function not implemented, lchmod '${pathStr}'`) as NodeJS.ErrnoException;
-            err.code = 'ENOSYS';
-            err.syscall = 'lchmod';
-            err.path = pathStr;
-            throw err;
+            throw lchmodEnosysError(pathStr);
         }
         fs.chmod(pathStr, modeToNumber(mode));
     }, 'lchmodSync', pathStr);

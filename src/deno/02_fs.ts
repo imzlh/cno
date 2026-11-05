@@ -152,6 +152,40 @@ function tempPath(dir: string, prefix: string, suffix: string): string {
     return join(dir, `${prefix}${rand}${suffix}`);
 }
 
+// makeTempDir/File share one shape: keep drawing random paths until `mk`
+// stops hitting EEXIST, then surface AlreadyExists.
+async function makeTempRetry(opt: Deno.MakeTempOptions | undefined, defaultPrefix: string, mk: (path: string) => Promise<unknown>, message: string): Promise<string> {
+    const dir = opt?.dir ?? os.tmpDir;
+    const prefix = opt?.prefix ?? defaultPrefix;
+    const suffix = opt?.suffix ?? '';
+    for (let i = 0; i < 100; i++) {
+        const path = tempPath(dir, prefix, suffix);
+        try {
+            await mk(path);
+            return path;
+        } catch (e) {
+            if (!hasErrno(e, error.errno.EEXIST)) throw e;
+        }
+    }
+    throw new errors.AlreadyExists(message);
+}
+
+function makeTempRetrySync(opt: Deno.MakeTempOptions | undefined, defaultPrefix: string, mk: (path: string) => unknown, message: string): string {
+    const dir = opt?.dir ?? os.tmpDir;
+    const prefix = opt?.prefix ?? defaultPrefix;
+    const suffix = opt?.suffix ?? '';
+    for (let i = 0; i < 100; i++) {
+        const path = tempPath(dir, prefix, suffix);
+        try {
+            mk(path);
+            return path;
+        } catch (e) {
+            if (!hasErrno(e, error.errno.EEXIST)) throw e;
+        }
+    }
+    throw new errors.AlreadyExists(message);
+}
+
 function symlinkType(opt?: Deno.SymlinkOptions): CModuleAsyncFS.SymlinkType {
     if (opt?.type === 'dir') return 1;
     if (opt?.type === 'junction') return 2;
@@ -544,35 +578,11 @@ Object.assign(Deno, wrapFSns({
     },
 
     async makeTempDir(opt) {
-        const dir = opt?.dir ?? os.tmpDir;
-        const prefix = opt?.prefix ?? 'deno';
-        const suffix = opt?.suffix ?? '';
-        for (let i = 0; i < 100; i++) {
-            const path = tempPath(dir, prefix, suffix);
-            try {
-                await asfs.mkdir(path, 0o700);
-                return path;
-            } catch (e) {
-                if (!hasErrno(e, error.errno.EEXIST)) throw e;
-            }
-        }
-        throw new errors.AlreadyExists('Could not create a unique temporary directory');
+        return makeTempRetry(opt, 'deno', path => asfs.mkdir(path, 0o700), 'Could not create a unique temporary directory');
     },
 
     makeTempDirSync(opt) {
-        const dir = opt?.dir ?? os.tmpDir;
-        const prefix = opt?.prefix ?? 'deno';
-        const suffix = opt?.suffix ?? '';
-        for (let i = 0; i < 100; i++) {
-            const path = tempPath(dir, prefix, suffix);
-            try {
-                fs.mkdir(path, 0o700);
-                return path;
-            } catch (e) {
-                if (!hasErrno(e, error.errno.EEXIST)) throw e;
-            }
-        }
-        throw new errors.AlreadyExists('Could not create a unique temporary directory');
+        return makeTempRetrySync(opt, 'deno', path => fs.mkdir(path, 0o700), 'Could not create a unique temporary directory');
     },
 
     chmod(path, mode) {
@@ -621,37 +631,17 @@ Object.assign(Deno, wrapFSns({
     },
 
     async makeTempFile(opt) {
-        const dir = opt?.dir ?? os.tmpDir;
-        const prefix = opt?.prefix ?? 'cno-';
-        const suffix = opt?.suffix ?? '';
-        for (let i = 0; i < 100; i++) {
-            const path = tempPath(dir, prefix, suffix);
-            try {
-                const f = await asfs.open(path, 'wx', 0o600);
-                await f.close();
-                return path;
-            } catch (e) {
-                if (!hasErrno(e, error.errno.EEXIST)) throw e;
-            }
-        }
-        throw new errors.AlreadyExists('Could not create a unique temporary file');
+        return makeTempRetry(opt, 'cno-', async path => {
+            const f = await asfs.open(path, 'wx', 0o600);
+            await f.close();
+        }, 'Could not create a unique temporary file');
     },
 
     makeTempFileSync(opt) {
-        const dir = opt?.dir ?? os.tmpDir;
-        const prefix = opt?.prefix ?? 'cno-';
-        const suffix = opt?.suffix ?? '';
-        for (let i = 0; i < 100; i++) {
-            const path = tempPath(dir, prefix, suffix);
-            try {
-                const fd = fs.open(path, 'wx', 0o600);
-                fs.close(fd);
-                return path;
-            } catch (e) {
-                if (!hasErrno(e, error.errno.EEXIST)) throw e;
-            }
-        }
-        throw new errors.AlreadyExists('Could not create a unique temporary file');
+        return makeTempRetrySync(opt, 'cno-', path => {
+            const fd = fs.open(path, 'wx', 0o600);
+            fs.close(fd);
+        }, 'Could not create a unique temporary file');
     },
 
     watchFs(path, options) {

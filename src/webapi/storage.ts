@@ -104,26 +104,17 @@ class Storage {
         this.prepareStatements();
     }
 
-    /**
-     * Debug logging
-     */
     private log(...args: unknown[]): void {
         if (this.options.debug) {
             console.log(`[Storage:${this.options.name}]`, ...args);
         }
     }
 
-    /**
-     * Ensure storage directory exists
-     */
     private ensureStorageDirectory() {
         const dir = dirname(this.options.path);
         if (dir && dir !== '.') ensureDirectorySync(dir, 0o755);
     }
 
-    /**
-     * Open SQLite database connection
-     */
     private openDatabase(): void {
         this.log('Opening database:', this.options.path);
 
@@ -253,9 +244,6 @@ class Storage {
         );
     }
 
-    /**
-     * Dispatch storage event
-     */
     private dispatchStorageEvent(
         key: string | null,
         oldValue: string | null,
@@ -277,9 +265,6 @@ class Storage {
         }
     }
 
-    /**
-     * Check quota before writing
-     */
     private checkQuota(additionalSize: number): void {
         if (this.options.quota <= 0) return;
 
@@ -321,9 +306,6 @@ class Storage {
     // Web Storage API Methods
     // ========================================================================
 
-    /**
-     * Get number of items in storage
-     */
     get length(): number {
         this.ensureDb();
         try {
@@ -336,9 +318,6 @@ class Storage {
         }
     }
 
-    /**
-     * Get item by key
-     */
     getItem(key: string): string | null {
         this.ensureDb();
         try {
@@ -358,9 +337,6 @@ class Storage {
         }
     }
 
-    /**
-     * Set item
-     */
     setItem(key: string, value: string): void {
         this.ensureDb();
         try {
@@ -398,9 +374,6 @@ class Storage {
         }
     }
 
-    /**
-     * Remove item
-     */
     removeItem(key: string): void {
         this.ensureDb();
         try {
@@ -426,9 +399,6 @@ class Storage {
         }
     }
 
-    /**
-     * Clear all items
-     */
     clear(): void {
         this.ensureDb();
         try {
@@ -450,9 +420,6 @@ class Storage {
         }
     }
 
-    /**
-     * Get key at index (for iteration)
-     */
     key(index: number): string | null {
         this.ensureDb();
         try {
@@ -478,9 +445,6 @@ class Storage {
     // Additional Utility Methods (Non-standard)
     // ========================================================================
 
-    /**
-     * Get all keys
-     */
     keys(): string[] {
         this.ensureDb();
         try {
@@ -493,9 +457,6 @@ class Storage {
         }
     }
 
-    /**
-     * Get all values
-     */
     values(): string[] {
         this.ensureDb();
         try {
@@ -509,9 +470,6 @@ class Storage {
         }
     }
 
-    /**
-     * Get all entries
-     */
     entries(): Array<[string, string]> {
         this.ensureDb();
         try {
@@ -525,16 +483,10 @@ class Storage {
         }
     }
 
-    /**
-     * Check if key exists
-     */
     has(key: string): boolean {
         return this.getItem(key) !== null;
     }
 
-    /**
-     * Get storage statistics
-     */
     getStats(): StorageStats {
         this.ensureDb();
         try {
@@ -556,9 +508,6 @@ class Storage {
         }
     }
 
-    /**
-     * Optimize database (vacuum and analyze)
-     */
     optimize(): void {
         this.ensureDb();
         try {
@@ -576,9 +525,6 @@ class Storage {
         }
     }
 
-    /**
-     * Add event listener
-     */
     addEventListener(type: string, listener: StorageEventListener): void {
         let listeners = this.eventListeners.get(type);
         if (!listeners) {
@@ -588,9 +534,6 @@ class Storage {
         listeners.add(listener);
     }
 
-    /**
-     * Remove event listener
-     */
     removeEventListener(type: string, listener: StorageEventListener): void {
         const listeners = this.eventListeners.get(type);
         if (listeners) {
@@ -598,9 +541,6 @@ class Storage {
         }
     }
 
-    /**
-     * Close storage and cleanup
-     */
     close(): void {
         try {
             this.log('Closing storage');
@@ -623,9 +563,6 @@ class Storage {
         }
     }
 
-    /**
-     * Iterator support (for...of)
-     */
     *[Symbol.iterator](): Iterator<[string, string]> {
         const entries = this.entries();
         for (const entry of entries) {
@@ -633,9 +570,6 @@ class Storage {
         }
     }
 
-    /**
-     * forEach support
-     */
     forEach(callback: (value: string, key: string, storage: Storage) => void): void {
         const entries = this.entries();
         for (const [key, value] of entries) {
@@ -643,16 +577,10 @@ class Storage {
         }
     }
 
-    /**
-     * Get string representation
-     */
     toString(): string {
         return `[object Storage]`;
     }
 
-    /**
-     * Get string tag
-     */
     get [Symbol.toStringTag](): string {
         return 'Storage';
     }
@@ -737,9 +665,6 @@ class StorageManager {
         autoVacuum: true
     };
 
-    /**
-     * Create or get storage instance
-     */
     getStorage(name: string, path?: string, options?: Partial<StorageOptions>): Storage {
         const existing = this.storages.get(name);
         if (existing) {
@@ -758,9 +683,6 @@ class StorageManager {
         return storage;
     }
 
-    /**
-     * Get default storage path
-     */
     private getDefaultPath(name: string): string {
         const getEnv = (env: string): string => {
             try {
@@ -788,9 +710,6 @@ class StorageManager {
         return join(baseDir, `${name}.db`);
     }
 
-    /**
-     * Close storage by name
-     */
     closeStorage(name: string): void {
         const storage = this.storages.get(name);
         if (storage) {
@@ -799,9 +718,6 @@ class StorageManager {
         }
     }
 
-    /**
-     * Close all storages
-     */
     closeAll(): void {
         for (const [name, storage] of this.storages) {
             storage.close();
@@ -809,9 +725,6 @@ class StorageManager {
         this.storages.clear();
     }
 
-    /**
-     * Set default options
-     */
     setDefaultOptions(options: Partial<StorageOptions>): void {
         Object.assign(this.defaultOptions, options);
     }

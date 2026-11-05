@@ -1,7 +1,8 @@
 import { DOMException, EventTarget, ProgressEvent } from "../events";
 import { bytesToArrayBuffer } from "../../utils/bytes";
+import { basicAuth } from "../../utils/http";
 import { getFetchHook, getFetchInterceptHook, captureUserNetworkCallFrames, getCurlInitHook, type InterceptResult, type NetworkCallFrame } from "../../utils/network-hooks";
-import { attachCurlDebugTrace, buildConnectionInfo, CHARSET_RE, type CurlDebugTrace, curlMod, Decoder, engine, getCurlPool, parseHeaders, responseBodyToBytes, serializeBody, toCurlBody, truncateHookPostData } from "./helpers";
+import { attachCurlDebugTrace, buildConnectionInfo, CHARSET_RE, type CurlDebugTrace, curlMod, Decoder, engine, getCurlPool, parseHeaders, responseBodyToBytes, serializeBody, toCurlBody, truncateHookPostData, utf8Decoder } from "./helpers";
 import { isLocalFetchProtocol, loadLocalProtocol, type LocalProtocolResponse } from "./protocols";
 import { clearReferenceIfCurrent } from "./reference";
 
@@ -261,9 +262,9 @@ export class XMLHttpRequest extends EventTarget {
             }
         }
 
-        // Basic auth from open() user/password — UTF-8 encode then base64 (RFC 7617)
+        // Basic auth from open() user/password (RFC 7617)
         if (this._user !== null) {
-            hdrs['Authorization'] = `Basic ${crypto.base64Encode(engine.encodeString(`${this._user}:${this._password ?? ''}`))}`;
+            hdrs['Authorization'] = basicAuth(this._user, this._password);
         }
 
         curl.setUrl(this._url)
@@ -458,7 +459,7 @@ export class XMLHttpRequest extends EventTarget {
             }
             case 'json':
                 try {
-                    this._response = JSON.parse(new Decoder(undefined).decode(bytes));
+                    this._response = JSON.parse(utf8Decoder.decode(bytes));
                 } catch {
                     this._response = null;
                 }

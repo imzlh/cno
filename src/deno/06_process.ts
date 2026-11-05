@@ -33,13 +33,6 @@ function pipe(type: Deno.CommandOptions['stdout'] | undefined, name: StdioName):
     }
 }
 
-function validateStdioOptions(options?: Deno.CommandOptions): void {
-    if (!options) return;
-    pipe(options.stdin, 'stdin');
-    pipe(options.stdout, 'stdout');
-    pipe(options.stderr, 'stderr');
-}
-
 const signalAliases: Record<string, string> = {
     SIGIO: 'SIGPOLL',
     SIGUNUSED: 'SIGSYS',
@@ -92,7 +85,7 @@ function normalizeSignal(signo?: number | Deno.Signal): number | undefined {
 }
 
 function outputOptions(options?: Deno.CommandOptions): Deno.CommandOptions {
-    validateStdioOptions(options);
+    // Stdio variants are validated by pipe() at spawn/spawnSync time.
     if (options?.stdin === 'piped') {
         throw new TypeError("Piped stdin is not supported for this function, use 'Deno.Command.spawn()' instead");
     }
@@ -347,10 +340,9 @@ function applyAbort(child: CModuleProcess.ChildProcess, signal?: AbortSignal): v
     child.wait().finally(() => signal.removeEventListener('abort', abort)).catch(() => {});
 }
 
-function spawn(path: string, args: string[], options?: Deno.CommandOptions): CModuleProcess.ChildProcess {
-    const cwd = options?.cwd ? commandCwd(options.cwd) : undefined;
-    ensureCommandPath(path, cwd);
-    const child = proc.spawn([path, ...args], {
+// Native options shared verbatim by spawn/spawnSync.
+function nativeSpawnOptions(cwd: string | undefined, options?: Deno.CommandOptions): CModuleProcess.SpawnOptions<false> {
+    return {
         cwd,
         env: commandEnv(options),
         clearEnv: options?.clearEnv,
@@ -361,7 +353,13 @@ function spawn(path: string, args: string[], options?: Deno.CommandOptions): CMo
         windowsVerbatimArguments: options?.windowsRawArguments,
         uid: options?.uid,
         gid: options?.gid
-    });
+    };
+}
+
+function spawn(path: string, args: string[], options?: Deno.CommandOptions): CModuleProcess.ChildProcess {
+    const cwd = options?.cwd ? commandCwd(options.cwd) : undefined;
+    ensureCommandPath(path, cwd);
+    const child = proc.spawn([path, ...args], nativeSpawnOptions(cwd, options));
     applyAbort(child, options?.signal);
     return child;
 }
@@ -387,18 +385,7 @@ function spawnSync(path: string, args: string[], options?: Deno.CommandOptions):
     const cwd = options?.cwd ? commandCwd(options.cwd) : undefined;
     ensureCommandPath(path, cwd);
     try {
-        return proc.spawnSync([path, ...args], {
-            cwd,
-            env: commandEnv(options),
-            clearEnv: options?.clearEnv,
-            stdin: pipe(options?.stdin, 'stdin'),
-            stdout: pipe(options?.stdout, 'stdout'),
-            stderr: pipe(options?.stderr, 'stderr'),
-            detached: options?.detached,
-            windowsVerbatimArguments: options?.windowsRawArguments,
-            uid: options?.uid,
-            gid: options?.gid
-        });
+        return proc.spawnSync([path, ...args], nativeSpawnOptions(cwd, options));
     } catch (e) {
         throw wrapSpawnErr(e, path);
     }

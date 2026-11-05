@@ -117,7 +117,6 @@ function stripInternalErrorProxyCallSites(sites: unknown): unknown {
 
 /** Drop our lazy stack so native capture can write frames again. */
 function clearLazyErrorStack(error: object): void {
-    // Drop our lazy stack so native capture can write frames again.
     const own = Object.getOwnPropertyDescriptor(error, 'stack');
     if (own && typeof own.get === 'function' && own.configurable) {
         try { delete (error as { stack?: unknown }).stack; } catch { /* */ }

@@ -326,6 +326,21 @@ export class KvDatabase {
         return { entries, cursor: nextCursor };
     }
 
+    // Shared by the sum/max/min mutation arms: validates the operand, reads the
+    // stored U64 (undefined when the key is absent) and rejects non-U64 values.
+    private currentU64(key: RawKey, operand: bigint, opName: string): bigint | undefined {
+        if (typeof operand !== 'bigint') {
+            throw new TypeError(`Failed to perform '${opName}' mutation on a non-U64 operand`);
+        }
+        const current = this._getInternal(key);
+        if (!current) return undefined;
+        const val = deserializeValue(current.value);
+        if (!isKvU64(val)) {
+            throw new TypeError(`Failed to perform '${opName}' mutation on a non-U64 value in the database`);
+        }
+        return val.value;
+    }
+
     atomic(operations: AtomicDbOperation[], commitVersionstamp?: string): { success: boolean; versionstamp?: string } {
         const db = this.getDb();
         const setStmt = this.getStmt(SET_SQL);
@@ -360,58 +375,23 @@ export class KvDatabase {
                         break;
                     }
                     case 'sum': {
-                        if (typeof op.operand !== 'bigint') {
-                            throw new TypeError("Failed to perform 'sum' mutation on a non-U64 operand");
-                        }
-                        const current = this._getInternal(op.key);
-                        let currentValue = 0n;
-                        if (current) {
-                            const val = deserializeValue(current.value);
-                            if (!isKvU64(val)) {
-                                throw new TypeError("Failed to perform 'sum' mutation on a non-U64 value in the database");
-                            }
-                            currentValue = val.value;
-                        }
+                        const currentValue = (this.currentU64(op.key, op.operand, 'sum') ?? 0n);
                         const newValue = (currentValue + op.operand) & MAX_U64;
                         setStmt.run([op.key, serializeValue(new KvU64(newValue)), mutationVersionstamp, null]);
                         finalVersionstamp = mutationVersionstamp;
                         break;
                     }
                     case 'max': {
-                        if (typeof op.operand !== 'bigint') {
-                            throw new TypeError("Failed to perform 'max' mutation on a non-U64 operand");
-                        }
-                        const current = this._getInternal(op.key);
-                        let currentValue = op.operand;
-                        if (current) {
-                            const val = deserializeValue(current.value);
-                            if (!isKvU64(val)) {
-                                throw new TypeError("Failed to perform 'max' mutation on a non-U64 value in the database");
-                            }
-                            if (val.value > currentValue) {
-                                currentValue = val.value;
-                            }
-                        }
-                        setStmt.run([op.key, serializeValue(new KvU64(currentValue)), mutationVersionstamp, null]);
+                        const stored = this.currentU64(op.key, op.operand, 'max');
+                        const newValue = stored === undefined || op.operand > stored ? op.operand : stored;
+                        setStmt.run([op.key, serializeValue(new KvU64(newValue)), mutationVersionstamp, null]);
                         finalVersionstamp = mutationVersionstamp;
                         break;
                     }
                     case 'min': {
-                        if (typeof op.operand !== 'bigint') {
-                            throw new TypeError("Failed to perform 'min' mutation on a non-U64 operand");
-                        }
-                        const current = this._getInternal(op.key);
-                        let currentValue = op.operand;
-                        if (current) {
-                            const val = deserializeValue(current.value);
-                            if (!isKvU64(val)) {
-                                throw new TypeError("Failed to perform 'min' mutation on a non-U64 value in the database");
-                            }
-                            if (val.value < currentValue) {
-                                currentValue = val.value;
-                            }
-                        }
-                        setStmt.run([op.key, serializeValue(new KvU64(currentValue)), mutationVersionstamp, null]);
+                        const stored = this.currentU64(op.key, op.operand, 'min');
+                        const newValue = stored === undefined || op.operand < stored ? op.operand : stored;
+                        setStmt.run([op.key, serializeValue(new KvU64(newValue)), mutationVersionstamp, null]);
                         finalVersionstamp = mutationVersionstamp;
                         break;
                     }

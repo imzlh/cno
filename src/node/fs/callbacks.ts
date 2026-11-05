@@ -2,7 +2,7 @@
  * Node.js fs module - callback-style API
  * All async operations support callback functions
  */
-import { toUint8Array, normalizeRwArgs, decodeBuffer, encodePathResult, toNodeStat, toNodeStatFs, toNodeDirentAsync, parseFlags, pathToString, splitPathOrFd, describeFd, removeRecursive, retryOnBusy, mkdirRecursive, modeToNumber, timeToUnixSeconds, timeToUnixMs, readFileFromFdSync, randomHex, createAsyncDir, createEagerAsyncDir, readDirEntries, validateOpendirOptions, validateReaddirOptions, validateFd, errorFromUnknown, assertCopyFileMode, makeAbortError, rmIsDirectoryError, writeAllHandle, writeAllSync, type PathLike, type TimeLike, type Mode, type Stats, type StatsFs, type Dirent, type Dir } from './utils';
+import { toUint8Array, normalizeRwArgs, decodeBuffer, encodePathResult, toNodeStat, toNodeStatFs, toNodeDirentAsync, parseFlags, pathToString, splitPathOrFd, describeFd, removeRecursive, retryOnBusy, mkdirRecursive, modeToNumber, timeToUnixSeconds, timeToUnixMs, readFileFromFdSync, readFileFromHandle, randomHex, createAsyncDir, createEagerAsyncDir, readDirEntries, validateOpendirOptions, validateReaddirOptions, validateFd, errorFromUnknown, assertCopyFileMode, makeAbortError, rmIsDirectoryError, lchmodEnosysError, writeAllHandle, writeAllSync, type PathLike, type TimeLike, type Mode, type Stats, type StatsFs, type Dirent, type Dir } from './utils';
 // `toAsyncFsErrnoException` is `toErrnoException` plus the JS-name -> libuv-name
 // correction for `err.syscall` (readdir -> scandir, utimes -> utime). Aliased so
 // every existing call site gets it; see fs/syscall-names.ts for why it is needed.
@@ -129,15 +129,7 @@ export function readFile(path: PathLike | number, options?: unknown, callback?: 
 async function readFileWithFlag(path: string, flag: string | number): Promise<Uint8Array<ArrayBuffer>> {
     const handle = await asfs.open(path, parseFlags(flag));
     try {
-        const st = await handle.stat();
-        const buf = new Uint8Array(st.size);
-        let off = 0;
-        while (off < st.size) {
-            const n = await handle.read(buf.subarray(off));
-            if (n === 0) break;
-            off += n;
-        }
-        return buf;
+        return await readFileFromHandle(handle);
     } finally {
         await handle.close();
     }
@@ -735,11 +727,7 @@ export function lchmod(path: PathLike, mode: Mode, callback: NoParamCallback): v
         try {
             const st = fs.lstat(pathStr);
             if (st.isSymbolicLink) {
-                const err = new Error(`ENOSYS: function not implemented, lchmod '${pathStr}'`) as NodeJS.ErrnoException;
-                err.code = 'ENOSYS';
-                err.syscall = 'lchmod';
-                err.path = pathStr;
-                callback(err);
+                callback(lchmodEnosysError(pathStr));
                 return;
             }
             fs.chmod(pathStr, parsedMode);

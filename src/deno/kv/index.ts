@@ -21,41 +21,6 @@ function normalizeKvPath(path?: string): string {
     return `${path}.cnodb`;
 }
 
-export class KvError extends Error {
-    constructor(message: string) {
-        super(message);
-        this.name = 'KvError';
-    }
-}
-
-export class KvKeyError extends KvError {
-    constructor(message: string) {
-        super(message);
-        this.name = 'KvKeyError';
-    }
-}
-
-export class KvValueError extends KvError {
-    constructor(message: string) {
-        super(message);
-        this.name = 'KvValueError';
-    }
-}
-
-export class KvTransactionError extends KvError {
-    constructor(message: string) {
-        super(message);
-        this.name = 'KvTransactionError';
-    }
-}
-
-export class KvClosedError extends KvError {
-    constructor() {
-        super('KV database is closed');
-        this.name = 'KvClosedError';
-    }
-}
-
 export async function openKv(path?: string): Promise<Deno.Kv> {
     const kv = new Kv(normalizeKvPath(path));
     await kv.open();

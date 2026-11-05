@@ -94,20 +94,17 @@ class PermissionStatus extends EventTarget implements Deno.PermissionStatus {
 }
 
 class Permissions implements Deno.Permissions {
-    #statuses = new Map<string, PermissionStatus>();
-
     constructor(token: symbol | undefined = undefined) {
         if (token !== permissionToken) throw new TypeError('Illegal constructor');
     }
 
     #status(desc: Deno.PermissionDescriptor): Deno.PermissionStatus {
-        const key = descriptorKey(desc);
-        let status = this.#statuses.get(key);
-        if (!status) {
-            status = new PermissionStatus(permissionToken);
-            this.#statuses.set(key, status);
-        }
-        return status;
+        // descriptorKey doubles as validation of the descriptor.
+        descriptorKey(desc);
+        // Statuses stay 'granted' forever and never emit change events, so the
+        // descriptor-keyed identity cache was an unbounded leak; real Deno also
+        // returns a fresh PermissionStatus per query.
+        return new PermissionStatus(permissionToken);
     }
 
     querySync(desc: Deno.PermissionDescriptor): Deno.PermissionStatus {

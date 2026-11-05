@@ -75,6 +75,15 @@ export function rmIsDirectoryError(path: string): NodeJS.ErrnoException {
     return error;
 }
 
+/** libuv has no lchmod on Linux; Node matches by throwing ENOSYS for links. */
+export function lchmodEnosysError(pathStr: string): NodeJS.ErrnoException {
+    const error = new Error(`ENOSYS: function not implemented, lchmod '${pathStr}'`) as NodeJS.ErrnoException;
+    error.code = 'ENOSYS';
+    error.syscall = 'lchmod';
+    error.path = pathStr;
+    return error;
+}
+
 export function dirClosedError(): NodeJS.ErrnoException {
     const error = new Error('Directory handle was closed') as NodeJS.ErrnoException;
     error.code = 'ERR_DIR_CLOSED';
@@ -102,6 +111,21 @@ export async function writeAllHandle(
         if (n <= 0) break;
         written += n;
     }
+}
+
+/** stat → size-bounded read loop shared by the readFile paths. */
+export async function readFileFromHandle(
+    handle: CModuleAsyncFS.FileHandle,
+): Promise<Uint8Array<ArrayBuffer>> {
+    const st = await handle.stat();
+    const buf = new Uint8Array(st.size);
+    let off = 0;
+    while (off < st.size) {
+        const n = await handle.read(buf.subarray(off));
+        if (n === 0) break;
+        off += n;
+    }
+    return buf;
 }
 
 /**

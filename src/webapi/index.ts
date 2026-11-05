@@ -230,5 +230,24 @@ await import('./cache');
 // inside intl.ts instead.
 await import('./intl');
 
-// webtransport (QUIC) — loads always; native gate fails closed in ctor
-await import('./webtransport');
+// webtransport (QUIC): a ~38 KB module stack most CLI sessions never construct,
+// and the native gate fails closed in the ctor. The accessors keep
+// `typeof WebTransport === 'function'` true and start the load on first read,
+// same deferral as WebSocket above.
+void defineLazy(globalThis as unknown as Record<string, unknown>, [
+    { name: 'WebTransport', kind: 'ctor' },
+    { name: 'WebTransportBidirectionalStream', kind: 'ctor' },
+    { name: 'WebTransportDatagramDuplexStream', kind: 'ctor' },
+    { name: 'WebTransportError', kind: 'ctor' },
+    { name: 'WebTransportReceiveStream', kind: 'ctor' },
+    { name: 'WebTransportSendGroup', kind: 'ctor' },
+    { name: 'WebTransportSendStream', kind: 'ctor' },
+], () => import('./webtransport').then(() => new Map<string, unknown>([
+    ['WebTransport', Reflect.get(globalThis, 'WebTransport')],
+    ['WebTransportBidirectionalStream', Reflect.get(globalThis, 'WebTransportBidirectionalStream')],
+    ['WebTransportDatagramDuplexStream', Reflect.get(globalThis, 'WebTransportDatagramDuplexStream')],
+    ['WebTransportError', Reflect.get(globalThis, 'WebTransportError')],
+    ['WebTransportReceiveStream', Reflect.get(globalThis, 'WebTransportReceiveStream')],
+    ['WebTransportSendGroup', Reflect.get(globalThis, 'WebTransportSendGroup')],
+    ['WebTransportSendStream', Reflect.get(globalThis, 'WebTransportSendStream')],
+])));

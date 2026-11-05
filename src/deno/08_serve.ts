@@ -20,10 +20,6 @@ const crypto = import.meta.use('crypto');
 const engine = import.meta.use('engine');
 const http = import.meta.use('http');
 
-/* ------------------------------------------------------------------ */
-/* WebSocket Upgrade Symbol                                           */
-/* ------------------------------------------------------------------ */
-
 const kWebSocket = Symbol('deno.serve.websocket');
 const kWSMeta = Symbol('deno.serve.websocket.meta');
 let serveRequestSeq = 0;
@@ -138,10 +134,6 @@ function headersToRecord(headers: Iterable<[string, string]>): Record<string, st
     for (const [key, value] of headers) out[key] = value;
     return out;
 }
-
-/* ------------------------------------------------------------------ */
-/* Adapter: Server Core → Web API                                    */
-/* ------------------------------------------------------------------ */
 
 function createWebRequest(coreReq: HttpRequest, connInfo: { hostname: string; port: number; secure: boolean }, signal: AbortSignal): Request {
     const headers = new Headers(coreReq.headers);
@@ -361,29 +353,18 @@ class ResponseAdapter {
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Deno.serve Implementation                                          */
-/* ------------------------------------------------------------------ */
-
 class DenoHttpServer implements Deno.HttpServer<Deno.Addr> {
     private server: Server;
     private finishedPromise: Promise<void>;
     private finishedResolve: () => void;
     public readonly addr: Deno.Addr;
 
-    constructor(server: Server) {
+    constructor(server: Server, addr: Deno.Addr) {
         this.server = server;
         const finished = Promise.withResolvers<void>();
         this.finishedPromise = finished.promise;
         this.finishedResolve = finished.resolve;
-        const addr = server.address();
-        this.addr = addr && 'path' in addr
-            ? { transport: 'unix', path: addr.path }
-            : {
-                transport: 'tcp',
-                hostname: addr?.ip ?? '::',
-                port: addr?.port ?? 80
-            };
+        this.addr = addr;
     }
 
     get finished(): Promise<void> {
@@ -550,7 +531,7 @@ function serve(
         };
     coreServer.acceptLoop();
 
-    const httpServer = new DenoHttpServer(coreServer);
+    const httpServer = new DenoHttpServer(coreServer, denoAddr);
 
     // Handle abort signal
     if (options.signal) {
@@ -564,10 +545,6 @@ function serve(
 
     return httpServer;
 }
-
-/* ------------------------------------------------------------------ */
-/* Deno.upgradeWebSocket                                              */
-/* ------------------------------------------------------------------ */
 
 /**
  * Calculate WebSocket accept value
@@ -643,10 +620,6 @@ function createWebSocketFromISocket(conn: Promise<ISocket>): globalThis.WebSocke
         serverMeta,
     );
 }
-
-/* ------------------------------------------------------------------ */
-/* Export to Deno namespace                                           */
-/* ------------------------------------------------------------------ */
 
 export const SERVE_EXPORTS = wrapFSns({
     // @ts-ignore - serve cast

@@ -1,5 +1,4 @@
 ﻿const http = import.meta.use('http');
-const text = import.meta.use('text');
 const engine = import.meta.use('engine');
 
 import { Readable, Writable } from '../stream';
@@ -7,6 +6,7 @@ import { createWriteAfterEndError } from '../stream/_shared';
 import { Socket, Server as NetServer, AddressInfo, type HttpOwnedTransport } from '../net';
 import { normalizeTcpHost } from '../net/_shared';
 import { closeQuietly } from '../_internal/close';
+import { encoderForEncoding } from '../_internal/server-response-adapter';
 import type { HttpRequest, HttpResponse, Server as HttpServer } from '@cnojs/http/server';
 import {
     buildNodeServerUrl,
@@ -557,9 +557,7 @@ ServerResponseImpl.prototype.write = function write(
     }
 
     const encoding = typeof encodingOrCb === 'string' ? encodingOrCb : undefined;
-    if (!text) throw new Error('Text module is not available');
-    const encoder = new text.Encoder(encoding);
-    const data = toBodyChunkBytes(chunk, value => encoder.encode(value));
+    const data = toBodyChunkBytes(chunk, encoderForEncoding(encoding));
     this._bodyLength += data.length;
 
     // State-only; NodeResponseAdapter rebinds this per request and must never touch the socket.

@@ -145,7 +145,6 @@ function filterHeaders(headers: Headers): void {
 }
 
 
-const inFlightFetchFrames = new Set<Promise<unknown>>();
 // ----------------------------------------------------------------------------
 export async function performFetch(request: Request, url: URL): Promise<Response> {
     throwIfAborted(request.signal);
@@ -260,7 +259,6 @@ export async function performFetch(request: Request, url: URL): Promise<Response
 
     // Resolve immediately when headers arrive; stream body via ReadableStream.
     const headersDone = Promise.withResolvers<{ status: number; headers: Array<[string, string]> }>();
-    inFlightFetchFrames.add(headersDone.promise);
     let streamController: FetchStreamController | null = null;
     let bodyCanceled = false;
     let bodyTerminal: BodyTerminal | null = null;
@@ -379,7 +377,6 @@ export async function performFetch(request: Request, url: URL): Promise<Response
     // Idempotent: the interceptor can reject before perform(), with no finally to
     // release the in-flight marker or abort listener.
     const cleanupBeforePerform = () => {
-        inFlightFetchFrames.delete(headersDone.promise);
         removeAbortHandler();
         pendingBodyChunks.length = 0;
         pendingBodySize = 0;
@@ -442,10 +439,10 @@ export async function performFetch(request: Request, url: URL): Promise<Response
         const chunkBytes = new Uint8Array(chunkView.byteLength);
         chunkBytes.set(chunkView);
         if (netHook) {
-            const hookBytes = new Uint8Array(chunkBytes.byteLength);
-            hookBytes.set(chunkBytes);
+            // enqueueBodyChunk hands the same buffer on without mutating it, so
+            // the observer can share it like the base64 hook does.
             emitFetchHookQuietly(() => {
-                netHook.onData?.({ requestId, data: hookBytes, timestamp: ts() });
+                netHook.onData?.({ requestId, data: chunkBytes, timestamp: ts() });
             });
         }
         enqueueBodyChunk(chunkBytes);
@@ -471,7 +468,6 @@ export async function performFetch(request: Request, url: URL): Promise<Response
             if (result.action === 'fulfill') {
                 removeAbortHandler();
                 abortCurl();
-                inFlightFetchFrames.delete(headersDone.promise);
                 const resHeaders = new Headers();
                 for (const [k, v] of result.responseHeaders) resHeaders.set(k, v);
                 return new Response(result.body, { status: result.responseCode, headers: resHeaders });
@@ -479,7 +475,6 @@ export async function performFetch(request: Request, url: URL): Promise<Response
             if (result.action === 'fail') {
                 removeAbortHandler();
                 abortCurl();
-                inFlightFetchFrames.delete(headersDone.promise);
                 throw new TypeError(`Request blocked: ${result.reason}`);
             }
             // action === 'continue': apply modifications to the already-configured curl handle
@@ -533,7 +528,6 @@ export async function performFetch(request: Request, url: URL): Promise<Response
                 }
             }
         ).finally(() => {
-            inFlightFetchFrames.delete(headersDone.promise);
             removeAbortHandler();
             curlRecvPaused = false;
         });

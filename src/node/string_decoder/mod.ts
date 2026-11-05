@@ -52,8 +52,7 @@ function createDecoder(encoding: string): NativeDecoder | null {
 }
 
 function base64Encode(bytes: Uint8Array, url: boolean): string {
-    const encoded = crypto.base64Encode(bytes);
-    return url ? encoded.replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '') : encoded;
+    return url ? algorithm.base64UrlEncode(bytes) : crypto.base64Encode(bytes);
 }
 
 function concatBytes(a: Uint8Array | null, b: Uint8Array): Uint8Array {

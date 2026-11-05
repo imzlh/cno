@@ -216,11 +216,9 @@ export function generateVersionstamp(): string {
 }
 
 export function serializeLegacyKey(key: Deno.KvKey): string {
-    return JSON.stringify(key, (_, v) => {
-        if (typeof v === 'bigint') return { __kv_type: 'bigint', value: v.toString() };
-        if (v instanceof Uint8Array) return { __kv_type: 'Uint8Array', value: Array.from(v) };
-        return v;
-    });
+    // Valid keys only hold primitives and Uint8Array/ArrayBuffer, so the extra
+    // Date/Map/Set branches in LEGACY_JSON_SERIALIZER never fire here.
+    return JSON.stringify(key, LEGACY_JSON_SERIALIZER);
 }
 
 export function deserializeLegacyKey(rawKey: string): Deno.KvKey {

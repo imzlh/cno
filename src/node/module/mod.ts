@@ -286,15 +286,18 @@ export function _resolveFilename(request: string, parent?: { filename?: string }
     return fromFileUrl(result.url);
 }
 
-export function _pathFilename(filename: string): string {
-    return filename;
-}
-
 const builtinModulesTarget: string[] = [];
+/** Frozen once the cts bridge reports a non-empty table; before that the
+ *  bridge may still be absent, so recompute until it lands. PREFIX_ONLY
+ *  entries must not count: they would freeze an empty table early. */
+let allBuiltinsCache: string[] | undefined;
 function allBuiltinModules(): string[] {
+    if (allBuiltinsCache !== undefined) return allBuiltinsCache;
     const names = getBuiltinModules();
     const missing = PREFIX_ONLY_BUILTINS.filter(name => !names.includes(name));
-    return missing.length === 0 ? names : [...names, ...missing];
+    const all = missing.length === 0 ? names : [...names, ...missing];
+    if (names.length > 0) allBuiltinsCache = all;
+    return all;
 }
 export const builtinModules: string[] = new Proxy(builtinModulesTarget, {
     get: (_t, key) => Reflect.get(allBuiltinModules(), key),
@@ -725,7 +728,6 @@ export function isBuiltin(moduleName: string): boolean {
     if (typeof moduleName !== 'string') return false;
     const names = allBuiltinModules();
     if (names.includes(moduleName)) return true;
-    if (!moduleName.startsWith('node:') && names.includes(`node:${moduleName}`)) return false;
     const bare = moduleName.startsWith('node:') ? moduleName.slice(5) : moduleName;
     return moduleName.startsWith('node:') && names.includes(bare);
 }

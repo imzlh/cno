@@ -1,6 +1,7 @@
 import { DOMException, EventTarget, ProgressEvent } from "./events";
 
 const crypto = import.meta.use('crypto');
+const text = import.meta.use('text');
 
 type FileReaderHandler = ((this: FileReader, ev: ProgressEvent<FileReader>) => unknown) | null;
 
@@ -60,8 +61,11 @@ class FileReader extends EventTarget {
     readAsBinaryString(blob: Blob): void {
         this.#startRead(blob, async (source) => {
             const bytes = new Uint8Array(await source.arrayBuffer());
+            // Chunked fromCharCode: per-byte string concat is O(n²) on large blobs.
             let out = '';
-            for (let i = 0; i < bytes.length; i++) out += String.fromCharCode(bytes[i]);
+            for (let i = 0; i < bytes.length; i += 8192) {
+                out += String.fromCharCode.apply(null, [...bytes.subarray(i, i + 8192)] as number[]);
+            }
             return out;
         });
     }
@@ -77,7 +81,7 @@ class FileReader extends EventTarget {
     readAsText(blob: Blob, encoding?: string): void {
         this.#startRead(blob, async (source) => {
             const buffer = await source.arrayBuffer();
-            return new TextDecoder(encoding).decode(buffer);
+            return new text.Decoder(encoding).decode(buffer);
         });
     }
 

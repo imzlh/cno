@@ -140,41 +140,43 @@ function parseScheduleExpression(field: CronField, expr: Deno.CronScheduleExpres
     return rangeSet(field, start, end, every);
 }
 
-function compileMatcher(source: string | Deno.CronSchedule): Matcher {
-    if (typeof source === 'string') {
-        const fields = source.trim().split(/\s+/);
-        if (fields.length !== 5) fail(`expected 5 cron fields, got ${fields.length}`);
-        const [minute, hour, dayOfMonth, month, dayOfWeek] = fields;
-        const minuteSet = parseStringField('minute', minute);
-        const hourSet = parseStringField('hour', hour);
-        const dayOfMonthSet = parseStringField('dayOfMonth', dayOfMonth);
-        const monthSet = parseStringField('month', month);
-        const dayOfWeekSet = parseStringField('dayOfWeek', dayOfWeek);
-        return {
-            dayOfMonth: dayOfMonthSet,
-            dayOfWeek: dayOfWeekSet,
-            minuteValues: Array.from(minuteSet).sort((a, b) => a - b),
-            hourValues: Array.from(hourSet).sort((a, b) => a - b),
-            monthValues: Array.from(monthSet).sort((a, b) => a - b),
-            dayOfMonthWildcard: dayOfMonth === '*',
-            dayOfWeekWildcard: dayOfWeek === '*',
-        };
-    }
-
-    const minuteSet = parseScheduleExpression('minute', source.minute);
-    const hourSet = parseScheduleExpression('hour', source.hour);
-    const dayOfMonthSet = parseScheduleExpression('dayOfMonth', source.dayOfMonth);
-    const monthSet = parseScheduleExpression('month', source.month);
-    const dayOfWeekSet = parseScheduleExpression('dayOfWeek', source.dayOfWeek);
+function matcherFrom(minuteSet: Set<number>, hourSet: Set<number>, dayOfMonthSet: Set<number>, monthSet: Set<number>, dayOfWeekSet: Set<number>, dayOfMonthWildcard: boolean, dayOfWeekWildcard: boolean): Matcher {
     return {
         dayOfMonth: dayOfMonthSet,
         dayOfWeek: dayOfWeekSet,
         minuteValues: Array.from(minuteSet).sort((a, b) => a - b),
         hourValues: Array.from(hourSet).sort((a, b) => a - b),
         monthValues: Array.from(monthSet).sort((a, b) => a - b),
-        dayOfMonthWildcard: source.dayOfMonth === undefined,
-        dayOfWeekWildcard: source.dayOfWeek === undefined,
+        dayOfMonthWildcard,
+        dayOfWeekWildcard,
     };
+}
+
+function compileMatcher(source: string | Deno.CronSchedule): Matcher {
+    if (typeof source === 'string') {
+        const fields = source.trim().split(/\s+/);
+        if (fields.length !== 5) fail(`expected 5 cron fields, got ${fields.length}`);
+        const [minute, hour, dayOfMonth, month, dayOfWeek] = fields;
+        return matcherFrom(
+            parseStringField('minute', minute),
+            parseStringField('hour', hour),
+            parseStringField('dayOfMonth', dayOfMonth),
+            parseStringField('month', month),
+            parseStringField('dayOfWeek', dayOfWeek),
+            dayOfMonth === '*',
+            dayOfWeek === '*',
+        );
+    }
+
+    return matcherFrom(
+        parseScheduleExpression('minute', source.minute),
+        parseScheduleExpression('hour', source.hour),
+        parseScheduleExpression('dayOfMonth', source.dayOfMonth),
+        parseScheduleExpression('month', source.month),
+        parseScheduleExpression('dayOfWeek', source.dayOfWeek),
+        source.dayOfMonth === undefined,
+        source.dayOfWeek === undefined,
+    );
 }
 
 function nextAllowedValue(values: number[], current: number): number | null {

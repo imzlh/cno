@@ -1,6 +1,6 @@
 import { Headers } from "../headers";
 import { resolveObjectURL } from "../url";
-import { toOwnedBytes } from "../../utils/bytes";
+import { sanitizeSurrogates, toOwnedBytes } from "../../utils/bytes";
 import { toFsPath } from "../../utils/path";
 import { asyncfs, engine } from "./helpers";
 
@@ -15,49 +15,35 @@ export interface LocalProtocolResponse {
     body: Uint8Array;
 }
 
-function isHex(code: number): boolean {
-    return (code >= 48 && code <= 57) ||
-        (code >= 65 && code <= 70) ||
-        (code >= 97 && code <= 102);
-}
-
-function hexValue(code: number): number {
-    if (code <= 57) return code - 48;
-    if (code <= 70) return code - 55;
-    return code - 87;
-}
-
 function percentDecodeBytes(value: string): Uint8Array {
-    const chunks: Uint8Array[] = [];
-    let ascii: number[] = [];
-    const flushAscii = () => {
-        if (ascii.length === 0) return;
-        const chunk = new Uint8Array(ascii.length);
-        chunk.set(ascii);
-        chunks.push(chunk);
-        ascii = [];
-    };
-
-    for (let i = 0; i < value.length; i++) {
-        const code = value.charCodeAt(i);
-        if (code === 37 && i + 2 < value.length) {
-            const hi = value.charCodeAt(i + 1);
-            const lo = value.charCodeAt(i + 2);
-            if (isHex(hi) && isHex(lo)) {
-                ascii.push((hexValue(hi) << 4) | hexValue(lo));
-                i += 2;
+    // Encode the whole string once, then expand %XX in a single pass over the
+    // bytes — no per-char encodeString and no growable scratch array. Valid
+    // non-BMP characters survive intact; only lone surrogates become FFFD,
+    // matching percentDecodeUtf8 in webapi/url.ts.
+    const source = engine.encodeString(sanitizeSurrogates(value));
+    const out = new Uint8Array(source.length);
+    let length = 0;
+    for (let i = 0; i < source.length;) {
+        if (source[i] === 37 && i + 2 < source.length) {
+            const hi = hexValue(source[i + 1]);
+            const lo = hexValue(source[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                out[length++] = (hi << 4) | lo;
+                i += 3;
                 continue;
             }
         }
-        if (code <= 0x7f) {
-            ascii.push(code);
-            continue;
-        }
-        flushAscii();
-        chunks.push(engine.encodeString(value.charAt(i)));
+        out[length++] = source[i];
+        i++;
     }
-    flushAscii();
-    return chunks.length === 1 && chunks[0] ? chunks[0] : toOwnedBytes(algorithm.bytesConcat(chunks));
+    return length === out.length ? out : toOwnedBytes(out.subarray(0, length));
+}
+
+function hexValue(byte: number): number {
+    if (byte >= 0x30 && byte <= 0x39) return byte - 0x30;
+    if (byte >= 0x41 && byte <= 0x46) return byte - 0x41 + 10;
+    if (byte >= 0x61 && byte <= 0x66) return byte - 0x61 + 10;
+    return -1;
 }
 
 function dataUrlBytes(url: URL, rawUrl: string): LocalProtocolResponse {

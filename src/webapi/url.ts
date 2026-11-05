@@ -45,12 +45,12 @@ const hexValue = (byte: number): number => {
 
 // ==================== Utility Functions ====================
 
-const USERINFO_ENCODE_SET = /[^\w.~!$&'()*+,;=:-]/g;
-const PATH_ENCODE_SET = /[^\w.~!$&'()*+,;=:@\/%-]/g;
+const USERINFO_ENCODE_SET = /[^\w.~!$&'()*+,;=:-]/gu;
+const PATH_ENCODE_SET = /[^\w.~!$&'()*+,;=:@\/%-]/gu;
 // Backslash is a separator only for special schemes. In a hierarchical
 // non-special URL it is ordinary path data and serializes literally.
-const NON_SPECIAL_PATH_ENCODE_SET = /[^\w.~!$&'()*+,;=:@\/%\\-]/g;
-const FRAGMENT_ENCODE_SET = /[^\w.~!$&'()*+,;=:@\/?%-]/g;
+const NON_SPECIAL_PATH_ENCODE_SET = /[^\w.~!$&'()*+,;=:@\/%\\-]/gu;
+const FRAGMENT_ENCODE_SET = /[^\w.~!$&'()*+,;=:@\/?%-]/gu;
 const denoCustomInspect = Symbol.for('Deno.customInspect');
 
 const isWindowsDriveLetter = (str: string): boolean => {
@@ -61,26 +61,18 @@ const isWindowsDriveLetter = (str: string): boolean => {
 
 
 
-const percentEncode = (str: string, encodeSet: RegExp): string => {
-    let result = '';
-    for (const char of str) {
-        encodeSet.lastIndex = 0;
-        const shouldEncode = encodeSet.test(char);
-        encodeSet.lastIndex = 0;
-        if (!shouldEncode) {
-            result += char;
-            continue;
-        }
+// Single-pass replace over code points (the `u` flag makes a surrogate pair
+// match as one, and a lone surrogate still hits the FFFD fallback).
+const percentEncode = (str: string, encodeSet: RegExp): string =>
+    str.replace(encodeSet, (char) => {
         try {
-            result += encodeURIComponent(char).replace(/[!'()*]/g, (value) =>
+            return encodeURIComponent(char).replace(/[!'()*]/g, (value) =>
                 `%${value.charCodeAt(0).toString(16).toUpperCase()}`,
             );
         } catch {
-            result += '%EF%BF%BD';
+            return '%EF%BF%BD';
         }
-    }
-    return result;
-};
+    });
 
 const percentDecode = (str: string): string => {
     try {

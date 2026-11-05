@@ -1,10 +1,9 @@
 import { TcpSocket, type SocketTransport } from '@cnojs/http/socket';
 import { dnsCache } from '@cnojs/http/dns-cache';
-import { connectDirectTcp, createClientTlsContext, openTcp, type TlsOptions } from './http';
+import { basicAuth, connectDirectTcp, createClientTlsContext, openTcp, type TlsOptions } from './http';
 import type { RawConnection, RawConnectionHook } from './network-hooks';
 
 const engine = import.meta.use('engine');
-const crypto = import.meta.use('crypto');
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 
@@ -217,7 +216,7 @@ async function httpConnect(socket: TcpSocket, url: URL, config: ProxyConfig): Pr
 
 function proxyAuthorization(config: ProxyConfig): string | undefined {
     if (!config.user) return undefined;
-    return `Basic ${crypto.base64Encode(engine.encodeString(`${config.user}:${config.pass ?? ''}`))}`;
+    return basicAuth(config.user, config.pass);
 }
 
 function absoluteRequestTarget(url: URL): string {

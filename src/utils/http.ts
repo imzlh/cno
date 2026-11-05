@@ -7,10 +7,17 @@ import { dnsCache } from "@cnojs/http/dns-cache";
 import { getRawConnectionHook, type RawConnection } from './network-hooks';
 import { systemCaBundle } from './ca-certs';
 
+const engine = import.meta.use('engine');
+const crypto = import.meta.use('crypto');
 const streams = import.meta.use('streams');
 const ssl = import.meta.use('ssl');
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
+
+/** RFC 7617 Basic credential for the given user/password pair. */
+export function basicAuth(user: string, pass: string | null | undefined): string {
+    return `Basic ${crypto.base64Encode(engine.encodeString(`${user}:${pass ?? ''}`))}`;
+}
 
 /** Socket subset required for HTTP request/response exchange. */
 export type IHttpSocket = Pick<ISocket, 'onReadable' | 'stopReading' | 'write' | 'close'>;

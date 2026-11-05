@@ -435,6 +435,10 @@ class PerformanceObserver {
 
 class Performance extends EventTarget implements globalThis.Performance {
     #entries: globalThis.PerformanceEntry[] = [];
+    /** Per-type counts kept in sync with #entries by every mutation. */
+    #markCount = 0;
+    #measureCount = 0;
+    #resourceCount = 0;
     #marks = new Map<string, PerformanceMark>();
     #observers = new Set<PerformanceObserver>();
     #pendingEntries = new Map<PerformanceObserver, globalThis.PerformanceEntry[]>();
@@ -646,12 +650,15 @@ class Performance extends EventTarget implements globalThis.Performance {
         if (markName !== undefined) {
             const name = String(markName);
             this.#marks.delete(name);
-            this.#entries = this.#entries.filter(
+            const filtered = this.#entries.filter(
                 entry => !(entry.entryType === 'mark' && entry.name === name)
             );
+            this.#markCount -= this.#entries.length - filtered.length;
+            this.#entries = filtered;
         } else {
             this.#marks.clear();
             this.#entries = this.#entries.filter(entry => entry.entryType !== 'mark');
+            this.#markCount = 0;
         }
     }
 
@@ -721,11 +728,14 @@ class Performance extends EventTarget implements globalThis.Performance {
     clearMeasures(measureName?: string): void {
         if (measureName !== undefined) {
             const name = String(measureName);
-            this.#entries = this.#entries.filter(
+            const filtered = this.#entries.filter(
                 entry => !(entry.entryType === 'measure' && entry.name === name)
             );
+            this.#measureCount -= this.#entries.length - filtered.length;
+            this.#entries = filtered;
         } else {
             this.#entries = this.#entries.filter(entry => entry.entryType !== 'measure');
+            this.#measureCount = 0;
         }
     }
 
@@ -751,6 +761,7 @@ class Performance extends EventTarget implements globalThis.Performance {
 
     clearResourceTimings(): void {
         this.#entries = this.#entries.filter(entry => entry.entryType !== 'resource');
+        this.#resourceCount = 0;
     }
 
     setResourceTimingBufferSize(maxSize: number): void {
@@ -766,13 +777,10 @@ class Performance extends EventTarget implements globalThis.Performance {
     }
 
     #trimResourceTimings(): void {
-        const resourceEntries = this.#entries.filter(e => e.entryType === 'resource');
-        if (resourceEntries.length > this.#resourceTimingBufferSize) {
-            const toRemove = resourceEntries.slice(
-                0,
-                resourceEntries.length - this.#resourceTimingBufferSize
-            );
-            this.#entries = this.#entries.filter(e => !toRemove.includes(e));
+        if (this.#resourceCount > this.#resourceTimingBufferSize) {
+            const excess = this.#resourceCount - this.#resourceTimingBufferSize;
+            this.#dropOldestOfType('resource', excess);
+            this.#resourceCount -= excess;
             this.dispatchEvent(new Event('resourcetimingbufferfull'));
         }
     }
@@ -836,25 +844,26 @@ class Performance extends EventTarget implements globalThis.Performance {
 
     #addEntry(entry: globalThis.PerformanceEntry): void {
         this.#entries.push(entry);
+        // Per-type counts keep the buffer-full check and caps O(1) per add;
+        // a full filter per add dominated mark-dense scripts.
         if (entry.entryType === 'resource') {
-            const resourceEntries = this.#entries.filter(e => e.entryType === 'resource');
-            if (resourceEntries.length >= this.#resourceTimingBufferSize) {
+            this.#resourceCount++;
+            if (this.#resourceCount >= this.#resourceTimingBufferSize) {
                 this.dispatchEvent(new Event('resourcetimingbufferfull'));
             }
-        }
-        // Cap marks/measures to prevent unbounded growth
-        if (entry.entryType === 'mark' || entry.entryType === 'measure') {
-            const typed = this.#entries.filter(e => e.entryType === entry.entryType);
-            if (typed.length > 1000) {
-                const toRemove = typed.length - 1000;
-                let removed = 0;
-                this.#entries = this.#entries.filter(e => {
-                    if (removed < toRemove && e.entryType === entry.entryType) {
-                        removed++;
-                        return false;
-                    }
-                    return true;
-                });
+        } else if (entry.entryType === 'mark') {
+            this.#markCount++;
+            if (this.#markCount > 1000) {
+                const excess = this.#markCount - 1000;
+                this.#dropOldestOfType('mark', excess);
+                this.#markCount -= excess;
+            }
+        } else if (entry.entryType === 'measure') {
+            this.#measureCount++;
+            if (this.#measureCount > 1000) {
+                const excess = this.#measureCount - 1000;
+                this.#dropOldestOfType('measure', excess);
+                this.#measureCount -= excess;
             }
         }
 
@@ -867,6 +876,18 @@ class Performance extends EventTarget implements globalThis.Performance {
         }
 
         queueMicrotask(() => this.#flushObserverNotifications());
+    }
+
+    /** Remove the oldest `count` entries of `type` from the front of #entries. */
+    #dropOldestOfType(type: string, count: number): void {
+        let index = 0;
+        for (let remaining = count; remaining > 0 && index < this.#entries.length; index++) {
+            if (this.#entries[index].entryType === type) {
+                this.#entries.splice(index, 1);
+                remaining--;
+                index--;
+            }
+        }
     }
 
     #flushObserverNotifications(): void {
