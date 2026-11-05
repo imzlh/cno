@@ -14,7 +14,7 @@ const error = import.meta.use('error');
 import { dnsCache } from '@cnojs/http/dns-cache';
 import { errors } from "./01_errors";
 import { systemDnsServers } from "../utils/osdns";
-import { closeStreamQuietly } from "./pipe-streams";
+import { closeStreamQuietly } from "./utils/pipe-streams";
 
 const DEFAULT_TCP_KEEPALIVE_INITIAL_DELAY = 60;
 
@@ -23,8 +23,8 @@ type TakePipe = () => CModuleStreams.Stream;
 
 // The implementations live in `pipe-streams.ts` so that `06_process.ts` (which
 // only needs these two) does not pull the whole net module into its graph.
-export { useWritable, useReadable } from "./pipe-streams";
-import { useWritable, useReadable } from "./pipe-streams";
+export { useWritable, useReadable } from "./utils/pipe-streams";
+import { useWritable, useReadable } from "./utils/pipe-streams";
 
 const kRawPipe = Symbol('Stream.rawPipe');
 

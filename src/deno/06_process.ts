@@ -5,7 +5,7 @@ import { join, resolvePath, toFsPath } from "../utils/path";
 import { isWindows } from "../utils/platform";
 import { wrapFsClassDec as wrap, wrapFSns } from "../utils/wrap";
 import { ReadableStream } from "../webapi/streams";
-import { useWritable } from "./pipe-streams";
+import { useWritable } from "./utils/pipe-streams";
 import { errors } from "./01_errors";
 
 const os = import.meta.use('os');

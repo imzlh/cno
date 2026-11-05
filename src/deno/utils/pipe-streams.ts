@@ -1,7 +1,7 @@
 /** Stream constructors over a native circu.js pipe. */
 
-import { wrapFSErr } from "../utils/wrap";
-import { malloc } from "../utils/malloc";
+import { wrapFSErr } from "../../utils/wrap";
+import { malloc } from "../../utils/malloc";
 
 const stream = import.meta.use('streams');
 

@@ -1,7 +1,7 @@
 import { requireQuic } from "../quic-native";
 import { bytesToArrayBuffer, toOwnedBytes } from "../utils/bytes";
 import { withSystemCaCerts } from "../utils/ca-certs";
-import { closeStreamQuietly } from "./pipe-streams";
+import { closeStreamQuietly } from "./utils/pipe-streams";
 
 const DEFAULT_ALPN = "cno-quic";
 
