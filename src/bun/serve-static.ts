@@ -134,13 +134,72 @@ function notModified(request: Request, etag: string, mtime: Date): boolean {
     return false;
 }
 
+/** Parse a single-range `Range` header. Returns the inclusive byte window, or
+ *  `'ignore'` for absent/multi-range/non-byte/invalid syntax (serve the whole
+ *  file), or `'unsatisfiable'` for a well-formed range past the end (416). */
+function parseRange(header: string, size: number): { start: number; end: number } | 'ignore' | 'unsatisfiable' {
+    const match = /^bytes=(.*)$/i.exec(header.trim());
+    if (!match) return 'ignore';
+    // Only single ranges are served; a list (even a valid one) falls back to
+    // the full body, matching the conservative static-serving subset.
+    const spec = match[1]!;
+    if (spec.includes(',')) return 'ignore';
+    const dash = spec.indexOf('-');
+    if (dash < 0) return 'ignore';
+    const startText = spec.slice(0, dash);
+    const endText = spec.slice(dash + 1);
+    if (startText === '') {
+        // Suffix form: the final N bytes; more bytes than the file has yields
+        // the whole file.
+        if (!/^\d+$/.test(endText) || endText === '0') return 'ignore';
+        const suffix = Number(endText);
+        if (size === 0) return 'unsatisfiable';
+        const start = Math.max(0, size - suffix);
+        return { start, end: size - 1 };
+    }
+    if (!/^\d+$/.test(startText)) return 'ignore';
+    const start = Number(startText);
+    if (start >= size) return 'unsatisfiable';
+    if (endText === '') return { start, end: size - 1 };
+    if (!/^\d+$/.test(endText)) return 'ignore';
+    const end = Math.min(Number(endText), size - 1);
+    if (end < start) return 'ignore';
+    return { start, end };
+}
+
+/** Wrap a stream so only the [start, end] byte window passes through; the
+ *  upstream is cancelled once the window has been emitted. */
+function sliceStream(source: ReadableStream<Uint8Array>, start: number, end: number): ReadableStream<Uint8Array> {
+    let position = 0;
+    let done = false;
+    return source.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+        transform(chunk, controller) {
+            if (done) return;
+            const chunkEnd = position + chunk.byteLength;
+            if (chunkEnd <= start || position > end) {
+                position = chunkEnd;
+                return;
+            }
+            const from = Math.max(0, start - position);
+            const to = Math.min(chunk.byteLength, end - position + 1);
+            if (to > from) controller.enqueue(chunk.subarray(from, to));
+            position = chunkEnd;
+            if (position > end) {
+                done = true;
+                void source.cancel().catch(() => {});
+            }
+        },
+        flush() { done = true; },
+    }));
+}
+
 function fileResponse(request: Request, path: string, mtime: Date, size: number): Response {
     const target = newBunFile(path);
     const headers = new Headers();
     if (target.type) headers.set('content-type', target.type);
     headers.set('last-modified', mtime.toUTCString());
-    // Weak ETag over the stat pair; range requests are outside this subset,
-    // so the value drives the conditional GET below and manual inspection.
+    // Weak ETag over the stat pair; the value drives the conditional GET below
+    // and manual inspection.
     const etag = `W/"${size.toString(16)}-${Math.trunc(mtime.getTime()).toString(16)}"`;
     headers.set('etag', etag);
     // Pin content-length like Bun's static serving so the host can skip
@@ -151,6 +210,23 @@ function fileResponse(request: Request, path: string, mtime: Date, size: number)
     if (notModified(request, etag, mtime)) {
         headers.delete('content-length');
         return new Response(null, { status: 304, headers });
+    }
+    const rangeHeader = request.headers.get('range');
+    if (rangeHeader !== null) {
+        const range = parseRange(rangeHeader, size);
+        if (range === 'unsatisfiable') {
+            const failHeaders = new Headers({ 'content-range': `bytes */${size}` });
+            return new Response(null, { status: 416, headers: failHeaders });
+        }
+        if (range !== 'ignore') {
+            const { start, end } = range;
+            const rangeHeaders = new Headers(headers);
+            rangeHeaders.set('content-range', `bytes ${start}-${end}/${size}`);
+            const length = end - start + 1;
+            if (size > 0 || length > 0) rangeHeaders.set('content-length', String(length));
+            if (request.method === 'HEAD') return new Response(null, { status: 206, headers: rangeHeaders });
+            return new Response(sliceStream(target.stream(), start, end), { status: 206, headers: rangeHeaders });
+        }
     }
     if (request.method === 'HEAD') return new Response(null, { status: 200, headers });
     return new Response(target.stream(), { status: 200, headers });
