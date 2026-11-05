@@ -27,8 +27,12 @@ export type LazyGlobal = Record<string, unknown>;
 /** Final values by name once the loader has resolved. */
 const resolvedValues = new WeakMap<object, Map<string, unknown>>();
 
-/** The in-flight (or settled) load installed by `defineLazy`, by target and name. */
-const pendingLoads = new Map<object, Map<string, Promise<void>>>();
+/**
+ * In-flight (or settled) loads by target and name. Keep targets weak: embedders
+ * and tests may install accessors on short-lived realm globals, and bookkeeping
+ * must not keep those realms alive.
+ */
+const pendingLoads = new WeakMap<object, Map<string, Promise<void>>>();
 
 /**
  * Prototype stand-ins by name ("HttpServer"), so a class *load* that extends the
