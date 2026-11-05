@@ -29,12 +29,25 @@ function notFound(): Response {
  * Percent-decode the remainder once and reject every non-canonical shape.
  * The decoded segments are re-checked so encoded dots ("..") cannot survive
  * decoding, and encoded separators are rejected before decoding since they
- * would change which segments exist.
+ * would change which segments exist. Escapes of characters that can appear
+ * literally in a path (unreserved ASCII) are rejected too: the router and
+ * the exclusion table match on the raw remainder, so `/assets/%69ndex.html`
+ * must not reach the same file as `/assets/index.html` through the back door.
  */
 function canonicalRemainder(remainder: string): string | null {
     if (remainder.includes('%')) {
         if (/%(?:2f|5c)/i.test(remainder)) return null;
         if (/%(?![0-9A-Fa-f]{2})/.test(remainder)) return null;
+        // Reject escapes of characters that can appear literally (unreserved
+        // ASCII, RFC 3986): the router and exclusion table match the raw
+        // remainder, so `%69ndex.html` must not alias `index.html`.
+        for (const match of remainder.matchAll(/%([0-9A-Fa-f]{2})/g)) {
+            const code = parseInt(match[1]!, 16);
+            const unreserved = (code >= 0x41 && code <= 0x5A) || (code >= 0x61 && code <= 0x7A)
+                || (code >= 0x30 && code <= 0x39) || code === 0x2D || code === 0x2E
+                || code === 0x5F || code === 0x7E;
+            if (unreserved) return null;
+        }
         try {
             remainder = decodeURIComponent(remainder);
         } catch {
@@ -44,6 +57,9 @@ function canonicalRemainder(remainder: string): string | null {
     }
     if (remainder.includes('\\') || remainder.includes('\0')) return null;
     if (remainder === '') return remainder;
+    // A double slash is an empty segment wherever it sits — including the
+    // root-index form `//`, which must not alias the directory itself.
+    if (remainder.includes('//')) return null;
     // A trailing slash selects the directory itself, so it is not an interior
     // empty segment; the index step consumes it.
     const body = remainder.endsWith('/') ? remainder.slice(0, -1) : remainder;
@@ -68,8 +84,12 @@ async function realString(path: string): Promise<string | undefined> {
 async function resolveWithin(root: string, path: string): Promise<string | undefined> {
     const resolved = await realString(path);
     if (!resolved) return undefined;
-    const prefix = root.endsWith('/') ? root : `${root}/`;
-    if (resolved !== root && !resolved.startsWith(prefix)) return undefined;
+    // Windows realpath returns backslash separators; normalize both sides so
+    // containment compares the path, not the host's separator choice.
+    const normalizedRoot = root.replaceAll('\\', '/');
+    const normalizedResolved = resolved.replaceAll('\\', '/');
+    const prefix = normalizedRoot.endsWith('/') ? normalizedRoot : `${normalizedRoot}/`;
+    if (normalizedResolved !== normalizedRoot && !normalizedResolved.startsWith(prefix)) return undefined;
     return resolved;
 }
 

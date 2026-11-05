@@ -224,22 +224,30 @@ export type AnsiColorDepth = 0 | 1 | 2 | 3;
 
 /**
  * The color depth Bun's "ansi" format selects for stdout, following Bun's
- * env-based detection: FORCE_COLOR overrides everything (including without a
- * TTY, per force-color.org), then NO_COLOR, then the TERM/TMUX/CI/COLORTERM
- * table which only applies when stdout actually is a terminal. An unrecognized
- * terminal yields depth 0, matching Bun's compute_color_depth fallthrough.
+ * env-based detection: FORCE_COLOR overrides everything (numeric strings
+ * parse, case-insensitive true/false, anything unrecognized falls back to
+ * ANSI 16), then NO_COLOR (where only 'false'/'0' leave color enabled), then
+ * the TERM/TMUX/CI/COLORTERM table — which the installed Bun 1.4.4 oracle
+ * answers from even on a piped stdout, so there is no TTY gate on this path.
+ * An unrecognized terminal yields depth 0, matching Bun's fallthrough.
  */
 export function ansiColorDepth(env: Record<string, string | undefined>, stdoutTty: boolean): AnsiColorDepth {
+    void stdoutTty;
     const force = env.FORCE_COLOR;
     if (force !== undefined) {
-        if (force === '0') return 0;
-        if (force === '1' || force === 'true' || force === '') return 1;
-        if (force === '2') return 2;
-        return 3;
+        if (/^-?\d+$/.test(force)) {
+            return Math.min(3, Math.max(0, Number(force))) as AnsiColorDepth;
+        }
+        const lowered = force.toLowerCase();
+        if (lowered === 'false') return 0;
+        // 'true', '', and unrecognized values all select ANSI 16.
+        return 1;
     }
     const noColor = env.NO_COLOR;
-    if (noColor !== undefined && noColor !== '0' && noColor !== '') return 0;
-    if (!stdoutTty) return 0;
+    if (noColor !== undefined && noColor !== '') {
+        const lowered = noColor.toLowerCase();
+        if (lowered !== 'false' && lowered !== '0') return 0;
+    }
     if (env.TERM === 'dumb') return 0;
     if (env.TMUX !== undefined) return 3;
     if (env.CI !== undefined) return 1;

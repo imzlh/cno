@@ -528,7 +528,14 @@ function capturedParams(pathname: string, pattern: CompiledPattern): Record<stri
         const start = pattern.spans[spanIndex * 2]!;
         const end = pattern.spans[spanIndex * 2 + 1]!;
         spanIndex++;
-        params[segment.name] = decodeParamSegment(pathname.slice(start, end));
+        // Own data property: a capture named `__proto__` must not ride the
+        // inherited setter and vanish from the params object.
+        Object.defineProperty(params, segment.name, {
+            value: decodeParamSegment(pathname.slice(start, end)),
+            writable: true,
+            enumerable: true,
+            configurable: true,
+        });
     }
     return params;
 }

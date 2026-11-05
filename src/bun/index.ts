@@ -336,7 +336,9 @@ export function sleep(milliseconds: number | Date): Promise<void> {
         ? milliseconds.getTime() - Date.now()
         : milliseconds;
     if (delay === Infinity) return new Promise(() => {});
-    return new Promise((resolve) => setTimeout(resolve, Number.isFinite(delay) ? Math.max(0, delay) : 0));
+    // The runtime injects a global setTimeout; the timers module is its typed face.
+    const timers = import.meta.use('timers');
+    return new Promise((resolve) => timers.setTimeout(resolve, Number.isFinite(delay) ? Math.max(0, delay) : 0));
 }
 
 /**

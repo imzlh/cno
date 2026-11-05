@@ -150,6 +150,9 @@ export class EventSource extends EventTarget {
     }
 
     private processChunk(chunk: Uint8Array): void {
+        // A terminal failure (e.g. a data-buffer overflow) already closed the
+        // connection; later chunks from the same read must not keep parsing.
+        if (this.readyState === EventSourceReadyState.CLOSED) return;
         const text = this.decoder.decode(chunk, { stream: true });
         this.lineBuffer += text;
         // Guard against unbounded line buffer from malicious server
@@ -161,6 +164,9 @@ export class EventSource extends EventTarget {
             const line = this.lineBuffer.slice(0, newlineIndex);
             this.lineBuffer = this.lineBuffer.slice(newlineIndex + 1);
             this.processLine(line.endsWith('\r') ? line.slice(0, -1) : line);
+            // processLine can fail() the connection; the enum-wide read defeats
+            // the entry-time narrowing TS cannot see through.
+            if ((this.readyState as EventSourceReadyState) === EventSourceReadyState.CLOSED) return;
         }
     }
 
