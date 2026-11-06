@@ -10,12 +10,21 @@ export type { LibdeflateCompressionOptions, ZlibCompressionOptions };
 export type CompressionOptions = ZlibCompressionOptions | LibdeflateCompressionOptions;
 
 type RuntimeOptions = Record<PropertyKey, unknown>;
+type BrandGetter = (this: unknown) => number;
 type InflateHandle = {
     inflate(data: Uint8Array, flush?: number): Uint8Array;
     readonly finished: boolean;
 };
 
 type InflateFormat = 'raw' | 'zlib' | 'gzip' | 'auto';
+
+const arrayBufferByteLength = Object.getOwnPropertyDescriptor(
+    ArrayBuffer.prototype,
+    'byteLength',
+)!.get! as BrandGetter;
+const sharedArrayBufferByteLength = typeof SharedArrayBuffer === 'function'
+    ? Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength')?.get as BrandGetter | undefined
+    : undefined;
 
 function codedError<T extends Error>(error: T, code: string): T {
     Object.defineProperty(error, 'code', {
@@ -33,13 +42,26 @@ function invalidInput(): TypeError {
     );
 }
 
-function isSharedArrayBuffer(value: unknown): value is SharedArrayBuffer {
-    return typeof SharedArrayBuffer !== 'undefined' && value instanceof SharedArrayBuffer;
+function isBuffer(value: unknown): value is ArrayBuffer | SharedArrayBuffer {
+    if (typeof value !== 'object' || value === null) return false;
+    try {
+        // Intrinsic getters perform a realm-independent internal-slot check.
+        Reflect.apply(arrayBufferByteLength, value, []);
+        return true;
+    } catch {
+        if (sharedArrayBufferByteLength === undefined) return false;
+        try {
+            Reflect.apply(sharedArrayBufferByteLength, value, []);
+            return true;
+        } catch {
+            return false;
+        }
+    }
 }
 
 function inputBytes(data: unknown): Uint8Array {
     if (typeof data === 'string') return Buffer.from(data, 'utf8');
-    if (data instanceof ArrayBuffer || isSharedArrayBuffer(data)) return new Uint8Array(data);
+    if (isBuffer(data)) return new Uint8Array(data);
     if (ArrayBuffer.isView(data)) {
         return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
     }
@@ -131,7 +153,8 @@ function optionInteger(
 
 function formatValue(value: unknown): string {
     if (typeof value === 'string') return `type string ('${value}')`;
-    if (typeof value === 'bigint') return `${value}n`;
+    if (typeof value === 'boolean') return `type boolean (${value})`;
+    if (typeof value === 'bigint') return `type bigint (${value}n)`;
     if (typeof value === 'symbol') return `type symbol (${String(value)})`;
     if (Object.is(value, -0)) return '-0';
     return String(value);
