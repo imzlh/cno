@@ -22,6 +22,12 @@ function hasSharedArrayBufferSlot(value: unknown): value is SharedArrayBuffer {
 
 /** Convert supported inputs without losing the byte bounds of typed-array views. */
 export function hashInputBytes(data: unknown): Uint8Array {
+    if (data == null) {
+        throw Object.assign(
+            new TypeError('data must be a string, ArrayBuffer, ArrayBufferView or Blob'),
+            { code: 'ERR_INVALID_ARG_TYPE' },
+        );
+    }
     if (typeof data === 'string') return engine.encodeString(sanitizeSurrogates(data));
     if (typeof Blob !== 'undefined' && data instanceof Blob) {
         const getBytes = Reflect.get(data, blobBytesSymbol);
@@ -38,12 +44,17 @@ export function hashInputBytes(data: unknown): Uint8Array {
 
 export function seed32(value: unknown): number {
     if (typeof value === 'bigint') return Number(BigInt.asUintN(32, value));
-    if (typeof value !== 'number' || !Number.isInteger(value) || value <= -0x8000_0000 || value >= 2 ** 51) return 0;
-    return Math.trunc(value) >>> 0;
+    return Number(BigInt.asUintN(32, numberSeed(value)));
 }
 
 export function seed64(value: unknown): bigint {
     if (typeof value === 'bigint') return BigInt.asUintN(64, value);
-    if (typeof value !== 'number' || !Number.isInteger(value) || value <= -0x8000_0000 || value >= 2 ** 51) return 0n;
+    return numberSeed(value);
+}
+
+function numberSeed(value: unknown): bigint {
+    if (typeof value !== 'number' || Number.isNaN(value) || value === -Infinity) return 0n;
+    if (value === Infinity || value >= 2 ** 64) return 0xffff_ffff_ffff_ffffn;
+    // Finite negative values wrap modulo 2^64, including values below -2^64.
     return BigInt.asUintN(64, BigInt(Math.trunc(value)));
 }
