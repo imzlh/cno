@@ -40,13 +40,13 @@ function invalidScheme(): TypeError & { code: string } {
 }
 
 /** Convert a filesystem path to a file URL using the host platform's rules. */
-export function pathToFileURL(path: string): URL {
+export const pathToFileURL = (path: string): URL => {
     if (typeof path === 'symbol') throw new TypeError('Cannot convert a symbol to a string');
     return nodePathToFileURL(String(path));
-}
+};
 
 /** Bun accepts only file URLs, unlike cno's Node helper's runtime-specific schemes. */
-export function fileURLToPath(url: URL | string): string {
+export const fileURLToPath = (url: URL | string): string => {
     if (typeof url === 'string') {
         if (!/^file:/i.test(url)) throw invalidScheme();
     } else if (!isURL(url)) {
@@ -55,4 +55,4 @@ export function fileURLToPath(url: URL | string): string {
         throw invalidScheme();
     }
     return nodeFileURLToPath(url);
-}
+};
