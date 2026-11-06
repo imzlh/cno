@@ -271,15 +271,23 @@ function defineCryptoHasher(): CryptoHasherConstructor {
         const requestedAlgorithm = stringValue(args[0]);
         if (requestedAlgorithm === undefined) throw invalidArgType('algorithm must be a string');
         const name = requestedAlgorithm.toLowerCase().replace(/^sha-(1|224|256|384|512)$/, 'sha$1');
-        const hash = Object.hasOwn(hashes, name) ? hashes[name] : undefined;
-        if (!hash) throw invalidArgType(`Unsupported algorithm ${requestedAlgorithm}`);
-
-        let key: Uint8Array<ArrayBuffer> | undefined;
         const hmacKey = args[1];
         if (hmacKey != null) {
             if (stringValue(hmacKey) === undefined && !isRawBuffer(hmacKey) && viewSlots(hmacKey) === null) {
                 throw invalidArgType('hmacKey must be a string, ArrayBuffer or ArrayBufferView');
             }
+        }
+        if (requestedAlgorithm.length === 0) throw invalidArgType('Invalid algorithm name');
+        const hash = Object.hasOwn(hashes, name) ? hashes[name] : undefined;
+        if (!hash) {
+            if (hmacKey != null) {
+                throw invalidArgType("algorithm must be one of 'blake2b256', 'blake2b512', 'blake2s256', 'md4', 'md5', 'ripemd160', 'sha1', 'sha224', 'sha256', 'sha384', 'sha512', 'sha512-224', 'sha512-256', 'sha3-224', 'sha3-256', 'sha3-384', 'sha3-512', 'shake128' or 'shake256'");
+            }
+            throw invalidArgType(`Unsupported algorithm ${requestedAlgorithm}`);
+        }
+
+        let key: Uint8Array<ArrayBuffer> | undefined;
+        if (hmacKey != null) {
             if (!hash[2]) {
                 const error = new Error('HMAC is not supported for this algorithm yet');
                 error.name = 'TODOError';
