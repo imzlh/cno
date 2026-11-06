@@ -10,49 +10,49 @@ export type BunHash = ((...args: Parameters<OfficialHash>) => ReturnType<Officia
         | 'xxHash32' | 'xxHash64' | 'murmur32v2' | 'murmur64v2' | 'murmur32v3'>;
 
 /** Zig's Wyhash-compatible implementation used by Bun.hash. */
-export function wyhash(data: HashInput, seed: bigint | undefined = undefined): bigint {
+export const wyhash = (data: HashInput, seed: bigint | undefined = undefined): bigint => {
     return algo.wyhash(hashInputBytes(data), seed64(seed));
-}
+};
 
-export function adler32(data: HashInput): number {
+export const adler32 = (data: HashInput): number => {
     return zlib.adler32(hashInputBytes(data));
-}
+};
 
-export function crc32(data: HashInput, seed: number | undefined = undefined): number {
+export const crc32 = (data: HashInput, seed: number | undefined = undefined): number => {
     return zlib.crc32(hashInputBytes(data), seed32(seed));
-}
+};
 
-export function cityHash32(data: HashInput): number {
+export const cityHash32 = (data: HashInput): number => {
     return algo.cityHash32(hashInputBytes(data));
-}
+};
 
-export function cityHash64(data: HashInput, seed: bigint | undefined = undefined): bigint {
+export const cityHash64 = (data: HashInput, seed: bigint | undefined = undefined): bigint => {
     return algo.cityHash64(hashInputBytes(data), seed64(seed));
-}
+};
 
-export function xxHash32(data: HashInput, seed: number | undefined = undefined): number {
+export const xxHash32 = (data: HashInput, seed: number | undefined = undefined): number => {
     return algo.xxHash32(hashInputBytes(data), seed32(seed));
-}
+};
 
-export function xxHash64(data: HashInput, seed: bigint | undefined = undefined): bigint {
+export const xxHash64 = (data: HashInput, seed: bigint | undefined = undefined): bigint => {
     return algo.xxHash64(hashInputBytes(data), seed64(seed));
-}
+};
 
-export function murmur32v2(data: HashInput, seed: number | undefined = undefined): number {
+export const murmur32v2 = (data: HashInput, seed: number | undefined = undefined): number => {
     return algo.murmur32v2(hashInputBytes(data), seed32(seed));
-}
+};
 
-export function murmur64v2(data: HashInput, seed: bigint | undefined = undefined): bigint {
+export const murmur64v2 = (data: HashInput, seed: bigint | undefined = undefined): bigint => {
     return algo.murmur64v2(hashInputBytes(data), seed64(seed));
-}
+};
 
-export function murmur32v3(data: HashInput, seed: number | undefined = undefined): number {
+export const murmur32v3 = (data: HashInput, seed: number | undefined = undefined): number => {
     return algo.murmur3(hashInputBytes(data), seed32(seed));
-}
+};
 
-function hash(data: HashInput, seed: number | bigint | undefined = undefined): bigint {
+const hash = (data: HashInput, seed: number | bigint | undefined = undefined): bigint => {
     return wyhash(data, seed as bigint | undefined);
-}
+};
 
 Object.defineProperties(hash, {
     wyhash: { configurable: true, enumerable: true, value: wyhash, writable: true },
@@ -63,8 +63,8 @@ Object.defineProperties(hash, {
     xxHash32: { configurable: true, enumerable: true, value: xxHash32, writable: true },
     xxHash64: { configurable: true, enumerable: true, value: xxHash64, writable: true },
     murmur32v2: { configurable: true, enumerable: true, value: murmur32v2, writable: true },
-    murmur64v2: { configurable: true, enumerable: true, value: murmur64v2, writable: true },
     murmur32v3: { configurable: true, enumerable: true, value: murmur32v3, writable: true },
+    murmur64v2: { configurable: true, enumerable: true, value: murmur64v2, writable: true },
 });
 
 export type { HashInput };

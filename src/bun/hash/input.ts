@@ -5,18 +5,55 @@ export type HashInput = Parameters<typeof import('bun').hash>[0];
 const engine = import.meta.use('engine');
 const blobBytesSymbol = Symbol.for('cno.blob.bytes');
 
-const sharedArrayBufferByteLengthGetter = typeof SharedArrayBuffer === 'function'
-    ? Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength')?.get
-    : undefined;
+type BrandGetter<T> = (this: unknown) => T;
 
-function hasSharedArrayBufferSlot(value: unknown): value is SharedArrayBuffer {
-    if ((typeof value !== 'object' && typeof value !== 'function') || value === null) return false;
-    if (!sharedArrayBufferByteLengthGetter) return false;
+const arrayBufferByteLengthGetter = Object.getOwnPropertyDescriptor(
+    ArrayBuffer.prototype,
+    'byteLength',
+)!.get! as BrandGetter<number>;
+const sharedArrayBufferByteLengthGetter = typeof SharedArrayBuffer === 'function'
+    ? Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength')?.get as BrandGetter<number> | undefined
+    : undefined;
+const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
+const typedArrayBufferGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')!.get! as BrandGetter<ArrayBufferLike>;
+const typedArrayByteOffsetGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteOffset')!.get! as BrandGetter<number>;
+const typedArrayByteLengthGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteLength')!.get! as BrandGetter<number>;
+const dataViewBufferGetter = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer')!.get! as BrandGetter<ArrayBufferLike>;
+const dataViewByteOffsetGetter = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset')!.get! as BrandGetter<number>;
+const dataViewByteLengthGetter = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength')!.get! as BrandGetter<number>;
+const arrayBufferIsView = ArrayBuffer.isView;
+const emptyBytes = new Uint8Array();
+
+function rawBufferByteLength(value: unknown): number | undefined {
     try {
-        Reflect.apply(sharedArrayBufferByteLengthGetter, value, []);
-        return true;
+        return Reflect.apply(arrayBufferByteLengthGetter, value, []);
     } catch {
-        return false;
+        if (!sharedArrayBufferByteLengthGetter) return undefined;
+        try {
+            return Reflect.apply(sharedArrayBufferByteLengthGetter, value, []);
+        } catch {
+            return undefined;
+        }
+    }
+}
+
+function viewBytes(value: ArrayBufferView): Uint8Array {
+    let buffer: ArrayBufferLike;
+    try {
+        buffer = Reflect.apply(typedArrayBufferGetter, value, []);
+        const byteOffset = Reflect.apply(typedArrayByteOffsetGetter, value, []);
+        const byteLength = Reflect.apply(typedArrayByteLengthGetter, value, []);
+        return byteLength === 0 ? emptyBytes : new Uint8Array(buffer, byteOffset, byteLength);
+    } catch {
+        try {
+            buffer = Reflect.apply(dataViewBufferGetter, value, []);
+            const byteOffset = Reflect.apply(dataViewByteOffsetGetter, value, []);
+            const byteLength = Reflect.apply(dataViewByteLengthGetter, value, []);
+            return byteLength === 0 ? emptyBytes : new Uint8Array(buffer, byteOffset, byteLength);
+        } catch {
+            // Bun hashes detached and out-of-bounds views as empty inputs.
+            return emptyBytes;
+        }
     }
 }
 
@@ -33,11 +70,12 @@ export function hashInputBytes(data: unknown): Uint8Array {
         const getBytes = Reflect.get(data, blobBytesSymbol);
         if (typeof getBytes === 'function') return Reflect.apply(getBytes, data, []) as Uint8Array;
     }
-    if (engine.isArrayBuffer(data) || hasSharedArrayBufferSlot(data)) {
-        return new Uint8Array(data as ArrayBufferLike);
+    const byteLength = rawBufferByteLength(data);
+    if (byteLength !== undefined) {
+        return byteLength === 0 ? emptyBytes : new Uint8Array(data as ArrayBufferLike, 0, byteLength);
     }
-    if (ArrayBuffer.isView(data)) {
-        return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    if (arrayBufferIsView(data)) {
+        return viewBytes(data);
     }
     return engine.encodeString(sanitizeSurrogates(`${data}`));
 }
