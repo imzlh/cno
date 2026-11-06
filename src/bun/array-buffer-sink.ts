@@ -7,9 +7,9 @@
  * - `write()` accepts strings (UTF-8), ArrayBuffer, SharedArrayBuffer and
  *   ArrayBufferView, copies the bytes immediately and returns the byte count.
  * - `flush()` returns the buffered bytes and restarts from an empty buffer
- *   when `stream` is set, and otherwise returns the number of bytes written
- *   since the previous flush without draining anything.
- * - `end()` returns everything not yet flushed and resets the sink.
+ *   when `stream` is set, and otherwise returns zero without draining.
+ * - `end()` returns everything not yet flushed and ends normal collection
+ *   until the next `start()`.
  */
 
 import type { ArrayBufferSink as BunArrayBufferSink } from 'bun';
@@ -41,40 +41,51 @@ function hasBrand(getter: (() => number) | undefined, value: object): boolean {
     }
 }
 
-const invalidChunk = 'ArrayBufferSink.write() expects a string, ArrayBufferView, ArrayBuffer or SharedArrayBuffer';
+const invalidChunk = 'write() expects a string, ArrayBufferView, or ArrayBuffer';
 
 export class ArrayBufferSink {
     #bytes: Uint8Array<ArrayBuffer> = new Uint8Array(0);
     #length = 0;
-    #sinceFlush = 0;
     #asUint8Array = false;
     #stream = false;
+    #ended = false;
+
+    get [Symbol.toStringTag](): string {
+        return 'ArrayBufferSink';
+    }
 
     /**
-     * (Re)initializes the sink. Pending data is discarded, a closed sink is
-     * reset, and every option is reset to its default unless given.
-     * A non-object `options` is treated as no options.
+     * (Re)initializes the sink and discards pending data. Empty/invalid options
+     * preserve the previous configuration. A typed option updates the whole
+     * configuration, with omitted typed options taking their defaults.
      */
     start(options?: ArrayBufferSinkStartOptions): void {
         // Validate the receiver before touching user-supplied getters.
         void this.#length;
-        let asUint8Array = false;
-        let stream = false;
+        let asUint8Array = this.#asUint8Array;
+        let stream = this.#stream;
         let capacity = 0;
         if (typeof options === 'object' && options !== null) {
-            // Only real booleans count; other values are ignored rather than coerced.
-            if (options.asUint8Array === true) asUint8Array = true;
-            if (options.stream === true) stream = true;
+            // Read in Bun's observable order before changing any sink state.
+            const asUint8ArrayOption: unknown = options.asUint8Array;
+            const streamOption: unknown = options.stream;
             const highWaterMark: unknown = options.highWaterMark;
-            if (typeof highWaterMark === 'number' && highWaterMark > 0) {
+            const hasTypedOption = typeof asUint8ArrayOption === 'boolean'
+                || typeof streamOption === 'boolean'
+                || typeof highWaterMark === 'number';
+            if (hasTypedOption) {
+                asUint8Array = typeof asUint8ArrayOption === 'boolean' ? asUint8ArrayOption : false;
+                stream = typeof streamOption === 'boolean' ? streamOption : false;
+            }
+            if (typeof highWaterMark === 'number' && Number.isFinite(highWaterMark) && highWaterMark > 0) {
                 capacity = Math.min(Math.trunc(highWaterMark), MAX_PREALLOCATION);
             }
         }
         this.#bytes = new Uint8Array(capacity);
         this.#length = 0;
-        this.#sinceFlush = 0;
         this.#asUint8Array = asUint8Array;
         this.#stream = stream;
+        this.#ended = false;
     }
 
     /** Appends a copy of `chunk` and returns the number of bytes written (UTF-8 length for strings). */
@@ -97,37 +108,35 @@ export class ArrayBufferSink {
         }
         const count = source.byteLength;
         if (count === 0) return 0;
+        // Bun keeps accepting writes after end(). Only streaming sinks retain
+        // those bytes, and they are then observable through flush(), not end().
+        if (this.#ended && !this.#stream) return count;
         this.#reserve(count);
         this.#bytes.set(source, this.#length);
         this.#length += count;
-        this.#sinceFlush += count;
         return count;
     }
 
     /**
      * With `stream`, returns the buffered bytes (ArrayBuffer, or Uint8Array
-     * with `asUint8Array`) and empties the buffer. Otherwise returns the
-     * number of bytes written since the last flush and keeps the data.
+     * with `asUint8Array`) and empties the buffer. Otherwise returns zero and
+     * keeps the data.
      */
     flush(): number | Uint8Array<ArrayBuffer> | ArrayBuffer {
-        if (!this.#stream) {
-            const written = this.#sinceFlush;
-            this.#sinceFlush = 0;
-            return written;
-        }
+        if (!this.#stream) return 0;
         // Copy out: the internal buffer, including any preallocation, is reused.
         const copy = this.#bytes.slice(0, this.#length);
         this.#length = 0;
-        this.#sinceFlush = 0;
         return this.#asUint8Array ? copy : copy.buffer;
     }
 
     /**
-     * Returns the data not yet flushed and resets the sink. Further writes are
-     * accepted with the same options, matching Bun's reusable sink behavior.
+     * Returns the data not yet flushed and ends normal collection. A later
+     * `start()` reopens the sink; repeated `end()` calls return ArrayBuffer(0).
      */
     end(): ArrayBuffer | Uint8Array<ArrayBuffer> {
         void this.#length;
+        if (this.#ended) return new ArrayBuffer(0);
         let buffer: ArrayBuffer;
         if (this.#length === 0) {
             buffer = new ArrayBuffer(0);
@@ -138,7 +147,7 @@ export class ArrayBufferSink {
         }
         this.#bytes = new Uint8Array(0);
         this.#length = 0;
-        this.#sinceFlush = 0;
+        this.#ended = true;
         return this.#asUint8Array ? new Uint8Array(buffer) : buffer;
     }
 
