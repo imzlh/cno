@@ -45,15 +45,25 @@ function windowsCandidates(command: string): string[] {
  * `cwd` and not searched in PATH; empty PATH entries are skipped so the current
  * directory is never searched implicitly.
  */
-export function which(command: string, options: WhichOptions = {}): string | null {
+export const which = (command: string, options: WhichOptions = {}): string | null => {
     if (typeof command === 'symbol') throw new TypeError('Cannot convert a symbol to a string');
     command = command == null ? '' : String(command);
-    if (command.length === 0) return null;
 
     const optionObject = options !== null && (typeof options === 'object' || typeof options === 'function')
         ? options
         : {};
-    const cwd = resolvePath(optionObject.cwd == null ? currentDirectory() : String(optionObject.cwd), currentDirectory());
+    // Bun reads and converts both option fields once, in this order, before
+    // checking the command or touching the filesystem.
+    const pathOption = optionObject.PATH;
+    const searchPath = pathOption == null
+        ? getEnv('PATH') ?? getEnv('Path') ?? ''
+        : String(pathOption);
+    const cwdOption = optionObject.cwd;
+    const processCwd = currentDirectory();
+    const cwd = resolvePath(cwdOption == null ? processCwd : String(cwdOption), processCwd);
+
+    if (command.length === 0) return null;
+
     const names = isWindows ? windowsCandidates(command) : [command];
     const hasSeparator = command.includes('/') || (isWindows && command.includes('\\'));
 
@@ -65,9 +75,6 @@ export function which(command: string, options: WhichOptions = {}): string | nul
         return null;
     }
 
-    const searchPath = optionObject.PATH == null
-        ? getEnv('PATH') ?? getEnv('Path') ?? ''
-        : String(optionObject.PATH);
     const delimiter = isWindows ? ';' : ':';
     const dirs = searchPath
         .split(delimiter)
@@ -80,4 +87,4 @@ export function which(command: string, options: WhichOptions = {}): string | nul
         }
     }
     return null;
-}
+};
