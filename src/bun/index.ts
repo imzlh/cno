@@ -95,6 +95,11 @@ import { randomUUIDv7 } from './uuid';
 import { randomUUIDv5 } from './uuid/v5';
 
 const webFetch = globalThis.fetch;
+const NativePromise = Promise;
+const dateGetTime = Date.prototype.getTime;
+const dateNow = Date.now;
+// The native timer converts through signed int64; stay within exact JS integers.
+const MAX_TIMER_DELAY = 9_007_199_254_740_991;
 const UNSUPPORTED_FETCH_OPTIONS = [
     'tls',
     'verbose',
@@ -331,18 +336,24 @@ export const inspect: BunInspect = Object.defineProperties(
     },
 ) as BunInspect;
 
-export function sleep(milliseconds: number | Date): Promise<void> {
-    if (typeof milliseconds !== 'number' && !(milliseconds instanceof Date)) {
+export const sleep = (milliseconds: number | Date): Promise<void> => {
+    let delay: number;
+    if (typeof milliseconds === 'number') {
+        delay = milliseconds;
+    } else if (import.meta.use('engine').isDate(milliseconds)) {
+        delay = dateGetTime.call(milliseconds) - dateNow();
+    } else {
         throw new TypeError('sleep expects a number (milliseconds)');
     }
-    const delay = milliseconds instanceof Date
-        ? milliseconds.getTime() - Date.now()
-        : milliseconds;
-    if (delay === Infinity) return new Promise(() => {});
+
+    if (delay === Infinity) return new NativePromise(() => {});
+    const timerDelay = delay !== delay || delay <= 0
+        ? 0
+        : Math.min(delay, MAX_TIMER_DELAY);
     // The runtime injects a global setTimeout; the timers module is its typed face.
     const timers = import.meta.use('timers');
-    return new Promise((resolve) => timers.setTimeout(resolve, Number.isFinite(delay) ? Math.max(0, delay) : 0));
-}
+    return new NativePromise((resolve) => timers.setTimeout(resolve, timerDelay));
+};
 
 /**
  * Manual engine GC. Bun distinguishes eden (`false`) from full (`true`)
@@ -501,5 +512,11 @@ for (const name of [
         enumerable: true,
     });
 }
+Object.defineProperty(Bun, 'sleep', {
+    value: sleep,
+    writable: true,
+    configurable: false,
+    enumerable: true,
+});
 
 export default Bun;
