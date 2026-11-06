@@ -17,6 +17,13 @@ const algorithm = import.meta.use('algorithm');
 const BUN_FILE_CHUNK_SIZE = 64 * 1024;
 const MISSING_LAST_MODIFIED = 2 ** 52 - 1;
 const filePaths = new WeakMap<BunFile, string>();
+const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
+const typedArrayBuffer = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')!.get!;
+const typedArrayByteOffset = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteOffset')!.get!;
+const typedArrayByteLength = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteLength')!.get!;
+const dataViewBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer')!.get!;
+const dataViewByteOffset = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset')!.get!;
+const dataViewByteLength = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength')!.get!;
 // Use the host's global Blob and its registered byte protocol. Importing
 // webapi/formdata would bundle a second Blob into the payload, and that module
 // overwrites globalThis.Blob/File/FormData when evaluated.
@@ -221,12 +228,27 @@ function toArrayBufferBytes(value: ArrayBufferView | ArrayBufferLike): Uint8Arra
     };
 
     if (ArrayBuffer.isView(value)) {
-        const view = value as ArrayBufferView & {
-            buffer: ArrayBufferLike;
-            byteOffset: number;
-            byteLength: number;
-        };
-        const bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+        let buffer: ArrayBufferLike;
+        let byteOffset: number;
+        let byteLength: number;
+        try {
+            buffer = Reflect.apply(typedArrayBuffer, value, []);
+        } catch {
+            buffer = Reflect.apply(dataViewBuffer, value, []);
+            try {
+                byteOffset = Reflect.apply(dataViewByteOffset, value, []);
+                byteLength = Reflect.apply(dataViewByteLength, value, []);
+            } catch {
+                // Bun treats detached and out-of-bounds DataViews as empty inputs.
+                return new Uint8Array(0);
+            }
+            if (byteLength === 0) return new Uint8Array(0);
+            return copy(new Uint8Array(buffer, byteOffset, byteLength));
+        }
+        byteOffset = Reflect.apply(typedArrayByteOffset, value, []);
+        byteLength = Reflect.apply(typedArrayByteLength, value, []);
+        if (byteLength === 0) return new Uint8Array(0);
+        const bytes = new Uint8Array(buffer, byteOffset, byteLength);
         return copy(bytes);
     }
     const bytes = new Uint8Array(value);
