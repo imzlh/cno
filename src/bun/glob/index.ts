@@ -408,9 +408,9 @@ export class Glob {
     }
 
     scanSync(optionsOrCwd?: string | GlobScanOptions): IterableIterator<string> {
+        const compiled = this.#compiled;
         const options = scanOptions(optionsOrCwd);
         validateCwdSync(options.cwd);
-        const compiled = this.#compiled;
         return (function* (): Generator<string> {
             const seen = new Set<string>();
             for (const plan of plansFor(compiled, options)) {
@@ -424,8 +424,8 @@ export class Glob {
     }
 
     scan(optionsOrCwd?: string | GlobScanOptions): AsyncIterableIterator<string> {
-        const options = scanOptions(optionsOrCwd);
         const compiled = this.#compiled;
+        const options = scanOptions(optionsOrCwd);
         return (async function* (): AsyncGenerator<string> {
             await validateCwd(options.cwd);
             const seen = new Set<string>();
@@ -441,6 +441,11 @@ export class Glob {
 }
 
 Object.defineProperty(Glob.prototype, 'match', { enumerable: true, configurable: false });
+for (const method of [Glob.prototype.scan, Glob.prototype.scanSync]) {
+    Object.defineProperty(method, 'name', { value: '' });
+}
+Object.defineProperty(Glob.prototype, 'scan', { enumerable: true });
+Object.defineProperty(Glob.prototype, 'scanSync', { enumerable: true });
 Object.defineProperty(Glob.prototype, Symbol.toStringTag, { value: 'Glob', configurable: true });
 
 export default Glob;
