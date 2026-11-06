@@ -1,4 +1,5 @@
 const MAX_BRACE_EXPANSIONS = 16_384;
+const stringValueOf = String.prototype.valueOf;
 
 export interface CompiledGlobPattern {
     readonly source: string;
@@ -34,7 +35,7 @@ export function globStringValue(value: unknown): string | null {
     if (typeof value === 'string') return value;
     if (typeof value !== 'object' || value === null) return null;
     try {
-        return String.prototype.valueOf.call(value);
+        return Reflect.apply(stringValueOf, value, []);
     } catch {
         return null;
     }
@@ -150,7 +151,7 @@ function expandSequence(body: string): string[] | null {
 function braceChoices(body: string): string[] | null {
     const alternatives = splitTopLevel(body, ',');
     if (alternatives.length > 1) return alternatives;
-    return expandSequence(body);
+    return expandSequence(body) ?? alternatives;
 }
 
 export function expandBraces(pattern: string): string[] {
@@ -307,7 +308,8 @@ function compileSegment(segment: string): SegmentMatcher {
     try {
         regex = new RegExp(`^${compileSequence(segment)}$`, 'u');
     } catch {
-        regex = new RegExp(`^${Array.from(segment).map(regexLiteral).join('')}$`, 'u');
+        // Bun treats invalid ranges such as [z-a] as a pattern that never matches.
+        regex = new RegExp('(?!)', 'u');
     }
     const compiled = { regex, explicitDot: firstTokenCanMatchDot(segment) };
     if (segmentCache.size > 2048) segmentCache.clear();
@@ -364,7 +366,10 @@ function matchSegments(
 }
 
 function matchExpanded(value: string, pattern: string, dot: boolean): boolean {
-    if (value === '' && pattern.includes('/')) return false;
+    if (value === '' && pattern.includes('/')) {
+        const segments = splitPath(pattern);
+        if (pattern.startsWith('/') || segments.some(segment => segment !== '' && segment !== '**')) return false;
+    }
     if (pattern.endsWith('/**') && !value.endsWith('/')) {
         const prefix = pattern.slice(0, -3);
         if (value === prefix) return false;
@@ -394,8 +399,10 @@ export function compileGlobPattern(value: unknown): CompiledGlobPattern {
     };
 }
 
-export function assertGlobMatchValue(value: unknown): asserts value is string {
-    if (globStringValue(value) === null) throw invalidMatchValue();
+export function globMatchValue(value: unknown): string {
+    const stringValue = globStringValue(value);
+    if (stringValue === null) throw invalidMatchValue();
+    return stringValue;
 }
 
 export function hasGlobMagic(pattern: string): boolean {

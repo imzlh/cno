@@ -2,9 +2,9 @@ import { join, normalize, resolve } from 'node:path';
 import { nsasfs, nsfs } from '../../node/fs/syspath';
 import type { GlobScanOptions } from 'bun';
 import {
-    assertGlobMatchValue,
     compileGlobPattern,
     expandBraces,
+    globMatchValue,
     globStringValue,
     hasGlobMagic,
     unescapeGlobLiteral,
@@ -370,6 +370,25 @@ function plansFor(compiled: CompiledGlobPattern, options: ResolvedScanOptions): 
     return expandBraces(compiled.source).map(pattern => patternPlan(pattern, options));
 }
 
+function invalidGlobThis(value: unknown): TypeError & { code: string } {
+    let received = '';
+    if (value === null) {
+        received = ', but received null';
+    } else if (value !== undefined) {
+        const type = typeof value;
+        if (type === 'object') {
+            const constructor = Reflect.get(value as object, 'constructor');
+            const name = constructor == null ? 'Object' : Reflect.get(Object(constructor), 'name');
+            received = `, but received an instance of ${String(name ?? 'Object')}`;
+        } else if (type === 'function') {
+            received = `, but received function ${(value as Function).name}`;
+        } else {
+            received = `, but received type ${type}`;
+        }
+    }
+    return Object.assign(new TypeError(`Expected this to be instanceof Glob${received}`), { code: 'ERR_INVALID_THIS' });
+}
+
 export class Glob {
     readonly #compiled: CompiledGlobPattern;
 
@@ -378,9 +397,14 @@ export class Glob {
     }
 
     match(value: string): boolean {
-        assertGlobMatchValue(value);
+        let compiled: CompiledGlobPattern;
+        try {
+            compiled = this.#compiled;
+        } catch {
+            throw invalidGlobThis(this);
+        }
         // Bun.Glob#match is purely lexical and includes dot-prefixed segments.
-        return this.#compiled.match(globStringValue(value)!, true);
+        return compiled.match(globMatchValue(value), true);
     }
 
     scanSync(optionsOrCwd?: string | GlobScanOptions): IterableIterator<string> {
@@ -415,5 +439,8 @@ export class Glob {
         })();
     }
 }
+
+Object.defineProperty(Glob.prototype, 'match', { enumerable: true, configurable: false });
+Object.defineProperty(Glob.prototype, Symbol.toStringTag, { value: 'Glob', configurable: true });
 
 export default Glob;
