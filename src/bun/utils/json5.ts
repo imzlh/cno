@@ -1,4 +1,74 @@
-const engine = import.meta.use('engine');
+import { utf8Decode } from '../../utils/bytes';
+
+type BrandGetter<T> = (this: unknown) => T;
+
+const arrayBufferByteLength = Object.getOwnPropertyDescriptor(
+    ArrayBuffer.prototype,
+    'byteLength',
+)!.get! as BrandGetter<number>;
+const sharedArrayBufferByteLength = typeof SharedArrayBuffer === 'function'
+    ? Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength')?.get as BrandGetter<number> | undefined
+    : undefined;
+const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
+const typedArrayBuffer = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')!.get! as BrandGetter<ArrayBufferLike>;
+const typedArrayByteOffset = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteOffset')!.get! as BrandGetter<number>;
+const typedArrayByteLength = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteLength')!.get! as BrandGetter<number>;
+const dataViewBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer')!.get! as BrandGetter<ArrayBufferLike>;
+const dataViewByteOffset = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset')!.get! as BrandGetter<number>;
+const dataViewByteLength = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength')!.get! as BrandGetter<number>;
+const arrayBufferIsView = ArrayBuffer.isView;
+const emptyBytes = new Uint8Array();
+
+function rawBuffer(value: unknown): { bytes: Uint8Array; shared: boolean } | undefined {
+    try {
+        const byteLength = Reflect.apply(arrayBufferByteLength, value, []);
+        return { bytes: byteLength === 0 ? emptyBytes : new Uint8Array(value as ArrayBuffer, 0, byteLength), shared: false };
+    } catch {
+        if (!sharedArrayBufferByteLength) return undefined;
+        try {
+            const byteLength = Reflect.apply(sharedArrayBufferByteLength, value, []);
+            return { bytes: byteLength === 0 ? emptyBytes : new Uint8Array(value as SharedArrayBuffer, 0, byteLength), shared: true };
+        } catch {
+            return undefined;
+        }
+    }
+}
+
+function viewBytes(value: ArrayBufferView): { bytes: Uint8Array; shared: boolean } {
+    let buffer: ArrayBufferLike;
+    let byteOffset: number;
+    let byteLength: number;
+    try {
+        buffer = Reflect.apply(typedArrayBuffer, value, []);
+        byteOffset = Reflect.apply(typedArrayByteOffset, value, []);
+        byteLength = Reflect.apply(typedArrayByteLength, value, []);
+    } catch {
+        try {
+            buffer = Reflect.apply(dataViewBuffer, value, []);
+            byteOffset = Reflect.apply(dataViewByteOffset, value, []);
+            byteLength = Reflect.apply(dataViewByteLength, value, []);
+        } catch {
+            // Bun parses detached and out-of-bounds views as empty input.
+            return { bytes: emptyBytes, shared: false };
+        }
+    }
+    const raw = rawBuffer(buffer);
+    const bytes = byteLength === 0 ? emptyBytes : new Uint8Array(buffer, byteOffset, byteLength);
+    return { bytes, shared: raw?.shared ?? false };
+}
+
+function decodeBinary(input: unknown): string | undefined {
+    if (input === null || (typeof input !== 'object' && typeof input !== 'function')) return undefined;
+    const normalized = arrayBufferIsView(input) ? viewBytes(input) : rawBuffer(input);
+    if (!normalized) return undefined;
+    const bytes = normalized.shared ? Uint8Array.from(normalized.bytes) : normalized.bytes;
+    try {
+        return utf8Decode(bytes, true);
+    } catch (error) {
+        if (error instanceof TypeError) throw new SyntaxError('JSON5 Parse error: Invalid UTF-8 byte sequence');
+        throw error;
+    }
+}
 
 const identifierStart = /[$_\p{ID_Start}]/u;
 const identifierPart = /[$_\u200c\u200d\p{ID_Continue}]/u;
@@ -113,13 +183,8 @@ class Parser {
 
 export function parseJSON5(input: unknown): any {
     if (input == null) throw new TypeError('input must be a string, ArrayBuffer, ArrayBufferView or Blob');
-    let text: string;
-    if (input instanceof ArrayBuffer) text = engine.decodeString(input);
-    else if (typeof SharedArrayBuffer !== 'undefined' && input instanceof SharedArrayBuffer) {
-        text = engine.decodeString(Uint8Array.from(new Uint8Array(input)));
-    }
-    else if (ArrayBuffer.isView(input)) text = engine.decodeString(new Uint8Array(input.buffer, input.byteOffset, input.byteLength));
-    else text = `${input}`;
+    const binary = decodeBinary(input);
+    const text = binary === undefined ? `${input}` : binary;
     return new Parser(text).parse();
 }
 
