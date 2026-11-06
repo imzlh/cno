@@ -6,6 +6,7 @@ import { blake2b, blake2b256 } from './blake2b';
 const kblobBytes = Symbol.for('cno.blob.bytes');
 
 const native = import.meta.use('crypto');
+const engine = import.meta.use('engine');
 type Hash = (data: BufferSource) => ArrayBuffer;
 type Hmac = (key: BufferSource, data: BufferSource) => ArrayBuffer;
 
@@ -39,29 +40,102 @@ const hashes: Record<string, [number, Hash, Hmac?]> = {
 
 type Input = string | ArrayBuffer | ArrayBufferView | Blob;
 type Output = string | ArrayBuffer | ArrayBufferView | null;
-function ownedBytes(input: Input, encoding?: string): Uint8Array<ArrayBuffer> {
+
+const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
+const typedArrayBuffer = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')!.get!;
+const typedArrayByteOffset = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteOffset')!.get!;
+const typedArrayByteLength = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteLength')!.get!;
+const dataViewBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer')!.get!;
+const dataViewByteOffset = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset')!.get!;
+const dataViewByteLength = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength')!.get!;
+const sharedByteLength = typeof SharedArrayBuffer === 'function'
+    ? Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength')?.get
+    : undefined;
+
+interface ViewSlots {
+    buffer: ArrayBufferLike;
+    byteOffset: number;
+    byteLength: number;
+}
+
+function viewSlots(value: unknown): ViewSlots | null {
+    if (!ArrayBuffer.isView(value)) return null;
+    try {
+        return {
+            buffer: Reflect.apply(typedArrayBuffer, value, []) as ArrayBufferLike,
+            byteOffset: Reflect.apply(typedArrayByteOffset, value, []) as number,
+            byteLength: Reflect.apply(typedArrayByteLength, value, []) as number,
+        };
+    } catch {
+        return {
+            buffer: Reflect.apply(dataViewBuffer, value, []) as ArrayBufferLike,
+            byteOffset: Reflect.apply(dataViewByteOffset, value, []) as number,
+            byteLength: Reflect.apply(dataViewByteLength, value, []) as number,
+        };
+    }
+}
+
+function isSharedArrayBuffer(value: unknown): value is SharedArrayBuffer {
+    if (!sharedByteLength || (typeof value !== 'object' && typeof value !== 'function') || value === null) return false;
+    try {
+        Reflect.apply(sharedByteLength, value, []);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+function isRawBuffer(value: unknown): value is ArrayBufferLike {
+    return engine.isArrayBuffer(value) || isSharedArrayBuffer(value);
+}
+
+function stringValue(value: unknown): string | undefined {
+    if (typeof value === 'string') return value;
+    if ((typeof value !== 'object' && typeof value !== 'function') || value === null) return undefined;
+    try {
+        return Reflect.apply(String.prototype.valueOf, value, []) as string;
+    } catch {
+        return undefined;
+    }
+}
+
+function codedError<T extends Error>(error: T, code: string): T {
+    Object.defineProperty(error, 'code', { value: code, writable: true, configurable: true });
+    return error;
+}
+
+function invalidArgType(message: string): TypeError {
+    return codedError(new TypeError(message), 'ERR_INVALID_ARG_TYPE');
+}
+
+function ownedBytes(input: unknown, encoding?: unknown): Uint8Array<ArrayBuffer> {
     let source: Uint8Array;
     if (typeof Blob !== 'undefined' && input instanceof Blob) {
         const getBytes = Reflect.get(input, kblobBytes);
         if (typeof getBytes !== 'function') throw new TypeError('Blob byte access is unavailable');
         source = Reflect.apply(getBytes, input, []) as Uint8Array;
-    }
-    else if (typeof input === 'string') {
-        const text = sanitizeSurrogates(input);
-        const normalized = typeof encoding === 'string' ? encoding.toLowerCase() : '';
-        if (normalized === 'ucs2' || normalized === 'ucs-2' || normalized === 'utf16le') {
-            source = Buffer.from(text, 'utf16le');
-        } else {
-            source = toBuffer(text, normalized === 'buffer' ? 'latin1' : normalized);
-        }
-    } else if (input instanceof ArrayBuffer || ArrayBuffer.isView(input)) {
-        source = toBuffer(input);
     } else {
-        throw new TypeError('input must be a string, ArrayBuffer, ArrayBufferView or Blob');
+        const text = stringValue(input);
+        if (text !== undefined) {
+            const sanitized = sanitizeSurrogates(text);
+            const requestedEncoding = stringValue(encoding);
+            const normalized = requestedEncoding === undefined ? '' : requestedEncoding.toLowerCase();
+            if (normalized === 'ucs2' || normalized === 'ucs-2' || normalized === 'utf16le') {
+                source = Buffer.from(sanitized, 'utf16le');
+            } else {
+                source = toBuffer(sanitized, normalized === 'buffer' ? 'latin1' : normalized);
+            }
+        } else if (isRawBuffer(input)) {
+            source = new Uint8Array(input);
+        } else {
+            const slots = viewSlots(input);
+            if (!slots) throw invalidArgType('input must be a string, ArrayBuffer, ArrayBufferView or Blob');
+            source = new Uint8Array(slots.buffer, slots.byteOffset, slots.byteLength);
+        }
     }
 
-    // The crypto binding's BufferSource contract is ArrayBuffer-backed. Own a
-    // copy here both to satisfy that contract and to snapshot update() input.
+    // Own a copy both for the native BufferSource contract and to snapshot
+    // update() input, including SharedArrayBuffer-backed views.
     const result = new Uint8Array(source.byteLength);
     result.set(source);
     return result;
@@ -77,81 +151,216 @@ function joinBytes(chunks: readonly Uint8Array[]): Uint8Array<ArrayBuffer> {
     return result;
 }
 
-export class CryptoHasher {
-    static readonly algorithms = Object.keys(hashes);
+const ENCODINGS = new Set([
+    'hex', 'base64', 'base64url', 'utf8', 'utf-8', 'ascii', 'latin1',
+    'binary', 'buffer', 'ucs2', 'ucs-2', 'utf16le',
+]);
+
+function planOutput(
+    output: unknown,
+    nullMeansDefault: boolean,
+): (digest: Uint8Array<ArrayBuffer>) => Buffer | string | ArrayBufferLike | ArrayBufferView {
+    if (output === undefined || (output === null && nullMeansDefault)) return digest => Buffer.from(digest);
+    const requested = stringValue(output);
+    if (requested !== undefined) {
+        const encoding = requested.toLowerCase();
+        if (!ENCODINGS.has(encoding)) {
+            throw codedError(new TypeError(`Unknown encoding: ${requested}`), 'ERR_INVALID_ARG_VALUE');
+        }
+        return digest => {
+            const buffer = Buffer.from(digest);
+            return encoding === 'buffer'
+                ? buffer
+                : Reflect.apply(buffer.toString, buffer, [encoding]) as string;
+        };
+    }
+    if (isRawBuffer(output)) {
+        const target = new Uint8Array(output);
+        if (target.byteLength < 64) throw invalidArgType('TypedArray must be at least 64 bytes');
+        return digest => {
+            target.set(digest);
+            return output;
+        };
+    }
+    const slots = viewSlots(output);
+    if (slots) {
+        if (slots.byteLength < 64) throw invalidArgType('TypedArray must be at least 64 bytes');
+        const target = new Uint8Array(slots.buffer, slots.byteOffset, slots.byteLength);
+        return digest => {
+            target.set(digest);
+            return output as ArrayBufferView;
+        };
+    }
+    throw invalidArgType('output must be of type string or ArrayBuffer or ArrayBufferView');
+}
+
+interface CryptoHasherState {
+    algorithm: string;
+    byteLength: number;
+    key?: Uint8Array<ArrayBuffer>;
+    chunks: Uint8Array<ArrayBuffer>[];
+    consumed: boolean;
+}
+
+export interface CryptoHasher {
     readonly algorithm: string;
     readonly byteLength: number;
-    private readonly key?: Uint8Array<ArrayBuffer>;
-    private chunks: Uint8Array<ArrayBuffer>[] = [];
-    private consumed = false;
+    update(input: Input, inputEncoding?: string): this;
+    copy(): CryptoHasher;
+    digest(): Buffer;
+    digest(encoding: string): string;
+    digest<T extends ArrayBuffer | ArrayBufferView>(output: T): T;
+}
 
-    constructor(algorithm: string, hmacKey?: string | ArrayBuffer | ArrayBufferView) {
-        if (typeof algorithm !== 'string') throw new TypeError('algorithm must be a string');
-        const name = algorithm.toLowerCase().replace(/^sha-(1|224|256|384|512)$/, 'sha$1');
+export interface CryptoHasherConstructor {
+    new (algorithm: string, hmacKey?: string | ArrayBuffer | ArrayBufferView): CryptoHasher;
+    readonly prototype: CryptoHasher;
+    readonly algorithms: string[];
+    hash(algorithm: string, input: Input): Buffer;
+    hash(algorithm: string, input: Input, encoding: string): string;
+    hash<T extends ArrayBuffer | ArrayBufferView>(algorithm: string, input: Input, output: T): T;
+}
+
+function receivedSuffix(self: unknown): string {
+    if (self === undefined) return '';
+    if (self === null) return ', but received null';
+    if (typeof self === 'object' || typeof self === 'function') {
+        let name: unknown;
+        try {
+            name = (self as { constructor?: { name?: unknown } }).constructor?.name;
+        } catch {
+            // Formatting an invalid receiver must not replace ERR_INVALID_THIS.
+        }
+        return `, but received an instance of ${String(name ?? 'Object')}`;
+    }
+    return `, but received type ${typeof self} (${String(self)})`;
+}
+
+function defineCryptoHasher(): CryptoHasherConstructor {
+    const states = new WeakMap<object, CryptoHasherState>();
+
+    function stateOf(self: unknown): CryptoHasherState {
+        const state = (typeof self === 'object' || typeof self === 'function') && self !== null
+            ? states.get(self)
+            : undefined;
+        if (state) return state;
+        throw codedError(
+            new TypeError(`Expected this to be instanceof CryptoHasher${receivedSuffix(self)}`),
+            'ERR_INVALID_THIS',
+        );
+    }
+
+    function assertUsable(state: CryptoHasherState): void {
+        if (state.consumed) throw new Error('HMAC has been consumed and is no longer usable');
+    }
+
+    function CryptoHasher(this: object, ...args: unknown[]): void {
+        if (!new.target) {
+            throw codedError(
+                new TypeError("CryptoHasher constructor cannot be invoked without 'new'"),
+                'ERR_ILLEGAL_CONSTRUCTOR',
+            );
+        }
+        const requestedAlgorithm = stringValue(args[0]);
+        if (requestedAlgorithm === undefined) throw invalidArgType('algorithm must be a string');
+        const name = requestedAlgorithm.toLowerCase().replace(/^sha-(1|224|256|384|512)$/, 'sha$1');
         const hash = Object.hasOwn(hashes, name) ? hashes[name] : undefined;
-        if (!hash) throw new TypeError(`Unsupported algorithm ${algorithm}`);
-        this.algorithm = name;
-        this.byteLength = hash[0];
+        if (!hash) throw invalidArgType(`Unsupported algorithm ${requestedAlgorithm}`);
+
+        let key: Uint8Array<ArrayBuffer> | undefined;
+        const hmacKey = args[1];
         if (hmacKey != null) {
-            if (typeof hmacKey !== 'string' && !(hmacKey instanceof ArrayBuffer) && !ArrayBuffer.isView(hmacKey)) throw new TypeError('hmacKey must be a string or buffer');
+            if (stringValue(hmacKey) === undefined && !isRawBuffer(hmacKey) && viewSlots(hmacKey) === null) {
+                throw invalidArgType('hmacKey must be a string, ArrayBuffer or ArrayBufferView');
+            }
             if (!hash[2]) {
                 const error = new Error('HMAC is not supported for this algorithm yet');
                 error.name = 'TODOError';
                 throw error;
             }
-            this.key = ownedBytes(hmacKey);
+            key = ownedBytes(hmacKey);
         }
+        states.set(this, {
+            algorithm: name,
+            byteLength: hash[0],
+            key,
+            chunks: [],
+            consumed: false,
+        });
     }
 
-    update(input: Input, inputEncoding?: string): this {
-        this.assertUsable();
-        this.chunks.push(ownedBytes(input, inputEncoding));
+    function algorithm(this: unknown): string {
+        const state = (typeof this === 'object' || typeof this === 'function') && this !== null
+            ? states.get(this)
+            : undefined;
+        if (!state) throw new TypeError('The CryptoHasher.algorithm getter can only be used on instances of CryptoHasher');
+        return state.algorithm;
+    }
+    Object.defineProperty(algorithm, 'name', { value: 'get algorithm', configurable: true });
+
+    function byteLength(this: unknown): number {
+        const state = (typeof this === 'object' || typeof this === 'function') && this !== null
+            ? states.get(this)
+            : undefined;
+        if (!state) throw new TypeError('The CryptoHasher.byteLength getter can only be used on instances of CryptoHasher');
+        return state.byteLength;
+    }
+    Object.defineProperty(byteLength, 'name', { value: 'get byteLength', configurable: true });
+
+    function update(this: unknown, input: unknown, inputEncoding?: unknown): unknown {
+        const state = stateOf(this);
+        const bytes = ownedBytes(input, inputEncoding);
+        assertUsable(state);
+        state.chunks.push(bytes);
         return this;
     }
 
-    copy(): CryptoHasher {
-        this.assertUsable();
-        const result = new CryptoHasher(this.algorithm, this.key);
-        result.chunks = this.chunks.map(chunk => chunk.slice());
+    function copy(this: unknown): CryptoHasher {
+        const state = stateOf(this);
+        assertUsable(state);
+        const result = new CryptoHasher(state.algorithm, state.key);
+        const copyState = states.get(result as object)!;
+        copyState.chunks = state.chunks.map(chunk => chunk.slice());
         return result;
     }
 
-    digest(): Buffer;
-    digest(encoding: string): string;
-    digest<T extends ArrayBuffer | ArrayBufferView>(output: T): T;
-    digest(output?: Output): Buffer | string | ArrayBuffer | ArrayBufferView {
-        this.assertUsable();
-        if (output != null && typeof output !== 'string' && !(output instanceof ArrayBuffer) && !ArrayBuffer.isView(output)) {
-            throw new TypeError('output must be of type string or ArrayBuffer or ArrayBufferView');
-        }
-        if (typeof output === 'string' && !['hex', 'base64', 'base64url', 'utf8', 'utf-8', 'ascii', 'latin1', 'binary', 'buffer', 'ucs2', 'ucs-2', 'utf16le'].includes(output.toLowerCase())) {
-            throw new TypeError(`Unknown encoding: ${output}`);
-        }
-        if (output && typeof output !== 'string' && output.byteLength < 64) throw new TypeError('TypedArray must be at least 64 bytes');
-        const data = joinBytes(this.chunks);
-        const [, hash, hmac] = hashes[this.algorithm];
-        const result = new Uint8Array(this.key ? hmac!(this.key, data) : hash(data));
-        this.chunks = [];
-        if (this.key) this.consumed = true;
-        if (output && typeof output !== 'string') {
-            const view = output instanceof ArrayBuffer ? new Uint8Array(output) : new Uint8Array(output.buffer, output.byteOffset, output.byteLength);
-            view.set(result);
-            return output;
-        }
-        const buffer = Buffer.from(result);
-        if (!output || output.toLowerCase() === 'buffer') return buffer;
-        return Reflect.apply(buffer.toString, buffer, [output.toLowerCase()]) as string;
+    function digest(this: unknown, ...args: unknown[]): unknown {
+        const state = stateOf(this);
+        const render = planOutput(args[0], true);
+        assertUsable(state);
+        const data = joinBytes(state.chunks);
+        const [, hash, hmac] = hashes[state.algorithm];
+        const result = new Uint8Array(state.key === undefined ? hash(data) : hmac!(state.key, data));
+        state.chunks = [];
+        if (state.key !== undefined) state.consumed = true;
+        return render(result);
     }
 
-    private assertUsable(): void {
-        if (this.consumed) throw new Error('HMAC has been consumed and is no longer usable');
+    function hash(algorithm: unknown, input: unknown, ...rest: unknown[]): unknown {
+        const hasher = new CryptoHasher(algorithm as string);
+        update.call(hasher, input);
+        return digest.call(hasher, rest[0]);
     }
 
-    static hash(algorithm: string, input: Input): Buffer;
-    static hash(algorithm: string, input: Input, encoding: string): string;
-    static hash<T extends ArrayBuffer | ArrayBufferView>(algorithm: string, input: Input, output: T): T;
-    static hash(algorithm: string, input: Input, output?: Output): Buffer | string | ArrayBuffer | ArrayBufferView {
-        const hasher = new CryptoHasher(algorithm).update(input);
-        return hasher.digest(output as string);
+    function algorithms(): string[] {
+        return Object.keys(hashes);
     }
+    Object.defineProperty(algorithms, 'name', { value: 'get algorithms', configurable: true });
+
+    Object.defineProperties(CryptoHasher.prototype, {
+        algorithm: { get: algorithm, enumerable: true, configurable: false },
+        byteLength: { get: byteLength, enumerable: true, configurable: false },
+        copy: { value: copy, writable: true, enumerable: true, configurable: false },
+        digest: { value: digest, writable: true, enumerable: true, configurable: false },
+        update: { value: update, writable: true, enumerable: true, configurable: false },
+        [Symbol.toStringTag]: { value: 'CryptoHasher', configurable: true },
+    });
+    Object.defineProperties(CryptoHasher, {
+        algorithms: { get: algorithms, enumerable: true, configurable: false },
+        hash: { value: hash, writable: true, enumerable: true, configurable: false },
+        prototype: { writable: false },
+    });
+    return CryptoHasher as unknown as CryptoHasherConstructor;
 }
+
+export const CryptoHasher: CryptoHasherConstructor = defineCryptoHasher();

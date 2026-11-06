@@ -47,6 +47,36 @@ const ENCODINGS = new Set([
 const sharedByteLength = typeof SharedArrayBuffer === 'function'
     ? Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength')?.get
     : undefined;
+const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
+const typedArrayBuffer = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')!.get!;
+const typedArrayByteOffset = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteOffset')!.get!;
+const typedArrayByteLength = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteLength')!.get!;
+const dataViewBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer')!.get!;
+const dataViewByteOffset = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset')!.get!;
+const dataViewByteLength = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength')!.get!;
+
+interface ViewSlots {
+    buffer: ArrayBufferLike;
+    byteOffset: number;
+    byteLength: number;
+}
+
+function viewSlots(value: unknown): ViewSlots | null {
+    if (!ArrayBuffer.isView(value)) return null;
+    try {
+        return {
+            buffer: Reflect.apply(typedArrayBuffer, value, []) as ArrayBufferLike,
+            byteOffset: Reflect.apply(typedArrayByteOffset, value, []) as number,
+            byteLength: Reflect.apply(typedArrayByteLength, value, []) as number,
+        };
+    } catch {
+        return {
+            buffer: Reflect.apply(dataViewBuffer, value, []) as ArrayBufferLike,
+            byteOffset: Reflect.apply(dataViewByteOffset, value, []) as number,
+            byteLength: Reflect.apply(dataViewByteLength, value, []) as number,
+        };
+    }
+}
 
 function isSharedArrayBuffer(value: unknown): value is SharedArrayBuffer {
     if (!sharedByteLength || typeof value !== 'object' || value === null) return false;
@@ -62,6 +92,16 @@ function isRawBuffer(value: unknown): value is ArrayBufferLike {
     return engine.isArrayBuffer(value) || isSharedArrayBuffer(value);
 }
 
+function stringValue(value: unknown): string | undefined {
+    if (typeof value === 'string') return value;
+    if ((typeof value !== 'object' && typeof value !== 'function') || value === null) return undefined;
+    try {
+        return Reflect.apply(String.prototype.valueOf, value, []) as string;
+    } catch {
+        return undefined;
+    }
+}
+
 function codedError<T extends Error>(error: T, code: string): T {
     Object.defineProperty(error, 'code', { value: code, writable: true, configurable: true });
     return error;
@@ -72,17 +112,17 @@ function invalidArgType(message: string): TypeError {
 }
 
 function bytesOfBuffer(value: ArrayBufferLike | ArrayBufferView): Uint8Array {
-    return ArrayBuffer.isView(value)
-        ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
-        : new Uint8Array(value);
+    if (isRawBuffer(value)) return new Uint8Array(value);
+    const slots = viewSlots(value)!;
+    return new Uint8Array(slots.buffer, slots.byteOffset, slots.byteLength);
 }
 
 /** Bytes of an accepted input, or a TypeError carrying `invalidMessage`. */
-function inputBytes(input: unknown, invalidMessage: string): Uint8Array {
-    if (typeof input === 'string') return engine.encodeString(sanitizeSurrogates(input));
+function inputBytes(input: unknown): Uint8Array {
+    const text = stringValue(input);
+    if (text !== undefined) return engine.encodeString(sanitizeSurrogates(text));
     if (typeof input === 'object' && input !== null) {
-        if (isRawBuffer(input) || ArrayBuffer.isView(input)) return bytesOfBuffer(input);
-        if (input instanceof String) return engine.encodeString(sanitizeSurrogates(input.valueOf()));
+        if (isRawBuffer(input) || viewSlots(input)) return bytesOfBuffer(input as ArrayBufferLike | ArrayBufferView);
         if (input instanceof BunFile) throw invalidArgType('File blob cannot be used here');
         if (typeof Blob !== 'undefined' && input instanceof Blob) {
             const getBytes = Reflect.get(input, kBlobBytes);
@@ -90,7 +130,7 @@ function inputBytes(input: unknown, invalidMessage: string): Uint8Array {
             return Reflect.apply(getBytes, input, []) as Uint8Array;
         }
     }
-    throw invalidArgType(invalidMessage);
+    throw invalidArgType('input must be a string, ArrayBuffer, ArrayBufferView or Blob');
 }
 
 /**
@@ -103,8 +143,8 @@ function planOutput(
     nullMeansDefault: boolean,
 ): (digest: Uint8Array<ArrayBuffer>) => unknown {
     if (output === undefined || (output === null && nullMeansDefault)) return digest => digest;
-    if (typeof output === 'string' || output instanceof String) {
-        const requested = String(output);
+    const requested = stringValue(output);
+    if (requested !== undefined) {
         const encoding = requested.toLowerCase();
         if (!ENCODINGS.has(encoding)) {
             throw codedError(new TypeError(`Unknown encoding: ${requested}`), 'ERR_INVALID_ARG_VALUE');
@@ -126,7 +166,7 @@ function planOutput(
             return output;
         };
     }
-    throw invalidArgType('expected string or buffer');
+    throw invalidArgType('output must be of type string or ArrayBuffer or ArrayBufferView');
 }
 
 interface HashEngine {
@@ -170,11 +210,16 @@ function defineHashClass(name: string, size: number, createEngine: () => HashEng
     function stateOf(self: unknown): HashState {
         const state = typeof self === 'object' && self !== null ? states.get(self) : undefined;
         if (state) return state;
-        const received = typeof self === 'object' && self !== null
-            ? String((self as { constructor?: { name?: unknown } }).constructor?.name ?? 'Object')
-            : typeof self;
+        let suffix = '';
+        if (self === null) suffix = ', but received null';
+        else if (self !== undefined && (typeof self === 'object' || typeof self === 'function')) {
+            const received = String((self as { constructor?: { name?: unknown } }).constructor?.name ?? 'Object');
+            suffix = `, but received an instance of ${received}`;
+        } else if (self !== undefined) {
+            suffix = `, but received type ${typeof self} (${String(self)})`;
+        }
         throw codedError(
-            new TypeError(`Expected this to be instanceof ${name}, but received an instance of ${received}`),
+            new TypeError(`Expected this to be instanceof ${name}${suffix}`),
             'ERR_INVALID_THIS',
         );
     }
@@ -198,8 +243,9 @@ function defineHashClass(name: string, size: number, createEngine: () => HashEng
 
     function update(this: unknown, input: unknown): unknown {
         const state = stateOf(this);
+        const bytes = inputBytes(input);
         assertOpen(state, 'update');
-        state.engine.update(inputBytes(input, 'expected blob or string or buffer'));
+        state.engine.update(bytes);
         return this;
     }
 
@@ -215,7 +261,7 @@ function defineHashClass(name: string, size: number, createEngine: () => HashEng
     }
 
     function hash(input: unknown, output?: unknown): unknown {
-        const bytes = inputBytes(input, 'expected blob, string or buffer');
+        const bytes = inputBytes(input);
         const render = planOutput(output, size, false);
         const hasher = createEngine();
         hasher.update(bytes);
