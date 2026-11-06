@@ -7,14 +7,16 @@ const arrayBufferByteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.protot
 const sharedArrayBufferByteLength = typeof SharedArrayBuffer === 'function'
     ? Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength')?.get
     : undefined;
+const Uint8ArrayConstructor = Uint8Array;
 const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
 const typedArrayBuffer = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')!.get!;
 const typedArrayByteOffset = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteOffset')!.get!;
 const typedArrayByteLength = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteLength')!.get!;
+const typedArrayIndexOf = Uint8Array.prototype.indexOf;
 const dataViewBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer')!.get!;
 const dataViewByteOffset = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset')!.get!;
 const dataViewByteLength = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength')!.get!;
-const emptyBytes = new Uint8Array();
+const emptyBytes = new Uint8ArrayConstructor();
 
 function invalidBuffer(): never {
     throw Object.assign(
@@ -42,7 +44,7 @@ function viewBytes(value: ArrayBufferView): Uint8Array {
         backing = Reflect.apply(typedArrayBuffer, value, []);
         const byteOffset = Reflect.apply(typedArrayByteOffset, value, []);
         const byteLength = Reflect.apply(typedArrayByteLength, value, []);
-        return byteLength === 0 ? emptyBytes : new Uint8Array(backing, byteOffset, byteLength);
+        return byteLength === 0 ? emptyBytes : new Uint8ArrayConstructor(backing, byteOffset, byteLength);
     } catch {
         try {
             backing = Reflect.apply(dataViewBuffer, value, []);
@@ -54,7 +56,7 @@ function viewBytes(value: ArrayBufferView): Uint8Array {
     try {
         const byteOffset = Reflect.apply(dataViewByteOffset, value, []);
         const byteLength = Reflect.apply(dataViewByteLength, value, []);
-        return byteLength === 0 ? emptyBytes : new Uint8Array(backing, byteOffset, byteLength);
+        return byteLength === 0 ? emptyBytes : new Uint8ArrayConstructor(backing, byteOffset, byteLength);
     } catch {
         // Bun treats a detached or out-of-bounds DataView as an empty window.
         return emptyBytes;
@@ -88,33 +90,40 @@ function toNumberPrimitive(value: unknown): unknown {
     throw new TypeError('No default value');
 }
 
-function normalizedOffset(value: unknown, byteLength: number): number {
+function numericOffset(value: unknown): number | bigint {
     const primitive = toNumberPrimitive(value);
-    if (typeof primitive === 'bigint') {
-        if (primitive < 0n) return 0;
-        if (primitive >= BigInt(byteLength)) return byteLength;
-        return Number(primitive);
-    }
+    if (typeof primitive === 'bigint') return primitive;
     if (typeof primitive === 'symbol') throw new TypeError('Cannot convert a symbol to a number');
+    return Number(primitive);
+}
 
-    const numericOffset = Number(primitive);
-    if (numericOffset === Infinity) return byteLength;
-    return !Number.isFinite(numericOffset) || numericOffset < 0
+function normalizedOffset(value: number | bigint, byteLength: number): number {
+    if (typeof value === 'bigint') {
+        if (value < 0n) return 0;
+        if (value >= BigInt(byteLength)) return byteLength;
+        return Number(value);
+    }
+    if (value === Infinity) return byteLength;
+    return !Number.isFinite(value) || value < 0
         ? 0
-        : Math.trunc(numericOffset);
+        : Math.trunc(value);
 }
 
 export const indexOfLine = (
     buffer: ArrayBufferLike | ArrayBufferView,
     offset: unknown = 0,
 ): number => {
-    let bytes: Uint8Array;
-    if (arrayBufferIsView(buffer)) {
-        bytes = viewBytes(buffer);
-    } else {
-        const byteLength = rawBufferByteLength(buffer);
-        if (byteLength === undefined) return invalidBuffer();
-        bytes = byteLength === 0 ? emptyBytes : new Uint8Array(buffer as ArrayBufferLike);
-    }
-    return bytes.indexOf(0x0a, normalizedOffset(offset, bytes.length));
+    const isView = arrayBufferIsView(buffer);
+    if (!isView && rawBufferByteLength(buffer) === undefined) return invalidBuffer();
+
+    // Coercion can detach or resize the backing buffer. Re-read the intrinsic
+    // window afterwards so length-tracking and out-of-bounds views match Bun.
+    const numeric = numericOffset(offset);
+    const bytes = isView
+        ? viewBytes(buffer as ArrayBufferView)
+        : (() => {
+            const byteLength = rawBufferByteLength(buffer)!;
+            return byteLength === 0 ? emptyBytes : new Uint8ArrayConstructor(buffer as ArrayBufferLike);
+        })();
+    return Reflect.apply(typedArrayIndexOf, bytes, [0x0a, normalizedOffset(numeric, bytes.length)]);
 };
