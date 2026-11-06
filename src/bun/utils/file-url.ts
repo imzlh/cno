@@ -39,6 +39,12 @@ function invalidScheme(): TypeError & { code: string } {
     return Object.assign(new TypeError('The URL must be of scheme file'), { code: 'ERR_INVALID_URL_SCHEME' });
 }
 
+function preprocessUrlString(value: string): string {
+    return value
+        .replace(/^[\u0000-\u0020]+|[\u0000-\u0020]+$/g, '')
+        .replace(/[\t\n\r]/g, '');
+}
+
 /** Convert a filesystem path to a file URL using the host platform's rules. */
 export const pathToFileURL = (path: string): URL => {
     if (typeof path === 'symbol') throw new TypeError('Cannot convert a symbol to a string');
@@ -48,6 +54,7 @@ export const pathToFileURL = (path: string): URL => {
 /** Bun accepts only file URLs, unlike cno's Node helper's runtime-specific schemes. */
 export const fileURLToPath = (url: URL | string): string => {
     if (typeof url === 'string') {
+        url = preprocessUrlString(url);
         if (!/^file:/i.test(url)) throw invalidScheme();
     } else if (!isURL(url)) {
         throw invalidUrlArgument(url);
