@@ -10,7 +10,7 @@ that every declared API exists at runtime.
 | Surface | Status | Notes |
 | --- | --- | --- |
 | `globalThis.Bun`, `bun` | Partial | One shared namespace for lifecycle, file, HTTP, process and the helpers listed below; not the full Bun namespace |
-| `Bun.fetch` | Partial | Reuses cno's global Web fetch; Bun-specific fetch options are rejected rather than silently ignored. |
+| `Bun.fetch` | Partial | Reuses cno's global Web fetch; unsupported Bun-specific options are rejected when set, while primitive `init` values follow Bun's no-options behavior. |
 | `Bun.isMainThread` | Supported | Reports whether the current runtime is a worker. |
 | `Bun.isStandaloneExecutable`, `Bun.embeddedFiles` | Supported | cno does not produce Bun `--compile` executables, so these feature-detection values are permanently `false` and a frozen empty list. |
 | `Bun.file`, `Bun.write` | Partial | Local paths, file URL objects and UTF-8 byte paths, lazy file blobs, slices, reads, stats, deletion, and instance writes. Invalid UTF-8 byte paths are rejected because the string-based host filesystem API cannot represent them safely. `Bun.write` accepts strings, bytes, Blob, Response, Request and ReadableStream bodies; `BunFile.write` also accepts Request and ReadableStream. File-descriptor destinations, remote/S3 files, mmap, and optimized sendfile are unsupported. Path-based FileSink/`writer()` and the fixed stdio handles are covered below. |
