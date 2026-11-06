@@ -1,5 +1,10 @@
 import { arrayBufferBackedBytes, sanitizeSurrogates } from '../../utils/bytes';
-import type { BunProcessFileSink } from './types';
+import {
+    readableStreamToBlob,
+    readableStreamToBytes,
+    readableStreamToJSON,
+    readableStreamToText,
+} from '../utils/streams';
 
 const engine = import.meta.use('engine');
 const PIPE_CHUNK_SIZE = 64 * 1024;
@@ -24,35 +29,36 @@ function inputBytes(value: string | ArrayBuffer | SharedArrayBuffer | ArrayBuffe
     return copy;
 }
 
-async function consumeBytes(stream: ReadableStream<Uint8Array>): Promise<Uint8Array<ArrayBuffer>> {
-    const reader = stream.getReader();
-    const chunks: Uint8Array[] = [];
-    let length = 0;
-    try {
-        while (true) {
-            const next = await reader.read();
-            if (next.done) break;
-            if (!(next.value instanceof Uint8Array)) {
-                throw new TypeError('Bun subprocess streams must contain Uint8Array chunks');
-            }
-            chunks.push(next.value);
-            length += next.value.byteLength;
-        }
-    } catch (error) {
-        await reader.cancel(error).catch(() => {});
-        throw error;
-    } finally {
-        reader.releaseLock();
-    }
+const readableStreamLocked = Object.getOwnPropertyDescriptor(ReadableStream.prototype, 'locked')!.get!;
 
-    const result = new Uint8Array(length);
-    let offset = 0;
-    for (const chunk of chunks) {
-        result.set(chunk, offset);
-        offset += chunk.byteLength;
+function assertReadableStream(value: unknown): asserts value is ReadableStream<unknown> {
+    try {
+        Reflect.apply(readableStreamLocked, value, []);
+    } catch {
+        const error = new TypeError('Value of "this" must be of type ReadableStream') as TypeError & { code: string };
+        error.code = 'ERR_INVALID_THIS';
+        throw error;
     }
-    return result;
 }
+
+const { blob, bytes, text, json } = {
+    blob(this: unknown): Promise<Blob> {
+        assertReadableStream(this);
+        return readableStreamToBlob(this);
+    },
+    bytes(this: unknown): Promise<Uint8Array<ArrayBuffer>> {
+        assertReadableStream(this);
+        return readableStreamToBytes(this as ReadableStream<ArrayBufferView | ArrayBufferLike | string>);
+    },
+    text(this: unknown): Promise<string> {
+        assertReadableStream(this);
+        return readableStreamToText(this as ReadableStream<ArrayBufferView | ArrayBufferLike | string>);
+    },
+    json<T = unknown>(this: unknown): Promise<T> {
+        assertReadableStream(this);
+        return readableStreamToJSON(this as ReadableStream<ArrayBufferView | ArrayBufferLike | string>) as Promise<T>;
+    },
+};
 
 type BunReadable = ReadableStream<Uint8Array<ArrayBuffer>> & {
     blob(): Promise<Blob>;
@@ -60,6 +66,13 @@ type BunReadable = ReadableStream<Uint8Array<ArrayBuffer>> & {
     text(): Promise<string>;
     json<T = unknown>(): Promise<T>;
 };
+
+Object.defineProperties(ReadableStream.prototype, {
+    blob: { value: blob, enumerable: true, writable: true, configurable: true },
+    bytes: { value: bytes, enumerable: true, writable: true, configurable: true },
+    json: { value: json, enumerable: true, writable: true, configurable: true },
+    text: { value: text, enumerable: true, writable: true, configurable: true },
+});
 
 /**
  * Drain native output eagerly. Waiting on `exited` before reading stdout must
@@ -70,7 +83,7 @@ export function readablePipe(
     countBytes?: (length: number) => void,
 ): BunReadable {
     let cancelled = false;
-    const stream = new ReadableStream<Uint8Array<ArrayBuffer>>({
+    return new ReadableStream<Uint8Array<ArrayBuffer>>({
         start(controller) {
             void (async () => {
                 try {
@@ -94,30 +107,26 @@ export function readablePipe(
             closeQuietly(pipe);
         },
     }) as BunReadable;
-
-    Object.defineProperties(stream, {
-        blob: {
-            value: async () => new Blob([await consumeBytes(stream)]),
-            configurable: true,
-        },
-        bytes: {
-            value: () => consumeBytes(stream),
-            configurable: true,
-        },
-        text: {
-            value: async () => engine.decodeString(await consumeBytes(stream)),
-            configurable: true,
-        },
-        json: {
-            value: async () => JSON.parse(engine.decodeString(await consumeBytes(stream))),
-            configurable: true,
-        },
-    });
-    return stream;
 }
 
 /** A serialized Bun FileSink facade over a native child-stdin pipe. */
-export class FileSink implements BunProcessFileSink {
+const fileSinkBrands = new WeakSet<object>();
+
+function assertFileSink(value: unknown): void {
+    if ((typeof value !== 'object' && typeof value !== 'function') || value === null || !fileSinkBrands.has(value)) {
+        const error = new TypeError('Expected FileSink') as TypeError & { code: string };
+        error.code = 'ERR_INVALID_THIS';
+        throw error;
+    }
+}
+
+function invalidSinkChunk(value: unknown): never {
+    const error = new TypeError('write() expects a string, ArrayBufferView, or ArrayBuffer') as TypeError & { code: string };
+    error.code = value === null || value === undefined ? 'ERR_STREAM_NULL_VALUES' : 'ERR_INVALID_ARG_TYPE';
+    throw error;
+}
+
+export class FileSink {
     #pipe: CModuleProcess.Pipe;
     #queue: Promise<void> = Promise.resolve();
     #buffered = 0;
@@ -125,26 +134,24 @@ export class FileSink implements BunProcessFileSink {
 
     constructor(pipe: CModuleProcess.Pipe) {
         this.#pipe = pipe;
+        fileSinkBrands.add(this);
     }
 
     start(options?: { highWaterMark?: number }): void {
-        if (options !== undefined && (typeof options !== 'object' || options === null)) {
-            throw new TypeError('FileSink.start options must be an object');
-        }
-        const mark = options?.highWaterMark;
-        if (mark !== undefined && (!Number.isFinite(mark) || mark < 0)) {
-            throw new RangeError('FileSink highWaterMark must be a non-negative number');
-        }
+        assertFileSink(this);
+        // Bun treats start() as an advisory hook and ignores every option value.
+        void options;
     }
 
-    write(chunk: string | ArrayBufferView | ArrayBuffer | SharedArrayBuffer): Promise<number> {
-        if (this.#ended) throw new Error('FileSink is already closed');
+    write(chunk: string | ArrayBufferView | ArrayBuffer | SharedArrayBuffer): Promise<number> | true {
+        assertFileSink(this);
         if (typeof chunk !== 'string' && !ArrayBuffer.isView(chunk)
             && !(chunk instanceof ArrayBuffer)
             && !(typeof SharedArrayBuffer !== 'undefined' && chunk instanceof SharedArrayBuffer)) {
-            throw new TypeError('FileSink.write expects a string or binary buffer');
+            invalidSinkChunk(chunk);
         }
         const bytes = inputBytes(chunk);
+        if (this.#ended) return true;
         this.#buffered += bytes.byteLength;
         const operation = this.#queue.then(async () => {
             let offset = 0;
@@ -158,28 +165,28 @@ export class FileSink implements BunProcessFileSink {
         return operation.then(() => bytes.byteLength);
     }
 
-    flush(): Promise<number> {
+    flush(_wait?: boolean): Promise<number> | true {
+        assertFileSink(this);
+        if (this.#ended) return true;
         const count = this.#buffered;
         this.#buffered = 0;
         return this.#queue.then(() => count);
     }
 
-    end(error?: Error): Promise<number> {
-        // Validate before touching state: a rejected argument must not leave the sink half-closed.
-        if (error !== undefined && !(error instanceof Error)) {
-            throw new TypeError('FileSink.end error must be an Error');
-        }
-        if (this.#ended) return Promise.resolve(0);
+    end(...args: [error?: Error | null]): Promise<number> | number {
+        assertFileSink(this);
+        if (this.#ended) return 0;
+        // Bun accepts this argument as close metadata; it does not reject it.
+        void args;
         this.#ended = true;
         const count = this.#buffered;
         this.#buffered = 0;
 
         const operation = this.#queue.then(async () => {
             try {
-                if (error) throw error;
                 await this.#pipe.shutdown();
             } finally {
-                // The child must observe EOF on every path, including end(error).
+                // The child must observe EOF even if shutdown races with teardown.
                 closeQuietly(this.#pipe);
             }
         }, (queueError) => {
@@ -198,6 +205,32 @@ export class FileSink implements BunProcessFileSink {
         try { this.#pipe.unref(); } catch { /* closed */ }
     }
 }
+
+const fileSinkConstructor = function FileSink(): never {
+    const error = new TypeError('Illegal constructor') as TypeError & { code: string };
+    error.code = 'ERR_ILLEGAL_CONSTRUCTOR';
+    throw error;
+};
+Object.defineProperty(fileSinkConstructor, 'prototype', { value: undefined });
+
+const fileSinkPrototype = FileSink.prototype;
+Object.defineProperty(fileSinkPrototype, 'constructor', {
+    value: fileSinkConstructor,
+    writable: true,
+    configurable: true,
+});
+for (const name of ['start', 'write', 'flush', 'end', 'ref', 'unref'] as const) {
+    Object.defineProperty(fileSinkPrototype, name, {
+        value: fileSinkPrototype[name],
+        enumerable: true,
+        writable: false,
+        configurable: false,
+    });
+}
+Object.defineProperty(fileSinkPrototype, Symbol.toStringTag, {
+    value: 'FileSink',
+    configurable: true,
+});
 
 export function isBufferInput(value: unknown): value is string | ArrayBuffer | SharedArrayBuffer | ArrayBufferView {
     return typeof value === 'string'
@@ -224,14 +257,14 @@ export async function pipeInput(source: ReadableStream<Uint8Array>, sink: FileSi
             } catch (writeError) {
                 // The child closed stdin early (EPIPE); that is not a spawn failure.
                 await reader.cancel(writeError).catch(() => {});
-                await sink.end().catch(() => {});
+                await Promise.resolve(sink.end()).catch(() => {});
                 return;
             }
         }
         await sink.end();
     } catch (error) {
         await reader.cancel(error).catch(() => {});
-        await sink.end(error instanceof Error ? error : new Error(String(error))).catch(() => {});
+        await Promise.resolve(sink.end(error instanceof Error ? error : new Error(String(error)))).catch(() => {});
         throw error;
     } finally {
         reader.releaseLock();
