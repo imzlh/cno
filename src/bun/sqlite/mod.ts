@@ -594,18 +594,9 @@ export class Statement<ReturnType = unknown> {
         return this.#database._statementResult(this.#safeIntegerMode);
     }
 
-    #iterate(...args: unknown[]): IterableIterator<ReturnType> {
+    *#iterate(...args: unknown[]): IterableIterator<ReturnType> {
         const rows = this.#all(...args);
-        let index = 0;
-        return {
-            next: (): IteratorResult<ReturnType> => {
-                if (index >= rows.length) return { done: true, value: undefined as never };
-                return { done: false, value: rows[index++] as ReturnType };
-            },
-            [Symbol.iterator](): IterableIterator<ReturnType> {
-                return this;
-            },
-        };
+        yield* rows;
     }
 
     [Symbol.iterator](): IterableIterator<ReturnType> {
