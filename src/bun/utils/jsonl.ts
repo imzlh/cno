@@ -9,7 +9,7 @@
  * or the window start when nothing was committed.
  */
 
-const engine = import.meta.use('engine');
+import { utf8Decode } from '../../utils/bytes';
 
 export type JSONLParseChunkResult = import('bun').JSONL.ParseChunkResult;
 export type JSONLInput = Parameters<typeof import('bun').JSONL.parse>[0];
@@ -19,6 +19,15 @@ const INCOMPLETE = -1;
 const ERROR = -2;
 // Single punctuation that the oracle leaves pending when it is the final byte.
 const PENDING_PUNCTUATION = new Set([',', ':', ';', '=', '(', ')', '.', '-', '[', '{', ']', '}'].map((c) => c.charCodeAt(0)));
+const arrayBufferIsView = ArrayBuffer.isView;
+const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
+const typedArrayBuffer = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')!.get!;
+const typedArrayByteOffset = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteOffset')!.get!;
+const typedArrayByteLength = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteLength')!.get!;
+const dataViewByteLength = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength')!.get!;
+const sharedArrayBufferByteLength = typeof SharedArrayBuffer === 'function'
+    ? Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength')?.get
+    : undefined;
 
 function isDigit(code: number): boolean {
     return code >= 0x30 && code <= 0x39;
@@ -55,7 +64,7 @@ class Scanner {
     slice(start: number, stop: number): string {
         return typeof this.source === 'string'
             ? this.source.slice(start, stop)
-            : engine.decodeString(this.source.subarray(start, stop));
+            : utf8Decode(this.source.subarray(start, stop));
     }
 
     skipSpace(index: number): number {
@@ -248,14 +257,39 @@ class Scanner {
 
 type NormalizedInput = { source: string | Uint8Array } | { invalid: true };
 
+function typedArrayBytes(input: ArrayBufferView): Uint8Array {
+    const buffer = Reflect.apply(typedArrayBuffer, input, []) as ArrayBufferLike;
+    const byteOffset = Reflect.apply(typedArrayByteOffset, input, []) as number;
+    const byteLength = Reflect.apply(typedArrayByteLength, input, []) as number;
+    const bytes = new Uint8Array(buffer, byteOffset, byteLength);
+    if (!sharedArrayBufferByteLength) return bytes;
+    try {
+        Reflect.apply(sharedArrayBufferByteLength, buffer, []);
+        // The scanner and JSON.parse must observe one stable shared-memory snapshot.
+        return Uint8Array.from(bytes);
+    } catch {
+        return bytes;
+    }
+}
+
 function normalize(input: unknown, method: string): NormalizedInput {
     if (typeof input === 'string') return { source: input };
-    if (ArrayBuffer.isView(input)) {
-        // DataView is rejected by the oracle; other views are read as raw bytes.
-        if (input instanceof DataView) return { invalid: true };
-        return { source: new Uint8Array(input.buffer, input.byteOffset, input.byteLength) };
+    if (arrayBufferIsView(input)) {
+        // The typed-array intrinsic rejects DataView without realm-sensitive instanceof.
+        try {
+            return { source: typedArrayBytes(input) };
+        } catch (error) {
+            // DataView is a valid view but not a TypedArray. A Proxy/detached
+            // TypedArray follows the intrinsic TypeError instead of being
+            // reclassified as malformed JSONL.
+            try {
+                Reflect.apply(dataViewByteLength, input, []);
+                return { invalid: true };
+            } catch {
+                throw error;
+            }
+        }
     }
-    if (input instanceof ArrayBuffer) return { invalid: true };
     if (input === null || input === undefined) {
         throw new TypeError(`JSONL.${method} requires a string argument`);
     }
@@ -317,21 +351,33 @@ function runScan(
 }
 
 /** Parses JSON Lines input and returns values, throwing only when no value precedes an error. */
-export function parseJSONL(input: JSONLInput | string): unknown[] {
+export const parseJSONL = (input: JSONLInput | string): unknown[] => {
     const normalized = normalize(input, 'parse');
     if ('invalid' in normalized) throw new SyntaxError(FAILURE_MESSAGE);
     const result = runScan(normalized.source, 0, undefined);
     if (result.error && result.values.length === 0) throw result.error;
     return result.values;
-}
+};
 
 /** Streaming parse. Never throws for malformed input; reports it through `error`. */
-export function parseJSONLChunk(input: JSONLInput | string, start?: number, end?: number): JSONLParseChunkResult {
+export const parseJSONLChunk = (input: JSONLInput | string, start?: number, end?: number): JSONLParseChunkResult => {
     const normalized = normalize(input, 'parseChunk');
     if ('invalid' in normalized) {
         return { values: [], read: 0, done: false, error: new SyntaxError(FAILURE_MESSAGE) };
     }
     return runScan(normalized.source, start, end);
-}
+};
 
-export const JSONL = { parse: parseJSONL, parseChunk: parseJSONLChunk };
+Object.defineProperties(parseJSONL, {
+    name: { value: 'parse' },
+});
+Object.defineProperties(parseJSONLChunk, {
+    name: { value: 'parseChunk' },
+    length: { value: 1 },
+});
+
+export const JSONL = Object.defineProperties({}, {
+    parse: { value: parseJSONL, writable: true, enumerable: true, configurable: false },
+    parseChunk: { value: parseJSONLChunk, writable: true, enumerable: true, configurable: false },
+    [Symbol.toStringTag]: { value: 'JSONL', configurable: true },
+}) as { parse: typeof parseJSONL; parseChunk: typeof parseJSONLChunk };
