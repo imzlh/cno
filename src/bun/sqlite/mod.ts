@@ -534,6 +534,7 @@ export class Statement<ReturnType = unknown> {
     }
 
     get columnTypes(): Array<'INTEGER' | 'FLOAT' | 'TEXT' | 'BLOB' | 'NULL' | null> {
+        this.assertUsable();
         return unsupported('Statement.columnTypes');
     }
 
@@ -545,11 +546,11 @@ export class Statement<ReturnType = unknown> {
     safeIntegers(): boolean;
     safeIntegers(enabled: boolean): this;
     safeIntegers(enabled?: boolean): boolean | this {
-        if (enabled === undefined) return this.safeIntegerMode;
-        if (typeof enabled !== 'boolean') throw new TypeError('safeIntegers must be a boolean');
-        this.safeIntegerMode = enabled;
         this.assertUsable();
-        nativeCall(() => this.statement.setReadBigInts(enabled));
+        if (enabled === undefined) return this.safeIntegerMode;
+        const normalized = !!enabled;
+        nativeCall(() => this.statement.setReadBigInts(normalized));
+        this.safeIntegerMode = normalized;
         return this;
     }
 
@@ -603,6 +604,7 @@ export class Statement<ReturnType = unknown> {
     }
 
     raw(..._args: unknown[]): Array<Array<Uint8Array | null>> {
+        this.assertUsable();
         unsupported('Statement.raw');
     }
 
