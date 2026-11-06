@@ -84,7 +84,6 @@ export class FileSink {
     #buffered = 0;
     #fd: number | undefined;
     #ended = false;
-    #highWaterMark: number | undefined;
 
     constructor(target: SinkTarget, open = false) {
         this.#target = target;
@@ -94,10 +93,7 @@ export class FileSink {
     start(options?: { highWaterMark?: number } | null): void {
         // Bun's sink.start() is an advisory reconfiguration hook. It accepts
         // any value and does not discard already buffered data.
-        this.#highWaterMark = typeof options?.highWaterMark === 'number'
-            && Number.isFinite(options.highWaterMark) && options.highWaterMark > 0
-            ? options.highWaterMark
-            : undefined;
+        void options;
     }
 
     write(chunk: string | ArrayBufferView | ArrayBuffer | SharedArrayBuffer): number {
@@ -105,11 +101,6 @@ export class FileSink {
         const bytes = chunkBytes(chunk);
         this.#pending.push({ chunk: bytes, offset: 0 });
         this.#buffered += bytes.byteLength;
-        // Bun auto-flushes when the high water mark is reached. Without a
-        // mark, data stays buffered until flush()/end().
-        if (this.#highWaterMark !== undefined && this.#buffered >= this.#highWaterMark) {
-            this.flush();
-        }
         return bytes.byteLength;
     }
 
