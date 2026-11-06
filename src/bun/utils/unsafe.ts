@@ -67,9 +67,12 @@ function byteView(value: unknown): Uint8Array {
  * Safe copying fallback for Bun's zero-copy cast. The cno engine always creates
  * an owned JavaScript string, so callers do not need to retain the input view.
  */
-export function arrayBufferToString(buffer: Uint8Array<ArrayBuffer> | ArrayBufferLike): string;
-export function arrayBufferToString(buffer: ArrayBufferView): string;
-export function arrayBufferToString(buffer: unknown): string {
+interface ArrayBufferToString {
+    (buffer: Uint8Array<ArrayBuffer> | ArrayBufferLike): string;
+    (buffer: ArrayBufferView): string;
+}
+
+export const arrayBufferToString = ((buffer: unknown): string => {
     const tag = typedArrayTag(buffer);
     if ((tag === 'Uint16Array' || tag === 'Int16Array')
         && hasTypedArrayBrand(uint16ByteLength, buffer)) {
@@ -83,19 +86,19 @@ export function arrayBufferToString(buffer: unknown): string {
     }
 
     return algorithm.latin1DecodeLoose(byteView(buffer));
-}
+}) as ArrayBufferToString;
 
 /** Best-effort heap trim request; the host has no separate idle trim hook. */
-export function shrink(): void {
+export const shrink = (): void => {
     engine.gc.run();
-}
+};
 
 /**
  * Returns Linux proportional set size when the kernel exposes its compact
  * rollup view. Other platforms deliberately return undefined rather than
  * substituting RSS or another non-equivalent metric.
  */
-export function memoryFootprint(): number | undefined {
+export const memoryFootprint = (): number | undefined => {
     if (os.platform !== 'linux') return undefined;
 
     try {
@@ -111,7 +114,7 @@ export function memoryFootprint(): number | undefined {
         // Sandboxes and older kernels may not expose smaps_rollup.
         return undefined;
     }
-}
+};
 
 /** Partial, intentionally conservative subset of Bun.unsafe. */
 export const unsafe = Object.freeze({ memoryFootprint, arrayBufferToString });
