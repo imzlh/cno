@@ -4,9 +4,11 @@
  * Behavior was derived from the Bun 1.4.4 oracle, not from documentation alone.
  * Known deviations are listed in the report that accompanies this file.
  *
- * Offsets: string input counts UTF-16 code units; byte input counts bytes.
- * `read` is the absolute offset just past the last committed top-level value,
- * or the window start when nothing was committed.
+ * Offsets: string input counts UTF-16 code units. Byte `start`/`end` offsets
+ * address the original input, while `read` counts the replacement-decoded
+ * UTF-8 bytes and can exceed the original length for malformed input.
+ * `read` is just past the last committed value, or the window start when
+ * nothing was committed.
  */
 
 import { utf8Decode } from '../../utils/bytes';
@@ -43,6 +45,55 @@ function isHex(code: number): boolean {
 
 function isJSONSpace(code: number): boolean {
     return code === 0x20 || code === 0x09 || code === 0x0a || code === 0x0d;
+}
+
+/** Byte-length growth from WHATWG UTF-8 replacement decoding and re-encoding. */
+function utf8ReplacementDelta(bytes: Uint8Array, start: number, end: number): number {
+    let delta = 0;
+    let index = start;
+    while (index < end) {
+        const lead = bytes[index];
+        if (lead <= 0x7f) {
+            index++;
+            continue;
+        }
+
+        let length = 0;
+        let secondLow = 0x80;
+        let secondHigh = 0xbf;
+        if (lead >= 0xc2 && lead <= 0xdf) {
+            length = 2;
+        } else if (lead >= 0xe0 && lead <= 0xef) {
+            length = 3;
+            if (lead === 0xe0) secondLow = 0xa0;
+            else if (lead === 0xed) secondHigh = 0x9f;
+        } else if (lead >= 0xf0 && lead <= 0xf4) {
+            length = 4;
+            if (lead === 0xf0) secondLow = 0x90;
+            else if (lead === 0xf4) secondHigh = 0x8f;
+        }
+
+        let accepted = 1;
+        if (length !== 0) {
+            while (accepted < length && index + accepted < end) {
+                const byte = bytes[index + accepted];
+                const valid = accepted === 1
+                    ? byte >= secondLow && byte <= secondHigh
+                    : byte >= 0x80 && byte <= 0xbf;
+                if (!valid) break;
+                accepted++;
+            }
+            if (accepted === length) {
+                index += length;
+                continue;
+            }
+        }
+
+        // A maximal invalid subpart becomes U+FFFD, whose UTF-8 length is 3.
+        delta += 3 - accepted;
+        index += accepted;
+    }
+    return delta;
 }
 
 /** Scans one window of input. Scanner methods return an end offset, INCOMPLETE, or ERROR. */
@@ -315,6 +366,14 @@ function runScan(
 
     let read = from;
     let position = from;
+    let mappedThrough = from;
+    let byteReadDelta = 0;
+    const committedRead = (rawEnd: number): number => {
+        if (typeof source === 'string') return rawEnd;
+        byteReadDelta += utf8ReplacementDelta(source, mappedThrough, rawEnd);
+        mappedThrough = rawEnd;
+        return rawEnd + byteReadDelta;
+    };
     if (typeof source !== 'string' && from === 0 && stop >= 3 &&
         source[0] === 0xef && source[1] === 0xbb && source[2] === 0xbf) {
         // The oracle skips a UTF-8 byte order mark at the start of byte input.
@@ -332,12 +391,12 @@ function runScan(
         if (next === ERROR) {
             if (scanner.partialEnd >= 0) {
                 values.push(JSON.parse(scanner.slice(position, scanner.partialEnd)));
-                read = scanner.partialEnd;
+                read = committedRead(scanner.partialEnd);
             }
             return { values, read, done: false, error: new SyntaxError(FAILURE_MESSAGE) };
         }
         values.push(JSON.parse(scanner.slice(position, next)));
-        read = next;
+        read = committedRead(next);
         // Top-level values are separated by a line feed. Other trailing bytes are an error.
         let separator = next;
         while (separator < stop && (scanner.code(separator) === 0x20 ||
