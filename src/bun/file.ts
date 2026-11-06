@@ -24,6 +24,8 @@ const typedArrayByteLength = Object.getOwnPropertyDescriptor(typedArrayPrototype
 const dataViewBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer')!.get!;
 const dataViewByteOffset = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset')!.get!;
 const dataViewByteLength = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength')!.get!;
+const blobSlice = Blob.prototype.slice;
+const blobStream = Blob.prototype.stream;
 // Use the host's global Blob and its registered byte protocol. Importing
 // webapi/formdata would bundle a second Blob into the payload, and that module
 // overwrites globalThis.Blob/File/FormData when evaluated.
@@ -442,7 +444,10 @@ export class BunFile extends Blob implements BunFileLike {
         return JSON.parse(await this.text()) as T;
     }
 
-    stream(): ReadableStream<Uint8Array<ArrayBuffer>> {
+    stream(_chunkSize?: number): ReadableStream<Uint8Array<ArrayBuffer>> {
+        if (!filePaths.has(this)) {
+            return Reflect.apply(blobStream, this, arguments) as ReadableStream<Uint8Array<ArrayBuffer>>;
+        }
         const source = this;
         let opened: Awaited<ReturnType<typeof openReadableFile>> | undefined;
         let active: Promise<void> | undefined;
@@ -509,7 +514,10 @@ export class BunFile extends Blob implements BunFileLike {
     slice(begin?: number, end?: number, contentType?: string): BunFile;
     slice(begin?: number, contentType?: string): BunFile;
     slice(contentType?: string): BunFile;
-    slice(beginOrType?: number | string, endOrType?: number | string, type?: string): BunFile {
+    slice(beginOrType?: number | string, endOrType?: number | string, type: string | undefined = undefined): BunFile {
+        if (!filePaths.has(this)) {
+            return Reflect.apply(blobSlice, this, arguments) as BunFile;
+        }
         let begin: number | undefined;
         let end: number | undefined;
         let contentType: string | undefined = type;
