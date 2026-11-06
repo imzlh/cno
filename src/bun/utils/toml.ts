@@ -1,4 +1,20 @@
+import { sanitizeSurrogates, utf8Decode } from '../../utils/bytes';
+
 const engine = import.meta.use('engine');
+
+const sharedArrayBufferByteLengthGetter = typeof SharedArrayBuffer === 'function'
+    ? Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength')?.get
+    : undefined;
+
+function hasSharedArrayBufferSlot(value: unknown): value is SharedArrayBuffer {
+    if (!sharedArrayBufferByteLengthGetter || value === null || (typeof value !== 'object' && typeof value !== 'function')) return false;
+    try {
+        Reflect.apply(sharedArrayBufferByteLengthGetter, value, []);
+        return true;
+    } catch {
+        return false;
+    }
+}
 
 const TOML_TEMPORAL = Symbol('cno.bun.toml.temporal');
 
@@ -21,7 +37,8 @@ function parseTomlTemporal(value: string): TomlTemporalValue {
     if (match[9] !== undefined) {
         const hour = Number(match[9]), minute = Number(match[10]), second = Number(match[11]);
         if (hour > 23 || minute > 59 || second > 59) throw new RangeError('Invalid time');
-        return new TomlTemporalValue(`${match[9]}:${match[10]}:${match[11]}${match[12] ?? ''}`);
+        const fraction = match[12]?.replace(/0+$/, '').replace(/^\.$/, '') ?? '';
+        return new TomlTemporalValue(`${match[9]}:${match[10]}:${match[11]}${fraction}`);
     }
     const year = Number(match[1]), month = Number(match[2]), day = Number(match[3]);
     if (!validDate(year, month, day)) throw new RangeError('Invalid date');
@@ -29,11 +46,13 @@ function parseTomlTemporal(value: string): TomlTemporalValue {
     if (match[4] === undefined) return new TomlTemporalValue(date);
     const hour = Number(match[4]), minute = Number(match[5]), second = Number(match[6]);
     if (hour > 23 || minute > 59 || second > 59) throw new RangeError('Invalid time');
-    const local = `${date}T${match[4]}:${match[5]}:${match[6]}${match[7] ?? ''}`;
+    const fraction = match[7]?.replace(/0+$/, '').replace(/^\.$/, '') ?? '';
+    const local = `${date}T${match[4]}:${match[5]}:${match[6]}${fraction}`;
     if (!match[8]) return new TomlTemporalValue(local);
-    const epoch = Date.parse(local + match[8]);
+    const epoch = Date.parse(`${date}T${match[4]}:${match[5]}:${match[6]}${match[8]}`);
     if (!Number.isFinite(epoch)) throw new RangeError('Invalid instant');
-    return new TomlTemporalValue(new Date(epoch).toISOString().replace('.000Z', 'Z'));
+    const instant = new Date(epoch).toISOString();
+    return new TomlTemporalValue(fraction ? instant.replace('.000Z', `${fraction}Z`) : instant.replace('.000Z', 'Z'));
 }
 
 const own = (o: object, k: string) => Object.prototype.hasOwnProperty.call(o, k);
@@ -121,13 +140,23 @@ class Parser {
 export function parseTOML(input: unknown): Record<string, any> {
     if (input == null || typeof input === 'symbol') throw new TypeError('input must be a string, ArrayBuffer, ArrayBufferView or Blob');
     let s: string;
-    if (input instanceof ArrayBuffer) s = engine.decodeString(input);
-    else if (ArrayBuffer.isView(input)) s = engine.decodeString(new Uint8Array(input.buffer, input.byteOffset, input.byteLength));
-    else s = String(input);
+    if (engine.isArrayBuffer(input) || hasSharedArrayBufferSlot(input) || ArrayBuffer.isView(input)) {
+        let bytes = ArrayBuffer.isView(input)
+            ? new Uint8Array(input.buffer, input.byteOffset, input.byteLength)
+            : new Uint8Array(input as ArrayBufferLike);
+        // Stabilize shared memory between validation and decoding while retaining a view's bounds.
+        if (hasSharedArrayBufferSlot(bytes.buffer)) bytes = Uint8Array.from(bytes);
+        try {
+            s = utf8Decode(bytes, true);
+        } catch (error) {
+            if (error instanceof TypeError) return fail('Invalid UTF-8 byte sequence');
+            throw error;
+        }
+    } else s = sanitizeSurrogates(String(input));
     return new Parser(s).parse();
 }
 
-const quoteText = (text: string) => JSON.stringify(text).replace(/\x7f/g, '\\u007f');
+const quoteText = (text: string) => JSON.stringify(sanitizeSurrogates(text)).replace(/\x7f/g, '\\u007f');
 const keyText = (key: string) => /^[A-Za-z0-9_-]+$/.test(key) ? key : quoteText(key);
 const temporalValue = (value: any): string | undefined => {
     if (value instanceof Date) return value.toISOString().replace(/\.000Z$/, 'Z');
