@@ -298,8 +298,8 @@ export class BunFile extends Blob implements BunFileLike {
     }
 
     /**
-     * Incremental writer for this path. The sink opens (and truncates) the
-     * file on its first flush and owns the descriptor until end().
+     * Incremental writer for this path. The sink opens immediately, overwrites
+     * from byte zero without truncating a longer file, and owns the descriptor.
      */
     writer(options?: { highWaterMark?: number }): BunFileSink {
         if (options !== undefined && options !== null && !isObject(options)) {
