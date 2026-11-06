@@ -301,6 +301,15 @@ class BunServeServerImpl implements BunServeServer {
 
     reload(options: BunServeReloadOptions): BunServeServer {
         const parsed = parseReloadOptions(options, this.stopPromise !== undefined);
+        // User getters and Response.clone() can re-enter stop() while parsing.
+        // Never install (or retain) a route table compiled after shutdown began.
+        if (this.stopPromise !== undefined) {
+            parsed.routes?.dispose();
+            if (parsed.routes !== undefined) {
+                throw new TypeError('Bun.serve: cannot replace routes on a stopped server.');
+            }
+            return this;
+        }
         const previousRoutes = this.routes;
         // Validation is complete before any live handler or route table is changed.
         if (parsed.fetch !== undefined) this.fetchHandler = parsed.fetch;

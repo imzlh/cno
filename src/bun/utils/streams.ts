@@ -1,4 +1,4 @@
-import { utf8Decode } from '../../utils/bytes';
+import { sanitizeSurrogates, utf8Decode } from '../../utils/bytes';
 
 const engine = import.meta.use('engine');
 
@@ -60,7 +60,9 @@ export async function readableStreamToBlob(stream: ReadableStream<StreamChunk>):
 
 export async function readableStreamToArrayBuffer(stream: ReadableStream<StreamChunk>): Promise<ArrayBuffer> {
     const chunks = await readChunks(stream);
-    return concatArrayBuffers(chunks.map(chunk => typeof chunk === 'string' ? engine.encodeString(chunk) : bytesOf(chunk)));
+    return concatArrayBuffers(chunks.map(chunk => typeof chunk === 'string'
+        ? engine.encodeString(sanitizeSurrogates(chunk))
+        : bytesOf(chunk)));
 }
 
 export async function readableStreamToBytes(stream: ReadableStream<StreamChunk>): Promise<Uint8Array<ArrayBuffer>> {
@@ -71,30 +73,43 @@ export async function readableStreamToText(stream: ReadableStream<StreamChunk>):
     const chunks = await readChunks(stream);
     let result = '';
     let binary: Uint8Array[] = [];
+    let strings = '';
     let firstRun = true;
-    const flush = () => {
-        if (binary.length) {
-            let bytes = new Uint8Array(concatArrayBuffers(binary));
-            if (firstRun) {
-                // TextDecoder strips one leading BOM at the stream start; it
-                // may span chunks because the run is concatenated first.
-                if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) bytes = bytes.subarray(3);
-            }
+    const stripBom = (value: string): string => value.charCodeAt(0) === 0xFEFF ? value.slice(1) : value;
+    const append = (value: string, finalString = false): void => {
+        if (firstRun) {
+            value = stripBom(value);
             firstRun = false;
-            // WHATWG replacement semantics for invalid sequences.
-            result += utf8Decode(bytes);
-            binary = [];
         }
+        if (finalString) value = stripBom(value);
+        result += value;
+    };
+    const flushBinary = (): void => {
+        if (binary.length === 0) return;
+        // WHATWG replacement semantics for invalid sequences; joining the run
+        // first lets a UTF-8 sequence (including the initial BOM) span chunks.
+        append(utf8Decode(new Uint8Array(concatArrayBuffers(binary))));
+        binary = [];
+    };
+    const flushStrings = (final = false): void => {
+        if (strings.length === 0) return;
+        append(strings, final);
+        strings = '';
     };
     for (const chunk of chunks) {
         if (typeof chunk === 'string') {
-            flush();
-            result += chunk;
+            if (chunk.length === 0) continue;
+            flushBinary();
+            strings += chunk;
         } else {
-            binary.push(bytesOf(chunk));
+            const bytes = bytesOf(chunk);
+            if (bytes.byteLength === 0) continue;
+            flushStrings();
+            binary.push(bytes);
         }
     }
-    flush();
+    if (binary.length !== 0) flushBinary();
+    else flushStrings(true);
     return result;
 }
 

@@ -12,9 +12,10 @@
  * trailing slash serves the directory's index.html, and missing files 404.
  */
 
-import { join } from '../utils/path';
+import { isPathWithin, join } from '../utils/path';
 import { realpath, stat as nodeStat } from '../node/fs/_promises';
 import { file as newBunFile } from './file';
+import { openValidatedReadableFile, type OpenedReadableFile } from './opened-file';
 import { setServeRouteValueResolver } from './serve-routes';
 import type { BunServeHandler } from './serve';
 import type { ResolvedRouteValue } from './serve-routes';
@@ -38,15 +39,18 @@ function canonicalRemainder(remainder: string): string | null {
     if (remainder.includes('%')) {
         if (/%(?:2f|5c)/i.test(remainder)) return null;
         if (/%(?![0-9A-Fa-f]{2})/.test(remainder)) return null;
-        // Reject escapes of characters that can appear literally (unreserved
-        // ASCII, RFC 3986): the router and exclusion table match the raw
-        // remainder, so `%69ndex.html` must not alias `index.html`.
+        // Reject escapes of characters that can appear literally in a path
+        // segment: the router and exclusion table match the raw remainder, so
+        // `%69ndex.html` and `secret%40.txt` must not alias exact routes.
         for (const match of remainder.matchAll(/%([0-9A-Fa-f]{2})/g)) {
             const code = parseInt(match[1]!, 16);
             const unreserved = (code >= 0x41 && code <= 0x5A) || (code >= 0x61 && code <= 0x7A)
                 || (code >= 0x30 && code <= 0x39) || code === 0x2D || code === 0x2E
                 || code === 0x5F || code === 0x7E;
-            if (unreserved) return null;
+            const literalPunctuation = code === 0x21 || code === 0x24 || code === 0x26
+                || (code >= 0x27 && code <= 0x2C) || code === 0x3A || code === 0x3B
+                || code === 0x3D || code === 0x40;
+            if (unreserved || literalPunctuation) return null;
         }
         try {
             remainder = decodeURIComponent(remainder);
@@ -55,7 +59,7 @@ function canonicalRemainder(remainder: string): string | null {
             return null;
         }
     }
-    if (remainder.includes('\\') || remainder.includes('\0')) return null;
+    if (remainder.includes('\\') || remainder.includes('\0') || remainder.startsWith('/')) return null;
     if (remainder === '') return remainder;
     // A double slash is an empty segment wherever it sits — including the
     // root-index form `//`, which must not alias the directory itself.
@@ -84,12 +88,9 @@ async function realString(path: string): Promise<string | undefined> {
 async function resolveWithin(root: string, path: string): Promise<string | undefined> {
     const resolved = await realString(path);
     if (!resolved) return undefined;
-    // Windows realpath returns backslash separators; normalize both sides so
-    // containment compares the path, not the host's separator choice.
-    const normalizedRoot = root.replaceAll('\\', '/');
-    const normalizedResolved = resolved.replaceAll('\\', '/');
-    const prefix = normalizedRoot.endsWith('/') ? normalizedRoot : `${normalizedRoot}/`;
-    if (normalizedResolved !== normalizedRoot && !normalizedResolved.startsWith(prefix)) return undefined;
+    // The shared helper is separator- and case-aware without treating a
+    // backslash in a POSIX filename as a directory boundary.
+    if (!isPathWithin(root, resolved)) return undefined;
     return resolved;
 }
 
@@ -120,9 +121,10 @@ function notModified(request: Request, etag: string, mtime: Date): boolean {
     const ifNoneMatch = request.headers.get('if-none-match');
     if (ifNoneMatch !== null) {
         // The client echoes the validator as sent (weak form) or as a strong
-        // tag; either match — or a wildcard — means "send 304".
+        // tag. Bun accepts '*' only when it is the whole field value.
         const strong = `"${etag.slice(3, -1)}"`;
-        return validatorList(ifNoneMatch).some(tag => tag === '*' || tag === etag || tag === strong);
+        const trimmed = ifNoneMatch.trim();
+        return trimmed === '*' || validatorList(ifNoneMatch).some(tag => tag === etag || tag === strong);
     }
     const ifModifiedSince = request.headers.get('if-modified-since');
     if (ifModifiedSince !== null) {
@@ -151,88 +153,110 @@ function parseRange(header: string, size: number): { start: number; end: number 
     if (startText === '') {
         // Suffix form: the final N bytes; more bytes than the file has yields
         // the whole file.
-        if (!/^\d+$/.test(endText) || endText === '0') return 'ignore';
+        if (!/^\d+$/.test(endText)) return 'ignore';
         const suffix = Number(endText);
-        if (size === 0) return 'unsatisfiable';
+        if (!Number.isSafeInteger(suffix)) return 'ignore';
+        if (suffix === 0) return 'unsatisfiable';
+        // Bun ignores a non-zero suffix range for an empty representation,
+        // while the explicit zero suffix remains a 416 above.
+        if (size === 0) return 'ignore';
         const start = Math.max(0, size - suffix);
         return { start, end: size - 1 };
     }
     if (!/^\d+$/.test(startText)) return 'ignore';
     const start = Number(startText);
-    if (start >= size) return 'unsatisfiable';
-    if (endText === '') return { start, end: size - 1 };
+    if (!Number.isSafeInteger(start)) return 'ignore';
+    if (endText === '') return start >= size ? 'unsatisfiable' : { start, end: size - 1 };
     if (!/^\d+$/.test(endText)) return 'ignore';
-    const end = Math.min(Number(endText), size - 1);
+    const requestedEnd = Number(endText);
+    if (!Number.isSafeInteger(requestedEnd)) return 'ignore';
+    if (start >= size) return 'unsatisfiable';
+    const end = Math.min(requestedEnd, size - 1);
     if (end < start) return 'ignore';
     return { start, end };
 }
 
-/** Wrap a stream so only the [start, end] byte window passes through; the
- *  upstream is cancelled once the window has been emitted. */
-function sliceStream(source: ReadableStream<Uint8Array>, start: number, end: number): ReadableStream<Uint8Array> {
-    let position = 0;
-    let done = false;
-    return source.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
-        transform(chunk, controller) {
-            if (done) return;
-            const chunkEnd = position + chunk.byteLength;
-            if (chunkEnd <= start || position > end) {
-                position = chunkEnd;
-                return;
-            }
-            const from = Math.max(0, start - position);
-            const to = Math.min(chunk.byteLength, end - position + 1);
-            if (to > from) controller.enqueue(chunk.subarray(from, to));
-            position = chunkEnd;
-            if (position > end) {
-                done = true;
-                void source.cancel().catch(() => {});
-            }
-        },
-        flush() { done = true; },
-    }));
+/** If-Range only enables ranges for a matching strong tag or fresh date. Our
+ *  generated ETag is weak, so only the date form can currently match. */
+function ifRangeMatches(request: Request, mtime: Date): boolean {
+    const value = request.headers.get('if-range');
+    if (value === null) return true;
+    const trimmed = value.trim();
+    if (trimmed.startsWith('"') || /^W\//i.test(trimmed)) return false;
+    // Bun accepts the two HTTP date forms below; Date.parse's ISO extensions
+    // are too broad for If-Range.
+    const imfFixdate = /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT$/;
+    const rfc850 = /^(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), \d{2}-(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-\d{2} \d{2}:\d{2}:\d{2} GMT$/;
+    if (!imfFixdate.test(trimmed) && !rfc850.test(trimmed)) {
+        return false;
+    }
+    const since = Date.parse(trimmed);
+    return Number.isFinite(since) && Math.floor(mtime.getTime() / 1000) * 1000 === since;
 }
 
-function fileResponse(request: Request, path: string, mtime: Date, size: number): Response {
-    const target = newBunFile(path);
-    const headers = new Headers();
-    if (target.type) headers.set('content-type', target.type);
-    headers.set('last-modified', mtime.toUTCString());
-    // Weak ETag over the stat pair; the value drives the conditional GET below
-    // and manual inspection.
-    const etag = `W/"${size.toString(16)}-${Math.trunc(mtime.getTime()).toString(16)}"`;
-    headers.set('etag', etag);
-    // Pin content-length like Bun's static serving so the host can skip
-    // chunked framing — but only for sizes the stat can trust: procfs-style
-    // files report size 0 while streaming real bytes, and a pinned 0 would
-    // truncate them. Size 0 keeps EOF framing, which also serves empty files.
-    if (size > 0) headers.set('content-length', String(size));
-    if (notModified(request, etag, mtime)) {
-        headers.delete('content-length');
-        return new Response(null, { status: 304, headers });
-    }
-    const rangeHeader = request.headers.get('range');
-    if (rangeHeader !== null) {
-        const range = parseRange(rangeHeader, size);
-        if (range === 'unsatisfiable') {
-            const failHeaders = new Headers({ 'content-range': `bytes */${size}` });
-            return new Response(null, { status: 416, headers: failHeaders });
+async function fileResponse(request: Request, path: string, target: OpenedReadableFile): Promise<Response> {
+    try {
+        const mtime = target.stat.mtim;
+        const size = target.stat.size;
+        const headers = new Headers();
+        const contentType = newBunFile(path).type;
+        if (contentType) headers.set('content-type', contentType);
+        headers.set('last-modified', mtime.toUTCString());
+
+        // A pseudo-file may advertise a positive but fictional st_size. In that
+        // case total-size validators and ranges would be wrong, so serve to EOF.
+        if (!target.sizeKnown) {
+            if (request.method === 'HEAD') {
+                await target.close();
+                return new Response(null, { status: 200, headers });
+            }
+            return new Response(target.stream(), { status: 200, headers });
         }
-        if (range !== 'ignore') {
-            const { start, end } = range;
-            const rangeHeaders = new Headers(headers);
-            rangeHeaders.set('content-range', `bytes ${start}-${end}/${size}`);
-            const length = end - start + 1;
-            if (size > 0 || length > 0) rangeHeaders.set('content-length', String(length));
-            if (request.method === 'HEAD') return new Response(null, { status: 206, headers: rangeHeaders });
-            return new Response(sliceStream(target.stream(), start, end), { status: 206, headers: rangeHeaders });
+
+        // Weak ETag over the stat pair; the value drives the conditional GET below
+        // and manual inspection.
+        const etag = `W/"${size.toString(16)}-${Math.trunc(mtime.getTime()).toString(16)}"`;
+        headers.set('etag', etag);
+        headers.set('content-length', String(size));
+        if (notModified(request, etag, mtime)) {
+            headers.delete('content-length');
+            await target.close();
+            return new Response(null, { status: 304, headers });
         }
+        const rangeHeader = request.headers.get('range');
+        if (rangeHeader !== null && ifRangeMatches(request, mtime)) {
+            const range = parseRange(rangeHeader, size);
+            if (range === 'unsatisfiable') {
+                const failHeaders = new Headers({ 'content-range': `bytes */${size}` });
+                await target.close();
+                return new Response(null, { status: 416, headers: failHeaders });
+            }
+            if (range !== 'ignore') {
+                const { start, end } = range;
+                const rangeHeaders = new Headers(headers);
+                rangeHeaders.set('content-range', `bytes ${start}-${end}/${size}`);
+                const length = end - start + 1;
+                rangeHeaders.set('content-length', String(length));
+                if (request.method === 'HEAD') {
+                    await target.close();
+                    return new Response(null, { status: 206, headers: rangeHeaders });
+                }
+                return new Response(target.stream(start, end + 1), { status: 206, headers: rangeHeaders });
+            }
+        }
+        if (request.method === 'HEAD') {
+            await target.close();
+            return new Response(null, { status: 200, headers });
+        }
+        return new Response(target.stream(), { status: 200, headers });
+    } catch (error) {
+        await target.close();
+        throw error;
     }
-    if (request.method === 'HEAD') return new Response(null, { status: 200, headers });
-    return new Response(target.stream(), { status: 200, headers });
 }
 
 function serveDirectory(prefix: string, dir: string): ResolvedRouteValue {
+    const rootPromise = realString(dir);
     const handler: BunServeHandler = async request => {
         const url = new URL(request.url);
         const pathname = url.pathname;
@@ -240,10 +264,11 @@ function serveDirectory(prefix: string, dir: string): ResolvedRouteValue {
         const remainder = canonicalRemainder(pathname.slice(prefix.length));
         if (remainder === null) return notFound();
 
-        let root: string | undefined;
-        root = await realString(dir);
+        const root = await rootPromise;
         if (!root) return notFound();
-        const within = await resolveWithin(root, join(dir, remainder));
+        // Build candidates from the canonical root captured for this request;
+        // a mutable relative path or root symlink must not redefine it later.
+        const within = await resolveWithin(root, join(root, remainder));
         if (!within) return notFound();
         const info = await nodeStat(within).catch(() => undefined);
         if (!info) return notFound();
@@ -256,12 +281,14 @@ function serveDirectory(prefix: string, dir: string): ResolvedRouteValue {
             }
             const indexWithin = await resolveWithin(root, join(within, DIRECTORY_INDEX));
             if (!indexWithin) return notFound();
-            const indexInfo = await nodeStat(indexWithin).catch(() => undefined);
-            if (!indexInfo || !indexInfo.isFile()) return notFound();
-            return fileResponse(request, indexWithin, indexInfo.mtime, indexInfo.size);
+            const indexTarget = await openValidatedReadableFile(root, indexWithin);
+            if (!indexTarget) return notFound();
+            return fileResponse(request, indexWithin, indexTarget);
         }
         if (!info.isFile()) return notFound();
-        return fileResponse(request, within, info.mtime, info.size);
+        const target = await openValidatedReadableFile(root, within);
+        if (!target) return notFound();
+        return fileResponse(request, within, target);
     };
     // GET and HEAD only; other methods fall through like an unmatched method map.
     return new Map<string, BunServeHandler>([['GET', handler], ['HEAD', handler]]);

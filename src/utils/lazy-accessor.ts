@@ -161,20 +161,15 @@ function defineData(target: LazyGlobal, name: string, value: unknown): void {
     });
 }
 
-/**
- * Settles once `target[name]` holds its final value instead of a stand-in: the
- * in-flight load started by `defineLazy` resolves, an already loaded value
- * resolves at once, and a missing or reassigned name resolves immediately.
- */
+/** Settles once `target[name]` holds its final value instead of a stand-in. */
 export function whenLazy(target: object, name: string): Promise<void> {
     return pendingLoads.get(target)?.get(name) ?? Promise.resolve();
 }
 
 /**
- * Install accessors for `specs` on `target`, and start the load. The returned
- * promise resolves once every spec is replaced by its value. Accessors never
- * observe rejection: on failure they stay installed and the next read retries,
- * so an optional module that cannot load degrades to "not available yet".
+ * Install accessors for `specs` on `target` and start loading their values.
+ * Accessors keep synchronous constructors/functions available after bootstrap;
+ * a rejected optional load stays installed so a later read can retry.
  */
 export function defineLazy(target: LazyGlobal, specs: readonly LazySpec[], load: LazyLoader): Promise<void> {
     if (specs.length === 0) return Promise.resolve();
@@ -204,6 +199,7 @@ export function defineLazy(target: LazyGlobal, specs: readonly LazySpec[], load:
         loads = new Map();
         pendingLoads.set(target, loads);
     }
+    let started: Promise<void> | undefined;
     for (const spec of specs) {
         const value = standIn(target, spec.name, spec);
         standIns.set(spec.name, value);
@@ -218,10 +214,9 @@ export function defineLazy(target: LazyGlobal, specs: readonly LazySpec[], load:
             enumerable: true,
             configurable: true,
         });
-        loads.set(spec.name, start());
+        started ??= start();
+        loads.set(spec.name, started);
     }
 
-    // Callers that want the last value in the same turn await this; a load that is
-    // already in flight is shared, so boot-side awaiters see the same evaluation.
-    return start();
+    return started!;
 }

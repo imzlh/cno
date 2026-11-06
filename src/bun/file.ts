@@ -3,6 +3,7 @@ import { basename, dirname, join, toFsPath } from '../utils/path';
 import { ensureDirectory } from '../utils/fs-path';
 import { isBunBytePath } from './file-path';
 import { filePathSink, type FileSink as BunFileSink } from './file-sink';
+import { openReadableFile } from './opened-file';
 import { stdioDestination, type StdioFile } from './stdio';
 import { stat as nodeStat, unlink as nodeUnlink } from '../node/fs/_promises';
 import type { Stats } from '../node/fs/utils';
@@ -325,19 +326,42 @@ export class BunFile extends Blob implements BunFileLike {
         const fd = fs.open(this.#path, 'r');
         try {
             const stat = fs.fstat(fd);
-            // procfs and FIFOs can report zero bytes while reads produce data.
-            const unknownSize = stat.size === 0;
-            const applySlices = unknownSize && this.#needsSize();
-            const range = applySlices
-                ? { start: 0, end: Infinity }
-                : this.#resolveRange(unknownSize ? Infinity : stat.size);
-            const seekable = stat.isFile && !unknownSize;
+            let positional = stat.isFile && Number.isSafeInteger(stat.size) && stat.size >= 0;
+            let sizeKnown = false;
+            if (positional) {
+                const byte = new Uint8Array(1);
+                try {
+                    sizeKnown = stat.size === 0
+                        ? fs.pread(fd, byte, 0) === 0
+                        : fs.pread(fd, byte, stat.size - 1) === 1 && fs.pread(fd, byte, stat.size) === 0;
+                } catch {
+                    positional = false;
+                }
+            }
+
+            let actualSize: number | undefined;
+            if (!sizeKnown && positional && this.#needsSize()) {
+                const buffer = new Uint8Array(BUN_FILE_CHUNK_SIZE);
+                actualSize = 0;
+                while (true) {
+                    const count = fs.pread(fd, buffer, actualSize);
+                    if (count <= 0) break;
+                    actualSize += count;
+                    if (!Number.isSafeInteger(actualSize)) {
+                        throw new RangeError('Bun.file source is too large to address safely');
+                    }
+                }
+            } else if (!sizeKnown && !positional && this.#needsSize()) {
+                throw new TypeError('Cannot resolve a negative Bun.file slice on a non-seekable source');
+            }
+
+            const range = this.#resolveRange(sizeKnown ? stat.size : actualSize ?? Infinity);
             const chunks: Uint8Array<ArrayBuffer>[] = [];
-            let position = seekable ? range.start : 0;
+            let position = positional ? range.start : 0;
             let length = 0;
             while (position < range.end) {
                 const buffer = new Uint8Array(Math.min(BUN_FILE_CHUNK_SIZE, range.end - position));
-                const count = seekable ? fs.pread(fd, buffer, position) : fs.read(fd, buffer);
+                const count = positional ? fs.pread(fd, buffer, position) : fs.read(fd, buffer);
                 if (count <= 0) break;
                 const skip = Math.min(count, Math.max(0, range.start - position));
                 position += count;
@@ -347,10 +371,7 @@ export class BunFile extends Blob implements BunFileLike {
                     length += chunk.byteLength;
                 }
             }
-            const bytes = concatenate(chunks, length);
-            if (!applySlices) return bytes;
-            const bounds = this.#resolveRange(bytes.byteLength);
-            return bytes.slice(bounds.start, bounds.end);
+            return concatenate(chunks, length);
         } finally {
             fs.close(fd);
         }
@@ -391,73 +412,32 @@ export class BunFile extends Blob implements BunFileLike {
     }
 
     stream(): ReadableStream<Uint8Array<ArrayBuffer>> {
-        let handle: CModuleAsyncFS.FileHandle | undefined;
+        const source = this;
+        let opened: Awaited<ReturnType<typeof openReadableFile>> | undefined;
         let active: Promise<void> | undefined;
         let cancelled = false;
-        let position = 0;
-        let range: FileRange | undefined;
-        let seekable = false;
-        let buffered: Uint8Array<ArrayBuffer> | undefined;
+        let reader: ReadableStreamDefaultReader<Uint8Array<ArrayBuffer>> | undefined;
 
         const close = async (): Promise<void> => {
-            const opened = handle;
-            handle = undefined;
-            await closeQuietly(opened);
-        };
-
-        const open = async (): Promise<CModuleAsyncFS.FileHandle> => {
-            if (handle) return handle;
-            handle = await asyncfs.open(this.#path, 'r');
-            const stat = await handle.stat();
-            const unknownSize = stat.size === 0;
-            seekable = stat.isFile && !unknownSize;
-            if (unknownSize && this.#needsSize()) {
-                // Negative bounds need the actual length, not a zero stat size.
-                const chunks: Uint8Array<ArrayBuffer>[] = [];
-                let length = 0;
-                while (!cancelled) {
-                    const chunk = new Uint8Array(BUN_FILE_CHUNK_SIZE);
-                    const count = await handle.read(chunk);
-                    if (count <= 0) break;
-                    chunks.push(chunk.slice(0, count));
-                    length += count;
-                }
-                const bytes = concatenate(chunks, length);
-                const bounds = this.#resolveRange(length);
-                buffered = bytes.slice(bounds.start, bounds.end);
-                range = { start: 0, end: buffered.byteLength };
-            } else {
-                range = this.#resolveRange(unknownSize ? Infinity : stat.size);
-            }
-            position = seekable ? range.start : 0;
-            return handle;
+            await opened?.close();
         };
 
         return new ReadableStream<Uint8Array<ArrayBuffer>>({
             pull(controller) {
                 active = (async () => {
                     try {
-                        const current = await open();
-                        const bounds = range!;
-                        while (!cancelled && position < bounds.end) {
-                            const buffer = new Uint8Array(Math.min(BUN_FILE_CHUNK_SIZE, bounds.end - position));
-                            const count = buffered
-                                ? Math.min(buffer.byteLength, buffered.byteLength - position)
-                                : await current.read(buffer, seekable ? position : undefined);
-                            if (count <= 0) break;
-                            const skip = Math.min(count, Math.max(0, bounds.start - position));
-                            const chunk = buffered
-                                ? buffered.slice(position + skip, position + count)
-                                : buffer.slice(skip, count);
-                            position += count;
-                            if (cancelled) break;
-                            if (chunk.byteLength > 0) {
-                                controller.enqueue(chunk);
-                                return;
-                            }
+                        if (!reader) {
+                            opened = await openReadableFile(source.#path);
+                            const size = opened.sizeKnown
+                                ? opened.stat.size
+                                : source.#needsSize() ? await opened.measure(() => cancelled) : Infinity;
+                            const range = source.#resolveRange(size);
+                            reader = opened.stream(range.start, range.end).getReader();
                         }
-                        await close();
-                        if (!cancelled) controller.close();
+                        const next = await reader.read();
+                        if (cancelled) return;
+                        if (next.done) controller.close();
+                        else controller.enqueue(next.value);
                     } catch (error) {
                         await close();
                         if (!cancelled) controller.error(error);
@@ -467,6 +447,7 @@ export class BunFile extends Blob implements BunFileLike {
             },
             async cancel() {
                 cancelled = true;
+                await reader?.cancel().catch(() => {});
                 await active;
                 await close();
             },

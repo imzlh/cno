@@ -5,7 +5,7 @@ import { join, resolvePath, toFsPath } from "../utils/path";
 import { isWindows } from "../utils/platform";
 import { wrapFsClassDec as wrap, wrapFSns } from "../utils/wrap";
 import { ReadableStream } from "../webapi/streams";
-import { useWritable } from "./utils/pipe-streams";
+import { closeStreamQuietly, useWritable } from "./utils/pipe-streams";
 import { errors } from "./01_errors";
 
 const os = import.meta.use('os');
@@ -151,14 +151,17 @@ class RStream extends ReadableStream<Uint8Array<ArrayBuffer>> implements Deno.Su
                     const buf = malloc(controller);
                     const n = await pipe.read(buf);
                     if (n === 0) {
+                        closeStreamQuietly(pipe);
                         controller.close();
                     } else {
                         controller.enqueue(buf.slice(0, n));
                     }
                 } catch (e) {
+                    closeStreamQuietly(pipe);
                     controller.error(e);
                 }
-            }
+            },
+            cancel: () => closeStreamQuietly(pipe),
         });
     }
 

@@ -15,12 +15,20 @@ export function closeStreamQuietly(pipe: { close(): unknown }): void {
 }
 
 export const useWritable = (pipe: CModuleStreams.Stream) => new WritableStream({
-    write: async (chunk) => {
+    write: async (chunk, controller) => {
+        const close = () => closeStreamQuietly(pipe);
+        if (controller.signal.aborted) {
+            close();
+            throw controller.signal.reason;
+        }
+        controller.signal.addEventListener('abort', close, { once: true });
         try {
             await pipe.write(chunk);
         } catch (e) {
-            closeStreamQuietly(pipe);
+            close();
             throw wrapFSErr(e);
+        } finally {
+            controller.signal.removeEventListener('abort', close);
         }
     },
     close: () => pipe.close(),

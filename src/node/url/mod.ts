@@ -11,10 +11,8 @@ import path from '../path';
 import { getCtsBridge } from '../_internal/cts-bridge';
 
 export const URLSearchParams = globalThis.URLSearchParams;
-// The webapi boot installs URLPattern as a lazy accessor, so this capture is
-// the forwarding stand-in: constructions forward to the real class once the
-// module settles, statics are mirrored, and the prototype is adopted — only
-// `node:url.URLPattern === globalThis.URLPattern` stays false.
+// The webapi boot installs URLPattern through the shared lazy accessor; normal
+// bootstrap settles it before this module is exposed to user code.
 export const URLPattern = globalThis.URLPattern;
 type ParsedQuery = Record<string, string | string[]>;
 

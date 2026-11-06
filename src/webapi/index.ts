@@ -44,10 +44,8 @@ await Promise.all([
     import('./events'),
 ]);
 
-// urlpattern (+ its ~18 KB vendor polyfill) sits behind the same deferral as
-// WebSocket below: nothing but a program constructing a URLPattern reaches it.
-// node:url re-exports the forwarding stand-in and converges with the real
-// class once the load settles (constructor forwards, prototype adopted).
+// Keep URLPattern behind the shared accessor so boot can load it alongside the
+// other optional clients without placing it on the main import chain.
 void defineLazy(globalThis as unknown as Record<string, unknown>, [
     { name: 'URLPattern', kind: 'ctor' },
 ], () => import('./urlpattern').then(() => new Map<string, unknown>([
