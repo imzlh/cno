@@ -7,7 +7,10 @@ const defaultState: State = { timestamp: -1, requested: -1, counter: 0 };
 const explicitState: State = { timestamp: -1, requested: -1, counter: 0 };
 const MAX_TIMESTAMP = 2 ** 48 - 1;
 const stringValueOf = String.prototype.valueOf;
+const stringFrom = String;
+const stringToLowerCase = String.prototype.toLowerCase;
 const dateGetTime = Date.prototype.getTime;
+const dateNow = Date.now;
 
 interface RandomUUIDv7 {
     (encoding: 'buffer', timestamp?: number | Date): Buffer;
@@ -38,7 +41,7 @@ export const randomUUIDv7 = {
   randomUUIDv7(encoding?: Encoding | number | Date, timestamp?: number | Date): string | Buffer {
     let format: Encoding = 'hex';
     if (typeof encoding === 'string' || isStringObject(encoding)) {
-        format = String(encoding).toLowerCase() as Encoding;
+        format = Reflect.apply(stringToLowerCase, stringFrom(encoding), []) as Encoding;
         if (format !== 'hex' && format !== 'base64' && format !== 'base64url' && format !== 'buffer') {
             throw Object.assign(
                 new TypeError('Encoding must be one of base64, base64url, hex, or buffer'),
@@ -50,7 +53,7 @@ export const randomUUIDv7 = {
         timestamp = encoding as number | Date;
     }
     const explicit = timestamp !== undefined;
-    const time = explicit ? dateMilliseconds(timestamp) : Date.now();
+    const time = explicit ? dateMilliseconds(timestamp) : dateNow();
     if (typeof time !== 'number') {
         throw Object.assign(
             new TypeError(`The "timestamp" property must be of type number. Received ${typeof time}`),
