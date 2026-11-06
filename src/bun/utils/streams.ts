@@ -6,6 +6,7 @@ type BinaryChunk = ArrayBufferView | ArrayBufferLike;
 type StreamChunk = BinaryChunk | string;
 type BrandGetter<T> = (this: unknown) => T;
 
+const arrayIsArray = Array.isArray;
 const arrayBufferIsView = ArrayBuffer.isView;
 const arrayBufferByteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength')!.get! as BrandGetter<number>;
 const sharedArrayBufferByteLength = typeof SharedArrayBuffer === 'undefined' ? undefined
@@ -80,12 +81,21 @@ export const concatArrayBuffers = ({
             throw new RangeError('Maximum length must be >= 0');
         }
         if (arguments.length === 0) throw new TypeError('Expected at least one argument');
-        const chunks = (buffers ?? []).map(bytesOf);
-        const total = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+        const list = buffers ?? [];
+        if (engine.isProxy(list) || !arrayIsArray(list)) throw new TypeError('Argument must be an array');
+        const chunks: Uint8Array[] = [];
+        const chunkCount = list.length;
+        let total = 0;
+        for (let i = 0; i < chunkCount; i++) {
+            const chunk = bytesOf(list[i]);
+            chunks[i] = chunk;
+            total += chunk.byteLength;
+        }
         const length = typeof maxLength === 'number' ? Math.min(total, Math.floor(maxLength)) : total;
         const result = new Uint8Array(length);
         let offset = 0;
-        for (const chunk of chunks) {
+        for (let i = 0; i < chunks.length; i++) {
+            const chunk = chunks[i];
             const count = Math.min(chunk.byteLength, length - offset);
             result.set(chunk.subarray(0, count), offset);
             offset += count;
