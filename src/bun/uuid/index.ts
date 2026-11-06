@@ -15,14 +15,49 @@ export function randomUUIDv7(encoding?: Encoding | number | Date, timestamp?: nu
         timestamp = encoding;
         encoding = 'hex';
     }
-    if (encoding === undefined) encoding = 'hex';
-    if (encoding !== 'hex' && encoding !== 'base64' && encoding !== 'base64url' && encoding !== 'buffer') {
-        throw new TypeError('Invalid UUID encoding');
+    const boxedEncoding = typeof encoding === 'object' && encoding !== null
+        ? (() => { try { return String.prototype.valueOf.call(encoding); } catch { return undefined; } })()
+        : undefined;
+    if (typeof encoding === 'string' || boxedEncoding !== undefined) {
+        encoding = (typeof encoding === 'string' ? encoding : boxedEncoding!).toLowerCase() as Encoding;
+        if (encoding !== 'hex' && encoding !== 'base64' && encoding !== 'base64url' && encoding !== 'buffer') {
+            throw Object.assign(
+                new TypeError('Encoding must be one of base64, base64url, hex, or buffer'),
+                { code: 'ERR_UNKNOWN_ENCODING' },
+            );
+        }
+    } else if (timestamp !== undefined || encoding === undefined) {
+        encoding = 'hex';
+    } else {
+        // With one non-string argument Bun treats it as the timestamp.
+        timestamp = encoding as number | Date;
+        encoding = 'hex';
     }
     const explicit = timestamp !== undefined;
     const time = timestamp instanceof Date ? timestamp.getTime() : explicit ? timestamp : Date.now();
-    if (typeof time !== 'number' || !Number.isInteger(time) || time < 0 || time > MAX_TIMESTAMP) {
-        throw new RangeError('UUID timestamp must be an integer between 0 and 2^48 - 1');
+    if (typeof time !== 'number') {
+        throw Object.assign(
+            new TypeError(`The "timestamp" property must be of type number. Received ${typeof time}`),
+            { code: 'ERR_INVALID_ARG_TYPE' },
+        );
+    }
+    if (!Number.isInteger(time)) {
+        if (Number.isFinite(time)) {
+            throw Object.assign(
+                new TypeError('The "timestamp" property must be of type integer. Received number'),
+                { code: 'ERR_INVALID_ARG_TYPE' },
+            );
+        }
+        throw Object.assign(
+            new RangeError(`The value of "timestamp" is out of range. It must be >= 0 and <= ${MAX_TIMESTAMP}. Received ${time}`),
+            { code: 'ERR_OUT_OF_RANGE' },
+        );
+    }
+    if (time < 0 || time > MAX_TIMESTAMP) {
+        throw Object.assign(
+            new RangeError(`The value of "timestamp" is out of range. It must be >= 0 and <= ${MAX_TIMESTAMP}. Received ${time}`),
+            { code: 'ERR_OUT_OF_RANGE' },
+        );
     }
 
     const bytes = new Uint8Array(16);
