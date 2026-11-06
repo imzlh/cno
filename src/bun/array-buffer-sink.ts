@@ -30,15 +30,43 @@ const arrayBufferByteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.protot
 const sharedArrayBufferByteLength = typeof SharedArrayBuffer === 'function'
     ? Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength')?.get
     : undefined;
+const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
+const typedArrayBuffer = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')!.get!;
+const typedArrayByteOffset = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteOffset')!.get!;
+const typedArrayByteLength = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteLength')!.get!;
+const dataViewBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer')!.get!;
+const dataViewByteOffset = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset')!.get!;
+const dataViewByteLength = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength')!.get!;
+const emptyBytes = new Uint8Array(0);
 
-function hasBrand(getter: (() => number) | undefined, value: object): boolean {
-    if (!getter) return false;
+function brandedByteLength(getter: (() => number) | undefined, value: object): number | undefined {
+    if (!getter) return undefined;
     try {
-        Reflect.apply(getter, value, []);
-        return true;
+        return Reflect.apply(getter, value, []);
     } catch {
-        return false;
+        return undefined;
     }
+}
+
+function viewBytes(value: ArrayBufferView): Uint8Array<ArrayBufferLike> {
+    let buffer: ArrayBufferLike;
+    let byteOffset: number;
+    let byteLength: number;
+    try {
+        buffer = Reflect.apply(typedArrayBuffer, value, []);
+        byteOffset = Reflect.apply(typedArrayByteOffset, value, []);
+        byteLength = Reflect.apply(typedArrayByteLength, value, []);
+    } catch {
+        try {
+            buffer = Reflect.apply(dataViewBuffer, value, []);
+            byteOffset = Reflect.apply(dataViewByteOffset, value, []);
+            byteLength = Reflect.apply(dataViewByteLength, value, []);
+        } catch {
+            // Bun treats detached and out-of-bounds views as empty writes.
+            return emptyBytes;
+        }
+    }
+    return byteLength === 0 ? emptyBytes : new Uint8Array(buffer, byteOffset, byteLength);
 }
 
 const invalidChunk = 'write() expects a string, ArrayBufferView, or ArrayBuffer';
@@ -49,10 +77,6 @@ export class ArrayBufferSink {
     #asUint8Array = false;
     #stream = false;
     #ended = false;
-
-    get [Symbol.toStringTag](): string {
-        return 'ArrayBufferSink';
-    }
 
     /**
      * (Re)initializes the sink and discards pending data. Empty/invalid options
@@ -90,18 +114,23 @@ export class ArrayBufferSink {
 
     /** Appends a copy of `chunk` and returns the number of bytes written (UTF-8 length for strings). */
     write(chunk: string | ArrayBufferView | ArrayBuffer | SharedArrayBuffer): number {
-        let source: Uint8Array;
+        // Brand the receiver before encoding or inspecting the input.
+        void this.#length;
+        let source: Uint8Array<ArrayBufferLike>;
         if (typeof chunk === 'string') {
             // Lone surrogates become U+FFFD, matching the WHATWG UTF-8 encode
             // every other Bun string input uses.
             source = engine.encodeString(sanitizeSurrogates(chunk));
         } else if (typeof chunk === 'object' && chunk !== null) {
             if (ArrayBuffer.isView(chunk)) {
-                source = new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
-            } else if (hasBrand(arrayBufferByteLength, chunk) || hasBrand(sharedArrayBufferByteLength, chunk)) {
-                source = new Uint8Array(chunk as ArrayBuffer);
+                source = viewBytes(chunk);
             } else {
-                throw new TypeError(invalidChunk);
+                const byteLength = brandedByteLength(arrayBufferByteLength, chunk)
+                    ?? brandedByteLength(sharedArrayBufferByteLength, chunk);
+                if (byteLength === undefined) throw new TypeError(invalidChunk);
+                source = byteLength === 0
+                    ? emptyBytes
+                    : new Uint8Array(chunk as ArrayBuffer | SharedArrayBuffer, 0, byteLength);
             }
         } else {
             throw new TypeError(invalidChunk);
@@ -122,7 +151,7 @@ export class ArrayBufferSink {
      * with `asUint8Array`) and empties the buffer. Otherwise returns zero and
      * keeps the data.
      */
-    flush(): number | Uint8Array<ArrayBuffer> | ArrayBuffer {
+    flush(_force?: boolean): number | Uint8Array<ArrayBuffer> | ArrayBuffer {
         if (!this.#stream) return 0;
         // Copy out: the internal buffer, including any preallocation, is reused.
         const copy = this.#bytes.slice(0, this.#length);
@@ -160,3 +189,11 @@ export class ArrayBufferSink {
         this.#bytes = grown;
     }
 }
+
+Object.defineProperties(ArrayBufferSink.prototype, {
+    start: { enumerable: true, writable: false, configurable: false },
+    write: { enumerable: true, writable: false, configurable: false },
+    flush: { enumerable: true, writable: false, configurable: false },
+    end: { enumerable: true, writable: false, configurable: false },
+    [Symbol.toStringTag]: { value: 'ArrayBufferSink', configurable: true },
+});
