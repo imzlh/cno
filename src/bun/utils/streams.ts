@@ -5,19 +5,47 @@ const engine = import.meta.use('engine');
 type BinaryChunk = ArrayBufferView | ArrayBufferLike;
 type StreamChunk = BinaryChunk | string;
 
+const arrayBufferByteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength')!.get!;
+const sharedArrayBufferByteLength = typeof SharedArrayBuffer === 'undefined' ? undefined
+    : Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength')!.get!;
+
+function isArrayBufferLike(value: unknown): value is ArrayBufferLike {
+    try {
+        arrayBufferByteLength.call(value);
+        return true;
+    } catch {
+        if (!sharedArrayBufferByteLength) return false;
+        try {
+            sharedArrayBufferByteLength.call(value);
+            return true;
+        } catch {
+            return false;
+        }
+    }
+}
+
 function bytesOf(value: BinaryChunk): Uint8Array {
     if (ArrayBuffer.isView(value)) {
         return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
     }
-    if (value instanceof ArrayBuffer ||
-        (typeof SharedArrayBuffer !== 'undefined' && value instanceof SharedArrayBuffer)) {
+    if (isArrayBufferLike(value)) {
         return new Uint8Array(value);
     }
     throw new TypeError('Expected TypedArray');
 }
 
+function blobPartOf(value: unknown): BlobPart {
+    if (ArrayBuffer.isView(value)) {
+        return new Uint8Array(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
+    }
+    if (isArrayBufferLike(value)) {
+        return new Uint8Array(new Uint8Array(value));
+    }
+    return value as BlobPart;
+}
+
 export function concatArrayBuffers(buffers: BinaryChunk[], maxLength?: number, asUint8Array?: false): ArrayBuffer;
-export function concatArrayBuffers(buffers: BinaryChunk[], maxLength: number, asUint8Array: true): Uint8Array<ArrayBuffer>;
+export function concatArrayBuffers(buffers: BinaryChunk[], maxLength: number | undefined, asUint8Array: true): Uint8Array<ArrayBuffer>;
 export function concatArrayBuffers(buffers: BinaryChunk[], maxLength?: number, asUint8Array = false): ArrayBuffer | Uint8Array<ArrayBuffer> {
     if (typeof maxLength === 'number' && (Number.isNaN(maxLength) || maxLength < 0)) {
         throw new RangeError('Maximum length must be >= 0');
@@ -54,8 +82,10 @@ export function readableStreamToArray<T>(stream: ReadableStream<T>): Promise<T[]
     return readChunks(stream);
 }
 
-export async function readableStreamToBlob(stream: ReadableStream<StreamChunk>): Promise<Blob> {
-    return new Blob([await readableStreamToArrayBuffer(stream)]);
+export async function readableStreamToBlob(stream: ReadableStream<unknown>): Promise<Blob> {
+    // Bun treats each stream chunk as a Blob part, including Blob values and
+    // values which Blob stringifies, rather than requiring binary chunks.
+    return new Blob((await readChunks(stream)).map(blobPartOf));
 }
 
 export async function readableStreamToArrayBuffer(stream: ReadableStream<StreamChunk>): Promise<ArrayBuffer> {
@@ -176,9 +206,9 @@ function parseUrlEncoded(data: Uint8Array, form: FormData): void {
     }
 }
 
-function boundaryBytes(boundary: FormBoundary): Uint8Array {
+function boundaryBytes(boundary: FormBoundary): Uint8Array | undefined {
     const bytes = typeof boundary === 'string' ? engine.encodeString(boundary) : bytesOf(boundary);
-    if (bytes.length === 0) throw new TypeError('Multipart boundary must not be empty');
+    if (bytes.length === 0) return undefined;
     if (bytes.includes(13) || bytes.includes(10)) throw new TypeError('Multipart boundary must not contain line breaks');
     return bytes;
 }
@@ -267,7 +297,7 @@ function parseMultipart(data: Uint8Array, boundary: Uint8Array, form: FormData):
         const split = indexOfBytes(part, headerEnd, 0);
         if (split === -1) throw formError('multipart part has no header block');
         let disposition: ReturnType<typeof parseHeaderParams> | undefined;
-        let contentType = 'text/plain';
+        let contentType = 'text/plain;charset=utf-8';
         for (const line of engine.decodeString(part.subarray(0, split)).split('\r\n')) {
             const colon = line.indexOf(':');
             if (colon === -1) throw formError('malformed multipart header');
@@ -297,12 +327,12 @@ function parseMultipart(data: Uint8Array, boundary: Uint8Array, form: FormData):
  * leading dashes) they are parsed as multipart/form-data.
  */
 export async function readableStreamToFormData(
-    stream: ReadableStream<string | ArrayBufferView>,
+    stream: ReadableStream<unknown>,
     multipartBoundaryExcludingDashes?: FormBoundary,
 ): Promise<FormData> {
     if (typeof FormData !== 'function') throw new TypeError('FormData is not available');
     const boundary = multipartBoundaryExcludingDashes == null ? undefined : boundaryBytes(multipartBoundaryExcludingDashes);
-    const data = new Uint8Array(await readableStreamToArrayBuffer(stream));
+    const data = new Uint8Array(await new Blob((await readChunks(stream)).map(blobPartOf)).arrayBuffer());
     const form = new FormData();
     if (boundary) parseMultipart(data, boundary, form);
     else parseUrlEncoded(data, form);
