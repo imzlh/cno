@@ -33,15 +33,11 @@ function read(value: unknown): PromiseRead {
         : { status: 'fulfilled', value: null };
 }
 
-function peekValue(value: unknown): unknown {
-    return read(value).value;
-}
+const peekValue = (value: unknown): unknown => read(value).value;
 
-function peekStatus(value: unknown): PeekStatus {
-    return read(value).status;
-}
+const peekStatus = (value: unknown): PeekStatus => read(value).status;
 
-// Bun's peek and peek.status are anonymous functions, and status is read-only.
+// Arrow functions match Bun's non-constructable native functions.
 Object.defineProperty(peekStatus, 'name', { value: '' });
 export const peek = Object.defineProperties(peekValue, {
     name: { value: '' },
