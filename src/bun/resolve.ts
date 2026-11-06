@@ -34,7 +34,7 @@ export const resolveSync = (...args: [specifier?: unknown, from?: unknown, esm?:
     if (typeof resolve !== 'function') throw new Error('cts ESM inspection bridge unavailable');
     try {
         // Bun treats `from` as a directory, while CTS expects an importer file.
-        return resolve(spec, join(resolvePath(parent, os.cwd), '__bun_resolve__.js')) as string;
+        return resolve(spec, join(resolvePath(parent, os.cwd), '__bun_resolve__.js'), esm !== false) as string;
     } catch (cause) {
         const code = (cause as { code?: string })?.code;
         if (code === 'ERR_UNKNOWN_BUILTIN_MODULE' && spec.startsWith('node:')) {
