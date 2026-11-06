@@ -1,6 +1,7 @@
 const fs = import.meta.use('fs');
 const os = import.meta.use('os');
 const engine = import.meta.use('engine');
+const algorithm = import.meta.use('algorithm');
 
 const KIB = 1024;
 const MAX_PSS_KIB = Math.floor(Number.MAX_SAFE_INTEGER / KIB);
@@ -47,9 +48,9 @@ function typedArrayTag(value: unknown): string {
     }
 }
 
-function asciiBytes(value: unknown): Uint8Array {
-    if (typedArrayTag(value) === 'Uint8Array'
-        && hasTypedArrayBrand(uint8ByteLength, value)) {
+function byteView(value: unknown): Uint8Array {
+    const tag = typedArrayTag(value);
+    if (tag && tag !== 'Uint16Array' && hasTypedArrayBrand(uint8ByteLength, value)) {
         const object = value as object;
         const buffer = uint8Buffer.call(object);
         return new Uint8Array(
@@ -59,20 +60,18 @@ function asciiBytes(value: unknown): Uint8Array {
         );
     }
     if (isArrayBufferLike(value)) return new Uint8Array(value);
-    throw new TypeError(
-        'Bun.unsafe.arrayBufferToString expects an ArrayBuffer, Uint8Array, or Uint16Array.',
-    );
+    throw new TypeError('Expected an ArrayBuffer');
 }
 
 /**
- * Safe fallback for Bun's zero-copy ASCII cast. The cno engine always creates
- * an owned JavaScript string, so callers do not need to retain the input view;
- * rejecting non-ASCII bytes avoids exposing Bun's intentionally unsafe result.
+ * Safe copying fallback for Bun's zero-copy cast. The cno engine always creates
+ * an owned JavaScript string, so callers do not need to retain the input view.
  */
 export function arrayBufferToString(buffer: Uint8Array<ArrayBuffer> | ArrayBufferLike): string;
-export function arrayBufferToString(buffer: Uint16Array): string;
+export function arrayBufferToString(buffer: ArrayBufferView): string;
 export function arrayBufferToString(buffer: unknown): string {
-    if (typedArrayTag(buffer) === 'Uint16Array'
+    const tag = typedArrayTag(buffer);
+    if ((tag === 'Uint16Array' || tag === 'Int16Array')
         && hasTypedArrayBrand(uint16ByteLength, buffer)) {
         const object = buffer as object;
         const source = new Uint16Array(
@@ -83,13 +82,7 @@ export function arrayBufferToString(buffer: unknown): string {
         return engine.decodeU16String(source);
     }
 
-    const bytes = asciiBytes(buffer);
-    for (let index = 0; index < bytes.byteLength; index++) {
-        if (bytes[index]! > 0x7f) {
-            throw new TypeError('Bun.unsafe.arrayBufferToString only accepts ASCII bytes.');
-        }
-    }
-    return engine.decodeString(bytes);
+    return algorithm.latin1DecodeLoose(byteView(buffer));
 }
 
 /** Best-effort heap trim request; the host has no separate idle trim hook. */
