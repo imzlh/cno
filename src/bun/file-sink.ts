@@ -10,8 +10,6 @@ import { arrayBufferBackedBytes, sanitizeSurrogates, toOwnedBytes } from '../uti
 const engine = import.meta.use('engine');
 const fs = import.meta.use('fs');
 
-const blobBytesSymbol = Symbol.for('cno.blob.bytes');
-
 function chunkBytes(chunk: unknown): Uint8Array<ArrayBuffer> {
     if (typeof chunk === 'string') {
         return arrayBufferBackedBytes(engine.encodeString(sanitizeSurrogates(chunk)));
@@ -23,12 +21,7 @@ function chunkBytes(chunk: unknown): Uint8Array<ArrayBuffer> {
     if (typeof SharedArrayBuffer !== 'undefined' && chunk instanceof SharedArrayBuffer) {
         return toOwnedBytes(new Uint8Array(chunk));
     }
-    if (typeof Blob !== 'undefined' && chunk instanceof Blob) {
-        const getBytes = Reflect.get(chunk, blobBytesSymbol);
-        if (typeof getBytes !== 'function') throw new TypeError('Blob byte access is unavailable');
-        return toOwnedBytes(Reflect.apply(getBytes, chunk, []) as Uint8Array);
-    }
-    throw new TypeError('FileSink.write expects a string or binary buffer');
+    throw new TypeError('write() expects a string, ArrayBufferView, or ArrayBuffer');
 }
 
 interface SinkTarget {
@@ -93,22 +86,21 @@ export class FileSink {
     #ended = false;
     #highWaterMark: number | undefined;
 
-    constructor(target: SinkTarget) {
+    constructor(target: SinkTarget, open = false) {
         this.#target = target;
+        if (open) this.#fd = this.#openTracked();
     }
 
-    start(options?: { highWaterMark?: number }): void {
-        if (options !== undefined && (typeof options !== 'object' || options === null)) {
-            throw new TypeError('FileSink.start options must be an object');
-        }
-        const mark = options?.highWaterMark;
-        if (mark !== undefined && (!Number.isFinite(mark) || mark < 0)) {
-            throw new RangeError('FileSink highWaterMark must be a non-negative number');
-        }
-        this.#highWaterMark = mark;
+    start(options?: { highWaterMark?: number } | null): void {
+        // Bun's sink.start() is an advisory reconfiguration hook. It accepts
+        // any value and does not discard already buffered data.
+        this.#highWaterMark = typeof options?.highWaterMark === 'number'
+            && Number.isFinite(options.highWaterMark) && options.highWaterMark > 0
+            ? options.highWaterMark
+            : undefined;
     }
 
-    write(chunk: string | ArrayBufferView | ArrayBuffer | SharedArrayBuffer | Blob): number {
+    write(chunk: string | ArrayBufferView | ArrayBuffer | SharedArrayBuffer): number {
         if (this.#ended) throw new Error('FileSink is already closed');
         const bytes = chunkBytes(chunk);
         this.#pending.push({ chunk: bytes, offset: 0 });
@@ -152,15 +144,13 @@ export class FileSink {
         return fd;
     }
 
-    end(error?: Error): number {
-        if (error !== undefined && !(error instanceof Error)) {
-            throw new TypeError('FileSink.end error must be an Error');
-        }
+    end(error?: Error | null): number {
         if (this.#ended) return 0;
         let flushed = 0;
         try {
-            // end(error) discards the buffer; a plain end commits it first.
-            if (error === undefined) flushed = this.#flushBuffered();
+            // Bun currently flushes pending file data even when an error value
+            // is supplied; the optional argument is metadata for pipe sinks.
+            flushed = this.#flushBuffered();
         } finally {
             // The fd must close on every path: end() is the only close.
             this.#ended = true;
@@ -189,9 +179,11 @@ export class FileSink {
     }
 }
 
-/** A sink that truncates `path` on first flush and owns its descriptor. */
+/** A sink that opens `path` eagerly and owns its descriptor. */
 export function filePathSink(path: string): FileSink {
-    return new FileSink(pathTarget(path));
+    // Bun.file(path).writer() creates a missing file immediately, before the
+    // first write or flush, while preserving an existing file's contents.
+    return new FileSink(pathTarget(path), true);
 }
 
 /** A sink over an already-owned descriptor; closing is the caller's job. */

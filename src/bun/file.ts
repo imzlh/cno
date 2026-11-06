@@ -43,7 +43,7 @@ export interface BunFileLike extends Blob {
     unlink(): Promise<void>;
     delete(): Promise<void>;
     write(data: BunFileWriteInput, options?: { highWaterMark?: number }): Promise<number>;
-    /** Incremental sink that truncates the file on first flush (BunFile.writer). */
+    /** Incremental sink that opens immediately and overwrites from byte zero. */
     writer(options?: { highWaterMark?: number }): BunFileSink;
 }
 
@@ -302,6 +302,9 @@ export class BunFile extends Blob implements BunFileLike {
      * file on its first flush and owns the descriptor until end().
      */
     writer(options?: { highWaterMark?: number }): BunFileSink {
+        if (options !== undefined && options !== null && !isObject(options)) {
+            throw new TypeError('options must be an object or undefined');
+        }
         const sink = filePathSink(this.#path);
         sink.start(options);
         return sink;
