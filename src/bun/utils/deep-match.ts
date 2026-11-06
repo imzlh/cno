@@ -2,65 +2,79 @@
  * Partial structural match used by Bun.deepMatch. Every enumerable property of
  * `subset` must match the same key on `value`; extra keys on `value` are ignored.
  * Arrays retain Bun's exact-length rule, while other objects compare only their
- * enumerable state rather than prototypes or internal slots.
+ * enumerable state rather than prototypes or internal slots. Host objects can
+ * differ when CNO and Bun expose different enumerable prototype properties.
  */
-export function deepMatch(subset: unknown, value: unknown): boolean {
-    const inProgress = new Map<object, Set<object>>();
+export const deepMatch = {
+    deepMatch(subset: unknown, value: unknown): boolean {
+        const inProgress = new Map<object, number>();
 
-    function match(s: unknown, v: unknown): boolean {
-        if (!isObject(s) || !isObject(v)) return Object.is(s, v);
-        const active = inProgress.get(s);
-        if (active?.has(v)) return true;
-        if (!active) inProgress.set(s, new Set([v]));
-        else active.add(v);
-        try {
-            return matchObjects(s, v);
-        } finally {
-            const set = inProgress.get(s);
-            set?.delete(v);
-            if (set?.size === 0) inProgress.delete(s);
+        function match(s: unknown, v: unknown): boolean {
+            if (Object.is(s, v)) return true;
+            if (!isObject(s) || !isObject(v)) return Object.is(s, v);
+            const active = inProgress.get(s) ?? 0;
+            if (active >= 2) return true;
+            inProgress.set(s, active + 1);
+            try {
+                return matchObjects(s, v);
+            } finally {
+                if (active === 0) inProgress.delete(s);
+                else inProgress.set(s, active);
+            }
         }
+
+        function matchObjects(s: object | Function, v: object | Function): boolean {
+            if (Array.isArray(s)) {
+                if (!Array.isArray(v) || s.length !== v.length) return false;
+                return matchArrays(s, v);
+            }
+
+            for (const key of enumerableKeys(s)) {
+                if (!(key in v)) return false;
+                const target = Reflect.get(v, key);
+                if (!match(Reflect.get(s, key), target)) return false;
+            }
+            return true;
+        }
+
+        function matchArrays(s: unknown[], v: unknown[]): boolean {
+            const sKeys = enumerableKeys(s), vKeys = enumerableKeys(v);
+            if (sKeys.length !== vKeys.length) return false;
+            const targetKeys = new Map(vKeys.map(key => [key, isOwnEnumerable(v, key)]));
+            for (const key of sKeys) {
+                if (!targetKeys.has(key) || targetKeys.get(key) !== isOwnEnumerable(s, key)) return false;
+                const target = Reflect.get(v, key);
+                if (!match(Reflect.get(s, key), target)) return false;
+            }
+            return true;
+        }
+
+        if (arguments.length < 2) throw new TypeError('Expected 2 values to compare');
+        if (!isObject(subset) || !isObject(value)) {
+            throw new TypeError('Expected 2 objects to match');
+        }
+        return match(subset, value);
     }
+}.deepMatch;
 
-    function matchObjects(s: object | Function, v: object | Function): boolean {
-        if (Array.isArray(s)) {
-            if (!Array.isArray(v) || s.length !== v.length) return false;
-        } else if (Array.isArray(v)) {
-            // Non-array subsets can still match an array's enumerable indices.
-        }
-
-        // for..in intentionally includes enumerable inherited string keys. Bun
-        // also considers own enumerable symbols, which for..in omits.
-        for (const key in s) {
-            if (!(key in v)) return false;
-            if (!match(Reflect.get(s, key), Reflect.get(v, key))) return false;
-        }
-        for (const key of enumerableSymbols(s)) {
-            if (!(key in v)) return false;
-            if (!match(Reflect.get(s, key), Reflect.get(v, key))) return false;
-        }
-        return true;
-    }
-
-    if (!isObject(subset) || !isObject(value)) {
-        throw new TypeError('Expected 2 objects to match');
-    }
-    return match(subset, value);
+function isOwnEnumerable(value: object, key: string | symbol): boolean {
+    return Object.prototype.propertyIsEnumerable.call(value, key);
 }
 
 function isObject(value: unknown): value is object | Function {
     return (typeof value === 'object' && value !== null) || typeof value === 'function';
 }
 
-function enumerableSymbols(value: object | Function): symbol[] {
-    const symbols: symbol[] = [];
-    const seen = new Set<symbol>();
+function enumerableKeys(value: object | Function): (string | symbol)[] {
+    const keys: (string | symbol)[] = [];
+    const seen = new Set<string | symbol>();
     for (let current: object | null = value; current !== null; current = Object.getPrototypeOf(current)) {
-        for (const key of Object.getOwnPropertySymbols(current)) {
-            if (!Object.prototype.propertyIsEnumerable.call(current, key) || seen.has(key)) continue;
+        for (const key of Reflect.ownKeys(current)) {
+            if (seen.has(key)) continue;
+            if (!Object.prototype.propertyIsEnumerable.call(current, key)) continue;
             seen.add(key);
-            symbols.push(key);
+            keys.push(key);
         }
     }
-    return symbols;
+    return keys;
 }
