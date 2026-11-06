@@ -90,6 +90,8 @@ function parseRange(range: string): { comparators: Comparator[]; explicit: boole
         return '';
     });
     range = range.replace(/(\^|~>|~|>=|<=|>|<|=)\s+/g, '$1');
+    // Bun accepts the common compact npm form `>=1,<2`.
+    range = range.replace(/(\S),(?=[<>=~^v\d*xX])/g, '$1 ');
     for (const token of range.trim().split(/\s+/)) {
         if (!token) continue;
         const m = /^(\^|~>|~|>=|<=|>|<|=)?(.*)$/.exec(token)!;
@@ -108,9 +110,13 @@ function parseRange(range: string): { comparators: Comparator[]; explicit: boole
 }
 
 export function order(v1: unknown, v2: unknown): Ordering {
-    const s1 = String(v1).trim(), s2 = String(v2).trim();
+    // Template coercion matches Bun's TypeError for symbols while retaining
+    // ordinary StringLike object support.
+    const raw1 = `${v1}`, raw2 = `${v2}`;
+    const s1 = raw1.trim(), s2 = raw2.trim();
     const a = parse(s1, true), b = parse(s2, true);
-    if (!a || !b) throw new Error('Invalid semantic version');
+    if (!a) throw new Error(`Invalid SemVer: ${raw1}\n`);
+    if (!b) throw new Error(`Invalid SemVer: ${raw2}\n`);
     const ma = versionPattern.exec(s1)!, mb = versionPattern.exec(s2)!;
     for (let i = 0; i < 3; i++) {
         const x = ma[i + 1] && /^\d+$/.test(ma[i + 1]) ? BigInt(ma[i + 1]) : undefined;
@@ -124,15 +130,17 @@ export function order(v1: unknown, v2: unknown): Ordering {
     return compare(full(a), full(b));
 }
 export function satisfies(version: unknown, range: unknown): boolean {
-    const parsed = parse(String(version), false);
-    const text = String(range);
+    const parsed = parse(`${version}`, false);
+    const text = `${range}`;
     if (!parsed) return false;
     const v = full(parsed);
     const alternatives = text.split('||');
     const sets = alternatives.map(parseRange);
     const hasNonempty = sets.some(set => set.explicit);
     return sets.some(set => {
-        if (!set.explicit && (hasNonempty || set.invalid)) return false;
+        // Unrecognized text is ignored by Bun's range parser. An invalid-only
+        // branch is wildcard-like unless another OR branch contains a range.
+        if (!set.explicit && hasNonempty) return false;
         if (v.pre.length && !set.comparators.some(c => c.version.pre.length && c.version.parts.every((n, i) => n === v.parts[i]))) return false;
         return set.comparators.every(c => {
             const result = compare(v, c.version);
