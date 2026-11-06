@@ -156,9 +156,16 @@ const ENCODINGS = new Set([
     'binary', 'buffer', 'ucs2', 'ucs-2', 'utf16le',
 ]);
 
+function assertOutputType(output: unknown, nullMeansDefault: boolean): void {
+    if (output === undefined || (output === null && nullMeansDefault)) return;
+    if (stringValue(output) !== undefined || isRawBuffer(output) || viewSlots(output)) return;
+    throw invalidArgType('output must be of type string or ArrayBuffer or ArrayBufferView');
+}
+
 function planOutput(
     output: unknown,
     nullMeansDefault: boolean,
+    minimumLength = 64,
 ): (digest: Uint8Array<ArrayBuffer>) => Buffer | string | ArrayBufferLike | ArrayBufferView {
     if (output === undefined || (output === null && nullMeansDefault)) return digest => Buffer.from(digest);
     const requested = stringValue(output);
@@ -176,7 +183,7 @@ function planOutput(
     }
     if (isRawBuffer(output)) {
         const target = new Uint8Array(output);
-        if (target.byteLength < 64) throw invalidArgType('TypedArray must be at least 64 bytes');
+        if (target.byteLength < minimumLength) throw invalidArgType(`TypedArray must be at least ${minimumLength} bytes`);
         return digest => {
             target.set(digest);
             return output;
@@ -184,7 +191,7 @@ function planOutput(
     }
     const slots = viewSlots(output);
     if (slots) {
-        if (slots.byteLength < 64) throw invalidArgType('TypedArray must be at least 64 bytes');
+        if (slots.byteLength < minimumLength) throw invalidArgType(`TypedArray must be at least ${minimumLength} bytes`);
         const target = new Uint8Array(slots.buffer, slots.byteOffset, slots.byteLength);
         return digest => {
             target.set(digest);
@@ -337,9 +344,16 @@ function defineCryptoHasher(): CryptoHasherConstructor {
     }
 
     function hash(algorithm: unknown, input: unknown, ...rest: unknown[]): unknown {
-        const hasher = new CryptoHasher(algorithm as string);
-        update.call(hasher, input);
-        return digest.call(hasher, rest[0]);
+        // Bun's static helper requires a primitive algorithm string and checks
+        // input/output categories before lookup, but output details afterward.
+        if (typeof algorithm !== 'string') throw invalidArgType('algorithm must be a string');
+        const data = ownedBytes(input);
+        assertOutputType(rest[0], false);
+        const name = algorithm.toLowerCase().replace(/^sha-(1|224|256|384|512)$/, 'sha$1');
+        const entry = Object.hasOwn(hashes, name) ? hashes[name] : undefined;
+        if (!entry) throw invalidArgType(`Unsupported algorithm "${algorithm}"`);
+        const render = planOutput(rest[0], false, entry[0]);
+        return render(new Uint8Array(entry[1](data)));
     }
 
     function algorithms(): string[] {
