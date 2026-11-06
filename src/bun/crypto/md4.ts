@@ -1,6 +1,6 @@
 /**
- * MD4 (RFC 1320). The native crypto binding has no MD4, so `Bun.MD4` uses this
- * one-shot implementation. It is checked against the RFC vectors and Bun's output.
+ * MD4 (RFC 1320). The native crypto binding has no MD4, so Bun's MD4 APIs use
+ * this one-shot implementation. It is checked against the RFC vectors and Bun's output.
  */
 
 const ROUND2_ORDER = [0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15];
@@ -59,4 +59,21 @@ export function md4(data: Uint8Array): Uint8Array<ArrayBuffer> {
     out.setInt32(8, c0, true);
     out.setInt32(12, d0, true);
     return digest;
+}
+
+/** HMAC-MD4 using MD4's 64-byte compression block. */
+export function hmacMd4(key: Uint8Array, data: Uint8Array): Uint8Array<ArrayBuffer> {
+    const blockSize = 64;
+    const normalizedKey = key.byteLength > blockSize ? md4(key) : key;
+    const inner = new Uint8Array(blockSize + data.byteLength);
+    const outer = new Uint8Array(blockSize + 16);
+    inner.fill(0x36, 0, blockSize);
+    outer.fill(0x5c, 0, blockSize);
+    for (let i = 0; i < normalizedKey.byteLength; i++) {
+        inner[i] ^= normalizedKey[i];
+        outer[i] ^= normalizedKey[i];
+    }
+    inner.set(data, blockSize);
+    outer.set(md4(inner), blockSize);
+    return md4(outer);
 }

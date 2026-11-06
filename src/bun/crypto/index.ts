@@ -2,6 +2,7 @@ import { Buffer } from 'node:buffer';
 import { toBuffer } from '../../node/crypto/helpers';
 import { sanitizeSurrogates } from '../../utils/bytes';
 import { blake2b, blake2b256 } from './blake2b';
+import { hmacMd4, md4 } from './md4';
 
 const kblobBytes = Symbol.for('cno.blob.bytes');
 
@@ -21,6 +22,7 @@ const hashes: Record<string, [number, Hash, Hmac?]> = {
     blake2b256: [32, data => blake2b256(asBytes(data)).buffer, (key, data) => blake2b256(asBytes(data), asBytes(key)).buffer],
     blake2b512: [64, native.blake2b512, (key, data) => blake2b(64, asBytes(data), asBytes(key)).buffer],
     blake2s256: [32, native.blake2s256],
+    md4: [16, data => md4(asBytes(data)).buffer, (key, data) => hmacMd4(asBytes(key), asBytes(data)).buffer],
     md5: [16, native.md5, native.hmacMd5],
     ripemd160: [20, native.ripemd160, native.hmacRipemd160],
     sha1: [20, native.sha1, native.hmacSha1],
