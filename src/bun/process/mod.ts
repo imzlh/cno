@@ -276,8 +276,10 @@ function spawnSyncImpl(input: unknown, options?: unknown): BunSyncSubprocess {
     return output as unknown as BunSyncSubprocess;
 }
 
-export const spawn = spawnImpl as BunSpawnFunction;
-export const spawnSync = spawnSyncImpl as BunSpawnSyncFunction;
+export const spawn = ((input: unknown, options: unknown = undefined) =>
+    spawnImpl(input, options)) as BunSpawnFunction;
+export const spawnSync = ((input: unknown, options: unknown = undefined) =>
+    spawnSyncImpl(input, options)) as BunSpawnSyncFunction;
 
 export type { BunSpawnOptions, BunSubprocess, BunSyncSubprocess } from './types';
 export { FileSink } from './streams';
