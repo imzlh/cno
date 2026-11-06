@@ -62,10 +62,15 @@ export const randomUUIDv5 = {
     const input = new Uint8Array(16 + nameBytes.byteLength);
     input.set(namespaceBytes);
     input.set(nameBytes, 16);
-    const result = Buffer.from(crypto.sha1(input)).subarray(0, 16);
+    const result = Buffer.from(Buffer.from(crypto.sha1(input)).subarray(0, 16));
     result[6] = (result[6] & 0x0f) | 0x50;
     result[8] = (result[8] & 0x3f) | 0x80;
     if (format === 'buffer') return result;
+    if (format === 'ucs2' || format === 'ucs-2' || format === 'utf16le') {
+        let value = '';
+        for (let i = 0; i < result.length; i += 2) value += String.fromCharCode(result[i] | (result[i + 1] << 8));
+        return value;
+    }
     if (format !== 'hex') return result.toString(format as BufferEncoding);
     const hex = result.toString('hex');
     return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
