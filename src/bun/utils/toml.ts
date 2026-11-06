@@ -137,7 +137,7 @@ class Parser {
     }
 }
 
-export function parseTOML(input: unknown): Record<string, any> {
+const parse = (input: unknown): Record<string, any> => {
     if (input == null || typeof input === 'symbol') throw new TypeError('input must be a string, ArrayBuffer, ArrayBufferView or Blob');
     let s: string;
     if (engine.isArrayBuffer(input) || hasSharedArrayBufferSlot(input) || ArrayBuffer.isView(input)) {
@@ -154,7 +154,7 @@ export function parseTOML(input: unknown): Record<string, any> {
         }
     } else s = sanitizeSurrogates(String(input));
     return new Parser(s).parse();
-}
+};
 
 const quoteText = (text: string) => JSON.stringify(sanitizeSurrogates(text)).replace(/\x7f/g, '\\u007f');
 const keyText = (key: string) => /^[A-Za-z0-9_-]+$/.test(key) ? key : quoteText(key);
@@ -165,8 +165,9 @@ const temporalValue = (value: any): string | undefined => {
 };
 const tableValue = (v: any) => v !== null && typeof v === 'object' && !Array.isArray(v) && temporalValue(v) === undefined;
 
-export function stringifyTOML(input?: unknown): string | undefined {
-    if (input === undefined) return undefined;
+const stringify = (input?: unknown, replacer?: unknown, _space?: unknown): string | undefined => {
+    if (input === undefined || typeof input === 'function' || typeof input === 'symbol') return undefined;
+    if (replacer !== undefined && replacer !== null) throw new Error('TOML.stringify does not support the replacer argument');
     if (!input || typeof input !== 'object' || Array.isArray(input) || input instanceof Date || input instanceof String || input instanceof Number || input instanceof Boolean) throw new Error('TOML.stringify expects an object at the top level (a TOML document is a table)');
     const ancestors = new Set<object>();
     const enter = (o: object) => { if (ancestors.has(o)) throw new Error('TOML.stringify cannot serialize circular references'); ancestors.add(o); };
@@ -201,6 +202,7 @@ export function stringifyTOML(input?: unknown): string | undefined {
     };
     walk(input, [], null);
     return sections.length ? sections.join('\n\n') + '\n' : '';
-}
+};
 
-export const TOML = { parse: parseTOML, stringify: stringifyTOML };
+export { parse as parseTOML, stringify as stringifyTOML };
+export const TOML = { parse, stringify };
