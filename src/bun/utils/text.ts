@@ -182,6 +182,7 @@ function graphemeWidth(cluster: number[], ambiguousIsNarrow: boolean): number {
  */
 export const stringWidth = (text: string, options: StringWidthOptions = {}): number => {
     text = toText(text);
+    if (text === '') return 0;
     options ??= {};
     if (!options.countAnsiEscapeCodes) text = stripANSI(text);
     const ambiguousIsNarrow = options.ambiguousIsNarrow !== false;
@@ -384,10 +385,14 @@ function widthOf(items: readonly AnsiItem[]): number {
     return width;
 }
 
-function columnIndex(value: number | undefined, total: number, fallback: number): number {
-    if (value === undefined) return fallback;
+function coerceColumnIndex(value: number | undefined): number | undefined {
+    if (value === undefined) return undefined;
     const number = Number(value);
-    const index = Number.isNaN(number) ? 0 : Math.trunc(number);
+    return Number.isNaN(number) ? 0 : Math.trunc(number);
+}
+
+function clampColumnIndex(index: number | undefined, total: number, fallback: number): number {
+    if (index === undefined) return fallback;
     if (index < 0) return Math.max(total + index, 0);
     return Math.min(index, total);
 }
@@ -398,9 +403,13 @@ function sliceOptions(
 ): { ellipsis: string; ambiguousIsNarrow: boolean } {
     if (typeof options === 'string') return { ellipsis: options, ambiguousIsNarrow: ambiguousPosition ?? true };
     if (typeof options === 'boolean') return { ellipsis: '', ambiguousIsNarrow: options };
-    if (options && typeof options === 'object') {
-        const ellipsis = typeof options.ellipsis === 'string' ? options.ellipsis : '';
-        const ambiguousIsNarrow = options.ambiguousIsNarrow === undefined || Boolean(options.ambiguousIsNarrow);
+    const optionValue: unknown = options;
+    if (optionValue !== null && (typeof optionValue === 'object' || typeof optionValue === 'function')) {
+        const optionObject = optionValue as SliceAnsiOptions;
+        const rawEllipsis = optionObject.ellipsis;
+        const rawAmbiguousIsNarrow = optionObject.ambiguousIsNarrow;
+        const ellipsis = typeof rawEllipsis === 'string' ? rawEllipsis : '';
+        const ambiguousIsNarrow = rawAmbiguousIsNarrow === undefined || Boolean(rawAmbiguousIsNarrow);
         return { ellipsis, ambiguousIsNarrow };
     }
     return { ellipsis: '', ambiguousIsNarrow: ambiguousPosition ?? true };
@@ -422,11 +431,14 @@ export const sliceAnsi = (
     ambiguousIsNarrow?: boolean,
 ): string => {
     input = toText(input);
+    if (input === '') return '';
+    const startIndex = coerceColumnIndex(start);
+    const endIndex = coerceColumnIndex(end);
     const slice = sliceOptions(options, ambiguousIsNarrow);
     const items = tokenize(input, slice.ambiguousIsNarrow);
     const total = widthOf(items);
-    const from = columnIndex(start, total, 0);
-    const to = columnIndex(end, total, total);
+    const from = clampColumnIndex(startIndex, total, 0);
+    const to = clampColumnIndex(endIndex, total, total);
     if (from >= to) return '';
 
     const ellipsisWidth = slice.ellipsis === '' ? 0 : stringWidth(slice.ellipsis, { ambiguousIsNarrow: slice.ambiguousIsNarrow });
@@ -480,14 +492,16 @@ export const sliceAnsi = (
  */
 export const wrapAnsi = (input: string, columns: number, options: WrapAnsiOptions = {}): string => {
     input = toText(input);
+    if (input === '') return '';
     options ??= {};
     const numericColumns = Number(columns);
-    if (!Number.isFinite(numericColumns) || numericColumns < 1) return input;
-    const width = Math.floor(numericColumns);
     const hard = options.hard ?? false;
     const wordWrap = options.wordWrap ?? true;
     const trim = options.trim ?? true;
-    const ambiguousIsNarrow = options.ambiguousIsNarrow === undefined || Boolean(options.ambiguousIsNarrow);
+    const rawAmbiguousIsNarrow = options.ambiguousIsNarrow;
+    const ambiguousIsNarrow = rawAmbiguousIsNarrow === undefined || Boolean(rawAmbiguousIsNarrow);
+    if (!Number.isFinite(numericColumns) || numericColumns < 1) return input;
+    const width = Math.floor(numericColumns);
 
     const state: StyleState = new Map();
     const rows: string[] = [];
