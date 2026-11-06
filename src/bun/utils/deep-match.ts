@@ -7,19 +7,21 @@
  */
 export const deepMatch = {
     deepMatch(subset: unknown, value: unknown): boolean {
-        const inProgress = new Map<object, number>();
+        const inProgress = new Set<object>();
+        let repeatedReferences = 0;
 
         function match(s: unknown, v: unknown): boolean {
             if (Object.is(s, v)) return true;
             if (!isObject(s) || !isObject(v)) return Object.is(s, v);
-            const active = inProgress.get(s) ?? 0;
-            if (active >= 2) return true;
-            inProgress.set(s, active + 1);
+            const active = inProgress.has(s);
+            if (active && repeatedReferences >= 1) return true;
+            if (active) repeatedReferences++;
+            else inProgress.add(s);
             try {
                 return matchObjects(s, v);
             } finally {
-                if (active === 0) inProgress.delete(s);
-                else inProgress.set(s, active);
+                if (active) repeatedReferences--;
+                else inProgress.delete(s);
             }
         }
 
