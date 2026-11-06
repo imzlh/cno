@@ -13,8 +13,8 @@ const streams = import.meta.use('streams');
 const STDIO_CHUNK_SIZE = 64 * 1024;
 
 function inputToBytes(value: unknown): Uint8Array<ArrayBuffer> {
-    // The sink chunk converter covers strings, buffers, and Blobs; the stdio
-    // error label is the only difference from the file sink.
+    // Blob inputs are streamed separately; this converts each concrete chunk
+    // while preserving the stdio-specific error label.
     try {
         return sinkChunkBytes(value);
     } catch (error) {
@@ -54,7 +54,27 @@ export class StdioFile {
         if (this.#readable) {
             throw new TypeError(`Bun.${this.#label} is not writable`);
         }
-        const bytes = inputToBytes(data);
+        if (data instanceof Blob) {
+            const reader = data.stream().getReader();
+            let written = 0;
+            try {
+                while (true) {
+                    const chunk = await reader.read();
+                    if (chunk.done) break;
+                    written += await this.#writeBytes(inputToBytes(chunk.value));
+                }
+                return written;
+            } catch (error) {
+                await reader.cancel(error).catch(() => {});
+                throw error;
+            } finally {
+                reader.releaseLock();
+            }
+        }
+        return await this.#writeBytes(inputToBytes(data));
+    }
+
+    async #writeBytes(bytes: Uint8Array<ArrayBuffer>): Promise<number> {
         let written = 0;
         while (written < bytes.byteLength) {
             const count = await this.#stream.write(bytes.subarray(written));
