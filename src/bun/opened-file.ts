@@ -1,4 +1,5 @@
 import { isPathWithin } from '../utils/path';
+import { normalizeErrnoError } from '../node/_internal/errno';
 
 const asyncfs = import.meta.use('asyncfs');
 
@@ -61,7 +62,7 @@ export async function adoptReadableFile(
         stat = knownStat ?? await handle.stat();
     } catch (error) {
         await handle.close().catch(() => {});
-        throw error;
+        throw normalizeErrnoError(error, 'fstat');
     }
     let probe: SizeProbe;
     try {
@@ -104,7 +105,7 @@ export async function adoptReadableFile(
             }
         } catch (error) {
             await close();
-            throw error;
+            throw normalizeErrnoError(error, 'read');
         }
     };
 
@@ -148,7 +149,7 @@ export async function adoptReadableFile(
                         if (!cancelled) controller.close();
                     } catch (error) {
                         await close();
-                        if (!cancelled) controller.error(error);
+                        if (!cancelled) controller.error(normalizeErrnoError(error, 'read'));
                     }
                 })();
                 return active;
@@ -165,7 +166,12 @@ export async function adoptReadableFile(
 }
 
 export async function openReadableFile(path: string): Promise<OpenedReadableFile> {
-    const handle = await asyncfs.open(path, 'r');
+    let handle: CModuleAsyncFS.FileHandle;
+    try {
+        handle = await asyncfs.open(path, 'r');
+    } catch (error) {
+        throw normalizeErrnoError(error, 'open', path);
+    }
     return adoptReadableFile(handle);
 }
 
