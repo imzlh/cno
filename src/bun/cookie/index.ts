@@ -42,11 +42,56 @@ function encodeValue(value: string): string {
         `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
 }
 
+function hexDigit(byte: number): number {
+    if (byte >= 48 && byte <= 57) return byte - 48;
+    if (byte >= 65 && byte <= 70) return byte - 55;
+    if (byte >= 97 && byte <= 102) return byte - 87;
+    return -1;
+}
+
+function decodeValue(value: string): string {
+    if (!value.includes('%')) return value;
+    const bytes = new TextEncoder().encode(value);
+    let length = 0;
+    for (let i = 0; i < bytes.length; i++) {
+        let byte = bytes[i];
+        if (byte === 37) {
+            byte = 255;
+            // Malformed escapes consume two following bytes when available.
+            if (i + 2 < bytes.length) {
+                const hi = hexDigit(bytes[i + 1]), lo = hexDigit(bytes[i + 2]);
+                if (hi >= 0 && lo >= 0) byte = hi * 16 + lo;
+                i += 2;
+            }
+        }
+        bytes[length++] = byte;
+    }
+    let result = '';
+    for (let i = 0; i < length;) {
+        const first = bytes[i++];
+        if (first < 128) { result += String.fromCharCode(first); continue; }
+        const size = first >= 192 && first < 224 ? 2
+            : first >= 224 && first < 240 ? 3
+                : first >= 240 && first < 248 ? 4 : 1;
+        let code = first & (127 >> size);
+        let consumed = 1;
+        while (consumed < size && i < length && (bytes[i] & 192) === 128) {
+            code = code * 64 + (bytes[i++] & 63);
+            consumed++;
+        }
+        // Bun replaces an invalid UTF-8 sequence once, including overlong ones.
+        const minimum = size === 2 ? 128 : size === 3 ? 2048 : 65536;
+        result += size === 1 || consumed !== size || code < minimum || code > 0x10ffff
+            || code >= 0xd800 && code <= 0xdfff ? '\ufffd' : String.fromCodePoint(code);
+    }
+    return result;
+}
+
 function toDate(expires: number | Date | string): Date {
     const date = expires instanceof Date
         ? new Date(expires.getTime())
         : typeof expires === 'number'
-            ? new Date(expires)
+            ? new Date(expires * 1000)
             : new Date(expires);
     if (Number.isNaN(date.getTime())) throw new RangeError('Invalid cookie expires date');
     return date;
@@ -101,31 +146,36 @@ function parseHeader(header: string): [string, string][] {
         if (eq === -1) continue;
         const name = segment.slice(0, eq).trim();
         if (name === '') continue;
-        pairs.push([name, segment.slice(eq + 1).trim()]);
+        pairs.push([name, decodeValue(segment.slice(eq + 1).trim())]);
     }
     return pairs;
 }
 
 export class CookieMap implements Iterable<[string, string]> {
-    readonly #cookies = new Map<string, CookieRecord>();
-    // Names touched by set/delete since construction, in first-touch order.
+    readonly #cookies: CookieRecord[] = [];
+    // Names touched by set/delete since construction, in last-touch order.
     readonly #changed = new Map<string, CookieRecord>();
+
+    #markChanged(name: string, cookie: CookieRecord): void {
+        this.#changed.delete(name);
+        this.#changed.set(name, cookie);
+    }
 
     constructor(init?: string[][] | Record<string, string> | string) {
         if (init === undefined || init === null) return;
         if (typeof init === 'string') {
-            for (const [name, value] of parseHeader(init)) this.#cookies.set(name, record(name, value));
+            for (const [name, value] of parseHeader(init)) this.#cookies.push(record(name, value));
         } else if (Array.isArray(init)) {
             for (const pair of init) {
                 if (!Array.isArray(pair) || pair.length !== 2) {
                     throw new TypeError('CookieMap array init entries must be [name, value] pairs');
                 }
                 const [name, value] = pair;
-                this.#cookies.set(String(name), record(String(name), String(value)));
+                this.#cookies.push(record(String(name), String(value)));
             }
         } else if (typeof init === 'object') {
             for (const [name, value] of Object.entries(init)) {
-                this.#cookies.set(name, record(name, String(value)));
+                this.#cookies.push(record(name, String(value)));
             }
         } else {
             throw new TypeError('CookieMap init must be a string, string[][], or record');
@@ -133,15 +183,17 @@ export class CookieMap implements Iterable<[string, string]> {
     }
 
     get size(): number {
-        return this.#cookies.size;
+        return this.#cookies.length;
     }
 
     get(name: string): string | null {
-        return this.#cookies.get(String(name))?.value ?? null;
+        const key = String(name);
+        return this.#cookies.find(cookie => cookie.name === key)?.value ?? null;
     }
 
     has(name: string): boolean {
-        return this.#cookies.has(String(name));
+        const key = String(name);
+        return this.#cookies.some(cookie => cookie.name === key);
     }
 
     set(name: string, value: string, options?: CookieInit): void;
@@ -155,17 +207,17 @@ export class CookieMap implements Iterable<[string, string]> {
             if (typeof name !== 'string') throw new TypeError('CookieMap.set options require a string name');
             cookie = record(name, optionValue ?? '', rest);
         }
-        const existed = this.#cookies.has(cookie.name);
-        this.#cookies.set(cookie.name, cookie);
+        const index = this.#cookies.findIndex(current => current.name === cookie.name);
         // Bun lists newly changed cookies before untouched constructor entries,
         // while updates retain the existing key position.
-        if (!existed) {
-            const ordered = new Map<string, CookieRecord>([[cookie.name, cookie]]);
-            for (const [name, current] of this.#cookies) if (name !== cookie.name) ordered.set(name, current);
-            this.#cookies.clear();
-            for (const [name, current] of ordered) this.#cookies.set(name, current);
+        if (index < 0) this.#cookies.unshift(cookie);
+        else {
+            this.#cookies[index] = cookie;
+            for (let i = this.#cookies.length - 1; i > index; i--) {
+                if (this.#cookies[i].name === cookie.name) this.#cookies.splice(i, 1);
+            }
         }
-        this.#changed.set(cookie.name, cookie);
+        this.#markChanged(cookie.name, cookie);
     }
 
     delete(name: string): void;
@@ -191,8 +243,10 @@ export class CookieMap implements Iterable<[string, string]> {
             httpOnly: false,
             partitioned: false,
         };
-        this.#cookies.delete(name);
-        this.#changed.set(name, removed);
+        for (let i = this.#cookies.length - 1; i >= 0; i--) {
+            if (this.#cookies[i].name === name) this.#cookies.splice(i, 1);
+        }
+        this.#markChanged(name, removed);
     }
 
     toSetCookieHeaders(): string[] {
@@ -201,20 +255,24 @@ export class CookieMap implements Iterable<[string, string]> {
 
     toJSON(): Record<string, string> {
         const json: Record<string, string> = {};
-        for (const [name, cookie] of this.#cookies) json[name] = cookie.value;
+        for (const { name, value } of this.#cookies) {
+            if (!Object.prototype.hasOwnProperty.call(json, name)) {
+                Object.defineProperty(json, name, { value, enumerable: true, configurable: true, writable: true });
+            }
+        }
         return json;
     }
 
     entries(): IterableIterator<[string, string]> {
-        return [...this.#cookies].map(([name, cookie]): [string, string] => [name, cookie.value])[Symbol.iterator]();
+        return this.#cookies.map(({ name, value }): [string, string] => [name, value])[Symbol.iterator]();
     }
 
     keys(): IterableIterator<string> {
-        return this.#cookies.keys();
+        return this.#cookies.map(cookie => cookie.name)[Symbol.iterator]();
     }
 
     values(): IterableIterator<string> {
-        return [...this.#cookies.values()].map(cookie => cookie.value)[Symbol.iterator]();
+        return this.#cookies.map(cookie => cookie.value)[Symbol.iterator]();
     }
 
     forEach(callback: (value: string, key: string, map: CookieMap) => void): void {

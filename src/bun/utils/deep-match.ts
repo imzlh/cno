@@ -1,20 +1,14 @@
-import { deepEquals } from './deep-equals';
-
 /**
- * Partial structural match used by Bun.deepMatch. Every own enumerable property of
+ * Partial structural match used by Bun.deepMatch. Every enumerable property of
  * `subset` must match the same key on `value`; extra keys on `value` are ignored.
- * Arrays must have equal length and match element-wise. Built-in objects (Date,
- * RegExp, Map, Set, typed arrays, buffers, errors, wrappers) fall back to deepEquals.
- * A plain-object subset matches any object value; other class instances require the
- * same prototype.
+ * Arrays retain Bun's exact-length rule, while other objects compare only their
+ * enumerable state rather than prototypes or internal slots.
  */
 export function deepMatch(subset: unknown, value: unknown): boolean {
     const inProgress = new Map<object, Set<object>>();
 
     function match(s: unknown, v: unknown): boolean {
-        if (typeof s !== 'object' || s === null || typeof v !== 'object' || v === null) {
-            return deepEquals(s, v);
-        }
+        if (!isObject(s) || !isObject(v)) return Object.is(s, v);
         const active = inProgress.get(s);
         if (active?.has(v)) return true;
         if (!active) inProgress.set(s, new Set([v]));
@@ -28,34 +22,45 @@ export function deepMatch(subset: unknown, value: unknown): boolean {
         }
     }
 
-    function matchObjects(s: object, v: object): boolean {
+    function matchObjects(s: object | Function, v: object | Function): boolean {
         if (Array.isArray(s)) {
             if (!Array.isArray(v) || s.length !== v.length) return false;
-            for (let i = 0; i < s.length; i++) {
-                if (!match(s[i], v[i])) return false;
-            }
-            return true;
+        } else if (Array.isArray(v)) {
+            // Non-array subsets can still match an array's enumerable indices.
         }
-        if (Array.isArray(v) || isBuiltin(s)) return deepEquals(s, v);
 
-        const proto = Object.getPrototypeOf(s);
-        if (proto !== Object.prototype && proto !== null && Object.getPrototypeOf(v) !== proto) return false;
-
-        for (const key of Reflect.ownKeys(s)) {
-            if (!Object.prototype.propertyIsEnumerable.call(s, key)) continue;
+        // for..in intentionally includes enumerable inherited string keys. Bun
+        // also considers own enumerable symbols, which for..in omits.
+        for (const key in s) {
+            if (!(key in v)) return false;
+            if (!match(Reflect.get(s, key), Reflect.get(v, key))) return false;
+        }
+        for (const key of enumerableSymbols(s)) {
             if (!(key in v)) return false;
             if (!match(Reflect.get(s, key), Reflect.get(v, key))) return false;
         }
         return true;
     }
 
+    if (!isObject(subset) || !isObject(value)) {
+        throw new TypeError('Expected 2 objects to match');
+    }
     return match(subset, value);
 }
 
-function isBuiltin(value: object): boolean {
-    return value instanceof Date || value instanceof RegExp || value instanceof Map || value instanceof Set
-        || value instanceof Error || value instanceof ArrayBuffer || ArrayBuffer.isView(value)
-        || (typeof SharedArrayBuffer !== 'undefined' && value instanceof SharedArrayBuffer)
-        || value instanceof Number || value instanceof String || value instanceof Boolean
-        || value instanceof URL;
+function isObject(value: unknown): value is object | Function {
+    return (typeof value === 'object' && value !== null) || typeof value === 'function';
+}
+
+function enumerableSymbols(value: object | Function): symbol[] {
+    const symbols: symbol[] = [];
+    const seen = new Set<symbol>();
+    for (let current: object | null = value; current !== null; current = Object.getPrototypeOf(current)) {
+        for (const key of Object.getOwnPropertySymbols(current)) {
+            if (!Object.prototype.propertyIsEnumerable.call(current, key) || seen.has(key)) continue;
+            seen.add(key);
+            symbols.push(key);
+        }
+    }
+    return symbols;
 }
