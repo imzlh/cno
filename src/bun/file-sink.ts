@@ -10,18 +10,67 @@ import { arrayBufferBackedBytes, sanitizeSurrogates, toOwnedBytes } from '../uti
 const engine = import.meta.use('engine');
 const fs = import.meta.use('fs');
 
+type BrandGetter<T> = (this: unknown) => T;
+
+const arrayBufferByteLength = Object.getOwnPropertyDescriptor(
+    ArrayBuffer.prototype,
+    'byteLength',
+)!.get! as BrandGetter<number>;
+const sharedArrayBufferByteLength = typeof SharedArrayBuffer === 'function'
+    ? Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength')?.get as BrandGetter<number> | undefined
+    : undefined;
+const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
+const typedArrayBuffer = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')!.get! as BrandGetter<ArrayBufferLike>;
+const typedArrayByteOffset = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteOffset')!.get! as BrandGetter<number>;
+const typedArrayByteLength = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteLength')!.get! as BrandGetter<number>;
+const dataViewBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer')!.get! as BrandGetter<ArrayBufferLike>;
+const dataViewByteOffset = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset')!.get! as BrandGetter<number>;
+const dataViewByteLength = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength')!.get! as BrandGetter<number>;
+const arrayBufferIsView = ArrayBuffer.isView;
+const emptyBytes = new Uint8Array();
+
+function rawBufferByteLength(value: unknown): number | undefined {
+    try {
+        return Reflect.apply(arrayBufferByteLength, value, []);
+    } catch {
+        if (!sharedArrayBufferByteLength) return undefined;
+        try {
+            return Reflect.apply(sharedArrayBufferByteLength, value, []);
+        } catch {
+            return undefined;
+        }
+    }
+}
+
+function viewBytes(value: ArrayBufferView): Uint8Array<ArrayBufferLike> {
+    try {
+        const buffer = Reflect.apply(typedArrayBuffer, value, []);
+        const byteOffset = Reflect.apply(typedArrayByteOffset, value, []);
+        const byteLength = Reflect.apply(typedArrayByteLength, value, []);
+        return byteLength === 0 ? emptyBytes : new Uint8Array(buffer, byteOffset, byteLength);
+    } catch {
+        try {
+            const buffer = Reflect.apply(dataViewBuffer, value, []);
+            const byteOffset = Reflect.apply(dataViewByteOffset, value, []);
+            const byteLength = Reflect.apply(dataViewByteLength, value, []);
+            return byteLength === 0 ? emptyBytes : new Uint8Array(buffer, byteOffset, byteLength);
+        } catch {
+            // Bun accepts detached and out-of-bounds views as empty writes.
+            return emptyBytes;
+        }
+    }
+}
+
 function chunkBytes(chunk: unknown): Uint8Array<ArrayBuffer> {
     if (typeof chunk === 'string') {
         return arrayBufferBackedBytes(engine.encodeString(sanitizeSurrogates(chunk)));
     }
-    if (ArrayBuffer.isView(chunk)) {
-        // Bun accepts detached and ordinary zero-length views as empty writes.
-        if (chunk.byteLength === 0) return new Uint8Array();
-        return toOwnedBytes(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength));
-    }
-    if (chunk instanceof ArrayBuffer) return toOwnedBytes(new Uint8Array(chunk));
-    if (typeof SharedArrayBuffer !== 'undefined' && chunk instanceof SharedArrayBuffer) {
-        return toOwnedBytes(new Uint8Array(chunk));
+    if (arrayBufferIsView(chunk)) return toOwnedBytes(viewBytes(chunk));
+    const byteLength = rawBufferByteLength(chunk);
+    if (byteLength !== undefined) {
+        return byteLength === 0
+            ? new Uint8Array()
+            : toOwnedBytes(new Uint8Array(chunk as ArrayBufferLike, 0, byteLength));
     }
     const error = new TypeError('write() expects a string, ArrayBufferView, or ArrayBuffer') as TypeError & { code: string };
     error.code = chunk === null || chunk === undefined ? 'ERR_STREAM_NULL_VALUES' : 'ERR_INVALID_ARG_TYPE';
