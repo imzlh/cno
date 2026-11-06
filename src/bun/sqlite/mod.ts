@@ -691,6 +691,8 @@ export class Statement<ReturnType = unknown> {
     }
 }
 
+Object.defineProperty(Statement, 'length', { value: 1 });
+
 export class Database {
     static MAX_QUERY_CACHE_SIZE = DEFAULT_QUERY_CACHE_SIZE;
 
@@ -705,21 +707,22 @@ export class Database {
     private readonly queryCache = new Map<string, Statement>();
     private transactionSerial = 0;
 
-    constructor(filename?: string, options: number | DatabaseOptions = {}) {
+    constructor(filename?: string, options?: number | DatabaseOptions) {
         if (filename !== undefined && typeof filename !== 'string') {
             throw new TypeError('Database filename must be a string');
         }
         this.filename = filename ?? ':memory:';
         this.handle = nextDatabaseHandle++;
 
+        const effectiveOptions = options ?? {};
         let flags: number;
-        if (typeof options === 'number') {
-            if (!Number.isInteger(options)) throw new TypeError('Database flags must be an integer');
-            flags = options;
+        if (typeof effectiveOptions === 'number') {
+            if (!Number.isInteger(effectiveOptions)) throw new TypeError('Database flags must be an integer');
+            flags = effectiveOptions;
             this.safeIntegers = false;
             this.strict = false;
         } else {
-            const parsed = parseOptions(options);
+            const parsed = parseOptions(effectiveOptions);
             flags = parsed.flags;
             this.safeIntegers = parsed.safeIntegers;
             this.strict = parsed.strict;
@@ -728,7 +731,7 @@ export class Database {
         this.nativeHandle = nativeCall(() => native.open(this.filename, flags));
     }
 
-    static open(filename?: string, options: number | DatabaseOptions = {}): Database {
+    static open(filename?: string, options?: number | DatabaseOptions): Database {
         return new Database(filename, options);
     }
 
@@ -1010,6 +1013,14 @@ export class Database {
         this.nativeHandle = null;
     }
 }
+
+Object.defineProperty(Database.prototype.transaction, 'length', { value: 2 });
+Object.defineProperty(Database.prototype, 'exec', {
+    value: Database.prototype.run,
+    writable: true,
+    enumerable: true,
+    configurable: true,
+});
 
 export interface Transaction<T extends (...args: any[]) => any> {
     (...args: Parameters<T>): ReturnType<T>;
