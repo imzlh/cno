@@ -96,6 +96,12 @@ function isReadableStream(value: unknown): value is ReadableStream {
 
 function pathFromValue(value: unknown): string {
     if (typeof value === 'string') {
+        if (value.includes('\0')) {
+            throw bytePathError(
+                "The argument 'path' must be a string, Uint8Array, or URL without null bytes.",
+                'ERR_INVALID_ARG_VALUE',
+            );
+        }
         if (/^[a-z][a-z\d+.-]*:\/\//i.test(value) && !/^file:\/\//i.test(value)) {
             throw new TypeError('Bun.file only supports local filesystem paths and file URLs');
         }
@@ -103,7 +109,7 @@ function pathFromValue(value: unknown): string {
         // decoded into filesystem paths.
         return value;
     }
-    if (typeof URL !== 'undefined' && value instanceof URL) return toFsPath(value);
+    if (typeof URL !== 'undefined' && value instanceof URL) return pathFromValue(toFsPath(value));
     throw new TypeError('Bun.file path must be a string or a local file URL');
 }
 
