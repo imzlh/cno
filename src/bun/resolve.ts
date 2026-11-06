@@ -9,12 +9,13 @@ function invalid(message: string): TypeError {
     return error;
 }
 
-export function resolveSync(specifier: unknown, from: unknown): string {
-    if (arguments.length === 0) throw invalid('Expected a specifier and a from path');
-    if (arguments.length === 1) throw invalid('Expected a from path');
+export const resolveSync = (...args: [specifier?: unknown, from?: unknown, esm?: boolean]): string => {
+    const [specifier, from, esm] = args;
+    if (args.length === 0) throw invalid('Expected a specifier and a from path');
+    if (esm !== undefined && typeof esm !== 'boolean') throw invalid('esm must be a boolean');
     if (specifier == null) throw invalid('specifier must be a string');
+    if (args.length === 1) throw invalid('Expected a from path');
     if (from == null) throw invalid('from must be a string');
-    if (typeof specifier === 'symbol' || typeof from === 'symbol') throw new TypeError('Cannot convert a symbol to a string');
     const spec = String(specifier);
     const parent = String(from);
     const resolve = getCtsBridge()?.resolveEsmForInspection;
@@ -31,8 +32,15 @@ export function resolveSync(specifier: unknown, from: unknown): string {
         error.code = 'ERR_MODULE_NOT_FOUND';
         throw error;
     }
-}
+};
 
-export async function resolve(specifier: unknown, from: unknown): Promise<string> {
-    return Reflect.apply(resolveSync, undefined, Array.from(arguments));
-}
+export const resolve = async (...args: [specifier?: unknown, from?: unknown, esm?: boolean]): Promise<string> => {
+    return Reflect.apply(resolveSync, undefined, args);
+};
+
+Object.defineProperties(resolveSync, {
+    length: { value: 1, configurable: true },
+});
+Object.defineProperties(resolve, {
+    length: { value: 1, configurable: true },
+});
