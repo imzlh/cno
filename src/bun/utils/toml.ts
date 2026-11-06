@@ -1,10 +1,20 @@
 import { sanitizeSurrogates, utf8Decode } from '../../utils/bytes';
 
-const engine = import.meta.use('engine');
+type BrandGetter<T> = (this: unknown) => T;
 
+const arrayBufferByteLengthGetter = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength')!.get! as BrandGetter<number>;
 const sharedArrayBufferByteLengthGetter = typeof SharedArrayBuffer === 'function'
-    ? Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength')?.get
+    ? Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength')?.get as BrandGetter<number> | undefined
     : undefined;
+const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
+const typedArrayBufferGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')!.get! as BrandGetter<ArrayBufferLike>;
+const typedArrayByteOffsetGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteOffset')!.get! as BrandGetter<number>;
+const typedArrayByteLengthGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteLength')!.get! as BrandGetter<number>;
+const dataViewBufferGetter = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer')!.get! as BrandGetter<ArrayBufferLike>;
+const dataViewByteOffsetGetter = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset')!.get! as BrandGetter<number>;
+const dataViewByteLengthGetter = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength')!.get! as BrandGetter<number>;
+const arrayBufferIsView = ArrayBuffer.isView;
+const emptyBytes = new Uint8Array();
 
 function hasSharedArrayBufferSlot(value: unknown): value is SharedArrayBuffer {
     if (!sharedArrayBufferByteLengthGetter || value === null || (typeof value !== 'object' && typeof value !== 'function')) return false;
@@ -13,6 +23,52 @@ function hasSharedArrayBufferSlot(value: unknown): value is SharedArrayBuffer {
         return true;
     } catch {
         return false;
+    }
+}
+
+function rawBufferByteLength(value: unknown): number | undefined {
+    try {
+        return Reflect.apply(arrayBufferByteLengthGetter, value, []);
+    } catch {
+        if (!sharedArrayBufferByteLengthGetter) return undefined;
+        try {
+            return Reflect.apply(sharedArrayBufferByteLengthGetter, value, []);
+        } catch {
+            return undefined;
+        }
+    }
+}
+
+function windowBytes(buffer: ArrayBufferLike, byteOffset: number, byteLength: number): Uint8Array {
+    if (byteLength === 0) return emptyBytes;
+    const bytes = new Uint8Array(buffer, byteOffset, byteLength);
+    return hasSharedArrayBufferSlot(buffer) ? Uint8Array.from(bytes) : bytes;
+}
+
+function viewBytes(value: ArrayBufferView): Uint8Array {
+    let buffer: ArrayBufferLike;
+    try {
+        buffer = Reflect.apply(typedArrayBufferGetter, value, []);
+    } catch {
+        try {
+            buffer = Reflect.apply(dataViewBufferGetter, value, []);
+            return windowBytes(
+                buffer,
+                Reflect.apply(dataViewByteOffsetGetter, value, []),
+                Reflect.apply(dataViewByteLengthGetter, value, []),
+            );
+        } catch {
+            return emptyBytes;
+        }
+    }
+    try {
+        return windowBytes(
+            buffer,
+            Reflect.apply(typedArrayByteOffsetGetter, value, []),
+            Reflect.apply(typedArrayByteLengthGetter, value, []),
+        );
+    } catch {
+        return emptyBytes;
     }
 }
 
@@ -140,12 +196,11 @@ class Parser {
 const parse = (input: unknown): Record<string, any> => {
     if (input == null || typeof input === 'symbol') throw new TypeError('input must be a string, ArrayBuffer, ArrayBufferView or Blob');
     let s: string;
-    if (engine.isArrayBuffer(input) || hasSharedArrayBufferSlot(input) || ArrayBuffer.isView(input)) {
-        let bytes = ArrayBuffer.isView(input)
-            ? new Uint8Array(input.buffer, input.byteOffset, input.byteLength)
-            : new Uint8Array(input as ArrayBufferLike);
-        // Stabilize shared memory between validation and decoding while retaining a view's bounds.
-        if (hasSharedArrayBufferSlot(bytes.buffer)) bytes = Uint8Array.from(bytes);
+    const rawByteLength = rawBufferByteLength(input);
+    if (rawByteLength !== undefined || arrayBufferIsView(input)) {
+        const bytes = rawByteLength !== undefined
+            ? windowBytes(input as ArrayBufferLike, 0, rawByteLength)
+            : viewBytes(input as ArrayBufferView);
         try {
             s = utf8Decode(bytes, true);
         } catch (error) {
