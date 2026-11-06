@@ -2,9 +2,14 @@ import type { SliceAnsiOptions, StringWidthOptions, WrapAnsiOptions } from 'bun'
 
 export type { SliceAnsiOptions, StringWidthOptions, WrapAnsiOptions };
 
+/** JavaScript ToString, including its TypeError for symbols. */
+function toText(value: unknown): string {
+    return `${value}`;
+}
+
 /** Strip terminal control sequences, including OSC hyperlinks and C1 CSI. */
 export function stripANSI(text: string): string {
-    if (typeof text !== 'string') throw new TypeError('Expected a string');
+    text = toText(text);
     let result = '';
     let start = 0;
     for (let i = 0; i < text.length; i++) {
@@ -14,7 +19,10 @@ export function stripANSI(text: string): string {
         const escapeStart = i;
         let command = code;
         if (code === 0x1b) {
-            if (i + 1 === text.length) continue;
+            if (i + 1 === text.length) {
+                result += text.slice(start, escapeStart);
+                return result;
+            }
             command = text.charCodeAt(++i);
         }
         if (command === 0x5b || command === 0x9b) {
@@ -22,6 +30,10 @@ export function stripANSI(text: string): string {
             let j = i + 1;
             while (j < text.length && text.charCodeAt(j) >= 0x20 && text.charCodeAt(j) <= 0x3f) j++;
             if (j === text.length || text.charCodeAt(j) < 0x40 || text.charCodeAt(j) > 0x7e) {
+                if (j === text.length) {
+                    result += text.slice(start, escapeStart);
+                    return result;
+                }
                 i = j - 1;
                 continue;
             }
@@ -33,13 +45,19 @@ export function stripANSI(text: string): string {
                 if (text.charCodeAt(j) === 0x9c || (osc && text.charCodeAt(j) === 7)) break;
                 if (text.charCodeAt(j) === 0x1b && text[j + 1] === '\\') { j++; break; }
             }
-            // An unterminated control string must not swallow the remaining text.
-            if (j === text.length) { i = j - 1; continue; }
+            if (j === text.length) {
+                result += text.slice(start, escapeStart);
+                return result;
+            }
             i = j;
         } else if (code === 0x1b) {
             let j = i;
             while (j < text.length && text.charCodeAt(j) >= 0x20 && text.charCodeAt(j) <= 0x2f) j++;
-            if (j === text.length || text.charCodeAt(j) < 0x30 || text.charCodeAt(j) > 0x7e) continue;
+            if (j === text.length) {
+                result += text.slice(start, escapeStart);
+                return result;
+            }
+            if (text.charCodeAt(j) < 0x30 || text.charCodeAt(j) > 0x7e) continue;
             i = j;
         }
         result += text.slice(start, escapeStart);
@@ -163,7 +181,8 @@ function graphemeWidth(cluster: number[], ambiguousIsNarrow: boolean): number {
  * every code point counts on its own, so `"👨‍👩‍👧‍👦"` measures 8.
  */
 export function stringWidth(text: string, options: StringWidthOptions = {}): number {
-    if (typeof text !== 'string') throw new TypeError('Expected a string');
+    text = toText(text);
+    options ??= {};
     if (!options.countAnsiEscapeCodes) text = stripANSI(text);
     const ambiguousIsNarrow = options.ambiguousIsNarrow !== false;
     const code = Array.from(text, char => char.codePointAt(0)!);
@@ -328,6 +347,17 @@ function applyEscape(state: StyleState, raw: string): void {
     }
 }
 
+function linkClose(open: string): string {
+    if (open.charCodeAt(0) === 0x9d) return '\x9d8;;\x9c';
+    if (open.endsWith('\x1b\\')) return '\x1b]8;;\x1b\\';
+    return LINK_CLOSE;
+}
+
+function normalizedLinkOpen(open: string): string {
+    const start = open.charCodeAt(0) === 0x9d ? 1 : 2;
+    return `\x1b]${open.slice(start).replace(/(\x07|\x9c|\x1b\\)$/, '')}\x07`;
+}
+
 function sgrOpen(state: StyleState): string {
     let out = '';
     for (const [key, open] of state) if (key !== LINK_KEY) out += open;
@@ -356,8 +386,8 @@ function widthOf(items: readonly AnsiItem[]): number {
 
 function columnIndex(value: number | undefined, total: number, fallback: number): number {
     if (value === undefined) return fallback;
-    if (typeof value !== 'number') throw new TypeError('Expected a number');
-    const index = Number.isNaN(value) ? 0 : Math.trunc(value);
+    const number = Number(value);
+    const index = Number.isNaN(number) ? 0 : Math.trunc(number);
     if (index < 0) return Math.max(total + index, 0);
     return Math.min(index, total);
 }
@@ -369,9 +399,9 @@ function sliceOptions(
     if (typeof options === 'string') return { ellipsis: options, ambiguousIsNarrow: ambiguousPosition ?? true };
     if (typeof options === 'boolean') return { ellipsis: '', ambiguousIsNarrow: options };
     if (options && typeof options === 'object') {
-        const ellipsis = options.ellipsis ?? '';
-        if (typeof ellipsis !== 'string') throw new TypeError('Expected ellipsis to be a string');
-        return { ellipsis, ambiguousIsNarrow: options.ambiguousIsNarrow ?? true };
+        const ellipsis = typeof options.ellipsis === 'string' ? options.ellipsis : '';
+        const ambiguousIsNarrow = options.ambiguousIsNarrow === undefined || Boolean(options.ambiguousIsNarrow);
+        return { ellipsis, ambiguousIsNarrow };
     }
     return { ellipsis: '', ambiguousIsNarrow: ambiguousPosition ?? true };
 }
@@ -391,7 +421,7 @@ export function sliceAnsi(
     options?: string | boolean | SliceAnsiOptions,
     ambiguousIsNarrow?: boolean,
 ): string {
-    if (typeof input !== 'string') throw new TypeError('Expected a string');
+    input = toText(input);
     const slice = sliceOptions(options, ambiguousIsNarrow);
     const items = tokenize(input, slice.ambiguousIsNarrow);
     const total = widthOf(items);
@@ -438,7 +468,8 @@ export function sliceAnsi(
         col += item.width;
     }
     if (!visible && !leftMark && !rightMark) return '';
-    const closeLink = state.has(LINK_KEY) ? LINK_CLOSE : '';
+    const activeLink = state.get(LINK_KEY);
+    const closeLink = activeLink === undefined ? '' : linkClose(activeLink);
     return openSgr + leftMark + openLink + body + closeLink + rightMark + sgrClose(state);
 }
 
@@ -448,13 +479,15 @@ export function sliceAnsi(
  * still open at its end. Existing `\n` characters always start a new row.
  */
 export function wrapAnsi(input: string, columns: number, options: WrapAnsiOptions = {}): string {
-    if (typeof input !== 'string') throw new TypeError('Expected a string');
-    if (typeof columns !== 'number' || Number.isNaN(columns)) throw new TypeError('Expected a number of columns');
-    const width = Math.max(1, Math.floor(columns));
+    input = toText(input);
+    options ??= {};
+    const numericColumns = Number(columns);
+    if (!Number.isFinite(numericColumns) || numericColumns < 1) return input;
+    const width = Math.floor(numericColumns);
     const hard = options.hard ?? false;
     const wordWrap = options.wordWrap ?? true;
     const trim = options.trim ?? true;
-    const ambiguousIsNarrow = options.ambiguousIsNarrow ?? true;
+    const ambiguousIsNarrow = options.ambiguousIsNarrow === undefined || Boolean(options.ambiguousIsNarrow);
 
     const state: StyleState = new Map();
     const rows: string[] = [];
@@ -481,7 +514,7 @@ export function wrapAnsi(input: string, columns: number, options: WrapAnsiOption
         for (const item of pending) emit(item);
         pending = [];
     };
-    const finishRow = (): void => {
+    const finishRow = (temporaryClose: boolean): void => {
         let items = row;
         if (trim) {
             // Drop visible spaces at both edges and keep escapes, so the state stays accurate.
@@ -501,21 +534,26 @@ export function wrapAnsi(input: string, columns: number, options: WrapAnsiOption
         if (items.length > 0) {
             const body = items.map(item => (item.kind === 'esc' ? item.raw : item.text)).join('');
             const openLink = rowStart.get(LINK_KEY) ?? '';
-            rows.push(sgrOpen(rowStart) + openLink + body + (state.has(LINK_KEY) ? LINK_CLOSE : '') + sgrClose(state));
+            const closeLink = temporaryClose && state.has(LINK_KEY) ? LINK_CLOSE : '';
+            rows.push(sgrOpen(rowStart) + openLink + body + closeLink + (temporaryClose ? sgrClose(state) : ''));
         } else {
             rows.push('');
         }
         row = [];
         rowWidth = 0;
         rowHasText = false;
-        rowStart = new Map(state);
+        rowStart = temporaryClose ? new Map(state) : new Map();
+        if (temporaryClose) {
+            const link = rowStart.get(LINK_KEY);
+            if (link !== undefined) rowStart.set(LINK_KEY, normalizedLinkOpen(link));
+        }
     };
     // Breaks the row before `item` when it would overflow. Pending escapes move to the new row.
     const placeChar = (item: AnsiItem & { kind: 'text' }): void => {
         const pendingWidth = widthOf(pending);
         if (rowHasText && rowWidth + pendingWidth + item.width > width) {
             if (trim) pending = pending.filter(isEscape);
-            finishRow();
+            finishRow(true);
         }
         flushPending();
         emit(item);
@@ -544,7 +582,7 @@ export function wrapAnsi(input: string, columns: number, options: WrapAnsiOption
                 pending = fits;
                 flushPending();
             }
-            finishRow();
+            finishRow(true);
         }
         if (trim) pending = pending.filter(isEscape);
         if (wordWidth <= width || !hard) {
@@ -561,7 +599,7 @@ export function wrapAnsi(input: string, columns: number, options: WrapAnsiOption
         if (word.length > 0) placeWord();
         if (trim) pending = pending.filter(isEscape);
         flushPending();
-        finishRow();
+        finishRow(false);
     };
 
     for (const item of tokenize(input, ambiguousIsNarrow)) {
