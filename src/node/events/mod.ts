@@ -5,7 +5,7 @@
 
 const console = import.meta.use('console');
 
-import { inspect } from '../util/inspect';
+import { getCtsBridge } from '../_internal/cts-bridge';
 import { flattenPrototype } from '../_internal/prototype';
 
 type EventArgs = unknown[];
@@ -85,6 +85,30 @@ function emitProcessWarning(warning: Error): void {
     const emit = proc === null || proc === undefined ? undefined : Reflect.get(Object(proc), 'emitWarning');
     if (typeof emit === 'function') emit.call(proc, warning);
     else console.warn(warning.message);
+}
+
+/** Keep the full util inspector off the embedded bootstrap graph. */
+function inspectUnhandledError(value: unknown): string {
+    let internalInspect: unknown;
+    let inspect: unknown;
+    const mkRequire = getCtsBridge()?.mkRequire;
+    if (typeof mkRequire === 'function') {
+        try {
+            const require = Reflect.apply(mkRequire, undefined, ['node:events/mod']);
+            internalInspect = typeof require === 'function'
+                ? Reflect.apply(require, undefined, ['../util/inspect'])
+                : undefined;
+            inspect = internalInspect && (typeof internalInspect === 'object' || typeof internalInspect === 'function')
+                ? Reflect.get(internalInspect, 'inspect')
+                : undefined;
+        } catch { /* CTS is not installed during the earliest bootstrap errors. */ }
+    }
+    if (typeof inspect === 'function') {
+        try { return String(Reflect.apply(inspect, internalInspect, [value])); }
+        catch { return String(value); }
+    }
+    try { return String(console.inspect(value, { colors: false, depth: 2, showHidden: false })); }
+    catch { return String(value); }
 }
 
 export interface EventEmitterOptions {
@@ -649,7 +673,7 @@ EventEmitter.prototype.emit = function emit(eventName: EventName, ...args: Event
             if (err instanceof Error) throw err;
             // Node wraps non-Error payloads in ERR_UNHANDLED_ERROR and keeps the original in .context
             const wrapped: Error & { code: string; context?: unknown } = Object.assign(
-                new Error(`Unhandled error. (${err === undefined ? 'undefined' : inspect(err)})`),
+                new Error(`Unhandled error. (${err === undefined ? 'undefined' : inspectUnhandledError(err)})`),
                 { code: 'ERR_UNHANDLED_ERROR' },
             );
             wrapped.context = err;
