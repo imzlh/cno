@@ -1,7 +1,7 @@
 /**
- * Bounded Bun.inspect formatter. Covers primitives, arrays, plain objects,
- * cycles, and the nodejs.util.inspect.custom hook. Other object kinds render
- * as `Name { ... }` and do not match Bun's output exactly.
+ * Bounded Bun.inspect formatter. Covers common primitives, collections,
+ * arrays, plain objects, cycles, and the nodejs.util.inspect.custom hook.
+ * Layout and less common object kinds do not match Bun's output exactly.
  */
 
 import { stringWidth } from './utils/text';
@@ -14,24 +14,28 @@ export type InspectOptions = {
 
 interface State {
     seen: object[];
-    refs: Map<object, number>;
     depth: number;
 }
 
-const DEFAULT_DEPTH = 2;
+const DEFAULT_DEPTH = 8;
 const IDENTIFIER = /^[A-Za-z_$][\w$]*$/;
 
-export function inspect(value: unknown, options: InspectOptions = {}): string {
-    if (options === null || typeof options !== 'object') {
-        throw new TypeError("Expected options to be an object for 'inspect'.");
+export function inspect(value: unknown, options: InspectOptions | number = {}): string {
+    let depth = DEFAULT_DEPTH;
+    const requestedDepth = typeof options === 'number'
+        ? options
+        : options !== null && typeof options === 'object' && typeof options.depth === 'number'
+            ? options.depth : undefined;
+    if (requestedDepth !== undefined) {
+        if (Number.isNaN(requestedDepth) || Number.isFinite(requestedDepth) && !Number.isInteger(requestedDepth)) {
+            throw invalidDepth(`expected depth to be an integer, got ${requestedDepth}`);
+        }
+        if (Number.isFinite(requestedDepth) && requestedDepth < 0) {
+            throw invalidDepth(`expected depth to be greater than or equal to 0, got ${requestedDepth}`);
+        }
+        depth = Math.abs(requestedDepth);
     }
-    const depth = options.depth === undefined
-        ? DEFAULT_DEPTH
-        : options.depth === null ? Infinity : options.depth;
-    if (typeof depth !== 'number' || Number.isNaN(depth)) {
-        throw new TypeError("Expected depth to be a number or null for 'inspect'.");
-    }
-    return formatValue(value, 0, { seen: [], refs: new Map(), depth });
+    return formatValue(value, 0, { seen: [], depth });
 }
 
 /** Format tabular data using Bun's console-table layout. */
@@ -40,6 +44,15 @@ export function inspectTable(value: unknown, columns?: unknown, _options?: unkno
     const isMap = value instanceof Map;
     const isSet = value instanceof Set;
     const rows: Array<{ index: string; value: unknown; key?: unknown }> = [];
+    const rowKeys = new Map<object, string[]>();
+    const keysOf = (object: object): string[] => {
+        let keys = rowKeys.get(object);
+        if (keys === undefined) {
+            keys = Object.keys(object);
+            rowKeys.set(object, keys);
+        }
+        return keys;
+    };
     if (isMap) {
         let index = 0;
         for (const [key, item] of value) rows.push({ index: String(index++), key, value: item });
@@ -57,7 +70,7 @@ export function inspectTable(value: unknown, columns?: unknown, _options?: unkno
     if (!selected && !isMap) {
         for (const row of rows) {
             if (row.value !== null && typeof row.value === 'object') {
-                for (const key of Object.keys(row.value)) if (!names.includes(key)) names.push(key);
+                for (const key of keysOf(row.value)) if (!names.includes(key)) names.push(key);
             } else {
                 hasValues = true;
             }
@@ -75,7 +88,10 @@ export function inspectTable(value: unknown, columns?: unknown, _options?: unkno
         const object = !isMap && row.value !== null && typeof row.value === 'object'
             ? row.value as Record<string, unknown> : undefined;
         return [row.index, ...(isMap ? [cell(row.key)] : []),
-            ...names.map(name => object && Object.prototype.hasOwnProperty.call(object, name) ? cell(object[name]) : ''),
+            ...names.map(name => object && (selected
+                ? Object.prototype.hasOwnProperty.call(object, name)
+                : keysOf(object).includes(name))
+                ? cell(object[name]) : ''),
             ...(hasValues ? [isMap || !object && typeof row.value !== 'function' ? cell(row.value) : ''] : [])];
     });
     const widthOf = (text: string) => stringWidth(text, { perCodePoint: true });
@@ -95,33 +111,33 @@ function formatValue(value: unknown, level: number, state: State): string {
     }
     const object = value as object;
 
+    if (typeof value === 'function') {
+        const name = (value as { name?: unknown }).name;
+        return typeof name === 'string' && name !== '' ? `[Function: ${name}]` : '[Function (anonymous)]';
+    }
     const hook = Reflect.get(object, inspectCustom);
     if (typeof hook === 'function') {
-        const reply = hook.call(object, state.depth - level, { depth: state.depth }, inspect);
+        const reply = hook.call(object, state.depth - level, {
+            stylize: (text: string) => text,
+            depth: state.depth,
+            colors: false,
+        }, inspect);
         if (reply !== object) {
             return typeof reply === 'string' ? reply : formatValue(reply, level, state);
         }
     }
 
-    if (state.seen.includes(object)) {
-        if (!state.refs.has(object)) state.refs.set(object, state.refs.size + 1);
-        return `[Circular *${state.refs.get(object)}]`;
-    }
-    if (typeof value === 'function') {
-        const name = (value as { name?: unknown }).name;
-        return typeof name === 'string' && name !== '' ? `[Function: ${name}]` : '[Function (anonymous)]';
-    }
     if (level > state.depth) {
-        return Array.isArray(object) ? '[Array]' : `[${constructorName(object) ?? 'Object'}]`;
+        return `[${Array.isArray(object) ? 'Array' : constructorName(object) ?? 'Object'} ...]`;
+    }
+
+    if (state.seen.includes(object)) {
+        return '[Circular]';
     }
 
     state.seen.push(object);
     try {
-        const body = Array.isArray(object)
-            ? formatArray(object, level, state)
-            : formatObject(object, level, state);
-        const ref = state.refs.get(object);
-        return ref === undefined ? body : `<ref *${ref}> ${body}`;
+        return formatObjectKind(object, level, state);
     } finally {
         state.seen.pop();
     }
@@ -139,14 +155,17 @@ function formatPrimitive(value: unknown): string {
 function quote(text: string): string {
     const escaped = text
         .replace(/\\/g, '\\\\')
-        .replace(/'/g, "\\'")
+        .replace(/"/g, '\\"')
+        .replace(/\0/g, '\\u0000')
         .replace(/\n/g, '\\n')
         .replace(/\r/g, '\\r')
         .replace(/\t/g, '\\t')
         .replace(/\x08/g, '\\b')
         .replace(/\f/g, '\\f')
-        .replace(/\v/g, '\\v');
-    return `'${escaped}'`;
+        .replace(/\v/g, '\\u000B')
+        .replace(/[\x01-\x07\x0e-\x1f]/g, character =>
+            `\\u${character.charCodeAt(0).toString(16).toUpperCase().padStart(4, '0')}`);
+    return `"${escaped}"`;
 }
 
 function formatKey(key: string | symbol): string {
@@ -155,9 +174,91 @@ function formatKey(key: string | symbol): string {
 }
 
 function formatArray(array: unknown[], level: number, state: State): string {
-    if (array.length === 0) return '[]';
-    const items = array.map(item => formatValue(item, level + 1, state));
+    const items: string[] = [];
+    for (let index = 0; index < array.length;) {
+        if (Object.prototype.hasOwnProperty.call(array, index)) {
+            items.push(formatValue(array[index++], level + 1, state));
+            continue;
+        }
+        const start = index;
+        while (index < array.length && !Object.prototype.hasOwnProperty.call(array, index)) index++;
+        const count = index - start;
+        items.push(count === 1 ? 'empty item' : `${count} x empty items`);
+    }
+    for (const key of Object.keys(array)) {
+        if (!isArrayIndex(key, array.length)) {
+            items.push(`${formatKey(key)}: ${formatValue((array as unknown as Record<string, unknown>)[key], level + 1, state)}`);
+        }
+    }
+    if (items.length === 0) return '[]';
     return `[ ${items.join(', ')} ]`;
+}
+
+function formatObjectKind(object: object, level: number, state: State): string {
+    if (Array.isArray(object)) return formatArray(object, level, state);
+    const tag = Object.prototype.toString.call(object);
+    if (tag === '[object Date]') {
+        try {
+            const time = Date.prototype.getTime.call(object);
+            return Number.isNaN(time) ? 'Invalid Date' : new Date(time).toISOString();
+        } catch {}
+    }
+    if (tag === '[object RegExp]') {
+        try {
+            Object.getOwnPropertyDescriptor(RegExp.prototype, 'source')!.get!.call(object);
+            return RegExp.prototype.toString.call(object);
+        } catch {}
+    }
+    if (tag === '[object Map]') {
+        try {
+            return formatMap(object as Map<unknown, unknown>, level, state);
+        } catch {}
+    }
+    if (tag === '[object Set]') {
+        try {
+            return formatSet(object as Set<unknown>, level, state);
+        } catch {}
+    }
+    if (ArrayBuffer.isView(object)) return formatArrayBufferView(object, level, state);
+    if (tag === '[object ArrayBuffer]') {
+        try {
+            const byteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength')!.get!.call(object);
+            return `ArrayBuffer(${byteLength}) [ ${Array.from(new Uint8Array(object as ArrayBuffer)).join(', ')} ]`;
+        } catch {}
+    }
+    return formatObject(object, level, state);
+}
+
+function formatMap(map: Map<unknown, unknown>, level: number, state: State): string {
+    const size = Object.getOwnPropertyDescriptor(Map.prototype, 'size')!.get!.call(map);
+    const entries = Array.from(Map.prototype.entries.call(map), ([key, value]) =>
+        `${formatValue(key, level + 1, state)}: ${formatValue(value, level + 1, state)}`);
+    return entries.length === 0 ? 'Map {}' : `Map(${size}) { ${entries.join(', ')} }`;
+}
+
+function formatSet(set: Set<unknown>, level: number, state: State): string {
+    const size = Object.getOwnPropertyDescriptor(Set.prototype, 'size')!.get!.call(set);
+    const entries = Array.from(Set.prototype.values.call(set), value => formatValue(value, level + 1, state));
+    return entries.length === 0 ? 'Set {}' : `Set(${size}) { ${entries.join(', ')} }`;
+}
+
+function formatArrayBufferView(view: ArrayBufferView, level: number, state: State): string {
+    const name = constructorName(view) ?? 'ArrayBufferView';
+    const bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+    if (Object.prototype.toString.call(view) === '[object DataView]') {
+        return `DataView(${view.byteLength}) [ ${Array.from(bytes).join(', ')} ]`;
+    }
+    const values = Array.from(view as unknown as Iterable<unknown>, value => formatValue(value, level + 1, state));
+    return `${name}(${values.length}) [ ${values.join(', ')} ]`;
+}
+
+function isArrayIndex(key: string, length: number): boolean {
+    const index = Number(key);
+    return Number.isInteger(index) && index >= 0 && index < length && String(index) === key;
+}
+
+function invalidDepth(message: string): TypeError & { code: string } {
+    return Object.assign(new TypeError(message), { code: 'ERR_INVALID_ARG_TYPE' });
 }
 
 function formatObject(object: object, level: number, state: State): string {
