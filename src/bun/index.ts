@@ -359,9 +359,9 @@ export const sleep = (milliseconds: number | Date): Promise<void> => {
  * Manual engine GC. Bun distinguishes eden (`false`) from full (`true`)
  * collection; the engine binding only exposes one sweep, so every call runs it.
  */
-export function gc(_force?: boolean): void {
+export const gc = (_force?: boolean): void => {
     import.meta.use('engine').gc.run();
-}
+};
 
 const osModule = import.meta.use('os');
 /** Whether stdout is a terminal, i.e. whether ANSI colors are enabled. */
