@@ -119,21 +119,24 @@ export class Cookie {
     }
     get name(): string { assertInstance(this, 'name'); return this.#name; }
     get value(): string { assertInstance(this, 'value'); return this.#value; }
-    set value(value: string) { this.#value = asString(value); }
+    set value(value: string) { assertInstance(this, 'value'); this.#value = asString(value); }
     get domain(): string | undefined { assertInstance(this, 'domain'); return this.#domain; }
     set domain(value: string | undefined) {
+        assertInstance(this, 'domain');
         const string = asString(value);
         if (invalidDomain.test(string)) throw new TypeError('Invalid cookie domain: contains invalid characters');
         this.#domain = string || undefined;
     }
     get path(): string { assertInstance(this, 'path'); return this.#path; }
     set path(value: string) {
+        assertInstance(this, 'path');
         const string = asString(value);
         if (invalidPath.test(string)) throw new TypeError('Invalid cookie path: contains invalid characters');
         this.#path = string;
     }
     get expires(): Date | undefined { assertInstance(this, 'expires'); return this.#expires && new Date(this.#expires.getTime()); }
     set expires(value: Date | number | string | undefined) {
+        assertInstance(this, 'expires');
         if (value == null) { this.#expires = undefined; return; }
         let date: Date;
         if (value instanceof Date) {
@@ -150,26 +153,29 @@ export class Cookie {
     }
     get maxAge(): number | undefined { assertInstance(this, 'maxAge'); return this.#maxAge; }
     set maxAge(value: number | undefined) {
+        assertInstance(this, 'maxAge');
         if (value == null) { this.#maxAge = undefined; return; }
         const n = +value;
         if (!Number.isFinite(n)) throw new TypeError('The provided value is non-finite');
         this.#maxAge = n;
     }
     get secure(): boolean { assertInstance(this, 'secure'); return this.#secure; }
-    set secure(value: boolean) { this.#secure = Boolean(value); }
+    set secure(value: boolean) { assertInstance(this, 'secure'); this.#secure = Boolean(value); }
     get httpOnly(): boolean { assertInstance(this, 'httpOnly'); return this.#httpOnly; }
-    set httpOnly(value: boolean) { this.#httpOnly = Boolean(value); }
+    set httpOnly(value: boolean) { assertInstance(this, 'httpOnly'); this.#httpOnly = Boolean(value); }
     get sameSite(): CookieSameSite { assertInstance(this, 'sameSite'); return this.#sameSite; }
     set sameSite(value: CookieSameSite) {
+        assertInstance(this, 'sameSite');
         const s = asString(value).toLowerCase();
         if (s !== 'strict' && s !== 'lax' && s !== 'none') throw new TypeError(sameSiteError);
         this.#sameSite = s;
     }
     get partitioned(): boolean { assertInstance(this, 'partitioned'); return this.#partitioned; }
-    set partitioned(value: boolean) { this.#partitioned = Boolean(value); }
-    isExpired(): boolean { return this.#maxAge !== undefined && !Number.isNaN(this.#maxAge) ? this.#maxAge <= 0 : this.#expires !== undefined && this.#expires.getTime() <= Date.now(); }
-    toString(): string { return this.#serialize(); }
+    set partitioned(value: boolean) { assertInstance(this, 'partitioned'); this.#partitioned = Boolean(value); }
+    isExpired(): boolean { assertInstance(this, 'isExpired'); return this.#maxAge !== undefined && !Number.isNaN(this.#maxAge) ? this.#maxAge <= 0 : this.#expires !== undefined && this.#expires.getTime() <= Date.now(); }
+    toString(): string { assertInstance(this, 'toString'); return this.#serialize(); }
     toJSON(): CookieOptions {
+        assertInstance(this, 'toJSON');
         const result: CookieOptions = Object.assign(Object.create(null), { name: this.#name, value: this.#value });
         if (this.#domain !== undefined) result.domain = this.#domain;
         result.path = this.#path;
@@ -181,7 +187,7 @@ export class Cookie {
         result.partitioned = this.#partitioned;
         return result;
     }
-    serialize(): string { return this.#serialize(); }
+    serialize(): string { assertInstance(this, 'serialize'); return this.#serialize(); }
     #serialize(): string {
         const parts = [`${this.#name}=${encodeURIComponent(this.#value)}`];
         if (this.#domain) parts.push(`Domain=${this.#domain}`);
@@ -205,8 +211,8 @@ Object.defineProperty(Cookie.prototype, Symbol.toStringTag, {
     configurable: true,
 });
 
-// Class getter functions carry the "get " prefix by spec, and the transformer
-// emits accessors without `enumerable`; both are restored to spec shape here.
+// The transformer emits class members without `enumerable`; Bun exposes its
+// Cookie accessors and ordinary methods as enumerable prototype members.
 for (const property of [
     'name', 'value', 'domain', 'path', 'expires',
     'maxAge', 'secure', 'httpOnly', 'sameSite', 'partitioned',
@@ -218,7 +224,14 @@ for (const property of [
         enumerable: true,
         configurable: true,
     });
-    if (descriptor.get) {
-        Object.defineProperty(descriptor.get, 'name', { value: property, configurable: true });
-    }
+}
+
+for (const property of ['isExpired', 'toString', 'toJSON', 'serialize'] as const) {
+    const descriptor = Object.getOwnPropertyDescriptor(Cookie.prototype, property);
+    if (descriptor) Object.defineProperty(Cookie.prototype, property, { ...descriptor, enumerable: true });
+}
+
+for (const property of ['parse', 'from'] as const) {
+    const descriptor = Object.getOwnPropertyDescriptor(Cookie, property);
+    if (descriptor) Object.defineProperty(Cookie, property, { ...descriptor, enumerable: true, configurable: false });
 }
