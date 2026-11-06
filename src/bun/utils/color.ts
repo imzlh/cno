@@ -1,5 +1,6 @@
 /** A deliberately partial implementation of Bun 1.4.4's color utility.
  * Unsupported output formats throw instead of returning approximations. */
+const engine = import.meta.use('engine');
 type RGBA = [number, number, number, number];
 const names: Record<string, string> = {
     black: '000000', silver: 'c0c0c0', gray: '808080', grey: '808080', white: 'ffffff',
@@ -20,10 +21,14 @@ const ansi16Palette: readonly (readonly [number, number, number])[] = [
     [0x7f, 0x7f, 0x7f], [0xff, 0x00, 0x00], [0x00, 0xff, 0x00], [0xff, 0xff, 0x00],
     [0x5c, 0x5c, 0xff], [0xff, 0x00, 0xff], [0x00, 0xff, 0xff], [0xff, 0xff, 0xff],
 ];
-// Unlike `instanceof`, this intrinsic recognizes typed arrays from another
-// realm. DataView has no indexed color channels and remains an object input.
+// The intrinsic brand checks work across realms and cannot be shadowed by an
+// own `length` getter. DataView fails the TypedArray length getter below.
 const arrayBufferIsView = ArrayBuffer.isView;
-type IndexedColorInput = { readonly length: number; readonly [index: number]: unknown };
+const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
+const typedArrayLength = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'length')!.get!;
+const stringValueOf = String.prototype.valueOf;
+const stringFrom = String;
+type IndexedColorInput = { readonly [index: number]: unknown };
 function f32String(n: number): string {
     const v = Math.fround(n);
     for (let p = 1; p <= 9; p++) {
@@ -147,23 +152,26 @@ function parseString(input: string): RGBA | null {
     return [Math.round((rgb[0] + m) * 255), Math.round((rgb[1] + m) * 255), Math.round((rgb[2] + m) * 255), a];
 }
 
-function isIndexedTypedArray(value: unknown): value is IndexedColorInput {
-    return value !== null
-        && typeof value === 'object'
-        && arrayBufferIsView(value)
-        && typeof Reflect.get(value, 'length') === 'number';
+function indexedTypedArrayLength(value: object): number | undefined {
+    if (!arrayBufferIsView(value)) return undefined;
+    try {
+        return Reflect.apply(typedArrayLength, value, []) as number;
+    } catch {
+        return undefined;
+    }
 }
 
-function parseArrayInput(input: IndexedColorInput): RGBA {
-    if (input.length !== 3 && input.length !== 4) throw new Error('Expected array length 3 or 4');
-    const values = [0, 1, 2].map(index => {
+function parseArrayInput(input: IndexedColorInput, length: number): RGBA {
+    if (length !== 3 && length !== 4) throw new Error('Expected array length 3 or 4');
+    const values: number[] = [];
+    for (let index = 0; index < 3; index++) {
         const value = input[index];
         if (typeof value !== 'number') throw new TypeError(`Expected [${index}] to be a integer for 'color'.`);
-        return byte(value);
-    });
+        values.push(byte(value));
+    }
     let alpha = 255;
-    const value = input[3];
-    if (value !== undefined) {
+    if (length === 4) {
+        const value = input[3];
         if (typeof value !== 'number') throw new TypeError("Expected [3] to be a integer for 'color'.");
         alpha = byte(value);
     }
@@ -171,32 +179,16 @@ function parseArrayInput(input: IndexedColorInput): RGBA {
 }
 
 function parseObjectInput(input: Record<string, unknown>): RGBA {
-    const values = ['r', 'g', 'b'].map(key => {
+    const values: number[] = [];
+    for (const key of ['r', 'g', 'b']) {
         const value = input[key];
         if (typeof value !== 'number') throw new TypeError(`Expected ${key} to be a integer for 'color'.`);
-        return byte(value);
-    });
-    let alpha = 255;
-    if (input.a !== undefined) {
-        const value = input.a;
-        if (typeof value !== 'number') throw new TypeError("Expected a to be a number for 'color'.");
-        alpha = byte(clamp(value, 1) * 255);
+        values.push(byte(value));
     }
+    let alpha = 255;
+    const value = input.a;
+    if (typeof value === 'number') alpha = byte(clamp(value, 1) * 255);
     return [values[0], values[1], values[2], alpha];
-}
-
-function hasColorFields(input: object): boolean {
-    return Reflect.has(input, 'r') || Reflect.has(input, 'g')
-        || Reflect.has(input, 'b') || Reflect.has(input, 'a');
-}
-
-function parseStringLike(input: object): RGBA | null | undefined {
-    const toString = Reflect.get(input, 'toString');
-    // Keep ordinary records on the RGB-object path. Other StringLike objects
-    // (including boxed strings and explicit custom methods) can provide CSS.
-    if (typeof toString !== 'function' || toString === Object.prototype.toString) return undefined;
-    const text = Reflect.apply(toString, input, []);
-    return typeof text === 'string' ? parseString(text) : null;
 }
 
 function parse(input: unknown): RGBA | null {
@@ -207,17 +199,26 @@ function parse(input: unknown): RGBA | null {
         const n = (input === Infinity ? 0xffffffff : input === -Infinity ? 0 : Math.trunc(input)) >>> 0;
         return [(n >>> 16) & 255, (n >>> 8) & 255, n & 255, n > 0xffffff ? (n >>> 24) & 255 : 255];
     }
-    if (typeof input !== 'object') return null;
-    if (Array.isArray(input) || isIndexedTypedArray(input)) return parseArrayInput(input);
-    // ArrayBuffer.isView also covers DataView, which has no color channels;
-    // keep it on the ordinary object validation path instead of stringifying
-    // its cross-realm default `toString` result.
-    if (arrayBufferIsView(input)) return parseObjectInput(input as unknown as Record<string, unknown>);
-    if (!hasColorFields(input)) {
-        const stringified = parseStringLike(input);
-        if (stringified !== undefined) return stringified;
-    }
+    if (typeof input === 'symbol') throw new TypeError('Cannot convert a symbol to a string');
+    if (typeof input !== 'object' && typeof input !== 'function') return null;
+    if (!engine.isProxy(input) && Array.isArray(input)) return parseArrayInput(input, input.length);
+    const typedLength = indexedTypedArrayLength(input);
+    if (typedLength !== undefined) return parseArrayInput(input as IndexedColorInput, typedLength);
     return parseObjectInput(input as Record<string, unknown>);
+}
+
+function normalizeFormat(format: unknown): string {
+    if (format == null) return 'css';
+    if (typeof format === 'string') return format;
+    if (typeof format === 'object') {
+        try {
+            Reflect.apply(stringValueOf, format, []);
+        } catch {
+            throw new TypeError("Expected format to be a string for 'color'.");
+        }
+        return stringFrom(format);
+    }
+    throw new TypeError("Expected format to be a string for 'color'.");
 }
 /** 0 disables ANSI output, 1 selects ansi-16, 2 ansi-256, 3 truecolor. */
 export type AnsiColorDepth = 0 | 1 | 2 | 3;
@@ -279,10 +280,10 @@ export function setStdoutColorDepthProvider(provider: () => AnsiColorDepth): voi
     stdoutColorDepth = provider;
 }
 
-export function color(input: unknown, format?: unknown): unknown {
-    if (format != null && typeof format !== 'string') throw new TypeError("Expected format to be a string for 'color'.");
-    const f = format ?? 'css';
-    if (!formats.includes(f as string)) throw new TypeError(`format must be one of ${formats.map(x => `'${x}'`).join(', ').replace(/, 'rgba'$/, " or 'rgba'")}`);
+export const color = (input: unknown, format?: unknown): unknown => {
+    if (input === undefined) throw new TypeError("Expected input to be a string, number, or object for 'color'.");
+    const f = normalizeFormat(format);
+    if (!formats.includes(f)) throw new TypeError(`format must be one of ${formats.map(x => `'${x}'`).join(', ').replace(/, 'rgba'$/, " or 'rgba'")}`);
     const rgba = parse(input);
     if (!rgba) return null;
     const [r, g, b, a] = rgba;
@@ -318,4 +319,4 @@ export function color(input: unknown, format?: unknown): unknown {
         }
         default: throw new Error(`Bun.color output format '${f}' is not implemented`);
     }
-}
+};
