@@ -487,33 +487,49 @@ type StatementConstructor<T> = new (...args: any[]) => T;
 
 /** A Bun prepared statement backed by circu.js' native SQLite statement. */
 export class Statement<ReturnType = unknown> {
-    private finalized = false;
-    private finalizedByDatabase = false;
-    private rowPrototype: object | undefined;
-    private safeIntegerMode: boolean;
+    #database: Database;
+    #statement: Sqlite3Stmt;
+    #sourceSQL: string;
+    #closeWithDatabase: boolean;
+    #finalized = false;
+    #finalizedByDatabase = false;
+    #rowPrototype: object | undefined;
+    #safeIntegerMode: boolean;
+
+    // Bun installs these shared execution functions as own enumerable fields.
+    get = this.#get;
+    all = this.#all;
+    iterate = this.#iterate;
+    values = this.#values;
+    raw = this.#raw;
+    run = this.#run;
 
     constructor(
-        private readonly database: Database,
-        private readonly statement: Sqlite3Stmt,
-        readonly sourceSQL: string,
-        private readonly closeWithDatabase: boolean,
+        database: Database,
+        statement: Sqlite3Stmt,
+        sourceSQL: string,
+        closeWithDatabase: boolean,
     ) {
-        this.safeIntegerMode = database.safeIntegers;
+        this.#database = database;
+        this.#statement = statement;
+        this.#sourceSQL = sourceSQL;
+        this.#closeWithDatabase = closeWithDatabase;
+        this.#safeIntegerMode = database.safeIntegers;
         database._registerStatement(this);
     }
 
     get isFinalized(): boolean {
-        return this.finalized;
+        return this.#finalized;
     }
 
     get columnNames(): string[] {
-        this.assertUsable();
-        return nativeCall(() => this.statement.columnNames?.() ?? []);
+        this.#assertUsable();
+        return nativeCall(() => this.#statement.columnNames?.() ?? []);
     }
 
     get paramsCount(): number {
-        this.assertUsable();
-        return scanParameters(firstStatement(this.sourceSQL)).maxIndex;
+        this.#assertUsable();
+        return scanParameters(firstStatement(this.#sourceSQL)).maxIndex;
     }
 
     get reader(): boolean {
@@ -521,65 +537,65 @@ export class Statement<ReturnType = unknown> {
     }
 
     get readonly(): boolean {
-        this.assertUsable();
-        const sql = stripSqlCommentsAndWhitespace(firstStatement(this.sourceSQL)).toUpperCase();
+        this.#assertUsable();
+        const sql = stripSqlCommentsAndWhitespace(firstStatement(this.#sourceSQL)).toUpperCase();
         return /^(SELECT|VALUES|PRAGMA|EXPLAIN|WITH|BEGIN|COMMIT|ROLLBACK|SAVEPOINT|RELEASE)\b/.test(sql);
     }
 
     get declaredTypes(): Array<string | null> {
-        this.assertUsable();
-        const metadata = this.statement.columnMetadata?.();
+        this.#assertUsable();
+        const metadata = this.#statement.columnMetadata?.();
         if (metadata) return metadata.map(column => column.type ?? null);
         return this.columnNames.map(() => null);
     }
 
     get columnTypes(): Array<'INTEGER' | 'FLOAT' | 'TEXT' | 'BLOB' | 'NULL' | null> {
-        this.assertUsable();
+        this.#assertUsable();
         return unsupported('Statement.columnTypes');
     }
 
     get native(): Sqlite3Stmt {
-        this.assertUsable();
-        return this.statement;
+        this.#assertUsable();
+        return this.#statement;
     }
 
     safeIntegers(): boolean;
     safeIntegers(enabled: boolean): this;
     safeIntegers(enabled?: boolean): boolean | this {
-        this.assertUsable();
-        if (enabled === undefined) return this.safeIntegerMode;
+        this.#assertUsable();
+        if (enabled === undefined) return this.#safeIntegerMode;
         const normalized = !!enabled;
-        nativeCall(() => this.statement.setReadBigInts(normalized));
-        this.safeIntegerMode = normalized;
+        nativeCall(() => this.#statement.setReadBigInts(normalized));
+        this.#safeIntegerMode = normalized;
         return this;
     }
 
-    all(...args: unknown[]): ReturnType[] {
-        const rows = this.execute(args, params => (
+    #all(...args: unknown[]): ReturnType[] {
+        const rows = this.#execute(args, params => (
             params === undefined
-                ? nativeCall(() => this.statement.all())
-                : nativeCall(() => this.statement.all(params as NativeParams))
+                ? nativeCall(() => this.#statement.all())
+                : nativeCall(() => this.#statement.all(params as NativeParams))
         ));
-        return rows.map(row => plainRow(row, this.safeIntegerMode, this.rowPrototype) as ReturnType);
+        return rows.map(row => plainRow(row, this.#safeIntegerMode, this.#rowPrototype) as ReturnType);
     }
 
-    get(...args: unknown[]): ReturnType | null {
-        return this.all(...args)[0] ?? null;
+    #get(...args: unknown[]): ReturnType | null {
+        return this.#all(...args)[0] ?? null;
     }
 
-    run(...args: unknown[]): Changes {
-        this.execute(args, params => {
+    #run(...args: unknown[]): Changes {
+        this.#execute(args, params => {
             nativeCall(() => {
-                if (params === undefined) this.statement.run();
-                else this.statement.run(params as NativeParams);
+                if (params === undefined) this.#statement.run();
+                else this.#statement.run(params as NativeParams);
             });
             return [];
         });
-        return this.database._statementResult(this.safeIntegerMode);
+        return this.#database._statementResult(this.#safeIntegerMode);
     }
 
-    iterate(...args: unknown[]): IterableIterator<ReturnType> {
-        const rows = this.all(...args);
+    #iterate(...args: unknown[]): IterableIterator<ReturnType> {
+        const rows = this.#all(...args);
         let index = 0;
         return {
             next: (): IteratorResult<ReturnType> => {
@@ -596,15 +612,15 @@ export class Statement<ReturnType = unknown> {
         return this.iterate();
     }
 
-    values(...args: unknown[]): unknown[][] {
-        return this.all(...args).map(row => {
+    #values(...args: unknown[]): unknown[][] {
+        return this.#all(...args).map(row => {
             if (Array.isArray(row)) return row as unknown[];
             return Object.keys(row as object).map(key => (row as Record<string, unknown>)[key]);
         });
     }
 
-    raw(..._args: unknown[]): Array<Array<Uint8Array | null>> {
-        this.assertUsable();
+    #raw(..._args: unknown[]): Array<Array<Uint8Array | null>> {
+        this.#assertUsable();
         unsupported('Statement.raw');
     }
 
@@ -612,37 +628,37 @@ export class Statement<ReturnType = unknown> {
         if (typeof Class !== 'function' || !Class.prototype) {
             throw new TypeError('Statement.as expects a class or constructor');
         }
-        this.rowPrototype = Class.prototype;
+        this.#rowPrototype = Class.prototype;
         return this as unknown as Statement<T>;
     }
 
     toString(): string {
-        if (this.finalized) return '';
-        return nativeCall(() => this.statement.expand());
+        if (this.#finalized) return '';
+        return nativeCall(() => this.#statement.expand());
     }
 
     toJSON(): { sql: string; isFinalized: boolean; paramsCount: number; columnNames: string[] } {
-        this.assertUsable();
+        this.#assertUsable();
         return {
             sql: this.toString(),
-            isFinalized: this.finalized,
-            paramsCount: this.finalized ? 0 : this.paramsCount,
-            columnNames: this.finalized ? [] : this.columnNames,
+            isFinalized: this.#finalized,
+            paramsCount: this.#finalized ? 0 : this.paramsCount,
+            columnNames: this.#finalized ? [] : this.columnNames,
         };
     }
 
     finalize(): void {
-        this.finalizeInternal(false);
+        this.#finalizeInternal(false);
     }
 
-    private finalizeInternal(fromDatabase: boolean): void {
-        if (this.finalized) return;
-        this.finalizedByDatabase = fromDatabase;
-        this.finalized = true;
+    #finalizeInternal(fromDatabase: boolean): void {
+        if (this.#finalized) return;
+        this.#finalizedByDatabase = fromDatabase;
+        this.#finalized = true;
         try {
-            nativeCall(() => this.statement.finalize());
+            nativeCall(() => this.#statement.finalize());
         } finally {
-            this.database._statementFinalized(this, this.closeWithDatabase);
+            this.#database._statementFinalized(this, this.#closeWithDatabase);
         }
     }
 
@@ -657,38 +673,38 @@ export class Statement<ReturnType = unknown> {
 
     /** @internal */
     _finalizeFromDatabase(): void {
-        this.finalizeInternal(true);
+        this.#finalizeInternal(true);
     }
 
     /** @internal */
     _closesWithDatabase(): boolean {
-        return this.closeWithDatabase;
+        return this.#closeWithDatabase;
     }
 
-    private assertUsable(): void {
-        if (this.finalized) throw finalizedError(this.finalizedByDatabase);
+    #assertUsable(): void {
+        if (this.#finalized) throw finalizedError(this.#finalizedByDatabase);
     }
 
-    private execute<T>(args: unknown[], operation: (params: unknown[] | BindingRecord | undefined) => T): T {
-        this.assertUsable();
+    #execute<T>(args: unknown[], operation: (params: unknown[] | BindingRecord | undefined) => T): T {
+        this.#assertUsable();
         const invocation = invocationParams(args);
         if (!invocation.provided) {
             return operation(undefined);
         }
 
         const params = normalizeParams(
-            this.sourceSQL,
+            this.#sourceSQL,
             invocation.params!,
-            this.database.strict,
-            this.safeIntegerMode,
+            this.#database.strict,
+            this.#safeIntegerMode,
         );
         return operation(params);
     }
 
     /** @internal */
     _bindInitial(params: unknown): void {
-        this.execute([params], normalized => {
-            nativeCall(() => this.statement.bind(normalized as NativeParams));
+        this.#execute([params], normalized => {
+            nativeCall(() => this.#statement.bind(normalized as NativeParams));
         });
     }
 }
