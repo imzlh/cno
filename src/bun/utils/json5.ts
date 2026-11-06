@@ -115,6 +115,9 @@ export function parseJSON5(input: unknown): any {
     if (input == null) throw new TypeError('input must be a string, ArrayBuffer, ArrayBufferView or Blob');
     let text: string;
     if (input instanceof ArrayBuffer) text = engine.decodeString(input);
+    else if (typeof SharedArrayBuffer !== 'undefined' && input instanceof SharedArrayBuffer) {
+        text = engine.decodeString(Uint8Array.from(new Uint8Array(input)));
+    }
     else if (ArrayBuffer.isView(input)) text = engine.decodeString(new Uint8Array(input.buffer, input.byteOffset, input.byteLength));
     else text = `${input}`;
     return new Parser(text).parse();
@@ -127,14 +130,19 @@ function quote(value: string): string {
         return escapes[c] ?? (code <= 127 ? `\\x${code.toString(16).padStart(2, '0')}` : `\\u${code.toString(16)}`);
     }) + "'";
 }
+// Bun quotes astral identifier keys even though the parser accepts them.
 const validIdentifier = /^[$_\p{ID_Start}][$_\u200c\u200d\p{ID_Continue}]*$/u;
+function isBareKey(value: string): boolean {
+    return validIdentifier.test(value) && !/[\ud800-\udfff]/.test(value);
+}
 function hasBoxedValue(value: object, valueOf: (this: any) => any): boolean {
     try { valueOf.call(value); return true; } catch { return false; }
 }
 export function stringifyJSON5(value: any, replacer?: unknown, space?: unknown): string | undefined {
     if (replacer != null) throw new Error('JSON5.stringify does not support the replacer argument');
     let gap = '';
-    if (space instanceof Number || space instanceof String) space = space.valueOf();
+    if (space instanceof Number && hasBoxedValue(space, Number.prototype.valueOf)) space = space.valueOf();
+    else if (space instanceof String && hasBoxedValue(space, String.prototype.valueOf)) space = space.toString();
     if (typeof space === 'number') gap = ' '.repeat(Math.min(10, Math.max(0, Math.floor(space) || 0)));
     else if (typeof space === 'string') gap = space.slice(0, 10);
     const stack = new Set<object>();
@@ -158,7 +166,7 @@ export function stringifyJSON5(value: any, replacer?: unknown, space?: unknown):
         } else {
             for (const key of Object.keys(item)) {
                 const v = serialize(item[key], depth + 1, key);
-                if (v !== undefined) parts.push((validIdentifier.test(key) ? key : quote(key)) + (gap ? ': ' : ':') + v);
+                if (v !== undefined) parts.push((isBareKey(key) ? key : quote(key)) + (gap ? ': ' : ':') + v);
             }
         }
         stack.delete(item);
