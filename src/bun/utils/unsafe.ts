@@ -6,6 +6,8 @@ const algorithm = import.meta.use('algorithm');
 const KIB = 1024;
 const MAX_PSS_KIB = Math.floor(Number.MAX_SAFE_INTEGER / KIB);
 
+const Uint8ArrayConstructor = Uint8Array;
+const Uint16ArrayConstructor = Uint16Array;
 const arrayBufferByteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength')!.get!;
 const sharedArrayBufferByteLength = typeof SharedArrayBuffer === 'function'
     ? Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength')?.get
@@ -18,23 +20,44 @@ const uint16ByteLength = uint8ByteLength;
 const uint16ByteOffset = uint8ByteOffset;
 const uint16Buffer = uint8Buffer;
 const typedArrayTagGetter = Object.getOwnPropertyDescriptor(typedArrayPrototype, Symbol.toStringTag)!.get!;
+const emptyBytes = new Uint8ArrayConstructor();
+const emptyU16 = new Uint16ArrayConstructor();
 
 type Getter = () => number;
+type InvalidBufferError = TypeError & { code: string };
 
-function hasTypedArrayBrand(getter: Getter | undefined, value: unknown): value is object {
-    if (!getter) return false;
-    if (value === null || (typeof value !== 'object' && typeof value !== 'function')) return false;
+const invalidBufferPrototype = Object.create(TypeError.prototype) as InvalidBufferError;
+const invalidBufferToString = {
+    toString(this: InvalidBufferError): string {
+        return `${this.name} [${this.code}]: ${this.message}`;
+    },
+}.toString;
+
+Object.defineProperties(invalidBufferPrototype, {
+    name: { configurable: true, enumerable: true, value: 'TypeError', writable: true },
+    code: { configurable: true, enumerable: true, value: 'ERR_INVALID_ARG_TYPE', writable: true },
+    toString: { configurable: true, enumerable: true, value: invalidBufferToString, writable: true },
+});
+
+function invalidBuffer(): never {
+    const error = new TypeError('Expected an ArrayBuffer');
+    Object.setPrototypeOf(error, invalidBufferPrototype);
+    throw error;
+}
+
+function slotValue(getter: Getter | undefined, value: unknown): number | undefined {
+    if (!getter) return undefined;
+    if (value === null || (typeof value !== 'object' && typeof value !== 'function')) return undefined;
     try {
-        getter.call(value as object);
-        return true;
+        return Reflect.apply(getter, value, []);
     } catch {
-        return false;
+        return undefined;
     }
 }
 
-function isArrayBufferLike(value: unknown): value is ArrayBufferLike {
-    return hasTypedArrayBrand(arrayBufferByteLength, value)
-        || hasTypedArrayBrand(sharedArrayBufferByteLength, value);
+function rawBufferByteLength(value: unknown): number | undefined {
+    return slotValue(arrayBufferByteLength, value)
+        ?? slotValue(sharedArrayBufferByteLength, value);
 }
 
 function typedArrayTag(value: unknown): string {
@@ -42,7 +65,7 @@ function typedArrayTag(value: unknown): string {
     try {
         // Calling the intrinsic getter directly avoids a user-defined
         // Symbol.toStringTag and still works for typed arrays from another realm.
-        return typedArrayTagGetter.call(value);
+        return Reflect.apply(typedArrayTagGetter, value, []);
     } catch {
         return '';
     }
@@ -50,17 +73,22 @@ function typedArrayTag(value: unknown): string {
 
 function byteView(value: unknown): Uint8Array {
     const tag = typedArrayTag(value);
-    if (tag && tag !== 'Uint16Array' && hasTypedArrayBrand(uint8ByteLength, value)) {
+    const byteLength = slotValue(uint8ByteLength, value);
+    if (tag && tag !== 'Uint16Array' && byteLength !== undefined) {
+        if (byteLength === 0) return emptyBytes;
         const object = value as object;
-        const buffer = uint8Buffer.call(object);
-        return new Uint8Array(
+        const buffer = Reflect.apply(uint8Buffer, object, []);
+        return new Uint8ArrayConstructor(
             buffer,
-            uint8ByteOffset.call(object),
-            uint8ByteLength.call(object),
+            Reflect.apply(uint8ByteOffset, object, []),
+            byteLength,
         );
     }
-    if (isArrayBufferLike(value)) return new Uint8Array(value);
-    throw new TypeError('Expected an ArrayBuffer');
+    const rawByteLength = rawBufferByteLength(value);
+    if (rawByteLength !== undefined) {
+        return rawByteLength === 0 ? emptyBytes : new Uint8ArrayConstructor(value as ArrayBufferLike);
+    }
+    return invalidBuffer();
 }
 
 /**
@@ -74,13 +102,14 @@ interface ArrayBufferToString {
 
 export const arrayBufferToString = ((buffer: unknown): string => {
     const tag = typedArrayTag(buffer);
-    if ((tag === 'Uint16Array' || tag === 'Int16Array')
-        && hasTypedArrayBrand(uint16ByteLength, buffer)) {
+    const byteLength = slotValue(uint16ByteLength, buffer);
+    if ((tag === 'Uint16Array' || tag === 'Int16Array') && byteLength !== undefined) {
+        if (byteLength === 0) return engine.decodeU16String(emptyU16);
         const object = buffer as object;
-        const source = new Uint16Array(
-            uint16Buffer.call(object),
-            uint16ByteOffset.call(object),
-            uint16ByteLength.call(object) / 2,
+        const source = new Uint16ArrayConstructor(
+            Reflect.apply(uint16Buffer, object, []),
+            Reflect.apply(uint16ByteOffset, object, []),
+            byteLength / 2,
         );
         return engine.decodeU16String(source);
     }
