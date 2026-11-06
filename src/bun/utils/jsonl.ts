@@ -24,7 +24,7 @@ const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as objec
 const typedArrayBuffer = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')!.get!;
 const typedArrayByteOffset = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteOffset')!.get!;
 const typedArrayByteLength = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteLength')!.get!;
-const dataViewByteLength = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength')!.get!;
+const dataViewBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer')!.get!;
 const sharedArrayBufferByteLength = typeof SharedArrayBuffer === 'function'
     ? Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength')?.get
     : undefined;
@@ -279,11 +279,11 @@ function normalize(input: unknown, method: string): NormalizedInput {
         try {
             return { source: typedArrayBytes(input) };
         } catch (error) {
-            // DataView is a valid view but not a TypedArray. A Proxy/detached
-            // TypedArray follows the intrinsic TypeError instead of being
-            // reclassified as malformed JSONL.
+            // DataView is a valid view but not a TypedArray. Its byteLength
+            // getter also throws after detachment, but the buffer getter keeps
+            // the brand check independent of backing-store state.
             try {
-                Reflect.apply(dataViewByteLength, input, []);
+                Reflect.apply(dataViewBuffer, input, []);
                 return { invalid: true };
             } catch {
                 throw error;
