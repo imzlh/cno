@@ -18,7 +18,7 @@ const FAILURE_MESSAGE = 'Failed to parse JSONL';
 const INCOMPLETE = -1;
 const ERROR = -2;
 // Single punctuation that the oracle leaves pending when it is the final byte.
-const PENDING_PUNCTUATION = new Set([',', ':', ';', '=', '(', ')', '.', '-', '[', '{', ']', '}'].map((c) => c.charCodeAt(0)));;
+const PENDING_PUNCTUATION = new Set([',', ':', ';', '=', '(', ')', '.', '-', '[', '{', ']', '}'].map((c) => c.charCodeAt(0)));
 
 function isDigit(code: number): boolean {
     return code >= 0x30 && code <= 0x39;
@@ -81,9 +81,12 @@ class Scanner {
     /** A token that cannot appear at this position. A bare-word run is pending only at the window end. */
     unexpected(index: number): number {
         const code = this.code(index);
-        if (isLetter(code) || isDigit(code)) {
+        if (code === 0x2d || isDigit(code)) return this.unexpectedNumber(index);
+        if (isLetter(code)) {
             let stop = index;
             while (stop < this.end && (isLetter(this.code(stop)) || isDigit(this.code(stop)))) stop++;
+            const token = this.slice(index, stop);
+            if (stop === this.end && /^(?:true|false|null).+/.test(token)) return ERROR;
             return stop === this.end ? INCOMPLETE : ERROR;
         }
         if (code === 0x22) {
@@ -93,6 +96,35 @@ class Scanner {
         }
         if (index + 1 === this.end && PENDING_PUNCTUATION.has(code)) return INCOMPLETE;
         return ERROR;
+    }
+
+    /** Classifies a number-shaped token where a value is not currently allowed. */
+    unexpectedNumber(index: number): number {
+        let stop = index;
+        if (this.code(stop) === 0x2d) {
+            stop++;
+            if (stop >= this.end) return INCOMPLETE;
+        }
+        if (!isDigit(this.code(stop))) return ERROR;
+        if (this.code(stop) === 0x30) {
+            stop++;
+            if (stop < this.end && isDigit(this.code(stop))) return ERROR;
+        } else {
+            while (stop < this.end && isDigit(this.code(stop))) stop++;
+        }
+        if (stop < this.end && this.code(stop) === 0x2e) {
+            stop++;
+            if (stop >= this.end) return INCOMPLETE;
+            if (!isDigit(this.code(stop))) return ERROR;
+            while (stop < this.end && isDigit(this.code(stop))) stop++;
+        }
+        if (stop < this.end && (this.code(stop) === 0x65 || this.code(stop) === 0x45)) {
+            stop++;
+            if (stop < this.end && (this.code(stop) === 0x2b || this.code(stop) === 0x2d)) stop++;
+            if (stop >= this.end || !isDigit(this.code(stop))) return ERROR;
+            while (stop < this.end && isDigit(this.code(stop))) stop++;
+        }
+        return stop === this.end ? INCOMPLETE : ERROR;
     }
 
     literal(index: number, word: string): number {
@@ -125,14 +157,18 @@ class Scanner {
         }
         if (stop < this.end && (this.code(stop) === 0x65 || this.code(stop) === 0x45)) {
             stop++;
-            if (stop < this.end && (this.code(stop) === 0x2b || this.code(stop) === 0x2d)) stop++;
+            let hasSign = false;
+            if (stop < this.end && (this.code(stop) === 0x2b || this.code(stop) === 0x2d)) {
+                hasSign = true;
+                stop++;
+            }
             if (stop >= this.end || !isDigit(this.code(stop))) {
                 // Oracle commits a top-level mantissa before reporting a bad exponent.
                 if (index === this.topStart) {
                     this.partialEnd = mantissaEnd;
                     return ERROR;
                 }
-                return stop >= this.end ? INCOMPLETE : ERROR;
+                return stop >= this.end && !hasSign ? INCOMPLETE : ERROR;
             }
             while (stop < this.end && isDigit(this.code(stop))) stop++;
         }
@@ -228,7 +264,8 @@ function normalize(input: unknown, method: string): NormalizedInput {
 
 function clampOffset(value: unknown, fallback: number, max: number): number {
     if (typeof value !== 'number') return fallback;
-    return Math.min(Math.floor(value), max);
+    const offset = Math.min(Math.floor(value), max);
+    return Object.is(offset, -0) ? 0 : offset;
 }
 
 function runScan(
