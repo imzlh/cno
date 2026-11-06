@@ -266,8 +266,9 @@ function serveDirectory(prefix: string, dir: string): ResolvedRouteValue {
 
         const root = await rootPromise;
         if (!root) return notFound();
-        // Build candidates from the canonical root captured for this request;
-        // a mutable relative path or root symlink must not redefine it later.
+        // Build candidates from the canonical root captured when the route was
+        // registered; replacing a root path or symlink must not retarget an
+        // already-running server to a different directory.
         const within = await resolveWithin(root, join(root, remainder));
         if (!within) return notFound();
         const info = await nodeStat(within).catch(() => undefined);
