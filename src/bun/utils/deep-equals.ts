@@ -94,7 +94,14 @@ function regexpFlagsOf(value: object): string {
 
 function slotInfo(value: object, prototype: object | null): SlotInfo | undefined {
     const hint = prototypeBrand(prototype);
-    if (!hint) return undefined;
+    if (!hint) {
+        try {
+            // Date slots survive prototype replacement, and this intrinsic check cannot be spoofed.
+            return { kind: 'Date', value: call(dateValue, value) as number };
+        } catch {
+            return undefined;
+        }
+    }
     try {
         switch (hint) {
             case 'Date':
