@@ -18,12 +18,99 @@ interface CookieRecord {
     partitioned: boolean;
 }
 
+interface CookieIterationSource {
+    cookies: CookieRecord[];
+    deletions: number;
+}
+
+interface CookieIteratorState {
+    source: CookieIterationSource;
+    index: number;
+    deletions: number;
+    kind: 'entries' | 'keys' | 'values';
+    done: boolean;
+}
+
 // RFC 6265 cookie-name token: no controls, whitespace, or separators.
 const INVALID_NAME = /[\x00-\x20\x7f()<>@,;:\\"/[\]?={}]/;
 const INVALID_ATTRIBUTE = /[\x00-\x1f\x7f;]/;
 const EPOCH = new Date(0);
 const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const cookieMapInstances = new WeakSet<object>();
+const cookieIteratorStates = new WeakMap<object, CookieIteratorState>();
+
+function invalidThis(method: string): never {
+    throw Object.assign(
+        new TypeError(`Can only call CookieMap.${method} on instances of CookieMap`),
+        { code: 'ERR_INVALID_THIS' },
+    );
+}
+
+function assertInstance(value: unknown, method: string): void {
+    if (typeof value !== 'object' || value === null || !cookieMapInstances.has(value)) invalidThis(method);
+}
+
+function missingArguments(): TypeError {
+    return Object.assign(new TypeError('Not enough arguments'), { code: 'ERR_MISSING_ARGS' });
+}
+
+function asString(value: unknown, symbolMessage = 'Cannot convert a Symbol value to a string'): string {
+    if (typeof value === 'symbol') throw new TypeError(symbolMessage);
+    return `${value}`;
+}
+
+function optionsObject(value: unknown, nullIsEmpty: boolean): CookieInit {
+    if (value === undefined || nullIsEmpty && value === null) return {};
+    if ((typeof value !== 'object' || value === null) && typeof value !== 'function') {
+        throw new TypeError('Options must be an object');
+    }
+    return value as CookieInit;
+}
+
+function createCookieIterator(
+    source: CookieIterationSource,
+    kind: CookieIteratorState['kind'],
+): IterableIterator<[string, string]> | IterableIterator<string> {
+    const iterator = Object.create(cookieIteratorPrototype) as IterableIterator<[string, string]>;
+    cookieIteratorStates.set(iterator, { source, index: 0, deletions: source.deletions, kind, done: false });
+    return iterator;
+}
+
+const iteratorParent = Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]()));
+const cookieIteratorPrototype = Object.create(iteratorParent) as { next: () => IteratorResult<unknown> };
+Object.defineProperties(cookieIteratorPrototype, {
+    next: {
+        configurable: true,
+        enumerable: true,
+        writable: true,
+        value: function next(this: object): IteratorResult<unknown> {
+            const state = typeof this === 'object' && this !== null ? cookieIteratorStates.get(this) : undefined;
+            if (!state) {
+                throw Object.assign(
+                    new TypeError('Cannot call next() on a non-Iterator object'),
+                    { code: 'ERR_INVALID_THIS' },
+                );
+            }
+            if (state.done) return { value: undefined, done: true };
+            state.index = Math.max(0, state.index - (state.source.deletions - state.deletions));
+            state.deletions = state.source.deletions;
+            const cookie = state.source.cookies[state.index++];
+            if (!cookie) {
+                state.done = true;
+                return { value: undefined, done: true };
+            }
+            const value = state.kind === 'keys' ? cookie.name
+                : state.kind === 'values' ? cookie.value
+                    : [cookie.name, cookie.value];
+            return { value, done: false };
+        },
+    },
+    [Symbol.toStringTag]: {
+        configurable: true,
+        value: 'CookieMap Iterator',
+    },
+});
 
 function validateName(name: string): void {
     if (name.length === 0 || INVALID_NAME.test(name)) {
@@ -105,24 +192,35 @@ function httpDate(date: Date): string {
 }
 
 function record(name: string, value: string, options: CookieInit = {}): CookieRecord {
+    const domainValue = options.domain;
+    const domain = domainValue == null ? undefined : asString(domainValue);
+    const pathValue = options.path;
+    const path = pathValue == null ? '/' : asString(pathValue);
+    const expiresValue = options.expires;
+    const maxAgeValue = options.maxAge;
+    const secure = Boolean(options.secure);
+    const httpOnly = Boolean(options.httpOnly);
+    const partitioned = Boolean(options.partitioned);
+    const sameSiteValue = options.sameSite;
+    const sameSite = sameSiteValue == null ? 'lax' : asString(sameSiteValue).toLowerCase();
+
     validateName(name);
-    if (options.domain !== undefined) validateAttribute('domain', options.domain);
-    if (options.path !== undefined) validateAttribute('path', options.path);
-    if (options.sameSite !== undefined &&
-        options.sameSite !== 'strict' && options.sameSite !== 'lax' && options.sameSite !== 'none') {
+    if (domain !== undefined) validateAttribute('domain', domain);
+    validateAttribute('path', path);
+    if (sameSite !== 'strict' && sameSite !== 'lax' && sameSite !== 'none') {
         throw new TypeError("Invalid sameSite value. Must be 'strict', 'lax', or 'none'");
     }
     return {
         name,
         value,
-        domain: options.domain || undefined,
-        path: options.path ?? '/',
-        expires: options.expires === undefined ? undefined : toDate(options.expires),
-        maxAge: options.maxAge !== undefined && !Number.isNaN(options.maxAge) ? options.maxAge : undefined,
-        secure: options.secure ?? false,
-        sameSite: options.sameSite ?? 'lax',
-        httpOnly: options.httpOnly ?? false,
-        partitioned: options.partitioned ?? false,
+        domain: domain || undefined,
+        path,
+        expires: expiresValue == null ? undefined : toDate(expiresValue),
+        maxAge: typeof maxAgeValue === 'number' && !Number.isNaN(maxAgeValue) ? maxAgeValue : undefined,
+        secure,
+        sameSite: sameSite as CookieSameSite,
+        httpOnly,
+        partitioned,
     };
 }
 
@@ -134,8 +232,8 @@ function serialize(cookie: CookieRecord): string {
     if (cookie.maxAge !== undefined) parts.push(`Max-Age=${cookie.maxAge}`);
     if (cookie.secure) parts.push('Secure');
     if (cookie.httpOnly) parts.push('HttpOnly');
-    parts.push(`SameSite=${cookie.sameSite[0].toUpperCase()}${cookie.sameSite.slice(1)}`);
     if (cookie.partitioned) parts.push('Partitioned');
+    parts.push(`SameSite=${cookie.sameSite[0].toUpperCase()}${cookie.sameSite.slice(1)}`);
     return parts.join('; ');
 }
 
@@ -153,6 +251,7 @@ function parseHeader(header: string): [string, string][] {
 
 export class CookieMap implements Iterable<[string, string]> {
     readonly #cookies: CookieRecord[] = [];
+    readonly #iterationSource: CookieIterationSource = { cookies: this.#cookies, deletions: 0 };
     // Names touched by set/delete since construction, in last-touch order.
     readonly #changed = new Map<string, CookieRecord>();
 
@@ -162,60 +261,74 @@ export class CookieMap implements Iterable<[string, string]> {
     }
 
     constructor(init?: string[][] | Record<string, string> | string) {
+        cookieMapInstances.add(this);
         if (init === undefined || init === null) return;
         if (typeof init === 'string') {
             for (const [name, value] of parseHeader(init)) this.#cookies.push(record(name, value));
         } else if (Array.isArray(init)) {
-            for (const pair of init) {
-                if (!Array.isArray(pair) || pair.length !== 2) {
-                    throw new TypeError('CookieMap array init entries must be [name, value] pairs');
-                }
-                const [name, value] = pair;
-                this.#cookies.push(record(String(name), String(value)));
+            for (let i = 0; i < init.length; i++) {
+                const pair = init[i];
+                if (!Array.isArray(pair)) throw new TypeError('Expected each element to be an array of two strings');
+                if (pair.length !== 2) throw new TypeError('Expected arrays of exactly two strings');
+                const name = asString(pair[0], 'Cannot convert a symbol to a string');
+                const value = asString(pair[1], 'Cannot convert a symbol to a string');
+                this.#cookies.push(record(name, value));
             }
-        } else if (typeof init === 'object') {
-            for (const [name, value] of Object.entries(init)) {
-                this.#cookies.push(record(name, String(value)));
+        } else if (typeof init === 'object' || typeof init === 'function') {
+            for (const name of Object.getOwnPropertyNames(init)) {
+                const value = asString((init as Record<string, unknown>)[name], 'Cannot convert a symbol to a string');
+                this.#cookies.push(record(name, value));
             }
         } else {
-            throw new TypeError('CookieMap init must be a string, string[][], or record');
+            throw new TypeError('Invalid initializer type');
         }
     }
 
     get size(): number {
+        if (!cookieMapInstances.has(this)) throw new TypeError('Type error');
         return this.#cookies.length;
     }
 
     get(name: string): string | null {
-        const key = String(name);
+        assertInstance(this, 'get');
+        const key = asString(name);
         return this.#cookies.find(cookie => cookie.name === key)?.value ?? null;
     }
 
     has(name: string): boolean {
-        const key = String(name);
+        assertInstance(this, 'has');
+        const key = asString(name);
         return this.#cookies.some(cookie => cookie.name === key);
     }
 
     set(name: string, value: string, options?: CookieInit): void;
     set(options: CookieInit): void;
-    set(nameOrOptions: string | CookieInit, value?: string, options?: CookieInit): void {
+    set(nameOrOptions: string | CookieInit, value?: string, options: CookieInit = {}): void {
+        assertInstance(this, 'set');
+        if (arguments.length === 0) return;
         let cookie: CookieRecord;
         if (typeof nameOrOptions === 'string') {
-            cookie = record(nameOrOptions, String(value), options);
+            if (arguments.length < 2) throw missingArguments();
+            const stringValue = asString(value);
+            cookie = record(nameOrOptions, stringValue, optionsObject(options, true));
         } else {
-            const { name, value: optionValue, ...rest } = nameOrOptions ?? {};
-            if (typeof name !== 'string') throw new TypeError('CookieMap.set options require a string name');
-            cookie = record(name, optionValue ?? '', rest);
+            if ((typeof nameOrOptions !== 'object' || nameOrOptions === null) && typeof nameOrOptions !== 'function') {
+                throw missingArguments();
+            }
+            if (!('name' in nameOrOptions)) throw new TypeError('name is required');
+            const name = asString(nameOrOptions.name);
+            const optionValue = 'value' in nameOrOptions ? asString(nameOrOptions.value) : '';
+            cookie = record(name, optionValue, nameOrOptions);
         }
         const index = this.#cookies.findIndex(current => current.name === cookie.name);
         // Bun lists newly changed cookies before untouched constructor entries,
-        // while updates retain the existing key position.
+        // including when an existing name is updated.
         if (index < 0) this.#cookies.unshift(cookie);
         else {
-            this.#cookies[index] = cookie;
-            for (let i = this.#cookies.length - 1; i > index; i--) {
+            for (let i = this.#cookies.length - 1; i >= 0; i--) {
                 if (this.#cookies[i].name === cookie.name) this.#cookies.splice(i, 1);
             }
+            this.#cookies.unshift(cookie);
         }
         this.#markChanged(cookie.name, cookie);
     }
@@ -223,13 +336,26 @@ export class CookieMap implements Iterable<[string, string]> {
     delete(name: string): void;
     delete(options: CookieStoreDeleteOptions): void;
     delete(name: string, options: Omit<CookieStoreDeleteOptions, 'name'>): void;
-    delete(nameOrOptions: string | CookieStoreDeleteOptions, options?: Omit<CookieStoreDeleteOptions, 'name'>): void {
-        const name = typeof nameOrOptions === 'string' ? nameOrOptions : nameOrOptions?.name;
-        if (typeof name !== 'string') throw new TypeError('CookieMap.delete requires a name');
+    delete(nameOrOptions: string | CookieStoreDeleteOptions, options: Omit<CookieStoreDeleteOptions, 'name'> = {}): void {
+        assertInstance(this, 'delete');
+        if (arguments.length === 0) return;
+        let name: unknown;
+        let deleteOptions: CookieStoreDeleteOptions;
+        if (typeof nameOrOptions === 'string') {
+            name = nameOrOptions;
+            deleteOptions = optionsObject(options, false) as CookieStoreDeleteOptions;
+        } else if (typeof nameOrOptions === 'object' && nameOrOptions !== null || typeof nameOrOptions === 'function') {
+            deleteOptions = nameOrOptions as CookieStoreDeleteOptions;
+            name = deleteOptions.name;
+        } else {
+            throw new TypeError('Cookie name is required');
+        }
+        const domainValue = deleteOptions.domain;
+        const domain = domainValue == null ? undefined : asString(domainValue);
+        const pathValue = deleteOptions.path;
+        const path = pathValue == null ? '/' : asString(pathValue);
+        if (typeof name !== 'string') throw new TypeError('Cookie name is required');
         validateName(name);
-        const deleteOptions = typeof nameOrOptions === 'string' ? options : nameOrOptions;
-        const path = deleteOptions?.path ?? '/';
-        const domain = deleteOptions?.domain ?? undefined;
         if (domain !== undefined) validateAttribute('domain', domain);
         validateAttribute('path', path);
         const removed: CookieRecord = {
@@ -243,17 +369,24 @@ export class CookieMap implements Iterable<[string, string]> {
             httpOnly: false,
             partitioned: false,
         };
+        let removedAny = false;
         for (let i = this.#cookies.length - 1; i >= 0; i--) {
-            if (this.#cookies[i].name === name) this.#cookies.splice(i, 1);
+            if (this.#cookies[i].name === name) {
+                this.#cookies.splice(i, 1);
+                removedAny = true;
+            }
         }
+        if (removedAny) this.#iterationSource.deletions++;
         this.#markChanged(name, removed);
     }
 
     toSetCookieHeaders(): string[] {
+        assertInstance(this, 'toSetCookieHeaders');
         return [...this.#changed.values()].map(serialize);
     }
 
     toJSON(): Record<string, string> {
+        assertInstance(this, 'toJSON');
         const json: Record<string, string> = {};
         for (const { name, value } of this.#cookies) {
             if (!Object.prototype.hasOwnProperty.call(json, name)) {
@@ -264,26 +397,57 @@ export class CookieMap implements Iterable<[string, string]> {
     }
 
     entries(): IterableIterator<[string, string]> {
-        return this.#cookies.map(({ name, value }): [string, string] => [name, value])[Symbol.iterator]();
+        assertInstance(this, 'entries');
+        return createCookieIterator(this.#iterationSource, 'entries') as IterableIterator<[string, string]>;
     }
 
     keys(): IterableIterator<string> {
-        return this.#cookies.map(cookie => cookie.name)[Symbol.iterator]();
+        assertInstance(this, 'keys');
+        return createCookieIterator(this.#iterationSource, 'keys') as IterableIterator<string>;
     }
 
     values(): IterableIterator<string> {
-        return this.#cookies.map(cookie => cookie.value)[Symbol.iterator]();
+        assertInstance(this, 'values');
+        return createCookieIterator(this.#iterationSource, 'values') as IterableIterator<string>;
     }
 
-    forEach(callback: (value: string, key: string, map: CookieMap) => void): void {
-        for (const [name, value] of this.entries()) callback(value, name, this);
-    }
-
-    [Symbol.iterator](): IterableIterator<[string, string]> {
-        return this.entries();
-    }
-
-    get [Symbol.toStringTag](): string {
-        return 'CookieMap';
+    forEach(callback: (value: string, key: string, map: CookieMap) => void, thisArg: unknown = undefined): void {
+        assertInstance(this, 'forEach');
+        if (typeof callback !== 'function') {
+            throw Object.assign(
+                new TypeError('Cannot call callback on a non-function'),
+                { code: 'ERR_INVALID_ARG_TYPE' },
+            );
+        }
+        for (const [name, value] of this.entries()) callback.call(thisArg, value, name, this);
     }
 }
+
+for (const property of [
+    'get', 'toSetCookieHeaders', 'has', 'set', 'delete',
+    'entries', 'keys', 'values', 'forEach', 'toJSON',
+] as const) {
+    const descriptor = Object.getOwnPropertyDescriptor(CookieMap.prototype, property);
+    if (descriptor) Object.defineProperty(CookieMap.prototype, property, { ...descriptor, enumerable: true });
+}
+
+const sizeDescriptor = Object.getOwnPropertyDescriptor(CookieMap.prototype, 'size');
+if (sizeDescriptor) {
+    Object.defineProperty(CookieMap.prototype, 'size', {
+        ...sizeDescriptor,
+        enumerable: true,
+        configurable: false,
+    });
+}
+
+Object.defineProperties(CookieMap.prototype, {
+    [Symbol.iterator]: {
+        configurable: true,
+        value: CookieMap.prototype.entries,
+        writable: true,
+    },
+    [Symbol.toStringTag]: {
+        configurable: true,
+        value: 'CookieMap',
+    },
+});
