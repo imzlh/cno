@@ -5,6 +5,7 @@ import {
     assertGlobMatchValue,
     compileGlobPattern,
     expandBraces,
+    globStringValue,
     hasGlobMagic,
     unescapeGlobLiteral,
     type CompiledGlobPattern,
@@ -62,9 +63,10 @@ function scanOptions(value?: string | GlobScanOptions | null): ResolvedScanOptio
             onlyFiles: true,
         };
     }
-    if (typeof value === 'string') {
+    const directCwd = globStringValue(value);
+    if (directCwd !== null) {
         return {
-            cwd: resolve(value),
+            cwd: resolve(directCwd),
             dot: false,
             absolute: false,
             followSymlinks: false,
@@ -72,19 +74,27 @@ function scanOptions(value?: string | GlobScanOptions | null): ResolvedScanOptio
             onlyFiles: true,
         };
     }
-    if (typeof value !== 'object' || Array.isArray(value)) {
+    if (typeof value !== 'object' && typeof value !== 'function') {
         throw Object.assign(new TypeError('GlobScanOptions must be an object'), { code: 'ERR_INVALID_ARG_TYPE' });
     }
-    if (value.cwd !== undefined && typeof value.cwd !== 'string') {
-        throw Object.assign(new TypeError('cwd must be a string'), { code: 'ERR_INVALID_ARG_TYPE' });
+    // Bun observes option getters in this order before starting traversal.
+    const onlyFiles = value.onlyFiles;
+    const throwErrorOnBrokenSymlink = value.throwErrorOnBrokenSymlink;
+    const followSymlinks = value.followSymlinks;
+    const absolute = value.absolute;
+    const cwdValue = value.cwd;
+    const dot = value.dot;
+    const cwdString = cwdValue == null ? null : globStringValue(cwdValue);
+    if (cwdValue != null && cwdString === null) {
+        throw Object.assign(new TypeError('GlobScanOptions.cwd must be a string'), { code: 'ERR_INVALID_ARG_TYPE' });
     }
     return {
-        cwd: resolve(value.cwd ?? cwd()),
-        dot: !!value.dot,
-        absolute: !!value.absolute,
-        followSymlinks: !!value.followSymlinks,
-        throwErrorOnBrokenSymlink: !!value.throwErrorOnBrokenSymlink,
-        onlyFiles: value.onlyFiles === undefined ? true : !!value.onlyFiles,
+        cwd: resolve(cwdString ?? cwd()),
+        dot: !!dot,
+        absolute: !!absolute,
+        followSymlinks: !!followSymlinks,
+        throwErrorOnBrokenSymlink: !!throwErrorOnBrokenSymlink,
+        onlyFiles: onlyFiles == null ? true : !!onlyFiles,
     };
 }
 
@@ -370,33 +380,39 @@ export class Glob {
     match(value: string): boolean {
         assertGlobMatchValue(value);
         // Bun.Glob#match is purely lexical and includes dot-prefixed segments.
-        return this.#compiled.match(value, true);
+        return this.#compiled.match(globStringValue(value)!, true);
     }
 
-    *scanSync(optionsOrCwd?: string | GlobScanOptions): IterableIterator<string> {
+    scanSync(optionsOrCwd?: string | GlobScanOptions): IterableIterator<string> {
         const options = scanOptions(optionsOrCwd);
         validateCwdSync(options.cwd);
-        const seen = new Set<string>();
-        for (const plan of plansFor(this.#compiled, options)) {
-            for (const path of scanPlanSync(plan, options)) {
-                if (seen.has(path)) continue;
-                seen.add(path);
-                yield path;
+        const compiled = this.#compiled;
+        return (function* (): Generator<string> {
+            const seen = new Set<string>();
+            for (const plan of plansFor(compiled, options)) {
+                for (const path of scanPlanSync(plan, options)) {
+                    if (seen.has(path)) continue;
+                    seen.add(path);
+                    yield path;
+                }
             }
-        }
+        })();
     }
 
-    async *scan(optionsOrCwd?: string | GlobScanOptions): AsyncIterableIterator<string> {
+    scan(optionsOrCwd?: string | GlobScanOptions): AsyncIterableIterator<string> {
         const options = scanOptions(optionsOrCwd);
-        await validateCwd(options.cwd);
-        const seen = new Set<string>();
-        for (const plan of plansFor(this.#compiled, options)) {
-            for await (const path of scanPlan(plan, options)) {
-                if (seen.has(path)) continue;
-                seen.add(path);
-                yield path;
+        const compiled = this.#compiled;
+        return (async function* (): AsyncGenerator<string> {
+            await validateCwd(options.cwd);
+            const seen = new Set<string>();
+            for (const plan of plansFor(compiled, options)) {
+                for await (const path of scanPlan(plan, options)) {
+                    if (seen.has(path)) continue;
+                    seen.add(path);
+                    yield path;
+                }
             }
-        }
+        })();
     }
 }
 

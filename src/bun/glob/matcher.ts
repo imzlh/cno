@@ -30,6 +30,16 @@ function invalidMatchValue(): TypeError & { code: string } {
     return Object.assign(new TypeError('str must be a string'), { code: 'ERR_INVALID_ARG_TYPE' });
 }
 
+export function globStringValue(value: unknown): string | null {
+    if (typeof value === 'string') return value;
+    if (typeof value !== 'object' || value === null) return null;
+    try {
+        return String.prototype.valueOf.call(value);
+    } catch {
+        return null;
+    }
+}
+
 function isEscaped(value: string, index: number): boolean {
     let slashes = 0;
     for (let cursor = index - 1; cursor >= 0 && value[cursor] === '\\'; cursor--) slashes++;
@@ -367,12 +377,13 @@ function patternHasExplicitDot(pattern: string): boolean {
 }
 
 export function compileGlobPattern(value: unknown): CompiledGlobPattern {
-    if (typeof value !== 'string') throw invalidPattern(value);
-    const parsed = parseNegation(value);
+    const stringValue = globStringValue(value);
+    if (stringValue === null) throw invalidPattern(value);
+    const parsed = parseNegation(stringValue);
     const expanded = expandBraces(parsed.pattern);
     const requiresExplicitDot = expanded.some(patternHasExplicitDot);
     return {
-        source: value,
+        source: stringValue,
         expanded,
         negated: parsed.negated,
         requiresExplicitDot,
@@ -384,7 +395,7 @@ export function compileGlobPattern(value: unknown): CompiledGlobPattern {
 }
 
 export function assertGlobMatchValue(value: unknown): asserts value is string {
-    if (typeof value !== 'string') throw invalidMatchValue();
+    if (globStringValue(value) === null) throw invalidMatchValue();
 }
 
 export function hasGlobMagic(pattern: string): boolean {
