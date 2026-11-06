@@ -411,17 +411,27 @@ function mainPath(): string {
     }
 }
 
-// Accessors intentionally stay live: env files and script arguments are applied
-// by the CLI after the compatibility bootstrap and before entry evaluation.
+const noLifecycleOverride = Symbol('no Bun lifecycle override');
+let argvOverride: unknown = noLifecycleOverride;
+let mainOverride: unknown = noLifecycleOverride;
+
+// Keep the lifecycle defaults live because the CLI applies env files and script
+// arguments after bootstrap. Bun.argv and Bun.main remain user-replaceable.
 const Bun: BunApi = {
     get argv(): string[] {
-        return processBridge().argv;
+        return (argvOverride === noLifecycleOverride ? processBridge().argv : argvOverride) as string[];
+    },
+    set argv(value: string[]) {
+        argvOverride = value;
     },
     get env(): Record<string, string | undefined> {
         return processBridge().env;
     },
     get main(): string {
-        return mainPath();
+        return (mainOverride === noLifecycleOverride ? mainPath() : mainOverride) as string;
+    },
+    set main(value: string) {
+        mainOverride = value;
     },
     fetch,
     isMainThread,
@@ -498,29 +508,24 @@ const Bun: BunApi = {
     resolveSync,
 };
 
-// The whole Bun namespace is exposed as non-writable value members in real
-// Bun; fetch/isMainThread/dns were locked first, and the newer namespace
-// members follow the same rule so `Bun` stays identical to its named exports.
-for (const name of [
-    'fetch', 'isMainThread', 'dns',
-    'connect', 'listen',
-    'stdout', 'stderr', 'stdin',
-    'gc', 'shrink', 'enableANSIColors',
-    'isStandaloneExecutable', 'embeddedFiles',
-    'unsafe',
-] as const) {
-    Object.defineProperty(Bun, name, {
-        value: Bun[name],
-        writable: false,
-        configurable: false,
-        enumerable: true,
-    });
+const readOnlyBunMembers = new Set<PropertyKey>([
+    'env', 'fetch', 'isMainThread', 'isStandaloneExecutable',
+    'Cookie', 'CookieMap', 'dns', 'JSONL', 'semver',
+]);
+
+// Bun's public namespace slots cannot be deleted. Most remain replaceable;
+// only the small set above is read-only in Bun 1.4.4.
+for (const name of Object.keys(Bun)) {
+    const descriptor = Object.getOwnPropertyDescriptor(Bun, name)!;
+    Object.defineProperty(Bun, name, 'value' in descriptor
+        ? { ...descriptor, writable: !readOnlyBunMembers.has(name), configurable: false }
+        : { ...descriptor, configurable: false });
 }
-Object.defineProperty(Bun, 'sleep', {
-    value: sleep,
-    writable: true,
-    configurable: false,
-    enumerable: true,
+Object.defineProperty(Bun, Symbol.toStringTag, {
+    value: 'Bun',
+    writable: false,
+    enumerable: false,
+    configurable: true,
 });
 
 export default Bun;
