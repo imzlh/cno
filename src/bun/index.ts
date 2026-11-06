@@ -95,6 +95,7 @@ import { randomUUIDv7 } from './uuid';
 import { randomUUIDv5 } from './uuid/v5';
 
 const webFetch = globalThis.fetch;
+const reflectGet = Reflect.get;
 const NativePromise = Promise;
 const dateGetTime = Date.prototype.getTime;
 const dateNow = Date.now;
@@ -114,15 +115,18 @@ const UNSUPPORTED_FETCH_OPTIONS = [
     'timeout',
 ] as const;
 
-export const fetch: typeof globalThis.fetch = function fetch(input, init = undefined) {
-    if (init !== undefined && init !== null) {
+export const fetch: typeof globalThis.fetch = async function fetch(input, init = undefined) {
+    const objectInit = init !== null && (typeof init === 'object' || typeof init === 'function')
+        ? init
+        : undefined;
+    if (objectInit !== undefined) {
         for (const name of UNSUPPORTED_FETCH_OPTIONS) {
-            if (Reflect.get(init, name) !== undefined) {
+            if (reflectGet(objectInit, name) !== undefined) {
                 throw new TypeError(`Bun.fetch: unsupported Bun-specific option "${name}".`);
             }
         }
     }
-    return webFetch(input, init);
+    return webFetch(input, objectInit);
 };
 export const isMainThread = !import.meta.use('worker').isWorker;
 // cno does not produce Bun-style `--compile` standalone executables. Keep
