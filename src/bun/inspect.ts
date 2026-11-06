@@ -39,7 +39,7 @@ export function inspect(value: unknown, options: InspectOptions | number = {}): 
 }
 
 /** Format tabular data using Bun's console-table layout. */
-export function inspectTable(value: unknown, columns?: unknown, _options?: unknown): string {
+const table = (value: unknown, columns?: unknown, _options?: unknown): string => {
     if (value === null || (typeof value !== 'object' && typeof value !== 'function')) return '';
     const isMap = value instanceof Map;
     const isSet = value instanceof Set;
@@ -103,7 +103,9 @@ export function inspectTable(value: unknown, columns?: unknown, _options?: unkno
         ' ' + text + ' '.repeat(widths[i] - widthOf(text) + 1)).join('│') + '│\n';
     return border('┌', '┬', '┐') + line(headers) + border('├', '┼', '┤') +
         lines.map(line).join('') + border('└', '┴', '┘');
-}
+};
+
+export { table as inspectTable };
 
 function formatValue(value: unknown, level: number, state: State): string {
     if (value === null || (typeof value !== 'object' && typeof value !== 'function')) {
@@ -111,10 +113,6 @@ function formatValue(value: unknown, level: number, state: State): string {
     }
     const object = value as object;
 
-    if (typeof value === 'function') {
-        const name = (value as { name?: unknown }).name;
-        return typeof name === 'string' && name !== '' ? `[Function: ${name}]` : '[Function (anonymous)]';
-    }
     const hook = Reflect.get(object, inspectCustom);
     if (typeof hook === 'function') {
         const reply = hook.call(object, state.depth - level, {
@@ -125,6 +123,11 @@ function formatValue(value: unknown, level: number, state: State): string {
         if (reply !== object) {
             return typeof reply === 'string' ? reply : formatValue(reply, level, state);
         }
+    }
+
+    if (typeof value === 'function') {
+        const name = (value as { name?: unknown }).name;
+        return typeof name === 'string' && name !== '' ? `[Function: ${name}]` : '[Function (anonymous)]';
     }
 
     if (level > state.depth) {
