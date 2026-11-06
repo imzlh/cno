@@ -8,7 +8,7 @@ function toText(value: unknown): string {
 }
 
 /** Strip terminal control sequences, including OSC hyperlinks and C1 CSI. */
-export function stripANSI(text: string): string {
+export const stripANSI = (text: string): string => {
     text = toText(text);
     let result = '';
     let start = 0;
@@ -64,7 +64,7 @@ export function stripANSI(text: string): string {
         start = i + 1;
     }
     return result + text.slice(start);
-}
+};
 
 function isWide(code: number): boolean {
     return code >= 0x1100 && (
@@ -180,7 +180,7 @@ function graphemeWidth(cluster: number[], ambiguousIsNarrow: boolean): number {
  * ZWJ sequences, skin tones, flags and keycaps measure as one emoji. With `perCodePoint`,
  * every code point counts on its own, so `"👨‍👩‍👧‍👦"` measures 8.
  */
-export function stringWidth(text: string, options: StringWidthOptions = {}): number {
+export const stringWidth = (text: string, options: StringWidthOptions = {}): number => {
     text = toText(text);
     options ??= {};
     if (!options.countAnsiEscapeCodes) text = stripANSI(text);
@@ -197,7 +197,7 @@ export function stringWidth(text: string, options: StringWidthOptions = {}): num
         start = end;
     }
     return width;
-}
+};
 
 /** A tokenized piece of input: an escape sequence (zero width) or one grapheme cluster. */
 type AnsiItem =
@@ -414,13 +414,13 @@ function sliceOptions(
  * ellipsis, which takes columns from the content. It is drawn inside SGR styles and
  * outside the hyperlink.
  */
-export function sliceAnsi(
+export const sliceAnsi = (
     input: string,
     start?: number,
     end?: number,
     options?: string | boolean | SliceAnsiOptions,
     ambiguousIsNarrow?: boolean,
-): string {
+): string => {
     input = toText(input);
     const slice = sliceOptions(options, ambiguousIsNarrow);
     const items = tokenize(input, slice.ambiguousIsNarrow);
@@ -471,14 +471,14 @@ export function sliceAnsi(
     const activeLink = state.get(LINK_KEY);
     const closeLink = activeLink === undefined ? '' : linkClose(activeLink);
     return openSgr + leftMark + openLink + body + closeLink + rightMark + sgrClose(state);
-}
+};
 
 /**
  * Wrap to `columns` terminal cells while keeping SGR styles and OSC 8 hyperlinks valid
  * on every row. Each row re-opens the styles active at its start and closes the ones
  * still open at its end. Existing `\n` characters always start a new row.
  */
-export function wrapAnsi(input: string, columns: number, options: WrapAnsiOptions = {}): string {
+export const wrapAnsi = (input: string, columns: number, options: WrapAnsiOptions = {}): string => {
     input = toText(input);
     options ??= {};
     const numericColumns = Number(columns);
@@ -625,4 +625,14 @@ export function wrapAnsi(input: string, columns: number, options: WrapAnsiOption
     }
     endLine();
     return rows.join('\n');
+};
+
+// Bun reports the declared API arity even though these JavaScript fallbacks use
+// defaults internally, which would otherwise shorten Function#length.
+for (const [helper, length] of [
+    [stringWidth, 2],
+    [sliceAnsi, 5],
+    [wrapAnsi, 3],
+] as const) {
+    Object.defineProperty(helper, 'length', { value: length, configurable: true });
 }
