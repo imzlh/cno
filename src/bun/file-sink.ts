@@ -15,13 +15,17 @@ function chunkBytes(chunk: unknown): Uint8Array<ArrayBuffer> {
         return arrayBufferBackedBytes(engine.encodeString(sanitizeSurrogates(chunk)));
     }
     if (ArrayBuffer.isView(chunk)) {
+        // Bun accepts detached and ordinary zero-length views as empty writes.
+        if (chunk.byteLength === 0) return new Uint8Array();
         return toOwnedBytes(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength));
     }
     if (chunk instanceof ArrayBuffer) return toOwnedBytes(new Uint8Array(chunk));
     if (typeof SharedArrayBuffer !== 'undefined' && chunk instanceof SharedArrayBuffer) {
         return toOwnedBytes(new Uint8Array(chunk));
     }
-    throw new TypeError('write() expects a string, ArrayBufferView, or ArrayBuffer');
+    const error = new TypeError('write() expects a string, ArrayBufferView, or ArrayBuffer') as TypeError & { code: string };
+    error.code = chunk === null || chunk === undefined ? 'ERR_STREAM_NULL_VALUES' : 'ERR_INVALID_ARG_TYPE';
+    throw error;
 }
 
 interface SinkTarget {
@@ -78,7 +82,17 @@ const sinkFinalizer = typeof FinalizationRegistry === 'function'
     })
     : undefined;
 
-export class FileSink {
+const fileSinkBrands = new WeakSet<object>();
+
+function assertFileSink(value: unknown): void {
+    if ((typeof value !== 'object' && typeof value !== 'function') || value === null || !fileSinkBrands.has(value)) {
+        const error = new TypeError('Expected FileSink') as TypeError & { code: string };
+        error.code = 'ERR_INVALID_THIS';
+        throw error;
+    }
+}
+
+class FileSinkImpl {
     readonly #target: SinkTarget;
     #pending: { chunk: Uint8Array<ArrayBuffer>; offset: number }[] = [];
     #buffered = 0;
@@ -87,25 +101,30 @@ export class FileSink {
 
     constructor(target: SinkTarget, open = false) {
         this.#target = target;
+        fileSinkBrands.add(this);
         if (open) this.#fd = this.#openTracked();
     }
 
     start(options?: { highWaterMark?: number } | null): void {
+        assertFileSink(this);
         // Bun's sink.start() is an advisory reconfiguration hook. It accepts
         // any value and does not discard already buffered data.
         void options;
     }
 
-    write(chunk: string | ArrayBufferView | ArrayBuffer | SharedArrayBuffer): number {
-        if (this.#ended) throw new Error('FileSink is already closed');
+    write(chunk: string | ArrayBufferView | ArrayBuffer | SharedArrayBuffer): number | true {
+        assertFileSink(this);
+        // Native Bun validates the chunk before consulting the closed state.
         const bytes = chunkBytes(chunk);
+        if (this.#ended) return true;
         this.#pending.push({ chunk: bytes, offset: 0 });
         this.#buffered += bytes.byteLength;
         return bytes.byteLength;
     }
 
-    flush(): number {
-        if (this.#ended) throw new Error('FileSink is already closed');
+    flush(_wait?: boolean): number | true {
+        assertFileSink(this);
+        if (this.#ended) return true;
         return this.#flushBuffered();
     }
 
@@ -135,8 +154,10 @@ export class FileSink {
         return fd;
     }
 
-    end(error?: Error | null): number {
+    end(...args: [error?: Error | null]): number {
+        assertFileSink(this);
         if (this.#ended) return 0;
+        void args;
         let flushed = 0;
         try {
             // Bun currently flushes pending file data even when an error value
@@ -170,16 +191,46 @@ export class FileSink {
     }
 }
 
+// Native FileSink objects expose a built-in-style, illegal constructor rather
+// than the implementation class used to allocate them.
+const fileSinkConstructor = function FileSink(): never {
+    const error = new TypeError('Illegal constructor') as TypeError & { code: string };
+    error.code = 'ERR_ILLEGAL_CONSTRUCTOR';
+    throw error;
+};
+Object.defineProperty(fileSinkConstructor, 'prototype', { value: undefined });
+
+const fileSinkPrototype = FileSinkImpl.prototype;
+Object.defineProperty(fileSinkPrototype, 'constructor', {
+    value: fileSinkConstructor,
+    writable: true,
+    configurable: true,
+});
+for (const name of ['start', 'write', 'flush', 'end', 'ref', 'unref'] as const) {
+    Object.defineProperty(fileSinkPrototype, name, {
+        value: fileSinkPrototype[name],
+        enumerable: true,
+        writable: false,
+        configurable: false,
+    });
+}
+Object.defineProperty(fileSinkPrototype, Symbol.toStringTag, {
+    value: 'FileSink',
+    configurable: true,
+});
+
+export type FileSink = FileSinkImpl;
+
 /** A sink that opens `path` eagerly and owns its descriptor. */
 export function filePathSink(path: string): FileSink {
     // Bun.file(path).writer() creates a missing file immediately, before the
     // first write or flush, while preserving an existing file's contents.
-    return new FileSink(pathTarget(path), true);
+    return new FileSinkImpl(pathTarget(path), true);
 }
 
 /** A sink over an already-owned descriptor; closing is the caller's job. */
 export function fileDescriptorSink(fd: number): FileSink {
-    return new FileSink(fdTarget(fd));
+    return new FileSinkImpl(fdTarget(fd));
 }
 
 export { chunkBytes as sinkChunkBytes };
