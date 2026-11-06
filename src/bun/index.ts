@@ -346,12 +346,9 @@ export function sleep(milliseconds: number | Date): Promise<void> {
 
 /**
  * Manual engine GC. Bun distinguishes eden (`false`) from full (`true`)
- * collection; the engine binding only exposes one sweep, so both run it.
+ * collection; the engine binding only exposes one sweep, so every call runs it.
  */
-export function gc(force?: boolean): void {
-    if (force !== undefined && typeof force !== 'boolean') {
-        throw new TypeError('Bun.gc: force must be a boolean when an argument is provided');
-    }
+export function gc(_force?: boolean): void {
     import.meta.use('engine').gc.run();
 }
 
