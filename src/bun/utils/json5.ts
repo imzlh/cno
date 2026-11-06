@@ -177,4 +177,9 @@ export function stringifyJSON5(value: any, replacer?: unknown, space?: unknown):
     }
     return serialize(value, 0, '');
 }
-export const JSON5 = { parse: parseJSON5, stringify: stringifyJSON5 };
+export const JSON5 = {
+    parse(input: unknown): any { return parseJSON5(input); },
+    stringify(value: any, replacer?: unknown, space?: unknown): string | undefined {
+        return stringifyJSON5(value, replacer, space);
+    },
+};
