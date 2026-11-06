@@ -4,10 +4,22 @@ const engine = import.meta.use('engine');
 
 type BinaryChunk = ArrayBufferView | ArrayBufferLike;
 type StreamChunk = BinaryChunk | string;
+type BrandGetter<T> = (this: unknown) => T;
 
-const arrayBufferByteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength')!.get!;
+const arrayBufferIsView = ArrayBuffer.isView;
+const arrayBufferByteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength')!.get! as BrandGetter<number>;
 const sharedArrayBufferByteLength = typeof SharedArrayBuffer === 'undefined' ? undefined
-    : Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength')!.get!;
+    : Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength')!.get! as BrandGetter<number>;
+const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
+const typedArrayBuffer = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')!.get! as BrandGetter<ArrayBufferLike>;
+const typedArrayByteOffset = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteOffset')!.get! as BrandGetter<number>;
+const typedArrayByteLength = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteLength')!.get! as BrandGetter<number>;
+const dataViewBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer')!.get! as BrandGetter<ArrayBufferLike>;
+const dataViewByteOffset = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset')!.get! as BrandGetter<number>;
+const dataViewByteLength = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength')!.get! as BrandGetter<number>;
+const readableStreamGetReader = ReadableStream.prototype.getReader;
+const readerRead = ReadableStreamDefaultReader.prototype.read;
+const readerReleaseLock = ReadableStreamDefaultReader.prototype.releaseLock;
 
 function isArrayBufferLike(value: unknown): value is ArrayBufferLike {
     try {
@@ -25,8 +37,21 @@ function isArrayBufferLike(value: unknown): value is ArrayBufferLike {
 }
 
 function bytesOf(value: BinaryChunk): Uint8Array {
-    if (ArrayBuffer.isView(value)) {
-        return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+    if (arrayBufferIsView(value)) {
+        let buffer: ArrayBufferLike;
+        try {
+            buffer = Reflect.apply(typedArrayBuffer, value, []);
+            const byteOffset = Reflect.apply(typedArrayByteOffset, value, []);
+            const byteLength = Reflect.apply(typedArrayByteLength, value, []);
+            return new Uint8Array(buffer, byteOffset, byteLength);
+        } catch {
+            try {
+                buffer = Reflect.apply(dataViewBuffer, value, []);
+                const byteOffset = Reflect.apply(dataViewByteOffset, value, []);
+                const byteLength = Reflect.apply(dataViewByteLength, value, []);
+                return new Uint8Array(buffer, byteOffset, byteLength);
+            } catch {}
+        }
     }
     if (isArrayBufferLike(value)) {
         return new Uint8Array(value);
@@ -35,8 +60,8 @@ function bytesOf(value: BinaryChunk): Uint8Array {
 }
 
 function blobPartOf(value: unknown): BlobPart {
-    if (ArrayBuffer.isView(value)) {
-        return new Uint8Array(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
+    if (arrayBufferIsView(value)) {
+        return new Uint8Array(bytesOf(value));
     }
     if (isArrayBufferLike(value)) {
         return new Uint8Array(new Uint8Array(value));
@@ -44,43 +69,56 @@ function blobPartOf(value: unknown): BlobPart {
     return value as BlobPart;
 }
 
-export function concatArrayBuffers(buffers: BinaryChunk[], maxLength?: number, asUint8Array?: false): ArrayBuffer;
-export function concatArrayBuffers(buffers: BinaryChunk[], maxLength: number | undefined, asUint8Array: true): Uint8Array<ArrayBuffer>;
-export function concatArrayBuffers(buffers: BinaryChunk[], maxLength?: number, asUint8Array = false): ArrayBuffer | Uint8Array<ArrayBuffer> {
-    if (typeof maxLength === 'number' && (Number.isNaN(maxLength) || maxLength < 0)) {
-        throw new RangeError('Maximum length must be >= 0');
-    }
-    const chunks = (buffers ?? []).map(bytesOf);
-    const total = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
-    const length = typeof maxLength === 'number' ? Math.min(total, Math.floor(maxLength)) : total;
-    const result = new Uint8Array(length);
-    let offset = 0;
-    for (const chunk of chunks) {
-        const count = Math.min(chunk.byteLength, length - offset);
-        result.set(chunk.subarray(0, count), offset);
-        offset += count;
-        if (offset === length) break;
-    }
-    return asUint8Array ? result : result.buffer;
+interface ConcatArrayBuffers {
+    (buffers: BinaryChunk[], maxLength?: number, asUint8Array?: false): ArrayBuffer;
+    (buffers: BinaryChunk[], maxLength: number | undefined, asUint8Array: true): Uint8Array<ArrayBuffer>;
 }
 
+export const concatArrayBuffers = ({
+    concatArrayBuffers(buffers: BinaryChunk[] | null | undefined, maxLength?: number, asUint8Array?: boolean) {
+        if (typeof maxLength === 'number' && (Number.isNaN(maxLength) || maxLength < 0)) {
+            throw new RangeError('Maximum length must be >= 0');
+        }
+        if (arguments.length === 0) throw new TypeError('Expected at least one argument');
+        const chunks = (buffers ?? []).map(bytesOf);
+        const total = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+        const length = typeof maxLength === 'number' ? Math.min(total, Math.floor(maxLength)) : total;
+        const result = new Uint8Array(length);
+        let offset = 0;
+        for (const chunk of chunks) {
+            const count = Math.min(chunk.byteLength, length - offset);
+            result.set(chunk.subarray(0, count), offset);
+            offset += count;
+            if (offset === length) break;
+        }
+        return asUint8Array ? result : result.buffer;
+    }
+}).concatArrayBuffers as ConcatArrayBuffers;
+
 async function readChunks<T>(stream: ReadableStream<T>): Promise<T[]> {
-    const reader = stream.getReader();
+    const reader = Reflect.apply(readableStreamGetReader, stream, []) as ReadableStreamDefaultReader<T>;
     const chunks: T[] = [];
+    let failed = false;
     try {
         while (true) {
-            const { done, value } = await reader.read();
+            const { done, value } = await Reflect.apply(readerRead, reader, []) as ReadableStreamReadResult<T>;
             if (done) return chunks;
             chunks.push(value);
         }
+    } catch (error) {
+        failed = true;
+        throw error;
     } finally {
-        reader.releaseLock();
+        try {
+            Reflect.apply(readerReleaseLock, reader, []);
+        } catch (error) {
+            // Reader cleanup must not replace the source's original failure.
+            if (!failed) throw error;
+        }
     }
 }
 
-export function readableStreamToArray<T>(stream: ReadableStream<T>): Promise<T[]> {
-    return readChunks(stream);
-}
+export const readableStreamToArray = <T>(stream: ReadableStream<T>): Promise<T[]> => readChunks(stream);
 
 export async function readableStreamToBlob(stream: ReadableStream<unknown>): Promise<Blob> {
     // Bun treats each stream chunk as a Blob part, including Blob values and
@@ -338,3 +376,5 @@ export async function readableStreamToFormData(
     else parseUrlEncoded(data, form);
     return form;
 }
+
+Object.defineProperty(readableStreamToFormData, 'length', { value: 1, configurable: true });
