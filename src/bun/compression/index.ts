@@ -10,7 +10,7 @@ export type { LibdeflateCompressionOptions, ZlibCompressionOptions };
 export type CompressionOptions = ZlibCompressionOptions | LibdeflateCompressionOptions;
 
 type RuntimeOptions = Record<PropertyKey, unknown>;
-type BrandGetter = (this: unknown) => number;
+type BrandGetter<T> = (this: unknown) => T;
 type InflateHandle = {
     inflate(data: Uint8Array, flush?: number): Uint8Array;
     readonly finished: boolean;
@@ -21,10 +21,20 @@ type InflateFormat = 'raw' | 'zlib' | 'gzip' | 'auto';
 const arrayBufferByteLength = Object.getOwnPropertyDescriptor(
     ArrayBuffer.prototype,
     'byteLength',
-)!.get! as BrandGetter;
+)!.get! as BrandGetter<number>;
 const sharedArrayBufferByteLength = typeof SharedArrayBuffer === 'function'
-    ? Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength')?.get as BrandGetter | undefined
+    ? Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength')?.get as BrandGetter<number> | undefined
     : undefined;
+const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
+const typedArrayBuffer = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')!.get! as BrandGetter<ArrayBufferLike>;
+const typedArrayByteOffset = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteOffset')!.get! as BrandGetter<number>;
+const typedArrayByteLength = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteLength')!.get! as BrandGetter<number>;
+const dataViewBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer')!.get! as BrandGetter<ArrayBufferLike>;
+const dataViewByteOffset = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset')!.get! as BrandGetter<number>;
+const dataViewByteLength = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength')!.get! as BrandGetter<number>;
+const stringValueOf = String.prototype.valueOf;
+const arrayBufferIsView = ArrayBuffer.isView;
+const emptyBytes = new Uint8Array();
 
 function codedError<T extends Error>(error: T, code: string): T {
     Object.defineProperty(error, 'code', {
@@ -42,30 +52,84 @@ function invalidInput(): TypeError {
     );
 }
 
-function isBuffer(value: unknown): value is ArrayBuffer | SharedArrayBuffer {
-    if (typeof value !== 'object' || value === null) return false;
+function bufferByteLength(value: unknown): number | undefined {
+    if (typeof value !== 'object' || value === null) return undefined;
     try {
         // Intrinsic getters perform a realm-independent internal-slot check.
-        Reflect.apply(arrayBufferByteLength, value, []);
-        return true;
+        return Reflect.apply(arrayBufferByteLength, value, []);
     } catch {
-        if (sharedArrayBufferByteLength === undefined) return false;
+        if (sharedArrayBufferByteLength === undefined) return undefined;
         try {
-            Reflect.apply(sharedArrayBufferByteLength, value, []);
-            return true;
+            return Reflect.apply(sharedArrayBufferByteLength, value, []);
         } catch {
-            return false;
+            return undefined;
         }
     }
 }
 
-function inputBytes(data: unknown): Uint8Array {
-    if (typeof data === 'string') return Buffer.from(data, 'utf8');
-    if (isBuffer(data)) return new Uint8Array(data);
-    if (ArrayBuffer.isView(data)) {
-        return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+function boxedString(value: unknown): string | undefined {
+    if (typeof value !== 'object' || value === null) return undefined;
+    try {
+        return Reflect.apply(stringValueOf, value, []);
+    } catch {
+        return undefined;
     }
+}
+
+function validateInput(data: unknown): void {
+    if (typeof data === 'string' || boxedString(data) !== undefined) return;
+    if (bufferByteLength(data) !== undefined || arrayBufferIsView(data)) return;
     throw invalidInput();
+}
+
+function viewBytes(data: ArrayBufferView): { backing: ArrayBufferLike; bytes: Uint8Array } {
+    let backing: ArrayBufferLike;
+    try {
+        backing = Reflect.apply(typedArrayBuffer, data, []);
+        const byteOffset = Reflect.apply(typedArrayByteOffset, data, []);
+        const byteLength = Reflect.apply(typedArrayByteLength, data, []);
+        return { backing, bytes: byteLength === 0 ? emptyBytes : new Uint8Array(backing, byteOffset, byteLength) };
+    } catch {
+        try {
+            backing = Reflect.apply(dataViewBuffer, data, []);
+            const byteOffset = Reflect.apply(dataViewByteOffset, data, []);
+            const byteLength = Reflect.apply(dataViewByteLength, data, []);
+            return { backing, bytes: byteLength === 0 ? emptyBytes : new Uint8Array(backing, byteOffset, byteLength) };
+        } catch {
+            // Bun treats detached views as empty inputs.
+            return { backing: new ArrayBuffer(0), bytes: emptyBytes };
+        }
+    }
+}
+
+function inputBytes(data: unknown, copyShared = false): Uint8Array {
+    if (typeof data === 'string') return Buffer.from(data, 'utf8');
+    const text = boxedString(data);
+    if (text !== undefined) return Buffer.from(text, 'utf8');
+
+    const byteLength = bufferByteLength(data);
+    if (byteLength !== undefined) {
+        if (byteLength === 0) return emptyBytes;
+        const bytes = new Uint8Array(data as ArrayBufferLike);
+        return copyShared && sharedArrayBufferByteLength !== undefined
+                && bufferByteLengthWith(sharedArrayBufferByteLength, data) !== undefined
+            ? new Uint8Array(bytes)
+            : bytes;
+    }
+
+    const view = viewBytes(data as ArrayBufferView);
+    return copyShared && sharedArrayBufferByteLength !== undefined
+            && bufferByteLengthWith(sharedArrayBufferByteLength, view.backing) !== undefined
+        ? new Uint8Array(view.bytes)
+        : view.bytes;
+}
+
+function bufferByteLengthWith(getter: BrandGetter<number>, value: unknown): number | undefined {
+    try {
+        return Reflect.apply(getter, value, []);
+    } catch {
+        return undefined;
+    }
 }
 
 function optionsObject(options: unknown, operation: 'Compression' | 'Decompression'): RuntimeOptions {
@@ -83,9 +147,11 @@ function validateLibrary(
     value: unknown,
     operation: 'Compression' | 'Decompression',
 ): 'zlib' | 'libdeflate' {
-    if (value == null || value === 'zlib') return 'zlib';
-    if (value === 'libdeflate') return value;
-    if (typeof value !== 'string') {
+    if (value == null) return 'zlib';
+    const name = typeof value === 'string' ? value : boxedString(value);
+    if (name === '' || name === 'zlib') return 'zlib';
+    if (name === 'libdeflate') return name;
+    if (name === undefined) {
         throw codedError(
             new TypeError(`Zlib${operation}Options.library must be a string`),
             'ERR_INVALID_ARG_TYPE',
@@ -118,13 +184,12 @@ function compressionLevel(value: unknown, library: 'zlib' | 'libdeflate'): numbe
 }
 
 function optionInteger(
-    options: RuntimeOptions,
+    value: unknown,
     name: 'memLevel' | 'strategy',
     minimum: number,
     maximum: number,
     fallback: number,
 ): number {
-    const value = options[name];
     if (value === undefined) return fallback;
     const optionName = `ZlibCompressionOptions.${name}`;
     if (typeof value !== 'number') {
@@ -161,25 +226,21 @@ function formatValue(value: unknown): string {
 }
 
 function compress(kind: 'gzip' | 'deflateRaw', data: unknown, options?: unknown): Uint8Array {
-    const input = inputBytes(data);
+    validateInput(data);
     const object = optionsObject(options, 'Compression');
 
-    // Keep Bun's observable conversion order for accessors and proxies. The
-    // compressor currently ignores windowBits, but Bun still converts it.
+    // Dictionary fields are read and converted one at a time in declaration order.
     const windowBits = object.windowBits;
-    const libraryValue = object.library;
-    const levelValue = object.level;
-    const memLevelValue = object.memLevel;
-    const strategyValue = object.strategy;
     if (windowBits !== undefined) Number(windowBits);
-    const library = validateLibrary(libraryValue, 'Compression');
+    const library = validateLibrary(object.library, 'Compression');
+    const levelValue = object.level;
     const requestedLevel = compressionLevel(levelValue, library);
-
-    let strategy = zlib.DEFAULT_STRATEGY;
-    let memLevel = 8;
-    const values: RuntimeOptions = { memLevel: memLevelValue, strategy: strategyValue };
-    memLevel = optionInteger(values, 'memLevel', 1, 9, 8);
-    strategy = optionInteger(values, 'strategy', 0, 4, zlib.DEFAULT_STRATEGY);
+    const memLevelValue = object.memLevel;
+    const memLevel = optionInteger(memLevelValue, 'memLevel', 1, 9, 8);
+    const strategyValue = object.strategy;
+    const strategy = optionInteger(strategyValue, 'strategy', 0, 4, zlib.DEFAULT_STRATEGY);
+    // Capture bytes only after option access: accessors can detach or mutate the input.
+    const input = inputBytes(data, true);
 
     // zlib's encoder is the portable fallback for Bun's optional libdeflate
     // backend. Level 0 is stored; every positive effort maps to zlib's closest
@@ -205,9 +266,8 @@ function toInteger(value: unknown): number {
     return Number.isNaN(number) ? 0 : Math.trunc(number);
 }
 
-function decompressionFormat(defaultFormat: 'raw' | 'gzip', value: unknown): InflateFormat {
-    if (value === undefined) return defaultFormat;
-    const bits = toInteger(value);
+function decompressionFormat(defaultFormat: 'raw' | 'gzip', bits: number | undefined): InflateFormat {
+    if (bits === undefined) return defaultFormat;
     // zlib's inflateInit2() accepts these mode ranges. Values outside them
     // fail at initialization; Bun exposes that as this generic argument error.
     if (bits <= -8 && bits >= -15) return 'raw';
@@ -235,9 +295,10 @@ function nativeErrorMessage(error: unknown): string {
 }
 
 function decompress(defaultFormat: 'raw' | 'gzip', data: unknown, options?: unknown): Uint8Array {
-    const input = inputBytes(data);
+    validateInput(data);
     const object = optionsObject(options, 'Decompression');
-    const windowBits = object.windowBits;
+    const windowBitsValue = object.windowBits;
+    const windowBits = windowBitsValue === undefined ? undefined : toInteger(windowBitsValue);
     const level = object.level;
     const memLevel = object.memLevel;
     const strategy = object.strategy;
@@ -247,6 +308,7 @@ function decompress(defaultFormat: 'raw' | 'gzip', data: unknown, options?: unkn
     if (strategy !== undefined) toInteger(strategy);
     validateLibrary(library, 'Decompression');
     const format = decompressionFormat(defaultFormat, windowBits);
+    const input = inputBytes(data);
     const handle = createInflate(format);
 
     let output: Uint8Array;
@@ -262,14 +324,14 @@ function decompress(defaultFormat: 'raw' | 'gzip', data: unknown, options?: unkn
     return new Uint8Array(output.buffer, output.byteOffset, output.byteLength);
 }
 
-export const gzipSync = (data: CompressionInput, options?: CompressionOptions): Uint8Array<ArrayBuffer> =>
+export const gzipSync = (data: CompressionInput, options: CompressionOptions | undefined = undefined): Uint8Array<ArrayBuffer> =>
     compress('gzip', data, options) as Uint8Array<ArrayBuffer>;
 
-export const gunzipSync = (data: CompressionInput, options?: CompressionOptions): Uint8Array<ArrayBuffer> =>
+export const gunzipSync = (data: CompressionInput, options: CompressionOptions | undefined = undefined): Uint8Array<ArrayBuffer> =>
     decompress('gzip', data, options) as Uint8Array<ArrayBuffer>;
 
-export const deflateSync = (data: CompressionInput, options?: CompressionOptions): Uint8Array<ArrayBuffer> =>
+export const deflateSync = (data: CompressionInput, options: CompressionOptions | undefined = undefined): Uint8Array<ArrayBuffer> =>
     compress('deflateRaw', data, options) as Uint8Array<ArrayBuffer>;
 
-export const inflateSync = (data: CompressionInput, options?: CompressionOptions): Uint8Array<ArrayBuffer> =>
+export const inflateSync = (data: CompressionInput, options: CompressionOptions | undefined = undefined): Uint8Array<ArrayBuffer> =>
     decompress('raw', data, options) as Uint8Array<ArrayBuffer>;
