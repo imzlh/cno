@@ -53,7 +53,7 @@ export interface BunSocket {
     readonly localFamily: 'IPv4' | 'IPv6';
     readonly localAddress: string;
     readonly localPort: number;
-    /** -2 shutdown, 0 closed, 1 established; detach (-1) has no TCP meaning here. */
+    /** -2 shutdown, -1 closed/detached, 0 pending, 1 established. */
     readonly readyState: -2 | -1 | 0 | 1 | 2;
     readonly listener?: BunTcpSocketListener;
     write(data: BunSocketData, byteOffset?: number, byteLength?: number): number;
@@ -340,7 +340,7 @@ class BunSocketImpl implements BunSocket {
     }
 
     get readyState(): -2 | -1 | 0 | 1 | 2 {
-        if (this.#closed) return 0;
+        if (this.#closed) return -1;
         if (this.#writeEnded || this.#readCancelled) return -2;
         return this.#conn ? 1 : 0;
     }
