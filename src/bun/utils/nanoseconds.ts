@@ -5,5 +5,6 @@
  * integer exactness.
  */
 const performanceNow = globalThis.performance.now.bind(globalThis.performance);
+const floor = Math.floor;
 
-export const nanoseconds = (): number => Math.floor(performanceNow() * 1_000_000);
+export const nanoseconds = (): number => floor(performanceNow() * 1_000_000);
