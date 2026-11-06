@@ -24,6 +24,13 @@ const typedArrayByteLength = Object.getOwnPropertyDescriptor(typedArrayPrototype
 const dataViewBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer')!.get!;
 const dataViewByteOffset = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset')!.get!;
 const dataViewByteLength = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength')!.get!;
+const blobSize = Object.getOwnPropertyDescriptor(Blob.prototype, 'size')!.get!;
+const fileName = typeof File === 'function'
+    ? Object.getOwnPropertyDescriptor(File.prototype, 'name')?.get
+    : undefined;
+const fileLastModified = typeof File === 'function'
+    ? Object.getOwnPropertyDescriptor(File.prototype, 'lastModified')?.get
+    : undefined;
 const blobSlice = Blob.prototype.slice;
 const blobStream = Blob.prototype.stream;
 // Use the host's global Blob and its registered byte protocol. Importing
@@ -33,6 +40,7 @@ const blobBytesSymbol = Symbol.for('cno.blob.bytes');
 // Serve-route recognition protocol (serve-routes.ts): lets Bun.serve treat a
 // BunFile as a static file target without importing this module there.
 const bunFileServeSymbol = Symbol.for('cno.bun-file.serve-target');
+const blobNames = new WeakMap<object, string>();
 
 // The shared Node Stats class also supports bigint stats; Bun.file.stat does not.
 type BunFileStats = { [K in keyof Stats]: Stats[K] extends number | bigint ? number : Stats[K] };
@@ -101,6 +109,10 @@ function isRequest(value: unknown): value is Request {
 
 function isReadableStream(value: unknown): value is ReadableStream {
     return typeof ReadableStream !== 'undefined' && value instanceof ReadableStream;
+}
+
+function assertBlobReceiver(value: unknown): asserts value is Blob {
+    Reflect.apply(blobSize, value, []);
 }
 
 function pathFromValue(value: unknown): string {
@@ -302,8 +314,19 @@ export class BunFile extends Blob implements BunFileLike {
         filePaths.set(this, path);
     }
 
-    get name(): string {
-        return this.#path;
+    get name(): string | undefined {
+        if (blobNames.has(this)) return blobNames.get(this)!;
+        const path = filePaths.get(this);
+        if (path !== undefined) return path;
+        assertBlobReceiver(this);
+        return fileName && this instanceof File
+            ? Reflect.apply(fileName, this, []) as string
+            : undefined;
+    }
+
+    set name(value: string) {
+        assertBlobReceiver(this);
+        blobNames.set(this, String(value));
     }
 
     get type(): string {
@@ -320,8 +343,15 @@ export class BunFile extends Blob implements BunFileLike {
     }
 
     get lastModified(): number {
+        const path = filePaths.get(this);
+        if (path === undefined) {
+            assertBlobReceiver(this);
+            return fileLastModified && this instanceof File
+                ? Reflect.apply(fileLastModified, this, []) as number
+                : MISSING_LAST_MODIFIED;
+        }
         try {
-            return fs.stat(this.#path).mtim?.getTime() ?? MISSING_LAST_MODIFIED;
+            return fs.stat(path).mtim?.getTime() ?? MISSING_LAST_MODIFIED;
         } catch {
             return MISSING_LAST_MODIFIED;
         }
@@ -490,13 +520,16 @@ export class BunFile extends Blob implements BunFileLike {
         });
     }
 
-    async exists(): Promise<boolean> {
-        try {
-            const stat = await asyncfs.stat(this.#path);
-            return stat.isFile || stat.isFIFO;
-        } catch {
-            return false;
+    exists(): Promise<boolean> {
+        const path = filePaths.get(this);
+        if (path === undefined) {
+            assertBlobReceiver(this);
+            return Promise.resolve(true);
         }
+        return asyncfs.stat(path).then(
+            stat => stat.isFile || stat.isFIFO,
+            () => false,
+        );
     }
 
     stat(): Promise<BunFileStats> {
@@ -572,6 +605,19 @@ export class BunFile extends Blob implements BunFileLike {
         }
         return write(this, data as BunWriteInput);
     }
+}
+
+for (const property of [
+    'name', 'type', 'size', 'lastModified',
+    'slice', 'stream', 'bytes', 'arrayBuffer', 'text', 'json',
+    'exists', 'stat', 'unlink', 'delete', 'write', 'writer',
+] as const) {
+    const descriptor = Object.getOwnPropertyDescriptor(BunFile.prototype, property)!;
+    Object.defineProperty(BunFile.prototype, property, {
+        ...descriptor,
+        enumerable: true,
+        configurable: false,
+    });
 }
 
 function destinationPath(value: unknown): string {
