@@ -46,10 +46,14 @@ function windowsCandidates(command: string): string[] {
  * directory is never searched implicitly.
  */
 export function which(command: string, options: WhichOptions = {}): string | null {
-    if (typeof command !== 'string') throw new TypeError('Expected command to be a string');
+    if (typeof command === 'symbol') throw new TypeError('Cannot convert a symbol to a string');
+    command = command == null ? '' : String(command);
     if (command.length === 0) return null;
 
-    const cwd = resolvePath(options.cwd ?? currentDirectory(), currentDirectory());
+    const optionObject = options !== null && (typeof options === 'object' || typeof options === 'function')
+        ? options
+        : {};
+    const cwd = resolvePath(optionObject.cwd == null ? currentDirectory() : String(optionObject.cwd), currentDirectory());
     const names = isWindows ? windowsCandidates(command) : [command];
     const hasSeparator = command.includes('/') || (isWindows && command.includes('\\'));
 
@@ -61,7 +65,9 @@ export function which(command: string, options: WhichOptions = {}): string | nul
         return null;
     }
 
-    const searchPath = options.PATH ?? getEnv('PATH') ?? getEnv('Path') ?? '';
+    const searchPath = optionObject.PATH == null
+        ? getEnv('PATH') ?? getEnv('Path') ?? ''
+        : String(optionObject.PATH);
     const delimiter = isWindows ? ';' : ':';
     const dirs = searchPath
         .split(delimiter)
