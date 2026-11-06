@@ -102,12 +102,32 @@ function normalizeGlobPath(value: string): string {
     return value.replace(/\\/g, '/').replace(/\/+/g, '/');
 }
 
+function normalizeGlobPattern(value: string): string {
+    let output = '';
+    for (let index = 0; index < value.length; index++) {
+        if (value[index] !== '\\') {
+            output += value[index];
+            continue;
+        }
+        if (value[index + 1] === '\\') {
+            output += '/';
+            index++;
+        } else if (index + 1 < value.length) {
+            // Keep glob escapes intact so they cannot become path separators.
+            output += value[index] + value[++index];
+        } else {
+            output += '/';
+        }
+    }
+    return output.replace(/\/+/g, '/');
+}
+
 function isAbsoluteGlob(pattern: string): boolean {
     return pattern.startsWith('/') || /^[A-Za-z]:\//.test(pattern) || pattern.startsWith('//');
 }
 
 function staticPrefix(pattern: string): string {
-    const segments = normalizeGlobPath(pattern).split('/');
+    const segments = normalizeGlobPattern(pattern).split('/');
     const prefix: string[] = [];
     for (const segment of segments) {
         if (hasGlobMagic(segment)) break;
@@ -118,7 +138,7 @@ function staticPrefix(pattern: string): string {
 }
 
 function scanRoot(pattern: string, options: ResolvedScanOptions): ScanRoot {
-    const normalizedPattern = normalizeGlobPath(pattern);
+    const normalizedPattern = normalizeGlobPattern(pattern);
     const absolutePattern = isAbsoluteGlob(normalizedPattern);
     let prefix = staticPrefix(normalizedPattern);
     if (normalizedPattern.startsWith('./') && prefix === '.') prefix = './';
