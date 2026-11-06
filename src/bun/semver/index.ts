@@ -4,7 +4,9 @@ interface PartialVersion { parts: bigint[]; pre: string[] }
 interface Comparator { op: '>' | '>=' | '<' | '<=' | '='; version: Version }
 
 const identifier = '[0-9A-Za-z-]+';
-const versionPattern = new RegExp(`^[v=]*(\\d+|[xX*])(?:\\.(\\d+|[xX*]))?(?:\\.(\\d+|[xX*]))?(?:-?(${identifier}(?:\\.${identifier})*)?)?(?:\\+(${identifier}(?:\\.${identifier})*)?)?$`);
+const looseIdentifier = '[0-9A-Za-z-]*';
+const looseIdentifiers = `${looseIdentifier}(?:\\.${looseIdentifier})*`;
+const versionPattern = new RegExp(`^[v=]*(\\d+|[xX*])(?:\\.(\\d+|[xX*]))?(?:\\.(\\d+|[xX*]))?(?:-(${looseIdentifiers})|(${identifier}(?:\\.${looseIdentifier})*))?(?:\\+(${looseIdentifiers}))?$`);
 
 function parse(input: string, partial: boolean, range = false): PartialVersion | null {
     let text = input.trim();
@@ -19,7 +21,8 @@ function parse(input: string, partial: boolean, range = false): PartialVersion |
         else if (wildcard) continue;
         else parts.push(BigInt(part));
     }
-    const pre = m[4] ? m[4].split('.') : [];
+    const preText = m[4] ?? m[5];
+    const pre = preText ? preText.split('.') : [];
     if (!partial && parts.length !== 3) return null;
     if (range && parts.length !== 3) pre.length = 0;
     return { parts, pre };
@@ -109,7 +112,7 @@ function parseRange(range: string): { comparators: Comparator[]; explicit: boole
     return { comparators, explicit, invalid };
 }
 
-export function order(v1: unknown, v2: unknown): Ordering {
+export const order = (v1: unknown, v2: unknown): Ordering => {
     // Template coercion matches Bun's TypeError for symbols while retaining
     // ordinary StringLike object support.
     const raw1 = `${v1}`, raw2 = `${v2}`;
@@ -128,8 +131,8 @@ export function order(v1: unknown, v2: unknown): Ordering {
         if (x !== y) return x < y ? -1 : 1;
     }
     return compare(full(a), full(b));
-}
-export function satisfies(version: unknown, range: unknown): boolean {
+};
+export const satisfies = (version: unknown, range: unknown): boolean => {
     const parsed = parse(`${version}`, false);
     const text = `${range}`;
     if (!parsed) return false;
@@ -153,6 +156,6 @@ export function satisfies(version: unknown, range: unknown): boolean {
             }
         });
     });
-}
-export const bunSemver = { order, satisfies };
+};
+export const bunSemver = { satisfies, order };
 export default bunSemver;
