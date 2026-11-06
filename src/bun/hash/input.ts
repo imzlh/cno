@@ -23,6 +23,26 @@ const dataViewByteOffsetGetter = Object.getOwnPropertyDescriptor(DataView.protot
 const dataViewByteLengthGetter = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength')!.get! as BrandGetter<number>;
 const arrayBufferIsView = ArrayBuffer.isView;
 const emptyBytes = new Uint8Array();
+const invalidInputPrototype = Object.create(TypeError.prototype) as TypeError & { code: string };
+
+Object.defineProperties(invalidInputPrototype, {
+    name: { configurable: true, enumerable: true, value: 'TypeError', writable: true },
+    code: { configurable: true, enumerable: true, value: 'ERR_INVALID_ARG_TYPE', writable: true },
+    toString: {
+        configurable: true,
+        enumerable: true,
+        value: function toString(this: TypeError & { code: string }) {
+            return `${this.name} [${this.code}]: ${this.message}`;
+        },
+        writable: true,
+    },
+});
+
+function invalidInput(): TypeError & { code: string } {
+    const error = new TypeError('data must be a string, ArrayBuffer, ArrayBufferView or Blob');
+    Object.setPrototypeOf(error, invalidInputPrototype);
+    return error as TypeError & { code: string };
+}
 
 function rawBufferByteLength(value: unknown): number | undefined {
     try {
@@ -60,10 +80,7 @@ function viewBytes(value: ArrayBufferView): Uint8Array {
 /** Convert supported inputs without losing the byte bounds of typed-array views. */
 export function hashInputBytes(data: unknown): Uint8Array {
     if (data == null) {
-        throw Object.assign(
-            new TypeError('data must be a string, ArrayBuffer, ArrayBufferView or Blob'),
-            { code: 'ERR_INVALID_ARG_TYPE' },
-        );
+        throw invalidInput();
     }
     if (typeof data === 'string') return engine.encodeString(sanitizeSurrogates(data));
     if (typeof Blob !== 'undefined' && data instanceof Blob) {
