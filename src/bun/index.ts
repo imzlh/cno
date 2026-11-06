@@ -332,6 +332,9 @@ export const inspect: BunInspect = Object.defineProperties(
 ) as BunInspect;
 
 export function sleep(milliseconds: number | Date): Promise<void> {
+    if (typeof milliseconds !== 'number' && !(milliseconds instanceof Date)) {
+        throw new TypeError('sleep expects a number (milliseconds)');
+    }
     const delay = milliseconds instanceof Date
         ? milliseconds.getTime() - Date.now()
         : milliseconds;
