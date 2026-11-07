@@ -27,7 +27,7 @@ export const markRequestBodyUsed = Symbol('markRequestBodyUsed');
 // Pre-compiled: these run per request.
 export const HTTP_LINE_RE = /^HTTP\//i;
 export const TIMEOUT_ERR_RE = /\b(timed?\s*out|timeout)\b/i;
-export const BOUNDARY_RE = /boundary=([^\s;]+)/i;
+export const BOUNDARY_RE = /(?:^|;)\s*boundary=(?:"([^"]+)"|([^;\s"]+))/i;
 export const CHARSET_RE = /charset\s*=\s*["']?([^\s;'"]+)/i;
 export const NULL_BODY_STATUS = new Set([101, 204, 205, 304]);
 
@@ -389,7 +389,8 @@ function createMultipartBoundary(): string {
 
 export function ensureFormDataContentType(headers: Headers): string {
     const existing = headers.get('content-type');
-    const existingBoundary = existing ? BOUNDARY_RE.exec(existing)?.[1] : undefined;
+    const boundaryMatch = existing ? BOUNDARY_RE.exec(existing) : null;
+    const existingBoundary = boundaryMatch?.[1] ?? boundaryMatch?.[2];
     if (existingBoundary) return existingBoundary;
     const boundary = createMultipartBoundary();
     if (!existing || /^multipart\/form-data\s*(?:;.*)?$/i.test(existing)) {
@@ -499,7 +500,8 @@ export async function serializeFormData(fd: FormData, boundary: string = createM
 
 export function parseFormData(body: Uint8Array, contentType: string): FormData {
     if (contentType.includes('multipart/form-data')) {
-        const boundary = BOUNDARY_RE.exec(contentType)?.[1];
+        const boundaryMatch = BOUNDARY_RE.exec(contentType);
+        const boundary = boundaryMatch?.[1] ?? boundaryMatch?.[2];
         if (!boundary) throw new TypeError('Missing multipart boundary');
         return parseMultipart(body, boundary);
     }
