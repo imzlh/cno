@@ -1,7 +1,8 @@
 import { Buffer } from '../../node/buffer';
 
 const crypto = import.meta.use('crypto');
-type Encoding = 'hex' | 'base64' | 'base64url' | 'buffer';
+type Encoding = 'hex' | 'base64' | 'base64url' | 'buffer' | 'utf8' | 'utf-8'
+    | 'ascii' | 'latin1' | 'binary' | 'ucs2' | 'ucs-2' | 'utf16le';
 type State = { timestamp: number; requested: number; counter: number };
 const defaultState: State = { timestamp: -1, requested: -1, counter: 0 };
 const explicitState: State = { timestamp: -1, requested: -1, counter: 0 };
@@ -28,6 +29,17 @@ function isStringObject(value: unknown): boolean {
     }
 }
 
+function isEncoding(value: string): value is Encoding {
+    switch (value) {
+        case 'hex': case 'base64': case 'base64url': case 'buffer':
+        case 'utf8': case 'utf-8': case 'ascii': case 'latin1': case 'binary':
+        case 'ucs2': case 'ucs-2': case 'utf16le':
+            return true;
+        default:
+            return false;
+    }
+}
+
 function dateMilliseconds(value: unknown): unknown {
     if (typeof value !== 'object' || value === null) return value;
     try {
@@ -41,13 +53,14 @@ export const randomUUIDv7 = {
   randomUUIDv7(encoding?: Encoding | number | Date, timestamp?: number | Date): string | Buffer {
     let format: Encoding = 'hex';
     if (typeof encoding === 'string' || isStringObject(encoding)) {
-        format = Reflect.apply(stringToLowerCase, stringFrom(encoding), []) as Encoding;
-        if (format !== 'hex' && format !== 'base64' && format !== 'base64url' && format !== 'buffer') {
+        const normalized = Reflect.apply(stringToLowerCase, stringFrom(encoding), []);
+        if (!isEncoding(normalized)) {
             throw Object.assign(
                 new TypeError('Encoding must be one of base64, base64url, hex, or buffer'),
                 { code: 'ERR_UNKNOWN_ENCODING' },
             );
         }
+        format = normalized;
     } else if (timestamp === undefined && encoding !== undefined) {
         // With one non-string argument Bun treats it as the timestamp.
         timestamp = encoding as number | Date;
