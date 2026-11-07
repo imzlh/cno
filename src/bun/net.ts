@@ -9,6 +9,15 @@ import { Buffer } from 'node:buffer';
 import { arrayBufferBackedBytes, bytesToArrayBuffer, sanitizeSurrogates } from '../utils/bytes';
 
 const engine = import.meta.use('engine');
+const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
+const typedArrayBuffer = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')!.get!;
+const typedArrayByteOffset = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteOffset')!.get!;
+const typedArrayByteLength = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteLength')!.get!;
+const dataViewBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer')!.get!;
+const dataViewByteOffset = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset')!.get!;
+const dataViewByteLength = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength')!.get!;
+const arrayBufferIsView = ArrayBuffer.isView;
+const emptyBytes = new Uint8Array(0);
 
 type BinaryType = 'arraybuffer' | 'buffer' | 'uint8array';
 
@@ -228,6 +237,25 @@ function parseHostname(value: unknown, label: string): string {
     return value.startsWith('[') && value.endsWith(']') ? value.slice(1, -1) : value;
 }
 
+function viewBytes(data: ArrayBufferView): Uint8Array<ArrayBufferLike> {
+    try {
+        const buffer = Reflect.apply(typedArrayBuffer, data, []);
+        const byteOffset = Reflect.apply(typedArrayByteOffset, data, []);
+        const byteLength = Reflect.apply(typedArrayByteLength, data, []);
+        return byteLength === 0 ? emptyBytes : new Uint8Array(buffer, byteOffset, byteLength);
+    } catch {
+        try {
+            const buffer = Reflect.apply(dataViewBuffer, data, []);
+            const byteOffset = Reflect.apply(dataViewByteOffset, data, []);
+            const byteLength = Reflect.apply(dataViewByteLength, data, []);
+            return byteLength === 0 ? emptyBytes : new Uint8Array(buffer, byteOffset, byteLength);
+        } catch {
+            // Bun accepts detached views as empty writes.
+            return emptyBytes;
+        }
+    }
+}
+
 /** Applies write() byteOffset/byteLength and converts strings to UTF-8 bytes. */
 function writeBytes(data: BunSocketData, byteOffset?: number, byteLength?: number): Uint8Array<ArrayBuffer> {
     if (typeof data === 'string') {
@@ -235,8 +263,8 @@ function writeBytes(data: BunSocketData, byteOffset?: number, byteLength?: numbe
         return arrayBufferBackedBytes(engine.encodeString(sanitizeSurrogates(data)));
     }
     let bytes: Uint8Array;
-    if (ArrayBuffer.isView(data)) {
-        bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    if (arrayBufferIsView(data)) {
+        bytes = viewBytes(data);
     } else if (engine.isArrayBuffer(data)) {
         bytes = new Uint8Array(data);
     } else {
