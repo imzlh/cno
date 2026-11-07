@@ -989,7 +989,7 @@ async function writeStdioStream(stdio: StdioFile, stream: ReadableStream): Promi
 }
 
 export async function write(
-    destination: string | URL | BunFile | StdioFile,
+    destination: string | URL | number | BunFile | StdioFile,
     input: BunWriteInput,
     options?: BunFileWriteOptions,
 ): Promise<number> {
@@ -1010,29 +1010,36 @@ export async function write(
         return stdio.write(input as string | ArrayBufferView | ArrayBufferLike | Blob);
     }
     const backing = isBunFile(destination) ? fileBackings.get(destination)! : undefined;
-    if (backing?.kind === 'fd') {
+    let borrowedFd: number | undefined;
+    if (typeof destination === 'number') {
+        validateFd(destination);
+        borrowedFd = destination;
+    } else if (backing?.kind === 'fd') {
+        borrowedFd = backing.fd;
+    }
+    if (borrowedFd !== undefined) {
         // mode/createPath are path concepts; Bun ignores them for a borrowed fd.
         if (isResponse(input) || isRequest(input)) {
             const name = isRequest(input) ? 'Request' : 'Response';
             if (input.bodyUsed || input.body?.locked) {
                 throw new TypeError(`Bun.write: ${name} body is already used or locked`);
             }
-            return input.body ? writeBorrowedStream(backing.fd, input.body) : 0;
+            return input.body ? writeBorrowedStream(borrowedFd, input.body) : 0;
         }
         if (isBlob(input)) {
             const source = isBunFile(input) ? fileBackings.get(input) : undefined;
-            if (source?.kind === 'fd' && source.fd === backing.fd) {
-                return writeAliasedBorrowedStream(backing.fd, blobInputStream(input));
+            if (source?.kind === 'fd' && source.fd === borrowedFd) {
+                return writeAliasedBorrowedStream(borrowedFd, blobInputStream(input));
             }
-            return writeBorrowedStream(backing.fd, blobInputStream(input));
+            return writeBorrowedStream(borrowedFd, blobInputStream(input));
         }
-        if (isReadableStream(input)) return writeBorrowedStream(backing.fd, input);
+        if (isReadableStream(input)) return writeBorrowedStream(borrowedFd, input);
         const bytes = await inputBytes(
             typeof input === 'object' && input !== null && !arrayBufferIsView(input) && !isArrayBufferLike(input)
                 ? stringifyWriteInput(input)
                 : input,
         );
-        return writeBorrowedBytes(backing.fd, bytes);
+        return writeBorrowedBytes(borrowedFd, bytes);
     }
     const path = destinationPath(destination);
     const parsed = validateWriteOptions(options);
