@@ -1,5 +1,7 @@
 import { utf8Decode } from '../../utils/bytes';
 
+const engine = import.meta.use('engine');
+
 type BrandGetter<T> = (this: unknown) => T;
 
 const arrayBufferByteLength = Object.getOwnPropertyDescriptor(
@@ -233,7 +235,9 @@ export function stringifyJSON5(value: any, replacer?: unknown, space?: unknown):
         if (typeof item !== 'object') return undefined;
         if (stack.has(item)) throw new Error('Converting circular structure to JSON5');
         stack.add(item);
-        const array = Array.isArray(item); const parts: string[] = [];
+        // Bun serializes Proxy-wrapped arrays through the ordinary object path:
+        // enumerable indices are kept, holes are skipped, and `length` stays hidden.
+        const array = !engine.isProxy(item) && Array.isArray(item); const parts: string[] = [];
         if (array) {
             for (let i = 0; i < item.length; i++) parts.push(serialize(item[i], depth + 1, StringConstructor(i)) ?? 'null');
         } else {
