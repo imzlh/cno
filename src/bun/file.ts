@@ -117,6 +117,33 @@ function assertBlobReceiver(value: unknown): asserts value is Blob {
     Reflect.apply(blobSize, value, []);
 }
 
+function isBlob(value: unknown): value is Blob {
+    try {
+        assertBlobReceiver(value);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+function blobInputStream(value: Blob): ReadableStream<Uint8Array<ArrayBuffer>> {
+    if (filePaths.has(value as BunFile)) {
+        return Reflect.apply(BunFile.prototype.stream, value, []);
+    }
+    return Reflect.apply(blobStream, value, []);
+}
+
+function stringifyWriteInput(value: unknown): string {
+    try {
+        return String(value);
+    } catch (error) {
+        // The runtime Blob polyfill's toString has a private-slot check, while
+        // Bun stringifies forged/proxied Blob-tagged objects generically.
+        if (isObject(value) && Object.prototype.toString.call(value) === '[object Blob]') return '[object Blob]';
+        throw error;
+    }
+}
+
 function pathFromValue(value: unknown): string {
     if (typeof value === 'string') {
         if (value.includes('\0')) {
@@ -608,8 +635,8 @@ export class BunFile extends Blob implements BunFileLike {
         if (isReadableStream(data)) return writeStream(this.#path, data, {});
         if (data == null) throw new TypeError('Bun.file.write: missing input');
         if (typeof data !== 'string' && !arrayBufferIsView(data) && !isArrayBufferLike(data)
-            && !(data instanceof Blob) && !isResponse(data)) {
-            return write(this, String(data));
+            && !isBlob(data) && !isResponse(data)) {
+            return write(this, stringifyWriteInput(data));
         }
         return write(this, data as BunWriteInput);
     }
@@ -755,12 +782,18 @@ export async function write(
             throw new TypeError(`Bun.write: ${name} body is already used or locked`);
         }
         if (input.body) return writeStream(path, input.body, parsed);
-    } else if (input instanceof Blob) {
-        return writeStream(path, input.stream(), parsed);
+    } else if (isBlob(input)) {
+        return writeStream(path, blobInputStream(input), parsed);
     } else if (isReadableStream(input)) {
         return writeStream(path, input, parsed);
     }
-    const bytes = isResponse(input) || isRequest(input) ? new Uint8Array(0) : await inputBytes(input);
+    const bytes = isResponse(input) || isRequest(input)
+        ? new Uint8Array(0)
+        : await inputBytes(
+            typeof input === 'object' && input !== null && !arrayBufferIsView(input) && !isArrayBufferLike(input)
+                ? stringifyWriteInput(input)
+                : input,
+        );
 
     if (parsed.createPath !== false) await ensureDirectory(dirname(path));
     const handle = await asyncfs.open(path, 'w', parsed.mode);
