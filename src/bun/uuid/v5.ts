@@ -3,6 +3,20 @@ import { Buffer } from '../../node/buffer';
 const crypto = import.meta.use('crypto');
 type Binary = ArrayBuffer | SharedArrayBuffer | ArrayBufferView;
 type Encoding = 'hex' | 'base64' | 'base64url' | 'buffer' | 'utf8' | 'utf-8' | 'ascii' | 'latin1' | 'binary' | 'ucs2' | 'ucs-2' | 'utf16le';
+type BrandGetter<T> = (this: unknown) => T;
+
+const arrayBufferByteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength')!.get! as BrandGetter<number>;
+const sharedArrayBufferByteLength = typeof SharedArrayBuffer === 'function'
+    ? Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength')?.get as BrandGetter<number> | undefined
+    : undefined;
+const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
+const typedArrayBuffer = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')!.get! as BrandGetter<ArrayBufferLike>;
+const typedArrayByteOffset = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteOffset')!.get! as BrandGetter<number>;
+const typedArrayByteLength = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteLength')!.get! as BrandGetter<number>;
+const dataViewBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer')!.get! as BrandGetter<ArrayBufferLike>;
+const dataViewByteOffset = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset')!.get! as BrandGetter<number>;
+const dataViewByteLength = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength')!.get! as BrandGetter<number>;
+const emptyBytes = new Uint8Array();
 const namespaces: Record<string, string> = {
     dns: '6ba7b810-9dad-11d1-80b4-00c04fd430c8',
     url: '6ba7b811-9dad-11d1-80b4-00c04fd430c8',
@@ -10,17 +24,55 @@ const namespaces: Record<string, string> = {
     x500: '6ba7b814-9dad-11d1-80b4-00c04fd430c8',
 };
 
+function rawBufferByteLength(value: unknown): number | undefined {
+    try {
+        return Reflect.apply(arrayBufferByteLength, value, []);
+    } catch {
+        if (sharedArrayBufferByteLength === undefined) return undefined;
+        try {
+            return Reflect.apply(sharedArrayBufferByteLength, value, []);
+        } catch {
+            return undefined;
+        }
+    }
+}
+
 function isBinary(value: unknown): value is Binary {
-    if (ArrayBuffer.isView(value)) return true;
-    try { Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength')!.get!.call(value); return true; } catch { /* not an ArrayBuffer */ }
-    if (typeof SharedArrayBuffer === 'undefined') return false;
-    try { Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength')!.get!.call(value); return true; } catch { return false; }
+    if (rawBufferByteLength(value) !== undefined) return true;
+    try {
+        Reflect.apply(typedArrayBuffer, value, []);
+        return true;
+    } catch {
+        try {
+            Reflect.apply(dataViewBuffer, value, []);
+            return true;
+        } catch {
+            return false;
+        }
+    }
 }
 
 function bytes(value: Binary): Uint8Array {
-    return ArrayBuffer.isView(value)
-        ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
-        : new Uint8Array(value);
+    const bufferLength = rawBufferByteLength(value);
+    if (bufferLength !== undefined) {
+        return bufferLength === 0 ? emptyBytes : new Uint8Array(value as ArrayBufferLike, 0, bufferLength);
+    }
+    try {
+        const buffer = Reflect.apply(typedArrayBuffer, value, []);
+        const byteOffset = Reflect.apply(typedArrayByteOffset, value, []);
+        const byteLength = Reflect.apply(typedArrayByteLength, value, []);
+        return byteLength === 0 ? emptyBytes : new Uint8Array(buffer, byteOffset, byteLength);
+    } catch {
+        try {
+            const buffer = Reflect.apply(dataViewBuffer, value, []);
+            const byteOffset = Reflect.apply(dataViewByteOffset, value, []);
+            const byteLength = Reflect.apply(dataViewByteLength, value, []);
+            return byteLength === 0 ? emptyBytes : new Uint8Array(buffer, byteOffset, byteLength);
+        } catch {
+            // Bun treats detached and out-of-bounds views as empty inputs.
+            return emptyBytes;
+        }
+    }
 }
 
 function isString(value: unknown): value is string {
@@ -62,7 +114,9 @@ export const randomUUIDv5 = {
     const input = new Uint8Array(16 + nameBytes.byteLength);
     input.set(namespaceBytes);
     input.set(nameBytes, 16);
-    const result = Buffer.from(Buffer.from(crypto.sha1(input)).subarray(0, 16));
+    const digest = new Uint8Array(crypto.sha1(input), 0, 16);
+    const result = new Buffer(16);
+    result.set(digest);
     result[6] = (result[6] & 0x0f) | 0x50;
     result[8] = (result[8] & 0x3f) | 0x80;
     if (format === 'buffer') return result;
