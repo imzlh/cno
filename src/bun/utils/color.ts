@@ -66,6 +66,38 @@ function hslString(r: number, g: number, b: number): string {
 
     return `hsl(${f32String(hue)}, ${f32String(Math.fround(saturation * 100))}%, ${f32String(Math.fround(lightness * 100))}%)`;
 }
+function labString(r: number, g: number, b: number): string {
+    const linear = (value: number): number => {
+        const channel = Math.fround(value / 255);
+        return Math.fround(channel <= 0.04045
+            ? channel / 12.92
+            : ((channel + 0.055) / 1.055) ** 2.4);
+    };
+    const red = linear(r), green = linear(g), blue = linear(b);
+    const product = (x: number, coefficient: number): number => Math.fround(x * coefficient);
+    const sum3 = (x: number, y: number, z: number): number => Math.fround(Math.fround(x + y) + z);
+
+    // CSS Color 4 sRGB-to-XYZ (D65), followed by Bradford adaptation to D50.
+    const x65 = sum3(product(red, 0.41239079926595934), product(green, 0.357584339383878), product(blue, 0.1804807884018343));
+    const y65 = sum3(product(red, 0.21263900587151027), product(green, 0.715168678767756), product(blue, 0.07219231536073371));
+    const z65 = sum3(product(red, 0.01933081871559182), product(green, 0.11919477979462598), product(blue, 0.9505321522496607));
+    const x50 = sum3(product(x65, 1.0479298208405488), product(y65, 0.022946793341019088), product(z65, -0.05019222954313557));
+    const y50 = sum3(product(x65, 0.029627815688159344), product(y65, 0.990434484573249), product(z65, -0.01707382502938514));
+    const z50 = sum3(product(x65, -0.009243058152591178), product(y65, 0.015055144896577895), product(z65, 0.7518742899580008));
+
+    const epsilon = 216 / 24389;
+    const kappa = 24389 / 27;
+    const curve = (value: number): number => Math.fround(value > epsilon
+        ? Math.cbrt(value)
+        : (kappa * value + 16) / 116);
+    const fx = curve(Math.fround(x50 / (3457 / 3585)));
+    const fy = curve(y50);
+    const fz = curve(Math.fround(z50 / (2958 / 3585)));
+    const lightness = Math.fround(Math.fround(116 * fy) - 16);
+    const a = Math.fround(500 * Math.fround(fx - fy));
+    const labB = Math.fround(200 * Math.fround(fy - fz));
+    return `lab(${f32String(lightness)}% ${f32String(a)} ${f32String(labB)})`;
+}
 function hexParse(s: string): RGBA | null {
     if (!/^(?:[\da-f]{3}|[\da-f]{4}|[\da-f]{6}|[\da-f]{8})$/i.test(s)) return null;
     if (s.length <= 4) s = [...s].map(c => c + c).join('');
@@ -328,6 +360,7 @@ export const color = (input: unknown, format?: unknown): unknown => {
         case 'rgb': return `rgb(${r}, ${g}, ${b})`;
         case 'rgba': return `rgba(${r}, ${g}, ${b}, ${f32String(a / 255)})`;
         case 'hsl': return hslString(r, g, b);
+        case 'lab': return labString(r, g, b);
         case 'ansi_16m': case 'ansi-16m': case 'ansi-24bit': case 'ansi-truecolor': return `\x1b[38;2;${r};${g};${b}m`;
         case 'ansi_256': case 'ansi-256': case 'ansi256': return `\x1b[38;5;${ansi256Index(r, g, b)}m`;
         case 'ansi_16': case 'ansi-16': return `\x1b[${ansi16Code(r, g, b)}m`;
