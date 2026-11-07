@@ -1,10 +1,14 @@
 import { Buffer } from 'node:buffer';
 import { toBuffer } from '../../node/crypto/helpers';
 import { sanitizeSurrogates } from '../../utils/bytes';
+import { Blob as WebBlob } from '../../webapi/formdata';
 import { blake2b, blake2b256 } from './blake2b';
 import { hmacMd4, md4 } from './md4';
+import { isBunFile } from '../file';
 
 const kblobBytes = Symbol.for('cno.blob.bytes');
+const blobSizeGetter = Object.getOwnPropertyDescriptor(WebBlob.prototype, 'size')!.get!;
+const blobBytes = Reflect.get(WebBlob.prototype, kblobBytes) as (this: Blob) => Uint8Array;
 
 const native = import.meta.use('crypto');
 const engine = import.meta.use('engine');
@@ -111,29 +115,40 @@ function invalidArgType(message: string): TypeError {
     return codedError(new TypeError(message), 'ERR_INVALID_ARG_TYPE');
 }
 
+function blobBytesOf(value: unknown): Uint8Array | undefined {
+    try {
+        Reflect.apply(blobSizeGetter, value, []);
+        return Reflect.apply(blobBytes, value, []) as Uint8Array;
+    } catch {
+        return undefined;
+    }
+}
+
 function ownedBytes(input: unknown, encoding?: unknown): Uint8Array<ArrayBuffer> {
     let source: Uint8Array;
-    if (typeof Blob !== 'undefined' && input instanceof Blob) {
-        const getBytes = Reflect.get(input, kblobBytes);
-        if (typeof getBytes !== 'function') throw new TypeError('Blob byte access is unavailable');
-        source = Reflect.apply(getBytes, input, []) as Uint8Array;
+    if (isBunFile(input)) {
+        throw invalidArgType('File blob cannot be used here');
     } else {
-        const text = stringValue(input);
-        if (text !== undefined) {
-            const sanitized = sanitizeSurrogates(text);
-            const requestedEncoding = stringValue(encoding);
-            const normalized = requestedEncoding === undefined ? '' : requestedEncoding.toLowerCase();
-            if (normalized === 'ucs2' || normalized === 'ucs-2' || normalized === 'utf16le') {
-                source = Buffer.from(sanitized, 'utf16le');
+        const blob = blobBytesOf(input);
+        if (blob) source = blob;
+        else {
+            const text = stringValue(input);
+            if (text !== undefined) {
+                const sanitized = sanitizeSurrogates(text);
+                const requestedEncoding = stringValue(encoding);
+                const normalized = requestedEncoding === undefined ? '' : requestedEncoding.toLowerCase();
+                if (normalized === 'ucs2' || normalized === 'ucs-2' || normalized === 'utf16le') {
+                    source = Buffer.from(sanitized, 'utf16le');
+                } else {
+                    source = toBuffer(sanitized, normalized === 'buffer' ? 'latin1' : normalized);
+                }
+            } else if (isRawBuffer(input)) {
+                source = new Uint8Array(input);
             } else {
-                source = toBuffer(sanitized, normalized === 'buffer' ? 'latin1' : normalized);
+                const slots = viewSlots(input);
+                if (!slots) throw invalidArgType('input must be a string, ArrayBuffer, ArrayBufferView or Blob');
+                source = new Uint8Array(slots.buffer, slots.byteOffset, slots.byteLength);
             }
-        } else if (isRawBuffer(input)) {
-            source = new Uint8Array(input);
-        } else {
-            const slots = viewSlots(input);
-            if (!slots) throw invalidArgType('input must be a string, ArrayBuffer, ArrayBufferView or Blob');
-            source = new Uint8Array(slots.buffer, slots.byteOffset, slots.byteLength);
         }
     }
 

@@ -1,4 +1,6 @@
 import { sanitizeSurrogates } from '../../utils/bytes';
+import { Blob as WebBlob } from '../../webapi/formdata';
+import { isBunFile } from '../file';
 
 export type HashInput = Parameters<typeof import('bun').hash>[0];
 
@@ -6,6 +8,9 @@ const engine = import.meta.use('engine');
 const blobBytesSymbol = Symbol.for('cno.blob.bytes');
 
 type BrandGetter<T> = (this: unknown) => T;
+
+const blobSizeGetter = Object.getOwnPropertyDescriptor(WebBlob.prototype, 'size')!.get! as BrandGetter<number>;
+const blobBytes = Reflect.get(WebBlob.prototype, blobBytesSymbol) as (this: Blob) => Uint8Array;
 
 const arrayBufferByteLengthGetter = Object.getOwnPropertyDescriptor(
     ArrayBuffer.prototype,
@@ -57,6 +62,15 @@ function rawBufferByteLength(value: unknown): number | undefined {
     }
 }
 
+function blobBytesOf(value: unknown): Uint8Array | undefined {
+    try {
+        Reflect.apply(blobSizeGetter, value, []);
+        return Reflect.apply(blobBytes, value, []) as Uint8Array;
+    } catch {
+        return undefined;
+    }
+}
+
 function viewBytes(value: ArrayBufferView): Uint8Array {
     let buffer: ArrayBufferLike;
     try {
@@ -83,10 +97,11 @@ export function hashInputBytes(data: unknown): Uint8Array {
         throw invalidInput();
     }
     if (typeof data === 'string') return engine.encodeString(sanitizeSurrogates(data));
-    if (typeof Blob !== 'undefined' && data instanceof Blob) {
-        const getBytes = Reflect.get(data, blobBytesSymbol);
-        if (typeof getBytes === 'function') return Reflect.apply(getBytes, data, []) as Uint8Array;
+    if (isBunFile(data)) {
+        throw Object.assign(invalidInput(), { message: 'File blob cannot be used here' });
     }
+    const blob = blobBytesOf(data);
+    if (blob) return blob;
     const byteLength = rawBufferByteLength(data);
     if (byteLength !== undefined) {
         return byteLength === 0 ? emptyBytes : new Uint8Array(data as ArrayBufferLike, 0, byteLength);

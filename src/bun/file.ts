@@ -93,6 +93,11 @@ interface FileOptions {
     inferType?: boolean;
 }
 
+/** Internal, realm-stable BunFile brand check for other Bun polyfills. */
+export function isBunFile(value: unknown): value is BunFile {
+    return isObject(value) && filePaths.has(value as BunFile);
+}
+
 function isObject(value: unknown): value is Record<PropertyKey, unknown> {
     return (typeof value === 'object' || typeof value === 'function') && value !== null;
 }
@@ -127,7 +132,7 @@ function isBlob(value: unknown): value is Blob {
 }
 
 function blobInputStream(value: Blob): ReadableStream<Uint8Array<ArrayBuffer>> {
-    if (filePaths.has(value as BunFile)) {
+    if (isBunFile(value)) {
         return Reflect.apply(BunFile.prototype.stream, value, []);
     }
     return Reflect.apply(blobStream, value, []);
@@ -656,7 +661,7 @@ for (const property of [
 }
 
 function destinationPath(value: unknown): string {
-    if (value instanceof BunFile) return filePaths.get(value)!;
+    if (isBunFile(value)) return filePaths.get(value)!;
     return pathFromValue(value);
 }
 

@@ -1,5 +1,6 @@
 import { Buffer } from 'node:buffer';
-import { BunFile } from '../file';
+import { Blob as WebBlob } from '../../webapi/formdata';
+import { isBunFile } from '../file';
 import { CryptoHasher } from './index';
 import { md4 } from './md4';
 import { sanitizeSurrogates } from '../../utils/bytes';
@@ -15,6 +16,8 @@ import { sanitizeSurrogates } from '../../utils/bytes';
 
 const engine = import.meta.use('engine');
 const kBlobBytes = Symbol.for('cno.blob.bytes');
+const blobSizeGetter = Object.getOwnPropertyDescriptor(WebBlob.prototype, 'size')!.get!;
+const blobBytes = Reflect.get(WebBlob.prototype, kBlobBytes) as (this: Blob) => Uint8Array;
 
 export type HashDigestEncoding = import('bun').DigestEncoding;
 export type HashClassInput = import('bun').BlobOrStringOrBuffer | DataView;
@@ -112,6 +115,15 @@ function invalidArgType(message: string): TypeError {
     return codedError(new TypeError(message), 'ERR_INVALID_ARG_TYPE');
 }
 
+function blobBytesOf(value: unknown): Uint8Array | undefined {
+    try {
+        Reflect.apply(blobSizeGetter, value, []);
+        return Reflect.apply(blobBytes, value, []) as Uint8Array;
+    } catch {
+        return undefined;
+    }
+}
+
 function bytesOfBuffer(value: ArrayBufferLike | ArrayBufferView): Uint8Array {
     if (isRawBuffer(value)) return new Uint8Array(value);
     const slots = viewSlots(value)!;
@@ -124,12 +136,9 @@ function inputBytes(input: unknown): Uint8Array {
     if (text !== undefined) return engine.encodeString(sanitizeSurrogates(text));
     if (typeof input === 'object' && input !== null) {
         if (isRawBuffer(input) || viewSlots(input)) return bytesOfBuffer(input as ArrayBufferLike | ArrayBufferView);
-        if (input instanceof BunFile) throw invalidArgType('File blob cannot be used here');
-        if (typeof Blob !== 'undefined' && input instanceof Blob) {
-            const getBytes = Reflect.get(input, kBlobBytes);
-            if (typeof getBytes !== 'function') throw new TypeError('Blob byte access is unavailable');
-            return Reflect.apply(getBytes, input, []) as Uint8Array;
-        }
+        if (isBunFile(input)) throw invalidArgType('File blob cannot be used here');
+        const bytes = blobBytesOf(input);
+        if (bytes) return bytes;
     }
     throw invalidArgType('input must be a string, ArrayBuffer, ArrayBufferView or Blob');
 }
