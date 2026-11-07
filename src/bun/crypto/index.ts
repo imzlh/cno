@@ -44,6 +44,7 @@ type Input = string | ArrayBuffer | ArrayBufferView | Blob;
 type Output = string | ArrayBuffer | ArrayBufferView | null;
 
 const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
+const arrayBufferIsView = ArrayBuffer.isView;
 const typedArrayBuffer = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')!.get!;
 const typedArrayByteOffset = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteOffset')!.get!;
 const typedArrayByteLength = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteLength')!.get!;
@@ -61,7 +62,7 @@ interface ViewSlots {
 }
 
 function viewSlots(value: unknown): ViewSlots | null {
-    if (!ArrayBuffer.isView(value)) return null;
+    if (!arrayBufferIsView(value)) return null;
     try {
         return {
             buffer: Reflect.apply(typedArrayBuffer, value, []) as ArrayBufferLike,
@@ -169,7 +170,11 @@ function planOutput(
     nullMeansDefault: boolean,
     minimumLength = 64,
 ): (digest: Uint8Array<ArrayBuffer>) => Buffer | string | ArrayBufferLike | ArrayBufferView {
-    if (output === undefined || (output === null && nullMeansDefault)) return digest => Buffer.from(digest);
+    if (output === undefined || (output === null && nullMeansDefault)) return digest => {
+        const buffer = new Buffer(digest.byteLength);
+        buffer.set(digest);
+        return buffer;
+    };
     const requested = stringValue(output);
     if (requested !== undefined) {
         const encoding = requested.toLowerCase();
@@ -177,7 +182,8 @@ function planOutput(
             throw codedError(new TypeError(`Unknown encoding: ${requested}`), 'ERR_INVALID_ARG_VALUE');
         }
         return digest => {
-            const buffer = Buffer.from(digest);
+            const buffer = new Buffer(digest.byteLength);
+            buffer.set(digest);
             return encoding === 'buffer'
                 ? buffer
                 : Reflect.apply(buffer.toString, buffer, [encoding]) as string;

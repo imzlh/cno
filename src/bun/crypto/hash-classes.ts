@@ -47,6 +47,7 @@ const ENCODINGS = new Set([
 const sharedByteLength = typeof SharedArrayBuffer === 'function'
     ? Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength')?.get
     : undefined;
+const arrayBufferIsView = ArrayBuffer.isView;
 const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
 const typedArrayBuffer = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')!.get!;
 const typedArrayByteOffset = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteOffset')!.get!;
@@ -62,7 +63,7 @@ interface ViewSlots {
 }
 
 function viewSlots(value: unknown): ViewSlots | null {
-    if (!ArrayBuffer.isView(value)) return null;
+    if (!arrayBufferIsView(value)) return null;
     try {
         return {
             buffer: Reflect.apply(typedArrayBuffer, value, []) as ArrayBufferLike,
@@ -150,13 +151,14 @@ function planOutput(
             throw codedError(new TypeError(`Unknown encoding: ${requested}`), 'ERR_INVALID_ARG_VALUE');
         }
         return digest => {
-            const buffer = Buffer.from(digest);
+            const buffer = new Buffer(digest.byteLength);
+            buffer.set(digest);
             return encoding === 'buffer'
                 ? buffer
                 : Reflect.apply(buffer.toString, buffer, [encoding]) as string;
         };
     }
-    if (typeof output === 'object' && output !== null && (isRawBuffer(output) || ArrayBuffer.isView(output))) {
+    if (typeof output === 'object' && output !== null && (isRawBuffer(output) || arrayBufferIsView(output))) {
         const target = bytesOfBuffer(output);
         if (target.byteLength < size) {
             throw invalidArgType(`TypedArray must be at least ${size} bytes`);
