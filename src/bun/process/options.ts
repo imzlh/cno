@@ -16,6 +16,16 @@ const nativeError = import.meta.use('error');
 const signalsBinding = import.meta.use('signals');
 const blobBytesSymbol = Symbol.for('cno.blob.bytes');
 
+type BrandGetter<T> = (this: unknown) => T;
+
+const blobSizeGetter = typeof Blob === 'function'
+    ? Object.getOwnPropertyDescriptor(Blob.prototype, 'size')?.get as BrandGetter<number> | undefined
+    : undefined;
+const blobStream = typeof Blob === 'function' ? Blob.prototype.stream : undefined;
+const blobBytes = typeof Blob === 'function'
+    ? Reflect.get(Blob.prototype, blobBytesSymbol) as ((this: Blob) => unknown) | undefined
+    : undefined;
+
 type OptionsRecord = Record<PropertyKey, unknown>;
 type SpawnKind = 'spawn' | 'spawnSync';
 
@@ -85,9 +95,23 @@ function normalizeCwd(value: unknown): string | undefined {
     return cwd;
 }
 
+export function isBlobInput(value: unknown): value is Blob {
+    if (!blobSizeGetter) return false;
+    try {
+        Reflect.apply(blobSizeGetter, value, []);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+export function blobInputStream(value: Blob): ReadableStream<Uint8Array> {
+    return Reflect.apply(blobStream!, value, []);
+}
+
 function isStaticInput(value: unknown): value is StaticInput {
     return (isBufferInput(value) && typeof value !== 'string')
-        || (typeof Blob !== 'undefined' && value instanceof Blob)
+        || isBlobInput(value)
         || (typeof Request !== 'undefined' && value instanceof Request)
         || (typeof Response !== 'undefined' && value instanceof Response)
         || (typeof ReadableStream !== 'undefined' && value instanceof ReadableStream);
@@ -296,11 +320,11 @@ export function assertSyncExecutable(command: string, cwd: string | undefined, e
 export function syncInput(value: WritableMode): string | Uint8Array<ArrayBuffer> | undefined {
     if (value === 'pipe' || value === 'ignore' || value === 'inherit' || typeof value === 'number') return undefined;
     if (isBufferInput(value)) return copyInputBytes(value);
-    if (value instanceof Blob) {
-        const getBytes = Reflect.get(value, blobBytesSymbol);
+    if (isBlobInput(value)) {
+        const getBytes = blobBytes;
         if (typeof getBytes === 'function') {
             const bytes = Reflect.apply(getBytes, value, []);
-            if (bytes instanceof Uint8Array) return copyInputBytes(bytes);
+            if (isBufferInput(bytes) && typeof bytes !== 'string') return copyInputBytes(bytes);
         }
     }
     throw new Error('Bun.spawnSync cannot synchronously consume this stdin source in this runtime');

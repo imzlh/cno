@@ -1,6 +1,14 @@
 import { Buffer } from 'node:buffer';
 import { normalizeErrnoError } from '../../node/_internal/errno';
-import { parseSpawn, parseSpawnSync, assertSyncExecutable, nativeMode, syncInput } from './options';
+import {
+    parseSpawn,
+    parseSpawnSync,
+    assertSyncExecutable,
+    blobInputStream,
+    isBlobInput,
+    nativeMode,
+    syncInput,
+} from './options';
 import { FileSink, copyInputBytes, isBufferInput, pipeInput, readablePipe } from './streams';
 import type {
     BunProcessResourceUsage,
@@ -44,7 +52,7 @@ function inputStream(value: StaticInput): ReadableStream<Uint8Array> {
             },
         });
     }
-    if (value instanceof Blob) return value.stream();
+    if (isBlobInput(value)) return blobInputStream(value);
     if (value instanceof Request || value instanceof Response) {
         return value.body ?? new Blob([]).stream();
     }
