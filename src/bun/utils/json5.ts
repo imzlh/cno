@@ -17,6 +17,12 @@ const dataViewBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, 'buff
 const dataViewByteOffset = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset')!.get! as BrandGetter<number>;
 const dataViewByteLength = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength')!.get! as BrandGetter<number>;
 const arrayBufferIsView = ArrayBuffer.isView;
+const NumberConstructor = Number;
+const StringConstructor = String;
+const numberValueOf = Number.prototype.valueOf;
+const stringValueOf = String.prototype.valueOf;
+const booleanValueOf = Boolean.prototype.valueOf;
+const bigintValueOf = BigInt.prototype.valueOf;
 const emptyBytes = new Uint8Array();
 
 function rawBuffer(value: unknown): { bytes: Uint8Array; shared: boolean } | undefined {
@@ -206,28 +212,30 @@ function hasBoxedValue(value: object, valueOf: (this: any) => any): boolean {
 export function stringifyJSON5(value: any, replacer?: unknown, space?: unknown): string | undefined {
     if (replacer != null) throw new Error('JSON5.stringify does not support the replacer argument');
     let gap = '';
-    if (space instanceof Number && hasBoxedValue(space, Number.prototype.valueOf)) space = space.valueOf();
-    else if (space instanceof String && hasBoxedValue(space, String.prototype.valueOf)) space = space.toString();
+    if (space !== null && (typeof space === 'object' || typeof space === 'function')) {
+        if (hasBoxedValue(space, numberValueOf)) space = NumberConstructor(space);
+        else if (hasBoxedValue(space, stringValueOf)) space = StringConstructor(space);
+    }
     if (typeof space === 'number') gap = ' '.repeat(Math.min(10, Math.max(0, Math.floor(space) || 0)));
     else if (typeof space === 'string') gap = space.slice(0, 10);
     const stack = new Set<object>();
     function serialize(item: any, depth: number, key: string): string | undefined {
         if (item && typeof item === 'object') {
-            if (hasBoxedValue(item, Number.prototype.valueOf)) item = Number(item);
-            else if (hasBoxedValue(item, String.prototype.valueOf)) item = String(item);
-            else if (hasBoxedValue(item, Boolean.prototype.valueOf)) item = Boolean.prototype.valueOf.call(item);
-            else if (hasBoxedValue(item, BigInt.prototype.valueOf)) throw new Error('JSON5.stringify cannot serialize BigInt');
+            if (hasBoxedValue(item, numberValueOf)) item = NumberConstructor(item);
+            else if (hasBoxedValue(item, stringValueOf)) item = StringConstructor(item);
+            else if (hasBoxedValue(item, booleanValueOf)) item = Reflect.apply(booleanValueOf, item, []);
+            else if (hasBoxedValue(item, bigintValueOf)) throw new Error('JSON5.stringify cannot serialize BigInt');
         }
         if (item === null) return 'null';
         if (typeof item === 'string') return quote(item);
-        if (typeof item === 'number' || typeof item === 'boolean') return String(item);
+        if (typeof item === 'number' || typeof item === 'boolean') return StringConstructor(item);
         if (typeof item === 'bigint') throw new Error('JSON5.stringify cannot serialize BigInt');
         if (typeof item !== 'object') return undefined;
         if (stack.has(item)) throw new Error('Converting circular structure to JSON5');
         stack.add(item);
         const array = Array.isArray(item); const parts: string[] = [];
         if (array) {
-            for (let i = 0; i < item.length; i++) parts.push(serialize(item[i], depth + 1, String(i)) ?? 'null');
+            for (let i = 0; i < item.length; i++) parts.push(serialize(item[i], depth + 1, StringConstructor(i)) ?? 'null');
         } else {
             for (const key of Object.keys(item)) {
                 const v = serialize(item[key], depth + 1, key);
