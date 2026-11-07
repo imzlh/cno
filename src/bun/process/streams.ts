@@ -8,6 +8,24 @@ import {
 
 const engine = import.meta.use('engine');
 const PIPE_CHUNK_SIZE = 64 * 1024;
+type BrandGetter<T> = (this: unknown) => T;
+
+const arrayBufferByteLength = Object.getOwnPropertyDescriptor(
+    ArrayBuffer.prototype,
+    'byteLength',
+)!.get! as BrandGetter<number>;
+const sharedArrayBufferByteLength = typeof SharedArrayBuffer === 'function'
+    ? Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength')?.get as BrandGetter<number> | undefined
+    : undefined;
+const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
+const typedArrayBuffer = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')!.get! as BrandGetter<ArrayBufferLike>;
+const typedArrayByteOffset = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteOffset')!.get! as BrandGetter<number>;
+const typedArrayByteLength = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteLength')!.get! as BrandGetter<number>;
+const dataViewBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer')!.get! as BrandGetter<ArrayBufferLike>;
+const dataViewByteOffset = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset')!.get! as BrandGetter<number>;
+const dataViewByteLength = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength')!.get! as BrandGetter<number>;
+const arrayBufferIsView = ArrayBuffer.isView;
+const emptyBytes = new Uint8Array();
 
 function closeQuietly(pipe: CModuleProcess.Pipe): void {
     try {
@@ -17,13 +35,46 @@ function closeQuietly(pipe: CModuleProcess.Pipe): void {
     }
 }
 
+function rawBufferByteLength(value: unknown): number | undefined {
+    try {
+        return Reflect.apply(arrayBufferByteLength, value, []);
+    } catch {
+        if (!sharedArrayBufferByteLength) return undefined;
+        try {
+            return Reflect.apply(sharedArrayBufferByteLength, value, []);
+        } catch {
+            return undefined;
+        }
+    }
+}
+
+function viewBytes(value: ArrayBufferView): Uint8Array<ArrayBufferLike> {
+    try {
+        const buffer = Reflect.apply(typedArrayBuffer, value, []);
+        const byteOffset = Reflect.apply(typedArrayByteOffset, value, []);
+        const byteLength = Reflect.apply(typedArrayByteLength, value, []);
+        return byteLength === 0 ? emptyBytes : new Uint8Array(buffer, byteOffset, byteLength);
+    } catch {
+        try {
+            const buffer = Reflect.apply(dataViewBuffer, value, []);
+            const byteOffset = Reflect.apply(dataViewByteOffset, value, []);
+            const byteLength = Reflect.apply(dataViewByteLength, value, []);
+            return byteLength === 0 ? emptyBytes : new Uint8Array(buffer, byteOffset, byteLength);
+        } catch {
+            // Bun accepts detached and out-of-bounds views as empty writes.
+            return emptyBytes;
+        }
+    }
+}
+
 function inputBytes(value: string | ArrayBuffer | SharedArrayBuffer | ArrayBufferView): Uint8Array<ArrayBuffer> {
     if (typeof value === 'string') {
         return arrayBufferBackedBytes(engine.encodeString(sanitizeSurrogates(value)));
     }
-    const source = ArrayBuffer.isView(value)
-        ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
-        : new Uint8Array(value);
+    const byteLength = rawBufferByteLength(value);
+    const source = arrayBufferIsView(value)
+        ? viewBytes(value)
+        : byteLength === 0 ? emptyBytes : new Uint8Array(value as ArrayBufferLike, 0, byteLength);
     const copy = new Uint8Array(source.byteLength);
     copy.set(source);
     return copy;
@@ -145,11 +196,7 @@ export class FileSink {
 
     write(chunk: string | ArrayBufferView | ArrayBuffer | SharedArrayBuffer): Promise<number> | true {
         assertFileSink(this);
-        if (typeof chunk !== 'string' && !ArrayBuffer.isView(chunk)
-            && !(chunk instanceof ArrayBuffer)
-            && !(typeof SharedArrayBuffer !== 'undefined' && chunk instanceof SharedArrayBuffer)) {
-            invalidSinkChunk(chunk);
-        }
+        if (!isBufferInput(chunk)) invalidSinkChunk(chunk);
         const bytes = inputBytes(chunk);
         if (this.#ended) return true;
         this.#buffered += bytes.byteLength;
@@ -234,9 +281,8 @@ Object.defineProperty(fileSinkPrototype, Symbol.toStringTag, {
 
 export function isBufferInput(value: unknown): value is string | ArrayBuffer | SharedArrayBuffer | ArrayBufferView {
     return typeof value === 'string'
-        || value instanceof ArrayBuffer
-        || (typeof SharedArrayBuffer !== 'undefined' && value instanceof SharedArrayBuffer)
-        || ArrayBuffer.isView(value);
+        || rawBufferByteLength(value) !== undefined
+        || arrayBufferIsView(value);
 }
 
 export function copyInputBytes(value: string | ArrayBuffer | SharedArrayBuffer | ArrayBufferView): Uint8Array<ArrayBuffer> {
