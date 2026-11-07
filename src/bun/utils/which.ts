@@ -7,6 +7,11 @@ const os = import.meta.use('os');
 
 export type { WhichOptions };
 
+function toStringValue(value: unknown): string {
+    if (typeof value === 'symbol') throw new TypeError('Cannot convert a symbol to a string');
+    return String(value);
+}
+
 function getEnv(name: string): string | undefined {
     try {
         return os.getenv(name) ?? undefined;
@@ -46,8 +51,7 @@ function windowsCandidates(command: string): string[] {
  * directory is never searched implicitly.
  */
 export const which = (command: string, options: WhichOptions = {}): string | null => {
-    if (typeof command === 'symbol') throw new TypeError('Cannot convert a symbol to a string');
-    command = command == null ? '' : String(command);
+    command = command == null ? '' : toStringValue(command);
 
     const optionObject = options !== null && (typeof options === 'object' || typeof options === 'function')
         ? options
@@ -57,10 +61,10 @@ export const which = (command: string, options: WhichOptions = {}): string | nul
     const pathOption = optionObject.PATH;
     const searchPath = pathOption == null
         ? getEnv('PATH') ?? getEnv('Path') ?? ''
-        : String(pathOption);
+        : toStringValue(pathOption);
     const cwdOption = optionObject.cwd;
     const processCwd = currentDirectory();
-    const cwd = resolvePath(cwdOption == null ? processCwd : String(cwdOption), processCwd);
+    const cwd = resolvePath(cwdOption == null ? processCwd : toStringValue(cwdOption), processCwd);
 
     if (command.length === 0) return null;
 
