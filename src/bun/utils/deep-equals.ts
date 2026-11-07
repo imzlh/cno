@@ -92,6 +92,19 @@ function regexpFlagsOf(value: object): string {
     return result;
 }
 
+function collectionSlotInfo(value: object): Extract<SlotInfo, { kind: 'Map' | 'Set' }> | undefined {
+    try {
+        return { kind: 'Map', iterator: Reflect.apply(mapEntries, value, []) as Iterator<[unknown, unknown]> };
+    } catch {
+        try {
+            return { kind: 'Set', iterator: Reflect.apply(setValues, value, []) as Iterator<unknown> };
+        } catch {
+            // Forged prototypes and Proxies do not carry the collection's internal slot.
+            return undefined;
+        }
+    }
+}
+
 function slotInfo(value: object, prototype: object | null): SlotInfo | undefined {
     const hint = prototypeBrand(prototype);
     if (!hint) {
@@ -99,7 +112,7 @@ function slotInfo(value: object, prototype: object | null): SlotInfo | undefined
             // Date slots survive prototype replacement, and this intrinsic check cannot be spoofed.
             return { kind: 'Date', value: call(dateValue, value) as number };
         } catch {
-            return undefined;
+            return collectionSlotInfo(value);
         }
     }
     try {
@@ -132,8 +145,8 @@ function slotInfo(value: object, prototype: object | null): SlotInfo | undefined
                 return { kind: hint, href: call(urlHref, value) as string };
         }
     } catch {
-        // A matching prototype is forgeable and Proxies do not carry the target's slots.
-        return undefined;
+        // A hint can be forged or replaced; intrinsic collection calls recover the real brand.
+        return collectionSlotInfo(value);
     }
 }
 
