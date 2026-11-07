@@ -34,7 +34,7 @@ that every declared API exists at runtime.
 | `Bun.hash` | Partial | Wyhash, Adler-32, CRC-32, CityHash, xxHash32/64 and Murmur v2/v3; xxHash3 and rapidhash are not implemented. |
 | `Bun.semver` | Partial | Common npm ranges and comparisons. Some malformed or nonstandard ranges still differ from Bun. |
 | `Bun.randomUUIDv5`, `Bun.randomUUIDv7` | Partial | UUIDv5 supports RFC namespace UUIDs plus `dns`, `url`, `oid`, and `x500`; UUIDv7 ordering state is context-local rather than process-shared. |
-| Bun stream conversion and file URL helpers | Partial | ArrayBuffer, bytes, text, JSON, array, Blob and FormData consumers, `concatArrayBuffers`, and local file URL conversion. Multipart parsing omits `filename*` and folded headers. |
+| Bun stream conversion and file URL helpers | Partial | ArrayBuffer, bytes, text, JSON, array, Blob and FormData consumers, `concatArrayBuffers`, and local file URL conversion. Multipart parsing omits `filename*`; like Bun 1.4.4, it rejects folded Content-Disposition fields and ignores folded Content-Type values. |
 | `Bun.ArrayBufferSink` | Partial | Incremental UTF-8/binary writes, streaming flushes, reusable `end`, preallocation, and ArrayBuffer/Uint8Array output. |
 | `Bun.Cookie`, `Bun.CookieMap` | Partial | Single-cookie parsing/serialization plus cookie-header parsing, mutation, iteration, value encoding, and Set-Cookie output. |
 | `Bun.sleepSync`, `Bun.nanoseconds`, `Bun.peek`, `Bun.allocUnsafe`, `Bun.indexOfLine` | Partial | `sleepSync` blocks through the native OS sleep. `nanoseconds` derives from `performance.now()`, so it counts from process start and loses integer exactness past about 104 days. `peek` synchronously observes native promise state. `allocUnsafe` always returns zero-filled memory. |

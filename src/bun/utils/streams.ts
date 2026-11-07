@@ -346,13 +346,20 @@ function parseMultipart(data: Uint8Array, boundary: Uint8Array, form: FormData):
         if (split === -1) throw formError('multipart part has no header block');
         let disposition: ReturnType<typeof parseHeaderParams> | undefined;
         let contentType = 'text/plain;charset=utf-8';
+        let previousHeader = '';
         for (const line of engine.decodeString(part.subarray(0, split)).split('\r\n')) {
             const colon = line.indexOf(':');
-            if (colon === -1) throw formError('malformed multipart header');
+            if (colon === -1) {
+                // Bun ignores obsolete Content-Type continuation lines, but
+                // rejects the same folding for Content-Disposition.
+                if ((line[0] === ' ' || line[0] === '\t') && previousHeader === 'content-type') continue;
+                throw formError('malformed multipart header');
+            }
             const header = line.slice(0, colon).trim().toLowerCase();
             const headerValue = line.slice(colon + 1).trim();
             if (header === 'content-disposition' && !disposition) disposition = parseHeaderParams(headerValue);
-            else if (header === 'content-type') contentType = headerValue;
+            else if (header === 'content-type' && headerValue) contentType = headerValue;
+            previousHeader = header;
         }
         if (!disposition || disposition.type !== 'form-data' || !disposition.params.has('name')) {
             throw formError('multipart part requires Content-Disposition: form-data with a name');
