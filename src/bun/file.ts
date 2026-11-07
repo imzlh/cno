@@ -620,12 +620,15 @@ export class BunFile extends Blob implements BunFileLike {
         return JSON.parse(await this.text()) as T;
     }
 
-    stream(_chunkSize?: number): ReadableStream<Uint8Array<ArrayBuffer>> {
+    stream(chunkSize?: number): ReadableStream<Uint8Array<ArrayBuffer>> {
         const backing = fileBackings.get(this);
         if (!backing) {
             return Reflect.apply(blobStream, this, arguments) as ReadableStream<Uint8Array<ArrayBuffer>>;
         }
         if (backing.kind === 'fd') return this.#borrowedStream();
+        if (chunkSize !== undefined && chunkSize !== null && typeof chunkSize !== 'number') {
+            throw Object.assign(new TypeError('chunkSize must be a number'), { code: 'ERR_INVALID_ARG_TYPE' });
+        }
         const source = this;
         let opened: Awaited<ReturnType<typeof openReadableFile>> | undefined;
         let active: Promise<void> | undefined;
