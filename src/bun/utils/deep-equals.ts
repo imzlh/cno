@@ -29,6 +29,7 @@ const mapIteratorNext = getPrototypeOf(mapEntries.call(new Map())).next as Funct
 const setValues = Set.prototype.values;
 const setIteratorNext = getPrototypeOf(setValues.call(new Set())).next as Function;
 const arrayBufferByteLength = getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength')!.get as Function;
+const arrayBufferIsView = ArrayBuffer.isView;
 const sharedArrayBufferByteLength = typeof SharedArrayBuffer === 'undefined' ? undefined
     : getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength')?.get as Function | undefined;
 const typedArrayPrototype = getPrototypeOf(Uint8Array.prototype);
@@ -345,7 +346,7 @@ export function deepEquals(a: unknown, b: unknown, strict = false): boolean {
         const xError = isError(x), yError = isError(y);
         if (xError || yError) return xError && yError && errorsEqual(x, y, depth);
 
-        const xView = ArrayBuffer.isView(x), yView = ArrayBuffer.isView(y);
+        const xView = arrayBufferIsView(x), yView = arrayBufferIsView(y);
         const xTypedName = xView ? call(typedArrayName, x) as string | undefined : undefined;
         const yTypedName = yView ? call(typedArrayName, y) as string | undefined : undefined;
         if (xTypedName !== undefined || yTypedName !== undefined) {
