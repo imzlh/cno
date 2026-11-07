@@ -19,6 +19,7 @@ type DNSException = Error & {
 };
 
 const stringValueOf = String.prototype.valueOf;
+const mathTrunc = Math.trunc;
 const codedErrorPrototypes = new Map<string, object>();
 
 function codedError<T extends Error>(error: T, code: string): T & { code: string } {
@@ -79,13 +80,13 @@ function dnsException(code: string, message: string, hostname?: string): DNSExce
 }
 
 function normalizedInteger(value: number): number {
-    return Number.isNaN(value) ? 0 : Math.trunc(value);
+    return Number.isNaN(value) ? 0 : mathTrunc(value);
 }
 
 function portText(value: number): string {
     if (value === Infinity || value >= 9_223_372_036_854_776_000) return '9223372036854775807';
     if (value === -Infinity || value <= -9_223_372_036_854_776_000) return '-9223372036854775808';
-    return String(Math.trunc(value));
+    return String(mathTrunc(value));
 }
 
 const lookup = (hostnameValue: unknown, options?: DNSLookupOptions): Promise<DNSLookupResult> => {
@@ -119,7 +120,7 @@ const lookup = (hostnameValue: unknown, options?: DNSLookupOptions): Promise<DNS
 
     if (typeof port === 'number') {
         if (Number.isNaN(port)) throw codedError(new RangeError('Invalid port number'), 'ERR_SOCKET_BAD_PORT');
-        const normalizedPort = Math.trunc(port);
+        const normalizedPort = mathTrunc(port);
         if (normalizedPort < 0 || normalizedPort > 65535 || !Number.isFinite(normalizedPort)) {
             throw codedError(new RangeError(`Port number out of range: ${portText(port)}`), 'ERR_SOCKET_BAD_PORT');
         }
