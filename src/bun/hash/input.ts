@@ -1,16 +1,12 @@
 import { sanitizeSurrogates } from '../../utils/bytes';
-import { Blob as WebBlob } from '../../webapi/formdata';
+import { blobBytesOf } from '../blob-intrinsics';
 import { isBunFile } from '../file';
 
 export type HashInput = Parameters<typeof import('bun').hash>[0];
 
 const engine = import.meta.use('engine');
-const blobBytesSymbol = Symbol.for('cno.blob.bytes');
 
 type BrandGetter<T> = (this: unknown) => T;
-
-const blobSizeGetter = Object.getOwnPropertyDescriptor(WebBlob.prototype, 'size')!.get! as BrandGetter<number>;
-const blobBytes = Reflect.get(WebBlob.prototype, blobBytesSymbol) as (this: Blob) => Uint8Array;
 
 const arrayBufferByteLengthGetter = Object.getOwnPropertyDescriptor(
     ArrayBuffer.prototype,
@@ -59,15 +55,6 @@ function rawBufferByteLength(value: unknown): number | undefined {
         } catch {
             return undefined;
         }
-    }
-}
-
-function blobBytesOf(value: unknown): Uint8Array | undefined {
-    try {
-        Reflect.apply(blobSizeGetter, value, []);
-        return Reflect.apply(blobBytes, value, []) as Uint8Array;
-    } catch {
-        return undefined;
     }
 }
 

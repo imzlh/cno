@@ -1,5 +1,5 @@
 import { Buffer } from 'node:buffer';
-import { Blob as WebBlob } from '../../webapi/formdata';
+import { blobBytesOf } from '../blob-intrinsics';
 import { isBunFile } from '../file';
 import { CryptoHasher } from './index';
 import { md4 } from './md4';
@@ -15,9 +15,6 @@ import { sanitizeSurrogates } from '../../utils/bytes';
  */
 
 const engine = import.meta.use('engine');
-const kBlobBytes = Symbol.for('cno.blob.bytes');
-const blobSizeGetter = Object.getOwnPropertyDescriptor(WebBlob.prototype, 'size')!.get!;
-const blobBytes = Reflect.get(WebBlob.prototype, kBlobBytes) as (this: Blob) => Uint8Array;
 
 export type HashDigestEncoding = import('bun').DigestEncoding;
 export type HashClassInput = import('bun').BlobOrStringOrBuffer | DataView;
@@ -113,15 +110,6 @@ function codedError<T extends Error>(error: T, code: string): T {
 
 function invalidArgType(message: string): TypeError {
     return codedError(new TypeError(message), 'ERR_INVALID_ARG_TYPE');
-}
-
-function blobBytesOf(value: unknown): Uint8Array | undefined {
-    try {
-        Reflect.apply(blobSizeGetter, value, []);
-        return Reflect.apply(blobBytes, value, []) as Uint8Array;
-    } catch {
-        return undefined;
-    }
 }
 
 function bytesOfBuffer(value: ArrayBufferLike | ArrayBufferView): Uint8Array {

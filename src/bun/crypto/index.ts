@@ -1,14 +1,10 @@
 import { Buffer } from 'node:buffer';
 import { toBuffer } from '../../node/crypto/helpers';
 import { sanitizeSurrogates } from '../../utils/bytes';
-import { Blob as WebBlob } from '../../webapi/formdata';
+import { blobBytesOf } from '../blob-intrinsics';
 import { blake2b, blake2b256 } from './blake2b';
 import { hmacMd4, md4 } from './md4';
 import { isBunFile } from '../file';
-
-const kblobBytes = Symbol.for('cno.blob.bytes');
-const blobSizeGetter = Object.getOwnPropertyDescriptor(WebBlob.prototype, 'size')!.get!;
-const blobBytes = Reflect.get(WebBlob.prototype, kblobBytes) as (this: Blob) => Uint8Array;
 
 const native = import.meta.use('crypto');
 const engine = import.meta.use('engine');
@@ -113,15 +109,6 @@ function codedError<T extends Error>(error: T, code: string): T {
 
 function invalidArgType(message: string): TypeError {
     return codedError(new TypeError(message), 'ERR_INVALID_ARG_TYPE');
-}
-
-function blobBytesOf(value: unknown): Uint8Array | undefined {
-    try {
-        Reflect.apply(blobSizeGetter, value, []);
-        return Reflect.apply(blobBytes, value, []) as Uint8Array;
-    } catch {
-        return undefined;
-    }
 }
 
 function ownedBytes(input: unknown, encoding?: unknown): Uint8Array<ArrayBuffer> {
