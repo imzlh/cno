@@ -334,14 +334,25 @@ export class CookieMap implements Iterable<[string, string]> {
             cookie = record(name, optionValue, nameOrOptions);
         }
         const index = this.#cookies.findIndex(current => current.name === cookie.name);
-        // Bun lists newly changed cookies before untouched constructor entries,
-        // including when an existing name is updated.
-        if (index < 0) this.#cookies.unshift(cookie);
-        else {
+        if (cookie.value === '') {
+            let removedAny = false;
             for (let i = this.#cookies.length - 1; i >= 0; i--) {
-                if (this.#cookies[i].name === cookie.name) this.#cookies.splice(i, 1);
+                if (this.#cookies[i].name === cookie.name) {
+                    this.#cookies.splice(i, 1);
+                    removedAny = true;
+                }
             }
-            this.#cookies.unshift(cookie);
+            if (removedAny) this.#iterationSource.deletions++;
+        } else {
+            // Bun lists newly changed cookies before untouched constructor entries,
+            // including when an existing name is updated.
+            if (index < 0) this.#cookies.unshift(cookie);
+            else {
+                for (let i = this.#cookies.length - 1; i >= 0; i--) {
+                    if (this.#cookies[i].name === cookie.name) this.#cookies.splice(i, 1);
+                }
+                this.#cookies.unshift(cookie);
+            }
         }
         this.#markChanged(cookie.name, cookie);
     }
