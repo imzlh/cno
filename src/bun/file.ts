@@ -38,6 +38,18 @@ const fileLastModified = typeof File === 'function'
     : undefined;
 const blobSlice = Blob.prototype.slice;
 const blobStream = Blob.prototype.stream;
+const requestBody = typeof Request === 'function'
+    ? Object.getOwnPropertyDescriptor(Request.prototype, 'body')?.get
+    : undefined;
+const requestBodyUsed = typeof Request === 'function'
+    ? Object.getOwnPropertyDescriptor(Request.prototype, 'bodyUsed')?.get
+    : undefined;
+const responseBody = typeof Response === 'function'
+    ? Object.getOwnPropertyDescriptor(Response.prototype, 'body')?.get
+    : undefined;
+const responseBodyUsed = typeof Response === 'function'
+    ? Object.getOwnPropertyDescriptor(Response.prototype, 'bodyUsed')?.get
+    : undefined;
 // Use the host's global Blob and its registered byte protocol. Importing
 // webapi/formdata would bundle a second Blob into the payload, and that module
 // overwrites globalThis.Blob/File/FormData when evaluated.
@@ -111,12 +123,31 @@ function isArrayBufferLike(value: unknown): value is ArrayBufferLike {
     return isBunBytePath(value) && !arrayBufferIsView(value);
 }
 
-function isResponse(value: unknown): value is Response {
-    return typeof Response !== 'undefined' && value instanceof Response;
+interface BodyInput {
+    kind: 'Request' | 'Response';
+    body: ReadableStream | null;
+    bodyUsed: boolean;
 }
 
-function isRequest(value: unknown): value is Request {
-    return typeof Request !== 'undefined' && value instanceof Request;
+function bodyInputOf(value: unknown): BodyInput | undefined {
+    // Bun does not forward Request/Response brands through Proxy wrappers.
+    if (!isObject(value) || engine.isProxy(value)) return undefined;
+    for (const [kind, bodyGetter, usedGetter] of [
+        ['Request', requestBody, requestBodyUsed],
+        ['Response', responseBody, responseBodyUsed],
+    ] as const) {
+        if (!bodyGetter || !usedGetter) continue;
+        try {
+            return {
+                kind,
+                body: Reflect.apply(bodyGetter, value, []) as ReadableStream | null,
+                bodyUsed: Reflect.apply(usedGetter, value, []) as boolean,
+            };
+        } catch {
+            // The captured getter is also the internal-slot brand check.
+        }
+    }
+    return undefined;
 }
 
 function isReadableStream(value: unknown): value is ReadableStream {
@@ -809,12 +840,15 @@ export class BunFile extends Blob implements BunFileLike {
             throw new TypeError('Bun.file.write: options must be an object');
         }
         // Bun accepts but ignores unrecognized options on this method.
-        if (typeof Request !== 'undefined' && data instanceof Request) {
-            if (data.bodyUsed || data.body?.locked) throw new TypeError('Bun.file.write: Request body is already used or locked');
-            if (data.body) {
+        const bodyInput = bodyInputOf(data);
+        if (bodyInput?.kind === 'Request') {
+            if (bodyInput.bodyUsed || bodyInput.body?.locked) {
+                throw new TypeError('Bun.file.write: Request body is already used or locked');
+            }
+            if (bodyInput.body) {
                 return this.#backing.kind === 'path'
-                    ? writeStream(this.#backing.path, data.body, {})
-                    : writeBorrowedStream(this.#backing.fd, data.body);
+                    ? writeStream(this.#backing.path, bodyInput.body, {})
+                    : writeBorrowedStream(this.#backing.fd, bodyInput.body);
             }
             return write(this, '');
         }
@@ -825,7 +859,7 @@ export class BunFile extends Blob implements BunFileLike {
         }
         if (data == null) throw new TypeError('Bun.file.write: missing input');
         if (typeof data !== 'string' && !arrayBufferIsView(data) && !isArrayBufferLike(data)
-            && !isBlob(data) && !isResponse(data)) {
+            && !isBlob(data) && bodyInput?.kind !== 'Response') {
             return write(this, stringifyWriteInput(data));
         }
         return write(this, data as BunWriteInput);
@@ -1023,16 +1057,17 @@ export async function write(
 ): Promise<number> {
     const stdio = stdioDestination(destination);
     if (stdio) {
-        if (isRequest(input)) {
-            if (input.bodyUsed || input.body?.locked) {
+        const bodyInput = bodyInputOf(input);
+        if (bodyInput?.kind === 'Request') {
+            if (bodyInput.bodyUsed || bodyInput.body?.locked) {
                 throw new TypeError('Bun.write: Request body is already used or locked');
             }
             // Bodyless Requests truncate files; for pipes they simply write nothing.
-            if (!input.body) return 0;
-            return writeStdioStream(stdio, input.body);
+            if (!bodyInput.body) return 0;
+            return writeStdioStream(stdio, bodyInput.body);
         }
         // mode/createPath are file-path concepts; Bun ignores them for pipes.
-        if (isResponse(input) || isReadableStream(input)) {
+        if (bodyInput?.kind === 'Response' || isReadableStream(input)) {
             throw new TypeError('Bun.write: Response and ReadableStream input is not supported for stdio files');
         }
         return stdio.write(input as string | ArrayBufferView | ArrayBufferLike | Blob);
@@ -1047,12 +1082,12 @@ export async function write(
     }
     if (borrowedFd !== undefined) {
         // mode/createPath are path concepts; Bun ignores them for a borrowed fd.
-        if (isResponse(input) || isRequest(input)) {
-            const name = isRequest(input) ? 'Request' : 'Response';
-            if (input.bodyUsed || input.body?.locked) {
-                throw new TypeError(`Bun.write: ${name} body is already used or locked`);
+        const bodyInput = bodyInputOf(input);
+        if (bodyInput) {
+            if (bodyInput.bodyUsed || bodyInput.body?.locked) {
+                throw new TypeError(`Bun.write: ${bodyInput.kind} body is already used or locked`);
             }
-            return input.body ? writeBorrowedStream(borrowedFd, input.body) : 0;
+            return bodyInput.body ? writeBorrowedStream(borrowedFd, bodyInput.body) : 0;
         }
         if (isBlob(input)) {
             const source = isBunFile(input) ? fileBackings.get(input) : undefined;
@@ -1071,18 +1106,18 @@ export async function write(
     }
     const path = destinationPath(destination);
     const parsed = validateWriteOptions(options);
-    if (isResponse(input) || isRequest(input)) {
-        const name = isRequest(input) ? 'Request' : 'Response';
-        if (input.bodyUsed || input.body?.locked) {
-            throw new TypeError(`Bun.write: ${name} body is already used or locked`);
+    const bodyInput = bodyInputOf(input);
+    if (bodyInput) {
+        if (bodyInput.bodyUsed || bodyInput.body?.locked) {
+            throw new TypeError(`Bun.write: ${bodyInput.kind} body is already used or locked`);
         }
-        if (input.body) return writeStream(path, input.body, parsed);
+        if (bodyInput.body) return writeStream(path, bodyInput.body, parsed);
     } else if (isBlob(input)) {
         return writeStream(path, blobInputStream(input), parsed);
     } else if (isReadableStream(input)) {
         return writeStream(path, input, parsed);
     }
-    const bytes = isResponse(input) || isRequest(input)
+    const bytes = bodyInput
         ? new Uint8Array(0)
         : await inputBytes(
             typeof input === 'object' && input !== null && !arrayBufferIsView(input) && !isArrayBufferLike(input)
