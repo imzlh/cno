@@ -24,6 +24,7 @@ const typedArrayByteLength = Object.getOwnPropertyDescriptor(typedArrayPrototype
 const dataViewBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer')!.get!;
 const dataViewByteOffset = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset')!.get!;
 const dataViewByteLength = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength')!.get!;
+const arrayBufferIsView = ArrayBuffer.isView;
 const blobSize = Object.getOwnPropertyDescriptor(Blob.prototype, 'size')!.get!;
 const fileName = typeof File === 'function'
     ? Object.getOwnPropertyDescriptor(File.prototype, 'name')?.get
@@ -96,7 +97,7 @@ function isObject(value: unknown): value is Record<PropertyKey, unknown> {
 }
 
 function isArrayBufferLike(value: unknown): value is ArrayBufferLike {
-    return isBunBytePath(value) && !ArrayBuffer.isView(value);
+    return isBunBytePath(value) && !arrayBufferIsView(value);
 }
 
 function isResponse(value: unknown): value is Response {
@@ -241,7 +242,7 @@ function toArrayBufferBytes(value: ArrayBufferView | ArrayBufferLike): Uint8Arra
         return output;
     };
 
-    if (ArrayBuffer.isView(value)) {
+    if (arrayBufferIsView(value)) {
         let buffer: ArrayBufferLike;
         let byteOffset: number;
         let byteLength: number;
@@ -599,7 +600,7 @@ export class BunFile extends Blob implements BunFileLike {
         }
         if (isReadableStream(data)) return writeStream(this.#path, data, {});
         if (data == null) throw new TypeError('Bun.file.write: missing input');
-        if (typeof data !== 'string' && !ArrayBuffer.isView(data) && !isArrayBufferLike(data)
+        if (typeof data !== 'string' && !arrayBufferIsView(data) && !isArrayBufferLike(data)
             && !(data instanceof Blob) && !isResponse(data)) {
             return write(this, String(data));
         }
@@ -629,7 +630,7 @@ async function inputBytes(value: unknown): Promise<Uint8Array<ArrayBuffer>> {
     if (typeof value === 'string') {
         return arrayBufferBackedBytes(engine.encodeString(sanitizeSurrogates(value)));
     }
-    if (ArrayBuffer.isView(value)) return toArrayBufferBytes(value);
+    if (arrayBufferIsView(value)) return toArrayBufferBytes(value);
     if (isArrayBufferLike(value)) return toArrayBufferBytes(value);
     if (isReadableStream(value)) {
         throw new TypeError('Bun.write: ReadableStream input is not supported by this runtime');
