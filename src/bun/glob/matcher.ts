@@ -327,6 +327,32 @@ function splitPath(value: string): string[] {
     return normalizeSeparators(value).split('/');
 }
 
+function normalizePatternSeparators(value: string): string {
+    let output = '';
+    let backslashes = 0;
+    let segmentStart = 0;
+    for (const character of value) {
+        if (character === '\\') {
+            output += character;
+            backslashes++;
+            continue;
+        }
+        if (character === '/' && (backslashes & 1) === 1) {
+            // Bun treats an escaped slash as a path separator, not a literal.
+            output = output.slice(0, -1);
+            // A globstar followed by an escaped separator remains a one-segment
+            // wildcard; only an ordinary separator gives `**` zero-or-more depth.
+            if (output.slice(segmentStart) === '**') {
+                output = `${output.slice(0, segmentStart)}*`;
+            }
+        }
+        output += character;
+        if (character === '/') segmentStart = output.length;
+        backslashes = 0;
+    }
+    return output;
+}
+
 function matchSegments(
     values: readonly string[],
     patterns: readonly string[],
@@ -366,19 +392,21 @@ function matchSegments(
 }
 
 function matchExpanded(value: string, pattern: string, dot: boolean): boolean {
-    if (value === '' && pattern.includes('/')) {
-        const segments = splitPath(pattern);
-        if (pattern.startsWith('/') || segments.some(segment => segment !== '' && segment !== '**')) return false;
+    const normalizedPattern = normalizePatternSeparators(pattern);
+    const patternSegments = splitPath(normalizedPattern);
+    if (value === '' && normalizedPattern.includes('/')) {
+        if (normalizedPattern.startsWith('/') || patternSegments.some(segment => segment !== '' && segment !== '**')) return false;
     }
-    if (pattern.endsWith('/**') && !value.endsWith('/')) {
-        const prefix = pattern.slice(0, -3);
+    if (normalizedPattern.endsWith('/**') && !value.endsWith('/')) {
+        const prefix = normalizedPattern.slice(0, -3);
         if (value === prefix) return false;
     }
-    return matchSegments(splitPath(value), splitPath(pattern), 0, 0, { dot }, new Map());
+    return matchSegments(splitPath(value), patternSegments, 0, 0, { dot }, new Map());
 }
 
 function patternHasExplicitDot(pattern: string): boolean {
-    return splitPath(pattern).some(segment => segment !== '**' && firstTokenCanMatchDot(segment));
+    return splitPath(normalizePatternSeparators(pattern))
+        .some(segment => segment !== '**' && firstTokenCanMatchDot(segment));
 }
 
 export function compileGlobPattern(value: unknown): CompiledGlobPattern {
