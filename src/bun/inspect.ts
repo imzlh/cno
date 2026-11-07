@@ -19,6 +19,13 @@ interface State {
 
 const DEFAULT_DEPTH = 8;
 const IDENTIFIER = /^[A-Za-z_$][\w$]*$/;
+const arrayBufferIsView = ArrayBuffer.isView;
+const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype);
+const typedArrayName = Object.getOwnPropertyDescriptor(typedArrayPrototype, Symbol.toStringTag)!.get!;
+const typedArrayLength = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'length')!.get!;
+const dataViewBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer')!.get!;
+const dataViewByteOffset = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset')!.get!;
+const dataViewByteLength = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength')!.get!;
 
 export function inspect(value: unknown, options: InspectOptions | number = {}): string {
     let depth = DEFAULT_DEPTH;
@@ -199,6 +206,7 @@ function formatArray(array: unknown[], level: number, state: State): string {
 
 function formatObjectKind(object: object, level: number, state: State): string {
     if (Array.isArray(object)) return formatArray(object, level, state);
+    if (arrayBufferIsView(object)) return formatArrayBufferView(object, level, state);
     const tag = Object.prototype.toString.call(object);
     if (tag === '[object Date]') {
         try {
@@ -222,7 +230,6 @@ function formatObjectKind(object: object, level: number, state: State): string {
             return formatSet(object as Set<unknown>, level, state);
         } catch {}
     }
-    if (ArrayBuffer.isView(object)) return formatArrayBufferView(object, level, state);
     if (tag === '[object ArrayBuffer]') {
         try {
             const byteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength')!.get!.call(object);
@@ -246,13 +253,27 @@ function formatSet(set: Set<unknown>, level: number, state: State): string {
 }
 
 function formatArrayBufferView(view: ArrayBufferView, level: number, state: State): string {
-    const name = constructorName(view) ?? 'ArrayBufferView';
-    const bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
-    if (Object.prototype.toString.call(view) === '[object DataView]') {
-        return `DataView(${view.byteLength}) [ ${Array.from(bytes).join(', ')} ]`;
+    const name = typedArrayName.call(view) as string | undefined;
+    if (name !== undefined) {
+        const length = typedArrayLength.call(view) as number;
+        if (length === 0) return `${name}(0) []`;
+        const values: string[] = [];
+        for (let index = 0; index < length; index++) {
+            values.push(formatValue((view as unknown as Record<number, unknown>)[index], level + 1, state));
+        }
+        return `${name}(${length}) [ ${values.join(', ')} ]`;
     }
-    const values = Array.from(view as unknown as Iterable<unknown>, value => formatValue(value, level + 1, state));
-    return `${name}(${values.length}) [ ${values.join(', ')} ]`;
+    try {
+        const byteLength = dataViewByteLength.call(view) as number;
+        if (byteLength === 0) return 'DataView(0) []';
+        const buffer = dataViewBuffer.call(view) as ArrayBuffer;
+        const byteOffset = dataViewByteOffset.call(view) as number;
+        const bytes = new Uint8Array(buffer, byteOffset, byteLength);
+        return `DataView(${byteLength}) [ ${Array.from(bytes).join(', ')} ]`;
+    } catch {
+        // Detached and out-of-bounds DataViews are displayed as empty views.
+        return 'DataView(0) []';
+    }
 }
 
 function isArrayIndex(key: string, length: number): boolean {
