@@ -248,6 +248,7 @@ export interface BunApi {
     readonly argv: string[];
     readonly env: Record<string, string | undefined>;
     readonly main: string;
+    cwd: string;
     readonly fetch: typeof fetch;
     readonly isMainThread: boolean;
     readonly sleep: typeof sleep;
@@ -433,6 +434,7 @@ const Bun: BunApi = {
     set main(value: string) {
         mainOverride = value;
     },
+    cwd: osModule.cwd,
     fetch,
     isMainThread,
     sleep,
@@ -512,6 +514,16 @@ const readOnlyBunMembers = new Set<PropertyKey>([
     'env', 'fetch', 'isMainThread', 'isStandaloneExecutable',
     'Cookie', 'CookieMap', 'dns', 'JSONL', 'semver',
 ]);
+
+// Bun exposes cwd as a hidden, replaceable snapshot rather than a live
+// process.cwd() view. Defining it before the public-slot pass also keeps it
+// out of the enumerable module facade.
+Object.defineProperty(Bun, 'cwd', {
+    value: Bun.cwd,
+    writable: true,
+    enumerable: false,
+    configurable: false,
+});
 
 // Bun's public namespace slots cannot be deleted. Most remain replaceable;
 // only the small set above is read-only in Bun 1.4.4.
