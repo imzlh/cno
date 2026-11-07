@@ -14,6 +14,8 @@ const dataViewBufferGetter = Object.getOwnPropertyDescriptor(DataView.prototype,
 const dataViewByteOffsetGetter = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset')!.get! as BrandGetter<number>;
 const dataViewByteLengthGetter = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength')!.get! as BrandGetter<number>;
 const arrayBufferIsView = ArrayBuffer.isView;
+const dateGetTime = Date.prototype.getTime;
+const dateToISOString = Date.prototype.toISOString;
 const emptyBytes = new Uint8Array();
 
 function hasSharedArrayBufferSlot(value: unknown): value is SharedArrayBuffer {
@@ -213,8 +215,19 @@ const parse = (input: unknown): Record<string, any> => {
 
 const quoteText = (text: string) => JSON.stringify(sanitizeSurrogates(text)).replace(/\x7f/g, '\\u007f');
 const keyText = (key: string) => /^[A-Za-z0-9_-]+$/.test(key) ? key : quoteText(key);
+const dateValue = (value: unknown): number | undefined => {
+    try {
+        return Reflect.apply(dateGetTime, value, []) as number;
+    } catch {
+        return undefined;
+    }
+};
 const temporalValue = (value: any): string | undefined => {
-    if (value instanceof Date) return value.toISOString().replace(/\.000Z$/, 'Z');
+    const time = dateValue(value);
+    if (time !== undefined) {
+        if (Number.isNaN(time)) throw new Error('TOML.stringify cannot serialize an invalid Date');
+        return (Reflect.apply(dateToISOString, value, []) as string).replace(/\.000Z$/, 'Z');
+    }
     if (value instanceof TomlTemporalValue) return value.toString();
     return undefined;
 };
@@ -223,7 +236,7 @@ const tableValue = (v: any) => v !== null && typeof v === 'object' && !Array.isA
 const stringify = (input?: unknown, replacer?: unknown, _space?: unknown): string | undefined => {
     if (input === undefined || typeof input === 'function' || typeof input === 'symbol') return undefined;
     if (replacer !== undefined && replacer !== null) throw new Error('TOML.stringify does not support the replacer argument');
-    if (!input || typeof input !== 'object' || Array.isArray(input) || input instanceof Date || input instanceof String || input instanceof Number || input instanceof Boolean) throw new Error('TOML.stringify expects an object at the top level (a TOML document is a table)');
+    if (!input || typeof input !== 'object' || Array.isArray(input) || dateValue(input) !== undefined || input instanceof String || input instanceof Number || input instanceof Boolean) throw new Error('TOML.stringify expects an object at the top level (a TOML document is a table)');
     const ancestors = new Set<object>();
     const enter = (o: object) => { if (ancestors.has(o)) throw new Error('TOML.stringify cannot serialize circular references'); ancestors.add(o); };
     const scalar = (v: any, context: string): string => {
