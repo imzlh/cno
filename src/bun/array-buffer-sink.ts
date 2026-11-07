@@ -37,6 +37,7 @@ const typedArrayByteLength = Object.getOwnPropertyDescriptor(typedArrayPrototype
 const dataViewBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer')!.get!;
 const dataViewByteOffset = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset')!.get!;
 const dataViewByteLength = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength')!.get!;
+const arrayBufferIsView = ArrayBuffer.isView;
 const emptyBytes = new Uint8Array(0);
 
 function brandedByteLength(getter: (() => number) | undefined, value: object): number | undefined {
@@ -122,7 +123,7 @@ export class ArrayBufferSink {
             // every other Bun string input uses.
             source = engine.encodeString(sanitizeSurrogates(chunk));
         } else if (typeof chunk === 'object' && chunk !== null) {
-            if (ArrayBuffer.isView(chunk)) {
+            if (arrayBufferIsView(chunk)) {
                 source = viewBytes(chunk);
             } else {
                 const byteLength = brandedByteLength(arrayBufferByteLength, chunk)
