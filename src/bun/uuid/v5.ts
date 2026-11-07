@@ -16,6 +16,11 @@ const typedArrayByteLength = Object.getOwnPropertyDescriptor(typedArrayPrototype
 const dataViewBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer')!.get! as BrandGetter<ArrayBufferLike>;
 const dataViewByteOffset = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset')!.get! as BrandGetter<number>;
 const dataViewByteLength = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength')!.get! as BrandGetter<number>;
+const stringFrom = String;
+const stringFromCharCode = String.fromCharCode;
+const stringValueOf = String.prototype.valueOf;
+const stringToLowerCase = String.prototype.toLowerCase;
+const stringReplace = String.prototype.replace;
 const emptyBytes = new Uint8Array();
 const namespaces: Record<string, string> = {
     dns: '6ba7b810-9dad-11d1-80b4-00c04fd430c8',
@@ -78,7 +83,7 @@ function bytes(value: Binary): Uint8Array {
 function isString(value: unknown): value is string {
     if (typeof value === 'string') return true;
     if (typeof value !== 'object' || value === null) return false;
-    try { String.prototype.valueOf.call(value); return true; } catch { return false; }
+    try { Reflect.apply(stringValueOf, value, []); return true; } catch { return false; }
 }
 
 function error(message: string, code: string): TypeError {
@@ -93,20 +98,21 @@ interface RandomUUIDv5 {
 export const randomUUIDv5 = {
   randomUUIDv5(name: string | Binary, namespace: string | Binary, encoding?: Encoding): string | Buffer {
     if (!isString(name) && !isBinary(name)) throw error('name must be a string, ArrayBuffer or ArrayBufferView', 'ERR_INVALID_ARG_TYPE');
-    const nameBytes = isString(name) ? Buffer.from(String(name), 'utf8') : bytes(name);
+    const nameBytes = isString(name) ? Buffer.from(stringFrom(name), 'utf8') : bytes(name);
     if (!isString(namespace) && !isBinary(namespace)) throw error('namespace must be a string, ArrayBuffer or ArrayBufferView', 'ERR_INVALID_ARG_TYPE');
-    const namespaceString = isString(namespace) ? String(namespace) : undefined;
-    const format = isString(encoding) ? String(encoding).toLowerCase() : 'hex';
+    const namespaceString = isString(namespace) ? stringFrom(namespace) : undefined;
+    const format = isString(encoding) ? Reflect.apply(stringToLowerCase, stringFrom(encoding), []) : 'hex';
     if (!['hex', 'base64', 'base64url', 'buffer', 'utf8', 'utf-8', 'ascii', 'latin1', 'binary', 'ucs2', 'ucs-2', 'utf16le'].includes(format)) {
         throw error('Encoding must be one of base64, base64url, hex, or buffer', 'ERR_UNKNOWN_ENCODING');
     }
     let namespaceBytes: Uint8Array;
     if (namespaceString !== undefined) {
-        const value = Object.hasOwn(namespaces, namespaceString.toLowerCase())
-            ? namespaces[namespaceString.toLowerCase()]
+        const lowerNamespace = Reflect.apply(stringToLowerCase, namespaceString, []);
+        const value = Object.hasOwn(namespaces, lowerNamespace)
+            ? namespaces[lowerNamespace]
             : namespaceString;
         if (value.length !== 36 || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)) throw error('Invalid UUID format for namespace', 'ERR_INVALID_ARG_VALUE');
-        namespaceBytes = Buffer.from(value.replace(/-/g, ''), 'hex');
+        namespaceBytes = Buffer.from(Reflect.apply(stringReplace, value, [/-/g, '']), 'hex');
     } else {
         namespaceBytes = bytes(namespace as Binary);
         if (namespaceBytes.byteLength !== 16) throw error('Namespace must be exactly 16 bytes', 'ERR_INVALID_ARG_VALUE');
@@ -122,7 +128,7 @@ export const randomUUIDv5 = {
     if (format === 'buffer') return result;
     if (format === 'ucs2' || format === 'ucs-2' || format === 'utf16le') {
         let value = '';
-        for (let i = 0; i < result.length; i += 2) value += String.fromCharCode(result[i] | (result[i + 1] << 8));
+        for (let i = 0; i < result.length; i += 2) value += stringFromCharCode(result[i] | (result[i + 1] << 8));
         return value;
     }
     if (format !== 'hex') return result.toString(format as BufferEncoding);
