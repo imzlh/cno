@@ -52,6 +52,7 @@ export interface BunFileLike extends Blob {
     readonly name?: string;
     readonly lastModified: number;
     bytes(): Promise<Uint8Array<ArrayBuffer>>;
+    formData(): Promise<FormData>;
     json<T = unknown>(): Promise<T>;
     slice(begin?: number, end?: number, contentType?: string): BunFileLike;
     slice(begin?: number, contentType?: string): BunFileLike;
@@ -471,6 +472,12 @@ export class BunFile extends Blob implements BunFileLike {
         return new decoder().decode(bytes);
     }
 
+    formData(): Promise<FormData> {
+        // Response owns the runtime's MIME dispatch and multipart parser. A new
+        // wrapper per call keeps path-backed files repeatable, unlike Body mixins.
+        return new Response(this).formData();
+    }
+
     async json<T = unknown>(): Promise<T> {
         return JSON.parse(await this.text()) as T;
     }
@@ -610,7 +617,7 @@ export class BunFile extends Blob implements BunFileLike {
 
 for (const property of [
     'name', 'type', 'size', 'lastModified',
-    'slice', 'stream', 'bytes', 'arrayBuffer', 'text', 'json',
+    'slice', 'stream', 'bytes', 'arrayBuffer', 'text', 'formData', 'json',
     'exists', 'stat', 'unlink', 'delete', 'write', 'writer',
 ] as const) {
     const descriptor = Object.getOwnPropertyDescriptor(BunFile.prototype, property)!;
