@@ -99,6 +99,7 @@ const reflectGet = Reflect.get;
 const NativePromise = Promise;
 const dateGetTime = Date.prototype.getTime;
 const dateNow = Date.now;
+const mathMin = Math.min;
 // The native timer converts through signed int64; stay within exact JS integers.
 const MAX_TIMER_DELAY = 9_007_199_254_740_991;
 const UNSUPPORTED_FETCH_OPTIONS = [
@@ -354,7 +355,7 @@ export const sleep = (milliseconds: number | Date): Promise<void> => {
     if (delay === Infinity) return new NativePromise(() => {});
     const timerDelay = delay !== delay || delay <= 0
         ? 0
-        : Math.min(delay, MAX_TIMER_DELAY);
+        : mathMin(delay, MAX_TIMER_DELAY);
     // The runtime injects a global setTimeout; the timers module is its typed face.
     const timers = import.meta.use('timers');
     return new NativePromise((resolve) => timers.setTimeout(resolve, timerDelay));
