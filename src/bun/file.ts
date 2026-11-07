@@ -2,11 +2,12 @@ import { arrayBufferBackedBytes, sanitizeSurrogates } from '../utils/bytes';
 import { basename, dirname, join, toFsPath } from '../utils/path';
 import { ensureDirectory } from '../utils/fs-path';
 import { isBunBytePath } from './file-path';
-import { filePathSink, type FileSink as BunFileSink } from './file-sink';
+import { fileDescriptorSink, filePathSink, type FileSink as BunFileSink } from './file-sink';
 import { openReadableFile } from './opened-file';
 import { stdioDestination, type StdioFile } from './stdio';
 import { stat as nodeStat, unlink as nodeUnlink } from '../node/fs/_promises';
-import type { Stats } from '../node/fs/utils';
+import { toNodeStat, validateFd, type Stats } from '../node/fs/utils';
+import { wrapSync as wrapSyncFs } from '../node/fs/errno-fix';
 
 const fs = import.meta.use('fs');
 const asyncfs = import.meta.use('asyncfs');
@@ -16,7 +17,10 @@ const algorithm = import.meta.use('algorithm');
 
 const BUN_FILE_CHUNK_SIZE = 64 * 1024;
 const MISSING_LAST_MODIFIED = 2 ** 52 - 1;
-const filePaths = new WeakMap<BunFile, string>();
+type FileBacking =
+    | { readonly kind: 'path'; readonly path: string }
+    | { readonly kind: 'fd'; readonly fd: number };
+const fileBackings = new WeakMap<BunFile, FileBacking>();
 const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
 const typedArrayBuffer = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')!.get!;
 const typedArrayByteOffset = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteOffset')!.get!;
@@ -38,6 +42,7 @@ const blobStream = Blob.prototype.stream;
 // webapi/formdata would bundle a second Blob into the payload, and that module
 // overwrites globalThis.Blob/File/FormData when evaluated.
 const blobBytesSymbol = Symbol.for('cno.blob.bytes');
+const bunFileBodyStreamSymbol = Symbol('cno.bun-file.body-stream');
 // Serve-route recognition protocol (serve-routes.ts): lets Bun.serve treat a
 // BunFile as a static file target without importing this module there.
 const bunFileServeSymbol = Symbol.for('cno.bun-file.serve-target');
@@ -95,7 +100,7 @@ interface FileOptions {
 
 /** Internal, realm-stable BunFile brand check for other Bun polyfills. */
 export function isBunFile(value: unknown): value is BunFile {
-    return isObject(value) && filePaths.has(value as BunFile);
+    return isObject(value) && fileBackings.has(value as BunFile);
 }
 
 function isObject(value: unknown): value is Record<PropertyKey, unknown> {
@@ -133,9 +138,29 @@ function isBlob(value: unknown): value is Blob {
 
 function blobInputStream(value: Blob): ReadableStream<Uint8Array<ArrayBuffer>> {
     if (isBunFile(value)) {
-        return Reflect.apply(BunFile.prototype.stream, value, []);
+        return Reflect.apply(BunFile.prototype[bunFileBodyStreamSymbol], value, []);
     }
     return Reflect.apply(blobStream, value, []);
+}
+
+function borrowedBodyStream(fd: number): ReadableStream<Uint8Array<ArrayBuffer>> {
+    let cancelled = false;
+    return new ReadableStream<Uint8Array<ArrayBuffer>>({
+        pull(controller) {
+            if (cancelled) return;
+            try {
+                const buffer = new Uint8Array(BUN_FILE_CHUNK_SIZE);
+                const count = wrapSyncFs(() => fs.read(fd, buffer), 'read', `fd:${fd}`);
+                if (count <= 0) controller.close();
+                else controller.enqueue(buffer.slice(0, count));
+            } catch (error) {
+                controller.error(error);
+            }
+        },
+        cancel() {
+            cancelled = true;
+        },
+    });
 }
 
 function stringifyWriteInput(value: unknown): string {
@@ -186,7 +211,7 @@ function parseFileOptions(value: unknown): FileOptions {
 
 function normalizeContentType(value: string | undefined, path: string, inferType = true): string {
     const type = value === undefined || value === ''
-        ? (inferType ? guessedContentType(path) : '')
+        ? (inferType ? guessedContentType(path) : (path === '' ? 'application/octet-stream' : ''))
         : value.toLowerCase();
     if (!/^[\x20-\x7e]*$/.test(type)) return '';
     if (!type.includes(';') && BUN_UTF8_TYPES.has(type)) {
@@ -334,24 +359,29 @@ function validateWriteOptions(value: unknown): BunFileWriteOptions {
     };
 }
 
-/** A lazy, path-backed Blob. Reads own and close their descriptor. */
+/** A lazy filesystem Blob. Path descriptors are owned; fd backings are borrowed. */
 export class BunFile extends Blob implements BunFileLike {
-    #path: string;
+    #backing: FileBacking;
     #contentType: string;
     #slices: readonly FileSlice[];
 
-    constructor(path: string, options: FileOptions = {}, slices: readonly FileSlice[] = []) {
+    constructor(backing: FileBacking, options: FileOptions = {}, slices: readonly FileSlice[] = []) {
         super([]);
-        this.#path = path;
-        this.#contentType = normalizeContentType(options.type, path, options.inferType ?? true);
+        this.#backing = backing;
+        this.#contentType = normalizeContentType(
+            options.type,
+            backing.kind === 'path' ? backing.path : '',
+            backing.kind === 'path' && (options.inferType ?? true),
+        );
         this.#slices = slices;
-        filePaths.set(this, path);
+        fileBackings.set(this, backing);
     }
 
     get name(): string | undefined {
         if (blobNames.has(this)) return blobNames.get(this)!;
-        const path = filePaths.get(this);
-        if (path !== undefined) return path;
+        const backing = fileBackings.get(this);
+        if (backing?.kind === 'path') return backing.path;
+        if (backing?.kind === 'fd') return undefined;
         assertBlobReceiver(this);
         return fileName && this instanceof File
             ? Reflect.apply(fileName, this, []) as string
@@ -369,7 +399,9 @@ export class BunFile extends Blob implements BunFileLike {
 
     get size(): number {
         try {
-            const range = this.#resolveRange(fs.stat(this.#path).size);
+            const stat = this.#statSync();
+            if (this.#backing.kind === 'fd' && !stat.isFile && !this.#hasSlices()) return Infinity;
+            const range = this.#resolveRange(stat.size);
             return range.end - range.start;
         } catch {
             return 0;
@@ -377,15 +409,15 @@ export class BunFile extends Blob implements BunFileLike {
     }
 
     get lastModified(): number {
-        const path = filePaths.get(this);
-        if (path === undefined) {
+        const backing = fileBackings.get(this);
+        if (backing === undefined) {
             assertBlobReceiver(this);
             return fileLastModified && this instanceof File
                 ? Reflect.apply(fileLastModified, this, []) as number
                 : MISSING_LAST_MODIFIED;
         }
         try {
-            return fs.stat(path).mtim?.getTime() ?? MISSING_LAST_MODIFIED;
+            return this.#statSync().mtim?.getTime() ?? MISSING_LAST_MODIFIED;
         } catch {
             return MISSING_LAST_MODIFIED;
         }
@@ -399,9 +431,21 @@ export class BunFile extends Blob implements BunFileLike {
         if (options !== undefined && options !== null && !isObject(options)) {
             throw new TypeError('options must be an object or undefined');
         }
-        const sink = filePathSink(this.#path);
+        const sink = this.#backing.kind === 'path'
+            ? filePathSink(this.#backing.path)
+            : fileDescriptorSink(this.#backing.fd);
         sink.start(options);
         return sink;
+    }
+
+    #statSync(): CModuleFS.Stats {
+        return this.#backing.kind === 'path'
+            ? fs.stat(this.#backing.path)
+            : fs.fstat(this.#backing.fd);
+    }
+
+    #hasSlices(): boolean {
+        return this.#slices.length > 0;
     }
 
     #resolveRange(size: number): FileRange {
@@ -420,7 +464,10 @@ export class BunFile extends Blob implements BunFileLike {
     // Cloning and object URLs need a synchronous snapshot, not an empty base Blob.
     // Construction stays lazy; only this explicit protocol hook performs sync I/O.
     [blobBytesSymbol](): Uint8Array<ArrayBuffer> {
-        const fd = fs.open(this.#path, 'r');
+        if (this.#backing.kind === 'fd') {
+            return this.#readBorrowedSync();
+        }
+        const fd = fs.open(this.#backing.path, 'r');
         try {
             const stat = fs.fstat(fd);
             let positional = stat.isFile && Number.isSafeInteger(stat.size) && stat.size >= 0;
@@ -474,7 +521,41 @@ export class BunFile extends Blob implements BunFileLike {
         }
     }
 
+    [bunFileBodyStreamSymbol](): ReadableStream<Uint8Array<ArrayBuffer>> {
+        if (this.#backing.kind === 'path') return this.stream();
+        if (this.#hasSlices()) {
+            throw new TypeError(
+                'Reading a sliced Bun.file(fd) as a body is unsupported because this runtime cannot seek a borrowed descriptor',
+            );
+        }
+        return borrowedBodyStream(this.#backing.fd);
+    }
+
+    #readBorrowedSync(): Uint8Array<ArrayBuffer> {
+        if (this.#hasSlices()) {
+            throw new TypeError(
+                'Reading a sliced Bun.file(fd) as a body is unsupported because this runtime cannot seek a borrowed descriptor',
+            );
+        }
+        const chunks: Uint8Array<ArrayBuffer>[] = [];
+        let length = 0;
+        while (true) {
+            const buffer = new Uint8Array(BUN_FILE_CHUNK_SIZE);
+            const count = wrapSyncFs(
+                () => fs.read(this.#backing.fd, buffer),
+                'read',
+                `fd:${this.#backing.fd}`,
+            );
+            if (count <= 0) break;
+            const chunk = buffer.slice(0, count);
+            chunks.push(chunk);
+            length += count;
+        }
+        return concatenate(chunks, length);
+    }
+
     async bytes(): Promise<Uint8Array<ArrayBuffer>> {
+        if (this.#backing.kind === 'fd') return this.#readBorrowedSync();
         const reader = this.stream().getReader();
         const chunks: Uint8Array<ArrayBuffer>[] = [];
         let length = 0;
@@ -515,9 +596,11 @@ export class BunFile extends Blob implements BunFileLike {
     }
 
     stream(_chunkSize?: number): ReadableStream<Uint8Array<ArrayBuffer>> {
-        if (!filePaths.has(this)) {
+        const backing = fileBackings.get(this);
+        if (!backing) {
             return Reflect.apply(blobStream, this, arguments) as ReadableStream<Uint8Array<ArrayBuffer>>;
         }
+        if (backing.kind === 'fd') return this.#borrowedStream();
         const source = this;
         let opened: Awaited<ReturnType<typeof openReadableFile>> | undefined;
         let active: Promise<void> | undefined;
@@ -533,7 +616,7 @@ export class BunFile extends Blob implements BunFileLike {
                 active = (async () => {
                     try {
                         if (!reader) {
-                            opened = await openReadableFile(source.#path);
+                            opened = await openReadableFile(backing.path);
                             const size = opened.sizeKnown
                                 ? opened.stat.size
                                 : source.#needsSize() ? await opened.measure(() => cancelled) : Infinity;
@@ -560,24 +643,80 @@ export class BunFile extends Blob implements BunFileLike {
         });
     }
 
+    #borrowedStream(): ReadableStream<Uint8Array<ArrayBuffer>> {
+        const fd = this.#backing.kind === 'fd' ? this.#backing.fd : -1;
+        let range: FileRange | undefined;
+        let position = 0;
+        let cancelled = false;
+        return new ReadableStream<Uint8Array<ArrayBuffer>>({
+            pull: controller => {
+                if (cancelled) return;
+                try {
+                    if (!range) {
+                        const stat = wrapSyncFs(() => fs.fstat(fd), 'fstat', `fd:${fd}`);
+                        range = this.#resolveRange(stat.size);
+                        position = range.start;
+                    }
+                    if (position >= range.end) {
+                        controller.close();
+                        return;
+                    }
+                    const buffer = new Uint8Array(Math.min(BUN_FILE_CHUNK_SIZE, range.end - position));
+                    const count = wrapSyncFs(() => fs.pread(fd, buffer, position), 'read', `fd:${fd}`);
+                    if (count <= 0) {
+                        controller.close();
+                        return;
+                    }
+                    position += count;
+                    controller.enqueue(buffer.slice(0, count));
+                } catch (error) {
+                    controller.error(error);
+                }
+            },
+            cancel() {
+                cancelled = true;
+            },
+        });
+    }
+
     exists(): Promise<boolean> {
-        const path = filePaths.get(this);
-        if (path === undefined) {
+        const backing = fileBackings.get(this);
+        if (backing === undefined) {
             assertBlobReceiver(this);
             return Promise.resolve(true);
         }
-        return asyncfs.stat(path).then(
+        if (backing.kind === 'fd') {
+            try {
+                const stat = fs.fstat(backing.fd);
+                return Promise.resolve(stat.isFile || stat.isFIFO);
+            } catch {
+                return Promise.resolve(false);
+            }
+        }
+        return asyncfs.stat(backing.path).then(
             stat => stat.isFile || stat.isFIFO,
             () => false,
         );
     }
 
     stat(): Promise<BunFileStats> {
-        return nodeStat(this.#path) as Promise<BunFileStats>;
+        if (this.#backing.kind === 'path') return nodeStat(this.#backing.path) as Promise<BunFileStats>;
+        try {
+            const fd = this.#backing.fd;
+            return Promise.resolve(toNodeStat(wrapSyncFs(() => fs.fstat(fd), 'fstat', `fd:${fd}`)) as BunFileStats);
+        } catch (error) {
+            return Promise.reject(error);
+        }
     }
 
     unlink(): Promise<void> {
-        return nodeUnlink(this.#path);
+        if (this.#backing.kind === 'path') return nodeUnlink(this.#backing.path);
+        const error = Object.assign(
+            new TypeError('Is not possible to unlink a file descriptor'),
+            { code: 'ERR_INVALID_ARG_TYPE' },
+        );
+        // Bun 1.4.4 resolves this Error value instead of rejecting it.
+        return Promise.resolve(error as unknown as void);
     }
 
     delete(): Promise<void> {
@@ -588,7 +727,7 @@ export class BunFile extends Blob implements BunFileLike {
     slice(begin?: number, contentType?: string): BunFile;
     slice(contentType?: string): BunFile;
     slice(beginOrType?: number | string, endOrType?: number | string, type: string | undefined = undefined): BunFile {
-        if (!filePaths.has(this)) {
+        if (!fileBackings.has(this)) {
             return Reflect.apply(blobSlice, this, arguments) as BunFile;
         }
         let begin: number | undefined;
@@ -605,8 +744,14 @@ export class BunFile extends Blob implements BunFileLike {
         if (contentType !== undefined && typeof contentType !== 'string') {
             throw new TypeError('Bun.file slice content type must be a string');
         }
+        if (this.#backing.kind === 'fd' && (
+            (begin !== undefined && Number.isFinite(begin) && begin < 0) ||
+            (end !== undefined && Number.isFinite(end) && end < 0)
+        )) {
+            throw new TypeError('Negative slices of Bun.file(fd) are unsupported by this runtime');
+        }
         return new BunFile(
-            this.#path,
+            this.#backing,
             { type: contentType === undefined ? this.type : contentType, inferType: false },
             [...this.#slices, { begin: toInteger(begin ?? 0), end: end === undefined ? undefined : toInteger(end) }],
         );
@@ -618,14 +763,17 @@ export class BunFile extends Blob implements BunFileLike {
      * route table can decide 404 behavior at registration time.
      */
     [bunFileServeSymbol](): { path: string; exists: boolean; contentType: string; stream(): ReadableStream<Uint8Array<ArrayBuffer>> } {
+        if (this.#backing.kind === 'fd') {
+            throw new TypeError('Bun.file(fd) cannot be used as a static path route');
+        }
         let exists = false;
         try {
-            const stat = fs.stat(this.#path);
+            const stat = fs.stat(this.#backing.path);
             exists = stat.isFile === true || stat.isFIFO === true;
         } catch {
             exists = false;
         }
-        return { path: this.#path, exists, contentType: this.#contentType, stream: () => this.stream() };
+        return { path: this.#backing.path, exists, contentType: this.#contentType, stream: () => this.stream() };
     }
 
     async write(data: BunFileWriteInput, options?: { highWaterMark?: number }): Promise<number> {
@@ -635,9 +783,18 @@ export class BunFile extends Blob implements BunFileLike {
         // Bun accepts but ignores unrecognized options on this method.
         if (typeof Request !== 'undefined' && data instanceof Request) {
             if (data.bodyUsed || data.body?.locked) throw new TypeError('Bun.file.write: Request body is already used or locked');
-            return data.body ? writeStream(this.#path, data.body, {}) : write(this, '');
+            if (data.body) {
+                return this.#backing.kind === 'path'
+                    ? writeStream(this.#backing.path, data.body, {})
+                    : writeBorrowedStream(this.#backing.fd, data.body);
+            }
+            return write(this, '');
         }
-        if (isReadableStream(data)) return writeStream(this.#path, data, {});
+        if (isReadableStream(data)) {
+            return this.#backing.kind === 'path'
+                ? writeStream(this.#backing.path, data, {})
+                : writeBorrowedStream(this.#backing.fd, data);
+        }
         if (data == null) throw new TypeError('Bun.file.write: missing input');
         if (typeof data !== 'string' && !arrayBufferIsView(data) && !isArrayBufferLike(data)
             && !isBlob(data) && !isResponse(data)) {
@@ -661,7 +818,13 @@ for (const property of [
 }
 
 function destinationPath(value: unknown): string {
-    if (isBunFile(value)) return filePaths.get(value)!;
+    if (isBunFile(value)) {
+        const backing = fileBackings.get(value)!;
+        if (backing.kind === 'fd') {
+            throw new TypeError('Bun.file(fd) is not a path destination');
+        }
+        return backing.path;
+    }
     return pathFromValue(value);
 }
 
@@ -686,6 +849,73 @@ async function writeBytes(handle: CModuleAsyncFS.FileHandle, bytes: Uint8Array<A
         written += count;
     }
     return written;
+}
+
+function writeBorrowedBytes(fd: number, bytes: Uint8Array<ArrayBuffer>): number {
+    let written = 0;
+    while (written < bytes.byteLength) {
+        const count = wrapSyncFs(
+            () => fs.write(fd, bytes.subarray(written, written + BUN_FILE_CHUNK_SIZE)),
+            'write',
+            `fd:${fd}`,
+        );
+        if (count <= 0) throw new Error('Bun.write: filesystem write made no progress');
+        written += count;
+    }
+    return written;
+}
+
+async function writeBorrowedStream(fd: number, stream: ReadableStream): Promise<number> {
+    const reader = stream.getReader();
+    let written = 0;
+    try {
+        while (true) {
+            const next = await reader.read();
+            if (next.done) break;
+            written += writeBorrowedBytes(fd, await inputBytes(next.value));
+        }
+        return written;
+    } catch (error) {
+        await reader.cancel(error).catch(() => {});
+        throw error;
+    } finally {
+        reader.releaseLock();
+    }
+}
+
+async function writeAliasedBorrowedStream(fd: number, stream: ReadableStream): Promise<number> {
+    const reader = stream.getReader();
+    let stage: CModuleAsyncFS.FileHandle | undefined;
+    try {
+        // Reading and writing the same open description interleaves its shared
+        // offset. Stage first so inputs larger than one chunk are not skipped.
+        stage = await asyncfs.mkstemp(join(os.tmpDir, `cno-bun-write-${os.pid}-XXXXXX`));
+        let written = 0;
+        while (true) {
+            const next = await reader.read();
+            if (next.done) break;
+            written += await writeBytes(stage, await inputBytes(next.value));
+        }
+        let position = 0;
+        while (position < written) {
+            const buffer = new Uint8Array(Math.min(BUN_FILE_CHUNK_SIZE, written - position));
+            const count = await stage.read(buffer, position);
+            if (count <= 0) throw new Error('Bun.write: staged input ended unexpectedly');
+            writeBorrowedBytes(fd, buffer.subarray(0, count));
+            position += count;
+        }
+        return written;
+    } catch (error) {
+        await reader.cancel(error).catch(() => {});
+        throw error;
+    } finally {
+        reader.releaseLock();
+        if (stage) {
+            const stagePath = stage.path;
+            await closeQuietly(stage);
+            await asyncfs.unlink(stagePath).catch(() => {});
+        }
+    }
 }
 
 async function writeStream(
@@ -779,6 +1009,31 @@ export async function write(
         }
         return stdio.write(input as string | ArrayBufferView | ArrayBufferLike | Blob);
     }
+    const backing = isBunFile(destination) ? fileBackings.get(destination)! : undefined;
+    if (backing?.kind === 'fd') {
+        // mode/createPath are path concepts; Bun ignores them for a borrowed fd.
+        if (isResponse(input) || isRequest(input)) {
+            const name = isRequest(input) ? 'Request' : 'Response';
+            if (input.bodyUsed || input.body?.locked) {
+                throw new TypeError(`Bun.write: ${name} body is already used or locked`);
+            }
+            return input.body ? writeBorrowedStream(backing.fd, input.body) : 0;
+        }
+        if (isBlob(input)) {
+            const source = isBunFile(input) ? fileBackings.get(input) : undefined;
+            if (source?.kind === 'fd' && source.fd === backing.fd) {
+                return writeAliasedBorrowedStream(backing.fd, blobInputStream(input));
+            }
+            return writeBorrowedStream(backing.fd, blobInputStream(input));
+        }
+        if (isReadableStream(input)) return writeBorrowedStream(backing.fd, input);
+        const bytes = await inputBytes(
+            typeof input === 'object' && input !== null && !arrayBufferIsView(input) && !isArrayBufferLike(input)
+                ? stringifyWriteInput(input)
+                : input,
+        );
+        return writeBorrowedBytes(backing.fd, bytes);
+    }
     const path = destinationPath(destination);
     const parsed = validateWriteOptions(options);
     if (isResponse(input) || isRequest(input)) {
@@ -810,10 +1065,14 @@ export async function write(
 }
 
 export function file(
-    path: string | URL | ArrayBufferLike | Uint8Array<ArrayBufferLike> | DataView<ArrayBufferLike>,
+    path: string | URL | number | ArrayBufferLike | Uint8Array<ArrayBufferLike> | DataView<ArrayBufferLike>,
     options?: BlobPropertyBag,
 ): BunFile {
     const parsed = parseFileOptions(options);
+    if (typeof path === 'number') {
+        validateFd(path);
+        return new BunFile({ kind: 'fd', fd: path }, parsed);
+    }
     if (isBunBytePath(path)) {
         const bytes = toArrayBufferBytes(path);
         if (bytes.byteLength === 0) {
@@ -833,7 +1092,7 @@ export function file(
                 'ERR_INVALID_ARG_VALUE',
             );
         }
-        return new BunFile(engine.decodeString(bytes), parsed);
+        return new BunFile({ kind: 'path', path: engine.decodeString(bytes) }, parsed);
     }
-    return new BunFile(pathFromValue(path), parsed);
+    return new BunFile({ kind: 'path', path: pathFromValue(path) }, parsed);
 }
