@@ -228,37 +228,62 @@ const BUN_UTF8_TYPES = new Set([
     'text/plain',
 ]);
 
+// Bun 1.4.4's inferred MIME values for the common extensions this adapter
+// supports. Keep the exact charset choices here instead of deriving them from
+// the broader explicit-type normalization above.
+const BUN_INFERRED_CONTENT_TYPES: Readonly<Record<string, string>> = Object.freeze(Object.assign(
+    Object.create(null) as Record<string, string>,
+    {
+        avif: 'image/avif',
+        bmp: 'image/x-ms-bmp',
+        cjs: 'text/javascript;charset=utf-8',
+        css: 'text/css;charset=utf-8',
+        csv: 'text/csv',
+        cts: 'text/javascript;charset=utf-8',
+        eot: 'application/vnd.ms-fontobject',
+        gif: 'image/gif',
+        gz: 'application/gzip',
+        htm: 'text/html;charset=utf-8',
+        html: 'text/html;charset=utf-8',
+        ico: 'image/x-icon',
+        jpeg: 'image/jpeg',
+        jpg: 'image/jpeg',
+        js: 'text/javascript;charset=utf-8',
+        json: 'application/json;charset=utf-8',
+        jsx: 'text/javascript;charset=utf-8',
+        map: 'application/json;charset=utf-8',
+        md: 'text/markdown',
+        mjs: 'text/javascript;charset=utf-8',
+        mp3: 'audio/mpeg',
+        mp4: 'video/mp4',
+        mts: 'text/javascript;charset=utf-8',
+        otf: 'font/otf',
+        pdf: 'application/pdf',
+        png: 'image/png',
+        svg: 'image/svg+xml',
+        tar: 'application/x-tar',
+        ts: 'text/javascript;charset=utf-8',
+        tsx: 'text/javascript;charset=utf-8',
+        ttf: 'font/ttf',
+        txt: 'text/plain;charset=utf-8',
+        wasm: 'application/wasm',
+        wav: 'audio/x-wav',
+        webm: 'video/webm',
+        webmanifest: 'application/manifest+json',
+        webp: 'image/webp',
+        woff: 'font/woff',
+        woff2: 'font/woff2',
+        xml: 'application/xml',
+        yaml: 'text/yaml',
+        yml: 'text/yaml',
+        zip: 'application/zip',
+    },
+));
+
 function guessedContentType(path: string): string {
     const name = basename(path).toLowerCase();
     const ext = name.lastIndexOf('.') >= 0 ? name.slice(name.lastIndexOf('.') + 1) : '';
-    const types: Record<string, string> = {
-        css: 'text/css;charset=utf-8',
-        csv: 'text/csv;charset=utf-8',
-        htm: 'text/html;charset=utf-8',
-        html: 'text/html;charset=utf-8',
-        js: 'text/javascript;charset=utf-8',
-        json: 'application/json;charset=utf-8',
-        mjs: 'text/javascript;charset=utf-8',
-        svg: 'image/svg+xml',
-        txt: 'text/plain;charset=utf-8',
-        ts: 'text/typescript;charset=utf-8',
-        xml: 'application/xml;charset=utf-8',
-        wasm: 'application/wasm',
-        webmanifest: 'application/manifest+json;charset=utf-8',
-        zip: 'application/zip',
-        gz: 'application/gzip',
-        png: 'image/png',
-        jpg: 'image/jpeg',
-        jpeg: 'image/jpeg',
-        gif: 'image/gif',
-        webp: 'image/webp',
-        avif: 'image/avif',
-        pdf: 'application/pdf',
-        mp3: 'audio/mpeg',
-        mp4: 'video/mp4',
-        webm: 'video/webm',
-    };
-    return types[ext] ?? 'application/octet-stream';
+    return BUN_INFERRED_CONTENT_TYPES[ext] ?? 'application/octet-stream';
 }
 
 function toInteger(value: unknown): number {
