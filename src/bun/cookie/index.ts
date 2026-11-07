@@ -34,7 +34,16 @@ interface CookieIteratorState {
 // RFC 6265 cookie-name token: no controls, whitespace, or separators.
 const INVALID_NAME = /[\x00-\x20\x7f()<>@,;:\\"/[\]?={}]/;
 const INVALID_ATTRIBUTE = /[\x00-\x1f\x7f;]/;
-const EPOCH = new Date(0);
+const DateConstructor = Date;
+const dateGetTime = Date.prototype.getTime;
+const dateGetUTCDay = Date.prototype.getUTCDay;
+const dateGetUTCDate = Date.prototype.getUTCDate;
+const dateGetUTCMonth = Date.prototype.getUTCMonth;
+const dateGetUTCFullYear = Date.prototype.getUTCFullYear;
+const dateGetUTCHours = Date.prototype.getUTCHours;
+const dateGetUTCMinutes = Date.prototype.getUTCMinutes;
+const dateGetUTCSeconds = Date.prototype.getUTCSeconds;
+const EPOCH = new DateConstructor(0);
 const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 const cookieMapInstances = new WeakSet<object>();
@@ -175,20 +184,24 @@ function decodeValue(value: string): string {
 }
 
 function toDate(expires: number | Date | string): Date {
-    const date = expires instanceof Date
-        ? new Date(expires.getTime())
+    let time: number | undefined;
+    try {
+        time = Reflect.apply(dateGetTime, expires, []) as number;
+    } catch {}
+    const date = time !== undefined
+        ? new DateConstructor(time)
         : typeof expires === 'number'
-            ? new Date(expires * 1000)
-            : new Date(expires);
-    if (Number.isNaN(date.getTime())) throw new RangeError('Invalid cookie expires date');
+            ? new DateConstructor(expires * 1000)
+            : new DateConstructor(expires);
+    if (Number.isNaN(Reflect.apply(dateGetTime, date, []))) throw new RangeError('Invalid cookie expires date');
     return date;
 }
 
 function httpDate(date: Date): string {
     const pad = (n: number) => String(n).padStart(2, '0');
-    return `${DAYS[date.getUTCDay()]}, ${pad(date.getUTCDate())} ${MONTHS[date.getUTCMonth()]} `
-        + `${date.getUTCFullYear()} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:`
-        + `${pad(date.getUTCSeconds())} GMT`;
+    return `${DAYS[Reflect.apply(dateGetUTCDay, date, [])]}, ${pad(Reflect.apply(dateGetUTCDate, date, []))} ${MONTHS[Reflect.apply(dateGetUTCMonth, date, [])]} `
+        + `${Reflect.apply(dateGetUTCFullYear, date, [])} ${pad(Reflect.apply(dateGetUTCHours, date, []))}:${pad(Reflect.apply(dateGetUTCMinutes, date, []))}:`
+        + `${pad(Reflect.apply(dateGetUTCSeconds, date, []))} GMT`;
 }
 
 function record(name: string, value: string, options: CookieInit = {}): CookieRecord {
@@ -363,7 +376,7 @@ export class CookieMap implements Iterable<[string, string]> {
             value: '',
             domain: domain || undefined,
             path,
-            expires: new Date(EPOCH.getTime()),
+            expires: new DateConstructor(Reflect.apply(dateGetTime, EPOCH, [])),
             secure: false,
             sameSite: 'lax',
             httpOnly: false,

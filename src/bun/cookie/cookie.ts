@@ -7,6 +7,10 @@ const invalidName = /[^!#$%&'*+\-.^_`|~0-9A-Za-z]/;
 const invalidPath = /[^\x20-\x7e]|;/;
 const invalidDomain = /[^a-z0-9.\-]/;
 const sameSiteError = "Invalid sameSite value. Must be 'strict', 'lax', or 'none'";
+const DateConstructor = Date;
+const dateGetTime = Date.prototype.getTime;
+const dateToUTCString = Date.prototype.toUTCString;
+const dateNow = Date.now;
 const asString = (value: unknown): string => {
     if (typeof value === 'symbol') throw new TypeError('Cannot convert a Symbol value to a string');
     return `${value}`;
@@ -23,6 +27,14 @@ function assertInstance(value: unknown, property: string): void {
             new TypeError(`Can only call Cookie.${property} on instances of Cookie`),
             { code: 'ERR_INVALID_THIS' },
         );
+    }
+}
+
+function dateValue(value: unknown): number | undefined {
+    try {
+        return Reflect.apply(dateGetTime, value, []) as number;
+    } catch {
+        return undefined;
     }
 }
 
@@ -96,7 +108,7 @@ export class Cookie {
             switch (key) {
                 case 'domain': if (val) cookie.domain = val.toLowerCase(); break;
                 case 'path': if (val.startsWith('/')) cookie.path = val; break;
-                case 'expires': { const date = new Date(val); if (/[a-z]/i.test(val) && !Number.isNaN(date.getTime())) cookie.expires = date; break; }
+                case 'expires': { const date = new DateConstructor(val); if (/[a-z]/i.test(val) && !Number.isNaN(Reflect.apply(dateGetTime, date, []))) cookie.expires = date; break; }
                 case 'max-age': {
                     const digits = /^[+-]?\d+/.exec(val)?.[0];
                     if (digits) {
@@ -134,22 +146,23 @@ export class Cookie {
         if (invalidPath.test(string)) throw new TypeError('Invalid cookie path: contains invalid characters');
         this.#path = string;
     }
-    get expires(): Date | undefined { assertInstance(this, 'expires'); return this.#expires && new Date(this.#expires.getTime()); }
+    get expires(): Date | undefined { assertInstance(this, 'expires'); return this.#expires && new DateConstructor(Reflect.apply(dateGetTime, this.#expires, [])); }
     set expires(value: Date | number | string | undefined) {
         assertInstance(this, 'expires');
         if (value == null) { this.#expires = undefined; return; }
         let date: Date;
-        if (value instanceof Date) {
-            if (Number.isNaN(value.getTime())) throw new RangeError('expires must be a valid Date (or Number)');
-            date = new Date(value.getTime());
+        const time = dateValue(value);
+        if (time !== undefined) {
+            if (Number.isNaN(time)) throw new RangeError('expires must be a valid Date (or Number)');
+            date = new DateConstructor(time);
         } else if (typeof value === 'number') {
             if (!Number.isFinite(value)) throw new RangeError('expires must be a valid Number (or Date)');
-            date = new Date(value * 1000);
+            date = new DateConstructor(value * 1000);
         } else if (typeof value === 'string') {
-            date = new Date(value);
-            if (Number.isNaN(date.getTime())) throw new TypeError('Invalid cookie expiration date');
+            date = new DateConstructor(value);
+            if (Number.isNaN(Reflect.apply(dateGetTime, date, []))) throw new TypeError('Invalid cookie expiration date');
         } else throw new TypeError(`The argument 'expires' Invalid expires value. Must be a Date or a number. Received ${typeof value === 'symbol' ? String(value) : JSON.stringify(value)}`);
-        this.#expires = Number.isNaN(date.getTime()) ? undefined : date;
+        this.#expires = Number.isNaN(Reflect.apply(dateGetTime, date, [])) ? undefined : date;
     }
     get maxAge(): number | undefined { assertInstance(this, 'maxAge'); return this.#maxAge; }
     set maxAge(value: number | undefined) {
@@ -172,14 +185,14 @@ export class Cookie {
     }
     get partitioned(): boolean { assertInstance(this, 'partitioned'); return this.#partitioned; }
     set partitioned(value: boolean) { assertInstance(this, 'partitioned'); this.#partitioned = Boolean(value); }
-    isExpired(): boolean { assertInstance(this, 'isExpired'); return this.#maxAge !== undefined && !Number.isNaN(this.#maxAge) ? this.#maxAge <= 0 : this.#expires !== undefined && this.#expires.getTime() <= Date.now(); }
+    isExpired(): boolean { assertInstance(this, 'isExpired'); return this.#maxAge !== undefined && !Number.isNaN(this.#maxAge) ? this.#maxAge <= 0 : this.#expires !== undefined && Reflect.apply(dateGetTime, this.#expires, []) <= Reflect.apply(dateNow, DateConstructor, []); }
     toString(): string { assertInstance(this, 'toString'); return this.#serialize(); }
     toJSON(): CookieOptions {
         assertInstance(this, 'toJSON');
         const result: CookieOptions = Object.assign(Object.create(null), { name: this.#name, value: this.#value });
         if (this.#domain !== undefined) result.domain = this.#domain;
         result.path = this.#path;
-        if (this.#expires !== undefined) result.expires = new Date(this.#expires.getTime());
+        if (this.#expires !== undefined) result.expires = new DateConstructor(Reflect.apply(dateGetTime, this.#expires, []));
         if (this.#maxAge !== undefined && !Number.isNaN(this.#maxAge)) result.maxAge = this.#maxAge;
         result.secure = this.#secure;
         result.sameSite = this.#sameSite;
@@ -192,7 +205,7 @@ export class Cookie {
         const parts = [`${this.#name}=${encodeURIComponent(this.#value)}`];
         if (this.#domain) parts.push(`Domain=${this.#domain}`);
         if (this.#path) parts.push(`Path=${this.#path}`);
-        if (this.#expires) parts.push(`Expires=${this.#expires.toUTCString()}`);
+        if (this.#expires) parts.push(`Expires=${Reflect.apply(dateToUTCString, this.#expires, [])}`);
         if (this.#maxAge !== undefined && !Number.isNaN(this.#maxAge)) parts.push(`Max-Age=${this.#maxAge}`);
         if (this.#secure) parts.push('Secure');
         if (this.#httpOnly) parts.push('HttpOnly');
