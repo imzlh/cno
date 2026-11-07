@@ -41,6 +41,7 @@ interface EntryInfo {
 
 interface PatternPlan {
     matcher: CompiledGlobPattern;
+    candidateMatcher?: CompiledGlobPattern;
     root: ScanRoot;
     maxDepth?: number;
 }
@@ -163,6 +164,15 @@ function patternPlan(pattern: string, options: ResolvedScanOptions): PatternPlan
     };
 }
 
+function negatedCandidatePattern(pattern: string): string {
+    const segments = normalizeGlobPattern(pattern).split('/');
+    let index = 0;
+    while (segments[index] === '' || segments[index] === '.') index++;
+    if (index === 0 && /^[A-Za-z]:$/.test(segments[index] ?? '')) index++;
+    if (index < segments.length) segments[index] = '*';
+    return segments.join('/');
+}
+
 function outputPath(entry: EntryInfo, options: ResolvedScanOptions, root: ScanRoot): string {
     if (root.absolutePattern || options.absolute) return normalizeGlobPath(resolve(entry.fullPath));
     return entry.relativePath;
@@ -216,9 +226,11 @@ async function entryFromAsync(
 function entryMatches(entry: EntryInfo, plan: PatternPlan, options: ResolvedScanOptions): boolean {
     if (entry.brokenLink && options.onlyFiles) return false;
     if (options.onlyFiles && entry.directory) return false;
+    const candidate = candidatePath(entry, plan.root);
+    if (plan.candidateMatcher && !plan.candidateMatcher.match(candidate, options.dot)) return false;
     if (plan.matcher.negated && !options.dot && !plan.matcher.requiresExplicitDot
         && entry.relativePath.split('/').some(segment => segment.startsWith('.') && segment !== '.' && segment !== '..')) return false;
-    return plan.matcher.match(candidatePath(entry, plan.root), options.dot);
+    return plan.matcher.match(candidate, options.dot);
 }
 
 function validateCwdSync(path: string): void {
@@ -382,6 +394,9 @@ function plansFor(compiled: CompiledGlobPattern, options: ResolvedScanOptions): 
             const rootPattern = isAbsoluteGlob(pattern) ? '/*' : pattern.startsWith('./') ? './*' : '*';
             return {
                 matcher: compiled,
+                // Bun keeps the suffix as the scan shape: !sub/*.ts visits
+                // sibling directories, but still only emits their *.ts files.
+                candidateMatcher: compileGlobPattern(negatedCandidatePattern(pattern)),
                 root: scanRoot(rootPattern, options),
                 maxDepth: segments.includes('**') ? undefined : Math.max(1, segments.length),
             };
