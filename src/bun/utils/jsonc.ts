@@ -22,6 +22,12 @@ const parse = (input: unknown): any => {
             inString = true;
             continue;
         }
+        // Bun treats ECMAScript whitespace as JSONC whitespace. Normalize the
+        // extra code points that JSON.parse itself does not accept.
+        if (isExtendedJSONCWhitespace(character)) {
+            characters[index] = ' ';
+            continue;
+        }
         if (character !== '/') continue;
         const next = source[index + 1];
         if (next === '/') {
@@ -80,6 +86,20 @@ export { parse as parseJSONC };
 
 function isJSONWhitespace(character: string): boolean {
     return character === ' ' || character === '\t' || character === '\r' || character === '\n';
+}
+
+function isExtendedJSONCWhitespace(character: string): boolean {
+    return character === '\v'
+        || character === '\f'
+        || character === '\u00a0'
+        || character === '\u1680'
+        || character >= '\u2000' && character <= '\u200a'
+        || character === '\u2028'
+        || character === '\u2029'
+        || character === '\u202f'
+        || character === '\u205f'
+        || character === '\u3000'
+        || character === '\ufeff';
 }
 
 function isLineTerminator(character: string): boolean {
