@@ -38,6 +38,9 @@ const dataViewBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, 'buff
 const dataViewByteOffset = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset')!.get!;
 const dataViewByteLength = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength')!.get!;
 const arrayBufferIsView = ArrayBuffer.isView;
+const numberIsFinite = Number.isFinite;
+const mathTrunc = Math.trunc;
+const mathMin = Math.min;
 const emptyBytes = new Uint8Array(0);
 
 function brandedByteLength(getter: (() => number) | undefined, value: object): number | undefined {
@@ -102,8 +105,8 @@ export class ArrayBufferSink {
                 asUint8Array = typeof asUint8ArrayOption === 'boolean' ? asUint8ArrayOption : false;
                 stream = typeof streamOption === 'boolean' ? streamOption : false;
             }
-            if (typeof highWaterMark === 'number' && Number.isFinite(highWaterMark) && highWaterMark > 0) {
-                capacity = Math.min(Math.trunc(highWaterMark), MAX_PREALLOCATION);
+            if (typeof highWaterMark === 'number' && numberIsFinite(highWaterMark) && highWaterMark > 0) {
+                capacity = mathMin(mathTrunc(highWaterMark), MAX_PREALLOCATION);
             }
         }
         this.#bytes = new Uint8Array(capacity);
