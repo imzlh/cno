@@ -37,6 +37,35 @@ function f32String(n: number): string {
     }
     return String(v);
 }
+function hslString(r: number, g: number, b: number): string {
+    const red = Math.fround(r / 255);
+    const green = Math.fround(g / 255);
+    const blue = Math.fround(b / 255);
+    const max = Math.max(red, green, blue);
+    const min = Math.min(red, green, blue);
+    const delta = Math.fround(max - min);
+    const sum = Math.fround(max + min);
+    const lightness = Math.fround(sum / 2);
+
+    let hue = 0;
+    let saturation = 0;
+    if (delta !== 0) {
+        saturation = Math.fround(
+            Math.fround(max - lightness) / Math.min(lightness, Math.fround(1 - lightness)),
+        );
+        if (max === red) {
+            hue = Math.fround(Math.fround(green - blue) / delta);
+            if (hue < 0) hue = Math.fround(hue + 6);
+        } else if (max === green) {
+            hue = Math.fround(Math.fround(Math.fround(blue - red) / delta) + 2);
+        } else {
+            hue = Math.fround(Math.fround(Math.fround(red - green) / delta) + 4);
+        }
+        hue = Math.fround(hue * 60);
+    }
+
+    return `hsl(${f32String(hue)}, ${f32String(Math.fround(saturation * 100))}%, ${f32String(Math.fround(lightness * 100))}%)`;
+}
 function hexParse(s: string): RGBA | null {
     if (!/^(?:[\da-f]{3}|[\da-f]{4}|[\da-f]{6}|[\da-f]{8})$/i.test(s)) return null;
     if (s.length <= 4) s = [...s].map(c => c + c).join('');
@@ -298,6 +327,7 @@ export const color = (input: unknown, format?: unknown): unknown => {
         case '{rgba}': return { r, g, b, a: Math.fround(a / 255) };
         case 'rgb': return `rgb(${r}, ${g}, ${b})`;
         case 'rgba': return `rgba(${r}, ${g}, ${b}, ${f32String(a / 255)})`;
+        case 'hsl': return hslString(r, g, b);
         case 'ansi_16m': case 'ansi-16m': case 'ansi-24bit': case 'ansi-truecolor': return `\x1b[38;2;${r};${g};${b}m`;
         case 'ansi_256': case 'ansi-256': case 'ansi256': return `\x1b[38;5;${ansi256Index(r, g, b)}m`;
         case 'ansi_16': case 'ansi-16': return `\x1b[${ansi16Code(r, g, b)}m`;
