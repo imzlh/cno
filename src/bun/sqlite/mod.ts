@@ -127,22 +127,61 @@ function unsupported(name: string): never {
     throw new Error(`bun:sqlite ${name} is not implemented by this runtime`);
 }
 
-function isArrayBufferView(value: unknown): value is ArrayBufferView {
-    return typeof ArrayBuffer !== 'undefined' && ArrayBuffer.isView(value);
+const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
+const typedArrayBuffer = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')!.get!;
+const typedArrayByteOffset = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteOffset')!.get!;
+const typedArrayByteLength = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteLength')!.get!;
+const dataViewBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer')!.get!;
+const dataViewByteOffset = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset')!.get!;
+const dataViewByteLength = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength')!.get!;
+const arrayBufferByteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength')!.get!;
+const sharedArrayBufferByteLength = typeof SharedArrayBuffer === 'undefined'
+    ? undefined
+    : Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength')!.get!;
+const emptyBlob = new Uint8Array(0);
+
+function bytesFromView(
+    value: unknown,
+    bufferGetter: (this: unknown) => ArrayBufferLike,
+    offsetGetter: (this: unknown) => number,
+    lengthGetter: (this: unknown) => number,
+): Uint8Array | undefined {
+    let buffer: ArrayBufferLike;
+    try {
+        buffer = Reflect.apply(bufferGetter, value, []);
+    } catch {
+        return undefined;
+    }
+
+    try {
+        const byteLength = Reflect.apply(lengthGetter, value, []);
+        if (byteLength === 0) return emptyBlob;
+        return new Uint8Array(buffer, Reflect.apply(offsetGetter, value, []), byteLength);
+    } catch {
+        // Detached and out-of-bounds views bind as an empty BLOB in Bun.
+        return emptyBlob;
+    }
 }
 
-function isArrayBufferLike(value: unknown): value is ArrayBufferLike {
-    if (typeof ArrayBuffer !== 'undefined' && value instanceof ArrayBuffer) return true;
-    return typeof SharedArrayBuffer !== 'undefined' && value instanceof SharedArrayBuffer;
+function bytesFromBuffer(
+    value: unknown,
+    lengthGetter: (this: unknown) => number,
+): Uint8Array | undefined {
+    let byteLength: number;
+    try {
+        byteLength = Reflect.apply(lengthGetter, value, []);
+    } catch {
+        return undefined;
+    }
+    if (byteLength === 0) return emptyBlob;
+    return new Uint8Array(value as ArrayBufferLike, 0, byteLength);
 }
 
 function asBlob(value: unknown): Uint8Array | undefined {
-    if (isArrayBufferView(value)) {
-        const view = value as ArrayBufferView & { byteOffset: number; byteLength: number; buffer: ArrayBufferLike };
-        return new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
-    }
-    if (isArrayBufferLike(value)) return new Uint8Array(value);
-    return undefined;
+    return bytesFromView(value, typedArrayBuffer, typedArrayByteOffset, typedArrayByteLength)
+        ?? bytesFromView(value, dataViewBuffer, dataViewByteOffset, dataViewByteLength)
+        ?? bytesFromBuffer(value, arrayBufferByteLength)
+        ?? (sharedArrayBufferByteLength && bytesFromBuffer(value, sharedArrayBufferByteLength));
 }
 
 function isBindingRecord(value: unknown): value is BindingRecord {
