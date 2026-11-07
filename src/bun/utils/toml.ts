@@ -1,4 +1,6 @@
 import { sanitizeSurrogates, utf8Decode } from '../../utils/bytes';
+import { blobBytesOf } from '../blob-intrinsics';
+import { isBunFile } from '../file';
 
 type BrandGetter<T> = (this: unknown) => T;
 
@@ -197,12 +199,16 @@ class Parser {
 
 const parse = (input: unknown): Record<string, any> => {
     if (input == null || typeof input === 'symbol') throw new TypeError('input must be a string, ArrayBuffer, ArrayBufferView or Blob');
+    if (isBunFile(input)) {
+        throw Object.assign(new TypeError('File blob cannot be used here'), { code: 'ERR_INVALID_ARG_TYPE' });
+    }
     let s: string;
+    const blob = blobBytesOf(input);
     const rawByteLength = rawBufferByteLength(input);
-    if (rawByteLength !== undefined || arrayBufferIsView(input)) {
-        const bytes = rawByteLength !== undefined
+    if (blob !== undefined || rawByteLength !== undefined || arrayBufferIsView(input)) {
+        const bytes = blob ?? (rawByteLength !== undefined
             ? windowBytes(input as ArrayBufferLike, 0, rawByteLength)
-            : viewBytes(input as ArrayBufferView);
+            : viewBytes(input as ArrayBufferView));
         try {
             s = utf8Decode(bytes, true);
         } catch (error) {

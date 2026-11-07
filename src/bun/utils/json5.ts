@@ -1,4 +1,6 @@
 import { utf8Decode } from '../../utils/bytes';
+import { blobBytesOf } from '../blob-intrinsics';
+import { isBunFile } from '../file';
 
 const engine = import.meta.use('engine');
 
@@ -191,7 +193,12 @@ class Parser {
 
 export function parseJSON5(input: unknown): any {
     if (input == null) throw new TypeError('input must be a string, ArrayBuffer, ArrayBufferView or Blob');
-    const binary = decodeBinary(input);
+    if (isBunFile(input)) {
+        throw Object.assign(new TypeError('File blob cannot be used here'), { code: 'ERR_INVALID_ARG_TYPE' });
+    }
+    const blob = blobBytesOf(input);
+    // Bun decodes in-memory Blob data with replacement, unlike raw byte inputs.
+    const binary = blob === undefined ? decodeBinary(input) : utf8Decode(blob);
     const text = binary === undefined ? `${input}` : binary;
     return new Parser(text).parse();
 }
