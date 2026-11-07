@@ -11,6 +11,17 @@ const engine = import.meta.use('engine');
 const streams = import.meta.use('streams');
 
 const STDIO_CHUNK_SIZE = 64 * 1024;
+const blobSize = Object.getOwnPropertyDescriptor(Blob.prototype, 'size')!.get!;
+const blobStream = Blob.prototype.stream;
+
+function isBlob(value: unknown): value is Blob {
+    try {
+        Reflect.apply(blobSize, value, []);
+        return true;
+    } catch {
+        return false;
+    }
+}
 
 function inputToBytes(value: unknown): Uint8Array<ArrayBuffer> {
     // Blob inputs are streamed separately; this converts each concrete chunk
@@ -54,8 +65,8 @@ export class StdioFile {
         if (this.#readable) {
             throw new TypeError(`Bun.${this.#label} is not writable`);
         }
-        if (data instanceof Blob) {
-            const reader = data.stream().getReader();
+        if (isBlob(data)) {
+            const reader = Reflect.apply(blobStream, data, []).getReader();
             let written = 0;
             try {
                 while (true) {
