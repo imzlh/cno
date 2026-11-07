@@ -33,6 +33,15 @@ const dataViewBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, 'buff
 const dataViewByteOffset = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset')!.get! as BrandGetter<number>;
 const dataViewByteLength = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength')!.get! as BrandGetter<number>;
 const stringValueOf = String.prototype.valueOf;
+const NumberConstructor = Number;
+const StringConstructor = String;
+const numberIsNaN = Number.isNaN;
+const numberIsFinite = Number.isFinite;
+const numberIsInteger = Number.isInteger;
+const mathTrunc = Math.trunc;
+const mathMax = Math.max;
+const mathMin = Math.min;
+const objectIs = Object.is;
 const arrayBufferIsView = ArrayBuffer.isView;
 const emptyBytes = new Uint8Array();
 
@@ -168,9 +177,9 @@ function validateLibrary(
 function compressionLevel(value: unknown, library: 'zlib' | 'libdeflate'): number {
     if (value === undefined) return library === 'zlib' ? -1 : 6;
 
-    let converted = Number(value);
-    if (Number.isNaN(converted)) converted = 0;
-    converted = Math.trunc(converted);
+    let converted = NumberConstructor(value);
+    if (numberIsNaN(converted)) converted = 0;
+    converted = mathTrunc(converted);
 
     if (library === 'libdeflate') {
         if (converted >= 0 && converted <= 12) return converted;
@@ -179,7 +188,7 @@ function compressionLevel(value: unknown, library: 'zlib' | 'libdeflate'): numbe
             'ERR_INVALID_ARG_TYPE',
         );
     }
-    if (Number.isFinite(converted) && converted >= -1 && converted <= 9) return converted;
+    if (numberIsFinite(converted) && converted >= -1 && converted <= 9) return converted;
     throw new Error('Zlib error: Invalid argument');
 }
 
@@ -198,7 +207,7 @@ function optionInteger(
             'ERR_INVALID_ARG_TYPE',
         );
     }
-    if (!Number.isInteger(value)) {
+    if (!numberIsInteger(value)) {
         throw codedError(
             new RangeError(`The value of "${optionName}" is out of range. It must be an integer. Received ${formatValue(value)}`),
             'ERR_OUT_OF_RANGE',
@@ -220,9 +229,9 @@ function formatValue(value: unknown): string {
     if (typeof value === 'string') return `type string ('${value}')`;
     if (typeof value === 'boolean') return `type boolean (${value})`;
     if (typeof value === 'bigint') return `type bigint (${value}n)`;
-    if (typeof value === 'symbol') return `type symbol (${String(value)})`;
-    if (Object.is(value, -0)) return '-0';
-    return String(value);
+    if (typeof value === 'symbol') return `type symbol (${StringConstructor(value)})`;
+    if (objectIs(value, -0)) return '-0';
+    return StringConstructor(value);
 }
 
 function compress(kind: 'gzip' | 'deflateRaw', data: unknown, options?: unknown): Uint8Array {
@@ -231,7 +240,7 @@ function compress(kind: 'gzip' | 'deflateRaw', data: unknown, options?: unknown)
 
     // Dictionary fields are read and converted one at a time in declaration order.
     const windowBits = object.windowBits;
-    if (windowBits !== undefined) Number(windowBits);
+    if (windowBits !== undefined) NumberConstructor(windowBits);
     const library = validateLibrary(object.library, 'Compression');
     const levelValue = object.level;
     const requestedLevel = compressionLevel(levelValue, library);
@@ -246,7 +255,7 @@ function compress(kind: 'gzip' | 'deflateRaw', data: unknown, options?: unknown)
     // backend. Level 0 is stored; every positive effort maps to zlib's closest
     // effort level while preserving the same DEFLATE wire format.
     const level = library === 'libdeflate'
-        ? requestedLevel === 0 ? 0 : Math.max(1, Math.min(9, requestedLevel))
+        ? requestedLevel === 0 ? 0 : mathMax(1, mathMin(9, requestedLevel))
         : requestedLevel;
     const output = kind === 'gzip'
         ? zlib.gzip(input, level, strategy, memLevel)
@@ -262,8 +271,8 @@ function compress(kind: 'gzip' | 'deflateRaw', data: unknown, options?: unknown)
 }
 
 function toInteger(value: unknown): number {
-    const number = Number(value);
-    return Number.isNaN(number) ? 0 : Math.trunc(number);
+    const number = NumberConstructor(value);
+    return numberIsNaN(number) ? 0 : mathTrunc(number);
 }
 
 function decompressionFormat(defaultFormat: 'raw' | 'gzip', bits: number | undefined): InflateFormat {
