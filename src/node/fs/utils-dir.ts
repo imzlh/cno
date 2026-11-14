@@ -561,7 +561,7 @@ export function createFileHandle(fd: number, handle: CModuleAsyncFS.FileHandle) 
             return toNodeStat(await native('fstat', () => handle.stat()), options);
         },
         async sync() { await ensureOpen('fsync'); await native('fsync', () => handle.sync()); },
-        async datasync() { await ensureOpen('fdatasync'); await native('fdatasync', () => handle.datasync()); },
+        async datasync() { await ensureOpen('fdatasync'); await native('fdatasync', () => handle.sync(true)); },
         async truncate(len?: number) {
             await ensureOpen('ftruncate');
             await native('ftruncate', () => handle.truncate(len ?? 0));

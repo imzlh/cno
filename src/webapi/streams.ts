@@ -1547,9 +1547,9 @@ export class CompressionStream implements globalThis.CompressionStream {
     constructor(format: CompressionFormat) {
         let handle: CModuleZLib.Deflate;
         switch (format) {
-            case 'gzip': handle = zlib.createGzip(); break;
-            case 'deflate': handle = zlib.createDeflate(); break;
-            case 'deflate-raw': handle = zlib.createDeflateRaw(); break;
+            case 'gzip': handle = new zlib.Gzip(); break;
+            case 'deflate': handle = new zlib.Deflate(); break;
+            case 'deflate-raw': handle = new zlib.DeflateRaw(); break;
             default: throw new TypeError(`Unsupported compression format: ${format}`);
         }
         const streams = createCompressionStreams(handle, format);
@@ -1565,9 +1565,9 @@ export class DecompressionStream implements globalThis.DecompressionStream {
     constructor(format: CompressionFormat) {
         let handle: CModuleZLib.Inflate;
         switch (format) {
-            case 'gzip': handle = zlib.createGunzip(); break;
-            case 'deflate': handle = zlib.createInflate(); break;
-            case 'deflate-raw': handle = zlib.createInflateRaw(); break;
+            case 'gzip': handle = new zlib.Gunzip(); break;
+            case 'deflate': handle = new zlib.Inflate(); break;
+            case 'deflate-raw': handle = new zlib.InflateRaw(); break;
             default: throw new TypeError(`Unsupported decompression format: ${format}`);
         }
         const streams = createCompressionStreams(handle, format);

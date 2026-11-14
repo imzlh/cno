@@ -1,6 +1,6 @@
 const COOKIE_NAME = "quietline_admin";
 const SESSION_TTL_SECONDS = 60 * 60 * 8;
-const encoder = new TextEncoder();
+const engine = import.meta.use('engine');
 
 function configuredToken(): string | null {
   try {
@@ -23,12 +23,12 @@ function base64Url(bytes: Uint8Array): string {
 async function signature(secret: string, value: string): Promise<string> {
   const key = await crypto.subtle.importKey(
     "raw",
-    encoder.encode(secret),
+    engine.encodeString(secret),
     { name: "HMAC", hash: "SHA-256" },
     false,
     ["sign"],
   );
-  const digest = await crypto.subtle.sign("HMAC", key, encoder.encode(value));
+  const digest = await crypto.subtle.sign("HMAC", key, engine.encodeString(value));
   return base64Url(new Uint8Array(digest));
 }
 

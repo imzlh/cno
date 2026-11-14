@@ -1,24 +1,33 @@
 /**
- * Deno FFI Callback Implementation
- * UnsafeCallback class for passing JS functions to C code
+ * Deno-compatible same-thread unsafe callbacks.
  */
 
-import { cachedCif, getTypeSize } from './utils';
-import { UnsafePointer, createPointerObject } from './pointer';
+import { errors } from '../01_errors';
+import { createPointerObject } from './pointer';
+import {
+    fromFfiValue,
+    toFfiCallbackResult,
+    toFfiFunctionSignature,
+} from './utils';
 
 const ffi = import.meta.use('ffi');
-const console = import.meta.use('console');
+const createCallback = ffi.callback as unknown as (
+    signature: CModuleFFI.FunctionSignature,
+    callback: (...args: unknown[]) => unknown,
+) => CModuleFFI.Callback;
 
 interface CallbackInternal {
-    closure: CModuleFFI.FfiClosure;
+    closure: CModuleFFI.Callback;
     refCount: number;
     closed: boolean;
-    definition: Deno.UnsafeCallbackDefinition;
-    callback: Deno.UnsafeCallbackFunction;
 }
 
-const callbackRegistry = new Map<Deno.PointerObject, CallbackInternal>();
-
+/**
+ * A synchronous JavaScript callback exposed as a native function pointer.
+ *
+ * Native code may invoke the callback only on the thread where it was created.
+ * Cross-thread callbacks are unsupported and never enter the JavaScript runtime.
+ */
 export class UnsafeCallback<
     const Definition extends Deno.UnsafeCallbackDefinition = Deno.UnsafeCallbackDefinition,
 > {
@@ -28,186 +37,98 @@ export class UnsafeCallback<
         Definition['parameters'],
         Definition['result']
     >;
-    
+
     private internal: CallbackInternal;
-    private static cifCache = new Map<string, CModuleFFI.FfiCif>();
+    /** Bounded keepalive for pointer-like results; a native caller holding a
+     * result older than the limit is already outside Deno's call-duration
+     * contract, so dropping the oldest entry cannot extend a live object. */
+    private resultOwners = new Set<unknown>();
+    private static readonly RESULT_OWNER_LIMIT = 64;
 
     constructor(
         definition: Definition,
         callback: Deno.UnsafeCallbackFunction<
             Definition['parameters'],
             Definition['result']
-        >
+        >,
     ) {
         this.definition = definition;
         this.callback = callback;
-        
-        const cif = cachedCif(UnsafeCallback.cifCache, definition.parameters, definition.result);
-        const wrappedCallback = this.wrapCallback(callback, definition);
-        
-        const closure = new ffi.FfiClosure(cif, wrappedCallback);
-        this.pointer = createPointerObject(closure.addr);
-        
+
+        const signature = toFfiFunctionSignature(definition.parameters, definition.result);
+        const closure = createCallback(signature, (...args: unknown[]) => {
+            const convertedArgs = args.map((arg, index) =>
+                fromFfiValue(arg, definition.parameters[index], createPointerObject)
+            );
+            const result = Reflect.apply(callback, null, convertedArgs);
+            const ffiResult = toFfiCallbackResult(result, definition.result);
+            if (
+                !this.internal.closed &&
+                result !== null &&
+                (definition.result === 'pointer' ||
+                    definition.result === 'function' ||
+                    definition.result === 'buffer')
+            ) {
+                this.resultOwners.add(result);
+                // Sets iterate in insertion order: the oldest result is dropped first.
+                if (this.resultOwners.size > UnsafeCallback.RESULT_OWNER_LIMIT) {
+                    const oldest = this.resultOwners.values().next().value;
+                    if (oldest !== undefined) this.resultOwners.delete(oldest);
+                }
+            }
+            return ffiResult as never;
+        });
+
+        this.pointer = createPointerObject<Definition>(closure.pointer);
         this.internal = {
             closure,
             refCount: 0,
             closed: false,
-            definition,
-            callback,
         };
-        
-        callbackRegistry.set(this.pointer, this.internal);
     }
 
+    /**
+     * Thread-safe callbacks are unsupported.
+     *
+     * This compatibility entry point always throws `Deno.errors.NotSupported`.
+     * Use the constructor for a synchronous, same-thread callback.
+     */
     static threadSafe<
         Definition extends Deno.UnsafeCallbackDefinition = Deno.UnsafeCallbackDefinition,
     >(
-        definition: Definition,
-        callback: Deno.UnsafeCallbackFunction<
+        _definition: Definition,
+        _callback: Deno.UnsafeCallbackFunction<
             Definition['parameters'],
             Definition['result']
         >,
     ): UnsafeCallback<Definition> {
-        const cb = new UnsafeCallback(definition, callback);
-        cb.ref();
-        return cb;
+        throw new errors.NotSupported('Thread-safe FFI callbacks are not supported');
     }
 
+    /**
+     * Increment and return the compatibility reference count.
+     * This does not enable cross-thread callbacks or change event-loop behavior.
+     */
     ref(): number {
-        if (this.internal.closed) {
-            throw new Error('Callback is closed');
-        }
+        if (this.internal.closed) throw new Error('Callback is closed');
         return ++this.internal.refCount;
     }
 
+    /**
+     * Decrement and return the compatibility reference count.
+     * This does not enable cross-thread callbacks or change event-loop behavior.
+     */
     unref(): number {
-        if (this.internal.closed) {
-            return 0;
-        }
+        if (this.internal.closed) return 0;
         this.internal.refCount = Math.max(0, this.internal.refCount - 1);
         return this.internal.refCount;
     }
 
     close(): void {
         if (this.internal.closed) return;
-        
         this.internal.closed = true;
         this.internal.refCount = 0;
-        callbackRegistry.delete(this.pointer);
+        this.internal.closure.close();
+        this.resultOwners.clear();
     }
-
-    private wrapCallback(
-        callback: Deno.UnsafeCallbackFunction,
-        definition: Deno.UnsafeCallbackDefinition
-    ): (...args: ArrayBuffer[]) => Uint8Array {
-        return (...args: ArrayBuffer[]): Uint8Array => {
-            try {
-                const buffers = args.map(arg => new Uint8Array(arg));
-                const convertedArgs = this.convertArgs(buffers, definition.parameters);
-                const result = Reflect.apply(callback, null, convertedArgs);
-                return this.convertResult(result, definition.result);
-            } catch (err) {
-                console.error('UnsafeCallback error:', err);
-                const size = definition.result === 'void' ? 0 : getTypeSize(definition.result as Deno.NativeType);
-                return new Uint8Array(size);
-            }
-        };
-    }
-
-    private convertArgs(args: Uint8Array[], parameters: readonly Deno.NativeType[]): unknown[] {
-        return parameters.map((type, i) => {
-            const buf = args[i];
-            if (buf === undefined) return null;
-            
-            if (typeof type === 'string') {
-                const view = new DataView(buf.buffer, buf.byteOffset);
-                switch (type) {
-                    case 'u8': return buf[0];
-                    case 'i8': return buf[0] > 127 ? buf[0] - 256 : buf[0];
-                    case 'u16': return view.getUint16(0, true);
-                    case 'i16': return view.getInt16(0, true);
-                    case 'u32': return view.getUint32(0, true);
-                    case 'i32': return view.getInt32(0, true);
-                    case 'u64': return view.getBigUint64(0, true);
-                    case 'i64': return view.getBigInt64(0, true);
-                    case 'f32': return view.getFloat32(0, true);
-                    case 'f64': return view.getFloat64(0, true);
-                    case 'bool': return buf[0] !== 0;
-                    case 'pointer':
-                    case 'buffer':
-                    case 'function': {
-                        const addr = view.getBigUint64(0, true);
-                        return addr === 0n ? null : createPointerObject(addr);
-                    }
-                    case 'usize': return view.getBigUint64(0, true);
-                    case 'isize': return view.getBigInt64(0, true);
-                }
-            }
-            
-            return buf;
-        });
-    }
-
-    private convertResult(result: unknown, type: Deno.NativeResultType): Uint8Array {
-        if (type === 'void') return new Uint8Array(0);
-        
-        const size = getTypeSize(type as Deno.NativeType);
-        const buf = new ArrayBuffer(size);
-        const view = new DataView(buf);
-        
-        if (typeof type === 'string') {
-            switch (type) {
-                case 'u8':
-                case 'i8':
-                    view.setUint8(0, Number(result));
-                    break;
-                case 'u16':
-                case 'i16':
-                    view.setUint16(0, Number(result), true);
-                    break;
-                case 'u32':
-                case 'i32':
-                    view.setUint32(0, Number(result), true);
-                    break;
-                case 'u64':
-                case 'usize':
-                    view.setBigUint64(0, result as bigint, true);
-                    break;
-                case 'i64':
-                case 'isize':
-                    view.setBigInt64(0, result as bigint, true);
-                    break;
-                case 'f32':
-                    view.setFloat32(0, Number(result), true);
-                    break;
-                case 'f64':
-                    view.setFloat64(0, Number(result), true);
-                    break;
-                case 'bool':
-                    view.setUint8(0, result ? 1 : 0);
-                    break;
-                case 'pointer':
-                case 'buffer':
-                case 'function': {
-                    const addr = result === null ? 0n : UnsafePointer.value(result as Deno.PointerValue);
-                    view.setBigUint64(0, addr, true);
-                    break;
-                }
-            }
-        } else if (typeof type === 'object' && 'struct' in type) {
-            return result instanceof Uint8Array ? result : new Uint8Array(size);
-        }
-        
-        return new Uint8Array(buf);
-    }
-}
-
-export function callRegisteredCallback(pointer: Deno.PointerValue, args: readonly unknown[]): { found: boolean; value?: unknown } {
-    if (pointer === null) return { found: false };
-    const internal = callbackRegistry.get(pointer);
-    if (!internal || internal.closed) return { found: false };
-    return {
-        found: true,
-        value: internal.callback(...args as []),
-    };
 }

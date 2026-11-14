@@ -102,10 +102,10 @@ function withInfo(
 // Native decompression handle factories, keyed by Node codec name.
 
 const DECOMPRESS_FACTORIES: Record<DecompressKind, () => ZlibInflateHandle> = {
-    inflate: () => zlib.createInflate(),
-    inflateRaw: () => zlib.createInflateRaw(),
-    gunzip: () => zlib.createGunzip(),
-    unzip: () => zlib.createUnzip(),
+    inflate: () => new zlib.Inflate(),
+    inflateRaw: () => new zlib.InflateRaw(),
+    gunzip: () => new zlib.Gunzip(),
+    unzip: () => new zlib.Unzip(),
 };
 
 // Only gzip streams concatenate members; zlib/raw deflate ignore trailing bytes.

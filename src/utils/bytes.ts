@@ -178,3 +178,14 @@ export function decodeSingleByte(bytes: globalThis.Uint8Array, encoding: SingleB
     const range = encoding === 'windows-1252' ? /[\u0080-\u009f]/g : /[\u0080-\u00ff]/g;
     return latin1.replace(range, (c) => high[c.charCodeAt(0) - 0x80]!);
 }
+
+/** True when this platform stores multibyte values little-endian in memory. */
+export const nativeLittleEndian = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
+
+/** Zero-copy Uint8Array view over an ArrayBuffer (shared or not) or a view into one. */
+export function viewBytes(
+    value: ArrayBuffer | SharedArrayBuffer | ArrayBufferView<ArrayBufferLike>,
+): Uint8Array<ArrayBufferLike> {
+    if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+    return new Uint8Array(value);
+}

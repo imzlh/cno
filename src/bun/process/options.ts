@@ -1,5 +1,6 @@
 import { normalizeErrnoError } from '../../node/_internal/errno';
 import { isAbsolutePath, join, resolvePath } from '../../utils/path';
+import { nativeSignalFromNumber, nodeNativeSignalNumber, unknownSignalError } from '../../utils/signals';
 import { copyInputBytes, isBufferInput } from './streams';
 import type {
     BunSignal,
@@ -203,15 +204,16 @@ function optionalSignal(value: unknown): BunSignal | undefined {
     if (value === undefined || value === null || value === '') return undefined;
     if (typeof value === 'string') {
         // Reject here: a bad name would otherwise throw from a timer/abort callback.
-        if (signalsBinding && !Object.hasOwn(signalsBinding.signals, value)) {
-            const error = new TypeError(`Unknown signal: ${value}`);
-            Object.defineProperty(error, 'code', { value: 'ERR_UNKNOWN_SIGNAL', configurable: true });
-            throw error;
+        if (signalsBinding && nodeNativeSignalNumber(value) === undefined) {
+            throw unknownSignalError(value);
         }
         return value as BunSignal;
     }
-    if (typeof value === 'number' && Number.isInteger(value) && value >= 0) {
-        return value as BunSignal;
+    // killSignal is never a probe, so 0 is rejected at set time rather than
+    // exploding later from a timer or abort callback.
+    if (typeof value === 'number' && Number.isInteger(value) && value > 0) {
+        if (nativeSignalFromNumber(value) !== undefined) return value as BunSignal;
+        throw unknownSignalError(value);
     }
     throw codedTypeError('killSignal must be a signal name or integer');
 }

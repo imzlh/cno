@@ -5,6 +5,8 @@ import type { CookieInit, CookieSameSite, CookieStoreDeleteOptions } from 'bun';
 
 export type { CookieInit, CookieSameSite, CookieStoreDeleteOptions };
 
+const engine = import.meta.use('engine');
+
 interface CookieRecord {
     name: string;
     value: string;
@@ -147,7 +149,7 @@ function hexDigit(byte: number): number {
 
 function decodeValue(value: string): string {
     if (!value.includes('%')) return value;
-    const bytes = new TextEncoder().encode(value);
+    const bytes = engine.encodeString(value);
     let length = 0;
     for (let i = 0; i < bytes.length; i++) {
         let byte = bytes[i];

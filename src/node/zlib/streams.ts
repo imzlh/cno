@@ -34,12 +34,8 @@ import {
 
 const zlib = import.meta.use('zlib');
 
-// The native zlib handles are direction-specific: createDeflate/createGzip/
-// createDeflateRaw expose only `deflate` (plus `params`), while createInflate/
-// createGunzip/createInflateRaw/createUnzip expose only `inflate`. Modelling
-// them as a single type requiring both methods made every handle fail to
-// assign. The `?: undefined` members keep both keys visible on the union so
-// dynamic dispatch sites can narrow with a plain `typeof` check.
+// The native module exports the Deflate/Gzip/DeflateRaw/Inflate/Gunzip/InflateRaw/Unzip
+// classes; this file is the JS-layer Node-compatible factory wrapping those classes.
 type ZlibHandleBase = {
     flush(flush?: number): Uint8Array;
     finish(input?: Uint8Array): Uint8Array;
@@ -396,13 +392,13 @@ const compressionOptions = (options?: ZlibOptions) => [
     options?.memLevel ?? 8,
 ] as const;
 
-export const Deflate = defineZlibConstructor<Deflate>('Deflate', options => zlib.createDeflate(...compressionOptions(options)));
-export const Inflate = defineZlibConstructor<Inflate>('Inflate', () => zlib.createInflate(), 'inflate');
-export const Gzip = defineZlibConstructor<Gzip>('Gzip', options => zlib.createGzip(...compressionOptions(options)));
-export const Gunzip = defineZlibConstructor<Gunzip>('Gunzip', () => zlib.createGunzip(), 'gunzip');
-export const DeflateRaw = defineZlibConstructor<DeflateRaw>('DeflateRaw', options => zlib.createDeflateRaw(...compressionOptions(options)));
-export const InflateRaw = defineZlibConstructor<InflateRaw>('InflateRaw', () => zlib.createInflateRaw(), 'inflateRaw');
-export const Unzip = defineZlibConstructor<Unzip>('Unzip', () => zlib.createUnzip(), 'unzip');
+export const Deflate = defineZlibConstructor<Deflate>('Deflate', options => new zlib.Deflate(...compressionOptions(options)));
+export const Inflate = defineZlibConstructor<Inflate>('Inflate', () => new zlib.Inflate(), 'inflate');
+export const Gzip = defineZlibConstructor<Gzip>('Gzip', options => new zlib.Gzip(...compressionOptions(options)));
+export const Gunzip = defineZlibConstructor<Gunzip>('Gunzip', () => new zlib.Gunzip(), 'gunzip');
+export const DeflateRaw = defineZlibConstructor<DeflateRaw>('DeflateRaw', options => new zlib.DeflateRaw(...compressionOptions(options)));
+export const InflateRaw = defineZlibConstructor<InflateRaw>('InflateRaw', () => new zlib.InflateRaw(), 'inflateRaw');
+export const Unzip = defineZlibConstructor<Unzip>('Unzip', () => new zlib.Unzip(), 'unzip');
 
 // Factory functions
 

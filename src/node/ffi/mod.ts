@@ -50,13 +50,32 @@ interface FunctionRecord {
 type CallbackFunction = (...args: FfiArgument[]) => FfiReturn;
 
 interface CallbackRecord {
-    closure: CModuleFFI.FfiClosure;
+    callback: CModuleFFI.Callback;
+    pointer: CModuleFFI.Pointer;
     strongCallback?: CallbackFunction;
     weakCallback: WeakRef<CallbackFunction>;
 }
 
-const nativeLittleEndian = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
+// A callback pointer can be passed to a function obtained from any library,
+// not only the DynamicLibrary that created it. Preserve the native Pointer
+// object (and therefore its callback provenance) across those library
+// boundaries for as long as the callback remains registered. The registry is
+// weak so it does not outlive the DynamicLibrary that strongly owns the record.
+const activeCallbacks = new Map<bigint, WeakRef<CallbackRecord>>();
 
+function getActiveCallback(address: bigint): CallbackRecord | undefined {
+    const reference = activeCallbacks.get(address);
+    const record = reference?.deref();
+    if (reference && !record) activeCallbacks.delete(address);
+    return record;
+}
+
+function deleteActiveCallback(address: bigint, record: CallbackRecord): void {
+    if (activeCallbacks.get(address)?.deref() === record) activeCallbacks.delete(address);
+}
+
+/* node: modules cannot import the shared utils layer; keep these local. */
+const nativeLittleEndian = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
 export const suffix = (() => {
     const system = os.uname().sysname;
     if (system === 'Windows_NT') return 'dll';
@@ -105,19 +124,19 @@ const aliases: Record<string, CanonicalType> = {
     arraybuffer: 'pointer', string: 'pointer', str: 'pointer',
 };
 
-const nativeTypes: Record<CanonicalType, CModuleFFI.FfiType> = {
-    void: ffi.type_void,
-    i8: ffi.type_sint8,
-    u8: ffi.type_uint8,
-    i16: ffi.type_sint16,
-    u16: ffi.type_uint16,
-    i32: ffi.type_sint32,
-    u32: ffi.type_uint32,
-    i64: ffi.type_sint64,
-    u64: ffi.type_uint64,
-    f32: ffi.type_float,
-    f64: ffi.type_double,
-    pointer: ffi.type_pointer,
+const nativeTypes: Record<CanonicalType, CModuleFFI.TypeToken> = {
+    void: ffi.types.void,
+    i8: ffi.types.i8,
+    u8: ffi.types.u8,
+    i16: ffi.types.i16,
+    u16: ffi.types.u16,
+    i32: ffi.types.i32,
+    u32: ffi.types.u32,
+    i64: ffi.types.i64,
+    u64: ffi.types.u64,
+    f32: ffi.types.f32,
+    f64: ffi.types.f64,
+    pointer: ffi.types.pointer,
 };
 
 function invalidArg(name: string, message: string): never {
@@ -153,77 +172,127 @@ function viewBytes(value: ArrayBufferLike | ArrayBufferView<ArrayBufferLike>): U
     return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
 }
 
-function encodeScalar(type: CanonicalType, value: unknown, keepalive?: unknown[]): Uint8Array | bigint {
-    if (type === 'pointer') {
-        if (value === null) return 0n;
-        if (typeof value === 'bigint') return value;
-        if (typeof value === 'string') {
-            const bytes = Buffer.from(`${value}\0`, 'utf8');
-            keepalive?.push(bytes);
-            return ffi.getArrayBufPtr(bytes);
-        }
-        if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {
-            const bytes = viewBytes(value);
-            keepalive?.push(value, bytes);
-            return ffi.getArrayBufPtr(bytes);
-        }
+function pointerAddress(pointer: CModuleFFI.Pointer | null): bigint {
+    return pointer === null ? 0n : ffi.unsafe.address(pointer);
+}
+
+function pointerFromAddress(address: bigint): CModuleFFI.Pointer | null {
+    return ffi.unsafe.fromAddress(address);
+}
+
+function normalizeInteger(type: CanonicalType, value: unknown): number | bigint {
+    switch (type) {
+        case 'i8': return (Number(value) << 24) >> 24;
+        case 'u8': return Number(value) & 0xff;
+        case 'i16': return (Number(value) << 16) >> 16;
+        case 'u16': return Number(value) & 0xffff;
+        case 'i32': return Number(value) | 0;
+        case 'u32': return Number(value) >>> 0;
+        case 'i64': return BigInt.asIntN(64, BigInt(value as bigint | number));
+        case 'u64': return BigInt.asUintN(64, BigInt(value as bigint | number));
+        default: throw new TypeError('Internal FFI integer conversion error');
+    }
+}
+
+function toNativeScalarArgument(type: CanonicalType, value: unknown): unknown {
+    switch (type) {
+        case 'void': return undefined;
+        case 'pointer': throw new TypeError('Internal FFI pointer conversion error');
+        case 'i8':
+        case 'u8':
+        case 'i16':
+        case 'u16':
+        case 'i32':
+        case 'u32':
+        case 'i64':
+        case 'u64':
+            return normalizeInteger(type, value);
+        default:
+            return Number(value);
+    }
+}
+
+function validatePointerArgument(value: unknown): void {
+    if (
+        value !== null
+        && typeof value !== 'bigint'
+        && typeof value !== 'string'
+        && !(value instanceof ArrayBuffer)
+        && !ArrayBuffer.isView(value)
+    ) {
         invalidArg('value', 'must be a bigint, string, ArrayBuffer, ArrayBufferView, or null for a pointer');
     }
-
-    const size = nativeTypes[type].size;
-    const bytes = new Uint8Array(size);
-    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-    switch (type) {
-        case 'void': return bytes;
-        case 'i8': view.setInt8(0, Number(value)); break;
-        case 'u8': view.setUint8(0, Number(value)); break;
-        case 'i16': view.setInt16(0, Number(value), nativeLittleEndian); break;
-        case 'u16': view.setUint16(0, Number(value), nativeLittleEndian); break;
-        case 'i32': view.setInt32(0, Number(value), nativeLittleEndian); break;
-        case 'u32': view.setUint32(0, Number(value), nativeLittleEndian); break;
-        case 'i64': view.setBigInt64(0, BigInt(value as bigint | number), nativeLittleEndian); break;
-        case 'u64': view.setBigUint64(0, BigInt(value as bigint | number), nativeLittleEndian); break;
-        case 'f32': view.setFloat32(0, Number(value), nativeLittleEndian); break;
-        case 'f64': view.setFloat64(0, Number(value), nativeLittleEndian); break;
-    }
-    return bytes;
 }
 
-function decodeScalar(type: CanonicalType, bytes: Uint8Array): FfiReturn {
+function toNativePointerArgument(
+    value: unknown,
+    keepalive: unknown[],
+): CModuleFFI.Pointer | null {
+    if (value === null) return null;
+    if (typeof value === 'bigint') return getActiveCallback(value)?.pointer ?? pointerFromAddress(value);
+    if (typeof value === 'string') {
+        const bytes = Buffer.from(`${value}\0`, 'utf8');
+        keepalive.push(bytes);
+        return ffi.unsafe.pointerOf(bytes);
+    }
+    const source = value as ArrayBuffer | ArrayBufferView<ArrayBufferLike>;
+    keepalive.push(source);
+    return ffi.unsafe.pointerOf(source);
+}
+
+function toNativeArguments(
+    types: readonly CanonicalType[],
+    args: readonly FfiArgument[],
+    keepalive: unknown[],
+): unknown[] {
+    for (let index = 0; index < types.length; index++) {
+        if (types[index] === 'pointer') validatePointerArgument(args[index]);
+    }
+
+    const result = args.map((arg, index) =>
+        types[index] === 'pointer' ? undefined : toNativeScalarArgument(types[index], arg)
+    );
+    for (let index = 0; index < types.length; index++) {
+        if (types[index] === 'pointer') {
+            result[index] = toNativePointerArgument(args[index], keepalive);
+        }
+    }
+    return result;
+}
+
+function fromNativeValue(type: CanonicalType, value: unknown): FfiReturn {
     if (type === 'void') return undefined;
-    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-    switch (type) {
-        case 'i8': return view.getInt8(0);
-        case 'u8': return view.getUint8(0);
-        case 'i16': return view.getInt16(0, nativeLittleEndian);
-        case 'u16': return view.getUint16(0, nativeLittleEndian);
-        case 'i32': return view.getInt32(0, nativeLittleEndian);
-        case 'u32': return view.getUint32(0, nativeLittleEndian);
-        case 'i64': return view.getBigInt64(0, nativeLittleEndian);
-        case 'u64': return view.getBigUint64(0, nativeLittleEndian);
-        case 'f32': return view.getFloat32(0, nativeLittleEndian);
-        case 'f64': return view.getFloat64(0, nativeLittleEndian);
-        case 'pointer': return nativeTypes.pointer.size === 4
-            ? BigInt(view.getUint32(0, nativeLittleEndian))
-            : view.getBigUint64(0, nativeLittleEndian);
-    }
+    if (type === 'pointer') return pointerAddress(value as CModuleFFI.Pointer | null);
+    return value as number | bigint;
 }
 
-function encodeCallbackResult(type: CanonicalType, value: unknown): Uint8Array {
-    if (type === 'void') return new Uint8Array(0);
-    if (type !== 'pointer') return encodeScalar(type, value) as Uint8Array;
+function toNativeCallbackResult(type: CanonicalType, value: unknown): unknown {
+    if (type === 'pointer') {
+        if (typeof value !== 'bigint') {
+            invalidArg('callback result', 'must be a bigint for a pointer return type');
+        }
+        return pointerFromAddress(value);
+    }
+    if (type === 'void') return undefined;
+    if (
+        type === 'i8' || type === 'u8'
+        || type === 'i16' || type === 'u16'
+        || type === 'i32' || type === 'u32'
+        || type === 'i64' || type === 'u64'
+    ) {
+        return normalizeInteger(type, value);
+    }
+    return Number(value);
+}
 
-    if (typeof value !== 'bigint') {
-        invalidArg('callback result', 'must be a bigint for a pointer return type');
+function zeroNativeResult(type: CanonicalType): unknown {
+    switch (type) {
+        case 'void': return undefined;
+        case 'pointer': return null;
+        case 'i64':
+        case 'u64': return 0n;
+        default: return 0;
     }
-    const bytes = new Uint8Array(nativeTypes.pointer.size);
-    const view = new DataView(bytes.buffer);
-    if (bytes.byteLength === 4) {
-        view.setUint32(0, Number(value), nativeLittleEndian);
-    } else {
-        view.setBigUint64(0, value, nativeLittleEndian);
-    }
-    return bytes;
 }
 
 function assertDefinitions(value: unknown): asserts value is FunctionDefinitions {
@@ -236,9 +305,9 @@ export class DynamicLibrary {
     readonly path: string;
     readonly symbols: Record<string, bigint> = Object.create(null);
 
-    #lib: CModuleFFI.UvLib;
+    #lib: CModuleFFI.Library;
     #closed = false;
-    #nativeSymbols = new Map<string, CModuleFFI.UvDlSym>();
+    #nativeSymbols = new Map<string, CModuleFFI.Pointer>();
     #functions = new Map<string, FunctionRecord>();
     #callbacks = new Map<bigint, CallbackRecord>();
 
@@ -250,21 +319,21 @@ export class DynamicLibrary {
         }
         if (typeof path !== 'string') invalidArg('path', 'must be a string or null');
         this.path = path;
-        this.#lib = new ffi.UvLib(path);
+        this.#lib = ffi.open(path);
     }
 
     #assertOpen(): void {
         if (this.#closed) throw new Error('Dynamic library is closed');
     }
 
-    #resolve(name: string): CModuleFFI.UvDlSym {
+    #resolve(name: string): CModuleFFI.Pointer {
         this.#assertOpen();
         if (typeof name !== 'string') invalidArg('symbol', 'must be a string');
         let symbol = this.#nativeSymbols.get(name);
         if (!symbol) {
             symbol = this.#lib.symbol(name);
             this.#nativeSymbols.set(name, symbol);
-            this.symbols[name] = symbol.addr;
+            this.symbols[name] = pointerAddress(symbol);
         }
         return symbol;
     }
@@ -274,6 +343,12 @@ export class DynamicLibrary {
         this.#closed = true;
         this.#functions.clear();
         this.#nativeSymbols.clear();
+        for (const [pointer, record] of this.#callbacks) {
+            // Check identity so a stale owner can never delete a newer callback
+            // if a native closure address is eventually reused.
+            deleteActiveCallback(pointer, record);
+            record.callback.close();
+        }
         this.#callbacks.clear();
         this.#lib.close();
     }
@@ -283,7 +358,7 @@ export class DynamicLibrary {
     }
 
     getSymbol(name: string): bigint {
-        return this.#resolve(name).addr;
+        return pointerAddress(this.#resolve(name));
     }
 
     getSymbols(): Record<string, bigint> {
@@ -302,10 +377,17 @@ export class DynamicLibrary {
             return cached.fn;
         }
 
-        const symbol = this.#resolve(name);
-        const cif = new ffi.FfiCif(
-            nativeTypes[normalized.result],
-            ...normalized.args.map(type => nativeTypes[type]),
+        this.#resolve(name);
+        /* Runtime-built signature: bind()'s literal-tuple generics cannot
+         * express it, so the method's type is widened (receiver preserved via
+         * .call — the native side reads `this` as the FfiLibrary). */
+        const runtimeBind = (this.#lib.bind as unknown as (
+            this: CModuleFFI.Library,
+            signature: readonly [CModuleFFI.TypeToken, string, ...CModuleFFI.TypeToken[]],
+        ) => ((...args: unknown[]) => FfiReturn) & { readonly pointer: CModuleFFI.Pointer });
+        const nativeFunction = runtimeBind.call(
+            this.#lib,
+            [nativeTypes[normalized.result], name, ...normalized.args.map(type => nativeTypes[type])],
         );
         const library = this;
         const fn = function(this: unknown, ...args: FfiArgument[]): FfiReturn {
@@ -314,15 +396,15 @@ export class DynamicLibrary {
                 throw new RangeError(`Expected ${normalized.args.length} arguments but got ${args.length}`);
             }
             const keepalive: unknown[] = [];
-            const nativeArgs = args.map((arg, index) => encodeScalar(normalized.args[index], arg, keepalive));
+            const nativeArgs = toNativeArguments(normalized.args, args, keepalive);
             try {
-                return decodeScalar(normalized.result, cif.call(symbol, ...nativeArgs));
+                return fromNativeValue(normalized.result, nativeFunction(...nativeArgs));
             } finally {
                 keepalive.length = 0;
             }
         } as unknown as WrappedFunction;
         Object.defineProperty(fn, 'pointer', {
-            value: symbol.addr,
+            value: pointerAddress(nativeFunction.pointer),
             writable: false,
             enumerable: true,
             configurable: false,
@@ -355,28 +437,43 @@ export class DynamicLibrary {
         const target = typeof signatureOrCallback === 'function' ? signatureOrCallback : callback;
         if (typeof target !== 'function') invalidArg('callback', 'must be a function');
 
-        const cif = new ffi.FfiCif(
+        const nativeSignature = [
             nativeTypes[signature.result],
             ...signature.args.map(type => nativeTypes[type]),
-        );
+        ];
         let record!: CallbackRecord;
         const weakCallback = new WeakRef(target);
-        const wrapped = (...args: ArrayBuffer[]): Uint8Array => {
+        const wrapped = (...args: unknown[]): unknown => {
             const current = record.strongCallback ?? weakCallback.deref();
-            if (!current) return new Uint8Array(nativeTypes[signature.result].size);
+            if (!current) return zeroNativeResult(signature.result);
             const values = args.map((arg, index) =>
-                decodeScalar(signature.args[index], new Uint8Array(arg)) as FfiArgument
+                fromNativeValue(signature.args[index], arg) as FfiArgument
             );
-            return encodeCallbackResult(signature.result, current(...values));
+            return toNativeCallbackResult(signature.result, current(...values));
         };
-        const closure = new ffi.FfiClosure(cif, wrapped);
+        /* node26 builds signatures at runtime; callback()'s generic contract
+         * (typed per-signature args, no-Promise returns) cannot be expressed
+         * here — conversion happens in fromNativeValue/toNativeCallbackResult. */
+        const createCallback = ffi.callback as unknown as (
+            signature: readonly CModuleFFI.TypeToken[],
+            callback: (...args: unknown[]) => unknown,
+        ) => CModuleFFI.Callback;
+        const nativeCallback = createCallback(nativeSignature, wrapped);
+        const nativePointer = nativeCallback.pointer;
+        const pointer = pointerAddress(nativePointer);
         record = {
-            closure,
+            callback: nativeCallback,
+            pointer: nativePointer,
             strongCallback: target,
             weakCallback,
         };
-        this.#callbacks.set(closure.addr, record);
-        return closure.addr;
+        if (getActiveCallback(pointer)) {
+            nativeCallback.close();
+            throw new Error('FFI callback address collides with an active callback');
+        }
+        this.#callbacks.set(pointer, record);
+        activeCallbacks.set(pointer, new WeakRef(record));
+        return pointer;
     }
 
     #getCallback(pointer: bigint): CallbackRecord {
@@ -388,8 +485,10 @@ export class DynamicLibrary {
     }
 
     unregisterCallback(pointer: bigint): void {
-        this.#getCallback(pointer);
+        const record = this.#getCallback(pointer);
         this.#callbacks.delete(pointer);
+        deleteActiveCallback(pointer, record);
+        record.callback.close();
     }
 
     refCallback(pointer: bigint): void {
@@ -440,7 +539,9 @@ export function dlsym(handle: DynamicLibrary, symbol: string): bigint {
 function pointerView(pointer: bigint, offset: number, size: number): DataView {
     if (typeof pointer !== 'bigint') invalidArg('pointer', 'must be a bigint');
     if (!Number.isSafeInteger(offset)) invalidArg('offset', 'must be an integer');
-    const bytes = ffi.ptrToBuffer(pointer + BigInt(offset), size);
+    const nativePointer = pointerFromAddress(pointer + BigInt(offset));
+    if (nativePointer === null && size !== 0) throw new RangeError('Cannot access memory through a null pointer');
+    const bytes = nativePointer === null ? new Uint8Array(0) : ffi.unsafe.view(nativePointer, size);
     return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
 }
 
@@ -468,7 +569,9 @@ export function setFloat64(pointer: bigint, offset: number, value: number): void
 
 export function toString(pointer: bigint): string | null {
     if (pointer === 0n) return null;
-    return ffi.getCString(pointer);
+    const native = pointerFromAddress(pointer);
+    if (native === null) throw new TypeError('cannot read a null pointer');
+    return ffi.unsafe.readCString(native);
 }
 
 function memoryView(pointer: bigint, length: number): Uint8Array {
@@ -478,7 +581,12 @@ function memoryView(pointer: bigint, length: number): Uint8Array {
         (error as RangeError & { code?: string }).code = 'ERR_OUT_OF_RANGE';
         throw error;
     }
-    return ffi.ptrToBuffer(pointer, length);
+    const nativePointer = pointerFromAddress(pointer);
+    if (nativePointer === null) {
+        if (length === 0) return new Uint8Array(0);
+        throw new RangeError('Cannot access memory through a null pointer');
+    }
+    return ffi.unsafe.view(nativePointer, length);
 }
 
 export function toBuffer(pointer: bigint, length: number, copy = true): Buffer {
@@ -541,9 +649,9 @@ export function getRawPointer(source: ArrayBuffer | ArrayBufferView<ArrayBufferL
     if (!(source instanceof ArrayBuffer) && !ArrayBuffer.isView(source)) {
         invalidArg('source', 'must be an ArrayBuffer or ArrayBufferView');
     }
-    return ffi.getArrayBufPtr(viewBytes(source));
+    return pointerAddress(ffi.unsafe.pointerOf(source));
 }
 
 export function getCurrentEventLoop(): bigint {
-    return ffi.getCurrentEventLoop();
+    return pointerAddress(ffi.unsafe.currentEventLoop());
 }

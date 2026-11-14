@@ -1,6 +1,6 @@
 import { DOMException } from "./events";
 
-const { setTimeout, clearTimeout } = import.meta.use('timers');
+const { setTimeout, clearTimeout, unrefTimer } = import.meta.use('timers');
 
 let allowAbortSignalConstruction = false;
 
@@ -111,6 +111,10 @@ class AbortSignal extends EventTarget implements globalThis.AbortSignal {
         const id = setTimeout(() => {
             signal._abort(new DOMException('Signal timed out', 'TimeoutError'));
         }, ms);
+        // Like Deno and Node, a timeout signal is passive: it may abort work
+        // that already keeps the loop alive, but must not keep the process
+        // alive on its own.
+        unrefTimer(id);
         signal.addEventListener('abort', () => clearTimeout(id), { once: true });
 
         return signal;

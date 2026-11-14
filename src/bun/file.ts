@@ -962,7 +962,7 @@ async function writeAliasedBorrowedStream(fd: number, stream: ReadableStream): P
         while (position < written) {
             const buffer = new Uint8Array(Math.min(BUN_FILE_CHUNK_SIZE, written - position));
             const count = await stage.read(buffer, position);
-            if (count <= 0) throw new Error('Bun.write: staged input ended unexpectedly');
+            if (count === null || count <= 0) throw new Error('Bun.write: staged input ended unexpectedly');
             writeBorrowedBytes(fd, buffer.subarray(0, count));
             position += count;
         }
@@ -975,7 +975,7 @@ async function writeAliasedBorrowedStream(fd: number, stream: ReadableStream): P
         if (stage) {
             const stagePath = stage.path;
             await closeQuietly(stage);
-            await asyncfs.unlink(stagePath).catch(() => {});
+            if (stagePath !== undefined) await asyncfs.unlink(stagePath).catch(() => {});
         }
     }
 }
@@ -1006,7 +1006,7 @@ async function writeStream(
             while (position < written) {
                 const buffer = new Uint8Array(Math.min(BUN_FILE_CHUNK_SIZE, written - position));
                 const count = await stage.read(buffer, position);
-                if (count <= 0) throw new Error('Bun.write: staged input ended unexpectedly');
+                if (count === null || count <= 0) throw new Error('Bun.write: staged input ended unexpectedly');
                 await writeBytes(destination, buffer.subarray(0, count));
                 position += count;
             }
@@ -1022,7 +1022,7 @@ async function writeStream(
         if (stage) {
             const stagePath = stage.path;
             await closeQuietly(stage);
-            await asyncfs.unlink(stagePath).catch(() => {});
+            if (stagePath !== undefined) await asyncfs.unlink(stagePath).catch(() => {});
         }
     }
 }

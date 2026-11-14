@@ -1,5 +1,6 @@
 const processNative = import.meta.use('process');
 const os = import.meta.use('os');
+const signalsNative = import.meta.use('signals');
 
 const STOP_SIGNALS = ['SIGINT', 'SIGTERM'] as const;
 
@@ -124,7 +125,7 @@ function cleanupPartialFork(children: readonly ParentChild[]): void {
     for (const child of children) {
         if (!child.process || !child.active) continue;
         try {
-            child.process.kill('SIGKILL');
+            child.process.kill(signalsNative.signals.SIGKILL);
         } catch {
             // The child may already have exited.
         }
@@ -256,7 +257,7 @@ export async function runZygote(options: ZygoteOptions): Promise<ZygoteResult> {
     let shutdownTimer: ReturnType<typeof setTimeout> | undefined;
     let waitPromises: Promise<ZygoteChildResult>[] | undefined;
 
-    const signalChildren = (signal: CModuleProcess.Signal) => {
+    const signalChildren = (signal: CModuleSignals.Signal) => {
         for (const child of children) {
             if (!child.process || !child.active) continue;
             try {
@@ -270,13 +271,15 @@ export async function runZygote(options: ZygoteOptions): Promise<ZygoteResult> {
     const forceStop = () => {
         if (forced || activeCount === 0) return;
         forced = true;
-        signalChildren('SIGKILL');
+        signalChildren(signalsNative.signals.SIGKILL);
     };
 
     const beginStop = (reason: ZygoteStopReason, signal: ZygoteSignal) => {
         if (stopReason) return;
+        const signalNumber = signalsNative.signals[signal];
+        if (signalNumber === undefined) throw new Error(`unsupported signal: ${signal}`);
         stopReason = reason;
-        signalChildren(signal);
+        signalChildren(signalNumber);
         try {
             shutdownTimer = setTimeout(forceStop, validated.shutdownTimeoutMs);
         } catch {

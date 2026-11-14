@@ -8,6 +8,8 @@ import { load as loadEnv } from "jsr:@std/dotenv";
 import { join, normalize } from "jsr:@std/path";
 import { contentType } from "jsr:@std/media-types";
 
+const engine = import.meta.use('engine');
+
 globalThis.addEventListener('error', e => {
     console.error(e.error);
 });
@@ -108,7 +110,7 @@ class PtyWebSocketHandler {
                 cols: this.config.pty.cols,
                 rows: this.config.pty.rows,
             });
-            this.socket.send(new TextEncoder().encode(`\x1b[32mWelcome to CNO terminal\r\n\x1b[0m\x1b[33mrunning ${this.config.pty.shell}\x1b[0m\r\n`));
+            this.socket.send(engine.encodeString(`\x1b[32mWelcome to CNO terminal\r\n\x1b[0m\x1b[33mrunning ${this.config.pty.shell}\x1b[0m\r\n`));
 
             // 启动 PTY 输出 -> WebSocket 的流式传输
             this.startPtyToWebSocket();

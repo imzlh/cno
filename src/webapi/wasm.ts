@@ -75,7 +75,7 @@ function wrapWasmError<T>(fn: () => T): T {
 
 // Absent section name must yield [], not one zero-length buffer.
 function customSectionsByName(module: CModuleWASM.Module, sectionName: string): ArrayBuffer[] {
-    const section = wasm.moduleCustomSections(module, sectionName);
+    const section = module.customSections(sectionName);
     return Array.isArray(section) ? section : section ? [section] : [];
 }
 
@@ -87,10 +87,133 @@ type FuncrefWrapper = WasmFunctionExport & {
     [FUNCREF_INDEX]: number;
     [FUNCREF_INSTANCE]: CModuleWASM.Instance;
 };
+type ExternKind = CModuleWASM.ModuleExportDescriptor['kind'];
+type PendingExternBinding = {
+    kind: 'memory' | 'table' | 'global';
+    index: number;
+    owner: Memory | Table | Global;
+};
+type ResolvedImports = {
+    pendingBindings: PendingExternBinding[];
+    functionDescs: CModuleWASM.ImportFunctionDescriptor[];
+};
+
+function externKey(kind: ExternKind, index: number): string {
+    return `${kind}:${index}`;
+}
+
+const WASM_HEADER = [0, 0x61, 0x73, 0x6d, 1, 0, 0, 0];
+const OWNER_EXPORT_NAME = [1, 0x78]; // "x"
+
+function encodeULEB(value: number): number[] {
+    const result: number[] = [];
+    let remaining = value;
+    do {
+        let byte = remaining % 128;
+        remaining = Math.floor(remaining / 128);
+        if (remaining) byte |= 0x80;
+        result.push(byte);
+    } while (remaining);
+    return result;
+}
+
+function encodeSLEB(value: bigint): number[] {
+    const result: number[] = [];
+    let remaining = value;
+    while (true) {
+        let byte = Number(remaining & 0x7fn);
+        remaining >>= 7n;
+        const sign = (byte & 0x40) !== 0;
+        if ((remaining === 0n && !sign) || (remaining === -1n && sign)) {
+            result.push(byte);
+            return result;
+        }
+        byte |= 0x80;
+        result.push(byte);
+    }
+}
+
+function wasmSection(id: number, payload: number[]): number[] {
+    return [id, ...encodeULEB(payload.length), ...payload];
+}
+
+function wasmLimits(initial: number, maximum: number | undefined): number[] {
+    return maximum === undefined
+        ? [0, ...encodeULEB(initial)]
+        : [1, ...encodeULEB(initial), ...encodeULEB(maximum)];
+}
+
+function instantiateOwner(sections: number[][]): CModuleWASM.Instance {
+    const bytes = Uint8Array.from([...WASM_HEADER, ...sections.flat()]);
+    return wrapWasmError(() => wasm.load(bytes).instantiate());
+}
+
+function createMemoryOwner(initial: number, maximum: number | undefined): CModuleWASM.Instance {
+    return instantiateOwner([
+        wasmSection(5, [1, ...wasmLimits(initial, maximum)]),
+        wasmSection(7, [1, ...OWNER_EXPORT_NAME, 2, 0]),
+    ]);
+}
+
+function createTableOwner(
+    element: string,
+    initial: number,
+    maximum: number | undefined,
+): CModuleWASM.Instance {
+    return instantiateOwner([
+        wasmSection(4, [
+            1,
+            isFuncrefElement(element) ? 0x70 : 0x6f,
+            ...wasmLimits(initial, maximum),
+        ]),
+        wasmSection(7, [1, ...OWNER_EXPORT_NAME, 1, 0]),
+    ]);
+}
+
+function floatBytes(value: number, bits: 32 | 64): number[] {
+    const buffer = new ArrayBuffer(bits / 8);
+    const view = new DataView(buffer);
+    if (bits === 32) view.setFloat32(0, value, true);
+    else view.setFloat64(0, value, true);
+    return [...new Uint8Array(buffer)];
+}
+
+function createGlobalOwner(
+    type: string,
+    mutable: boolean,
+    value: CModuleWASM.WasmGlobalValue,
+): CModuleWASM.Instance {
+    let valueType: number;
+    let initializer: number[];
+    switch (type) {
+        case 'i32':
+            valueType = 0x7f;
+            initializer = [0x41, ...encodeSLEB(BigInt(toWasmNumber(value) | 0))];
+            break;
+        case 'i64':
+            valueType = 0x7e;
+            initializer = [0x42, ...encodeSLEB(value as bigint)];
+            break;
+        case 'f32':
+            valueType = 0x7d;
+            initializer = [0x43, ...floatBytes(toWasmNumber(value), 32)];
+            break;
+        case 'f64':
+            valueType = 0x7c;
+            initializer = [0x44, ...floatBytes(toWasmNumber(value), 64)];
+            break;
+        default:
+            throw new TypeError(`Invalid global type: '${type}'`);
+    }
+    return instantiateOwner([
+        wasmSection(6, [1, valueType, mutable ? 1 : 0, ...initializer, 0x0b]),
+        wasmSection(7, [1, ...OWNER_EXPORT_NAME, 3, 0]),
+    ]);
+}
 
 /* The element type reaches this layer from two sources with different spellings:
  * a JS-constructed Table uses the descriptor's "anyfunc" (the WebAssembly JS API
- * name), while an imported/exported one is described by wasm.getTableInfo(),
+ * name), while an imported/exported one is described by Instance.tableInfo(),
  * which reports WAMR's "funcref". Both denote a function table. */
 function isFuncrefElement(element: string): boolean {
     return element === 'anyfunc' || element === 'funcref';
@@ -105,7 +228,7 @@ function wrapFuncref(instance: CModuleWASM.Instance, funcIndex: number): Funcref
     const cached = cache.get(funcIndex);
     if (cached) return cached;
     const fn = ((...args: CModuleWASM.WasmFunctionArgument[]) =>
-        wrapWasmError(() => wasm.callFuncByIndex(instance, funcIndex, ...args))) as FuncrefWrapper;
+        wrapWasmError(() => instance.callByIndex(funcIndex, ...args))) as FuncrefWrapper;
     Object.defineProperty(fn, FUNCREF_INDEX, { value: funcIndex, enumerable: false });
     Object.defineProperty(fn, FUNCREF_INSTANCE, { value: instance, enumerable: false });
     cache.set(funcIndex, fn);
@@ -151,17 +274,38 @@ class RuntimeError extends Error {
 
 class Module {
     _native: CModuleWASM.Module;
+    #bytes: ArrayBuffer;
 
     constructor(bufferSource: BufferSource) {
-        this._native = wrapWasmError(() => wasm.parseModule(toArrayBuffer(bufferSource)));
+        /* Snapshot the caller's BufferSource: a compiled Module must never see
+         * later writes, and non-function extern resolvers need a fresh native
+         * copy per instantiation (function callbacks are instance-scoped). */
+        this.#bytes = bufferSource instanceof ArrayBuffer
+            ? bufferSource.slice(0)
+            : toArrayBuffer(bufferSource);
+        this._native = wrapWasmError(() => wasm.load(this.#bytes));
+    }
+
+    _nativeForInstantiation(): CModuleWASM.Module {
+        /* Non-function extern resolvers mutate Module state; isolate them in a
+         * fresh native copy so repeated instantiations stay independent. */
+        return this._native.imports().some(({ kind }) => kind !== 'function')
+            ? wrapWasmError(() => wasm.load(this.#bytes))
+            : this._native;
     }
 
     static exports(module: Module): WebAssembly.ModuleExportDescriptor[] {
-        return wasm.moduleExports(module._native);
+        /* Native descriptors carry full type info; the JS API exposes only name and kind. */
+        return module._native.exports().map(({ name, kind }) => ({ name, kind }));
     }
 
     static imports(module: Module): WebAssembly.ModuleImportDescriptor[] {
-        return wasm.moduleImports(module._native);
+        /* Native imports report type/link state; keep the standard shape. */
+        return module._native.imports().map(({ module: moduleName, name, kind }) => ({
+            module: moduleName,
+            name,
+            kind,
+        }));
     }
 
     static customSections(module: Module, sectionName: string): ArrayBuffer[] {
@@ -175,6 +319,7 @@ class Module {
 
 class Memory {
     _instance: CModuleWASM.Instance | null;
+    _index: number;
     _buffer: ArrayBuffer | null;
     _cachedBuffer: ArrayBuffer | null;
     _maxPages: number | undefined;
@@ -199,9 +344,10 @@ class Memory {
              * SharedArrayBuffer/atomic semantics, so fail at construction. */
             throw new TypeError('WebAssembly.Memory shared memories are not supported');
         }
-        this._instance = null;
-        this._buffer = new ArrayBuffer(initial * 65536);
-        this._cachedBuffer = this._buffer;
+        this._instance = createMemoryOwner(initial, maximum);
+        this._index = 0;
+        this._buffer = null;
+        this._cachedBuffer = null;
         this._maxPages = maximum;
     }
 
@@ -213,7 +359,7 @@ class Memory {
     get buffer(): ArrayBuffer {
         const instance = this._instance;
         if (instance) {
-            this._cachedBuffer = wasm.getMemoryBuffer(instance);
+            this._cachedBuffer = wrapWasmError(() => instance.memoryBufferAt(this._index));
             return this._cachedBuffer;
         }
         return this.localBuffer();
@@ -223,8 +369,8 @@ class Memory {
         const pages = toWasmPageCount(delta, 'delta');
         const instance = this._instance;
         if (instance) {
-            const result = wrapWasmError(() => wasm.growMemory(instance, pages));
-            this._cachedBuffer = wasm.getMemoryBuffer(instance);
+            const result = wrapWasmError(() => instance.growMemoryAt(this._index, pages));
+            this._cachedBuffer = wrapWasmError(() => instance.memoryBufferAt(this._index));
             return result;
         }
         const oldBuffer = this.localBuffer();
@@ -274,6 +420,7 @@ const MAX_TABLE_ELEMENTS = 10_000_000;
 
 class Table {
     _instance: CModuleWASM.Instance | null;
+    _index: number;
     _name: string | null;
     _element: string;
     _array: CModuleWASM.WasmTableValue[];
@@ -293,22 +440,24 @@ class Table {
         if (maximum !== undefined && maximum < initial) {
             throw new RangeError('WebAssembly.Table(): Property "maximum" is below the initial size');
         }
-        this._instance = null;
-        this._name = null;
+        this._instance = element === 'externref'
+            ? createTableOwner(element, initial, maximum)
+            : null;
+        this._index = 0;
+        this._name = this._instance ? 'x' : null;
         this._element = element;
         this._maxSize = maximum;
-        this._array = new Array(initial).fill(null);
+        this._array = this._instance ? [] : new Array(initial).fill(null);
     }
 
-    private nativeBinding(): { instance: CModuleWASM.Instance; name: string } | null {
+    private nativeBinding(): { instance: CModuleWASM.Instance; index: number } | null {
         if (!this._instance) return null;
-        if (!this._name) throw new RuntimeError('WebAssembly.Table native binding is missing its export name');
-        return { instance: this._instance, name: this._name };
+        return { instance: this._instance, index: this._index };
     }
 
     get length(): number {
         const native = this.nativeBinding();
-        if (native) return wasm.tableSize(native.instance, native.name);
+        if (native) return wrapWasmError(() => native.instance.tableSizeAt(native.index));
         return this._array.length;
     }
 
@@ -316,14 +465,15 @@ class Table {
         const tableIndex = toTableIndex(index);
         const native = this.nativeBinding();
         if (native) {
-            if (tableIndex >= wasm.tableSize(native.instance, native.name)) {
+            if (tableIndex >= native.instance.tableSizeAt(native.index)) {
                 throw new RangeError('index out of bounds');
             }
-            const raw = wasm.tableGet(native.instance, native.name, tableIndex);
-            /* A funcref slot arrives as a raw function index; the spec requires a
-             * callable. externref slots and null pass through unchanged. */
-            if (isFuncrefElement(this._element) && typeof raw === 'number') {
-                return wrapFuncref(native.instance, raw) as unknown as CModuleWASM.WasmTableValue;
+            const raw = wrapWasmError(() => native.instance.tableGetAt(native.index, tableIndex));
+            /* C returns {owner, index} for funcref slots: the defining Instance
+             * travels with the function. */
+            if (isFuncrefElement(this._element) && raw !== null) {
+                const ref = raw as unknown as CModuleWASM.WasmFuncref;
+                return wrapFuncref(ref.owner, ref.index) as unknown as CModuleWASM.WasmTableValue;
             }
             return raw;
         }
@@ -337,7 +487,7 @@ class Table {
         const tableIndex = toTableIndex(index);
         const native = this.nativeBinding();
         if (native) {
-            if (tableIndex >= wasm.tableSize(native.instance, native.name)) {
+            if (tableIndex >= native.instance.tableSizeAt(native.index)) {
                 throw new RangeError('index out of bounds');
             }
             let toStore = value;
@@ -349,9 +499,9 @@ class Table {
                     || value[FUNCREF_INSTANCE] !== native.instance) {
                     throw new TypeError('Argument 1 must be null or a WebAssembly function');
                 }
-                toStore = (value as FuncrefWrapper)[FUNCREF_INDEX] as unknown as CModuleWASM.WasmTableValue;
+                toStore = value[FUNCREF_INDEX] as unknown as CModuleWASM.WasmTableValue;
             }
-            wasm.tableSet(native.instance, native.name, tableIndex, toStore);
+            wrapWasmError(() => native.instance.tableSetAt(native.index, tableIndex, toStore));
             return;
         }
         if (tableIndex >= this._array.length) {
@@ -369,13 +519,18 @@ class Table {
         const native = this.nativeBinding();
         if (native) {
             if (isFuncrefElement(this._element) && initialValue !== null
-                && (!isFuncrefWrapper(initialValue) || initialValue[FUNCREF_INSTANCE] !== native.instance)) {
+                && (!isFuncrefWrapper(initialValue)
+                    || initialValue[FUNCREF_INSTANCE] !== native.instance)) {
                 throw new TypeError('Argument 1 must be null or a WebAssembly function');
             }
-            const grown = wasm.tableGrow(native.instance, native.name, count);
+            let toStore = initialValue;
+            if (isFuncrefElement(this._element) && initialValue !== null) {
+                const refIndex = (initialValue as FuncrefWrapper)[FUNCREF_INDEX];
+                toStore = refIndex;
+            }
+            const grown = wrapWasmError(() => native.instance.tableGrowAt(native.index, count, toStore));
             /* WAMR reports refusal as -1; the JS API specifies a RangeError. */
             if (grown < 0) throw new RangeError('failed to grow table');
-            for (let i = 0; i < count; i++) this.set(grown + i, initialValue);
             return grown;
         }
         const oldLength = this._array.length;
@@ -420,6 +575,7 @@ function toTableIndex(value: unknown): number {
 
 class Global {
     _instance: CModuleWASM.Instance | null;
+    _index: number;
     _name: string | null;
     _value: CModuleWASM.WasmGlobalValue;
     _mutable: boolean;
@@ -430,22 +586,26 @@ class Global {
             throw new TypeError(`Invalid global type: '${descriptor.value}'`);
         }
         validateGlobalValue(descriptor.value, initialValue);
-        this._instance = null;
-        this._name = null;
+        this._instance = createGlobalOwner(
+            descriptor.value,
+            descriptor.mutable,
+            coerceGlobalValue(descriptor.value, initialValue),
+        );
+        this._index = 0;
+        this._name = 'x';
         this._type = descriptor.value;
         this._mutable = descriptor.mutable;
         this._value = coerceGlobalValue(descriptor.value, initialValue);
     }
 
-    private nativeBinding(): { instance: CModuleWASM.Instance; name: string } | null {
+    private nativeBinding(): { instance: CModuleWASM.Instance; index: number } | null {
         if (!this._instance) return null;
-        if (!this._name) throw new RuntimeError('WebAssembly.Global native binding is missing its export name');
-        return { instance: this._instance, name: this._name };
+        return { instance: this._instance, index: this._index };
     }
 
     get value(): CModuleWASM.WasmGlobalValue {
         const native = this.nativeBinding();
-        if (native) return wasm.getGlobal(native.instance, native.name);
+        if (native) return wrapWasmError(() => native.instance.getGlobalAt(native.index));
         return this._value;
     }
 
@@ -455,7 +615,7 @@ class Global {
         const coerced = coerceGlobalValue(this._type, newValue);
         const native = this.nativeBinding();
         if (native) {
-            wasm.setGlobal(native.instance, native.name, coerced);
+            wrapWasmError(() => native.instance.setGlobalAt(native.index, coerced));
             return;
         }
         this._value = coerced;
@@ -509,12 +669,16 @@ class Instance {
     _exports: WasmExports;
 
     constructor(module: Module, importObject?: WasmImportObject) {
-        const nativeModule = module._native;
+        const nativeModule = module._nativeForInstantiation();
+        let pendingBindings: PendingExternBinding[] = [];
+        let functionDescs: CModuleWASM.ImportFunctionDescriptor[] = [];
         if (importObject !== undefined && (typeof importObject !== 'object' || importObject === null)) {
             throw new TypeError('WebAssembly.Instance(): Argument 1 must be an object');
         }
         if (importObject) {
-            resolveImportObject(nativeModule, importObject);
+            ({ pendingBindings, functionDescs } = resolveImportObject(
+                nativeModule, importObject,
+            ));
         } else if (requiresImportObject(nativeModule)) {
             /* A module declaring non-WASI imports cannot be instantiated with no
              * import object. Skipping resolution entirely linked it against
@@ -522,7 +686,20 @@ class Instance {
              * unbound. */
             throw new TypeError('WebAssembly.Instance(): Argument 1 must be an object');
         }
-        this._instance = wrapWasmError(() => wasm.buildInstance(nativeModule));
+        this._instance = wrapWasmError(() => nativeModule.instantiate(
+            functionDescs.length > 0 ? { functions: functionDescs } : undefined,
+        ));
+        for (const binding of pendingBindings) {
+            binding.owner._instance = this._instance;
+            binding.owner._index = binding.index;
+            if (binding.kind === 'memory') {
+                const memory = binding.owner as Memory;
+                memory._buffer = null;
+                memory._cachedBuffer = null;
+            } else if (binding.kind === 'table') {
+                (binding.owner as Table)._array = [];
+            }
+        }
         this._exports = createExports(this._instance, nativeModule);
         Object.freeze(this._exports);
     }
@@ -542,7 +719,7 @@ class Instance {
  * itself (see resolveImportObject), so they legitimately instantiate with none.
  */
 function requiresImportObject(nativeModule: CModuleWASM.Module): boolean {
-    for (const imp of wasm.moduleImports(nativeModule)) {
+    for (const imp of nativeModule.imports()) {
         if (imp.module !== 'wasi_snapshot_preview1' && imp.module !== 'wasi_unstable') {
             return true;
         }
@@ -553,12 +730,16 @@ function requiresImportObject(nativeModule: CModuleWASM.Module): boolean {
 function resolveImportObject(
     nativeModule: CModuleWASM.Module,
     importObject: WasmImportObject
-): void {
-    const imports = wasm.moduleImports(nativeModule);
+): ResolvedImports {
+    const imports = nativeModule.imports();
     const functionDescs: CModuleWASM.ImportFunctionDescriptor[] = [];
     const globalDescs: CModuleWASM.GlobalImportDescriptor[] = [];
-    const memoryDescs: { module: string; name: string; memory: Memory }[] = [];
-    const tableDescs: { module: string; name: string; table: Table }[] = [];
+    const memoryDescs: ({ module: string; name: string; memory: Memory; owner: Memory }
+        & Partial<CModuleWASM.MemoryImportDescriptor>)[] = [];
+    const tableDescs: ({ module: string; name: string; table: Table; owner: Table }
+        & Partial<CModuleWASM.TableImportDescriptor>)[] = [];
+    const pendingBindings: PendingExternBinding[] = [];
+    const standaloneImports = new WeakMap<object, { kind: ExternKind; index: number }>();
     let wasiSet = false;
 
     for (const imp of imports) {
@@ -569,7 +750,7 @@ function resolveImportObject(
         if (value === undefined) {
             if (isWasi) {
                 if (!wasiSet) {
-                    wasm.setWasiOptions(nativeModule, [], null, null);
+                    nativeModule.configureWasi({ args: [] });
                     wasiSet = true;
                 }
                 continue;
@@ -586,17 +767,32 @@ function resolveImportObject(
                         `import object field '${imp.module}.${imp.name}' is not a Function`
                     );
                 }
-                functionDescs.push({ module: imp.module, name: imp.name, func: value as CModuleWASM.ImportFunctionDescriptor['func'] });
+                functionDescs.push({
+                    module: imp.module,
+                    name: imp.name,
+                    func: value as CModuleWASM.ImportFunctionDescriptor['func'],
+                    ...(isFuncrefWrapper(value) ? {
+                        provider: value[FUNCREF_INSTANCE],
+                        sourceIndex: value[FUNCREF_INDEX],
+                        owner: value,
+                    } : {}),
+                });
                 break;
             case 'global':
                 if (value instanceof Global) {
+                    const binding = externImportBinding(
+                        value, 'global', imp.externIndex, standaloneImports,
+                    );
                     globalDescs.push({
                         module: imp.module,
                         name: imp.name,
-                        value: toGlobalImportValue(value._value),
+                        value: toGlobalImportValue(value.value),
                         type: value._type as CModuleWASM.GlobalImportDescriptor['type'],
                         mutable: value._mutable,
+                        owner: value,
+                        ...binding.descriptor,
                     });
+                    if (binding.pending) pendingBindings.push(binding.pending);
                 } else {
                     globalDescs.push({
                         module: imp.module,
@@ -613,7 +809,19 @@ function resolveImportObject(
                         `import object field '${imp.module}.${imp.name}' is not a WebAssembly.Memory`
                     );
                 }
-                memoryDescs.push({ module: imp.module, name: imp.name, memory: value });
+                {
+                    const { descriptor, pending } = externImportBinding(
+                        value, 'memory', imp.externIndex, standaloneImports,
+                    );
+                    memoryDescs.push({
+                        module: imp.module,
+                        name: imp.name,
+                        memory: value,
+                        owner: value,
+                        ...descriptor,
+                    });
+                    if (pending) pendingBindings.push(pending);
+                }
                 break;
             case 'table':
                 if (!(value instanceof Table)) {
@@ -621,26 +829,76 @@ function resolveImportObject(
                         `import object field '${imp.module}.${imp.name}' is not a WebAssembly.Table`
                     );
                 }
-                tableDescs.push({ module: imp.module, name: imp.name, table: value });
+                {
+                    const { descriptor, pending } = externImportBinding(
+                        value, 'table', imp.externIndex, standaloneImports,
+                    );
+                    tableDescs.push({
+                        module: imp.module,
+                        name: imp.name,
+                        table: value,
+                        owner: value,
+                        ...descriptor,
+                    });
+                    if (pending) pendingBindings.push(pending);
+                }
                 break;
         }
     }
 
-    if (functionDescs.length > 0) {
-        wrapWasmError(() => wasm.resolveImports(nativeModule, functionDescs));
-    }
     if (globalDescs.length > 0) {
-        wrapWasmError(() => wasm.resolveGlobalImports(nativeModule, globalDescs));
+        wrapWasmError(() => nativeModule.resolveGlobals(globalDescs));
     }
-    wrapWasmError(() => wasm.resolveMemoryImports(nativeModule, memoryDescs.map(e => ({
-        ...e, initial: 1
-    }))));
-    wrapWasmError(() => wasm.resolveTableImports(nativeModule, tableDescs.map(e => ({
-        module: e.module,
-        name: e.name,
-        element: e.table._element as 'funcref' | 'externref',
-        initial: e.table._array.length,
-    }))));
+    if (memoryDescs.length > 0) {
+        wrapWasmError(() => nativeModule.resolveMemories(memoryDescs.map(e => ({
+            ...e,
+            initial: e.memory.buffer.byteLength / 65536,
+            maximum: e.memory._maxPages,
+        }))));
+    }
+    if (tableDescs.length > 0) {
+        wrapWasmError(() => nativeModule.resolveTables(tableDescs.map(e => ({
+            ...e,
+            element: isFuncrefElement(e.table._element) ? 'funcref' : 'externref',
+            initial: e.table.length,
+            maximum: e.table._maxSize,
+            values: e.table._instance ? undefined : e.table._array,
+        }))));
+    }
+    return { pendingBindings, functionDescs };
+}
+
+function externImportBinding(
+    owner: Memory | Table | Global,
+    kind: 'memory' | 'table' | 'global',
+    importIndex: number,
+    standaloneImports: WeakMap<object, { kind: ExternKind; index: number }>,
+): {
+    descriptor: {
+        provider?: CModuleWASM.Instance;
+        sourceIndex?: number;
+        sourceImportIndex?: number;
+    };
+    pending?: PendingExternBinding;
+} {
+    if (owner._instance) {
+        return {
+            descriptor: {
+                provider: owner._instance,
+                sourceIndex: owner._index,
+            },
+        };
+    }
+    const first = standaloneImports.get(owner);
+    if (first) {
+        if (first.kind !== kind) throw new LinkError('WebAssembly extern kind mismatch');
+        return { descriptor: { sourceImportIndex: first.index } };
+    }
+    standaloneImports.set(owner, { kind, index: importIndex });
+    return {
+        descriptor: {},
+        pending: { kind, index: importIndex, owner },
+    };
 }
 
 function inferGlobalType(value: unknown): 'i32' | 'i64' | 'f32' | 'f64' {
@@ -658,52 +916,69 @@ function createExports(
     instance: CModuleWASM.Instance,
     nativeModule: CModuleWASM.Module
 ): WasmExports {
-    const exports = wasm.moduleExports(nativeModule);
+    const exports = nativeModule.exports();
     const result: WasmExports = {};
+    const cache = new Map<string, WasmExportValue>();
 
     for (const exp of exports) {
+        const imported = instance.importedExtern(exp.kind, exp.externIndex);
+        if (imported !== undefined) {
+            result[exp.name] = imported as WasmExportValue;
+            cache.set(externKey(exp.kind, exp.externIndex), imported as WasmExportValue);
+            continue;
+        }
+        const key = externKey(exp.kind, exp.externIndex);
+        const cached = cache.get(key);
+        if (cached) {
+            result[exp.name] = cached;
+            continue;
+        }
+        let exported: WasmExportValue;
         switch (exp.kind) {
             case 'function': {
-                const idx = wasm.getFuncIndex(instance, exp.name);
-                const fn = typeof idx === 'number' && idx >= 0
-                    ? wrapFuncref(instance, idx)
-                    : ((...args: CModuleWASM.WasmFunctionArgument[]) =>
-                        wrapWasmError(() => instance.callFunction(exp.name, ...args))) as WasmFunctionExport;
-                result[exp.name] = fn;
+                exported = wrapFuncref(instance, exp.externIndex);
                 break;
             }
             case 'memory': {
                 const mem: Memory = Object.create(Memory.prototype);
                 mem._instance = instance;
+                mem._index = exp.externIndex;
                 mem._buffer = null;
                 mem._cachedBuffer = null;
-                mem._maxPages = undefined;
-                result[exp.name] = mem;
+                const info = instance.memoryInfoAt(exp.externIndex);
+                mem._maxPages = info.maximumPages;
+                exported = mem;
                 break;
             }
             case 'table': {
-                const info = wasm.getTableInfo(instance, exp.name);
+                const info = instance.tableInfoAt(exp.externIndex);
                 const table: Table = Object.create(Table.prototype);
                 table._instance = instance;
+                table._index = exp.externIndex;
                 table._name = exp.name;
-                table._element = info.element;
+                /* 'unknown' is the C side's funcref placeholder for bytecode
+                 * tables; treat it as funcref like the cts compiler does. */
+                table._element = info.element === 'unknown' ? 'funcref' : info.element;
                 table._array = [];
                 table._maxSize = info.max_size || undefined;
-                result[exp.name] = table;
+                exported = table;
                 break;
             }
             case 'global': {
-                const info = wasm.getGlobalInfo(instance, exp.name);
+                const info = instance.globalInfoAt(exp.externIndex);
                 const global: Global = Object.create(Global.prototype);
                 global._instance = instance;
+                global._index = exp.externIndex;
                 global._name = exp.name;
                 global._type = info.type;
                 global._mutable = info.mutable;
-                global._value = wasm.getGlobal(instance, exp.name);
-                result[exp.name] = global;
+                global._value = instance.getGlobalAt(exp.externIndex);
+                exported = global;
                 break;
             }
         }
+        cache.set(key, exported!);
+        result[exp.name] = exported!;
     }
 
     return result;

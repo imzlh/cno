@@ -26,6 +26,7 @@ import {
     validateStdioFdRedirects,
     validateTimeout,
 } from './validate';
+import { nodeSignalName } from '../_internal/signals';
 
 export function spawnSync(command: string, options?: SpawnOptions): SpawnSyncResult;
 export function spawnSync(command: string, args?: string[], options?: SpawnOptions): SpawnSyncResult;
@@ -109,7 +110,10 @@ export function spawnSync(command: string, argsOrOptions?: string[] | SpawnOptio
         let stdoutBytes = result.stdout === null ? null : new Uint8Array(result.stdout);
         let stderrBytes = result.stderr === null ? null : new Uint8Array(result.stderr);
         let status = result.status;
-        let signal = result.signal;
+        // Node reports '' for terminations by signals outside its name table
+        // (measured: realtime signals); the native wait result carries the raw
+        // number, so translate with an empty-string fallback.
+        let signal = result.signal === null ? null : nodeSignalName(result.signal) ?? '';
         let error = result.error ? normalizeSpawnFailure(result.error, command, 'spawnSync', optsSource.cwd, args) : undefined;
 
         // Native sync spawn currently captures to completion. Keep the existing

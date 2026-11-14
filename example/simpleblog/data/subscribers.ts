@@ -1,5 +1,7 @@
 import { getAppKv } from "./posts.ts";
 
+const engine = import.meta.use('engine');
+
 export interface Subscriber {
   email: string;
   status: "active" | "unsubscribed";
@@ -12,7 +14,7 @@ const SUBSCRIBER_PREFIX: Deno.KvKey = ["subscribers"];
 async function emailKey(email: string): Promise<Deno.KvKey> {
   const digest = await crypto.subtle.digest(
     "SHA-256",
-    new TextEncoder().encode(email),
+    engine.encodeString(email),
   );
   let binary = "";
   for (const byte of new Uint8Array(digest)) {

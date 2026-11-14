@@ -92,6 +92,37 @@ function errorMessage(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
 }
 
+function createServeCompletion(): {
+    promise: Promise<void>;
+    resolve: () => void;
+    reject: (reason: unknown) => void;
+} {
+    const deferred = Promise.withResolvers<void>();
+    let settled = false;
+
+    // A client disconnect is an ordinary server event. Keep the runtime from
+    // reporting an unhandled rejection when a handler does not observe it;
+    // consumers of `promise` still receive the original rejection.
+    void deferred.promise.catch(() => {});
+
+    return {
+        promise: deferred.promise,
+        resolve() {
+            if (settled) return;
+            settled = true;
+            deferred.resolve();
+        },
+        reject(reason: unknown) {
+            if (settled) return;
+            settled = true;
+            const error = reason instanceof errors.Interrupted
+                ? reason
+                : new errors.Interrupted(errorMessage(reason), { cause: reason });
+            deferred.reject(error);
+        },
+    };
+}
+
 function reportServeError(error: unknown, url: string, phase = 'request'): void {
     try {
         console.error(`Deno.serve ${phase} error${url ? ` for ${url}` : ''}:`, error);
@@ -447,8 +478,11 @@ function serve(
                 return adapter.sendResponse(response);
             };
             const requestAbort = new AbortController();
+            const completion = createServeCompletion();
             const removeRequestCloseListener = res.onTerminalClose?.(() => {
-                requestAbort.abort(Object.assign(new Error('HTTP request peer disconnected'), { code: 'ECONNRESET' }));
+                const error = Object.assign(new Error('HTTP request peer disconnected'), { code: 'ECONNRESET' });
+                requestAbort.abort(error);
+                completion.reject(error);
             });
             try {
                 const webRequest = createWebRequest(req, {
@@ -461,7 +495,7 @@ function serve(
 
                 const connInfo: Deno.ServeHandlerInfo = {
                     remoteAddr: denoAddr,
-                    completed: Promise.resolve() // Simplified
+                    completed: completion.promise,
                 };
 
                 const webResponse = await requestHandler(webRequest, connInfo);
@@ -476,9 +510,13 @@ function serve(
                 }
                 reportRequest();
                 await sendResponse(webResponse);
+                completion.resolve();
             } catch (error) {
                 // A started response or disconnected peer cannot be recovered with another response.
-                if (requestAbort.signal.aborted || error instanceof ServeResponseWriteError || isServePeerDisconnect(error)) return;
+                if (requestAbort.signal.aborted || error instanceof ServeResponseWriteError || isServePeerDisconnect(error)) {
+                    completion.reject(error);
+                    return;
+                }
                 if (typeof options.onError !== 'function') {
                     reportServeError(error, requestUrl);
                 }
@@ -490,7 +528,9 @@ function serve(
                         headers: { 'Content-Type': 'text/plain' },
                     });
                     await sendResponse(errorResponse);
+                    completion.resolve();
                 } catch (recoveryError) {
+                    completion.reject(recoveryError);
                     if (!isServePeerDisconnect(recoveryError)) {
                         reportServeError(recoveryError, requestUrl, 'error handler');
                     }

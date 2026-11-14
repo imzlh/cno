@@ -11,6 +11,7 @@ import {
     type EnvFilePath,
 } from '../_internal/envfile';
 import path from '../path';
+import { nativeSignalFromNumber, nodeNativeSignalNumber, probeProcess, unknownSignalError } from '../_internal/signals';
 
 const { basename, isAbsolute: isAbsolutePath, join } = path;
 
@@ -108,36 +109,29 @@ function normalizeKillPid(pid: unknown): number {
     ), 'ERR_INVALID_ARG_TYPE');
 }
 
-function normalizeSignal(signal?: string | number | null): CModuleProcess.Signal | number | undefined {
+function normalizeSignal(signal?: string | number | null): CModuleSignals.Signal | undefined {
     if (signal === undefined || signal === null || signal === '') return undefined;
     if (typeof signal === 'number') {
-        // Signal 0 is a liveness probe. Preserve it for the native binding;
-        // passing `undefined` would select the default terminating signal.
-        if (signal === 0) return 0;
+        if (signal === 0) throw new RangeError('signal 0 must be handled as a process probe');
         if (Number.isNaN(signal)) return undefined;
-        if (Number.isInteger(signal)) return signal;
-        throw codeError(new TypeError(`Unknown signal: ${String(signal)}`), 'ERR_UNKNOWN_SIGNAL');
+        if (Number.isInteger(signal)) {
+            const signalNumber = nativeSignalFromNumber(signal);
+            if (signalNumber !== undefined) return signalNumber;
+            throw errMod.Error(errMod.errno.EINVAL);
+        }
+        throw unknownSignalError(signal);
     }
-    const signals = sig?.signals;
-    if (signals && typeof signals[signal] === 'number') return signals[signal];
-    throw codeError(new TypeError(`Unknown signal: ${signal}`), 'ERR_UNKNOWN_SIGNAL');
+    const signalNumber = nodeNativeSignalNumber(signal);
+    if (signalNumber !== undefined) return signalNumber;
+    throw unknownSignalError(signal);
 }
 
 const signalMap: Map<string, Map<() => void, CModuleSignals.SignalHandler>> = new Map();
 
-const UNSUPPORTED_SIGNALS = new Set(['SIGBREAK', 'SIGIOT', 'SIGPOLL', 'SIGSTKFLT', 'SIGUNUSED', 'SIGLOST', 'SIGINFO']);
-
-function throwIfUnsupportedSignal(signalName: string): void {
-    if (UNSUPPORTED_SIGNALS.has(signalName))
-        throw new Error('The requested signal is not supported.');
-}
-
 function addSignalListener(signalName: string, listener: () => void): void {
-    throwIfUnsupportedSignal(signalName);
-    if (!sig) throw new Error('signal handling is unavailable outside the main thread');
-    const sigint = sig.signals[signalName];
+    const sigint = nodeNativeSignalNumber(signalName);
     if (typeof sigint !== 'number') {
-        throw new Error(`Invalid signal: ${signalName}`);
+        throw unknownSignalError(signalName);
     }
 
     let map = signalMap.get(signalName);
@@ -154,11 +148,9 @@ function addSignalListener(signalName: string, listener: () => void): void {
 }
 
 function removeSignalListener(signalName: string, listener: () => void): void {
-    throwIfUnsupportedSignal(signalName);
-    if (!sig) throw new Error('signal handling is unavailable outside the main thread');
-    const sigint = sig.signals[signalName];
+    const sigint = nodeNativeSignalNumber(signalName);
     if (typeof sigint !== 'number') {
-        throw new Error(`Invalid signal: ${signalName}`);
+        throw unknownSignalError(signalName);
     }
 
     const map = signalMap.get(signalName);
@@ -1391,7 +1383,9 @@ export let channel: IPCChannel | null = null;
 
 export function kill(pid: number, signal?: string | number | null): boolean {
     try {
-        proc.kill(normalizeKillPid(pid), normalizeSignal(signal));
+        const normalizedPid = normalizeKillPid(pid);
+        if (signal === 0) probeProcess(normalizedPid);
+        else proc.kill(normalizedPid, normalizeSignal(signal));
     } catch (e) {
         throw normalizeErrnoError(e, 'kill');
     }

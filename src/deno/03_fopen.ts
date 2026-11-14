@@ -157,7 +157,7 @@ export class FsFile implements Deno.FsFile {
     private writeOffsetSync(): number {
         this.assertOpen();
         if (!this.$append) return this.fpointer;
-        return fs.lstat(this.$handle.path).size;
+        return fs.fstat(this.$handle.fileno()).size;
     }
 
     private readTtySync(p: Uint8Array): number | null {
@@ -266,7 +266,7 @@ export class FsFile implements Deno.FsFile {
     @wrap
     statSync(): Deno.FileInfo {
         this.assertOpen();
-        const stat = fs.stat(this.$handle.path);
+        const stat = fs.fstat(this.$handle.fileno());
         return toDenoStat(stat);
     }
 
@@ -282,7 +282,7 @@ export class FsFile implements Deno.FsFile {
     @wrap
     seekSync(offset: number | bigint, whence: Deno.SeekMode): number {
         this.assertOpen();
-        const size = whence === Deno.SeekMode.End ? fs.lstat(this.$handle.path).size : 0;
+        const size = whence === Deno.SeekMode.End ? fs.fstat(this.$handle.fileno()).size : 0;
         this.fpointer = seekPosition(size, this.fpointer, offset, whence);
         return this.fpointer;
     }
@@ -296,7 +296,7 @@ export class FsFile implements Deno.FsFile {
     @wrap
     syncData(): Promise<void> {
         this.assertOpen();
-        return this.$handle.datasync();
+        return this.$handle.sync(true);
     }
 
     @wrap
@@ -412,6 +412,7 @@ function openFsFile(
     const read = !options || options.read === true;
     let tty: CModuleStreams.TTY | undefined;
     let ttyFd: number | undefined;
+    let handle: CModuleAsyncFS.FileHandle | undefined;
     try {
         if (os.guessHandle(fno) === 'tty') {
             ttyFd = fs.open(pathStr, flag, mode);
@@ -421,14 +422,20 @@ function openFsFile(
                 ttyFd = undefined;
             }
         }
-        const handle = asfs.newStdioFile(pathStr, fno);
+        handle = asfs.createFrom(fno, pathStr);
         return new FsFile(handle, !!options?.append, read, !!options?.write || !!options?.append, fsFileToken, tty);
     } catch (e) {
         try { tty?.close(); } catch {}
         if (!tty && ttyFd !== undefined) {
             try { fs.close(ttyFd); } catch {}
         }
-        try { fs.close(fno); } catch {}
+        if (handle) {
+            // createFrom transferred fd ownership to the handle; close through
+            // it. A second fs.close(fno) here would close a recycled fd.
+            try { handle.close(); } catch {}
+        } else {
+            try { fs.close(fno); } catch {}
+        }
         throw e;
     }
 }

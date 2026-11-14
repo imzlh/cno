@@ -156,7 +156,9 @@ export class WASI {
     private _stderr: number;
 
     private _memory: DataView | null = null;
-    private _memBuf: ArrayBuffer | SharedArrayBuffer | null = null;
+    /* Live memory source; its buffer is re-derived per access because growth
+     * detaches any previously cached copy. */
+    private _memSource: CModuleWASM.Instance | WebAssembly.Memory | null = null;
     private _started = false;
     /* dirfd -> { guest mount name, host directory }. Populated from _preopens. */
     private _preopenFds = new Map<number, { guestName: string; hostPath: string }>();
@@ -172,30 +174,32 @@ export class WASI {
         const native = this._getNativeInstance(instance);
         if (native) {
             if (!wasm) throw createWasiError('ERR_WASI_NO_WASM', 'WASM support is not available in this build');
-            this._memBuf = wasm.getMemoryBuffer(native);
+            this._memSource = native;
         } else {
             const mem = instance.exports.memory;
-            this._memBuf = mem instanceof WebAssembly.Memory ? mem.buffer : null;
+            this._memSource = mem instanceof WebAssembly.Memory ? mem : null;
         }
-        this._memory = this._memBuf ? new DataView(this._memBuf) : null;
+        this._memory = null;
     }
 
-    private _refresh(): void {
-        if (this._memBuf && this._memory?.buffer !== this._memBuf) {
-            this._memory = new DataView(this._memBuf);
-        }
+    private _currentBuffer(): ArrayBuffer | SharedArrayBuffer | null {
+        if (!this._memSource) return null;
+        return this._memSource instanceof WebAssembly.Memory
+            ? this._memSource.buffer
+            : this._memSource.memoryBuffer();
     }
 
     private _memoryView(): DataView {
-        this._refresh();
-        if (!this._memory) throw createWasiError('ERR_WASI_MEMORY_NOT_SET', 'WASI memory has not been bound');
+        const buf = this._currentBuffer();
+        if (!buf) throw createWasiError('ERR_WASI_MEMORY_NOT_SET', 'WASI memory has not been bound');
+        if (!this._memory || this._memory.buffer !== buf) this._memory = new DataView(buf);
         return this._memory;
     }
 
-    private _memoryBuffer(): SharedArrayBuffer | ArrayBuffer {
-        this._refresh();
-        if (!this._memBuf) throw createWasiError('ERR_WASI_MEMORY_NOT_SET', 'WASI memory has not been bound');
-        return this._memBuf;
+    private _memoryBuffer(): ArrayBuffer | SharedArrayBuffer {
+        const buf = this._currentBuffer();
+        if (!buf) throw createWasiError('ERR_WASI_MEMORY_NOT_SET', 'WASI memory has not been bound');
+        return buf;
     }
 
     private _u32(ptr: number): number { return this._memoryView().getUint32(ptr, true); }
@@ -294,16 +298,6 @@ export class WASI {
         this.wasiImport = this._createWasiBindings();
     }
 
-    private _configureWasi(nativeModule: CModuleWASM.Module): void {
-        if (!wasm) return;
-        wasm.setWasiOptions(
-            nativeModule,
-            this._args,
-            this._env,
-            this._preopens,
-        );
-    }
-
     start(instance: WebAssembly.Instance): number {
         if (this._started) {
             throw createWasiError('ERR_WASI_ALREADY_STARTED', 'WASI instance has already started');
@@ -313,7 +307,7 @@ export class WASI {
         }
         /* node validates the command-module contract before running anything:
          * the instance must export a memory, and `_start` must be a function.
-         * Without these, a reactor module (no `_start`) reached callFunction and
+         * Without these, a reactor module (no `_start`) reached Instance.call() and
          * surfaced as the ordinary returnOnExit code 1 -- indistinguishable from
          * a guest that really did exit 1. */
         if (!(instance.exports.memory instanceof WebAssembly.Memory)) {
@@ -331,7 +325,7 @@ export class WASI {
             return this._startFallback(instance);
         }
         try {
-            nativeInstance.callFunction('_start');
+            nativeInstance.call('_start');
             return 0;
         } catch (e: unknown) {
             if (this._returnOnExit && isReturnOnExit(e)) {
@@ -364,7 +358,7 @@ export class WASI {
             return;
         }
         if (typeof instance.exports._initialize === 'function') {
-            nativeInstance.callFunction('_initialize');
+            nativeInstance.call('_initialize');
         }
     }
 
@@ -575,7 +569,7 @@ export class WASI {
         bindings.fd_prestat_dir_name = (fd: number, pathPtr: number, pathLen: number): number => {
             const entry = this._preopenFds.get(fd);
             if (!entry) return WASI_EBADF;
-            const bytes = new TextEncoder().encode(entry.guestName);
+            const bytes = engine.encodeString(entry.guestName);
             if (bytes.length > pathLen) return WASI_ENOTCAPABLE;
             this._bytes(pathPtr, bytes.length).set(bytes);
             return 0;
@@ -585,7 +579,7 @@ export class WASI {
     }
 
     private _utf8len(s: string): number {
-        return new TextEncoder().encode(s).length;
+        return engine.encodeString(s).length;
     }
 
     /*

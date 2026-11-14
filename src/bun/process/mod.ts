@@ -10,6 +10,7 @@ import {
     syncInput,
 } from './options';
 import { FileSink, copyInputBytes, isBufferInput, pipeInput, readablePipe } from './streams';
+import { nativeSignalFromNumber, nativeSignalName, nodeNativeSignalNumber, probeProcess, unknownSignalError } from '../../utils/signals';
 import type {
     BunProcessResourceUsage,
     BunSignal,
@@ -22,7 +23,6 @@ import type {
 } from './types';
 
 const processBinding = import.meta.use('process');
-const signalsBinding = import.meta.use('signals');
 
 function nativeOptions(options: ParsedSpawnOptions, stdinPipe: boolean): CModuleProcess.SpawnOptions<false> {
     return {
@@ -59,10 +59,13 @@ function inputStream(value: StaticInput): ReadableStream<Uint8Array> {
     throw new TypeError('Unsupported Bun.spawn stdin source');
 }
 
-function signalExitCode(signal: string): number {
-    const signalNumber = signalsBinding?.signals[signal];
-    // The native binding always reports canonical signal names here.
-    return 128 + (typeof signalNumber === 'number' ? signalNumber : 0);
+function toNativeSignal(signal?: BunSignal): CModuleSignals.Signal | undefined {
+    if (signal === undefined) return undefined;
+    const signalNumber = typeof signal === 'number'
+        ? nativeSignalFromNumber(signal)
+        : nodeNativeSignalNumber(signal);
+    if (typeof signalNumber !== 'number') throw unknownSignalError(signal);
+    return signalNumber;
 }
 
 function callbackFailure(error: unknown): void {
@@ -117,13 +120,13 @@ class SubprocessImpl {
         this.#exited = native.wait().then((info) => {
             this.#finished = true;
             if (info.term_signal) {
-                this.#signalCode = info.term_signal as BunSignal;
+                this.#signalCode = nativeSignalName(info.term_signal) as BunSignal | null;
                 this.#exitCode = null;
             } else {
                 this.#exitCode = info.exit_status;
             }
             // libuv reports exit_status=0 for an asynchronously signalled process.
-            const code = info.term_signal ? signalExitCode(info.term_signal) : this.#exitCode!;
+            const code = info.term_signal ? 128 + info.term_signal : this.#exitCode!;
             if (onExit) {
                 try {
                     const result = Reflect.apply(onExit, this, [this, this.#exitCode, this.#signalCode, undefined]);
@@ -152,13 +155,17 @@ class SubprocessImpl {
                 const step = Math.min(remaining, MAX_TIMER_DELAY);
                 timeout = setTimeout(() => {
                     if (remaining > step) arm(remaining - step);
-                    else this.kill(options.killSignal);
+                    else {
+                        try { this.kill(options.killSignal); } catch (error) { callbackFailure(error); }
+                    }
                 }, step);
             };
             arm(options.timeout);
         }
         const abort = options.signal
-            ? () => this.kill(options.killSignal)
+            ? () => {
+                try { this.kill(options.killSignal); } catch (error) { callbackFailure(error); }
+            }
             : undefined;
         options.signal?.addEventListener('abort', abort!, { once: true });
         void this.#exited.finally(() => {
@@ -168,7 +175,7 @@ class SubprocessImpl {
 
         if (staticInput && nativeSink) {
             void pipeInput(inputStream(options.stdin as StaticInput), nativeSink).catch(() => {
-                this.kill(options.killSignal);
+                try { this.kill(options.killSignal); } catch (error) { callbackFailure(error); }
             });
         }
     }
@@ -189,7 +196,11 @@ class SubprocessImpl {
 
     kill(signal?: BunSignal): void {
         if (this.#finished) return;
-        this.#native.kill(signal as CModuleProcess.Signal | number | undefined);
+        if (signal === 0) {
+            probeProcess(this.#pid);
+            return;
+        }
+        this.#native.kill(toNativeSignal(signal));
     }
 
     ref(): void {
@@ -272,7 +283,7 @@ function spawnSyncImpl(input: unknown, options?: unknown): BunSyncSubprocess {
     }
     if (result.error) throw normalizeErrnoError(result.error, 'posix_spawn', command);
 
-    const signalCode = result.signal as BunSignal | null;
+    const signalCode = nativeSignalName(result.signal) as BunSignal | null;
     const exitCode = signalCode === null ? (result.status ?? 0) : null;
     const output: Record<string, unknown> = { exitCode };
     if (signalCode !== null) output.signalCode = signalCode;

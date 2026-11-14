@@ -1,6 +1,7 @@
 import { malloc } from "../utils/malloc";
 import { osShell } from "../utils/platform";
 import { wrapFSErr } from "../utils/wrap";
+import { nativeSignalFromNumber, nativeSignalName, nativeSignalNumber, probeProcess } from "../utils/signals";
 
 const process = import.meta.use('process');
 const os = import.meta.use('os');
@@ -81,7 +82,7 @@ class PtyProcess implements CNO.PtyPipe {
         this.#writable = pipeToWritable(this.#proc.writable);
         this.#wait = this.#proc.wait().then(res => ({
             exitStatus: res.exit_status,
-            termSignal: res.term_signal,
+            termSignal: nativeSignalName(res.term_signal),
         }));
     }
 
@@ -89,7 +90,17 @@ class PtyProcess implements CNO.PtyPipe {
     get readable(): ReadableStream<Uint8Array> { return this.#readable; }
     get writable(): WritableStream<Uint8Array> { return this.#writable; }
 
-    kill(signal: CNO.Signal = 'SIGINT') { this.#proc.kill(signal); }
+    kill(signal: CNO.Signal | number = 'SIGINT') {
+        if (signal === 0) {
+            probeProcess(this.#proc.pid);
+            return;
+        }
+        const nativeSignal = typeof signal === 'number'
+            ? nativeSignalFromNumber(signal)
+            : nativeSignalNumber(signal);
+        if (nativeSignal === undefined) throw new TypeError(`Invalid signal: ${signal}`);
+        this.#proc.kill(nativeSignal);
+    }
     resize(cols: number, rows: number) { this.#proc.resize(cols, rows); }
     getwinsize(): CNO.WinSize { return this.#proc.getwinsize; }
     wait(): Promise<CNO.ExitInfo> { return this.#wait; }

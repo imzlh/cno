@@ -289,10 +289,10 @@ function decompressionFormat(defaultFormat: 'raw' | 'gzip', bits: number | undef
 
 function createInflate(format: InflateFormat): InflateHandle {
     switch (format) {
-        case 'raw': return zlib.createInflateRaw();
-        case 'zlib': return zlib.createInflate();
-        case 'gzip': return zlib.createGunzip();
-        case 'auto': return zlib.createUnzip();
+        case 'raw': return new zlib.InflateRaw();
+        case 'zlib': return new zlib.Inflate();
+        case 'gzip': return new zlib.Gunzip();
+        case 'auto': return new zlib.Unzip();
     }
 }
 

@@ -18,6 +18,7 @@ import {
     waitStreamEnd,
 } from './_shared';
 import type { ChildProcess as ChildProcessInterface, SpawnOptions } from './types';
+import { nodeSignalName, probeProcess } from '../_internal/signals';
 
 export type ChildProcess = ChildProcessInterface;
 
@@ -301,8 +302,9 @@ ChildProcessImpl.prototype._waitExit = async function _waitExit(this: ChildProce
         const exitCode = info.term_signal ? null : info.exit_status;
         this._exitCode = exitCode;
         this.exitCode = exitCode;
-        this._signalCode = info.term_signal;
-        this.signalCode = info.term_signal;
+        const signalCode = nodeSignalName(info.term_signal);
+        this._signalCode = signalCode;
+        this.signalCode = signalCode;
 
         // Exit listeners must observe destroyed stdin before its deferred close.
         destroyChildStdin(this._stdin);
@@ -333,18 +335,27 @@ ChildProcessImpl.prototype.kill = function kill(this: ChildProcessImpl, signal?:
     if (this._killed || !this._process) return false;
     if (this._exitCode !== null || this._signalCode !== null) return false;
 
+    if (signal === 0) {
+        try {
+            probeProcess(this.pid);
+            // Node marks a successful kill(0) probe as publicly "killed", but
+            // it must not arm our internal guard: a later real signal remains valid.
+            this.killed = true;
+            return true;
+        } catch {
+            return false;
+        }
+    }
     const signum = transformSignal(signal);
-    // kill(0) is a liveness probe in Node: it must not arm the "already killed"
-    // guard, and must never fall through to the native SIGTERM default.
-    if (signum !== 0) this._killed = true;
+    this._killed = true;
     this.killed = true;
 
     try {
         this._process.kill(signum);
         return true;
     } catch (err) {
-        // Unsupported-signal fallback, matching Node. kill(0) must stay a probe.
-        if (signum !== 0 && isUnsupportedSignalError(err)) {
+        // Unsupported-signal fallback, matching Node.
+        if (isUnsupportedSignalError(err)) {
             try {
                 this._process.kill(transformSignal('SIGKILL'));
                 return true;

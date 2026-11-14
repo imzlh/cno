@@ -56,20 +56,20 @@ const IPV6_DROP_MEMBERSHIP = _isLinux ? 21 : 13;
 function ipOpt(self: Socket, v4: number, v6: number): [number, number] {
     return self._type === 'udp6'
         ? [IPPROTO_IPV6, v6]
-        : [sock.defines.IPPROTO_IP, v4];
+        : [sock.IPPROTO_IP, v4];
 }
 
-// Paths to a PosixSocket from UDP's fd. We cache the fd at init time since
-// fileno() is async but socket options are set via sync methods
-function _getFd(handle: CModuleUDP.UDP): number {
+// Bridge UDP's native descriptor into the synchronous Socket wrapper used for
+// socket options. On Windows the descriptor is a pointer-width bigint.
+function _getFd(handle: CModuleUDP.UDP): CModuleUDP.SocketDescriptor {
     return handle.fileno();
 }
 
-function _getSocket(handle: CModuleUDP.UDP): CModuleSocket.PosixSocket | null {
+function _getSocket(handle: CModuleUDP.UDP): CModuleSocket.Socket | null {
     const fd = _getFd(handle);
-    if (fd < 0) return null;
+    if (typeof fd === 'number' && fd < 0) return null;
     try {
-        return sock.socket_from_fd(fd);
+        return sock.createFrom(fd);
     } catch {
         return null;
     }
@@ -134,7 +134,7 @@ function healthCheck(self: Socket): CModuleUDP.UDP {
  * socket. uv_udp_set_membership and the buffer-size calls deferred-bind instead,
  * so they must NOT go through here.
  */
-function boundOptionSocket(self: Socket, syscall: string): CModuleSocket.PosixSocket {
+function boundOptionSocket(self: Socket, syscall: string): CModuleSocket.Socket {
     healthCheck(self);
     if (!self._materialized) throw errnoError('EBADF', syscall);
     const handle = self._handle;
@@ -143,7 +143,7 @@ function boundOptionSocket(self: Socket, syscall: string): CModuleSocket.PosixSo
     return s;
 }
 
-function applySockOpt(s: CModuleSocket.PosixSocket, syscall: string, level: number, option: number, value: Uint8Array): void {
+function applySockOpt(s: CModuleSocket.Socket, syscall: string, level: number, option: number, value: Uint8Array): void {
     try {
         s.setopt(level, option, value);
     } catch (err) {
@@ -698,7 +698,7 @@ Socket.prototype.remoteAddress = function remoteAddress(this: Socket): AddressIn
 };
 
 Socket.prototype.setBroadcast = function setBroadcast(this: Socket, flag: boolean): void {
-    setSockOpt(this, 'setBroadcast', sock.defines.SOL_SOCKET, sock.defines.SO_BROADCAST, uint32le(flag ? 1 : 0));
+    setSockOpt(this, 'setBroadcast', sock.SOL_SOCKET, sock.SO_BROADCAST, uint32le(flag ? 1 : 0));
 };
 
 Socket.prototype.setTTL = function setTTL(this: Socket, ttl: number): number {
@@ -737,7 +737,7 @@ Socket.prototype.setMulticastInterface = function setMulticastInterface(this: So
             validateString(multicastInterface, 'interfaceAddress');
             packIPv4(addr, 0, multicastInterface);
         }
-        setSockOpt(this, 'setMulticastInterface', sock.defines.IPPROTO_IP, IP_MULTICAST_IF, addr);
+        setSockOpt(this, 'setMulticastInterface', sock.IPPROTO_IP, IP_MULTICAST_IF, addr);
     }
 };
 
@@ -802,7 +802,7 @@ Socket.prototype.dropSourceSpecificMembership = function dropSourceSpecificMembe
  * INVALID, the call fails with ENOTSOCK, and Node rewraps it as
  * ERR_SOCKET_BUFFER_SIZE. This must not bind.
  */
-function bufferSizeSocket(self: Socket, syscall: string): CModuleSocket.PosixSocket {
+function bufferSizeSocket(self: Socket, syscall: string): CModuleSocket.Socket {
     const handle = healthCheck(self);
     if (!self._materialized) throw bufferSizeError('ENOTSOCK', syscall);
     const s = _getSocket(handle);
@@ -815,14 +815,14 @@ function bufferSizeError(code: string, syscall: string): NodeJS.ErrnoException {
 }
 
 const BUFFER_SIZE_OPTIONS = {
-    recv: { syscall: 'uv_recv_buffer_size', option: sock.defines.SO_RCVBUF, field: '_recvBufferSize' },
-    send: { syscall: 'uv_send_buffer_size', option: sock.defines.SO_SNDBUF, field: '_sendBufferSize' },
+    recv: { syscall: 'uv_recv_buffer_size', option: sock.SO_RCVBUF, field: '_recvBufferSize' },
+    send: { syscall: 'uv_send_buffer_size', option: sock.SO_SNDBUF, field: '_sendBufferSize' },
 } as const;
 
 function readBufferSize(self: Socket, { syscall, option }: typeof BUFFER_SIZE_OPTIONS[keyof typeof BUFFER_SIZE_OPTIONS]): number {
     const s = bufferSizeSocket(self, syscall);
     try {
-        const val = s.getopt(sock.defines.SOL_SOCKET, option, 4);
+        const val = s.getopt(sock.SOL_SOCKET, option, 4);
         return new DataView(val.buffer, val.byteOffset, val.byteLength).getUint32(0, true);
     } catch (err) {
         throw bufferSizeError(sockErrCode(err, syscall), syscall);
@@ -832,7 +832,7 @@ function readBufferSize(self: Socket, { syscall, option }: typeof BUFFER_SIZE_OP
 function writeBufferSize(self: Socket, { syscall, option, field }: typeof BUFFER_SIZE_OPTIONS[keyof typeof BUFFER_SIZE_OPTIONS], size: number): void {
     const s = bufferSizeSocket(self, syscall);
     try {
-        s.setopt(sock.defines.SOL_SOCKET, option, uint32le(size));
+        s.setopt(sock.SOL_SOCKET, option, uint32le(size));
     } catch (err) {
         throw bufferSizeError(sockErrCode(err, syscall), syscall);
     }

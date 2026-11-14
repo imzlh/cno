@@ -1,7 +1,6 @@
 // Internal to the module: nothing here is part of the public surface.
 
 const os = import.meta.use('os');
-const signals = import.meta.use('signals');
 const engine = import.meta.use('engine');
 
 import { Readable, Writable, type Duplex } from '../stream';
@@ -9,6 +8,7 @@ import { addReadableLength, decoderBytes, flowReadable, scheduleReadableEmit, sc
 import { viewToUint8Array } from '../_internal/buffer';
 import { normalizeErrnoError } from '../_internal/errno';
 import { Buffer } from '../buffer';
+import { nativeSignalFromNumber, nodeNativeSignalNumber, unknownSignalError } from '../_internal/signals';
 export { flattenPrototype } from '../_internal/prototype';
 
 export function asError(error: unknown, syscall?: string, path?: string): Error {
@@ -117,17 +117,16 @@ export function stdioChunkBytes(chunk: unknown): Uint8Array {
 
 // Node uppercases the signal name before looking it up and reports an unknown
 // name as ERR_UNKNOWN_SIGNAL.
-export function transformSignal(signal?: string | number): number | undefined {
+export function transformSignal(signal?: string | number): CModuleSignals.Signal | undefined {
     if (signal === undefined || signal === null) return;
     if (typeof signal === 'string') {
-        if (!signals) throw new Error('signal handling is unavailable outside the main thread');
-        const signalNumber = signals.signals[signal] ?? signals.signals[signal.toUpperCase()];
-        if (typeof signalNumber !== 'number') {
-            throw Object.assign(new TypeError(`Unknown signal: ${signal}`), { code: 'ERR_UNKNOWN_SIGNAL' });
-        }
+        const signalNumber = nodeNativeSignalNumber(signal) ?? nodeNativeSignalNumber(signal.toUpperCase());
+        if (typeof signalNumber !== 'number') throw unknownSignalError(signal);
         return signalNumber;
     }
-    return signal;
+    const signalNumber = nativeSignalFromNumber(signal);
+    if (signalNumber === undefined) throw unknownSignalError(signal);
+    return signalNumber;
 }
 
 // Buffer owns Node's encoding table; retain allocation-free UTF fast paths.

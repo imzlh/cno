@@ -7,6 +7,8 @@ import type { ISong, ISongDetail, IAlbum, IArtist, IPlaylist } from "./api/types
 export type { ISong, ISongDetail, IAlbum, IArtist, IPlaylist };
 export { api, setCookie, getCookie };
 
+const engine = import.meta.use('engine');
+
 // ─── Logger (CLI) ────────────────────────────────────────────────────────────
 
 export const colors = {
@@ -224,7 +226,7 @@ export class DownloadEngine {
 
             const args = this.buildFFmpegArgs(tmpAudio, outputPath, song, tmpCover);
             const result = await new Deno.Command("ffmpeg", { args, stdout: "piped", stderr: "piped" }).output();
-            if (!result.success) throw new Error(new TextDecoder().decode(result.stderr));
+            if (!result.success) throw new Error(engine.decodeString(result.stderr));
 
             if (lyric?.data?.lrc?.lyric) {
                 const lrcPath = `${dir}${songName}.lrc`;

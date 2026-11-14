@@ -3,6 +3,7 @@ import { bytesToArrayBuffer, concatChunks } from "../utils/bytes";
 import { malloc } from "../utils/malloc";
 import { join, resolvePath, toFsPath } from "../utils/path";
 import { isWindows } from "../utils/platform";
+import { nativeSignalFromNumber, nativeSignalName, probeProcess } from "../utils/signals";
 import { wrapFsClassDec as wrap, wrapFSns } from "../utils/wrap";
 import { ReadableStream } from "../webapi/streams";
 import { closeStreamQuietly, useWritable } from "./utils/pipe-streams";
@@ -53,28 +54,26 @@ function isDenoSignal(value: string): value is Deno.Signal {
 
 // Windows has no signals: TerminateProcess yields a plain exit code, so upstream
 // Deno always reports `signal: null` and the raw status there.
-function toDenoSignal(value: string | null): Deno.Signal | null {
+function toDenoSignal(value: CModuleSignals.Signal | null): Deno.Signal | null {
     if (isWindows) return null;
-    return value !== null && isDenoSignal(value) ? value : null;
+    const name = nativeSignalName(value);
+    return name !== null && isDenoSignal(name) ? name : null;
 }
 
-function commandCode(exitStatus: number | null | undefined, termSignal: string | null | undefined): number {
-    const denoSignal = termSignal ? toDenoSignal(termSignal) : null;
-    if (denoSignal !== null) {
-        const nativeName = signalAliases[denoSignal] ?? denoSignal;
-        const signalNumber = signal?.signals[nativeName];
-        if (typeof signalNumber === 'number') return 128 + signalNumber;
-    }
+function commandCode(exitStatus: number | null | undefined, termSignal: CModuleSignals.Signal | null | undefined): number {
+    if (!isWindows && termSignal !== null && termSignal !== undefined) return 128 + termSignal;
     return exitStatus ?? 0;
 }
 
-function normalizeSignal(signo?: number | Deno.Signal): number | undefined {
+function normalizeSignal(signo?: number | Deno.Signal): CModuleSignals.Signal | undefined {
     if (signo === undefined) return undefined;
     if (typeof signo === 'number') {
         if (!Number.isInteger(signo) || signo < 0 || signo > 0xffffffff) {
             throw new TypeError('data did not match any variant of untagged enum SignalArg');
         }
-        return signo;
+        const signalNumber = nativeSignalFromNumber(signo);
+        if (signalNumber === undefined) throw new TypeError('EINVAL: Invalid argument');
+        return signalNumber;
     }
 
     const name = signalAliases[signo] ?? signo;
@@ -257,6 +256,10 @@ export class ChildProcess implements Deno.ChildProcess {
     @wrap
     kill(signo?: Deno.Signal | number): void {
         if (this.#finished) throw new TypeError('Child process has already terminated');
+        if (signo === 0) {
+            probeProcess(this.#pid);
+            return;
+        }
         this.#proc.kill(normalizeSignal(signo));
     }
 
@@ -477,6 +480,10 @@ class Command implements Deno.Command {
 
 const processFunctions = wrapFSns({
     kill(pid: number, signo?: number | Deno.Signal): void {
+        if (signo === 0) {
+            probeProcess(pid);
+            return;
+        }
         proc.kill(pid, normalizeSignal(signo));
     },
 
