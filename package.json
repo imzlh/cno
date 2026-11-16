@@ -19,7 +19,6 @@
   "keywords": [],
   "author": "",
   "license": "MIT",
-  "packageManager": "pnpm@10.17.1",
   "dependencies": {
     "@cnojs/http": "workspace:../http",
     "@formatjs/intl": "^4.0.6",
