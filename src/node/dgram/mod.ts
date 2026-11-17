@@ -2,6 +2,8 @@
  * Node.js dgram module, over CModuleUDP for UDP datagrams.
  */
 
+import { errMsg } from '../../utils/error';
+
 const udp = import.meta.use('udp');
 const os = import.meta.use('os');
 const sock = import.meta.use('socket');
@@ -183,7 +185,7 @@ const WSA_TO_UV: Record<number, string> = {
 function sockErrCode(err: unknown, syscall: string): string {
     const normalized = toErrnoException(err, syscall);
     if (normalized.code && normalized.code !== 'UNKNOWN') return normalized.code;
-    const message = err instanceof Error ? err.message : String(err);
+    const message = errMsg(err);
     const match = /WSA error (\d+)/.exec(message);
     if (match) {
         const mapped = WSA_TO_UV[Number(match[1])];

@@ -9,6 +9,7 @@ import { createContext as createVmContext, runInContext } from '../vm/mod';
 import * as readline from '../readline/mod';
 import { builtinModules as moduleBuiltinModules } from '../module/mod';
 import { inspect } from '../util/mod';
+import { errMsg } from '../../utils/error';
 
 export interface ReplOptions {
     prompt?: string;
@@ -260,7 +261,7 @@ export class REPLServer extends EventEmitter {
                 return;
             }
             this._buffered = '';
-            const message = error instanceof Error ? error.message : String(error);
+            const message = errMsg(error);
             writeOutput(this.output, `${message}\n`);
         }
         this.displayPrompt();

@@ -12,6 +12,7 @@ import { createWebSocketFromConnection } from "../webapi/websocket";
 import { createSwitchingProtocolsResponse, getResponseInitiatorCallFrames, setResponseInitiatorCallFrames } from '../webapi/fetch/server-response';
 import { truncateHookPostData } from '../webapi/fetch/helpers';
 import { wrapFsClassDec as wrap, wrapFSErr, wrapFSns } from "../utils/wrap";
+import { errMsg } from "../utils/error";
 import { errors } from './01_errors';
 import { getServeHook, captureUserNetworkCallFrames, type NetworkCallFrame } from '../utils/network-hooks';
 import type { ISocket } from "@cnojs/http/socket";
@@ -88,10 +89,6 @@ function serveTs(): number {
     return Date.now() / 1000;
 }
 
-function errorMessage(error: unknown): string {
-    return error instanceof Error ? error.message : String(error);
-}
-
 function createServeCompletion(): {
     promise: Promise<void>;
     resolve: () => void;
@@ -117,7 +114,7 @@ function createServeCompletion(): {
             settled = true;
             const error = reason instanceof errors.Interrupted
                 ? reason
-                : new errors.Interrupted(errorMessage(reason), { cause: reason });
+                : new errors.Interrupted(errMsg(reason), { cause: reason });
             deferred.reject(error);
         },
     };
@@ -333,7 +330,7 @@ class ResponseAdapter {
             removeCloseListener?.();
             await this.coreRes.end();
         } catch (err) {
-            const message = errorMessage(err);
+            const message = errMsg(err);
             this.emitFinished(false, message);
             await cancelBody(err);
             this.coreRes.close();

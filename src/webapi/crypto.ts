@@ -1,4 +1,5 @@
 import { DOMException } from "./events";
+import { errMsg } from "../utils/error";
 
 const crypto = import.meta.use('crypto');
 const algo = import.meta.use('algorithm');
@@ -413,7 +414,7 @@ function validateKeyUsages(
 
 function operationError(error: unknown, fallback: string): DOMException {
     if (error instanceof DOMException) return error;
-    const message = error instanceof Error ? error.message : String(error);
+    const message = errMsg(error);
     return new DOMException(message || fallback, 'OperationError');
 }
 

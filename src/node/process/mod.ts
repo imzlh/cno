@@ -3,6 +3,7 @@ import { IPCChannel, type IPCSerialization } from '../ipc_channel';
 import { stdout, stderr, stdin } from './streams';
 import { hrtime, memoryUsage, cpuUsage, resourceUsage } from './metrics';
 import { normalizeErrnoError } from '../_internal/errno';
+import { errMsg } from '../../utils/error';
 import { withCode as codeError } from '../_internal/errors';
 import {
     loadNodeEnvFile,
@@ -1410,7 +1411,7 @@ export function dlopen(module: { exports?: unknown }, filename: string, _flags?:
     try {
         module.exports = napi.dlopen(filename);
     } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
+        const msg = errMsg(e);
         throw codeError(new Error(`Error loading shared library ${filename}: ${msg}`), 'ERR_DLOPEN_FAILED');
     }
 }

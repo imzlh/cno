@@ -1,5 +1,6 @@
 import type { BinaryInput, KeyInput } from './types';
 import { toBuffer, toExactArrayBuffer, encodeOutput, concatBuffers, getKeyBytes, kKeyData, isKeyObject } from './helpers';
+import { errMsg } from '../../utils/error';
 import { createInvalidIvError, createInvalidKeyLengthError, createUnknownCipherError, withCode } from './errors';
 
 /**
@@ -158,7 +159,7 @@ export function mapBadDecrypt<T>(operation: () => T): T {
     try {
         return operation();
     } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
+        const message = errMsg(error);
         if (message === 'Cipher operation failed') {
             const err = withCode(
                 new Error('error:1C800064:Provider routines::bad decrypt'),

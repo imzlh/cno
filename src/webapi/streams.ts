@@ -4,6 +4,7 @@
  */
 
 import { getMemoryTier } from "../utils/memory-tier";
+import { errMsg } from "../utils/error";
 
 const zlib = import.meta.use('zlib');
 const transformReadableDefault = Symbol('transformReadableDefault');
@@ -1473,7 +1474,7 @@ function createCompressionStreams(handle: CModuleZLib.Deflate | CModuleZLib.Infl
         handle = null;
         const reason = error instanceof TypeError
             ? error
-            : new TypeError(error instanceof Error ? error.message : String(error));
+            : new TypeError(errMsg(error));
         controller.error(reason);
         return reason;
     };

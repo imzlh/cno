@@ -63,7 +63,7 @@ export function toErrnoException(
     dest?: string,
 ): NodeJS.ErrnoException {
     if (!(e instanceof Error)) {
-        const err: NodeErrnoError = new Error(e instanceof Error ? e.message : String(e));
+        const err: NodeErrnoError = new Error(String(e));
         err.code = 'UNKNOWN';
         err.errno = error.errno.UNKNOWN;
         if (syscall) err.syscall = syscall;

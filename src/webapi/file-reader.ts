@@ -1,4 +1,5 @@
 import { DOMException, EventTarget, ProgressEvent } from "./events";
+import { errMsg } from "../utils/error";
 
 const crypto = import.meta.use('crypto');
 
@@ -151,7 +152,7 @@ class FileReader extends EventTarget {
     #failRead(readId: number, error: unknown): void {
         if (!this.#isActive(readId)) return;
 
-        const message = error instanceof Error ? error.message : String(error);
+        const message = errMsg(error);
         this.error = error instanceof DOMException
             ? error
             : new DOMException(message, 'NotReadableError');

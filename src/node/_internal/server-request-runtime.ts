@@ -3,6 +3,7 @@ import type { OutgoingHttpHeaders } from '../http/types';
 import { nodeTs } from './network-debug';
 import { isTransportDisconnectError } from './errno';
 import type { NetworkCallFrame, ServeHook } from './network-hooks';
+import { errMsg } from '../../utils/error';
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 type HeaderInput = OutgoingHttpHeaders | readonly string[];
@@ -127,15 +128,11 @@ function emitServeFailure(serveHook: ServeHook | null | undefined, request: Runt
             requestId: request.requestId,
             timestamp: nodeTs(),
             success: false,
-            errorText: errorMessage(err),
+            errorText: errMsg(err),
         });
     } catch {
         // Debug hooks must not affect request error handling.
     }
-}
-
-function errorMessage(error: unknown): string {
-    return error instanceof Error ? error.message : String(error);
 }
 
 function writeInternalServerErrorQuietly(response: RuntimeResponse): void {

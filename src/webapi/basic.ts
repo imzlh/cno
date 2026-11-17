@@ -5,6 +5,7 @@ import { arrayBufferBackedBytes, decodeSingleByte, sanitizeSurrogates, utf8Decod
 import { DOMException } from "./events";
 import { messagePortTransferHooks } from "./messaging";
 import { stdin, stdout } from "../utils/stdio";
+import { errMsg } from "../utils/error";
 
 type TimerOptions = { signal?: AbortSignal };
 
@@ -601,7 +602,7 @@ class TextDecoder implements globalThis.TextDecoder {
             this.#decoder = new text.Decoder(NATIVE_ENCODING[this.#encoding] ?? this.#encoding, options);
         } catch (e) {
             // Native throws TypeError; the encoding spec requires RangeError.
-            const message = e instanceof Error ? e.message : String(e);
+            const message = errMsg(e);
             if (/unsupported encoding/i.test(message)) throw new RangeError(message);
             throw e;
         }
