@@ -239,6 +239,7 @@ export class IPCChannel extends EventEmitter {
         this._pipe.onread = (result: Uint8Array<ArrayBuffer> | null | undefined, error: CModuleError.Error | undefined) => {
             if (error) {
                 this.emit('error', error);
+                this._closeAfterPeerEnd();
                 return;
             }
             if (result === null || result === undefined) {
@@ -246,6 +247,11 @@ export class IPCChannel extends EventEmitter {
                     this._connected = false;
                     this.emit('close');
                 }
+                /* EOF only proves the peer closed its end. The local handle is
+                 * still open and an unarmed read keeps its fd registered; a
+                 * child process that exits after closing its IPC endpoint used
+                 * to leave one socket in the parent forever. */
+                this._closeAfterPeerEnd();
                 return;
             }
             this._decoder.feed(result);
@@ -384,6 +390,23 @@ export class IPCChannel extends EventEmitter {
         }
         this._closeAfterWrites = false;
         this._decoder.reset();
+        if (this._connected) {
+            this._connected = false;
+            this.emit('close');
+        }
+    }
+
+    /**
+     * The peer is gone, so a bidirectional shutdown cannot complete: libuv
+     * reports EPIPE/ENOTCONN instead of invoking the shutdown callback. Close
+     * the descriptor directly; no further user write belongs on this channel.
+     */
+    private _closeAfterPeerEnd(): void {
+        const pipe = this._pipe;
+        this._pipe = null;
+        this._closeAfterWrites = false;
+        this._decoder.reset();
+        if (pipe) closeQuietly(pipe);
         if (this._connected) {
             this._connected = false;
             this.emit('close');

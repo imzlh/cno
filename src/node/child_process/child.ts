@@ -450,6 +450,7 @@ ChildProcessImpl.prototype._setupIPC = function _setupIPC(this: ChildProcessImpl
         this.connected = false;
         Reflect.set(this, 'channel', null);
         Reflect.set(this, '_channel', null);
+        this._ipcChannel = null;
         this.emit('disconnect');
     });
 };
