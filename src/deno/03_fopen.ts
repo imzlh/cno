@@ -422,7 +422,9 @@ function openFsFile(
                 ttyFd = undefined;
             }
         }
-        handle = asfs.createFrom(fno, pathStr);
+        // Deno.open owns the descriptor it just opened, so transfer it instead
+        // of leaving a second, borrowed handle to the same file open.
+        handle = asfs.createFrom(fno, pathStr, { closeOnClose: true });
         return new FsFile(handle, !!options?.append, read, !!options?.write || !!options?.append, fsFileToken, tty);
     } catch (e) {
         try { tty?.close(); } catch {}
@@ -430,8 +432,7 @@ function openFsFile(
             try { fs.close(ttyFd); } catch {}
         }
         if (handle) {
-            // createFrom transferred fd ownership to the handle; close through
-            // it. A second fs.close(fno) here would close a recycled fd.
+            // Ownership transferred to the handle; close through it.
             try { handle.close(); } catch {}
         } else {
             try { fs.close(fno); } catch {}
