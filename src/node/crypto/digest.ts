@@ -1,4 +1,3 @@
-import { Buffer } from '../buffer';
 import { Transform, type TransformOptions } from '../stream';
 import type { BinaryInput, Hash, Hmac, KeyInput } from './types';
 import { toBuffer, encodeOutput, concatBuffers, normalizeHashAlgorithm, oneShotHmac, isSupportedHmacAlgorithm, getKeyBytes } from './helpers';

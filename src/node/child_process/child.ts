@@ -2,7 +2,7 @@ const nativeError = import.meta.use('error');
 
 import { IPCChannel, type IPCSerialization } from '../ipc_channel';
 import { EventEmitter } from '../events';
-import { closeQuietly, tryCloseQuietly } from '../_internal/close';
+import { closeQuietly } from '../_internal/close';
 import { Writable, Readable, Duplex } from '../stream';
 import {
     asError,

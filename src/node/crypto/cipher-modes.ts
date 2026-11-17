@@ -1,6 +1,6 @@
 import type { BinaryInput, KeyInput } from './types';
 import { toBuffer, toExactArrayBuffer, encodeOutput, concatBuffers, getKeyBytes, kKeyData, isKeyObject } from './helpers';
-import { createInvalidIvError, createInvalidKeyLengthError, createUnknownCipherError, createAuthenticationFailedError, createCipherInvalidStateError, withCode } from './errors';
+import { createInvalidIvError, createInvalidKeyLengthError, createUnknownCipherError, withCode } from './errors';
 
 /**
  * ECB/CBC mode plumbing: the native function tables and the incremental

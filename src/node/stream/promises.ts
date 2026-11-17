@@ -1,4 +1,4 @@
-import { Stream, Readable, Writable, PassThrough, Transform } from './mod';
+import { Stream, Readable, Writable } from './mod';
 
 type PipelineStreamArg = Stream | ((source: Readable) => unknown);
 type PipelineOptions = { signal?: AbortSignal };

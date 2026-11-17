@@ -10,7 +10,7 @@ import {
     getNativePointer,
     isBufferSource,
 } from './utils';
-import { nativeLittleEndian, viewBytes } from '../../utils/bytes';
+import { nativeLittleEndian } from '../../utils/bytes';
 
 const ffi = import.meta.use('ffi');
 

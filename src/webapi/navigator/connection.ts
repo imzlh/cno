@@ -1,5 +1,5 @@
 import type { NetworkInformation } from './types';
-import { EventTarget, Event } from '../events';
+import { EventTarget } from '../events';
 
 const os = import.meta.use('os');
 

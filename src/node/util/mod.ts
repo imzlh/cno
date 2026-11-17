@@ -1,7 +1,7 @@
 import * as types from './types';
 import { deepEqual as _deepEqual } from '../_internal/deep-equal';
 import { parseNodeEnv } from '../_internal/dotenv';
-import { inspect, defaultInspectOptions, formatNumberNoColor, formatBigIntNoColor, hasBuiltInToString } from './inspect';
+import { inspect, formatNumberNoColor, formatBigIntNoColor, hasBuiltInToString } from './inspect';
 import type { InspectOptions } from './inspect';
 
 /**

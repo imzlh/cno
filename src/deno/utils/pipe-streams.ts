@@ -3,8 +3,6 @@
 import { wrapFSErr } from "../../utils/wrap";
 import { malloc } from "../../utils/malloc";
 
-const stream = import.meta.use('streams');
-
 /** Closing a socket a racing teardown already closed is expected, not an error. */
 export function closeStreamQuietly(pipe: { close(): unknown }): void {
     try {

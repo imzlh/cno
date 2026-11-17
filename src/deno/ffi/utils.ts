@@ -113,7 +113,7 @@ export function getNativePointer(value: Deno.PointerValue): CModuleFFI.Pointer |
 
 function pointerFromCarrier(value: unknown): CModuleFFI.Pointer | null {
     if (value === null) return null;
-    if (value !== null && typeof value === 'object' && Reflect.get(value, 'pointer') !== undefined) {
+    if (typeof value === 'object' && Reflect.get(value, 'pointer') !== undefined) {
         return getNativePointer(Reflect.get(value, 'pointer') as Deno.PointerValue);
     }
     return getNativePointer(value as Deno.PointerValue);
