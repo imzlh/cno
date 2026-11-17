@@ -23,12 +23,7 @@ function isInspectorBridge(value: unknown): value is InspectorBridge {
 
 export function getInspectorBridge(): InspectorBridge | null {
 	// The CLI inspector publishes itself on the `cno.inspector` evbus channel.
-	let value: unknown
-	try {
-		value = import.meta.use('evbus')?.get('cno.inspector', 'bridge')
-	} catch {
-		return null
-	}
+	const value: unknown = import.meta.use('evbus').get('cno.inspector', 'bridge')
 	return isInspectorBridge(value) ? value : null
 }
 

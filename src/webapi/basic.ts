@@ -66,7 +66,9 @@ function isInternalErrorProxyFrameAt(stack: string, from: number, lineEnd: numbe
         return false;
     }
     if (stack.startsWith('native)', rest)) return rest + 7 === lineEnd;
-    return stack.startsWith('<core>:', rest);
+    // `<core>:` carries line info; a debug-stripped core blob renders `<null>:0:1`.
+    // User code always loads from real files, so neither can be a user frame.
+    return stack.startsWith('<core>:', rest) || stack.startsWith('<null>:', rest);
 }
 
 function stripInternalErrorProxyFrames(stack: string): string {
@@ -315,7 +317,7 @@ if (nativeStackDescriptor && nativeStackDescriptor.configurable && nativeStackGe
             // have no [[ErrorData]] frames; Node reports `undefined` there too.
             if (raw === undefined) return undefined;
             const computed = headerizeErrorStack(this, raw);
-            try { headeredStackCache.set(this, computed); } catch { /* non-registerable key */ }
+            headeredStackCache.set(this, computed);
             return computed;
         },
         set(this: object, value: unknown) {

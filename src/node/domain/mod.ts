@@ -13,13 +13,11 @@ export let active: Domain | null = null;
 
 function setActive(domain: Domain | null): void {
     active = domain;
-    try {
-        const proc = Reflect.get(globalThis, 'process') as { domain?: Domain | null } | undefined;
-        if (proc && (typeof proc === 'object' || typeof proc === 'function')) {
-            proc.domain = domain;
-        }
-    } catch {
-        // process may be unavailable during early bootstrap
+    // process is installed by the polyfill bootstrap before any user module
+    // (and therefore any domain use) can load.
+    const proc = Reflect.get(globalThis, 'process') as { domain?: Domain | null } | undefined;
+    if (proc && (typeof proc === 'object' || typeof proc === 'function')) {
+        proc.domain = domain;
     }
 }
 

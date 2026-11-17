@@ -580,12 +580,8 @@ function emitProcessExit(code: number): void {
 
 // Older cores lack this enum member; -1 leaves the branch inactive.
 function beforeExitEventId(): number {
-    try {
-        const v = (engine.EventType as unknown as Record<string, unknown>)?.BEFORE_EXIT;
-        return typeof v === 'number' ? v : -1;
-    } catch {
-        return -1;
-    }
+    const v = (engine.EventType as unknown as Record<string, unknown>)?.BEFORE_EXIT;
+    return typeof v === 'number' ? v : -1;
 }
 
 // beforeExit may repeat while listeners keep scheduling work; listener errors propagate.

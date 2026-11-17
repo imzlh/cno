@@ -115,11 +115,7 @@ function isRecord(value: unknown): value is RecordLike {
 
 function currentRuntimeConfig(): unknown {
     // Resolved config published by the CLI on its `cno.runtime` channel.
-    try {
-        return import.meta.use('evbus')?.get('cno.runtime', 'workerRuntimeConfig');
-    } catch {
-        return undefined;
-    }
+    return import.meta.use('evbus').get('cno.runtime', 'workerRuntimeConfig');
 }
 
 function workerEntrySpecifier(specifier: string | URL): string {

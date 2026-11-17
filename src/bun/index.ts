@@ -395,13 +395,8 @@ function processBridge(): {
 
 function mainPath(): string {
     // The CLI publishes the entry URL on its `cno.runtime` channel.
-    let main: string;
-    try {
-        const published = import.meta.use('evbus')?.get('cno.runtime', 'mainScript');
-        main = typeof published === 'string' ? published : '';
-    } catch {
-        main = '';
-    }
+    const published = import.meta.use('evbus').get('cno.runtime', 'mainScript');
+    const main = typeof published === 'string' ? published : '';
     if (!main.startsWith('file:')) return main;
     try {
         const url = new URL(main);
