@@ -281,7 +281,8 @@ export async function startTest(contextName = '<core>', test = true, bench = tru
         });
     };
     if (test) {
-        try { globalThis.addEventListener('error', onSuiteError); } catch { /* */ }
+        // Installed unconditionally by the webapi boot; see webapi/index.ts.
+        globalThis.addEventListener('error', onSuiteError);
     }
 
     try {
@@ -447,7 +448,7 @@ export async function startTest(contextName = '<core>', test = true, bench = tru
     }
     } finally {
         if (test) {
-            try { globalThis.removeEventListener('error', onSuiteError); } catch { /* */ }
+            globalThis.removeEventListener('error', onSuiteError);
             // Mandatory: a 'load' listener's setInterval would hang the run.
             try { dispatchUnloadEvent(); } catch { /* a listener threw; not fatal */ }
         }
