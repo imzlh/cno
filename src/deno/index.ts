@@ -34,6 +34,7 @@ const signal = import.meta.use('signals');
 const console = import.meta.use('console');
 const timers = import.meta.use('timers');
 const ev = import.meta.use('evbus');
+const error = import.meta.use('error');
 
 const kInternal = Symbol('Deno.internal');
 
@@ -531,7 +532,18 @@ Object.defineProperty(globalThis, "Deno", {
             v8: engine.versions.quickjs,
             typescript: "5.9.2",
         },
-        cwd: () => os.cwd,
+        cwd: () => {
+            try {
+                return os.cwd;
+            } catch (e) {
+                // A removed working directory reports ENOENT from getcwd; real
+                // Deno raises NotFound for it.
+                if (Reflect.get(e as object, 'code') === error.errno.ENOENT) {
+                    throw new errors.NotFound('The current working directory was removed');
+                }
+                throw e;
+            }
+        },
         chdir: denoChdir,
         get mainModule() {
             // The CLI publishes the entry URL on its `cno.runtime` channel.
