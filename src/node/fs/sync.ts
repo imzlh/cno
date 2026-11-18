@@ -320,10 +320,18 @@ export function fchownSync(fd: number, uid: number, gid: number): void {
     wrapSync(() => fs.fchown(fd, uid, gid), 'fchownSync', describeFd(fd));
 }
 
+/** waitIO polls a promise without attaching a reaction, so a rejection would
+ *  reach the unhandled-rejection tracker before waitIO rethrows it as a sync
+ *  throw. Pre-mark it handled; the rejection still propagates through waitIO. */
+function waitIOQuietly<T>(promise: Promise<T>): Promise<T> {
+    promise.catch(() => {});
+    return promise;
+}
+
 export function lchownSync(path: PathLike, uid: number, gid: number): void {
     // Sync C layer has no lchown; bridge asyncfs via waitIO.
     const pathStr = pathToString(path);
-    wrapSync(() => engine.waitIO(asfs.lchown(pathStr, uid, gid)), 'lchownSync', pathStr);
+    wrapSync(() => engine.waitIO(waitIOQuietly(asfs.lchown(pathStr, uid, gid))), 'lchownSync', pathStr);
 }
 
 // Time operations
@@ -337,7 +345,7 @@ export function lutimesSync(path: PathLike, atime: TimeLike, mtime: TimeLike): v
     // Sync C layer has no lutimes; bridge asyncfs via waitIO.
     const pathStr = pathToString(path);
     wrapSync(
-        () => engine.waitIO(asfs.lutime(pathStr, timeToUnixMs(atime, 'atime'), timeToUnixMs(mtime, 'mtime'))),
+        () => engine.waitIO(waitIOQuietly(asfs.lutime(pathStr, timeToUnixMs(atime, 'atime'), timeToUnixMs(mtime, 'mtime')))),
         'lutimesSync',
         pathStr,
     );
