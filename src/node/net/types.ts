@@ -111,6 +111,8 @@ export interface Socket extends Duplex {
     _pipeReadStarted: boolean;
     _upgradeReadStarted: boolean;
     _refed: boolean;
+    /** resetAndDestroy() asked for an RST teardown on the next destroy(). */
+    _resetPending: boolean;
 
     bytesRead: number;
     bytesWritten: number;
@@ -144,6 +146,8 @@ export interface Socket extends Duplex {
     _read(size: number): void;
     _write(chunk: string | Uint8Array, encoding: BufferEncoding, callback: (error?: Error | null) => void): void;
     destroy(error?: Error): this;
+    /** Node 18+ API: tear down with a TCP RST (peer sees ECONNRESET). */
+    resetAndDestroy(): this;
 }
 
 export interface SocketConstructor {

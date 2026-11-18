@@ -74,6 +74,7 @@ function initSocket(self: Socket, options?: SocketConstructorOpts): void {
     self._pipeReadStarted = false;
     self._upgradeReadStarted = false;
     self._refed = true;
+    self._resetPending = false;
 
     self.bytesRead = 0;
     self.bytesWritten = 0;
@@ -739,7 +740,10 @@ Socket.prototype.destroy = function destroy(this: Socket, error?: Error): Socket
         closeQuietly(this._httpOwned);
         this._httpOwned = null;
     } else if (this._tcp) {
-        closeQuietly(this._tcp);
+        // resetAndDestroy(): RST instead of the graceful shutdown-and-drain, so
+        // the peer observes ECONNRESET even with in-flight unread bytes.
+        if (this._resetPending) this._tcp.reset();
+        else closeQuietly(this._tcp);
         this._tcp = null;
     }
 
@@ -764,6 +768,20 @@ Socket.prototype.destroy = function destroy(this: Socket, error?: Error): Socket
     });
 
     return this;
+};
+
+/** Node 18+ resetAndDestroy: tear down with a TCP RST instead of the graceful
+ *  shutdown-and-drain, so the peer observes ECONNRESET immediately even with
+ *  unread bytes in flight. Pending writes are discarded, matching Node, and
+ *  the resetting side reports ECONNRESET through the regular destroy(error)
+ *  event flow. */
+Socket.prototype.resetAndDestroy = function resetAndDestroy(this: Socket): Socket {
+    if (this._destroyed) return this;
+    this._resetPending = true;
+    const err = Object.assign(new Error('Socket is reset'), {
+        code: 'ECONNRESET',
+    }) as NodeJS.ErrnoException;
+    return this.destroy(err);
 };
 
 /**
