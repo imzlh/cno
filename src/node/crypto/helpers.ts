@@ -10,9 +10,30 @@ export const kKeyData = Symbol('cno.node.crypto.keyData');
 export const kKeyFormat = Symbol('cno.node.crypto.keyFormat');
 export type KeyFormat = 'raw' | 'pem' | 'der';
 
+// Internal slots come from the %TypedArray% prototype getters, never own
+// properties: a view with spoofed `buffer`/`byteOffset`/`byteLength` must not
+// forge an invalid view (same contract as the structuredClone fix).
+const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
+const typedArrayBuffer = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')!.get!;
+const typedArrayByteOffset = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteOffset')!.get!;
+const typedArrayByteLength = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteLength')!.get!;
+const dataViewBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer')!.get!;
+const dataViewByteOffset = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset')!.get!;
+const dataViewByteLength = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength')!.get!;
+
 function viewSlots(value: unknown): { buffer: ArrayBufferLike; byteOffset: number; byteLength: number } | null {
     if (!ArrayBuffer.isView(value)) return null;
-    return { buffer: value.buffer, byteOffset: value.byteOffset, byteLength: value.byteLength };
+    const isDataView = DataView.prototype.isPrototypeOf(value as object);
+    const buffer = isDataView
+        ? dataViewBuffer.call(value)
+        : typedArrayBuffer.call(value);
+    const byteOffset = isDataView
+        ? dataViewByteOffset.call(value)
+        : typedArrayByteOffset.call(value);
+    const byteLength = isDataView
+        ? dataViewByteLength.call(value)
+        : typedArrayByteLength.call(value);
+    return { buffer, byteOffset, byteLength };
 }
 
 function isBufferSource(value: unknown): value is ArrayBuffer | ArrayBufferView {
