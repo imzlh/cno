@@ -306,7 +306,11 @@ export function chownSync(path: PathLike, uid: number, gid: number): void {
     // through asyncfs inherits that per-platform behaviour instead of hardcoding
     // it, so POSIX still performs a real chown and reports its real errors.
     const pathStr = pathToString(path);
-    wrapSync(() => engine.waitIO(asfs.chown(pathStr, uid, gid)), 'chownSync', pathStr);
+    wrapSync(
+        () => engine.waitIO(waitIOQuietly(asfs.chown(pathStr, uid, gid))),
+        'chownSync',
+        pathStr,
+    );
 }
 
 export function fchownSync(fd: number, uid: number, gid: number): void {
