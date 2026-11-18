@@ -21,7 +21,10 @@ function format(...allArgs: unknown[]): string {
         : allArgs.map(String).join(' ');
 }
 
-const webConsole = {
+// Deno exposes console as a namespace object: its prototype is a dedicated,
+// property-less object backed by Object.prototype — not Object.prototype
+// itself (whose own methods would show up in getOwnPropertyNames).
+const webConsole = Object.assign(Object.create({}), {
     log(...args: unknown[]) {
         call('log', 'log', args);
     },
@@ -106,7 +109,7 @@ const webConsole = {
     profileEnd(_label?: string) { },
 
     format,
-};
+});
 
 Object.defineProperty(globalThis, 'console', {
     value: webConsole,
