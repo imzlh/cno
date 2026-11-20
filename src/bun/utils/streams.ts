@@ -1,6 +1,7 @@
-import { sanitizeSurrogates, utf8Decode } from '../../utils/bytes';
+import { concatChunks, sanitizeSurrogates, utf8Decode } from '../../utils/bytes';
 
 const engine = import.meta.use('engine');
+const text = import.meta.use('text');
 
 type BinaryChunk = ArrayBufferView | ArrayBufferLike;
 type StreamChunk = BinaryChunk | string;
@@ -107,6 +108,7 @@ export const concatArrayBuffers = ({
 
 async function readChunks<T>(stream: ReadableStream<T>): Promise<T[]> {
     const reader = Reflect.apply(readableStreamGetReader, stream, []) as ReadableStreamDefaultReader<T>;
+    // Bun keeps chunk references and prioritizes source errors until close.
     const chunks: T[] = [];
     let failed = false;
     try {
@@ -138,9 +140,13 @@ export async function readableStreamToBlob(stream: ReadableStream<unknown>): Pro
 
 export async function readableStreamToArrayBuffer(stream: ReadableStream<StreamChunk>): Promise<ArrayBuffer> {
     const chunks = await readChunks(stream);
-    return concatArrayBuffers(chunks.map(chunk => typeof chunk === 'string'
-        ? engine.encodeString(sanitizeSurrogates(chunk))
-        : bytesOf(chunk)));
+    for (let index = 0; index < chunks.length; index++) {
+        const chunk = chunks[index];
+        chunks[index] = typeof chunk === 'string'
+            ? engine.encodeString(sanitizeSurrogates(chunk))
+            : bytesOf(chunk);
+    }
+    return concatChunks(chunks as Uint8Array[]).buffer;
 }
 
 export async function readableStreamToBytes(stream: ReadableStream<StreamChunk>): Promise<Uint8Array<ArrayBuffer>> {
@@ -149,32 +155,38 @@ export async function readableStreamToBytes(stream: ReadableStream<StreamChunk>)
 
 export async function readableStreamToText(stream: ReadableStream<StreamChunk>): Promise<string> {
     const chunks = await readChunks(stream);
+    if (chunks.length === 1 && typeof chunks[0] !== 'string') {
+        const value = utf8Decode(bytesOf(chunks[0]));
+        return value.charCodeAt(0) === 0xFEFF ? value.slice(1) : value;
+    }
     let result = '';
-    let binary: Uint8Array[] = [];
+    let decoder: CModuleText.Decoder | undefined;
+    let decodingBinary = false;
+    let binarySeen = false;
     let strings = '';
     let firstRun = true;
-    const stripBom = (value: string): string => value.charCodeAt(0) === 0xFEFF ? value.slice(1) : value;
     const append = (value: string, finalString = false): void => {
+        if (value.length === 0) return;
         if (firstRun) {
-            value = stripBom(value);
+            if (value.charCodeAt(0) === 0xFEFF) value = value.slice(1);
             firstRun = false;
         }
-        if (finalString) value = stripBom(value);
+        if (finalString && value.charCodeAt(0) === 0xFEFF) value = value.slice(1);
         result += value;
     };
     const flushBinary = (): void => {
-        if (binary.length === 0) return;
-        // WHATWG replacement semantics for invalid sequences; joining the run
-        // first lets a UTF-8 sequence (including the initial BOM) span chunks.
-        append(utf8Decode(new Uint8Array(concatArrayBuffers(binary))));
-        binary = [];
+        if (!decodingBinary) return;
+        append(decoder!.decode());
+        decodingBinary = false;
     };
     const flushStrings = (final = false): void => {
         if (strings.length === 0) return;
-        append(strings, final);
+        append(binarySeen ? sanitizeSurrogates(strings) : strings, final);
         strings = '';
     };
-    for (const chunk of chunks) {
+    for (let index = 0; index < chunks.length; index++) {
+        const chunk = chunks[index];
+        chunks[index] = '';
         if (typeof chunk === 'string') {
             if (chunk.length === 0) continue;
             flushBinary();
@@ -182,11 +194,14 @@ export async function readableStreamToText(stream: ReadableStream<StreamChunk>):
         } else {
             const bytes = bytesOf(chunk);
             if (bytes.byteLength === 0) continue;
+            binarySeen = true;
             flushStrings();
-            binary.push(bytes);
+            decoder ??= new text.Decoder('utf-8', { ignoreBOM: true });
+            decodingBinary = true;
+            append(decoder.decode(bytes, { stream: true }));
         }
     }
-    if (binary.length !== 0) flushBinary();
+    if (decodingBinary) flushBinary();
     else flushStrings(true);
     return result;
 }

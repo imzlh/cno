@@ -2,17 +2,7 @@ import { Buffer } from 'node:buffer';
 import { blobBytesOf } from '../blob-intrinsics';
 import { isBunFile } from '../file';
 import { CryptoHasher } from './index';
-import { md4 } from './md4';
 import { sanitizeSurrogates } from '../../utils/bytes';
-
-/**
- * `Bun.SHA1`, `Bun.MD5`, `Bun.MD4`, `Bun.SHA224`, `Bun.SHA256`, `Bun.SHA384`,
- * `Bun.SHA512`, `Bun.SHA512_256` and `Bun.sha`.
- *
- * SHA-1/MD5/SHA-2 delegate to `CryptoHasher`. MD4 has no native binding, so it
- * uses the RFC 1320 implementation in `./md4`. Neither path hashes
- * incrementally: input is buffered until `digest()`.
- */
 
 const engine = import.meta.use('engine');
 
@@ -168,42 +158,12 @@ function planOutput(
     throw invalidArgType('output must be of type string or ArrayBuffer or ArrayBufferView');
 }
 
-interface HashEngine {
-    update(bytes: Uint8Array): void;
-    digest(): Uint8Array<ArrayBuffer>;
-}
-
-function nativeEngine(algorithm: string): HashEngine {
-    const hasher = new CryptoHasher(algorithm);
-    return {
-        // CryptoHasher snapshots every chunk, so callers may reuse their buffers.
-        update: bytes => void hasher.update(bytes),
-        digest: () => new Uint8Array(hasher.digest()),
-    };
-}
-
-function md4Engine(): HashEngine {
-    const chunks: Uint8Array[] = [];
-    return {
-        update: bytes => void chunks.push(bytes.slice()),
-        digest() {
-            const joined = new Uint8Array(chunks.reduce((length, chunk) => length + chunk.byteLength, 0));
-            let offset = 0;
-            for (const chunk of chunks) {
-                joined.set(chunk, offset);
-                offset += chunk.byteLength;
-            }
-            return md4(joined);
-        },
-    };
-}
-
 interface HashState {
-    engine: HashEngine;
+    hasher: CryptoHasher;
     done: boolean;
 }
 
-function defineHashClass(name: string, size: number, createEngine: () => HashEngine): HashClassConstructor<never> {
+function defineHashClass(name: string, size: number, algorithm: string): HashClassConstructor<never> {
     const states = new WeakMap<object, HashState>();
 
     function stateOf(self: unknown): HashState {
@@ -236,7 +196,7 @@ function defineHashClass(name: string, size: number, createEngine: () => HashEng
         if (!new.target) {
             throw codedError(new TypeError(`${name} constructor cannot be invoked without 'new'`), 'ERR_ILLEGAL_CONSTRUCTOR');
         }
-        states.set(this, { engine: createEngine(), done: false });
+        states.set(this, { hasher: new CryptoHasher(algorithm), done: false });
     }
     Object.defineProperty(Hasher, 'name', { value: name, configurable: true });
 
@@ -244,7 +204,7 @@ function defineHashClass(name: string, size: number, createEngine: () => HashEng
         const state = stateOf(this);
         const bytes = inputBytes(input);
         assertOpen(state, 'update');
-        state.engine.update(bytes);
+        state.hasher.update(bytes);
         return this;
     }
 
@@ -254,7 +214,7 @@ function defineHashClass(name: string, size: number, createEngine: () => HashEng
         const state = stateOf(this);
         assertOpen(state, 'digest again');
         const render = planOutput(args[0], size, true);
-        const result = state.engine.digest();
+        const result = new Uint8Array(state.hasher.digest());
         state.done = true;
         return render(result);
     }
@@ -262,9 +222,9 @@ function defineHashClass(name: string, size: number, createEngine: () => HashEng
     function hash(input: unknown, output?: unknown): unknown {
         const bytes = inputBytes(input);
         const render = planOutput(output, size, false);
-        const hasher = createEngine();
+        const hasher = new CryptoHasher(algorithm);
         hasher.update(bytes);
-        return render(hasher.digest());
+        return render(new Uint8Array(hasher.digest()));
     }
 
     function instanceByteLength(this: unknown): number {
@@ -299,14 +259,14 @@ export interface SHA384 extends HashClassInstance<SHA384> {}
 export interface SHA512 extends HashClassInstance<SHA512> {}
 export interface SHA512_256 extends HashClassInstance<SHA512_256> {}
 
-export const SHA1: HashClassConstructor<SHA1> = defineHashClass('SHA1', 20, () => nativeEngine('sha1'));
-export const MD5: HashClassConstructor<MD5> = defineHashClass('MD5', 16, () => nativeEngine('md5'));
-export const MD4: HashClassConstructor<MD4> = defineHashClass('MD4', 16, md4Engine);
-export const SHA224: HashClassConstructor<SHA224> = defineHashClass('SHA224', 28, () => nativeEngine('sha224'));
-export const SHA256: HashClassConstructor<SHA256> = defineHashClass('SHA256', 32, () => nativeEngine('sha256'));
-export const SHA384: HashClassConstructor<SHA384> = defineHashClass('SHA384', 48, () => nativeEngine('sha384'));
-export const SHA512: HashClassConstructor<SHA512> = defineHashClass('SHA512', 64, () => nativeEngine('sha512'));
-export const SHA512_256: HashClassConstructor<SHA512_256> = defineHashClass('SHA512_256', 32, () => nativeEngine('sha512-256'));
+export const SHA1: HashClassConstructor<SHA1> = defineHashClass('SHA1', 20, 'sha1');
+export const MD5: HashClassConstructor<MD5> = defineHashClass('MD5', 16, 'md5');
+export const MD4: HashClassConstructor<MD4> = defineHashClass('MD4', 16, 'md4');
+export const SHA224: HashClassConstructor<SHA224> = defineHashClass('SHA224', 28, 'sha224');
+export const SHA256: HashClassConstructor<SHA256> = defineHashClass('SHA256', 32, 'sha256');
+export const SHA384: HashClassConstructor<SHA384> = defineHashClass('SHA384', 48, 'sha384');
+export const SHA512: HashClassConstructor<SHA512> = defineHashClass('SHA512', 64, 'sha512');
+export const SHA512_256: HashClassConstructor<SHA512_256> = defineHashClass('SHA512_256', 32, 'sha512-256');
 
 /** `Bun.sha(input, output?)`: SHA-512/256 of `input`. Bun's sha.length is 1. */
 export function sha(input: HashClassInput): Uint8Array<ArrayBuffer>;

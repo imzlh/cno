@@ -1,6 +1,6 @@
 import { Buffer } from 'node:buffer';
 import { toBuffer } from '../../node/crypto/helpers';
-import { sanitizeSurrogates } from '../../utils/bytes';
+import { arrayBufferBackedBytes, nativeLittleEndian, sanitizeSurrogates } from '../../utils/bytes';
 import { blobBytesOf } from '../blob-intrinsics';
 import { blake2b, blake2b256 } from './blake2b';
 import { hmacMd4, md4 } from './md4';
@@ -8,40 +8,38 @@ import { isBunFile } from '../file';
 
 const native = import.meta.use('crypto');
 const engine = import.meta.use('engine');
-type Hash = (data: BufferSource) => ArrayBuffer;
-type Hmac = (key: BufferSource, data: BufferSource) => ArrayBuffer;
-
-/** The BLAKE2b implementation reads plain bytes and owns its copies. */
-function asBytes(data: BufferSource): Uint8Array<ArrayBuffer> {
-    return ownedBytes(data);
+interface HashAlgorithm {
+    byteLength: number;
+    hash(data: Uint8Array<ArrayBuffer>): ArrayBuffer;
+    create?: () => CModuleCrypto.Hash;
+    hmac?: (key: Uint8Array<ArrayBuffer>, data: Uint8Array<ArrayBuffer>) => ArrayBuffer;
+    blockSize?: number;
 }
-const hashes: Record<string, [number, Hash, Hmac?]> = {
-    // BLAKE2b has no native keyed mode and Bun's second argument is BLAKE2b
-    // keying rather than HMAC, so both widths run the JS core when a key is
-    // present; the unkeyed digests stay on the native path.
-    blake2b256: [32, data => blake2b256(asBytes(data)).buffer, (key, data) => blake2b256(asBytes(data), asBytes(key)).buffer],
-    blake2b512: [64, native.blake2b512, (key, data) => blake2b(64, asBytes(data), asBytes(key)).buffer],
-    blake2s256: [32, native.blake2s256],
-    md4: [16, data => md4(asBytes(data)).buffer, (key, data) => hmacMd4(asBytes(key), asBytes(data)).buffer],
-    md5: [16, native.md5, native.hmacMd5],
-    ripemd160: [20, native.ripemd160, native.hmacRipemd160],
-    sha1: [20, native.sha1, native.hmacSha1],
-    sha224: [28, native.sha224, native.hmacSha224],
-    sha256: [32, native.sha256, native.hmacSha256],
-    sha384: [48, native.sha384, native.hmacSha384],
-    sha512: [64, native.sha512, native.hmacSha512],
-    'sha512-224': [28, native.sha512_224, native.hmacSha512_224],
-    'sha512-256': [32, native.sha512_256, native.hmacSha512_256],
-    'sha3-224': [28, native.sha3_224, native.hmacSha3_224],
-    'sha3-256': [32, native.sha3_256, native.hmacSha3_256],
-    'sha3-384': [48, native.sha3_384, native.hmacSha3_384],
-    'sha3-512': [64, native.sha3_512, native.hmacSha3_512],
-    shake128: [16, data => native.shake128(data, 16)],
-    shake256: [32, data => native.shake256(data, 32)],
+
+const hashes: Record<string, HashAlgorithm> = {
+    // Bun keys BLAKE2b directly rather than applying HMAC.
+    blake2b256: { byteLength: 32, hash: data => blake2b256(data).buffer, hmac: (key, data) => blake2b256(data, key).buffer },
+    blake2b512: { byteLength: 64, hash: native.blake2b512, create: native.createBlake2b512, hmac: (key, data) => blake2b(64, data, key).buffer },
+    blake2s256: { byteLength: 32, hash: native.blake2s256, create: native.createBlake2s256 },
+    md4: { byteLength: 16, hash: data => md4(data).buffer, hmac: (key, data) => hmacMd4(key, data).buffer },
+    md5: { byteLength: 16, hash: native.md5, create: native.createMd5, blockSize: 64 },
+    ripemd160: { byteLength: 20, hash: native.ripemd160, create: native.createRipemd160, blockSize: 64 },
+    sha1: { byteLength: 20, hash: native.sha1, create: native.createSha1, blockSize: 64 },
+    sha224: { byteLength: 28, hash: native.sha224, create: native.createSha224, blockSize: 64 },
+    sha256: { byteLength: 32, hash: native.sha256, create: native.createSha256, blockSize: 64 },
+    sha384: { byteLength: 48, hash: native.sha384, create: native.createSha384, blockSize: 128 },
+    sha512: { byteLength: 64, hash: native.sha512, create: native.createSha512, blockSize: 128 },
+    'sha512-224': { byteLength: 28, hash: native.sha512_224, create: native.createSha512_224, blockSize: 128 },
+    'sha512-256': { byteLength: 32, hash: native.sha512_256, create: native.createSha512_256, blockSize: 128 },
+    'sha3-224': { byteLength: 28, hash: native.sha3_224, create: native.createSha3_224, blockSize: 144 },
+    'sha3-256': { byteLength: 32, hash: native.sha3_256, create: native.createSha3_256, blockSize: 136 },
+    'sha3-384': { byteLength: 48, hash: native.sha3_384, create: native.createSha3_384, blockSize: 104 },
+    'sha3-512': { byteLength: 64, hash: native.sha3_512, create: native.createSha3_512, blockSize: 72 },
+    shake128: { byteLength: 16, hash: data => native.shake128(data, 16) },
+    shake256: { byteLength: 32, hash: data => native.shake256(data, 32) },
 };
 
 type Input = string | ArrayBuffer | ArrayBufferView | Blob;
-type Output = string | ArrayBuffer | ArrayBufferView | null;
 
 const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
 const arrayBufferIsView = ArrayBuffer.isView;
@@ -111,7 +109,7 @@ function invalidArgType(message: string): TypeError {
     return codedError(new TypeError(message), 'ERR_INVALID_ARG_TYPE');
 }
 
-function ownedBytes(input: unknown, encoding?: unknown): Uint8Array<ArrayBuffer> {
+function inputBytes(input: unknown, encoding?: unknown): Uint8Array<ArrayBuffer> {
     let source: Uint8Array;
     if (isBunFile(input)) {
         throw invalidArgType('File blob cannot be used here');
@@ -125,7 +123,17 @@ function ownedBytes(input: unknown, encoding?: unknown): Uint8Array<ArrayBuffer>
                 const requestedEncoding = stringValue(encoding);
                 const normalized = requestedEncoding === undefined ? '' : requestedEncoding.toLowerCase();
                 if (normalized === 'ucs2' || normalized === 'ucs-2' || normalized === 'utf16le') {
-                    source = Buffer.from(sanitized, 'utf16le');
+                    const units = engine.encodeU16String(sanitized);
+                    source = new Uint8Array(units.buffer, units.byteOffset, units.byteLength);
+                    if (!nativeLittleEndian) {
+                        for (let offset = 0; offset < source.byteLength; offset += 2) {
+                            const low = source[offset];
+                            source[offset] = source[offset + 1];
+                            source[offset + 1] = low;
+                        }
+                    }
+                } else if (normalized === '' || normalized === 'utf8' || normalized === 'utf-8') {
+                    source = engine.encodeString(sanitized);
                 } else {
                     source = toBuffer(sanitized, normalized === 'buffer' ? 'latin1' : normalized);
                 }
@@ -139,21 +147,96 @@ function ownedBytes(input: unknown, encoding?: unknown): Uint8Array<ArrayBuffer>
         }
     }
 
-    // Own a copy both for the native BufferSource contract and to snapshot
-    // update() input, including SharedArrayBuffer-backed views.
-    const result = new Uint8Array(source.byteLength);
-    result.set(source);
-    return result;
+    return arrayBufferBackedBytes(source);
 }
 
-function joinBytes(chunks: readonly Uint8Array[]): Uint8Array<ArrayBuffer> {
-    const result = new Uint8Array(chunks.reduce((length, chunk) => length + chunk.byteLength, 0));
-    let offset = 0;
-    for (const chunk of chunks) {
-        result.set(chunk, offset);
-        offset += chunk.byteLength;
+class BufferedHash implements CModuleCrypto.Hash {
+    #algorithm: HashAlgorithm;
+    #key?: Uint8Array<ArrayBuffer>;
+    #chunks: Uint8Array<ArrayBuffer>[] = [];
+    #length = 0;
+
+    constructor(algorithm: HashAlgorithm, key?: Uint8Array<ArrayBuffer>) {
+        this.#algorithm = algorithm;
+        this.#key = key?.slice();
     }
-    return result;
+
+    update(data: BufferSource): this {
+        const bytes = inputBytes(data);
+        if (bytes.byteLength > 0) {
+            this.#chunks.push(bytes.slice());
+            this.#length += bytes.byteLength;
+        }
+        return this;
+    }
+
+    copy(): BufferedHash {
+        const copy = new BufferedHash(this.#algorithm, this.#key);
+        // Chunks are private snapshots and remain immutable across branches.
+        copy.#chunks = this.#chunks.slice();
+        copy.#length = this.#length;
+        return copy;
+    }
+
+    digest(): ArrayBuffer {
+        const joined = new Uint8Array(this.#length);
+        let offset = 0;
+        for (const chunk of this.#chunks) {
+            joined.set(chunk, offset);
+            offset += chunk.byteLength;
+        }
+        const result = this.#key === undefined
+            ? this.#algorithm.hash(joined)
+            : this.#algorithm.hmac!(this.#key, joined);
+        this.#chunks = [];
+        this.#length = 0;
+        return result;
+    }
+}
+
+class HmacHash implements CModuleCrypto.Hash {
+    #inner: CModuleCrypto.Hash;
+    #outer: CModuleCrypto.Hash;
+
+    constructor(inner: CModuleCrypto.Hash, outer: CModuleCrypto.Hash) {
+        this.#inner = inner;
+        this.#outer = outer;
+    }
+
+    update(data: BufferSource): this {
+        this.#inner.update(data);
+        return this;
+    }
+
+    copy(): HmacHash {
+        return new HmacHash(this.#inner.copy(), this.#outer.copy());
+    }
+
+    digest(): ArrayBuffer {
+        this.#outer.update(this.#inner.digest());
+        return this.#outer.digest();
+    }
+}
+
+function createHash(algorithm: HashAlgorithm, key?: Uint8Array<ArrayBuffer>): CModuleCrypto.Hash {
+    if (!algorithm.create || (key !== undefined && algorithm.blockSize === undefined)) {
+        return new BufferedHash(algorithm, key);
+    }
+    const inner = algorithm.create();
+    if (key === undefined) return inner;
+
+    const blockSize = algorithm.blockSize!;
+    const normalizedKey = key.byteLength > blockSize ? new Uint8Array(algorithm.hash(key)) : key;
+    const innerPad = new Uint8Array(blockSize).fill(0x36);
+    const outerPad = new Uint8Array(blockSize).fill(0x5c);
+    for (let index = 0; index < normalizedKey.byteLength; index++) {
+        innerPad[index] ^= normalizedKey[index];
+        outerPad[index] ^= normalizedKey[index];
+    }
+    inner.update(innerPad);
+    const outer = algorithm.create();
+    outer.update(outerPad);
+    return new HmacHash(inner, outer);
 }
 
 const ENCODINGS = new Set([
@@ -214,8 +297,8 @@ function planOutput(
 interface CryptoHasherState {
     algorithm: string;
     byteLength: number;
-    key?: Uint8Array<ArrayBuffer>;
-    chunks: Uint8Array<ArrayBuffer>[];
+    hash: CModuleCrypto.Hash;
+    keyed: boolean;
     consumed: boolean;
 }
 
@@ -298,18 +381,18 @@ function defineCryptoHasher(): CryptoHasherConstructor {
 
         let key: Uint8Array<ArrayBuffer> | undefined;
         if (hmacKey != null) {
-            if (!hash[2]) {
+            if (hash.blockSize === undefined && hash.hmac === undefined) {
                 const error = new Error('HMAC is not supported for this algorithm yet');
                 error.name = 'TODOError';
                 throw error;
             }
-            key = ownedBytes(hmacKey);
+            key = inputBytes(hmacKey);
         }
         states.set(this, {
             algorithm: name,
-            byteLength: hash[0],
-            key,
-            chunks: [],
+            byteLength: hash.byteLength,
+            hash: createHash(hash, key),
+            keyed: key !== undefined,
             consumed: false,
         });
     }
@@ -334,18 +417,17 @@ function defineCryptoHasher(): CryptoHasherConstructor {
 
     function update(this: unknown, input: unknown, inputEncoding?: unknown): unknown {
         const state = stateOf(this);
-        const bytes = ownedBytes(input, inputEncoding);
+        const bytes = inputBytes(input, inputEncoding);
         assertUsable(state);
-        state.chunks.push(bytes);
+        state.hash.update(bytes);
         return this;
     }
 
     function copy(this: unknown): CryptoHasher {
         const state = stateOf(this);
         assertUsable(state);
-        const result = new CryptoHasher(state.algorithm, state.key);
-        const copyState = states.get(result as object)!;
-        copyState.chunks = state.chunks.map(chunk => chunk.slice());
+        const result = Object.create(CryptoHasher.prototype) as CryptoHasher;
+        states.set(result, { ...state, hash: state.hash.copy() });
         return result;
     }
 
@@ -353,11 +435,8 @@ function defineCryptoHasher(): CryptoHasherConstructor {
         const state = stateOf(this);
         const render = planOutput(args[0], true);
         assertUsable(state);
-        const data = joinBytes(state.chunks);
-        const [, hash, hmac] = hashes[state.algorithm];
-        const result = new Uint8Array(state.key === undefined ? hash(data) : hmac!(state.key, data));
-        state.chunks = [];
-        if (state.key !== undefined) state.consumed = true;
+        const result = new Uint8Array(state.hash.digest());
+        if (state.keyed) state.consumed = true;
         return render(result);
     }
 
@@ -365,13 +444,13 @@ function defineCryptoHasher(): CryptoHasherConstructor {
         // Bun's static helper requires a primitive algorithm string and checks
         // input/output categories before lookup, but output details afterward.
         if (typeof algorithm !== 'string') throw invalidArgType('algorithm must be a string');
-        const data = ownedBytes(input);
+        const data = inputBytes(input).slice();
         assertOutputType(rest[0], false);
         const name = algorithm.toLowerCase().replace(/^sha-(1|224|256|384|512)$/, 'sha$1');
         const entry = Object.hasOwn(hashes, name) ? hashes[name] : undefined;
         if (!entry) throw invalidArgType(`Unsupported algorithm "${algorithm}"`);
-        const render = planOutput(rest[0], false, entry[0]);
-        return render(new Uint8Array(entry[1](data)));
+        const render = planOutput(rest[0], false, entry.byteLength);
+        return render(new Uint8Array(entry.hash(data)));
     }
 
     function algorithms(): string[] {

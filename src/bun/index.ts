@@ -28,6 +28,7 @@ import {
     type HashDigestEncoding,
 } from './crypto/hash-classes';
 import { file, type BunFileLike, type BunFileWriteOptions, type BunWriteInput, write } from './file';
+import { FileSystemRouter, type FileSystemRouterOptions, type MatchedRoute } from './file-system-router';
 import { Glob, type GlobScanOptions } from './glob';
 import { bunHash as hash, type BunHash, type HashInput } from './hash';
 import { inspect as inspectValue, inspectCustom, inspectTable, type InspectOptions } from './inspect';
@@ -39,7 +40,11 @@ import {
     type BunSocket,
     type BunSocketData,
     type BunSocketHandler,
+    type BunSocketListener,
     type BunTcpSocketListener,
+    type BunTcpSocketOptions,
+    type BunUnixSocketListener,
+    type BunUnixSocketOptions,
 } from './net';
 import { spawn, spawnSync } from './process';
 import { resolve, resolveSync } from './resolve';
@@ -94,6 +99,12 @@ import { TOML } from './utils/toml';
 import { randomUUIDv7 } from './uuid';
 import { randomUUIDv5 } from './uuid/v5';
 
+const engine = import.meta.use('engine');
+const evbus = import.meta.use('evbus');
+const osModule = import.meta.use('os');
+const timers = import.meta.use('timers');
+const worker = import.meta.use('worker');
+
 const webFetch = globalThis.fetch;
 const reflectGet = Reflect.get;
 const NativePromise = Promise;
@@ -129,7 +140,7 @@ export const fetch: typeof globalThis.fetch = async function fetch(input, init =
     }
     return webFetch(input, objectInit);
 };
-export const isMainThread = !import.meta.use('worker').isWorker;
+export const isMainThread = !worker.isWorker;
 // cno does not produce Bun-style `--compile` standalone executables. Keep
 // these feature-detection values truthful and allocation-free in normal runs.
 export const isStandaloneExecutable = false;
@@ -141,6 +152,7 @@ export {
     CookieMap,
     CryptoHasher,
     dns,
+    FileSystemRouter,
     Glob,
     JSONC,
     JSON5,
@@ -219,7 +231,11 @@ export type {
     BunSocket,
     BunSocketData,
     BunSocketHandler,
+    BunSocketListener,
     BunTcpSocketListener,
+    BunTcpSocketOptions,
+    BunUnixSocketListener,
+    BunUnixSocketOptions,
     BunWriteInput,
     CompressionInput,
     CompressionOptions,
@@ -227,6 +243,7 @@ export type {
     CookieOptions,
     CookieSameSite,
     CookieStoreDeleteOptions,
+    FileSystemRouterOptions,
     GlobScanOptions,
     HashInput,
     HashClassInput,
@@ -236,6 +253,7 @@ export type {
     JSONLInput,
     JSONLParseChunkResult,
     LibdeflateCompressionOptions,
+    MatchedRoute,
     PeekStatus,
     SliceAnsiOptions,
     StdioFile,
@@ -278,6 +296,7 @@ export interface BunApi {
     readonly inflateSync: typeof inflateSync;
     readonly CryptoHasher: typeof CryptoHasher;
     readonly dns: typeof dns;
+    readonly FileSystemRouter: typeof FileSystemRouter;
     readonly SHA1: typeof SHA1;
     readonly MD5: typeof MD5;
     readonly MD4: typeof MD4;
@@ -346,7 +365,7 @@ export const sleep = (milliseconds: number | Date): Promise<void> => {
     let delay: number;
     if (typeof milliseconds === 'number') {
         delay = milliseconds;
-    } else if (import.meta.use('engine').isDate(milliseconds)) {
+    } else if (engine.isDate(milliseconds)) {
         delay = dateGetTime.call(milliseconds) - dateNow();
     } else {
         throw new TypeError('sleep expects a number (milliseconds)');
@@ -356,8 +375,6 @@ export const sleep = (milliseconds: number | Date): Promise<void> => {
     const timerDelay = delay !== delay || delay <= 0
         ? 0
         : mathMin(delay, MAX_TIMER_DELAY);
-    // The runtime injects a global setTimeout; the timers module is its typed face.
-    const timers = import.meta.use('timers');
     return new NativePromise((resolve) => timers.setTimeout(resolve, timerDelay));
 };
 
@@ -366,10 +383,9 @@ export const sleep = (milliseconds: number | Date): Promise<void> => {
  * collection; the engine binding only exposes one sweep, so every call runs it.
  */
 export const gc = (_force?: boolean): void => {
-    import.meta.use('engine').gc.run();
+    engine.gc.run();
 };
 
-const osModule = import.meta.use('os');
 /** Whether stdout is a terminal, i.e. whether ANSI colors are enabled. */
 export const enableANSIColors: boolean = osModule.guessHandle(1) === 'tty';
 
@@ -395,7 +411,7 @@ function processBridge(): {
 
 function mainPath(): string {
     // The CLI publishes the entry URL on its `cno.runtime` channel.
-    const published = import.meta.use('evbus').get('cno.runtime', 'mainScript');
+    const published = evbus.get('cno.runtime', 'mainScript');
     const main = typeof published === 'string' ? published : '';
     if (!main.startsWith('file:')) return main;
     try {
@@ -459,6 +475,7 @@ const Bun: BunApi = {
     inflateSync,
     CryptoHasher,
     dns,
+    FileSystemRouter,
     SHA1,
     MD5,
     MD4,

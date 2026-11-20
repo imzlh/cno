@@ -1,10 +1,3 @@
-/**
- * TCP subset of Bun.connect and Bun.listen over the host Deno net primitives.
- * Unix sockets, TLS, and socket-sharing options are rejected explicitly; the
- * per-connection Socket keeps Bun's callback contract for the events and
- * methods listed below.
- */
-
 import { Buffer } from 'node:buffer';
 import { arrayBufferBackedBytes, bytesToArrayBuffer, sanitizeSurrogates } from '../utils/bytes';
 
@@ -56,15 +49,15 @@ export interface BunSocketHandler {
 export interface BunSocket {
     /** The per-instance context from the options object. */
     data: unknown;
-    readonly remoteFamily: 'IPv4' | 'IPv6';
-    readonly remoteAddress: string;
-    readonly remotePort: number;
-    readonly localFamily: 'IPv4' | 'IPv6';
-    readonly localAddress: string;
-    readonly localPort: number;
+    readonly remoteFamily: 'IPv4' | 'IPv6' | undefined;
+    readonly remoteAddress: string | undefined;
+    readonly remotePort: number | undefined;
+    readonly localFamily: 'IPv4' | 'IPv6' | undefined;
+    readonly localAddress: string | undefined;
+    readonly localPort: number | undefined;
     /** -2 shutdown, -1 closed/detached, 0 pending, 1 established. */
     readonly readyState: -2 | -1 | 0 | 1 | 2;
-    readonly listener?: BunTcpSocketListener;
+    readonly listener?: BunSocketListener;
     write(data: BunSocketData, byteOffset?: number, byteLength?: number): number;
     end(data?: BunSocketData, byteOffset?: number, byteLength?: number): number;
     /** Flushes are implicit in this runtime; retained for call compatibility. */
@@ -82,9 +75,10 @@ export interface BunSocket {
     [Symbol.dispose](): void;
 }
 
-export interface BunTcpSocketListener {
-    readonly port: number;
-    readonly hostname: string;
+export interface BunSocketListener {
+    readonly port: number | undefined;
+    readonly hostname: string | undefined;
+    readonly unix: string | undefined;
     data: unknown;
     /** Closes the listener; live connections drain unless told not to. */
     stop(closeActiveConnections?: boolean): void;
@@ -95,25 +89,42 @@ export interface BunTcpSocketListener {
     [Symbol.dispose](): void;
 }
 
-export interface BunConnectOptions {
-    hostname: string;
-    port: number;
+export interface BunTcpSocketListener extends BunSocketListener {
+    readonly port: number;
+    readonly hostname: string;
+    readonly unix: undefined;
+}
+
+export interface BunUnixSocketListener extends BunSocketListener {
+    readonly unix: string;
+    readonly port: undefined;
+    readonly hostname: undefined;
+}
+
+interface BunSocketOptions {
     socket: BunSocketHandler;
-    /** Per-instance context exposed as socket.data. */
     data?: unknown;
-    /** Keep the socket open after the peer closes its write side. */
     allowHalfOpen?: boolean;
 }
 
-export interface BunListenOptions {
+export interface BunTcpSocketOptions extends BunSocketOptions {
     hostname: string;
     port: number;
-    socket: BunSocketHandler;
-    /** Per-instance context exposed as socket.data on accepted sockets. */
-    data?: unknown;
-    /** Keep the socket open after the peer closes its write side. */
-    allowHalfOpen?: boolean;
+    unix?: undefined;
 }
+
+export interface BunUnixSocketOptions extends BunSocketOptions {
+    unix: string;
+    hostname?: string;
+    port?: number;
+}
+
+export type BunConnectOptions = BunTcpSocketOptions | BunUnixSocketOptions;
+export type BunListenOptions = BunTcpSocketOptions | BunUnixSocketOptions;
+
+type HostEndpoint =
+    | { transport: 'tcp'; hostname: string; port: number }
+    | { transport: 'unix'; path: string };
 
 interface HostAddr {
     hostname?: string;
@@ -141,14 +152,13 @@ interface HostListener {
 }
 
 interface HostDeno {
-    connect(options: { hostname?: string; port?: number; transport?: string }): Promise<HostConn>;
-    listen(options: { hostname?: string; port?: number; transport?: string }): HostListener;
+    connect(options: HostEndpoint): Promise<HostConn>;
+    listen(options: HostEndpoint): HostListener;
 }
 
-const CONNECT_OPTIONS = ['hostname', 'port', 'socket', 'data', 'allowHalfOpen'] as const;
+const CONNECT_OPTIONS = ['hostname', 'port', 'unix', 'socket', 'data', 'allowHalfOpen'] as const;
 const UNSUPPORTED_OPTION_DETAILS: Record<string, string> = {
-    tls: 'TLS is not part of the TCP subset.',
-    unix: 'Unix sockets are not part of the TCP subset.',
+    tls: 'TLS is not supported by this adapter.',
     fd: 'file descriptors are not supported by this adapter.',
     reusePort: 'socket reuse options are not supported by this adapter.',
     exclusive: 'exclusive-bind options are not supported by this adapter.',
@@ -168,7 +178,8 @@ function asError(value: unknown): Error {
     return new Error(typeof value === 'string' ? value : 'socket error', { cause: value });
 }
 
-function addressOf(addr: HostAddr | undefined): { family: 'IPv4' | 'IPv6'; address: string; port: number } {
+function addressOf(addr: HostAddr | undefined, transport = addr?.transport): { family: 'IPv4' | 'IPv6'; address: string; port: number } | undefined {
+    if (transport === 'unix') return undefined;
     const address = typeof addr?.hostname === 'string' && addr.hostname.length > 0 ? addr.hostname : '';
     return {
         family: address.includes(':') ? 'IPv6' : 'IPv4',
@@ -237,6 +248,23 @@ function parseHostname(value: unknown, label: string): string {
     return value.startsWith('[') && value.endsWith(']') ? value.slice(1, -1) : value;
 }
 
+function parseEndpoint(options: BunConnectOptions | BunListenOptions, label: string): HostEndpoint {
+    if (options.unix !== undefined) {
+        if (typeof options.unix !== 'string' || options.unix.length === 0) {
+            throw new TypeError(`${label}: unix must be a non-empty string`);
+        }
+        if (options.unix.includes('\0')) {
+            throw new TypeError(`${label}: abstract Unix sockets and NUL-containing paths are unsupported`);
+        }
+        return { transport: 'unix', path: options.unix };
+    }
+    return {
+        transport: 'tcp',
+        hostname: parseHostname(options.hostname, `${label}: hostname`),
+        port: parsePort(options.port, `${label}: port`),
+    };
+}
+
 function viewBytes(data: ArrayBufferView): Uint8Array<ArrayBufferLike> {
     try {
         const buffer = Reflect.apply(typedArrayBuffer, data, []);
@@ -291,10 +319,11 @@ function convertChunk(chunk: Uint8Array, binaryType: BinaryType): ArrayBuffer | 
 
 class BunSocketImpl implements BunSocket {
     #data: unknown;
-    #boundListener: BunTcpSocketListener | undefined;
+    #boundListener: BunSocketListener | undefined;
     #conn: HostConn | undefined;
     #handlers: BunSocketHandler;
     #binaryType: BinaryType;
+    readonly #transport: HostEndpoint['transport'];
     readonly #allowHalfOpen: boolean;
     #writeEnded = false;
     #writeClosed = false;
@@ -309,14 +338,16 @@ class BunSocketImpl implements BunSocket {
         handlers: BunSocketHandler;
         data: unknown;
         allowHalfOpen: boolean;
+        transport: HostEndpoint['transport'];
         conn?: HostConn;
-        listener?: BunTcpSocketListener;
+        listener?: BunSocketListener;
         activeSockets?: Set<BunSocketImpl>;
     }) {
         this.#conn = params.conn;
         this.#handlers = params.handlers;
         this.#data = params.data;
         this.#allowHalfOpen = params.allowHalfOpen;
+        this.#transport = params.transport;
         this.#boundListener = params.listener;
         this.#activeSockets = params.activeSockets;
         this.#binaryType = params.handlers.binaryType ?? 'buffer';
@@ -343,28 +374,28 @@ class BunSocketImpl implements BunSocket {
         this.#data = value;
     }
 
-    get remoteFamily(): 'IPv4' | 'IPv6' {
-        return addressOf(this.#conn?.remoteAddr).family;
+    get remoteFamily(): 'IPv4' | 'IPv6' | undefined {
+        return addressOf(this.#conn?.remoteAddr, this.#transport)?.family;
     }
 
-    get remoteAddress(): string {
-        return addressOf(this.#conn?.remoteAddr).address;
+    get remoteAddress(): string | undefined {
+        return addressOf(this.#conn?.remoteAddr, this.#transport)?.address;
     }
 
-    get remotePort(): number {
-        return addressOf(this.#conn?.remoteAddr).port;
+    get remotePort(): number | undefined {
+        return addressOf(this.#conn?.remoteAddr, this.#transport)?.port;
     }
 
-    get localFamily(): 'IPv4' | 'IPv6' {
-        return addressOf(this.#conn?.localAddr).family;
+    get localFamily(): 'IPv4' | 'IPv6' | undefined {
+        return addressOf(this.#conn?.localAddr, this.#transport)?.family;
     }
 
-    get localAddress(): string {
-        return addressOf(this.#conn?.localAddr).address;
+    get localAddress(): string | undefined {
+        return addressOf(this.#conn?.localAddr, this.#transport)?.address;
     }
 
-    get localPort(): number {
-        return addressOf(this.#conn?.localAddr).port;
+    get localPort(): number | undefined {
+        return addressOf(this.#conn?.localAddr, this.#transport)?.port;
     }
 
     get readyState(): -2 | -1 | 0 | 1 | 2 {
@@ -373,7 +404,7 @@ class BunSocketImpl implements BunSocket {
         return this.#conn ? 1 : 0;
     }
 
-    get listener(): BunTcpSocketListener | undefined {
+    get listener(): BunSocketListener | undefined {
         return this.#boundListener;
     }
 
@@ -636,10 +667,10 @@ Object.defineProperties(socketPrototype, {
     [Symbol.toStringTag]: { value: 'TCPSocket', configurable: true },
 });
 
-class BunTcpSocketListenerImpl implements BunTcpSocketListener {
+class BunSocketListenerImpl implements BunSocketListener {
     readonly #hostListener: HostListener;
     readonly #boundAddress: ReturnType<typeof addressOf>;
-    readonly #hostname: string;
+    readonly #endpoint: HostEndpoint;
     #data: unknown;
     readonly #allowHalfOpen: boolean;
     #handlers: BunSocketHandler;
@@ -648,31 +679,35 @@ class BunTcpSocketListenerImpl implements BunTcpSocketListener {
 
     constructor(params: {
         hostListener: HostListener;
-        hostname: string;
+        endpoint: HostEndpoint;
         data: unknown;
         allowHalfOpen: boolean;
         handlers: BunSocketHandler;
     }) {
         this.#hostListener = params.hostListener;
         this.#boundAddress = addressOf(params.hostListener.addr);
-        this.#hostname = params.hostname;
+        this.#endpoint = params.endpoint;
         this.#data = params.data;
         this.#allowHalfOpen = params.allowHalfOpen;
         this.#handlers = params.handlers;
         void this.#acceptConnections();
     }
 
-    static dispose(listener: BunTcpSocketListenerImpl): void {
+    static dispose(listener: BunSocketListenerImpl): void {
         void listener.#hostListener;
         listener.stop();
     }
 
-    get port(): number {
-        return this.#boundAddress.port;
+    get port(): number | undefined {
+        return this.#endpoint.transport === 'tcp' ? this.#boundAddress?.port ?? this.#endpoint.port : undefined;
     }
 
-    get hostname(): string {
-        return this.#boundAddress.address || this.#hostname;
+    get hostname(): string | undefined {
+        return this.#endpoint.transport === 'tcp' ? this.#boundAddress?.address || this.#endpoint.hostname : undefined;
+    }
+
+    get unix(): string | undefined {
+        return this.#endpoint.transport === 'unix' ? this.#endpoint.path : undefined;
     }
 
     get data(): unknown {
@@ -709,7 +744,7 @@ class BunTcpSocketListenerImpl implements BunTcpSocketListener {
     }
 
     [Symbol.dispose](_value?: unknown): void {
-        BunTcpSocketListenerImpl.dispose(this);
+        BunSocketListenerImpl.dispose(this);
     }
 
     async #acceptConnections(): Promise<void> {
@@ -720,6 +755,7 @@ class BunTcpSocketListenerImpl implements BunTcpSocketListener {
                     handlers: this.#handlers,
                     data: this.#data,
                     allowHalfOpen: this.#allowHalfOpen,
+                    transport: this.#endpoint.transport,
                     listener: this,
                     activeSockets: this.#activeSockets,
                 });
@@ -736,16 +772,16 @@ class BunTcpSocketListenerImpl implements BunTcpSocketListener {
     }
 }
 
-const listenerPrototype = BunTcpSocketListenerImpl.prototype;
+const listenerPrototype = BunSocketListenerImpl.prototype;
 delete (listenerPrototype as { constructor?: unknown }).constructor;
-for (const key of ['port', 'hostname', 'data', 'stop', 'reload', 'ref', 'unref']) {
+for (const key of ['port', 'hostname', 'unix', 'data', 'stop', 'reload', 'ref', 'unref']) {
     const descriptor = Object.getOwnPropertyDescriptor(listenerPrototype, key)!;
     Object.defineProperty(listenerPrototype, key, { ...descriptor, configurable: false, enumerable: true });
 }
 Object.defineProperties(listenerPrototype, {
     [Symbol.dispose]: {
-        value: function dispose(this: BunTcpSocketListenerImpl, _value?: unknown): void {
-            BunTcpSocketListenerImpl.dispose(this);
+        value: function dispose(this: BunSocketListenerImpl, _value?: unknown): void {
+            BunSocketListenerImpl.dispose(this);
         },
         configurable: true,
         enumerable: false,
@@ -754,22 +790,21 @@ Object.defineProperties(listenerPrototype, {
     [Symbol.toStringTag]: { value: 'Listener', configurable: true },
 });
 
-/** Connects a TCP client socket (Bun.connect, TCP-only subset). */
 export async function connect(options: BunConnectOptions): Promise<BunSocket> {
     const parsed = parseSocketOptions(options, 'Bun.connect');
-    const hostname = parseHostname(options?.hostname, 'Bun.connect: hostname');
-    const port = parsePort(options?.port, 'Bun.connect: port');
+    const endpoint = parseEndpoint(options, 'Bun.connect');
     const runtime = hostRuntime();
 
     const socket = new BunSocketImpl({
         handlers: parsed.handlers,
         data: parsed.data,
         allowHalfOpen: parsed.allowHalfOpen,
+        transport: endpoint.transport,
     });
 
     let conn: HostConn;
     try {
-        conn = await runtime.connect({ hostname, port });
+        conn = await runtime.connect(endpoint);
     } catch (error) {
         const normalized = asError(error);
         BunSocketImpl.invoke(socket, 'connectError', normalized);
@@ -780,18 +815,19 @@ export async function connect(options: BunConnectOptions): Promise<BunSocket> {
     return socket;
 }
 
-/** Listens for TCP connections (Bun.listen, TCP-only subset). */
-export const listen = (options: BunListenOptions): BunTcpSocketListener => {
+export function listen(options: BunTcpSocketOptions): BunTcpSocketListener;
+export function listen(options: BunUnixSocketOptions): BunUnixSocketListener;
+export function listen(options: BunListenOptions): BunTcpSocketListener | BunUnixSocketListener;
+export function listen(options: BunListenOptions): BunTcpSocketListener | BunUnixSocketListener {
     const parsed = parseSocketOptions(options, 'Bun.listen');
-    const hostname = parseHostname(options?.hostname, 'Bun.listen: hostname');
-    const port = parsePort(options?.port, 'Bun.listen: port');
+    const endpoint = parseEndpoint(options, 'Bun.listen');
     const runtime = hostRuntime();
-    const hostListener = runtime.listen({ hostname, port });
-    return new BunTcpSocketListenerImpl({
+    const hostListener = runtime.listen(endpoint);
+    return new BunSocketListenerImpl({
         hostListener,
-        hostname,
+        endpoint,
         data: parsed.data,
         allowHalfOpen: parsed.allowHalfOpen,
         handlers: parsed.handlers,
-    });
-};
+    }) as BunTcpSocketListener | BunUnixSocketListener;
+}
