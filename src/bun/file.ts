@@ -1,6 +1,7 @@
 import { arrayBufferBackedBytes, sanitizeSurrogates } from '../utils/bytes';
 import { basename, dirname, join, toFsPath } from '../utils/path';
 import { ensureDirectory } from '../utils/fs-path';
+import { blobBytesOf } from './blob-intrinsics';
 import { isBunBytePath } from './file-path';
 import { fileDescriptorSink, filePathSink, type FileSink as BunFileSink } from './file-sink';
 import { openReadableFile } from './opened-file';
@@ -29,6 +30,7 @@ const dataViewBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, 'buff
 const dataViewByteOffset = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset')!.get!;
 const dataViewByteLength = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength')!.get!;
 const arrayBufferIsView = ArrayBuffer.isView;
+const arrayIsArray = Array.isArray;
 const blobSize = Object.getOwnPropertyDescriptor(Blob.prototype, 'size')!.get!;
 const fileName = typeof File === 'function'
     ? Object.getOwnPropertyDescriptor(File.prototype, 'name')?.get
@@ -89,6 +91,7 @@ export type BunWriteInput =
     | string
     | ArrayBufferView
     | ArrayBufferLike
+    | BlobPart[]
     | Blob
     | Response
     | Request
@@ -858,12 +861,19 @@ export class BunFile extends Blob implements BunFileLike {
                 : writeBorrowedStream(this.#backing.fd, data);
         }
         if (data == null) throw new TypeError('Bun.file.write: missing input');
-        if (typeof data !== 'string' && !arrayBufferIsView(data) && !isArrayBufferLike(data)
+        if (typeof data !== 'string' && !arrayIsArray(data) && !arrayBufferIsView(data) && !isArrayBufferLike(data)
             && !isBlob(data) && bodyInput?.kind !== 'Response') {
             return write(this, stringifyWriteInput(data));
         }
         return write(this, data as BunWriteInput);
     }
+}
+
+const bunFileBytes = BunFile.prototype[blobBytesSymbol];
+
+export function readBunFileBytes(value: BunFileLike): Uint8Array<ArrayBuffer> {
+    if (!isBunFile(value)) throw new TypeError('Expected BunFile');
+    return Reflect.apply(bunFileBytes, value, []);
 }
 
 for (const property of [
@@ -896,6 +906,27 @@ async function inputBytes(value: unknown): Promise<Uint8Array<ArrayBuffer>> {
     }
     if (arrayBufferIsView(value)) return toArrayBufferBytes(value);
     if (isArrayBufferLike(value)) return toArrayBufferBytes(value);
+    if (arrayIsArray(value)) {
+        if (engine.isProxy(value)) {
+            return arrayBufferBackedBytes(engine.encodeString(sanitizeSurrogates(stringifyWriteInput(value))));
+        }
+        const chunks: Uint8Array[] = [];
+        const length = value.length;
+        for (let index = 0; index < length; index++) {
+            const part: unknown = value[index];
+            if (part == null || isBunFile(part)) continue;
+            let bytes: Uint8Array;
+            if (arrayBufferIsView(part) || isArrayBufferLike(part)) {
+                bytes = toArrayBufferBytes(part);
+            } else {
+                if (typeof part === 'symbol') throw new TypeError('Cannot convert a symbol to a string');
+                bytes = (isObject(part) ? blobBytesOf(part) : undefined)
+                    ?? engine.encodeString(sanitizeSurrogates(stringifyWriteInput(part)));
+            }
+            if (bytes.byteLength > 0) chunks.push(bytes);
+        }
+        return arrayBufferBackedBytes(algorithm.bytesConcat(chunks));
+    }
     if (isReadableStream(value)) {
         throw new TypeError('Bun.write: ReadableStream input is not supported by this runtime');
     }
@@ -1070,6 +1101,7 @@ export async function write(
         if (bodyInput?.kind === 'Response' || isReadableStream(input)) {
             throw new TypeError('Bun.write: Response and ReadableStream input is not supported for stdio files');
         }
+        if (arrayIsArray(input)) return stdio.write(await inputBytes(input));
         return stdio.write(input as string | ArrayBufferView | ArrayBufferLike | Blob);
     }
     const backing = isBunFile(destination) ? fileBackings.get(destination)! : undefined;
@@ -1098,7 +1130,8 @@ export async function write(
         }
         if (isReadableStream(input)) return writeBorrowedStream(borrowedFd, input);
         const bytes = await inputBytes(
-            typeof input === 'object' && input !== null && !arrayBufferIsView(input) && !isArrayBufferLike(input)
+            typeof input === 'object' && input !== null && !arrayIsArray(input)
+                && !arrayBufferIsView(input) && !isArrayBufferLike(input)
                 ? stringifyWriteInput(input)
                 : input,
         );
@@ -1120,7 +1153,8 @@ export async function write(
     const bytes = bodyInput
         ? new Uint8Array(0)
         : await inputBytes(
-            typeof input === 'object' && input !== null && !arrayBufferIsView(input) && !isArrayBufferLike(input)
+            typeof input === 'object' && input !== null && !arrayIsArray(input)
+                && !arrayBufferIsView(input) && !isArrayBufferLike(input)
                 ? stringifyWriteInput(input)
                 : input,
         );

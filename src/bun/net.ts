@@ -1,5 +1,6 @@
 import { Buffer } from 'node:buffer';
 import { arrayBufferBackedBytes, bytesToArrayBuffer, sanitizeSurrogates } from '../utils/bytes';
+import { normalizeTlsOptions, type BunTlsConfig } from './tls';
 
 const engine = import.meta.use('engine');
 const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
@@ -42,6 +43,7 @@ export interface BunSocketHandler {
      * awaited or caught by the caller.
      */
     connectError?(socket: BunSocket, error: Error): void | Promise<void>;
+    handshake?(socket: BunSocket, success: boolean, authorizationError: Error | null): void | Promise<void>;
     /** Chunk type passed to data(); defaults to "buffer". */
     binaryType?: BinaryType;
 }
@@ -58,6 +60,9 @@ export interface BunSocket {
     /** -2 shutdown, -1 closed/detached, 0 pending, 1 established. */
     readonly readyState: -2 | -1 | 0 | 1 | 2;
     readonly listener?: BunSocketListener;
+    readonly authorized: boolean;
+    readonly alpnProtocol: string | false;
+    getAuthorizationError(): Error | null;
     write(data: BunSocketData, byteOffset?: number, byteLength?: number): number;
     end(data?: BunSocketData, byteOffset?: number, byteLength?: number): number;
     /** Flushes are implicit in this runtime; retained for call compatibility. */
@@ -105,6 +110,7 @@ interface BunSocketOptions {
     socket: BunSocketHandler;
     data?: unknown;
     allowHalfOpen?: boolean;
+    tls?: boolean | import('bun').TLSOptions;
 }
 
 export interface BunTcpSocketOptions extends BunSocketOptions {
@@ -137,10 +143,14 @@ interface HostConn {
     readonly writable: WritableStream<Uint8Array>;
     readonly remoteAddr?: HostAddr;
     readonly localAddr?: HostAddr;
-    close(): void;
+    close(): void | Promise<void>;
     closeWrite(): Promise<void>;
     ref(): void;
     unref(): void;
+}
+
+interface HostTlsConn extends HostConn {
+    handshake(): Promise<{ alpnProtocol?: string | null }>;
 }
 
 interface HostListener {
@@ -153,6 +163,7 @@ interface HostListener {
 
 interface HostDeno {
     connect(options: HostEndpoint): Promise<HostConn>;
+    connectTls(options: { hostname: string; port: number } & BunTlsConfig): Promise<HostTlsConn>;
     listen(options: HostEndpoint): HostListener;
 }
 
@@ -199,7 +210,7 @@ function parseSocketOptions(options: unknown, label: string): {
     const record = options as Record<PropertyKey, unknown>;
     for (const key of Reflect.ownKeys(record)) {
         const name = String(key);
-        if (name === 'tls' && record[key] === false) continue; // Bun treats false as "no TLS"
+        if (name === 'tls' && (label === 'Bun.connect' || record[key] === false)) continue;
         if (CONNECT_OPTIONS.includes(name as typeof CONNECT_OPTIONS[number])) continue;
         const detail = UNSUPPORTED_OPTION_DETAILS[name];
         throw new TypeError(detail ? `${label}: unsupported option "${name}". ${detail}` : `${label}: unsupported option "${name}"`);
@@ -332,6 +343,11 @@ class BunSocketImpl implements BunSocket {
     #closeWhenDrained = false;
     #pendingWrites = 0;
     #writeWriter: WritableStreamDefaultWriter<Uint8Array> | undefined;
+    #tls = false;
+    #authorized = false;
+    #alpnProtocol: string | false = false;
+    #authorizationError: Error | null = null;
+    #teardownStarted = false;
     readonly #activeSockets: Set<BunSocketImpl> | undefined;
 
     constructor(params: {
@@ -353,8 +369,8 @@ class BunSocketImpl implements BunSocket {
         this.#binaryType = params.handlers.binaryType ?? 'buffer';
     }
 
-    static attach(socket: BunSocketImpl, conn: HostConn): void {
-        socket.#attach(conn);
+    static attach(socket: BunSocketImpl, conn: HostConn, tls = false): void {
+        socket.#attach(conn, tls);
     }
 
     static invoke(socket: BunSocketImpl, event: string, ...args: unknown[]): void {
@@ -406,6 +422,22 @@ class BunSocketImpl implements BunSocket {
 
     get listener(): BunSocketListener | undefined {
         return this.#boundListener;
+    }
+
+    get authorized(): boolean {
+        return this.#authorized;
+    }
+
+    get alpnProtocol(): string | false {
+        return this.#alpnProtocol;
+    }
+
+    getAuthorizationError(): Error | null {
+        return this.#authorizationError;
+    }
+
+    get [Symbol.toStringTag](): string {
+        return this.#tls ? 'TLSSocket' : 'TCPSocket';
     }
 
     write(data: BunSocketData, byteOffset?: number, byteLength?: number): number {
@@ -494,11 +526,36 @@ class BunSocketImpl implements BunSocket {
         BunSocketImpl.dispose(this);
     }
 
-    /** Installs the conn and starts the read pump; called once per socket. */
-    #attach(conn: HostConn): void {
+    #attach(conn: HostConn, tls: boolean): void {
         this.#conn = conn;
+        this.#tls = tls;
         this.#activeSockets?.add(this);
-        void this.#readLoop();
+        if (!tls) {
+            void this.#readLoop();
+            this.#invoke('open');
+            return;
+        }
+        let hasHandshake: boolean;
+        try {
+            hasHandshake = typeof Reflect.get(this.#handlers, 'handshake') === 'function';
+        } catch (error) {
+            void (conn as HostTlsConn).handshake().catch(() => {});
+            this.#fail(asError(error));
+            return;
+        }
+        void (conn as HostTlsConn).handshake().then(info => {
+            if (this.#closed) return;
+            this.#authorized = true;
+            this.#alpnProtocol = info.alpnProtocol || false;
+            this.#invoke(hasHandshake ? 'handshake' : 'open', true, null);
+            if (!this.#closed) void this.#readLoop();
+        }, error => {
+            if (this.#closed) return;
+            this.#authorizationError = asError(error);
+            this.#invoke(hasHandshake ? 'handshake' : 'open', false, this.#authorizationError);
+            this.#finishClose();
+        });
+        if (hasHandshake) this.#invoke('open');
     }
 
     #writer(): WritableStreamDefaultWriter<Uint8Array> {
@@ -572,10 +629,13 @@ class BunSocketImpl implements BunSocket {
     }
 
     #teardown(): void {
+        if (this.#teardownStarted) return;
+        this.#teardownStarted = true;
         // Discard queued writes and release the writer lock with the pipe.
         void this.#writeWriter?.abort().catch(() => {});
         try {
-            this.#conn?.close();
+            const closing = this.#conn?.close();
+            if (closing) void Promise.resolve(closing).catch(() => {});
         } catch {
             // The host may have already torn the conn down with the streams.
         }
@@ -649,6 +709,7 @@ const socketPrototype = BunSocketImpl.prototype;
 delete (socketPrototype as { constructor?: unknown }).constructor;
 for (const key of [
     'data', 'remoteFamily', 'remoteAddress', 'remotePort', 'localFamily', 'localAddress', 'localPort',
+    'authorized', 'alpnProtocol', 'getAuthorizationError',
     'readyState', 'listener', 'write', 'end', 'flush', 'shutdown', 'terminate', 'reload', 'ref', 'unref',
 ]) {
     const descriptor = Object.getOwnPropertyDescriptor(socketPrototype, key)!;
@@ -664,7 +725,6 @@ Object.defineProperties(socketPrototype, {
         enumerable: false,
         writable: false,
     },
-    [Symbol.toStringTag]: { value: 'TCPSocket', configurable: true },
 });
 
 class BunSocketListenerImpl implements BunSocketListener {
@@ -760,7 +820,6 @@ class BunSocketListenerImpl implements BunSocketListener {
                     activeSockets: this.#activeSockets,
                 });
                 BunSocketImpl.attach(socket, conn);
-                BunSocketImpl.invoke(socket, 'open');
             }
         } catch (error) {
             if (!this.#closed) {
@@ -793,6 +852,14 @@ Object.defineProperties(listenerPrototype, {
 export async function connect(options: BunConnectOptions): Promise<BunSocket> {
     const parsed = parseSocketOptions(options, 'Bun.connect');
     const endpoint = parseEndpoint(options, 'Bun.connect');
+    const tls = normalizeTlsOptions(options.tls, 'client');
+    if (tls && endpoint.transport !== 'tcp') throw new TypeError('Bun.connect: TLS over Unix sockets is not supported');
+    if (tls?.servername !== undefined && endpoint.transport === 'tcp') {
+        const hostname = endpoint.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+        if (tls.servername.replace(/^\[|\]$/g, '').toLowerCase() !== hostname) {
+            throw new TypeError('Bun.connect: TLS serverName must match hostname on this host');
+        }
+    }
     const runtime = hostRuntime();
 
     const socket = new BunSocketImpl({
@@ -804,14 +871,22 @@ export async function connect(options: BunConnectOptions): Promise<BunSocket> {
 
     let conn: HostConn;
     try {
-        conn = await runtime.connect(endpoint);
+        if (tls && endpoint.transport === 'tcp') {
+            if (typeof runtime.connectTls !== 'function') throw new Error('Bun.connect: the host does not provide TLS connections');
+            if (tls.caCerts === undefined) {
+                const { effectiveDefaultCACertificates } = await import('../node/tls/_shared');
+                tls.caCerts = effectiveDefaultCACertificates();
+            }
+            conn = await runtime.connectTls({ ...tls, hostname: endpoint.hostname, port: endpoint.port });
+        } else {
+            conn = await runtime.connect(endpoint);
+        }
     } catch (error) {
         const normalized = asError(error);
         BunSocketImpl.invoke(socket, 'connectError', normalized);
         throw normalized;
     }
-    BunSocketImpl.attach(socket, conn);
-    BunSocketImpl.invoke(socket, 'open');
+    BunSocketImpl.attach(socket, conn, tls !== undefined);
     return socket;
 }
 

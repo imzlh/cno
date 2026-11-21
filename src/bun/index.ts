@@ -58,7 +58,9 @@ import {
     type BunServeRoute,
     type BunServeRoutes,
     type BunServeServer,
+    type BunServeTlsConfig,
 } from './serve';
+import { installServeTlsNormalizer } from './serve';
 import { installServeStaticDirectoryRoutes } from './serve-static';
 import { sleepSync } from './sleep-sync';
 import { stderr, stdin, stdout, type StdioFile } from './stdio';
@@ -96,6 +98,8 @@ import {
 } from './utils/text';
 import { which, type WhichOptions } from './utils/which';
 import { TOML } from './utils/toml';
+import { XML } from './utils/xml';
+import { normalizeTlsOptions } from './tls';
 import { randomUUIDv7 } from './uuid';
 import { randomUUIDv5 } from './uuid/v5';
 
@@ -104,6 +108,8 @@ const evbus = import.meta.use('evbus');
 const osModule = import.meta.use('os');
 const timers = import.meta.use('timers');
 const worker = import.meta.use('worker');
+
+installServeTlsNormalizer(normalizeTlsOptions);
 
 const webFetch = globalThis.fetch;
 const reflectGet = Reflect.get;
@@ -207,6 +213,7 @@ export {
     stringWidth,
     stripANSI,
     TOML,
+    XML,
     unsafe,
     wrapAnsi,
     which,
@@ -228,6 +235,7 @@ export type {
     BunServeRoute,
     BunServeRoutes,
     BunServeServer,
+    BunServeTlsConfig,
     BunSocket,
     BunSocketData,
     BunSocketHandler,
@@ -328,6 +336,7 @@ export interface BunApi {
     readonly JSON5: typeof JSON5;
     readonly JSONL: typeof JSONL;
     readonly TOML: typeof TOML;
+    readonly XML: typeof XML;
     readonly color: typeof color;
     readonly stripANSI: typeof stripANSI;
     readonly sliceAnsi: typeof sliceAnsi;
@@ -507,6 +516,7 @@ const Bun: BunApi = {
     JSON5,
     JSONL,
     TOML,
+    XML,
     color,
     stripANSI,
     sliceAnsi,

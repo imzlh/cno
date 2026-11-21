@@ -1,44 +1,70 @@
-/**
- * HTTP-only Bun.serve adapter.
- *
- * Deno.serve owns parsing, response streaming, and connection lifetime in the
- * host. This adapter keeps Bun's synchronous handle and metadata while
- * rejecting transport features that the host cannot represent faithfully.
- */
+/** Bun server semantics over the host HTTP and WebSocket primitives. */
 
 import { compileRoutes, type BunServeRoutes, type CompiledRoutes } from './serve-routes';
+import {
+    BunWebSocketServer,
+    parseWebSocketHandler,
+    type BunWebSocketData,
+    type BunWebSocketHandler,
+    type BunWebSocketUpgradeOptions,
+    type HostWebSocketUpgrade,
+} from './serve-websocket';
 export type { BunServeHttpMethod, BunServeRoute, BunServeRoutes } from './serve-routes';
+export type { BunServerWebSocket, BunWebSocketBinaryType, BunWebSocketData, BunWebSocketHandler, BunWebSocketUpgradeOptions } from './serve-websocket';
 
-export interface BunServeServer {
+export interface BunServeTlsConfig {
+    cert?: string;
+    key?: string;
+    caCerts?: string[];
+    alpnProtocols?: string[];
+    servername?: string;
+}
+
+type ServeTlsNormalizer = (input: unknown, role: 'server') => BunServeTlsConfig | undefined;
+let serveTlsNormalizer: ServeTlsNormalizer | undefined;
+
+export function installServeTlsNormalizer(normalizer: ServeTlsNormalizer): void {
+    serveTlsNormalizer = normalizer;
+}
+
+export interface BunServeServer<T = unknown> {
     readonly port: number;
     readonly hostname: string;
     readonly url: URL;
+    readonly pendingWebSockets: number;
+    upgrade(request: Request, options?: BunWebSocketUpgradeOptions<T>): boolean;
+    publish(topic: string, data: BunWebSocketData, compress?: boolean): number;
+    subscriberCount(topic: string): number;
     /** Graceful shutdown; force-close is intentionally unsupported. */
     stop(closeActiveConnections?: boolean): Promise<void>;
     /** Replace request/error handlers and route tables without rebinding the listener. */
-    reload(options: BunServeReloadOptions): BunServeServer;
+    reload(options: BunServeReloadOptions<T>): BunServeServer<T>;
 }
 
-export type BunServeHandler = (
-    this: BunServeServer,
+export type BunServeHandler<T = unknown> = (
+    this: BunServeServer<T>,
     request: Request,
-    server: BunServeServer,
-) => Response | Promise<Response>;
+    server: BunServeServer<T>,
+) => Response | void | Promise<Response | void>;
 
-export type BunServeOptions = {
-    error?: (this: BunServeServer, error: unknown) => Response | Promise<Response>;
+export type BunServeOptions<T = unknown> = {
+    error?: (this: BunServeServer<T>, error: unknown) => Response | Promise<Response>;
     port?: number | string;
     hostname?: string;
-} & ({ fetch: BunServeHandler; routes?: BunServeRoutes } | { fetch?: BunServeHandler; routes: BunServeRoutes });
+    websocket?: BunWebSocketHandler<T>;
+    tls?: import('bun').TLSOptions | boolean | null;
+} & ({ fetch: BunServeHandler<T>; routes?: BunServeRoutes<T> } | { fetch?: BunServeHandler<T>; routes: BunServeRoutes<T> });
 
 /** The handler subset accepted by server.reload(). */
-export interface BunServeReloadOptions {
-    fetch?: BunServeHandler;
-    routes?: BunServeRoutes;
-    error?: (this: BunServeServer, error: unknown) => Response | Promise<Response>;
+export interface BunServeReloadOptions<T = unknown> {
+    fetch?: BunServeHandler<T>;
+    routes?: BunServeRoutes<T>;
+    error?: (this: BunServeServer<T>, error: unknown) => Response | Promise<Response>;
     // Bun accepts these on reload but leaves the existing listener unchanged.
     port?: number | string;
     hostname?: string;
+    websocket?: BunWebSocketHandler<T>;
+    tls?: import('bun').TLSOptions | boolean | null;
 }
 
 interface HostAddress {
@@ -55,9 +81,12 @@ interface HostServeOptions {
     port: number;
     hostname: string;
     onError?: (error: unknown) => Response | Promise<Response> | undefined;
+    cert?: string;
+    key?: string;
 }
 
 interface HostDeno {
+    upgradeWebSocket?: HostWebSocketUpgrade;
     serve(
         options: HostServeOptions,
         handler: (request: Request) => Response | Promise<Response>,
@@ -70,22 +99,23 @@ interface ParsedOptions {
     error?: (error: unknown) => Response | Promise<Response>;
     port: number;
     hostname: string;
+    websocket?: BunWebSocketHandler;
+    tls?: BunServeTlsConfig;
 }
 
 interface ParsedReloadOptions {
     fetch?: BunServeHandler;
     routes?: CompiledRoutes;
     error?: (error: unknown) => Response | Promise<Response>;
+    websocket?: BunWebSocketHandler;
 }
 
 const DEFAULT_PORT = 3000;
 const DEFAULT_HOSTNAME = 'localhost';
 const DEFAULT_BIND_HOSTNAME = '127.0.0.1';
-const SUPPORTED_OPTIONS = new Set(['fetch', 'routes', 'error', 'port', 'hostname']);
+const SUPPORTED_OPTIONS = new Set(['fetch', 'routes', 'error', 'port', 'hostname', 'websocket', 'tls']);
 
 const UNSUPPORTED_OPTION_DETAILS = new Map<string, string>([
-    ['websocket', 'WebSocket upgrades are not part of the HTTP-only subset.'],
-    ['tls', 'TLS is not part of the HTTP-only subset.'],
     ['development', 'development/hot-reload mode is not supported.'],
     ['reload', 'hot-reload options are not supported.'],
     ['hotReload', 'hot-reload options are not supported.'],
@@ -97,7 +127,7 @@ const UNSUPPORTED_OPTION_DETAILS = new Map<string, string>([
 
 function unsupportedOption(name: string): TypeError {
     const detail = UNSUPPORTED_OPTION_DETAILS.get(name)
-        ?? 'This subset supports only fetch, routes, error, port, and hostname.';
+        ?? 'This subset supports fetch, routes, error, port, hostname, and websocket.';
     return new TypeError(`Bun.serve: unsupported option "${name}". ${detail}`);
 }
 
@@ -152,13 +182,33 @@ function parseOptions(value: unknown): ParsedOptions {
 
     const port = parsePort(options.port);
     serverUrl(hostname, port);
-    return {
-        fetch: fetch as ParsedOptions['fetch'],
-        error: error as ParsedOptions['error'],
-        routes: routes === undefined ? undefined : compileRoutes(routes),
-        port,
-        hostname,
-    };
+    let compiledRoutes: CompiledRoutes | undefined;
+    try {
+        compiledRoutes = routes === undefined ? undefined : compileRoutes(routes);
+        return {
+            fetch: fetch as ParsedOptions['fetch'],
+            error: error as ParsedOptions['error'],
+            routes: compiledRoutes,
+            port,
+            hostname,
+            websocket: parseWebSocketHandler(options.websocket),
+            tls: parseServeTls(options.tls),
+        };
+    } catch (error) {
+        compiledRoutes?.dispose();
+        throw error;
+    }
+}
+
+function parseServeTls(value: unknown): BunServeTlsConfig | undefined {
+    if (value === undefined || value === false || value === null) return undefined;
+    if (Array.isArray(value)) throw new TypeError('Bun.serve: TLS identity arrays are unsupported by this host.');
+    if (!serveTlsNormalizer) throw new Error('Bun.serve TLS support is not initialized.');
+    const config = serveTlsNormalizer(value, 'server');
+    if (config?.caCerts !== undefined || config?.alpnProtocols !== undefined) {
+        throw new TypeError('Bun.serve: custom CA and ALPN TLS options are unsupported by the host server.');
+    }
+    return config;
 }
 
 function parseReloadOptions(value: unknown, stopped: boolean): ParsedReloadOptions {
@@ -188,12 +238,20 @@ function parseReloadOptions(value: unknown, stopped: boolean): ParsedReloadOptio
     if (stopped && routes !== undefined) {
         throw new TypeError('Bun.serve: cannot replace routes on a stopped server.');
     }
-
-    return {
-        fetch: fetch == null ? undefined : fetch as BunServeHandler,
-        error: error == null ? undefined : error as ParsedReloadOptions['error'],
-        routes: routes === undefined ? undefined : compileRoutes(routes),
-    };
+    let compiledRoutes: CompiledRoutes | undefined;
+    try {
+        compiledRoutes = routes === undefined ? undefined : compileRoutes(routes);
+        parseServeTls(options.tls);
+        return {
+            fetch: fetch == null ? undefined : fetch as BunServeHandler,
+            error: error == null ? undefined : error as ParsedReloadOptions['error'],
+            routes: compiledRoutes,
+            websocket: parseWebSocketHandler(options.websocket),
+        };
+    } catch (error) {
+        compiledRoutes?.dispose();
+        throw error;
+    }
 }
 
 function validateReloadPort(value: unknown): void {
@@ -214,11 +272,11 @@ function hostRuntime(): HostDeno {
     return runtime as HostDeno;
 }
 
-function serverUrl(hostname: string, port: number): URL {
+function serverUrl(hostname: string, port: number, secure = false): URL {
     const authorityHost = hostname.includes(':') && !hostname.startsWith('[')
         ? `[${hostname}]`
         : hostname;
-    return new URL(`http://${authorityHost}:${port}/`);
+    return new URL(`${secure ? 'https' : 'http'}://${authorityHost}:${port}/`);
 }
 
 function shutdownQuietly(server: HostHttpServer | undefined): void {
@@ -252,6 +310,7 @@ class BunServeServerImpl implements BunServeServer {
     private fetchHandler: BunServeHandler | undefined;
     private errorHandler: ((error: unknown) => Response | Promise<Response>) | undefined;
     private routes: CompiledRoutes | undefined;
+    private websockets: BunWebSocketServer | undefined;
 
     constructor(
         private readonly configuredHostname: string,
@@ -259,12 +318,19 @@ class BunServeServerImpl implements BunServeServer {
         fetchHandler: BunServeHandler | undefined,
         errorHandler: ((error: unknown) => Response | Promise<Response>) | undefined,
         routes: CompiledRoutes | undefined,
+        websocketHandlers?: BunWebSocketHandler,
+        private readonly upgradeWebSocket?: HostWebSocketUpgrade,
+        private readonly secure = false,
     ) {
         this.currentPort = requestedPort;
-        this.currentUrl = serverUrl(configuredHostname, requestedPort);
+        this.currentUrl = serverUrl(configuredHostname, requestedPort, secure);
         this.fetchHandler = fetchHandler;
         this.errorHandler = errorHandler;
         this.routes = routes;
+        if (websocketHandlers) {
+            if (!upgradeWebSocket) throw new Error('Bun.serve: the host does not support WebSocket upgrades.');
+            this.websockets = new BunWebSocketServer(websocketHandlers, upgradeWebSocket);
+        }
     }
 
     get port(): number {
@@ -279,7 +345,30 @@ class BunServeServerImpl implements BunServeServer {
         return this.currentUrl;
     }
 
+    get pendingWebSockets(): number {
+        return this.websockets?.pendingWebSockets ?? 0;
+    }
+
+    upgrade(request: Request, options?: BunWebSocketUpgradeOptions): boolean {
+        return this.websockets?.upgrade(request, options) ?? false;
+    }
+
+    publish(topic: string, data: BunWebSocketData, _compress?: boolean): number {
+        return this.websockets?.publish(topic, data) ?? 0;
+    }
+
+    subscriberCount(topic: string): number {
+        return this.websockets?.subscriberCount(topic) ?? 0;
+    }
+
     handleFetch(request: Request): Response | Promise<Response> {
+        if (this.websockets) {
+            return this.websockets.handleRequest(request, () => this.dispatchRequest(request), error => this.handleError(error));
+        }
+        return this.dispatchRequest(request) as Response | Promise<Response>;
+    }
+
+    private dispatchRequest(request: Request): Response | void | Promise<Response | void> {
         const matched = this.routes?.resolve(request);
         if (matched) {
             defineRequestParams(request, matched.params);
@@ -310,11 +399,23 @@ class BunServeServerImpl implements BunServeServer {
             }
             return this;
         }
+        let websockets = this.websockets;
+        if (parsed.websocket !== undefined && websockets === undefined) {
+            if (!this.upgradeWebSocket) {
+                parsed.routes?.dispose();
+                throw new Error('Bun.serve: the host does not support WebSocket upgrades.');
+            }
+            websockets = new BunWebSocketServer(parsed.websocket, this.upgradeWebSocket);
+        }
         const previousRoutes = this.routes;
         // Validation is complete before any live handler or route table is changed.
         if (parsed.fetch !== undefined) this.fetchHandler = parsed.fetch;
         if (parsed.error !== undefined) this.errorHandler = parsed.error;
         if (parsed.routes !== undefined) this.routes = parsed.routes;
+        if (parsed.websocket !== undefined) {
+            websockets!.reload(parsed.websocket);
+            this.websockets = websockets;
+        }
         if (parsed.routes !== undefined) previousRoutes?.dispose();
         return this;
     }
@@ -328,7 +429,7 @@ class BunServeServerImpl implements BunServeServer {
             throw new Error('Bun.serve: host returned a non-TCP address.');
         }
         this.currentPort = address.port;
-        this.currentUrl = serverUrl(this.configuredHostname, address.port);
+        this.currentUrl = serverUrl(this.configuredHostname, address.port, this.secure);
         this.hostServer = hostServer;
     }
 
@@ -344,28 +445,37 @@ class BunServeServerImpl implements BunServeServer {
         if (this.stopPromise) return this.stopPromise;
         if (!this.hostServer) return Promise.reject(new Error('Bun.serve: server is not initialized.'));
 
-        try {
-            this.stopPromise = Promise.resolve(this.hostServer.shutdown());
-        } catch (error) {
-            this.stopPromise = Promise.reject(error);
-        }
+        const stopped = Promise.withResolvers<void>();
+        this.stopPromise = stopped.promise;
         this.routes?.dispose();
+        const websockets = this.websockets?.stop();
+        try {
+            void Promise.all([this.hostServer.shutdown(), websockets]).then(() => stopped.resolve(), stopped.reject);
+        } catch (error) {
+            stopped.reject(error);
+        }
         return this.stopPromise;
     }
 }
 
-/** Start the supported HTTP subset of Bun.serve. */
-export function serve(options: BunServeOptions): BunServeServer {
+/** Start an HTTP server with optional WebSocket upgrades. */
+export function serve<T = unknown>(options: BunServeOptions<T>): BunServeServer<T> {
     const parsed = parseOptions(options);
     let hostServer: HostHttpServer | undefined;
     try {
         const runtime = hostRuntime();
-        const exposedServer = new BunServeServerImpl(parsed.hostname, parsed.port, parsed.fetch, parsed.error, parsed.routes);
+        const exposedServer = new BunServeServerImpl(
+            parsed.hostname, parsed.port, parsed.fetch, parsed.error, parsed.routes, parsed.websocket,
+            runtime.upgradeWebSocket?.bind(runtime),
+            parsed.tls !== undefined,
+        );
         const hostOptions: HostServeOptions = {
             port: parsed.port,
             // The host's native TCP bind only accepts literal IP addresses.
             hostname: parsed.hostname === DEFAULT_HOSTNAME ? DEFAULT_BIND_HOSTNAME : parsed.hostname,
             onError: error => exposedServer.handleError(error),
+            cert: parsed.tls?.cert,
+            key: parsed.tls?.key,
         };
         hostServer = runtime.serve.call(
             runtime,
@@ -376,7 +486,7 @@ export function serve(options: BunServeOptions): BunServeServer {
             throw new Error('Bun.serve: host server does not expose graceful shutdown.');
         }
         exposedServer.attach(hostServer);
-        return exposedServer;
+        return exposedServer as BunServeServer<T>;
     } catch (error) {
         shutdownQuietly(hostServer);
         parsed.routes?.dispose();

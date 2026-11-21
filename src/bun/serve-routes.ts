@@ -2,9 +2,9 @@ import type { BunFileLike } from './file';
 import type { BunServeHandler } from './serve';
 
 export type BunServeHttpMethod = 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH' | 'HEAD' | 'OPTIONS';
-export type BunServeRoute = Response | BunServeHandler | false | BunFileLike | BunServeDirectoryRoute
-    | Partial<Record<BunServeHttpMethod, Response | BunServeHandler>>;
-export type BunServeRoutes = Record<string, BunServeRoute>;
+export type BunServeRoute<T = unknown> = Response | BunServeHandler<T> | false | BunFileLike | BunServeDirectoryRoute
+    | Partial<Record<BunServeHttpMethod, Response | BunServeHandler<T>>>;
+export type BunServeRoutes<T = unknown> = Record<string, BunServeRoute<T>>;
 
 /** Bun's DirectoryRouteOptions subset; the route key must end in "/*". */
 export interface BunServeDirectoryRoute {

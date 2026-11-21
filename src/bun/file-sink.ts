@@ -1,14 +1,9 @@
-/**
- * Bun's FileSink over a filesystem path or an owned descriptor. Writes buffer
- * in memory and `flush` commits them through the sync native fs binding; the
- * sink owns its file descriptor and `end()` is the only close path. ref/unref
- * are no-ops because plain files are not event-loop resources.
- */
-
 import { arrayBufferBackedBytes, sanitizeSurrogates, toOwnedBytes } from '../utils/bytes';
 
 const engine = import.meta.use('engine');
 const fs = import.meta.use('fs');
+
+const FILE_SINK_BUFFER_SIZE = 4096;
 
 type BrandGetter<T> = (this: unknown) => T;
 
@@ -143,8 +138,11 @@ function assertFileSink(value: unknown): void {
 
 class FileSinkImpl {
     readonly #target: SinkTarget;
-    #pending: { chunk: Uint8Array<ArrayBuffer>; offset: number }[] = [];
+    readonly #buffer = new Uint8Array(FILE_SINK_BUFFER_SIZE);
     #buffered = 0;
+    #bufferOffset = 0;
+    #pending: Uint8Array<ArrayBuffer> | undefined;
+    #pendingOffset = 0;
     #fd: number | undefined;
     #ended = false;
 
@@ -166,9 +164,16 @@ class FileSinkImpl {
         // Native Bun validates the chunk before consulting the closed state.
         const bytes = chunkBytes(chunk);
         if (this.#ended) return true;
-        this.#pending.push({ chunk: bytes, offset: 0 });
-        this.#buffered += bytes.byteLength;
-        return bytes.byteLength;
+        let flushed = 0;
+        if (this.#pending || this.#bufferOffset > 0) flushed = this.#flushBuffered();
+        if (bytes.byteLength === 0) return flushed;
+        if (this.#buffered + bytes.byteLength < FILE_SINK_BUFFER_SIZE) {
+            this.#buffer.set(bytes, this.#buffered);
+            this.#buffered += bytes.byteLength;
+            return flushed + bytes.byteLength;
+        }
+        this.#pending = bytes;
+        return flushed + this.#flushBuffered();
     }
 
     flush(_wait?: boolean): number | true {
@@ -178,21 +183,28 @@ class FileSinkImpl {
     }
 
     #flushBuffered(): number {
-        if (this.#buffered === 0) return 0;
+        if (this.#buffered === 0 && !this.#pending) return 0;
         const fd = this.#fd ?? (this.#fd = this.#openTracked());
         let flushed = 0;
-        // Consume incrementally: a failed flush can be retried and resumes
-        // from the partial-write offset instead of replaying earlier chunks.
-        while (this.#pending.length > 0) {
-            const head = this.#pending[0]!;
-            while (head.offset < head.chunk.byteLength) {
-                const written = this.#target.write(fd, head.chunk.subarray(head.offset));
+        // Retain offsets across failed writes so a retry never replays bytes.
+        while (this.#bufferOffset < this.#buffered) {
+            const written = this.#target.write(fd, this.#buffer.subarray(this.#bufferOffset, this.#buffered));
+            if (written <= 0) throw new Error('FileSink write made no progress');
+            this.#bufferOffset += written;
+            flushed += written;
+        }
+        this.#bufferOffset = 0;
+        this.#buffered = 0;
+        const pending = this.#pending;
+        if (pending) {
+            while (this.#pendingOffset < pending.byteLength) {
+                const written = this.#target.write(fd, pending.subarray(this.#pendingOffset));
                 if (written <= 0) throw new Error('FileSink write made no progress');
-                head.offset += written;
-                this.#buffered -= written;
+                this.#pendingOffset += written;
                 flushed += written;
             }
-            this.#pending.shift();
+            this.#pending = undefined;
+            this.#pendingOffset = 0;
         }
         return flushed;
     }
@@ -218,8 +230,10 @@ class FileSinkImpl {
             sinkFinalizer?.unregister(this);
             const fd = this.#fd;
             this.#fd = undefined;
-            this.#pending = [];
+            this.#pending = undefined;
+            this.#pendingOffset = 0;
             this.#buffered = 0;
+            this.#bufferOffset = 0;
             if (fd !== undefined) {
                 try {
                     this.#target.close(fd);
