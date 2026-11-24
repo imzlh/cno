@@ -290,9 +290,11 @@ export class Http2Session extends EventEmitter {
         this.pingRequests.clear();
         if (requests.length === 0) return;
         const error = h2Error('ERR_HTTP2_PING_CANCEL', 'HTTP/2 ping was cancelled');
-        for (const request of requests) {
-            queueMicrotask(() => request.callback(error, 0, Buffer.from(request.payload)));
-        }
+        // Node cancels an outstanding ping as part of session teardown: the
+        // callback receives only the error and runs before the session's
+        // `close` event. Do not fabricate an ACK duration/payload or defer it
+        // past close; both details are observable by callers.
+        for (const request of requests) Reflect.apply(request.callback, undefined, [error]);
     }
 
     private clearPendingStreams(error: Error): void {
