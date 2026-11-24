@@ -2,11 +2,11 @@
  * DNS module internal helpers shared between mod.ts and promises.ts
  */
 
+import { toErrnoException } from '../_internal/errno';
+import { errnoCode, errnoName, errorCode } from '../../utils/errno';
+
 const dns = import.meta.use('dns');
 const timers = import.meta.use('timers');
-const uverror = import.meta.use('error');
-
-import { toErrnoException } from '../_internal/errno';
 
 export type DefaultResultOrder = 'ipv4first' | 'ipv6first' | 'verbatim';
 
@@ -128,6 +128,12 @@ const RETRYABLE_DNS_CODES = new Set([
     'ETIMEOUT', 'EAI_AGAIN', 'ESERVFAIL', 'ECONNREFUSED', 'ECONNRESET',
     'EHOSTUNREACH', 'ENETUNREACH', 'EADDRNOTAVAIL', 'EIO', 'EBADRESP',
 ]);
+
+function nodeDnsCode(code: string | undefined): string {
+    return code === 'EAI_NONAME' || code === 'EAI_NODATA' || code === 'ENONAME'
+        ? 'ENOTFOUND'
+        : code ?? 'UNKNOWN';
+}
 
 export function isAddressAnswer(answer: CModuleDNS.DNSAnswer): answer is CModuleDNS.AddressAnswer {
     return (answer.type === dns.A || answer.type === dns.AAAA) && 'address' in answer;
@@ -301,6 +307,7 @@ function isIPv6(host: string): boolean {
     const zoneSeparator = host.indexOf('%');
     if (zoneSeparator !== -1) {
         if (zoneSeparator === host.length - 1 || zoneSeparator !== host.lastIndexOf('%')) return false;
+        if (!/^[A-Za-z0-9.:-]+$/.test(host.slice(zoneSeparator + 1))) return false;
         host = host.slice(0, zoneSeparator);
     }
     const separator = host.indexOf('::');
@@ -401,6 +408,12 @@ export function getDefaultServers(): string[] {
     return [...defaultServers];
 }
 
+/** Global dns.setServers([]) restores the platform resolver configuration. */
+export function getDefaultServersForQuery(): string[] {
+    const servers = getDefaultServers();
+    return servers.length > 0 ? servers : readSystemServers();
+}
+
 // Capture explicit defaults now; defer system discovery until the resolver is used.
 export function snapshotDefaultServers(): string[] | undefined {
     return defaultServers && [...defaultServers];
@@ -424,26 +437,29 @@ function dnsSyscall(rrtype: Rrtype): string {
     return `query${suffix}`;
 }
 
-export function createDnsError(code: string, syscall: string, hostname: string): NodeJS.ErrnoException {
-    const error: NodeJS.ErrnoException & { hostname?: string } = new Error(`${syscall} ${code} ${hostname}`);
-    error.code = code;
+export function createDnsError(code: string | number, syscall: string, hostname?: string): NodeJS.ErrnoException {
+    const errno = typeof code === 'number' ? code : undefined;
+    // String query codes come from a different error domain than numeric UV codes.
+    const name = typeof code === 'number'
+        ? nodeDnsCode(errnoName(code))
+        : nodeDnsCode(code);
+    const error: NodeJS.ErrnoException & { hostname?: string } = new Error(`${syscall} ${name}${hostname ? ` ${hostname}` : ''}`);
+    error.code = name;
     error.syscall = syscall;
-    error.hostname = hostname;
-    // Node attaches the platform UV errno when one exists (e.g. EINVAL is
-    // -4071 on Windows, -22 on Linux); c-ares-only codes have none.
-    const errno = Reflect.get(uverror.errno as unknown as Record<string, number | undefined>, code);
-    if (typeof errno === 'number') error.errno = errno;
+    if (hostname) error.hostname = hostname;
+    if (errno !== undefined) error.errno = errno;
     return error;
 }
 
 function normalizeDnsError(error: unknown, syscall: string, hostname: string): NodeJS.ErrnoException {
     const normalized = toErrnoException(error, syscall);
     const rawCode = normalized.code;
-    const code = rawCode === 'EAI_NONAME' || rawCode === 'EAI_NODATA' || rawCode === 'ENONAME'
-        ? 'ENOTFOUND'
-        : rawCode ?? 'UNKNOWN';
+    const code = normalized.errno
+        ?? (rawCode === 'EAI_NONAME' || rawCode === 'EAI_NODATA' || rawCode === 'ENONAME'
+            ? errnoCode(rawCode)
+            : rawCode)
+        ?? 'UNKNOWN';
     const result = createDnsError(code, syscall, hostname);
-    result.errno = normalized.errno;
     result.stack = normalized.stack;
     return result;
 }
@@ -451,11 +467,8 @@ function normalizeDnsError(error: unknown, syscall: string, hostname: string): N
 export function normalizeLookupError(error: unknown, hostname: string): NodeJS.ErrnoException {
     const normalized = toErrnoException(error, 'getaddrinfo');
     const rawCode = normalized.code;
-    const code = rawCode === 'EAI_NONAME' || rawCode === 'EAI_NODATA' || rawCode === 'ENONAME'
-        ? 'ENOTFOUND'
-        : rawCode ?? 'UNKNOWN';
+    const code = normalized.errno ?? errnoCode(rawCode ?? '') ?? rawCode ?? 'UNKNOWN';
     const result = createDnsError(code, 'getaddrinfo', hostname);
-    result.errno = normalized.errno;
     result.stack = normalized.stack;
     return result;
 }
@@ -467,16 +480,8 @@ export function normalizeLookupServiceError(
 ): NodeJS.ErrnoException {
     const normalized = toErrnoException(error, 'getnameinfo');
     const rawCode = normalized.code;
-    const code = rawCode === 'EAI_NONAME' || rawCode === 'EAI_NODATA' || rawCode === 'ENONAME'
-        ? 'ENOTFOUND'
-        : rawCode ?? 'UNKNOWN';
-    const result: NodeJS.ErrnoException & { hostname?: string } = new Error(
-        `getnameinfo ${code}${includeHostname ? ` ${address}` : ''}`,
-    );
-    result.code = code;
-    result.errno = normalized.errno;
-    result.syscall = 'getnameinfo';
-    if (includeHostname) result.hostname = address;
+    const code = normalized.errno ?? errnoCode(rawCode ?? '') ?? rawCode ?? 'UNKNOWN';
+    const result = createDnsError(code, 'getnameinfo', includeHostname ? address : undefined);
     result.stack = normalized.stack;
     return result;
 }
@@ -499,14 +504,9 @@ function normalizeQueryOptions(options: number | ResolverOptions | undefined): N
     return normalizeResolverOptions(options);
 }
 
-function errorCode(error: unknown): string | undefined {
-    if (!error || (typeof error !== 'object' && typeof error !== 'function')) return undefined;
-    const code = Reflect.get(error, 'code');
-    return typeof code === 'string' ? code : undefined;
-}
-
 function canRetryDnsError(error: unknown): boolean {
-    return RETRYABLE_DNS_CODES.has(errorCode(error) ?? '');
+    const code = errorCode(error);
+    return typeof code === 'string' && RETRYABLE_DNS_CODES.has(code);
 }
 
 function timeoutForAttempt(options: NormalizedResolverOptions, attempt: number): number {
@@ -522,9 +522,13 @@ export function queryDns(
     options?: number | ResolverOptions,
 ): AbortableDnsQuery {
     validateHostname(hostname);
-    const endpoints = (servers.length > 0 ? servers : getDefaultServers()).map(parseServer);
     const config = normalizeQueryOptions(options);
     const syscall = dnsSyscall(rrtype);
+    if (servers.length === 0) {
+        const promise = Promise.reject<CModuleDNS.DNSAnswer[]>(createDnsError('UNKNOWN_ARES_ERROR', syscall, hostname));
+        return Object.assign(promise, { abort: () => {} });
+    }
+    const endpoints = servers.map(parseServer);
     let settled = false;
     let cancelled = false;
     let currentQuery: ReturnType<typeof dns.query> | undefined;
