@@ -7,10 +7,13 @@ import { EventEmitter } from '../events';
 import { Buffer } from '../buffer';
 import { Socket } from '../net';
 import type { TLSSocket } from '../tls';
+import { setTimeout, clearTimeout } from '../timers';
 import { H2Connection } from '@cnojs/http/h2';
+import type { H2Header } from '@cnojs/http/h2-native';
 import {
     SETTINGS_ENABLE_CONNECT_PROTOCOL,
     SETTINGS_ENABLE_PUSH,
+    SETTING_ID_TO_NAME,
     SETTING_NAME_TO_ID,
     constants,
 } from './constants';
@@ -22,9 +25,50 @@ import { ClientHttp2Stream } from './stream';
 
 /* ── Session base ─────────────────────────────────────────────── */
 
+type Http2SettingsSnapshot = Record<string, number | boolean | Record<number, number> | undefined> & {
+    headerTableSize?: number;
+    enablePush?: boolean;
+    maxConcurrentStreams?: number;
+    initialWindowSize?: number;
+    maxFrameSize?: number;
+    maxHeaderListSize?: number;
+    maxHeaderSize?: number;
+    enableConnectProtocol?: boolean;
+    customSettings?: Record<number, number>;
+};
+
+type NormalizedSessionSettings = Http2SettingsSnapshot;
+type PingRequest = {
+    startedAt: number;
+    payload: Uint8Array;
+    callback: (error: Error | null, duration: number, payload: Buffer) => void;
+};
+
+export function normalizeSessionSettings(settings: Record<string, unknown>): NormalizedSessionSettings {
+    if (settings === null || typeof settings !== 'object') {
+        throw invalidArgType('settings', 'of type object', settings);
+    }
+    const validated: NormalizedSessionSettings = {};
+    for (const [name, raw] of Object.entries(settings)) {
+        if (raw === undefined) continue;
+        if (name === 'customSettings') {
+            const entries = customSettingEntries(raw);
+            if (entries.length) validated.customSettings = Object.fromEntries(entries);
+            continue;
+        }
+        if (!Object.hasOwn(SETTING_NAME_TO_ID, name)) continue;
+        const id = SETTING_NAME_TO_ID[name]!;
+        const value = settingsValueAsUint32(id, raw);
+        const key = SETTING_ID_TO_NAME[id]!;
+        if (name === 'maxHeaderListSize' && validated[key] !== undefined) continue;
+        validated[key] = (id === SETTINGS_ENABLE_PUSH || id === SETTINGS_ENABLE_CONNECT_PROTOCOL) ? value !== 0 : value;
+    }
+    return validated;
+}
+
 export class Http2Session extends EventEmitter {
     protected conn: H2Connection | null = null;
-    protected socket: Socket | null = null;
+    socket: Socket | null = null;
     closed = false;
     destroyed = false;
     type: number;
@@ -32,8 +76,9 @@ export class Http2Session extends EventEmitter {
     protected _alpnProtocol: string | false | undefined;
     protected _encrypted: boolean | undefined;
     protected _connecting = true;
-    remoteSettings: Record<string, number | boolean> = {};
-    localSettings: Record<string, number | boolean>;
+    private _remoteSettings: Http2SettingsSnapshot = {};
+    private _localSettings: Http2SettingsSnapshot = {};
+    private submittedSettings: Record<string, unknown> = getDefaultSettings();
     pendingSettingsAck = false;
     /** Settings requested before a transport existed; flushed on attach. */
     private queuedSettings: Array<Record<string, unknown>> = [];
@@ -41,34 +86,33 @@ export class Http2Session extends EventEmitter {
     private timeoutMs = 0;
     private timeoutTimer: ReturnType<typeof setTimeout> | null = null;
     private _originSet: string[] | undefined;
+    private readonly pingRequests = new Map<string, PingRequest[]>();
+    protected readonly pendingStreams = new Set<ClientHttp2Stream>();
+    protected readonly initialSettings: NormalizedSessionSettings;
 
     constructor(type: number, initialSettings?: Record<string, unknown>) {
         super();
         this.type = type;
-        // Node seeds localSettings from the defaults merged with what the
-        // session was constructed with, not with `{}`.
-        this.localSettings = getDefaultSettings();
-        if (initialSettings) this.mergeLocalSettings(initialSettings);
+        this.initialSettings = initialSettings ? this.mergeLocalSettings(initialSettings) : {};
+        this._localSettings = { ...getDefaultSettings(), ...this.initialSettings };
     }
 
-    /** Validate then fold into localSettings (throws before mutating). */
-    private mergeLocalSettings(settings: Record<string, unknown>): void {
-        const validated: Record<string, number | boolean> = {};
-        for (const [name, raw] of Object.entries(settings)) {
-            if (raw === undefined) continue;
-            if (name === 'customSettings') {
-                customSettingEntries(raw);
-                continue;
-            }
-            const id = SETTING_NAME_TO_ID[name];
-            if (id === undefined) continue;
-            const value = settingsValueAsUint32(id, raw);
-            validated[name] = (id === SETTINGS_ENABLE_PUSH || id === SETTINGS_ENABLE_CONNECT_PROTOCOL)
-                ? value !== 0
-                : value;
+    /** Validate before updating the submitted (not yet acknowledged) settings. */
+    private mergeLocalSettings(settings: Record<string, unknown>): NormalizedSessionSettings {
+        const validated = normalizeSessionSettings(settings);
+        const previousCustom = this.submittedSettings['customSettings'] as Record<number, number> | undefined;
+        Object.assign(this.submittedSettings, validated);
+        if (validated.customSettings) {
+            this.submittedSettings['customSettings'] = { ...previousCustom, ...validated.customSettings };
         }
-        Object.assign(this.localSettings, validated);
+        if (validated['maxHeaderListSize'] !== undefined) {
+            this.submittedSettings['maxHeaderSize'] = validated['maxHeaderListSize'];
+        }
+        return validated;
     }
+
+    get remoteSettings(): Http2SettingsSnapshot { return this._remoteSettings; }
+    get localSettings(): Http2SettingsSnapshot { return this._localSettings; }
 
     /** Live: undefined until a transport is attached (matches Node). */
     get alpnProtocol(): string | false | undefined {
@@ -111,13 +155,28 @@ export class Http2Session extends EventEmitter {
         this._encrypted = secure;
         this._alpnProtocol = secure ? (alpn ?? 'h2') : false;
         const session = this.conn!.session;
+        this._localSettings = { ...session.localSettings };
+        this._remoteSettings = { ...session.remoteSettings };
+        session.onping = (isAck, payload) => {
+            if (!isAck) return;
+            const key = pingPayloadKey(payload);
+            const requests = this.pingRequests.get(key);
+            const request = requests?.shift();
+            if (requests?.length === 0) this.pingRequests.delete(key);
+            request?.callback(null, Date.now() - request.startedAt, Buffer.from(payload));
+        };
         const prevOnSettings = session.onsettings;
         // The native session sent its initial SETTINGS before transport attachment.
         this.settingsAckWaiters.unshift(undefined);
         this.pendingSettingsAck = true;
         session.onsettings = (isAck: boolean) => {
             if (typeof prevOnSettings === 'function') prevOnSettings(isAck);
-            if (!isAck) return;
+            if (!isAck) {
+                this._remoteSettings = { ...session.remoteSettings };
+                this.emit('remoteSettings', this.remoteSettings);
+                return;
+            }
+            this._localSettings = { ...session.localSettings };
             const waiter = this.settingsAckWaiters.shift();
             this.pendingSettingsAck = this.settingsAckWaiters.length > 0;
             waiter?.(this);
@@ -136,7 +195,7 @@ export class Http2Session extends EventEmitter {
             return;
         }
         this.pendingSettingsAck = true;
-        // `configure` only understands the named RFC 7540 settings.
+        // Validation canonicalizes custom ids before the native parser submits them.
         session.configure(settings as Parameters<typeof session.configure>[0]);
     }
 
@@ -157,12 +216,12 @@ export class Http2Session extends EventEmitter {
         if (this.destroyed) {
             throw h2Error('ERR_HTTP2_INVALID_SESSION', 'The session has been destroyed');
         }
-        this.mergeLocalSettings(settings);
+        const validated = this.mergeLocalSettings(settings);
         const start = Date.now();
         this.settingsAckWaiters.push(callback ? s => callback(null, s, Date.now() - start) : undefined);
         // Native configure skips empty settings; repeat the current table size
         // so every queued callback corresponds to a frame that receives an ACK.
-        this.sendSettings({ ...settings, headerTableSize: this.localSettings.headerTableSize });
+        this.sendSettings({ ...validated, headerTableSize: this.submittedSettings.headerTableSize });
     }
 
     setLocalWindowSize(windowSize: number): void {
@@ -226,18 +285,36 @@ export class Http2Session extends EventEmitter {
         this.pendingSettingsAck = false;
     }
 
+    private clearPingRequests(): void {
+        const requests = Array.from(this.pingRequests.values()).flat();
+        this.pingRequests.clear();
+        if (requests.length === 0) return;
+        const error = h2Error('ERR_HTTP2_PING_CANCEL', 'HTTP/2 ping was cancelled');
+        for (const request of requests) {
+            queueMicrotask(() => request.callback(error, 0, Buffer.from(request.payload)));
+        }
+    }
+
+    private clearPendingStreams(error: Error): void {
+        for (const stream of this.pendingStreams) stream.destroy(error);
+        this.pendingStreams.clear();
+    }
+
     close(cb?: () => void): void {
         if (this.closed) {
             if (cb) queueMicrotask(cb);
             return;
         }
         this.closed = true;
+        this.clearPendingStreams(h2Error('ERR_HTTP2_GOAWAY_SESSION', 'The session has been closed'));
         this.clearSettings();
+        this.clearPingRequests();
         if (this.timeoutTimer) {
             clearTimeout(this.timeoutTimer);
             this.timeoutTimer = null;
         }
         this.conn?.close();
+        if (!this.conn) this.socket?.destroy();
         this.conn = null;
         this.emit('close');
         if (cb) queueMicrotask(cb);
@@ -245,27 +322,47 @@ export class Http2Session extends EventEmitter {
 
     destroy(error?: Error): void {
         if (this.destroyed) return;
+        const wasClosed = this.closed;
         this.destroyed = true;
         this.closed = true;
+        this.clearPendingStreams(error ?? h2Error('ERR_HTTP2_INVALID_SESSION', 'The session has been destroyed'));
         this.clearSettings();
+        this.clearPingRequests();
         if (this.timeoutTimer) {
             clearTimeout(this.timeoutTimer);
             this.timeoutTimer = null;
         }
         this.conn?.destroy();
+        if (!this.conn) this.socket?.destroy();
         this.conn = null;
         if (error) this.emit('error', error);
-        this.emit('close');
+        if (!wasClosed) this.emit('close');
     }
 
     ping(payload?: Buffer | Uint8Array, cb?: (err: Error | null, duration: number, payload: Buffer) => void): boolean {
         if (!this.conn) return false;
-        const start = Date.now();
-        this.conn.session.onping = (isAck, p) => {
-            if (!isAck) return;
-            cb?.(null, Date.now() - start, Buffer.from(p));
-        };
-        this.conn.session.ping(payload instanceof Uint8Array ? payload : undefined);
+        if (payload !== undefined && (!(payload instanceof Uint8Array) || payload.byteLength !== 8)) {
+            throw Object.assign(new RangeError('HTTP2 ping payload must be 8 bytes'), { code: 'ERR_HTTP2_PING_LENGTH' });
+        }
+        const bytes = payload === undefined ? new Uint8Array(8) : new Uint8Array(payload);
+        if (cb) {
+            const key = pingPayloadKey(bytes);
+            let requests = this.pingRequests.get(key);
+            if (!requests) {
+                requests = [];
+                this.pingRequests.set(key, requests);
+            }
+            requests.push({ startedAt: Date.now(), payload: bytes, callback: cb });
+            try {
+                this.conn.session.ping(bytes);
+            } catch (error) {
+                requests.pop();
+                if (requests.length === 0) this.pingRequests.delete(key);
+                throw error;
+            }
+        } else {
+            this.conn.session.ping(bytes);
+        }
         return true;
     }
 
@@ -274,10 +371,21 @@ export class Http2Session extends EventEmitter {
     }
 }
 
+function pingPayloadKey(payload: Uint8Array): string {
+    let key = '';
+    // Native typed-array values do not necessarily expose the JS iterator.
+    // Indexing also avoids allocating another view just to correlate an ACK.
+    for (let index = 0; index < payload.byteLength; index++) {
+        key += String.fromCharCode(payload[index]!);
+    }
+    return key;
+}
+
 /* ── Client session ───────────────────────────────────────────── */
 
 export class ClientHttp2Session extends Http2Session {
     private authority = 'localhost';
+    private pendingRequests = new Map<ClientHttp2Stream, { pairs: H2Header[]; end: boolean }>();
 
     constructor(initialSettings?: Record<string, unknown>) {
         super(constants.NGHTTP2_SESSION_CLIENT, initialSettings);
@@ -287,7 +395,42 @@ export class ClientHttp2Session extends Http2Session {
         this.authority = value;
     }
 
+    private readonly flushRequests = (): void => {
+        for (const [stream, { pairs, end }] of this.pendingRequests) {
+            this.pendingRequests.delete(stream);
+            this.pendingStreams.delete(stream);
+            if (stream.destroyed) continue;
+            let opened;
+            try {
+                opened = this.openRequest(pairs, end);
+            } catch (error) {
+                stream.destroy(error instanceof Error ? error : new Error(String(error)));
+                continue;
+            }
+            try {
+                stream.attach(opened);
+            } catch (error) {
+                if (this.pendingRequests.size) queueMicrotask(this.flushRequests);
+                throw error;
+            }
+        }
+    };
+
+    close(callback?: () => void): void {
+        this.removeListener('connect', this.flushRequests);
+        this.pendingRequests.clear();
+        super.close(callback);
+    }
+
+    destroy(error?: Error): void {
+        this.removeListener('connect', this.flushRequests);
+        this.pendingRequests.clear();
+        super.destroy(error);
+    }
+
     attach(socket: Socket, secure: boolean): void {
+        if (this.closed || this.destroyed) { socket.destroy(); return; }
+        if (this.conn) { socket.destroy(); return; }
         this.socket = socket;
         try {
             socket.pause();
@@ -295,9 +438,9 @@ export class ClientHttp2Session extends Http2Session {
             /* */
         }
         const transport = takeTcpForH2(socket);
-        this.conn = new H2Connection(transport, false, secure);
+        this.conn = new H2Connection(transport, false, secure, this.initialSettings);
         this.conn.on({
-            onError: err => this.emit('error', err),
+            onError: err => this.destroy(err),
             onClose: () => this.close(),
         });
         this.onTransportAttached(secure);
@@ -305,6 +448,8 @@ export class ClientHttp2Session extends Http2Session {
     }
 
     attachTls(tlsSocket: TLSSocket): void {
+        if (this.closed || this.destroyed) { tlsSocket.destroy(); return; }
+        if (this.conn) { tlsSocket.destroy(); return; }
         this.socket = tlsSocket as unknown as Socket;
         const alpn = tlsSocket.alpnProtocol;
         if (alpn && alpn !== 'h2' && alpn !== 'h2c') {
@@ -314,35 +459,54 @@ export class ClientHttp2Session extends Http2Session {
             );
         }
         const transport = takeTlsForH2(tlsSocket);
-        this.conn = new H2Connection(transport, false, true);
+        this.conn = new H2Connection(transport, false, true, this.initialSettings);
         this.conn.on({
-            onError: err => this.emit('error', err),
+            onError: err => this.destroy(err),
             onClose: () => this.close(),
         });
         this.onTransportAttached(true, alpn || 'h2');
         queueMicrotask(() => this.emit('connect', this, tlsSocket));
     }
 
+    private assertOpenForRequest(): void {
+        if (this.destroyed) throw h2Error('ERR_HTTP2_INVALID_SESSION', 'The session has been destroyed');
+        if (this.closed) throw h2Error('ERR_HTTP2_GOAWAY_SESSION', 'The session has been closed');
+    }
+
     request(
-        headers: Record<string, unknown>,
+        headers: Record<string, unknown> = {},
         options?: { endStream?: boolean },
     ): ClientHttp2Stream {
-        if (!this.conn) {
-            throw h2Error('ERR_HTTP2_INVALID_SESSION', 'HTTP/2 session is not connected');
-        }
+        this.assertOpenForRequest();
         const pairs = toHeaderPairs(headers);
-        const method = pairs.find(([n]) => n === ':method')?.[1] ?? 'GET';
-        if (!pairs.some(([n]) => n === ':method')) pairs.unshift([':method', method]);
-        if (!pairs.some(([n]) => n === ':path')) pairs.push([':path', '/']);
+        const method = pairs.find(([name]) => name === ':method')?.[1] ?? 'GET';
+        const end = options?.endStream ?? (method === 'GET' || method === 'HEAD');
+        this.assertOpenForRequest();
+        if (!this.conn) {
+            const stream = new ClientHttp2Stream(undefined, method, this, end);
+            this.pendingStreams.add(stream);
+            stream.once('close', () => {
+                this.pendingStreams.delete(stream);
+                this.pendingRequests.delete(stream);
+                if (this.pendingRequests.size === 0) this.removeListener('connect', this.flushRequests);
+            });
+            if (this.pendingRequests.size === 0) this.once('connect', this.flushRequests);
+            this.pendingRequests.set(stream, { pairs, end });
+            return stream;
+        }
+        return new ClientHttp2Stream(this.openRequest(pairs, end), method, this, end);
+    }
+
+    private openRequest(pairs: H2Header[], end: boolean) {
+        if (!pairs.some(([n]) => n === ':method')) pairs.unshift([':method', 'GET']);
+        if (!pairs.some(([n]) => n === ':path')) pairs.unshift([':path', '/']);
         if (!pairs.some(([n]) => n === ':scheme')) {
-            pairs.push([':scheme', this.encrypted ? 'https' : 'http']);
+            pairs.unshift([':scheme', this.encrypted ? 'https' : 'http']);
         }
         if (!pairs.some(([n]) => n === ':authority')) {
-            pairs.push([':authority', this.authority]);
+            pairs.unshift([':authority', this.authority]);
         }
         // GET/HEAD default endStream; POST needs endStream:false then write+end
-        const end = options?.endStream ?? (method === 'GET' || method === 'HEAD');
-        const h2s = this.conn.request(pairs, end);
-        return new ClientHttp2Stream(h2s, method);
+        return this.conn!.request(pairs, end);
     }
 }
