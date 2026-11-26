@@ -13,7 +13,7 @@ export function assertCallback(callback: unknown): asserts callback is (...args:
 }
 
 export function asError(error: unknown): Error {
-    return error instanceof Error ? error : new Error(String(error));
+    return Error.isError(error) ? error : new Error(String(error));
 }
 
 export function createDigestAlreadyCalledError(): Error {

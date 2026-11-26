@@ -23,17 +23,15 @@ const dataViewByteLength = Object.getOwnPropertyDescriptor(DataView.prototype, '
 
 function viewSlots(value: unknown): { buffer: ArrayBufferLike; byteOffset: number; byteLength: number } | null {
     if (!ArrayBuffer.isView(value)) return null;
-    const isDataView = DataView.prototype.isPrototypeOf(value as object);
-    const buffer = isDataView
-        ? dataViewBuffer.call(value)
-        : typedArrayBuffer.call(value);
-    const byteOffset = isDataView
-        ? dataViewByteOffset.call(value)
-        : typedArrayByteOffset.call(value);
-    const byteLength = isDataView
-        ? dataViewByteLength.call(value)
-        : typedArrayByteLength.call(value);
-    return { buffer, byteOffset, byteLength };
+    const isDataView = engine.isDataView(value);
+    const getBuffer = isDataView ? dataViewBuffer : typedArrayBuffer;
+    const getByteOffset = isDataView ? dataViewByteOffset : typedArrayByteOffset;
+    const getByteLength = isDataView ? dataViewByteLength : typedArrayByteLength;
+    return {
+        buffer: getBuffer.call(value),
+        byteOffset: getByteOffset.call(value),
+        byteLength: getByteLength.call(value),
+    };
 }
 
 function isBufferSource(value: unknown): value is ArrayBuffer | ArrayBufferView {
@@ -97,11 +95,6 @@ export function isKeyObject(value: unknown): value is KeyObject & {
     return value !== null && typeof value === 'object'
         && Reflect.get(value, Symbol.toStringTag) === 'KeyObject'
         && kKeyData in value;
-}
-
-export function guessKeyFormat(input: KeyInput, explicit?: 'pem' | 'der'): KeyFormat {
-    if (explicit) return explicit;
-    return typeof input === 'string' ? 'pem' : 'der';
 }
 
 export function getKeyBytes(input: KeyInput): Uint8Array {

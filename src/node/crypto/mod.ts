@@ -6,6 +6,7 @@ export type { ScryptOptions } from './random';
 export type { RandomUUIDV7Options } from './misc';
 
 export { KeyObject, createPrivateKey, createPublicKey, createSecretKey } from './keys';
+export { X509Certificate } from './x509';
 
 export { generateKeyPair, generateKeyPairSync } from './keygen';
 

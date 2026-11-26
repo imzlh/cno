@@ -1,6 +1,6 @@
 import { Buffer } from '../buffer';
 import type { BinaryInput, KeyInput, KeyObject as KeyObjectShape, KeyExportOptions, SecretJwk, AsymmetricKeyType } from './types';
-import { getKeyBytes, toBuffer, keyDetailsFromBytes, kKeyData, kKeyFormat, guessKeyFormat, isKeyObject, type KeyFormat } from './helpers';
+import { getKeyBytes, toBuffer, keyDetailsFromBytes, kKeyData, kKeyFormat, isKeyObject, type KeyFormat } from './helpers';
 
 /**
  * KeyObject plus the import/export surface: createPrivateKey, createPublicKey,
@@ -31,18 +31,18 @@ function isKeyInputWithFormat(input: KeyInput | KeyInputWithFormat): input is Ke
 }
 
 export function normalizeKeySource(input: KeyInput | { key: KeyInput; format?: 'pem' | 'der' }): { bytes: Uint8Array; format: KeyFormat } {
-    const source = isKeyInputWithFormat(input)
-        ? input.key
-        : input;
+    const withFormat = isKeyInputWithFormat(input);
+    const source = withFormat ? input.key : input;
     if (isKeyObject(source)) {
         return {
             bytes: source[kKeyData],
             format: source[kKeyFormat],
         };
     }
+    const bytes = getKeyBytes(source);
     return {
-        bytes: getKeyBytes(source),
-        format: guessKeyFormat(source, isKeyInputWithFormat(input) ? input.format : undefined),
+        bytes,
+        format: (withFormat ? input.format : undefined) ?? (typeof source === 'string' ? 'pem' : 'der'),
     };
 }
 
@@ -84,7 +84,7 @@ export class KeyObject implements KeyObjectShape {
     constructor(type: 'private' | 'public' | 'secret', asymmetricKeyType: AsymmetricKeyType | undefined, data: BinaryInput, format: KeyFormat, details?: { namedCurve?: string; modulusLength?: number; publicExponent?: bigint }) {
         this.type = type;
         this.asymmetricKeyType = asymmetricKeyType;
-        this[kKeyData] = toBuffer(data);
+        this[kKeyData] = new Uint8Array(toBuffer(data));
         this[kKeyFormat] = format;
         this.asymmetricKeyDetails = details;
         if (type === 'secret') this.symmetricKeySize = this[kKeyData].byteLength;
@@ -118,6 +118,17 @@ export class KeyObject implements KeyObjectShape {
 
 // RSA
 
+function importAsymmetricKey(type: 'private' | 'public', source: { bytes: Uint8Array; format: KeyFormat }): KeyObject {
+    const asymmetricKeyType = type === 'private' ? keyTypeFromPrivate(source.bytes) : keyTypeFromPublic(source.bytes);
+    const format = source.format === 'pem' ? 'pem' : 'der';
+    // Re-encode through the parser so the stored bytes always match the format.
+    const encoded = type === 'private'
+        ? (format === 'pem' ? crypto.exportPrivateKeyPem(source.bytes) : crypto.exportPrivateKeyDer(source.bytes))
+        : (format === 'pem' ? crypto.exportPublicKeyPem(source.bytes) : crypto.exportPublicKeyDer(source.bytes));
+    const bytes = new Uint8Array(encoded);
+    return new KeyObject(type, asymmetricKeyType, bytes, format, keyDetailsFromBytes(bytes));
+}
+
 export function createPrivateKey(input: KeyInput | { key: KeyInput; type?: string; format?: 'pem' | 'der' }): KeyObject {
     if (isKeyObject(input)) {
         if (input.type !== 'private') {
@@ -126,10 +137,9 @@ export function createPrivateKey(input: KeyInput | { key: KeyInput; type?: strin
         return input;
     }
 
-    const { bytes, format } = normalizeKeySource(input);
     // Node reports asymmetricKeyDetails for parsed keys too, not just generated
     // ones; jsonwebtoken reads .namedCurve off it to validate ES* algorithms.
-    return new KeyObject('private', keyTypeFromPrivate(bytes), bytes, format, keyDetailsFromBytes(bytes));
+    return importAsymmetricKey('private', normalizeKeySource(input));
 }
 
 export function createSecretKey(key: BinaryInput): KeyObject {
@@ -159,7 +169,7 @@ export function createPublicKey(input: KeyInput | { key: KeyInput; type?: string
     const source = normalizeKeySource(input);
     let publicError: unknown;
     try {
-        return new KeyObject('public', keyTypeFromPublic(source.bytes), source.bytes, source.format, keyDetailsFromBytes(source.bytes));
+        return importAsymmetricKey('public', source);
     } catch (error) {
         publicError = error;
     }
