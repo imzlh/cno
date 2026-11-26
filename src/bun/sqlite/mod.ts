@@ -11,6 +11,7 @@ import type { Changes, DatabaseOptions } from 'bun:sqlite';
 export type { Changes, DatabaseOptions };
 
 const native = import.meta.use('sqlite3');
+const engine = import.meta.use('engine');
 
 type Sqlite3Handle = CModuleSQLite3.Sqlite3Handle;
 type Sqlite3Stmt = CModuleSQLite3.Sqlite3Stmt;
@@ -877,34 +878,55 @@ export class Database {
             throw new TypeError('transaction expects a function');
         }
 
-        const execute = (mode: '' | 'DEFERRED' | 'IMMEDIATE' | 'EXCLUSIVE', args: any[]): any => {
-            const nested = this.inTransaction;
-            const savepoint = nested ? `cno_bun_transaction_${++this.transactionSerial}` : '';
-            this.run(nested ? `SAVEPOINT ${savepoint}` : mode === '' ? 'BEGIN' : `BEGIN ${mode}`);
-            try {
-                const result = Reflect.apply(insideTransaction, undefined, args);
-                this.run(nested ? `RELEASE SAVEPOINT ${savepoint}` : 'COMMIT');
-                return result;
-            } catch (error) {
-                try {
-                    if (nested) {
-                        this.run(`ROLLBACK TO SAVEPOINT ${savepoint}`);
-                        this.run(`RELEASE SAVEPOINT ${savepoint}`);
-                    } else {
-                        this.run('ROLLBACK');
+        const database = this;
+        function wrap(mode: '' | 'DEFERRED' | 'IMMEDIATE' | 'EXCLUSIVE'): Transaction<T> {
+            return {
+                transaction(this: unknown, ...args: Parameters<T>): ReturnType<T> {
+                    const nested = database.inTransaction;
+                    const savepoint = nested ? `cno_bun_transaction_${++database.transactionSerial}` : '';
+                    database.run(nested ? `SAVEPOINT ${savepoint}` : mode === '' ? 'BEGIN' : `BEGIN ${mode}`);
+                    try {
+                        const result = Reflect.apply(insideTransaction, this, args);
+                        let rejected = false;
+                        if (engine.isPromise(result)) {
+                            try {
+                                engine.promiseResult(result);
+                            } catch {
+                                rejected = true;
+                            }
+                        }
+                        if (rejected) {
+                            if (database.inTransaction) database.rollbackTransaction(savepoint);
+                        } else {
+                            database.run(nested ? `RELEASE SAVEPOINT ${savepoint}` : 'COMMIT');
+                        }
+                        return result;
+                    } catch (error) {
+                        try {
+                            database.rollbackTransaction(savepoint);
+                        } catch {
+                            // Keep the callback or commit error.
+                        }
+                        throw error;
                     }
-                } catch {
-                    // Preserve the callback or commit error; rollback cannot
-                    // make the original failure more actionable.
                 }
-                throw error;
-            }
-        };
+            }.transaction as Transaction<T>;
+        }
 
-        const wrapped = ((...args: any[]) => execute('', args)) as Transaction<T>;
-        wrapped.deferred = ((...args: any[]) => execute('DEFERRED', args)) as T;
-        wrapped.immediate = ((...args: any[]) => execute('IMMEDIATE', args)) as T;
-        wrapped.exclusive = ((...args: any[]) => execute('EXCLUSIVE', args)) as T;
+        const wrapped = wrap('');
+        const deferred = wrap('DEFERRED');
+        const immediate = wrap('IMMEDIATE');
+        const exclusive = wrap('EXCLUSIVE');
+        const properties: PropertyDescriptorMap = {
+            default: { value: wrapped },
+            deferred: { value: deferred },
+            immediate: { value: immediate },
+            exclusive: { value: exclusive },
+            database: { value: database, enumerable: true },
+        };
+        for (const transaction of [wrapped, deferred, immediate, exclusive]) {
+            Object.defineProperties(transaction, properties);
+        }
         return wrapped;
     }
 
@@ -990,6 +1012,15 @@ export class Database {
         return this.nativeHandle;
     }
 
+    private rollbackTransaction(savepoint: string): void {
+        if (savepoint) {
+            this.run(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+            this.run(`RELEASE SAVEPOINT ${savepoint}`);
+        } else {
+            this.run('ROLLBACK');
+        }
+    }
+
     private prepareInternal<ReturnType>(sql: string, closeWithDatabase: boolean): Statement<ReturnType> {
         if (typeof sql !== 'string') throw new TypeError('SQL must be a string');
         const statement = nativeCall(() => this.requireOpen().prepare(sql));
@@ -1071,10 +1102,12 @@ Object.defineProperty(Database.prototype, 'exec', {
 });
 
 export interface Transaction<T extends (...args: any[]) => any> {
-    (...args: Parameters<T>): ReturnType<T>;
-    deferred: T;
-    immediate: T;
-    exclusive: T;
+    (this: ThisParameterType<T>, ...args: Parameters<T>): ReturnType<T>;
+    readonly default: Transaction<T>;
+    readonly deferred: Transaction<T>;
+    readonly immediate: Transaction<T>;
+    readonly exclusive: Transaction<T>;
+    readonly database: Database;
 }
 
 interface ParsedOptions {
