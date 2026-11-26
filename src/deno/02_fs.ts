@@ -1,12 +1,3 @@
-const fs = import.meta.use("fs");
-const asfs = import.meta.use("asyncfs");
-const engine = import.meta.use("engine");
-const fswatch = import.meta.use("fswatch");
-const os = import.meta.use("os");
-const error = import.meta.use("error");
-const console = import.meta.use('console');
-const crypto = import.meta.use('crypto');
-
 import { arrayBufferBackedBytes } from "../utils/bytes";
 import { hasErrno } from "../utils/errno";
 import { ensureDirectory, ensureDirectorySync } from "../utils/fs-path";
@@ -21,6 +12,15 @@ import { isWindows } from "../utils/platform";
 import { wrapFSErr, wrapFSns } from "../utils/wrap";
 import { DOMException } from "../webapi/events";
 import { errors } from "./01_errors";
+
+const fs = import.meta.use("fs");
+const asfs = import.meta.use("asyncfs");
+const engine = import.meta.use("engine");
+const fswatch = import.meta.use("fswatch");
+const os = import.meta.use("os");
+const error = import.meta.use("error");
+const console = import.meta.use('console');
+const crypto = import.meta.use('crypto');
 
 // Keep the local spelling used by this FS facade; path conversion itself is
 // owned by ../utils/path and is shared by the other Deno APIs.
@@ -204,19 +204,6 @@ function inferredSymlinkType(old: string, opt?: Deno.SymlinkOptions): Deno.Symli
         // Target missing or unreadable: leave the caller's options untouched.
     }
     return opt;
-}
-
-// The sync C layer reports symlink failures as a bare TypeError with no errno,
-// so wrapFSErr cannot classify them and callers saw a TypeError where async
-// symlink (and real Deno) give AlreadyExists.
-function classifySymlinkErr(e: unknown, newf: string): unknown {
-    if (typeof Reflect.get(e as object, 'code') === 'number') return e;
-    try {
-        fs.lstat(newf);
-        return new errors.AlreadyExists(`symlink '${newf}'`);
-    } catch {
-        return e;
-    }
 }
 
 // `Deno.chmod` follows symlinks. On Windows the mode is emulated with the
@@ -409,25 +396,7 @@ Object.assign(Deno, wrapFSns({
     },
 
     readLinkSync(path) {
-        const target = toString(path);
-        try {
-            return fs.readlink(target);
-        } catch (e) {
-            // The native sync readlink reports failures as a TypeError with no
-            // errno, so wrapFSErr cannot classify it and callers saw a
-            // TypeError where async readLink (and real Deno) give NotFound.
-            // Anything carrying a numeric errno is left for wrapFSErr.
-            if (typeof Reflect.get(e as object, 'code') === 'number') throw e;
-            let exists = true;
-            try {
-                fs.lstat(target);
-            } catch {
-                exists = false;
-            }
-            if (!exists) throw new errors.NotFound(`readlink '${target}'`);
-            // Path resolves but is not a symlink — mirror the async path.
-            throw new errors.InvalidData(`readlink '${target}'`);
-        }
+        return fs.readlink(toString(path));
     },
 
 
@@ -442,11 +411,7 @@ Object.assign(Deno, wrapFSns({
     async symlink(old, newf, opt) {
         const oldStr = toString(old);
         const newStr = toString(newf);
-        try {
-            return await asfs.symlink(oldStr, newStr, symlinkType(inferredSymlinkType(oldStr, opt)));
-        } catch (e) {
-            throw classifySymlinkErr(e, newStr);
-        }
+        return asfs.symlink(oldStr, newStr, symlinkType(inferredSymlinkType(oldStr, opt)));
     },
 
     symlinkSync(old, newf, opt) {
@@ -454,11 +419,7 @@ Object.assign(Deno, wrapFSns({
         const newStr = toString(newf);
         const resolved = inferredSymlinkType(oldStr, opt);
         const hint = resolved?.type === 'dir' || resolved?.type === 'junction' ? 'dir' : resolved?.type;
-        try {
-            return fs.symlink(oldStr, newStr, hint);
-        } catch (e) {
-            throw classifySymlinkErr(e, newStr);
-        }
+        return fs.symlink(oldStr, newStr, hint);
     },
 
     realPath(path) {
