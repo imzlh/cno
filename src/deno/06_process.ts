@@ -4,7 +4,8 @@ import { malloc } from "../utils/malloc";
 import { join, resolvePath, toFsPath } from "../utils/path";
 import { isWindows } from "../utils/platform";
 import { nativeSignalFromNumber, nativeSignalName, probeProcess } from "../utils/signals";
-import { wrapFsClassDec as wrap, wrapFSns } from "../utils/wrap";
+import { wrapFSns, wrapFSErr, wrapDenoError } from "../utils/wrap";
+import { matchesErrnoCode } from "../utils/errno";
 import { ReadableStream } from "../webapi/streams";
 import { closeStreamQuietly, useWritable } from "./utils/pipe-streams";
 import { errors } from "./01_errors";
@@ -15,7 +16,6 @@ const proc = import.meta.use('process');
 const engine = import.meta.use('engine');
 const signal = import.meta.use('signals');
 const crypto = import.meta.use('crypto');
-const sysError = import.meta.use('error');
 
 type StdioName = 'stdin' | 'stdout' | 'stderr';
 
@@ -157,14 +157,14 @@ class RStream extends ReadableStream<Uint8Array<ArrayBuffer>> implements Deno.Su
                     }
                 } catch (e) {
                     closeStreamQuietly(pipe);
-                    controller.error(e);
+                    controller.error(wrapFSErr(e));
                 }
             },
             cancel: () => closeStreamQuietly(pipe),
         });
     }
 
-    @wrap
+    @wrapDenoError
     private async readAll() {
         const bufs: Uint8Array[] = [];
         const reader = this.getReader();
@@ -217,14 +217,20 @@ export class ChildProcess implements Deno.ChildProcess {
         if (proc.stdout) this.#stdout = new RStream(proc.stdout);
         if (proc.stderr) this.#stderr = new RStream(proc.stderr);
         this.#pid = proc.pid;
-        this.#status = this.#wait.then(f => {
-            this.#finished = true;
-            return {
-                code: commandCode(f.exit_status, f.term_signal),
-                success: commandSuccess(f.exit_status, f.term_signal),
-                signal: toDenoSignal(f.term_signal)
-            };
-        });
+        this.#status = this.#wait.then(
+            result => {
+                this.#finished = true;
+                return {
+                    code: commandCode(result.exit_status, result.term_signal),
+                    success: commandSuccess(result.exit_status, result.term_signal),
+                    signal: toDenoSignal(result.term_signal),
+                };
+            },
+            error => {
+                this.#finished = true;
+                throw wrapFSErr(error);
+            },
+        );
     }
 
     get pid(): number {
@@ -235,7 +241,7 @@ export class ChildProcess implements Deno.ChildProcess {
         return this.#status;
     }
 
-    @wrap
+    @wrapDenoError
     async output(): Promise<Deno.CommandOutput> {
         const stdout = this.#stdout?.bytes() ?? Promise.resolve(new Uint8Array(0));
         const stderr = this.#stderr?.bytes() ?? Promise.resolve(new Uint8Array(0));
@@ -253,7 +259,7 @@ export class ChildProcess implements Deno.ChildProcess {
         );
     }
 
-    @wrap
+    @wrapDenoError
     kill(signo?: Deno.Signal | number): void {
         if (this.#finished) throw new TypeError('Child process has already terminated');
         if (signo === 0) {
@@ -283,13 +289,13 @@ export class ChildProcess implements Deno.ChildProcess {
         return this.#stderr;
     }
 
-    @wrap
+    @wrapDenoError
     async [Symbol.asyncDispose]() {
         if (!this.#finished) this.kill();
         await this.#status;
     }
 
-    @wrap
+    @wrapDenoError
     async resize(cols: number, rows: number): Promise<void> {
         const stdin = this.#proc.stdin?.fileno;
         assert(stdin !== undefined, "stdin is not piped");
@@ -315,8 +321,7 @@ function commandCwd(cwd: string | URL): string {
     try {
         stat = fs.stat(path);
     } catch (e) {
-        const code = e && typeof e === 'object' && 'code' in e ? e.code : undefined;
-        if (code === sysError.errno.ENOENT || code === sysError.errno.ENOTDIR) {
+        if (matchesErrnoCode(e, 'ENOENT', 'ENOTDIR')) {
             throw new errors.NotFound(`No such cwd: ${path}`);
         }
         throw e;
@@ -377,17 +382,19 @@ function spawn(path: string, args: string[], options?: Deno.CommandOptions): CMo
 }
 
 /**
- * The native sync spawn surfaces launch failures as an InternalError carrying a
- * raw Win32 code in its message and no numeric `code`, so wrapFSErr cannot
- * classify it. Real Deno reports a missing executable as NotFound/ENOENT for
- * both the async and sync paths; the async path already arrives as UV_ENOENT.
+ * Native sync spawn can surface Windows launch failures as an InternalError
+ * whose message contains only the raw Win32 error. Preserve Deno's NotFound
+ * contract for missing executables while leaving unrelated failures intact.
  */
 function wrapSpawnErr(e: unknown, path: string): unknown {
     if (typeof e !== 'object' || e === null) return e;
+    if (matchesErrnoCode(e, 'ENOENT')) {
+        return new errors.NotFound(`Failed to spawn '${path}': entity not found`);
+    }
     if (typeof Reflect.get(e, 'code') === 'number') return e;
     const message = String(Reflect.get(e, 'message') ?? '');
     // Win32: 2 = ERROR_FILE_NOT_FOUND, 3 = ERROR_PATH_NOT_FOUND.
-    if (/CreateProcess failed:\s*(2|3)\b/.test(message) || /ENOENT/.test(message)) {
+    if (/CreateProcess failed:\s*(2|3)\b/.test(message)) {
         return new errors.NotFound(`Failed to spawn '${path}': entity not found`);
     }
     return e;
@@ -398,8 +405,8 @@ function spawnSync(path: string, args: string[], options?: Deno.CommandOptions):
     ensureCommandPath(path, cwd);
     try {
         return proc.spawnSync([path, ...args], nativeSpawnOptions(cwd, options));
-    } catch (e) {
-        throw wrapSpawnErr(e, path);
+    } catch (error) {
+        throw wrapSpawnErr(error, path);
     }
 }
 
@@ -433,7 +440,7 @@ class Command implements Deno.Command {
         this.#detached = options?.detached ?? false;
     }
 
-    @wrap
+    @wrapDenoError
     output(): Promise<Deno.CommandOutput> {
         assert(!this.#detached, "Detached process cannot be waited");
 
@@ -453,7 +460,7 @@ class Command implements Deno.Command {
         })();
     }
 
-    @wrap
+    @wrapDenoError
     outputSync(): Deno.CommandOutput {
         assert(!this.#detached, "Detached process cannot be waited");
 
@@ -469,7 +476,7 @@ class Command implements Deno.Command {
         );
     }
 
-    @wrap
+    @wrapDenoError
     spawn(): Deno.ChildProcess {
         const proc = spawn(this.#path, this.#args, this.#options);
         const child = new ChildProcess(proc, proc.wait(), childProcessToken);
