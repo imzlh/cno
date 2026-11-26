@@ -3,6 +3,7 @@ import { deepEqual as _deepEqual } from '../_internal/deep-equal';
 import { parseNodeEnv } from '../_internal/dotenv';
 import { inspect, formatNumberNoColor, formatBigIntNoColor, hasBuiltInToString } from './inspect';
 import type { InspectOptions } from './inspect';
+import { errnoDescription, isErrorValue, systemErrorMap, systemErrorName } from '../../utils/errno';
 
 /**
  * Node.js util module
@@ -60,7 +61,7 @@ export function isObject(value: unknown): value is object {
 }
 
 export function isError(value: unknown): value is Error {
-    return value instanceof Error;
+    return isErrorValue(value);
 }
 
 export function isFunction(value: unknown): value is AnyCallable {
@@ -612,38 +613,27 @@ export function _extend(target: Record<PropertyKey, unknown>, source: unknown): 
 }
 
 export function getSystemErrorMap(): Map<number, [string, string]> {
-    const errMod = import.meta.use('error');
-    const map = new Map<number, [string, string]>();
-    for (const [name, code] of Object.entries(errMod.errno)) {
-        // Node keeps UNKNOWN (-4094) in the map; only OK (0) is absent.
-        if (name === 'OK') continue;
-        if (typeof code !== 'number') continue;
-        const message = errMod.strerror(code).replace(new RegExp(`^${name}:\\s*`), '');
-        map.set(code, [name, message]);
-    }
-    return map;
+    return systemErrorMap();
 }
 
 function validateSystemErrorCode(err: unknown): number {
     if (typeof err !== 'number') {
         throw new TypeError('The "err" argument must be of type number');
     }
-    if (!Number.isInteger(err) || err >= 0) {
+    if (!Number.isSafeInteger(err) || err >= 0) {
         throw new RangeError(`The value of "err" is out of range. It must be a negative integer. Received ${err}`);
     }
     return err;
 }
 
 export function getSystemErrorName(err: number): string {
-    const entry = getSystemErrorMap().get(validateSystemErrorCode(err));
-    // Node never returns undefined here — unmapped codes get a synthetic name.
-    return entry ? entry[0] : `Unknown system error ${err}`;
+    validateSystemErrorCode(err);
+    return err < -0x80000000 ? `Unknown system error ${err}` : systemErrorName(err);
 }
 
 export function getSystemErrorMessage(err: number): string {
-    const entry = getSystemErrorMap().get(validateSystemErrorCode(err));
-    // Matches libuv's uv_strerror fallback, which Node surfaces verbatim.
-    return entry ? entry[1] : `Unknown system error ${err}`;
+    validateSystemErrorCode(err);
+    return err < -0x80000000 ? `Unknown system error ${err}` : errnoDescription(err);
 }
 
 type ParseArgsOption = {

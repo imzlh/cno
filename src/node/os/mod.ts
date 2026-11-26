@@ -21,8 +21,6 @@ type NetworkInterfaceWithCidr = CModuleOS.NetworkInterface & {
     cidr?: string | null;
 };
 
-type SignalConstants = { [key in NodeJS.Signals]: number };
-
 const priorityOS = os as typeof os & PriorityNativeOS;
 const isWindows = uname.sysname === 'Windows_NT';
 
@@ -118,8 +116,10 @@ export const constants = {
     // `signals` is null inside a worker thread (POSIX signals are process-wide,
     // not per-thread) — fall back to an empty map instead of crashing on import.
     signals: Object.fromEntries(
-        Object.entries(sig?.signals ?? {}).map(([k, v]) => [k, v])
-    ) as SignalConstants,
+        Object.entries(sig?.signals ?? {}).filter(
+            (entry): entry is [string, CModuleSignals.Signal] => entry[1] !== undefined,
+        )
+    ),
 
     errno: errnoConstants,
 

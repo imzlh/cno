@@ -8,6 +8,7 @@ import { IPCChannel, type IPCSerialization } from '../ipc_channel';
 import { stdout, stderr, stdin } from './streams';
 import { hrtime, memoryUsage, cpuUsage, resourceUsage } from './metrics';
 import { normalizeErrnoError } from '../_internal/errno';
+import { errnoDescription, errnoEntries, errorCode, systemErrorMap } from '../../utils/errno';
 import { errMsg } from '../../utils/error';
 import { withCode as codeError } from '../_internal/errors';
 import {
@@ -512,7 +513,7 @@ function drainNextTickQueue(): void {
     }
 }
 
-const nativeTickDrain: boolean = installNativeTickDrain();
+const nativeTickDrain = installNativeTickDrain();
 
 function handleUncaughtException(error: unknown): void {
     processEE.emit('uncaughtExceptionMonitor', error, 'uncaughtException');
@@ -654,8 +655,6 @@ function ensureEventBridge(): void {
     emitter[PROCESS_EVENT_BRIDGE_SLOT] = unsubscribe;
 }
 
-// The native hook gives nextTick priority over promise jobs; older cores use a
-// queueMicrotask fallback rather than dropping callbacks.
 type NextTickEngineHook = {
     setNextTickDrain?: (fn: () => void) => void;
     notifyNextTick?: () => void;
@@ -1478,10 +1477,10 @@ export function loadEnvFile(path?: string | URL): void {
         loadNodeEnvFile(normalized);
     } catch (e) {
         const error = normalizeErrnoError(e, 'open', errorPath);
-        const code = Reflect.get(error, 'code');
+        const code = errorCode(error);
         const errno = Reflect.get(error, 'errno');
         if (typeof code === 'string' && typeof errno === 'number') {
-            const detail = errMod.strerror(errno).replace(new RegExp(`^${code}:\\s*`), '');
+            const detail = errnoDescription(errno);
             error.message = `${code}: ${detail}, open '${errorPath}'`;
         }
         throw error;
@@ -1514,15 +1513,10 @@ type UvBinding = {
 let uvBinding: UvBinding | undefined;
 
 function createUvBinding(): UvBinding {
-    const errorMap = new Map<number, [string, string]>();
+    const errorMap = systemErrorMap();
     const codeMap = new Map<string, number>();
     const constants: Record<string, number> = {};
-    for (const [name, code] of Object.entries(errMod.errno)) {
-        if (name === 'OK') continue;
-        if (typeof code !== 'number') continue;
-        const errno = code;
-        const message = errMod.strerror(errno).replace(new RegExp(`^${name}:\\s*`), '');
-        errorMap.set(errno, [name, message]);
+    for (const [name, errno] of errnoEntries()) {
         codeMap.set(name, errno);
         constants[`UV_${name}`] = errno;
     }
@@ -1536,7 +1530,7 @@ function createUvBinding(): UvBinding {
             return errorMap.get(code)?.[1] ?? `Unknown system error ${code}`;
         },
         getErrorMap(): Map<number, [string, string]> {
-            return new Map(errorMap);
+            return new Map(Array.from(errorMap, ([code, [name, message]]) => [code, [name, message]]));
         },
         getCodeMap(): Map<string, number> {
             return new Map(codeMap);

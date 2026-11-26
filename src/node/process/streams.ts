@@ -73,7 +73,7 @@ export class ProcessWriteStream extends Writable {
     // (not a TTY, or getWindowSize failed), so `columns > 0` stays a number test.
     get columns(): number {
         if (this.#columnsOverride !== undefined) return this.#columnsOverride;
-        if (!this.#stdio.isTTY) return 0;
+        if (!this.isTTY) return 0;
         return readTtySize(this.#stdio)?.width ?? 0;
     }
 
@@ -83,7 +83,7 @@ export class ProcessWriteStream extends Writable {
 
     get rows(): number {
         if (this.#rowsOverride !== undefined) return this.#rowsOverride;
-        if (!this.#stdio.isTTY) return 0;
+        if (!this.isTTY) return 0;
         return readTtySize(this.#stdio)?.height ?? 0;
     }
 
