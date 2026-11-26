@@ -4,29 +4,32 @@
  */
 
 import { Server, createServer, type HttpRequest, type HttpResponse } from '@cnojs/http/server';
-import { HttpVersion } from '@cnojs/http/protocol';
-import { h2Available } from '@cnojs/http/h2-native';
 import { TcpSocket } from '@cnojs/http/socket';
 import { assert } from '../utils/assert';
-import { createWebSocketFromConnection } from "../webapi/websocket";
+import { createWebSocketFromConnection, type ServerWebSocketMeta, type ServerWebSocketConnection } from "../webapi/websocket";
 import { createSwitchingProtocolsResponse, getResponseInitiatorCallFrames, setResponseInitiatorCallFrames } from '../webapi/fetch/server-response';
-import { truncateHookPostData } from '../webapi/fetch/helpers';
-import { wrapFsClassDec as wrap, wrapFSErr, wrapFSns } from "../utils/wrap";
+import { wrapFSErr, wrapFSns, wrapDenoError } from "../utils/wrap";
 import { errMsg } from "../utils/error";
 import { errors } from './01_errors';
 import { getServeHook, captureUserNetworkCallFrames, type NetworkCallFrame } from '../utils/network-hooks';
+import { getTierLimits } from '../utils/memory-tier';
 import type { ISocket } from "@cnojs/http/socket";
 
 const crypto = import.meta.use('crypto');
 const engine = import.meta.use('engine');
 const http = import.meta.use('http');
+const { hookPayloadCap } = getTierLimits();
 
 const kWebSocket = Symbol('deno.serve.websocket');
-const kWSMeta = Symbol('deno.serve.websocket.meta');
 let serveRequestSeq = 0;
 
+interface WebSocketUpgrade {
+    resolve(connection: ISocket, metadata: ServerWebSocketMeta): void;
+    reject(reason: unknown): void;
+}
+
 interface WebSocketResponse extends Response {
-    [kWebSocket]?: (conn: ISocket) => void;
+    [kWebSocket]?: WebSocketUpgrade;
 }
 
 /** Non-disconnect write fault after headers/body started — outer loop must not run onError/500. */
@@ -54,15 +57,6 @@ function isServePeerDisconnect(err: unknown): boolean {
     if (isDenoTransportGone(err)) return true;
     return isDenoTransportGone(wrapFSErr(err));
 }
-
-type IWSMeta = {
-    source: 'serve';
-    requestId: string;
-    url: string;
-    requestHeaders?: Array<[string, string]>;
-    responseStatus?: number;
-    responseHeaders?: Array<[string, string]>;
-} | undefined;
 
 type ServeRuntimeOptions =
     Deno.ServeOptions &
@@ -148,6 +142,14 @@ async function cancelReaderQuietly(reader: ReadableStreamDefaultReader<Uint8Arra
     }
 }
 
+function closeResponseQuietly(response: HttpResponse): void {
+    try {
+        response.close();
+    } catch {
+        // Preserve the request/response failure that triggered teardown.
+    }
+}
+
 function newServeRequestId(): string {
     return `serve-${++serveRequestSeq}`;
 }
@@ -163,13 +165,59 @@ function headersToRecord(headers: Iterable<[string, string]>): Record<string, st
     return out;
 }
 
-function createWebRequest(coreReq: HttpRequest, connInfo: { hostname: string; port: number; secure: boolean }, signal: AbortSignal): Request {
+type ServeRequestBodyCapture = {
+    present: boolean;
+    chunks: Uint8Array[];
+    bytes: number;
+    complete: boolean;
+};
+
+function captureServeRequestBody(capture: ServeRequestBodyCapture, chunk: Uint8Array | null): void {
+    if (chunk === null) {
+        capture.complete = true;
+        return;
+    }
+    if (capture.bytes >= hookPayloadCap) return;
+    const length = Math.min(chunk.byteLength, hookPayloadCap - capture.bytes);
+    if (length === 0) return;
+    const copy = new Uint8Array(length);
+    copy.set(chunk.subarray(0, length));
+    capture.chunks.push(copy);
+    capture.bytes += length;
+}
+
+function capturedServeRequestBody(capture: ServeRequestBodyCapture): Uint8Array | undefined {
+    // A handler may deliberately leave a streaming request body unread. Do not
+    // report a misleading prefix unless the body was consumed to completion or
+    // the bounded hook preview is already full.
+    if (!capture.present || (!capture.complete && capture.bytes < hookPayloadCap)) return undefined;
+    const body = new Uint8Array(capture.bytes);
+    let offset = 0;
+    for (const chunk of capture.chunks) {
+        body.set(chunk, offset);
+        offset += chunk.byteLength;
+    }
+    return body;
+}
+
+function createWebRequest(
+    coreReq: HttpRequest,
+    connInfo: { hostname: string; port: number; secure: boolean },
+    signal: AbortSignal,
+): { request: Request; postData: () => Uint8Array | undefined } {
     const headers = new Headers(coreReq.headers);
     const host = headers.get('host') || `${connInfo.hostname}:${connInfo.port}`;
     const protocol = connInfo.secure ? 'https:' : 'http:';
     const base = `${protocol}//${host}`;
     const url = new URL(coreReq.url, base);
     const bodyPoll = coreReq.body;
+    const capture: ServeRequestBodyCapture = {
+        present: bodyPoll !== null,
+        chunks: [],
+        bytes: 0,
+        complete: false,
+    };
+    let bodyEnded = false;
 
     const init: RequestInit & { duplex?: 'half' } = {
         method: coreReq.method,
@@ -178,15 +226,25 @@ function createWebRequest(coreReq: HttpRequest, connInfo: { hostname: string; po
         body: bodyPoll ? new ReadableStream({
             async pull(ctrl) {
                 const res = await bodyPoll();
-                if (!res)   ctrl.close();
-                else        ctrl.enqueue(res);
-            }
+                if (!res) {
+                    bodyEnded = true;
+                    captureServeRequestBody(capture, null);
+                    ctrl.close();
+                } else {
+                    captureServeRequestBody(capture, res);
+                    ctrl.enqueue(res);
+                }
+            },
+            cancel() {
+                if (!bodyEnded) coreReq.cancelBody();
+            },
         }) : null
     };
     // cno's Request implementation follows the Fetch streaming-upload rule:
     // a ReadableStream body must explicitly opt into half-duplex handling.
     if (bodyPoll) init.duplex = 'half';
-    return new Request(url.toString(), init);
+    const request = new Request(url.toString(), init);
+    return { request, postData: () => capturedServeRequestBody(capture) };
 }
 
 class ResponseAdapter {
@@ -294,7 +352,7 @@ class ResponseAdapter {
         };
         // A proxy may be awaiting an idle upstream read when the client leaves.
         // Cancel that read immediately instead of waiting for another body write.
-        const removeCloseListener = hasBody ? this.coreRes.onTerminalClose?.(() => {
+        const removeCloseListener = hasBody ? this.coreRes.onTerminalClose(() => {
             disconnectError = Object.assign(new Error('HTTP response peer disconnected'), { code: 'ECONNRESET' });
             void cancelBody(disconnectError);
         }) : undefined;
@@ -324,7 +382,7 @@ class ResponseAdapter {
                 }
             } else if (reader) {
                 // HEAD sends representation headers but must release its producer.
-                await cancelBody(undefined);
+                void cancelBody(undefined);
             }
             // Ending a completed H2 response can itself close its stream.
             removeCloseListener?.();
@@ -332,8 +390,10 @@ class ResponseAdapter {
         } catch (err) {
             const message = errMsg(err);
             this.emitFinished(false, message);
-            await cancelBody(err);
-            this.coreRes.close();
+            closeResponseQuietly(this.coreRes);
+            // A producer's cancel() may never settle. Transport teardown and
+            // request completion must not depend on that user-owned promise.
+            void cancelBody(err);
             if (isServePeerDisconnect(err)) throw err;
             throw new ServeResponseWriteError(message, err);
         } finally {
@@ -343,8 +403,9 @@ class ResponseAdapter {
         this.emitFinished(true);
     }
 
-    @wrap
+    @wrapDenoError
     private async handleWebSocketUpgrade(response: WebSocketResponse): Promise<void> {
+        const upgrade = response[kWebSocket]!;
         const headers = Array.from(response.headers.entries());
         const statusText = response.statusText ?? http.strstatus(response.status);
         const serveHook = getServeHook();
@@ -358,16 +419,12 @@ class ResponseAdapter {
                     headers: headersToRecord(response.headers),
                     timestamp: serveTs()
                 });
-                this.emitFinished(true);
             });
         }
-        await this.coreRes.writeHead(response.status, statusText, headers);
-
-        const conn = this.coreRes.upgrade();
-
-        const websocketHandler = response[kWebSocket];
-        if (websocketHandler) {
-            Reflect.set(conn, kWSMeta, {
+        try {
+            await this.coreRes.writeHead(response.status, statusText, headers);
+            const conn = this.coreRes.upgrade();
+            upgrade.resolve(conn, {
                 source: 'serve',
                 requestId: this.requestId,
                 url: this.url,
@@ -375,8 +432,13 @@ class ResponseAdapter {
                 responseStatus: response.status,
                 responseHeaders: headers,
                 callFrames: this.requestCallFrames,
-            } as IWSMeta);
-            websocketHandler(conn);
+            });
+            this.emitFinished(true);
+        } catch (error) {
+            upgrade.reject(error);
+            this.emitFinished(false, errMsg(error));
+            closeResponseQuietly(this.coreRes);
+            throw new ServeResponseWriteError(errMsg(error), error);
         }
     }
 }
@@ -385,6 +447,8 @@ class DenoHttpServer implements Deno.HttpServer<Deno.Addr> {
     private server: Server;
     private finishedPromise: Promise<void>;
     private finishedResolve: () => void;
+    private shutdownPromise?: Promise<void>;
+    private removeAbortListener?: () => void;
     public readonly addr: Deno.Addr;
 
     constructor(server: Server, addr: Deno.Addr) {
@@ -399,16 +463,27 @@ class DenoHttpServer implements Deno.HttpServer<Deno.Addr> {
         return this.finishedPromise;
     }
 
-    // The server handle exposes no ref/unref.
-    ref(): void { }
+    ref(): void { this.server.ref(); }
 
-    unref(): void { }
+    unref(): void { this.server.unref(); }
 
-    async shutdown(): Promise<void> {
-        await this.server.closeGracefully();
-        this.finishedResolve();
+    bindSignal(signal: AbortSignal): void {
+        const abort = () => {
+            void this.shutdown().catch(error => reportServeError(error, '', 'shutdown'));
+        };
+        signal.addEventListener('abort', abort, { once: true });
+        this.removeAbortListener = () => signal.removeEventListener('abort', abort);
+        if (signal.aborted) abort();
     }
 
+    @wrapDenoError
+    shutdown(): Promise<void> {
+        this.removeAbortListener?.();
+        this.removeAbortListener = undefined;
+        return this.shutdownPromise ??= this.server.closeGracefully().then(() => this.finishedResolve());
+    }
+
+    @wrapDenoError
     [Symbol.asyncDispose](): Promise<void> {
         return this.shutdown();
     }
@@ -437,7 +512,9 @@ function serve(
         };
     } else {
         const optionHandler = handler ?? (hasServeHandler(optionsOrHandler) ? optionsOrHandler.handler : undefined);
-        if (!optionHandler) throw new TypeError('Handler is required');
+        if (typeof optionHandler !== 'function') {
+            throw new TypeError(optionHandler === undefined ? 'Handler is required' : 'Handler must be a function');
+        }
         options = { ...optionsOrHandler, handler: optionHandler };
     }
 
@@ -453,12 +530,14 @@ function serve(
             const requestId = serveHook ? newServeRequestId() : '';
             const requestStartTime = serveTs();
             const requestEntryCallFrames = serveEntryCallFrames ?? (serveHook ? captureServeCallFrames() : undefined);
-            const requestPostData = req.body instanceof Uint8Array ? truncateHookPostData(req.body) : undefined;
             let requestUrl = '';
+            let requestPostData: Uint8Array | undefined;
+            let requestPostDataSource: (() => Uint8Array | undefined) | undefined;
             let requestReported = false;
             const reportRequest = () => {
                 if (!serveHook || requestReported) return;
                 requestReported = true;
+                requestPostData ??= requestPostDataSource?.();
                 emitServeHookQuietly(() => serveHook.onRequest?.({
                     requestId,
                     url: requestUrl,
@@ -471,31 +550,41 @@ function serve(
             };
             const sendResponse = (response: Response) => {
                 const adapter = new ResponseAdapter(res, req.method, req.httpVersion, requestId, requestUrl, req.headers, requestEntryCallFrames);
-                adapter.verify(response);
+                try {
+                    adapter.verify(response);
+                } catch (error) {
+                    (response as WebSocketResponse)[kWebSocket]?.reject(error);
+                    throw error;
+                }
                 return adapter.sendResponse(response);
             };
             const requestAbort = new AbortController();
             const completion = createServeCompletion();
-            const removeRequestCloseListener = res.onTerminalClose?.(() => {
+            const removeRequestCloseListener = res.onTerminalClose(() => {
                 const error = Object.assign(new Error('HTTP request peer disconnected'), { code: 'ECONNRESET' });
                 requestAbort.abort(error);
                 completion.reject(error);
             });
             try {
-                const webRequest = createWebRequest(req, {
+                const webRequestResult = createWebRequest(req, {
                     hostname: denoAddr.transport === 'tcp' ? denoAddr.hostname : 'localhost',
                     port: denoAddr.transport === 'tcp' ? denoAddr.port : 80,
                     secure: coreServer.isSecure
                 }, requestAbort.signal);
-                req.body = null;
+                const webRequest = webRequestResult.request;
+                requestPostDataSource = webRequestResult.postData;
                 requestUrl = webRequest.url;
 
+                const remote = req.connection.remoteAddress;
                 const connInfo: Deno.ServeHandlerInfo = {
-                    remoteAddr: denoAddr,
+                    remoteAddr: 'path' in remote
+                        ? { transport: 'unix', path: remote.path }
+                        : { transport: 'tcp', hostname: remote.ip, port: remote.port },
                     completed: completion.promise,
                 };
 
                 const webResponse = await requestHandler(webRequest, connInfo);
+                requestPostData = webRequestResult.postData();
                 if (!(webResponse instanceof Response)) {
                     throw new TypeError('Handler must return a Response');
                 }
@@ -528,13 +617,14 @@ function serve(
                     completion.resolve();
                 } catch (recoveryError) {
                     completion.reject(recoveryError);
+                    closeResponseQuietly(res);
                     if (!isServePeerDisconnect(recoveryError)) {
                         reportServeError(recoveryError, requestUrl, 'error handler');
                     }
                     // Keep the connection failure isolated from the accept loop.
                 }
             } finally {
-                removeRequestCloseListener?.();
+                removeRequestCloseListener();
             }
         },
         {
@@ -545,42 +635,30 @@ function serve(
             key,
             keepAliveTimeout: optionalNumberOption(options, 'keepAliveTimeout'),
             requestTimeout: optionalNumberOption(options, 'requestTimeout'),
-            // TLS: offer h2 when the native extension is linked (client ALPN picks).
-            // Cleartext stays HTTP/1.1 only — Deno.serve does not speak prior-knowledge h2c.
-            protocols: cert && key && h2Available()
-                ? [HttpVersion.HTTP2, HttpVersion.HTTP11]
-                : [HttpVersion.HTTP11],
         }
     );
 
-    // Start listening
-    coreServer.listen();
-    // address() is a getsockname syscall; the listen address is constant for
-    // the listener's lifetime, so compute the Deno.Addr shape once here
-    // instead of per request.
-    const listenAddr = coreServer.address();
-    const denoAddr: Deno.Addr = listenAddr && 'path' in listenAddr
-        ? { transport: 'unix', path: listenAddr.path }
-        : {
-            hostname: listenAddr?.ip || '0.0.0.0',
-            port: listenAddr?.port ?? options.port ?? 8000,
-            transport: 'tcp'
-        };
-    coreServer.acceptLoop();
-
-    const httpServer = new DenoHttpServer(coreServer, denoAddr);
-
-    // Handle abort signal
-    if (options.signal) {
-        options.signal.addEventListener('abort', () => httpServer.shutdown(), { once: true });
+    let denoAddr: Deno.Addr;
+    try {
+        coreServer.listen();
+        // The listen address is constant for the listener's lifetime.
+        const listenAddr = coreServer.address();
+        denoAddr = listenAddr && 'path' in listenAddr
+            ? { transport: 'unix', path: listenAddr.path }
+            : {
+                hostname: listenAddr?.ip || '0.0.0.0',
+                port: listenAddr?.port ?? options.port ?? 8000,
+                transport: 'tcp'
+            };
+        coreServer.acceptLoop();
+        const httpServer = new DenoHttpServer(coreServer, denoAddr);
+        options.onListen?.(httpServer.addr);
+        if (options.signal) httpServer.bindSignal(options.signal);
+        return httpServer;
+    } catch (error) {
+        coreServer.close();
+        throw error;
     }
-
-    // Call onListen callback if provided
-    if (options.onListen) {
-        options.onListen(httpServer.addr);
-    }
-
-    return httpServer;
 }
 
 /**
@@ -629,33 +707,27 @@ function upgradeWebSocket(
         }
     }
 
-    const conProm = Promise.withResolvers<ISocket>();
+    const connection = Promise.withResolvers<ServerWebSocketConnection>();
 
     const response = createSwitchingProtocolsResponse({
         statusText: 'Switching Protocols',
         headers
     }) as WebSocketResponse;
 
-    const ws = createWebSocketFromISocket(conProm.promise);
-    response[kWebSocket] = c => conProm.resolve(c);
+    const ws = createWebSocketFromConnection(connection.promise);
+    response[kWebSocket] = {
+        resolve(socket, meta) {
+            connection.resolve({ socket, metadata: meta });
+        },
+        reject(reason) {
+            connection.reject(reason);
+        },
+    };
 
     return {
         response,
         socket: ws
     };
-}
-
-function createWebSocketFromISocket(conn: Promise<ISocket>): globalThis.WebSocket {
-    const serverMeta = conn.then(c => Reflect.get(c, kWSMeta) as IWSMeta);
-    return createWebSocketFromConnection(
-        conn.then(c => ({
-            ...c,
-            async clientHandshake(ctx, servername) {
-                return; // here we already handled handshake, so just a stub enough
-            },
-        })),
-        serverMeta,
-    );
 }
 
 export const SERVE_EXPORTS = wrapFSns({

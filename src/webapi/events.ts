@@ -384,12 +384,6 @@ export class ProgressEvent<T extends EventTarget = EventTarget> extends Event im
     }
 }
 
-for (const [name, cls] of Object.entries({
-    Event, EventTarget, CustomEvent, ErrorEvent, PromiseRejectionEvent,
-    CloseEvent, MessageEvent, DOMException, ProgressEvent,
-})) Reflect.set(globalThis, name, cls);
-
-
 export const parseStackFrame = (
     line: string
 ): { func?: string; file: string; line: number; col: number } | null => {
@@ -447,8 +441,6 @@ export class StorageEvent extends Event {
         });
     }
 }
-
-Reflect.set(globalThis, 'StorageEvent', StorageEvent);
 
 function inspectEvent(event: Event): string {
     if (event === Event.prototype) {

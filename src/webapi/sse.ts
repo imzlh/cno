@@ -8,7 +8,7 @@
 import { Headers } from "./headers";
 import { HttpResponseParser } from "@cnojs/http/h1";
 import { connectHttp, buildRequest, readHeaders, type IHttpSocket } from "../utils/http";
-import { MessageEvent } from "./events";
+import { Event, EventTarget, MessageEvent } from "./events";
 
 const timers = import.meta.use('timers');
 const text = import.meta.use('text');
@@ -320,5 +320,3 @@ export class EventSource extends EventTarget {
         super.removeEventListener(type, listener, options);
     }
 }
-
-Reflect.set(globalThis, 'EventSource', EventSource);

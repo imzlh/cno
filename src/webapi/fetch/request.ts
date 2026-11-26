@@ -2,6 +2,7 @@ import { Headers } from "../headers";
 import { type NetworkCallFrame } from "../../utils/network-hooks";
 import { bytesToArrayBuffer } from "../../utils/bytes";
 import { bodyContentType, ensureFormDataContentType, isBodyIterable, isReadableStreamLike, iterableBodyToStream, markRequestBodyUsed, parseFormData, readStreamBody, serializeBody, serializeFormData, teeUntracked, trackBodyStream, utf8Decoder } from "./helpers";
+import { HttpClient } from "./http-client";
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
 type RequestBodySource = BodyInit | ReadableStream<Uint8Array> | Uint8Array | null;
@@ -26,6 +27,7 @@ interface RequestState {
     referrer: string;
     referrerPolicy: ReferrerPolicy;
     signal: AbortSignal;
+    client?: HttpClient;
     bodySource: RequestBodySource;
     bodyBuffer: Uint8Array | null;
     initiatorCallFrames?: NetworkCallFrame[];
@@ -95,6 +97,11 @@ export class Request implements globalThis.Request {
     get duplex(): 'half' { return 'half'; }
 
     constructor(input: URL | string | Request, init?: RequestInit) {
+        const base = input instanceof Request ? input : undefined;
+        const client = (init as RequestInit & { client?: unknown } | undefined)?.client;
+        if (client != null && !HttpClient.isHttpClient(client)) {
+            throw new TypeError("Failed to construct 'Request': Argument 2 `client` must be a Deno.HttpClient");
+        }
         const state: RequestState = {
             url: '',
             method: 'GET',
@@ -110,6 +117,7 @@ export class Request implements globalThis.Request {
             referrer: 'about:client',
             referrerPolicy: '',
             signal: new AbortController().signal,
+            client: client === undefined ? base?.[requestState].client : client ?? undefined,
             bodySource: null,
             bodyBuffer: null,
         };
@@ -155,7 +163,6 @@ export class Request implements globalThis.Request {
         if ((isReadableStreamLike(init?.body) || isBodyIterable(init?.body)) && explicitDuplex !== 'half') {
             throw new TypeError('RequestInit: duplex option is required when sending a body.');
         }
-        const base = input instanceof Request ? input : undefined;
         state.cache = init?.cache || base?.cache || 'default';
         state.credentials = init?.credentials || base?.credentials || 'same-origin';
         state.integrity = init?.integrity || base?.integrity || '';
@@ -248,6 +255,7 @@ export class Request implements globalThis.Request {
             signal: this.signal,
             duplex: 'half',
         } as RequestInit & { duplex: 'half' });
+        cloned[requestState].client = state.client;
         cloned[requestState].initiatorCallFrames = state.initiatorCallFrames;
         return cloned;
     }
@@ -305,4 +313,8 @@ export class Request implements globalThis.Request {
     [markRequestBodyUsed](): void { this[requestState].bodyUsed = true; }
 
     get [Symbol.toStringTag](): string { return 'Request'; }
+}
+
+export function getRequestClient(request: Request): HttpClient | undefined {
+    return request[requestState].client;
 }

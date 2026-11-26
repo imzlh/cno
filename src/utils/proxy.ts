@@ -214,8 +214,21 @@ async function httpConnect(socket: TcpSocket, url: URL, config: ProxyConfig): Pr
     return leftover;
 }
 
+export async function connectHttpProxyTunnel(url: URL, config: ProxyConfig): Promise<TcpSocket> {
+    if (config.type !== 'http') throw new TypeError('CONNECT requires an HTTP proxy');
+    const proxy = new URL(config.url);
+    const socket = await openTcp(normalizeHost(proxy.hostname), proxyPort(config, proxy));
+    try {
+        const leftover = await httpConnect(socket, url, config);
+        return prependTunnelBytes(socket, leftover);
+    } catch (error) {
+        socket.close();
+        throw error;
+    }
+}
+
 function proxyAuthorization(config: ProxyConfig): string | undefined {
-    if (!config.user) return undefined;
+    if (config.user == null) return undefined;
     return basicAuth(config.user, config.pass);
 }
 

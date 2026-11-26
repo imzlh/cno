@@ -1,4 +1,7 @@
-import { fromError, PromiseRejectionEvent, EventTarget } from './events';
+import {
+    CloseEvent, CustomEvent, DOMException, ErrorEvent, Event, EventTarget,
+    MessageEvent, ProgressEvent, PromiseRejectionEvent, StorageEvent, fromError,
+} from './events';
 import {
     claimUnloadEvent,
     installLifecycleEventObserver,
@@ -8,6 +11,11 @@ import { defineLazy } from '../utils/lazy-accessor';
 
 const { EventType } = import.meta.use('engine');
 const evbus = import.meta.use('evbus');
+
+Object.assign(globalThis, {
+    CloseEvent, CustomEvent, DOMException, ErrorEvent, Event, EventTarget,
+    MessageEvent, ProgressEvent, PromiseRejectionEvent, StorageEvent,
+});
 
 // basic polyfills
 Object.defineProperties(globalThis, {
@@ -41,7 +49,6 @@ Object.defineProperties(globalThis, {
 await Promise.all([
     import('./console'),
     import('./basic'),
-    import('./events'),
 ]);
 
 // Keep URLPattern behind the shared accessor so boot can load it alongside the
@@ -92,7 +99,7 @@ function defineGlobalHandler(prop: string, type: string): void {
         set(fn: unknown) {
             // @ts-ignore - event
             if (handler) globalEvent.removeEventListener(type, wrapper);
-            handler = typeof fn === 'function' ? fn as (ev: Event) => void : null;
+            handler = typeof fn === 'function' ? fn as (ev: globalThis.Event) => void : null;
             // @ts-ignore - event
             if (handler) globalEvent.addEventListener(type, wrapper);
         },
@@ -196,8 +203,8 @@ await import('./fetch');
 // same reason as the WebSocket client above.
 void defineLazy(globalThis as unknown as Record<string, unknown>, [
     { name: 'EventSource', kind: 'ctor' },
-], () => import('./sse').then(() => new Map<string, unknown>([
-    ['EventSource', Reflect.get(globalThis, 'EventSource')],
+], () => import('./sse').then(({ EventSource }) => new Map<string, unknown>([
+    ['EventSource', EventSource],
 ])));
 
 // websocket (CNO secondary wrapping layer): the client stack (frames, handshake,
@@ -207,9 +214,9 @@ void defineLazy(globalThis as unknown as Record<string, unknown>, [
 void defineLazy(globalThis as unknown as Record<string, unknown>, [
     { name: 'WebSocket', kind: 'ctor' },
     { name: 'WebSocketStream', kind: 'ctor' },
-], () => import('./websocket').then(() => new Map<string, unknown>([
-    ['WebSocket', Reflect.get(globalThis, 'WebSocket')],
-    ['WebSocketStream', Reflect.get(globalThis, 'WebSocketStream')],
+], () => import('./websocket').then(({ WebSocket, WebSocketStream }) => new Map<string, unknown>([
+    ['WebSocket', WebSocket],
+    ['WebSocketStream', WebSocketStream],
 ])));
 
 // crypto

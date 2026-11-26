@@ -1,4 +1,4 @@
-import { DOMException, EventTarget, ProgressEvent } from "../events";
+import { DOMException, Event, EventTarget, ProgressEvent } from "../events";
 import { bytesToArrayBuffer } from "../../utils/bytes";
 import { basicAuth } from "../../utils/http";
 import { getFetchHook, getFetchInterceptHook, captureUserNetworkCallFrames, getCurlInitHook, type InterceptResult, type NetworkCallFrame } from "../../utils/network-hooks";
@@ -38,7 +38,7 @@ const XHR_DONE = 4;
 
 type XMLHttpRequestResponseType = '' | 'arraybuffer' | 'blob' | 'document' | 'json' | 'text';
 type XHREventType = 'readystatechange' | 'load' | 'error' | 'abort' | 'loadstart' | 'loadend' | 'progress' | 'timeout';
-type XHREventHandler<T extends Event = Event> = ((this: XMLHttpRequest, ev: T) => unknown) | null;
+type XHREventHandler<T extends globalThis.Event = globalThis.Event> = ((this: XMLHttpRequest, ev: T) => unknown) | null;
 const RESPONSE_TYPES = new Set(['', 'arraybuffer', 'blob', 'document', 'json', 'text']);
 const FORBIDDEN_METHODS = new Set(['CONNECT', 'TRACE', 'TRACK']);
 const METHOD_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;

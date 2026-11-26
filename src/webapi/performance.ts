@@ -1,4 +1,4 @@
-import { DOMException, EventTarget } from "./events";
+import { DOMException, Event, EventTarget } from "./events";
 import { structuredCloneWithTransfer } from "../node/_internal/structured-clone";
 const console = import.meta.use('console');
 const denoCustomInspect = Symbol.for('Deno.customInspect');
@@ -20,7 +20,7 @@ type PerformanceObserverCallback = (
     list: PerformanceObserverEntryList,
     observer: PerformanceObserver
 ) => void;
-type PerformanceEventHandler = ((this: Performance, ev: Event) => unknown) | null;
+type PerformanceEventHandler = ((this: Performance, ev: globalThis.Event) => unknown) | null;
 
 interface PerformanceObserverInit {
     entryTypes?: PerformanceEntryType[];

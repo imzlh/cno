@@ -1,8 +1,8 @@
 import { Headers } from "../headers";
 import pkg from "../../../package.json";
 import { getFetchHook, getUserAgentOverride, getExtraHTTPHeaders, getFetchInterceptHook, captureUserNetworkCallFrames, getCurlInitHook, type NetworkCallFrame, type InterceptResult } from "../../utils/network-hooks";
-import { type HttpClient } from "../../deno/07_http";
-import { Request } from "./request";
+import { acquireHttpClientPool, type HttpClient, type HttpClientLease } from "./http-client";
+import { getRequestClient, Request } from "./request";
 import { Response, setResponseMetadata } from "./response";
 import { abortError, attachCurlDebugTrace, buildConnectionInfo, compressionAcceptEncoding, curlMod, engine, getCurlPool, headerPairsToHeaders, isCurlTimeoutError, isNullBodyStatus, maxPendingBodyBytes, parseHeaders, prepareRequestBody, streamHighWaterMark, throwIfAborted, timeoutError, toCurlBody, truncateHookPostData } from "./helpers";
 import { isLocalFetchProtocol, loadLocalProtocol } from "./protocols";
@@ -101,6 +101,7 @@ function clearCurlProxy(curl: CModuleCURL.CURL): void {
 /** Apply Deno.HttpClient proxy + mTLS settings without touching the filesystem. */
 function applyClientToCurl(curl: CModuleCURL.CURL, client: HttpClient, url: URL): void {
     const opts = client.options;
+    curl.setHTTPVersion(opts.http2 === false ? '1.1' : '2TLS');
     const proxy = opts.proxy;
     if (proxy) {
         clearCurlProxy(curl);
@@ -148,8 +149,10 @@ function filterHeaders(headers: Headers): void {
 // ----------------------------------------------------------------------------
 export async function performFetch(request: Request, url: URL): Promise<Response> {
     throwIfAborted(request.signal);
-    const localResponse = await loadLocalProtocol(url, request.url);
-    if (localResponse) {
+    const client = getRequestClient(request);
+    if (isLocalFetchProtocol(url.protocol)) {
+        client?.assertOpen();
+        const localResponse = (await loadLocalProtocol(url, request.url))!;
         const response = new Response(localResponse.body, {
             status: localResponse.status,
             statusText: localResponse.status === 200 ? 'OK' : '',
@@ -158,14 +161,25 @@ export async function performFetch(request: Request, url: URL): Promise<Response
         setResponseMetadata(response, { url: localResponse.url, type: 'basic' });
         return response;
     }
+
+    // Admit the request before body preparation yields to user code.
+    const lease = client?.[acquireHttpClientPool]();
+    try {
+        return await performCurlFetch(request, url, client, lease);
+    } catch (error) {
+        lease?.release();
+        throw error;
+    }
+}
+
+async function performCurlFetch(request: Request, url: URL, client?: HttpClient, lease?: HttpClientLease): Promise<Response> {
     const preparedBody = await prepareRequestBody(request);
     const body = preparedBody.kind === 'buffer' ? preparedBody.body : null;
     throwIfAborted(request.signal);
 
-    const curl = new curlMod.CURL(getCurlPool());
+    const curl = new curlMod.CURL(lease?.pool ?? getCurlPool());
 
     // A Deno.HttpClient is applied to curl rather than reimplementing HTTP on a raw socket.
-    const client = (await import('../../deno/07_http')).getRequestClient(request);
     const configureRequestNetwork = (target: URL) => {
         getCurlInitHook()?.(curl, target);
         if (client) applyClientToCurl(curl, client, target);
@@ -374,8 +388,7 @@ export async function performFetch(request: Request, url: URL): Promise<Response
         }
     };
 
-    // Idempotent: the interceptor can reject before perform(), with no finally to
-    // release the in-flight marker or abort listener.
+    // An interceptor can settle the fetch before perform() takes over cleanup.
     const cleanupBeforePerform = () => {
         removeAbortHandler();
         pendingBodyChunks.length = 0;
@@ -385,6 +398,7 @@ export async function performFetch(request: Request, url: URL): Promise<Response
 
     const followingRedirects = request.redirect !== 'error' && request.redirect !== 'manual';
     let didRedirect = false;
+    let redirectError: unknown;
     let waitingForFinalHeaders = false; // true between a redirect hop and the final onHeadersComplete
 
     curl.onHeadersComplete((status, headers) => {
@@ -397,6 +411,15 @@ export async function performFetch(request: Request, url: URL): Promise<Response
         // Skip intermediate redirect responses entirely — the netHook and
         // headersDone should only see the FINAL response.
         if (isRedirectStatus && followingRedirects) {
+            try {
+                // Deno admits the next hop when headers arrive, before draining this body.
+                client?.assertOpen();
+            } catch (error) {
+                // An automatic redirect is a new request under the client resource.
+                // Throwing from the header callback stops libcurl before it follows.
+                redirectError = error;
+                throw error;
+            }
             didRedirect = true;
             waitingForFinalHeaders = true;
             // Discard any body chunks accumulated from the redirect response
@@ -466,8 +489,8 @@ export async function performFetch(request: Request, url: URL): Promise<Response
         }
         if (result) {
             if (result.action === 'fulfill') {
-                removeAbortHandler();
-                abortCurl();
+                cleanupBeforePerform();
+                lease?.release();
                 const resHeaders = new Headers();
                 for (const [k, v] of result.responseHeaders) resHeaders.set(k, v);
                 return new Response(result.body, { status: result.responseCode, headers: resHeaders });
@@ -517,19 +540,23 @@ export async function performFetch(request: Request, url: URL): Promise<Response
                 }
             },
             (err: Error) => {
-                const fetchErr = isCurlTimeoutError(err) ? timeoutError() : err;
+                const fetchErr = redirectError ?? (isCurlTimeoutError(err) ? timeoutError() : err);
                 headersDone.reject(fetchErr);
                 errorBody(fetchErr);
                 if (netHook) {
                     const conn = buildConnectionInfo(curl, reqStartTime, curlTrace);
                     emitFetchHookQuietly(() => {
-                        netHook.onFinished?.({ requestId, success: false, errorText: fetchErr.message, connection: conn, timestamp: ts() });
+                        netHook.onFinished?.({ requestId, success: false, errorText: fetchErr instanceof Error ? fetchErr.message : String(fetchErr), connection: conn, timestamp: ts() });
                     });
                 }
             }
         ).finally(() => {
-            removeAbortHandler();
             curlRecvPaused = false;
+            try {
+                removeAbortHandler();
+            } finally {
+                lease?.release();
+            }
         });
     } catch (error) {
         cleanupBeforePerform();
@@ -583,34 +610,9 @@ export async function performFetch(request: Request, url: URL): Promise<Response
     }
 }
 
-/**
- * Attach an `init.client` (Deno.HttpClient) for performFetch. Request does not
- * retain unknown init keys, so the client is carried out of band; a non-HttpClient
- * value is rejected rather than dropped, matching Deno.
- */
-async function attachRequestClient(request: Request, init: RequestInit | undefined, input: unknown): Promise<void> {
-    const client = (init as { client?: unknown } | undefined)?.client;
-    // Import only when a client is actually in play: the common path must not pay
-    // for loading the Deno http module on every fetch.
-    if ((client === undefined || client === null) && !(input instanceof Request)) return;
-    const http = await import('../../deno/07_http');
-    if (client === undefined || client === null) {
-        if (input instanceof Request) {
-            const inherited = http.getRequestClient(input);
-            if (inherited) http.setRequestClient(request, inherited);
-        }
-        return;
-    }
-    if (!(client instanceof http.HttpClient)) {
-        throw new TypeError("Failed to construct 'Request': Argument 2 `client` must be a Deno.HttpClient");
-    }
-    http.setRequestClient(request, client);
-}
-
 export async function fetchAsync(input: unknown, init?: RequestInit, initiatorCallFrames?: NetworkCallFrame[]): Promise<Response> {
     if (input instanceof URL) input = input.href;
     const request = new Request(toRequestInput(input), init);
-    await attachRequestClient(request, init, input);
     request.setInitiatorCallFrames(initiatorCallFrames);
     throwIfAborted(request.signal);
     const url = new URL(request.url);

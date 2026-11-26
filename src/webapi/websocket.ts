@@ -12,7 +12,7 @@ import { buildRequest, connectHttp, readHeaders } from "../utils/http";
 import { bytesToArrayBuffer, concatChunks, toOwnedBytes, sanitizeSurrogates } from "../utils/bytes";
 import { getTierLimits } from '../utils/memory-tier';
 import { captureUserNetworkCallFrames, getWebSocketHook, type NetworkCallFrame, type NetworkSource, type WSFrameInfo } from '../utils/network-hooks';
-import { CloseEvent, DOMException, ErrorEvent, MessageEvent } from "./events";
+import { CloseEvent, DOMException, ErrorEvent, Event, EventTarget, MessageEvent } from "./events";
 
 const engine = import.meta.use('engine');
 const algo = import.meta.use('algorithm');
@@ -30,7 +30,7 @@ const utf8FatalDecoder = new textMod.Decoder('utf-8', { fatal: true });
 const decodeTextFrame = (payload: Uint8Array): string => utf8FatalDecoder.decode(payload);
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
-type IWSSocket = Omit<ISocket, 'serverHandshake' | 'alpnProtocol' | 'read'>;
+type IWSSocket = Pick<ISocket, 'onReadable' | 'stopReading' | 'write' | 'close'>;
 
 let _wsIdCounter = 0;
 const wsTs = () => Date.now() / 1000;
@@ -207,7 +207,10 @@ export interface ServerWebSocketMeta {
     callFrames?: NetworkCallFrame[];
 }
 
-type ServerWebSocketMetaSource = ServerWebSocketMeta | Promise<ServerWebSocketMeta | undefined> | undefined;
+export interface ServerWebSocketConnection {
+    socket: IWSSocket;
+    metadata?: ServerWebSocketMeta;
+}
 
 interface WebSocketFrame { fin: boolean; opcode: OpCode; masked: boolean; payload: Uint8Array; }
 interface WebSocketEventMap { open: Event; message: MessageEvent; error: ErrorEvent; close: globalThis.CloseEvent; }
@@ -439,7 +442,7 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
 
     public onopen: ((this: globalThis.WebSocket, ev: globalThis.Event) => unknown) | null = null;
     public onmessage: ((this: globalThis.WebSocket, ev: globalThis.MessageEvent) => unknown) | null = null;
-    public onerror: ((this: globalThis.WebSocket, ev: globalThis.ErrorEvent | Event) => unknown) | null = null;
+    public onerror: ((this: globalThis.WebSocket, ev: globalThis.ErrorEvent | globalThis.Event) => unknown) | null = null;
     public onclose: ((ev: globalThis.CloseEvent) => unknown) | null = null;
 
     get bufferedAmount(): number { return this.sendQueue.bufferedAmount; }
@@ -468,47 +471,34 @@ export class WebSocket extends EventTarget implements globalThis.WebSocket {
     }
 
     constructor(url: string | URL, protocols?: string | string[]);
-    constructor(connection: Promise<IWSSocket>, isServer: true);
-    constructor(connection: Promise<IWSSocket>, isServer: true, serverMeta?: ServerWebSocketMetaSource);
-    constructor(urlOrConnection: string | URL | Promise<IWSSocket>, protocolsOrIsServer?: string | string[] | true, serverMeta?: ServerWebSocketMetaSource) {
+    constructor(connection: Promise<ServerWebSocketConnection>, isServer: true);
+    constructor(urlOrConnection: string | URL | Promise<ServerWebSocketConnection>, protocolsOrIsServer?: string | string[] | true) {
         super();
         const isServerConnection = protocolsOrIsServer === true && engine.isPromise(urlOrConnection);
         if (!isServerConnection) {
             this.url = normalizeClientWebSocketUrl(urlOrConnection as string | URL); this.isClient = true;
             this.sendQueue = new SendQueue(null, true, () => this.handleConnectionFailure(new Error('Connection closed')));
-            const protocols = validateProtocols(protocolsOrIsServer === true ? undefined : protocolsOrIsServer);
+            const protocols = validateProtocols(protocolsOrIsServer);
             this.requestedProtocols = protocols;
             this.connectClient();
         } else {
-            const syncServerMeta = serverMeta && typeof (serverMeta as Promise<ServerWebSocketMeta | undefined>).then !== 'function'
-                ? serverMeta as ServerWebSocketMeta
-                : undefined;
-            const serverMetaReady = serverMeta && typeof (serverMeta as Promise<ServerWebSocketMeta | undefined>).then === 'function'
-                ? (serverMeta as Promise<ServerWebSocketMeta | undefined>).then(meta => {
-                    if (!meta) return;
-                    this._serverMeta = meta;
-                    if (!this.url) this.url = toWebSocketUrl(meta.url);
-                    if (!this._netRequestId) this._netRequestId = meta.requestId;
-                    if (!this._initiatorCallFrames) this._initiatorCallFrames = meta.callFrames;
-                }).catch(() => {})
-                : Promise.resolve();
-            this.url = syncServerMeta?.url ? toWebSocketUrl(syncServerMeta.url) : ''; this.isClient = false;
-            this._serverMeta = syncServerMeta;
-            this._netRequestId = syncServerMeta?.requestId ?? '';
-            this._initiatorCallFrames = syncServerMeta?.callFrames;
+            this.url = '';
+            this.isClient = false;
             this.sendQueue = new SendQueue(null, false, () => this.handleConnectionFailure(new Error('Connection closed')));
             this._readyState = WebSocketReadyState.CONNECTING;
-            (urlOrConnection as Promise<IWSSocket>).then(conn => {
-                serverMetaReady.then(() => {
+            (urlOrConnection as Promise<ServerWebSocketConnection>).then(({ socket: conn, metadata }) => {
                 if (this._readyState !== WebSocketReadyState.CONNECTING) {
                     closeQuietly(conn);
                     return;
                 }
+                this._serverMeta = metadata;
+                this.url = metadata?.url ? toWebSocketUrl(metadata.url) : '';
+                this._netRequestId = metadata?.requestId ?? '';
+                this._initiatorCallFrames = metadata?.callFrames;
                 this._readyState = WebSocketReadyState.OPEN; this.connection = conn; this.sendQueue.setConnection(conn);
                 this.emitServerHandshakeEvents();
                 this.scheduleOpen();
                 this.startReceiving();
-                });
             }).catch(err => { this.handleConnectionFailure(toError(err, 'Connection failed')); });
         }
     }
@@ -1354,9 +1344,6 @@ export class WebSocketStream {
     }
 }
 
-export function createWebSocketFromConnection(connection: Promise<IWSSocket>, serverMeta?: ServerWebSocketMetaSource): WebSocket {
-    return new WebSocket(connection, true, serverMeta);
+export function createWebSocketFromConnection(connection: Promise<ServerWebSocketConnection>): WebSocket {
+    return new WebSocket(connection, true);
 }
-
-Reflect.set(globalThis, 'WebSocket', WebSocket);
-Reflect.set(globalThis, 'WebSocketStream', WebSocketStream);

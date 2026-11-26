@@ -144,15 +144,16 @@ export function buildConnectionInfo(curl: CModuleCURL.CURL, reqStartTime: number
 
 let curlPool: CModuleCURL.ConnPool | null = null;
 
+export function createCurlPool(): CModuleCURL.ConnPool {
+    return new curlMod.ConnPool({
+        maxConnections: 64,
+        maxConnectionsPerHost: 8,
+        pipelining: true,
+    });
+}
+
 export function getCurlPool(): CModuleCURL.ConnPool {
-    if (!curlPool) {
-        curlPool = new curlMod.ConnPool({
-            maxConnections: 64,
-            maxConnectionsPerHost: 8,
-            pipelining: true,
-        });
-    }
-    return curlPool;
+    return curlPool ??= createCurlPool();
 }
 
 export function closeCurlPool(): void {
