@@ -165,11 +165,11 @@ interface HostDeno {
     connect(options: HostEndpoint): Promise<HostConn>;
     connectTls(options: { hostname: string; port: number } & BunTlsConfig): Promise<HostTlsConn>;
     listen(options: HostEndpoint): HostListener;
+    listenTls(options: { hostname: string; port: number; cert: string; key: string; alpnProtocols?: string[] }): HostListener;
 }
 
 const CONNECT_OPTIONS = ['hostname', 'port', 'unix', 'socket', 'data', 'allowHalfOpen'] as const;
 const UNSUPPORTED_OPTION_DETAILS: Record<string, string> = {
-    tls: 'TLS is not supported by this adapter.',
     fd: 'file descriptors are not supported by this adapter.',
     reusePort: 'socket reuse options are not supported by this adapter.',
     exclusive: 'exclusive-bind options are not supported by this adapter.',
@@ -210,7 +210,7 @@ function parseSocketOptions(options: unknown, label: string): {
     const record = options as Record<PropertyKey, unknown>;
     for (const key of Reflect.ownKeys(record)) {
         const name = String(key);
-        if (name === 'tls' && (label === 'Bun.connect' || record[key] === false)) continue;
+        if (name === 'tls') continue;
         if (CONNECT_OPTIONS.includes(name as typeof CONNECT_OPTIONS[number])) continue;
         const detail = UNSUPPORTED_OPTION_DETAILS[name];
         throw new TypeError(detail ? `${label}: unsupported option "${name}". ${detail}` : `${label}: unsupported option "${name}"`);
@@ -369,8 +369,8 @@ class BunSocketImpl implements BunSocket {
         this.#binaryType = params.handlers.binaryType ?? 'buffer';
     }
 
-    static attach(socket: BunSocketImpl, conn: HostConn, tls = false): void {
-        socket.#attach(conn, tls);
+    static attach(socket: BunSocketImpl, conn: HostConn, tlsRole?: 'client' | 'server'): void {
+        socket.#attach(conn, tlsRole);
     }
 
     static invoke(socket: BunSocketImpl, event: string, ...args: unknown[]): void {
@@ -526,11 +526,11 @@ class BunSocketImpl implements BunSocket {
         BunSocketImpl.dispose(this);
     }
 
-    #attach(conn: HostConn, tls: boolean): void {
+    #attach(conn: HostConn, tlsRole: 'client' | 'server' | undefined): void {
         this.#conn = conn;
-        this.#tls = tls;
+        this.#tls = tlsRole !== undefined;
         this.#activeSockets?.add(this);
-        if (!tls) {
+        if (tlsRole === undefined) {
             void this.#readLoop();
             this.#invoke('open');
             return;
@@ -545,14 +545,16 @@ class BunSocketImpl implements BunSocket {
         }
         void (conn as HostTlsConn).handshake().then(info => {
             if (this.#closed) return;
-            this.#authorized = true;
+            this.#authorized = tlsRole === 'client';
             this.#alpnProtocol = info.alpnProtocol || false;
-            this.#invoke(hasHandshake ? 'handshake' : 'open', true, null);
+            if (hasHandshake) this.#invoke('handshake', true, this.#authorizationError);
+            else this.#invoke('open');
             if (!this.#closed) void this.#readLoop();
         }, error => {
             if (this.#closed) return;
             this.#authorizationError = asError(error);
-            this.#invoke(hasHandshake ? 'handshake' : 'open', false, this.#authorizationError);
+            if (hasHandshake) this.#invoke('handshake', false, this.#authorizationError);
+            else this.#invoke('open');
             this.#finishClose();
         });
         if (hasHandshake) this.#invoke('open');
@@ -733,6 +735,7 @@ class BunSocketListenerImpl implements BunSocketListener {
     readonly #endpoint: HostEndpoint;
     #data: unknown;
     readonly #allowHalfOpen: boolean;
+    readonly #tls: boolean;
     #handlers: BunSocketHandler;
     #closed = false;
     readonly #activeSockets = new Set<BunSocketImpl>();
@@ -743,12 +746,14 @@ class BunSocketListenerImpl implements BunSocketListener {
         data: unknown;
         allowHalfOpen: boolean;
         handlers: BunSocketHandler;
+        tls: boolean;
     }) {
         this.#hostListener = params.hostListener;
         this.#boundAddress = addressOf(params.hostListener.addr);
         this.#endpoint = params.endpoint;
         this.#data = params.data;
         this.#allowHalfOpen = params.allowHalfOpen;
+        this.#tls = params.tls;
         this.#handlers = params.handlers;
         void this.#acceptConnections();
     }
@@ -819,7 +824,7 @@ class BunSocketListenerImpl implements BunSocketListener {
                     listener: this,
                     activeSockets: this.#activeSockets,
                 });
-                BunSocketImpl.attach(socket, conn);
+                BunSocketImpl.attach(socket, conn, this.#tls ? 'server' : undefined);
             }
         } catch (error) {
             if (!this.#closed) {
@@ -886,7 +891,7 @@ export async function connect(options: BunConnectOptions): Promise<BunSocket> {
         BunSocketImpl.invoke(socket, 'connectError', normalized);
         throw normalized;
     }
-    BunSocketImpl.attach(socket, conn, tls !== undefined);
+    BunSocketImpl.attach(socket, conn, tls ? 'client' : undefined);
     return socket;
 }
 
@@ -896,13 +901,29 @@ export function listen(options: BunListenOptions): BunTcpSocketListener | BunUni
 export function listen(options: BunListenOptions): BunTcpSocketListener | BunUnixSocketListener {
     const parsed = parseSocketOptions(options, 'Bun.listen');
     const endpoint = parseEndpoint(options, 'Bun.listen');
+    const tls = normalizeTlsOptions(options.tls, 'server');
+    if (tls && endpoint.transport !== 'tcp') throw new TypeError('Bun.listen: TLS over Unix sockets is not supported');
+    if (tls?.caCerts !== undefined) throw new TypeError('Bun.listen: TLS ca is not supported by the host listener');
     const runtime = hostRuntime();
-    const hostListener = runtime.listen(endpoint);
+    let hostListener: HostListener;
+    if (tls && endpoint.transport === 'tcp') {
+        if (typeof runtime.listenTls !== 'function') throw new Error('Bun.listen: the host does not provide TLS listeners');
+        hostListener = runtime.listenTls({
+            hostname: endpoint.hostname,
+            port: endpoint.port,
+            cert: tls.cert!,
+            key: tls.key!,
+            alpnProtocols: tls.alpnProtocols,
+        });
+    } else {
+        hostListener = runtime.listen(endpoint);
+    }
     return new BunSocketListenerImpl({
         hostListener,
         endpoint,
         data: parsed.data,
         allowHalfOpen: parsed.allowHalfOpen,
         handlers: parsed.handlers,
+        tls: tls !== undefined,
     }) as BunTcpSocketListener | BunUnixSocketListener;
 }

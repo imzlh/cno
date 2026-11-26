@@ -1,4 +1,5 @@
 import { Buffer } from 'node:buffer';
+import { arrayBufferBackedBytes } from '../utils/bytes';
 
 export type BunWebSocketData = string | BufferSource | Blob;
 export type BunWebSocketBinaryType = 'nodebuffer' | 'arraybuffer' | 'uint8array' | 'blob';
@@ -95,7 +96,7 @@ function messagePayload(data: BunWebSocketData): MessagePayload {
             bytes = new Uint8Array(Reflect.apply(dataViewBuffer, data, []),
                 Reflect.apply(dataViewOffset, data, []), Reflect.apply(dataViewLength, data, []));
         }
-        return { value: bytes, length: bytes.byteLength };
+        return { value: arrayBufferBackedBytes(bytes), length: bytes.byteLength };
     }
     try {
         return { value: data, length: Reflect.apply(arrayBufferLength, data, []) as number };

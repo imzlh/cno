@@ -31,7 +31,11 @@ export interface BunServeServer<T = unknown> {
     readonly port: number;
     readonly hostname: string;
     readonly url: URL;
+    readonly pendingRequests: number;
     readonly pendingWebSockets: number;
+    requestIP(request: Request): import('bun').SocketAddress | null;
+    ref(): BunServeServer<T>;
+    unref(): BunServeServer<T>;
     upgrade(request: Request, options?: BunWebSocketUpgradeOptions<T>): boolean;
     publish(topic: string, data: BunWebSocketData, compress?: boolean): number;
     subscriberCount(topic: string): number;
@@ -74,7 +78,14 @@ interface HostAddress {
 
 interface HostHttpServer {
     readonly addr: HostAddress;
+    ref(): void;
+    unref(): void;
     shutdown(): Promise<void>;
+}
+
+interface HostRequestInfo {
+    remoteAddr: { transport: 'tcp'; hostname: string; port: number } | { transport: 'unix'; path: string };
+    completed: Promise<void>;
 }
 
 interface HostServeOptions {
@@ -89,7 +100,7 @@ interface HostDeno {
     upgradeWebSocket?: HostWebSocketUpgrade;
     serve(
         options: HostServeOptions,
-        handler: (request: Request) => Response | Promise<Response>,
+        handler: (request: Request, info: HostRequestInfo) => Response | Promise<Response>,
     ): HostHttpServer;
 }
 
@@ -114,6 +125,7 @@ const DEFAULT_PORT = 3000;
 const DEFAULT_HOSTNAME = 'localhost';
 const DEFAULT_BIND_HOSTNAME = '127.0.0.1';
 const SUPPORTED_OPTIONS = new Set(['fetch', 'routes', 'error', 'port', 'hostname', 'websocket', 'tls']);
+const requestAddresses = new WeakMap<Request, HostRequestInfo['remoteAddr']>();
 
 const UNSUPPORTED_OPTION_DETAILS = new Map<string, string>([
     ['development', 'development/hot-reload mode is not supported.'],
@@ -311,6 +323,7 @@ class BunServeServerImpl implements BunServeServer {
     private errorHandler: ((error: unknown) => Response | Promise<Response>) | undefined;
     private routes: CompiledRoutes | undefined;
     private websockets: BunWebSocketServer | undefined;
+    private activeRequests = 0;
 
     constructor(
         private readonly configuredHostname: string,
@@ -349,8 +362,35 @@ class BunServeServerImpl implements BunServeServer {
         return this.websockets?.pendingWebSockets ?? 0;
     }
 
+    get pendingRequests(): number {
+        return this.activeRequests;
+    }
+
+    requestIP(request: Request): import('bun').SocketAddress | null {
+        if (!(request instanceof Request)) throw new TypeError('Expected Request object');
+        const address = requestAddresses.get(request);
+        if (address?.transport !== 'tcp' || request.signal.aborted) return null;
+        return {
+            address: address.hostname,
+            family: address.hostname.includes(':') ? 'IPv6' : 'IPv4',
+            port: address.port,
+        };
+    }
+
+    ref(): this {
+        if (!this.stopPromise) this.hostServer?.ref();
+        return this;
+    }
+
+    unref(): this {
+        if (!this.stopPromise) this.hostServer?.unref();
+        return this;
+    }
+
     upgrade(request: Request, options?: BunWebSocketUpgradeOptions): boolean {
-        return this.websockets?.upgrade(request, options) ?? false;
+        const upgraded = this.websockets?.upgrade(request, options) ?? false;
+        if (upgraded) requestAddresses.delete(request);
+        return upgraded;
     }
 
     publish(topic: string, data: BunWebSocketData, _compress?: boolean): number {
@@ -361,7 +401,16 @@ class BunServeServerImpl implements BunServeServer {
         return this.websockets?.subscriberCount(topic) ?? 0;
     }
 
-    handleFetch(request: Request): Response | Promise<Response> {
+    handleFetch(request: Request, info?: HostRequestInfo): Response | Promise<Response> {
+        if (info) {
+            this.activeRequests++;
+            requestAddresses.set(request, info.remoteAddr);
+            const complete = () => {
+                requestAddresses.delete(request);
+                this.activeRequests--;
+            };
+            void info.completed.then(complete, complete);
+        }
         if (this.websockets) {
             return this.websockets.handleRequest(request, () => this.dispatchRequest(request), error => this.handleError(error));
         }
@@ -480,7 +529,7 @@ export function serve<T = unknown>(options: BunServeOptions<T>): BunServeServer<
         hostServer = runtime.serve.call(
             runtime,
             hostOptions,
-            request => exposedServer.handleFetch(request),
+            (request, info) => exposedServer.handleFetch(request, info),
         );
         if (!hostServer || typeof hostServer.shutdown !== 'function') {
             throw new Error('Bun.serve: host server does not expose graceful shutdown.');

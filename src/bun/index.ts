@@ -28,6 +28,7 @@ import {
     type HashDigestEncoding,
 } from './crypto/hash-classes';
 import { file, type BunFileLike, type BunFileWriteOptions, type BunWriteInput, write } from './file';
+import { fetch } from './fetch';
 import { FileSystemRouter, type FileSystemRouterOptions, type MatchedRoute } from './file-system-router';
 import { Glob, type GlobScanOptions } from './glob';
 import { bunHash as hash, type BunHash, type HashInput } from './hash';
@@ -99,8 +100,8 @@ import {
 import { which, type WhichOptions } from './utils/which';
 import { TOML } from './utils/toml';
 import { XML } from './utils/xml';
-import { normalizeTlsOptions } from './tls';
 import { YAML } from './utils/yaml';
+import { normalizeTlsOptions } from './tls';
 import { randomUUIDv7 } from './uuid';
 import { randomUUIDv5 } from './uuid/v5';
 
@@ -112,41 +113,12 @@ const worker = import.meta.use('worker');
 
 installServeTlsNormalizer(normalizeTlsOptions);
 
-const webFetch = globalThis.fetch;
-const reflectGet = Reflect.get;
 const NativePromise = Promise;
 const dateGetTime = Date.prototype.getTime;
 const dateNow = Date.now;
 const mathMin = Math.min;
 // The native timer converts through signed int64; stay within exact JS integers.
 const MAX_TIMER_DELAY = 9_007_199_254_740_991;
-const UNSUPPORTED_FETCH_OPTIONS = [
-    'tls',
-    'verbose',
-    'proxy',
-    'session',
-    's3',
-    'unix',
-    'protocol',
-    'decompress',
-    'compress',
-    'maxRedirects',
-    'timeout',
-] as const;
-
-export const fetch: typeof globalThis.fetch = async function fetch(input, init = undefined) {
-    const objectInit = init !== null && (typeof init === 'object' || typeof init === 'function')
-        ? init
-        : undefined;
-    if (objectInit !== undefined) {
-        for (const name of UNSUPPORTED_FETCH_OPTIONS) {
-            if (reflectGet(objectInit, name) !== undefined) {
-                throw new TypeError(`Bun.fetch: unsupported Bun-specific option "${name}".`);
-            }
-        }
-    }
-    return webFetch(input, objectInit);
-};
 export const isMainThread = !worker.isWorker;
 // cno does not produce Bun-style `--compile` standalone executables. Keep
 // these feature-detection values truthful and allocation-free in normal runs.
@@ -180,6 +152,7 @@ export {
     deepMatch,
     deflateSync,
     escapeHTML,
+    fetch,
     file,
     fileURLToPath,
     gunzipSync,
@@ -188,7 +161,6 @@ export {
     indexOfLine,
     inflateSync,
     listen,
-    YAML,
     nanoseconds,
     pathToFileURL,
     peek,
@@ -216,6 +188,7 @@ export {
     stripANSI,
     TOML,
     XML,
+    YAML,
     unsafe,
     wrapAnsi,
     which,
@@ -312,7 +285,6 @@ export interface BunApi {
     readonly MD4: typeof MD4;
     readonly SHA224: typeof SHA224;
     readonly SHA256: typeof SHA256;
-    readonly YAML: typeof YAML;
     readonly SHA384: typeof SHA384;
     readonly SHA512: typeof SHA512;
     readonly SHA512_256: typeof SHA512_256;
@@ -340,6 +312,7 @@ export interface BunApi {
     readonly JSONL: typeof JSONL;
     readonly TOML: typeof TOML;
     readonly XML: typeof XML;
+    readonly YAML: typeof YAML;
     readonly color: typeof color;
     readonly stripANSI: typeof stripANSI;
     readonly sliceAnsi: typeof sliceAnsi;
@@ -493,7 +466,6 @@ const Bun: BunApi = {
     MD4,
     SHA224,
     SHA256,
-    YAML,
     SHA384,
     SHA512,
     SHA512_256,
@@ -521,6 +493,7 @@ const Bun: BunApi = {
     JSONL,
     TOML,
     XML,
+    YAML,
     color,
     stripANSI,
     sliceAnsi,
