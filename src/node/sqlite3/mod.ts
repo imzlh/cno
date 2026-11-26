@@ -13,9 +13,10 @@ const engine = import.meta.use('engine');
 
 type Sqlite3Handle = CModuleSQLite3.Sqlite3Handle;
 type Sqlite3Stmt = CModuleSQLite3.Sqlite3Stmt;
-type SqliteRow = Record<string, unknown> | unknown[];
-type BindParams = unknown[] | Record<string, unknown>;
-type Callback = (...args: unknown[]) => void;
+type SqliteRow = CModuleSQLite3.SqliteRow | unknown[];
+type SqliteValue = CModuleSQLite3.SqliteValue;
+type BindParams = CModuleSQLite3.SqliteParams;
+type Callback = (...args: any[]) => void;
 type RowCallback = (err: unknown, row?: SqliteRow) => void;
 type CompleteCallback = (err: unknown, count?: number) => void;
 type QueryMethod = 'run' | 'get' | 'all' | 'each' | 'map';
@@ -63,6 +64,10 @@ function call(callback: Callback | undefined, self: unknown, args: unknown[]): v
     if (callback) defer(() => Reflect.apply(callback, self, args));
 }
 
+function isCallback(value: unknown): value is Callback {
+    return typeof value === 'function';
+}
+
 function emitOrThrow(target: EventEmitter, callback: Callback | undefined, self: unknown, err: unknown): void {
     if (callback) {
         call(callback, self, [err]);
@@ -75,11 +80,43 @@ function isBindObject(value: unknown): value is Record<string, unknown> {
     return value !== null && typeof value === 'object' && !Array.isArray(value) && !(value instanceof Uint8Array);
 }
 
-function splitArgs(args: unknown[]): { params?: BindParams; callback?: Callback } {
+function isSqliteValue(value: unknown): value is SqliteValue {
+    return value === null
+        || typeof value === 'number'
+        || typeof value === 'bigint'
+        || typeof value === 'string'
+        || typeof value === 'boolean'
+        || value instanceof Uint8Array;
+}
+
+function toSqliteParams(value: unknown): BindParams {
+    if (Array.isArray(value)) {
+        const params: SqliteValue[] = [];
+        for (let index = 0; index < value.length; index++) {
+            const item = value[index];
+            if (!isSqliteValue(item)) throw new TypeError(`Invalid bound parameter type at position ${index}`);
+            params.push(item);
+        }
+        return params;
+    }
+    if (isBindObject(value)) {
+        const params: Record<string, SqliteValue> = {};
+        for (const [key, item] of Object.entries(value)) {
+            if (!isSqliteValue(item)) throw new TypeError(`Invalid bound parameter type for key ${key}`);
+            params[key] = item;
+        }
+        return params;
+    }
+    throw new TypeError('Invalid bound parameter type at position 0');
+}
+
+function splitArgs(args: unknown[]): { params?: unknown; callback?: Callback } {
     const values = args.slice();
     let callback: Callback | undefined;
-    if (typeof values[values.length - 1] === 'function') {
-        callback = values.pop();
+    const last = values[values.length - 1];
+    if (isCallback(last)) {
+        callback = last;
+        values.pop();
     }
     if (values.length === 0) return { callback };
     if (values.length === 1) {
@@ -90,22 +127,28 @@ function splitArgs(args: unknown[]): { params?: BindParams; callback?: Callback 
     return { params: values, callback };
 }
 
-function splitEachArgs(args: unknown[]): { params?: BindParams; rowCallback?: RowCallback; completeCallback?: CompleteCallback } {
+function splitEachArgs(args: unknown[]): { params?: unknown; rowCallback?: RowCallback; completeCallback?: CompleteCallback } {
+    if (args.length === 0) return {};
     const values = args.slice();
     let completeCallback: CompleteCallback | undefined;
     let rowCallback: RowCallback | undefined;
-    if (typeof values[values.length - 1] === 'function') {
-        rowCallback = values.pop();
-        if (typeof values[values.length - 1] === 'function') {
-            completeCallback = rowCallback as CompleteCallback;
-            rowCallback = values.pop();
+    const last = values.pop();
+    if (isCallback(last)) {
+        const previous = values[values.length - 1];
+        if (isCallback(previous)) {
+            completeCallback = last;
+            rowCallback = values.pop() as RowCallback;
+        } else {
+            rowCallback = last;
         }
+    } else {
+        values.push(last);
     }
     const { params } = splitArgs(values);
     return { params, rowCallback, completeCallback };
 }
 
-function normalizeBindParams(sql: string, params?: BindParams): BindParams | undefined {
+function normalizeBindParams(sql: string, params?: unknown): unknown | undefined {
     if (params === undefined || !isBindObject(params)) return params;
     const normalized: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(params)) {
@@ -124,29 +167,35 @@ function normalizeBindParams(sql: string, params?: BindParams): BindParams | und
     return normalized;
 }
 
-function bindStmt(stmt: Sqlite3Stmt, params?: BindParams, sql = ''): void {
+function bindStmt(stmt: Sqlite3Stmt, params?: unknown, sql = ''): void {
     params = normalizeBindParams(sql, params);
     if (params === undefined) {
         stmt.bind();
         return;
     }
-    stmt.bind(params);
+    stmt.bind(toSqliteParams(params));
 }
 
-function runStmt(stmt: Sqlite3Stmt, params?: BindParams, sql = ''): void {
+function runStmt(stmt: Sqlite3Stmt, params?: unknown, sql = ''): void {
     params = normalizeBindParams(sql, params);
     if (params === undefined) stmt.run();
-    else stmt.run(params);
+    else stmt.run(toSqliteParams(params));
 }
 
-function allStmt(stmt: Sqlite3Stmt, params?: BindParams, sql = ''): SqliteRow[] {
+function allStmt(stmt: Sqlite3Stmt, params?: unknown, sql = ''): SqliteRow[] {
     params = normalizeBindParams(sql, params);
-    return params === undefined ? stmt.all() : stmt.all(params);
+    return params === undefined ? stmt.all() : stmt.all(toSqliteParams(params));
 }
 
 function mapRows(rows: SqliteRow[]): Record<string, unknown> {
     const result: Record<string, unknown> = {};
     for (const row of rows) {
+        if (Array.isArray(row)) {
+            if (row.length === 0) continue;
+            const key = String(row[0]);
+            result[key] = row.length === 2 ? row[1] : row;
+            continue;
+        }
         const keys = Object.keys(row);
         if (keys.length === 0) continue;
         const key = String(row[keys[0]]);
@@ -327,10 +376,10 @@ export class Database extends EventEmitter {
     configure(option: string, value: unknown): this {
         switch (option) {
             case 'trace':
-                this.traceCallback = typeof value === 'function' ? value : null;
+                this.traceCallback = isCallback(value) ? value : null;
                 return this;
             case 'profile':
-                this.profileCallback = typeof value === 'function' ? value : null;
+                this.profileCallback = isCallback(value) ? value : null;
                 return this;
             case 'busyTimeout':
                 this.getHandle().busyTimeout(Number(value));
@@ -514,7 +563,9 @@ export class Database extends EventEmitter {
     private _query(method: QueryMethod, sql: string, args: unknown[]): this {
         const statement = this.prepare(sql);
         const values = args.slice();
-        const callback = typeof values[values.length - 1] === 'function' ? values.pop() : undefined;
+        const last = values[values.length - 1];
+        const callback = isCallback(last) ? last : undefined;
+        if (callback) values.pop();
         try {
             const query = statement[method] as (...queryArgs: unknown[]) => Statement;
             if (callback) {
@@ -678,7 +729,7 @@ function CachedDatabase(this: unknown, filename: string, mode?: number | Callbac
 }
 
 export const cached = {
-    Database: CachedDatabase as typeof Database,
+    Database: CachedDatabase,
 };
 
 export const sqlite3 = {

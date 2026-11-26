@@ -13,14 +13,15 @@ const engine = import.meta.use('engine');
 type Sqlite3Handle = CModuleSQLite3.Sqlite3Handle;
 type Sqlite3Stmt = CModuleSQLite3.Sqlite3Stmt;
 type SqliteRow = Record<string, unknown> | unknown[];
-type BindParams = unknown[] | Record<string, unknown>;
+type SqliteValue = CModuleSQLite3.SqliteValue;
+type BindParams = CModuleSQLite3.SqliteParams;
 type DatabaseLocation = string | URL | Uint8Array;
 
 const SQLITE_TYPE = Symbol.for('sqlite-type');
 const NAMED_PARAM_PREFIXES = new Set([':', '@', '$']);
 
 export interface RunResult {
-    changes: number;
+    changes: number | bigint;
     lastInsertRowid: number | bigint;
 }
 
@@ -55,10 +56,59 @@ export interface StatementColumnMetadata {
 const DEFAULT_FLAGS = native.O_CREATE | native.O_READWRITE;
 
 function isBindRecord(value: unknown): value is Record<string, unknown> {
-    return value !== null && typeof value === 'object' && !Array.isArray(value) && !(value instanceof Uint8Array);
+    return value !== null
+        && typeof value === 'object'
+        && !Array.isArray(value)
+        && !isBinarySqliteValue(value);
 }
 
-function paramsFrom(args: unknown[]): BindParams | undefined {
+function isBinarySqliteValue(value: unknown): value is ArrayBuffer | ArrayBufferView {
+    return engine.isArrayBuffer(value) || ArrayBuffer.isView(value);
+}
+
+function normalizeSqliteValue(value: unknown): SqliteValue | undefined {
+    if (isBinarySqliteValue(value)) {
+        if (engine.isArrayBuffer(value)) return new Uint8Array(value as ArrayBuffer);
+        const view = value as ArrayBufferView;
+        return new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+    }
+    if (value === null
+        || typeof value === 'number'
+        || typeof value === 'bigint'
+        || typeof value === 'string'
+        || typeof value === 'boolean'
+    ) return value;
+    return undefined;
+}
+
+function toSqliteParams(value: unknown): BindParams {
+    if (Array.isArray(value)) {
+        const params: SqliteValue[] = [];
+        for (let index = 0; index < value.length; index++) {
+            const item = value[index];
+            const normalized = normalizeSqliteValue(item);
+            if (normalized === undefined) throw new TypeError(`Invalid bound parameter type at position ${index}`);
+            params.push(normalized);
+        }
+        return params;
+    }
+    if (isBindRecord(value)) {
+        const params: Record<string, SqliteValue> = {};
+        for (const [key, item] of Object.entries(value)) {
+            const normalized = normalizeSqliteValue(item);
+            if (normalized === undefined) throw new TypeError(`Invalid bound parameter type for key ${key}`);
+            params[key] = normalized;
+        }
+        return params;
+    }
+    throw new TypeError('Invalid bound parameter type at position 0');
+}
+
+function isCallable(value: unknown): value is (...args: unknown[]) => unknown {
+    return typeof value === 'function';
+}
+
+function paramsFrom(args: unknown[]): unknown | undefined {
     if (args.length === 0) return undefined;
     if (args.length === 1) {
         const value = args[0];
@@ -83,14 +133,17 @@ function nativeCall<T>(fn: () => T): T {
     }
 }
 
-function allRows(stmt: Sqlite3Stmt, params?: BindParams): SqliteRow[] {
-    return nativeCall(() => (params === undefined ? stmt.all() : stmt.all(params)));
+function allRows(stmt: Sqlite3Stmt, params?: unknown): SqliteRow[] {
+    return nativeCall(() => {
+        if (params === undefined) return stmt.all();
+        return stmt.all(toSqliteParams(params));
+    });
 }
 
-function runStmt(stmt: Sqlite3Stmt, params?: BindParams): void {
+function runStmt(stmt: Sqlite3Stmt, params?: unknown): void {
     nativeCall(() => {
         if (params === undefined) stmt.run();
-        else stmt.run(params);
+        else stmt.run(toSqliteParams(params));
     });
 }
 
@@ -297,11 +350,7 @@ export class StatementSync {
         const rowid = nativeCall(() => this.db.raw().lastInsertRowid(this.readBigInts));
         const changes = nativeCall(() => this.db.raw().changes());
         return {
-            changes: this.readBigInts
-                ? (typeof changes === 'bigint'
-                    ? changes
-                    : Number.isSafeInteger(changes) ? BigInt(changes) : throwOutOfRange(changes))
-                : changes,
+            changes: this.readBigInts ? BigInt(changes) : changes,
             // Same narrowing as convertCell: only an exact integer may be widened.
             lastInsertRowid: this.readBigInts
                 ? (typeof rowid === 'bigint'
@@ -446,7 +495,7 @@ export class StatementSync {
         return this.namedParameters;
     }
 
-    private normalizeParams(params: BindParams | undefined): BindParams | undefined {
+    private normalizeParams(params: unknown | undefined): unknown | undefined {
         if (!isBindRecord(params)) return params;
 
         const known = this.getNamedParameters();
@@ -644,30 +693,31 @@ export class DatabaseSync {
         if (options.start === undefined) {
             throw new TypeError('The "options.start" argument must be a function or a primitive value');
         }
-        if (typeof options.step !== 'function') {
+        if (!isCallable(options.step)) {
             throw new TypeError('The "options.step" argument must be a function');
         }
-        if (options.inverse !== undefined && typeof options.inverse !== 'function') {
+        if (options.inverse !== undefined && !isCallable(options.inverse)) {
             throw new TypeError('The "options.inverse" argument must be a function');
         }
 
         const directOnly = optionalBoolean(options, 'directOnly');
         const varargs = optionalBoolean(options, 'varargs');
         const useBigIntArguments = optionalBoolean(options, 'useBigIntArguments');
+        const step = options.step;
         let nArg = -1;
         if (!varargs) {
             // Node infers arity from step.length minus the accumulator argument.
-            const stepLen = typeof (options.step as Function).length === 'number'
-                ? (options.step as Function).length
-                : 1;
+            const stepLen = step.length;
             nArg = Math.max(0, stepLen - 1);
         }
 
+        const result = options.result;
+        const inverse = options.inverse;
         nativeCall(() => this.raw().createAggregate(name, nArg, {
             start: options.start,
-            step: options.step as (...args: unknown[]) => unknown,
-            result: typeof options.result === 'function' ? options.result : undefined,
-            inverse: options.inverse as ((...args: unknown[]) => unknown) | undefined,
+            step,
+            result: isCallable(result) ? (acc: unknown) => result(acc) : undefined,
+            inverse: isCallable(inverse) ? inverse : undefined,
             deterministic: !!options.deterministic,
             directOnly,
             useBigIntArguments,
