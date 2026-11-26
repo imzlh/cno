@@ -3,7 +3,7 @@
  */
 
 
-import { matchesErrnoCode } from '../_internal/errno';
+import { matchesErrnoCode } from '../../utils/errno';
 import { wrapFsPromise as w, normalizeFsErrnoError as normalizeErrnoError } from './errno-fix';
 import { concatChunks } from '../_internal/buffer';
 import { withCode } from '../_internal/errors';
@@ -11,10 +11,18 @@ import { getTierLimits } from '../_internal/memory';
 import { resolve } from '../path';
 import { copyPath, validateCopyOptions, type CopyOptions } from './copy';
 import { globPaths, type GlobOptions, type GlobResult } from './glob';
-import { ReadStream, WriteStream } from './streams';
-import { createAsyncDir, createEagerAsyncDir, createFileHandle, decodeBuffer, encodePathResult, mkdirRecursive, modeToNumber, parseFlags, pathToString, randomHex, readDirEntries, readFileFromFdSync, readFileFromHandle, removeRecursive, retryOnBusy, splitPathOrFd, timeToUnixMs, toNodeDirentAsync, toNodeStat, toNodeStatFs, toUint8Array, validateOpendirOptions, validateReaddirOptions, assertCopyFileMode, makeAbortError, rmIsDirectoryError, lchmodEnosysError, writeAllHandle, writeAllSync, type Mode, type PathLike, type TimeLike } from './utils';
+import {
+    createReadStreamFromHandle,
+    createWriteStreamFromHandle,
+    type ReadStream,
+    type ReadStreamOptions,
+    type WriteStream,
+    type WriteStreamOptions,
+} from './streams';
+import { createAsyncDir, createEagerAsyncDir, createFileHandle, decodeBuffer, encodePathResult, mkdirRecursive, modeToNumber, parseFlags, pathToString, randomHex, readDirEntries, readFileFromFdSync, readFileFromHandle, removeRecursive, retryOnBusy, splitPathOrFd, timeToUnixMs, toNodeDirentAsync, toNodeStat, toNodeStatFs, toUint8Array, validateOpendirOptions, validateReaddirOptions, validateCopyFileMode, makeAbortError, rmIsDirectoryError, lchmodEnosysError, writeAllHandle, writeAllSync, type Mode, type PathLike, type TimeLike } from './utils';
 
-import type { Stats, Dirent, Dir, StatsFs } from 'node:fs';
+import type { Buffer as CnoBuffer } from '../buffer';
+import type { Stats, BigIntStats, Dirent, Directory, StatsFs } from './utils';
  
 const { readBufSize: READ_BUF_SIZE } = getTierLimits();
 
@@ -156,13 +164,13 @@ export async function access(path: PathLike, mode?: number): Promise<void> {
     }
 }
 
-export async function stat(path: PathLike, options?: { bigint?: boolean }): Promise<Stats> {
+export async function stat(path: PathLike, options?: { bigint?: boolean }): Promise<Stats | BigIntStats> {
     const pathStr = pathToString(path);
     const st = await w(asfs.stat(pathStr), 'stat', pathStr);
     return toNodeStat(st, options);
 }
 
-export async function lstat(path: PathLike, options?: { bigint?: boolean }): Promise<Stats> {
+export async function lstat(path: PathLike, options?: { bigint?: boolean }): Promise<Stats | BigIntStats> {
     const pathStr = pathToString(path);
     const st = await w(asfs.lstat(pathStr), 'lstat', pathStr);
     return toNodeStat(st, options);
@@ -205,7 +213,7 @@ export async function rm(path: PathLike, options?: { force?: boolean; recursive?
     try {
         stats = await w(asfs.lstat(pathStr), 'lstat', pathStr);
     } catch (err) {
-        if (options?.force && Reflect.get(err as object, 'code') === 'ENOENT') return;
+        if (options?.force && matchesErrnoCode(err, 'ENOENT')) return;
         throw err;
     }
 
@@ -222,7 +230,7 @@ export async function rm(path: PathLike, options?: { force?: boolean; recursive?
     }
 }
 
-export async function readdir(path: PathLike, options?: { encoding?: BufferEncoding | 'buffer'; withFileTypes?: boolean; recursive?: boolean } | BufferEncoding): Promise<Array<string | Buffer> | Dirent<string | Buffer>[]> {
+export async function readdir(path: PathLike, options?: { encoding?: BufferEncoding | 'buffer'; withFileTypes?: boolean; recursive?: boolean } | BufferEncoding): Promise<Array<string | CnoBuffer> | Dirent<string | CnoBuffer>[]> {
     validateReaddirOptions(options);
     const pathStr = pathToString(path);
     const withFileTypes = typeof options === 'object' ? options?.withFileTypes : false;
@@ -249,7 +257,7 @@ export async function readdir(path: PathLike, options?: { encoding?: BufferEncod
     }
 }
 
-export async function opendir(path: PathLike, options?: { encoding?: BufferEncoding; bufferSize?: number; recursive?: boolean }): Promise<Dir> {
+export async function opendir(path: PathLike, options?: { encoding?: BufferEncoding; bufferSize?: number; recursive?: boolean }): Promise<Directory> {
     validateOpendirOptions(options);
     const pathStr = pathToString(path);
     // opendir does not type-check `recursive`.
@@ -278,8 +286,8 @@ export async function rename(oldPath: PathLike, newPath: PathLike): Promise<void
 export async function copyFile(src: PathLike, dest: PathLike, mode?: number): Promise<void> {
     const srcStr = pathToString(src);
     const destStr = pathToString(dest);
-    assertCopyFileMode(srcStr, destStr, mode);
-    await w(asfs.copyFile(srcStr, destStr), 'copyFile', srcStr, destStr);
+    const flags = validateCopyFileMode(mode);
+    await w(asfs.copyFile(srcStr, destStr, flags), 'copyFile', srcStr, destStr);
 }
 
 export async function truncate(path: PathLike, len?: number): Promise<void> {
@@ -310,13 +318,13 @@ export async function symlink(target: PathLike, path: PathLike, type?: 'file' | 
     await w(asfs.symlink(pathToString(target), pathStr, symlinkType), 'symlink', pathStr);
 }
 
-export async function readlink(path: PathLike, options?: { encoding?: BufferEncoding | 'buffer' } | BufferEncoding): Promise<string | Buffer> {
+export async function readlink(path: PathLike, options?: { encoding?: BufferEncoding | 'buffer' } | BufferEncoding): Promise<string | CnoBuffer> {
     const pathStr = pathToString(path);
     const result = await w(asfs.readLink(pathStr), 'readlink', pathStr);
     return encodePathResult(result, options);
 }
 
-export async function realpath(pathLike: PathLike, options?: { encoding?: BufferEncoding | 'buffer' } | BufferEncoding): Promise<string | Buffer> {
+export async function realpath(pathLike: PathLike, options?: { encoding?: BufferEncoding | 'buffer' } | BufferEncoding): Promise<string | CnoBuffer> {
     const pathStr = pathToString(pathLike);
     const resolved = await w(asfs.realPath(pathStr), 'realpathNative', pathStr);
     return encodePathResult(resolved, options);
@@ -372,22 +380,24 @@ export async function statfs(path: PathLike, options?: { bigint?: boolean }): Pr
  * import cycle). A handle stream owns the handle and closes it on 'close';
  * `readableWebStream` leaves it open and refuses a second call.
  */
-function attachHandleStreams(handle: ReturnType<typeof createFileHandle>) {
+type ReadLinesResult = AsyncIterableIterator<string> & { close(): void };
+interface FileHandleStreams {
+    createReadStream(options?: ReadStreamOptions): ReadStream;
+    createWriteStream(options?: WriteStreamOptions): WriteStream;
+    readableWebStream(): ReadableStream<Uint8Array>;
+    readLines(options?: Record<string, unknown>): ReadLinesResult;
+}
+
+type OpenFileHandle = ReturnType<typeof createFileHandle> & FileHandleStreams;
+
+function attachHandleStreams(handle: ReturnType<typeof createFileHandle>): OpenFileHandle {
     let webStreamTaken = false;
     const h = Object.assign(handle, {
-        createReadStream(options?: Record<string, unknown>) {
-            // Passing the handle makes stream teardown close its owner too.
-            return new ReadStream(null as unknown as PathLike, {
-                highWaterMark: 64 * 1024,
-                ...options,
-                fd: handle,
-            });
+        createReadStream(options?: ReadStreamOptions) {
+            return createReadStreamFromHandle(handle, { highWaterMark: 64 * 1024, ...options });
         },
-        createWriteStream(options?: Record<string, unknown>) {
-            return new WriteStream(null as unknown as PathLike, {
-                ...options,
-                fd: handle,
-            });
+        createWriteStream(options?: WriteStreamOptions) {
+            return createWriteStreamFromHandle(handle, options);
         },
         readableWebStream(): ReadableStream<Uint8Array> {
             if (webStreamTaken) {
@@ -437,7 +447,7 @@ function attachHandleStreams(handle: ReturnType<typeof createFileHandle>) {
     });
 }
 
-export async function open(path: PathLike, flags?: string | number, mode?: Mode) {
+export async function open(path: PathLike, flags?: string | number, mode?: Mode): Promise<OpenFileHandle> {
     const flag = parseFlags(flags);
     const modeNum = modeToNumber(mode);
     const pathStr = pathToString(path);
@@ -457,7 +467,7 @@ export async function lchmod(path: PathLike, mode: Mode): Promise<void> {
     await chmod(path, mode);
 }
 
-export async function mkdtemp(prefix: string, options?: { encoding?: BufferEncoding | 'buffer' | null } | BufferEncoding): Promise<string | Buffer> {
+export async function mkdtemp(prefix: string, options?: { encoding?: BufferEncoding | 'buffer' | null } | BufferEncoding): Promise<string | CnoBuffer> {
     const dirPath = prefix + randomHex();
     const result = encodePathResult(dirPath, options);
     await w(asfs.mkdir(dirPath), 'mkdtemp', dirPath);
@@ -465,7 +475,7 @@ export async function mkdtemp(prefix: string, options?: { encoding?: BufferEncod
 }
 
 export async function mkdtempDisposable(prefix: string, options?: { encoding?: BufferEncoding | 'buffer' | null } | BufferEncoding): Promise<{
-    path: string | Buffer;
+    path: string | CnoBuffer;
     remove: () => Promise<void>;
     [Symbol.asyncDispose]: () => Promise<void>;
 }> {

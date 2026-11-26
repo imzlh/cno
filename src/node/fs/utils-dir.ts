@@ -41,8 +41,11 @@ import { Buffer } from '../buffer';
 import path from '../path';
 import { arrayBufferBackedBytes, concatChunks } from '../_internal/buffer';
 import { toErrnoException } from '../_internal/errno';
+import { errorCode, matchesErrnoCode } from '../../utils/errno';
 import { wrapSync } from './errno-fix';
 import { sysPath } from './syspath';
+
+const timers = import.meta.use('timers');
 
 const { join } = path;
 
@@ -112,7 +115,20 @@ export async function readDirEntries(
     return out;
 }
 
-export class Dir {
+export interface Directory {
+    path: string;
+    read(callback: (err: NodeJS.ErrnoException | null, dirent: Dirent | null) => void): void;
+    read(): Promise<Dirent | null>;
+    readSync(): Dirent | null;
+    close(callback: (err: NodeJS.ErrnoException | null) => void): void;
+    close(): Promise<void>;
+    closeSync(): void;
+    [Symbol.asyncDispose](): Promise<void>;
+    [Symbol.dispose](): void;
+    [Symbol.asyncIterator](): AsyncIterableIterator<Dirent>;
+}
+
+export class Dir implements Directory {
     path: string;
     private entries: DirEntryWithParent[];
     private index = 0;
@@ -164,10 +180,11 @@ export class Dir {
             queueMicrotask(() => {
                 try {
                     this.closeSync();
-                    callback(null);
                 } catch (err) {
                     callback(errorFromUnknown(err));
+                    return;
                 }
+                callback(null);
             });
             return;
         }
@@ -183,9 +200,17 @@ export class Dir {
     [Symbol.asyncIterator](): AsyncIterableIterator<Dirent> {
         return directoryIterator(this);
     }
+
+    [Symbol.asyncDispose](): Promise<void> {
+        return this.close();
+    }
+
+    [Symbol.dispose](): void {
+        this.closeSync();
+    }
 }
 
-function directoryIterator(dir: Pick<Dir, 'read' | 'close'>): AsyncIterableIterator<Dirent> {
+function directoryIterator(dir: Pick<Directory, 'read' | 'close'>): AsyncIterableIterator<Dirent> {
     return {
         async next() {
             const entry = await dir.read();
@@ -261,10 +286,6 @@ export function splitPathOrFd(path: PathLike | number): { fd: number } | { path:
     return { path: pathToString(path) };
 }
 
-export function describeFd(fd: number): string {
-    return `fd:${fd}`;
-}
-
 // Recursive deletion — use lstat so symlink-to-dir unlinks the link only.
 
 /**
@@ -320,12 +341,12 @@ export async function retryOnBusy(
             await fn();
             return;
         } catch (e) {
-            const code = Reflect.get(e as object, 'code');
+            const code = errorCode(e);
             if (attempt >= limit || typeof code !== 'string' || !RETRY_ERROR_CODES.has(code)) throw e;
             // Node: retries++ happens before the multiply, so the first wait is
             // 1*retryDelay, not 0.
             const delay = (attempt + 1) * delayUnit;
-            if (delay > 0) await new Promise<void>(res => { setTimeout(res, delay); });
+            if (delay > 0) await new Promise<void>(res => { timers.setTimeout(res, delay); });
         }
     }
 }
@@ -453,7 +474,7 @@ export async function mkdirRecursive(pathStr: string, mode?: number): Promise<st
             if (!stat.isDirectory) throw enotdirError(current);
             continue;
         } catch (e) {
-            if (e instanceof Error && Reflect.get(e, 'code') === 'ENOTDIR') throw e;
+            if (matchesErrnoCode(e, 'ENOTDIR')) throw e;
         }
         try {
             await asfs.mkdir(current, mode);
@@ -649,43 +670,64 @@ export function randomHex(): string {
 export function createAsyncDir(
     pathStr: string,
     dirHandle: CModuleAsyncFS.DirHandle,
-): Dir {
+): Directory {
     let closed = false;
     let exhausted = false;
 
-    const dir: Dir = {
+    async function readNext(): Promise<Dirent | null> {
+        if (closed) throw dirClosedError();
+        // Sticky: a second post-exhaustion native `next()` yields undefined, not null.
+        if (exhausted) return null;
+        const result = await dirHandle.next();
+        if (result === undefined || result.done) {
+            exhausted = true;
+            return null;
+        }
+        return toNodeDirentAsync(result.value, pathStr);
+    }
+    function read(): Promise<Dirent | null>;
+    function read(callback: (err: NodeJS.ErrnoException | null, dirent: Dirent | null) => void): void;
+    function read(callback?: (err: NodeJS.ErrnoException | null, dirent: Dirent | null) => void): Promise<Dirent | null> | void {
+        if (!callback) return readNext();
+        readNext().then(
+            value => callback(null, value),
+            error => callback(errorFromUnknown(error), null),
+        );
+    }
+    async function closeHandle(): Promise<void> {
+        if (closed) throw dirClosedError();
+        closed = true;
+        await dirHandle.close();
+    }
+    function close(): Promise<void>;
+    function close(callback: (err: NodeJS.ErrnoException | null) => void): void;
+    function close(callback?: (err: NodeJS.ErrnoException | null) => void): Promise<void> | void {
+        if (!callback) return closeHandle();
+        closeHandle().then(
+            () => callback(null),
+            error => callback(errorFromUnknown(error)),
+        );
+    }
+    const dir: Directory = {
         path: pathStr,
-
-        async read(): Promise<Dirent | null> {
-            if (closed) throw dirClosedError();
-            // Sticky: a second post-exhaustion native `next()` yields undefined, not null.
-            if (exhausted) return null;
-            const result = await dirHandle.next();
-            if (result === undefined || result.done) {
-                exhausted = true;
-                return null;
-            }
-            return toNodeDirentAsync(result.value, pathStr);
-        },
-
+        read,
         readSync(): Dirent | null {
             throw new Error('readSync is not supported in async opendir');
         },
-
-        async close(): Promise<void> {
-            if (closed) throw dirClosedError();
-            closed = true;
-            await dirHandle.close();
-        },
-
+        close,
         closeSync(): void {
             throw new Error('closeSync is not supported in async opendir');
         },
-
+        [Symbol.asyncDispose](): Promise<void> {
+            return closeHandle();
+        },
+        [Symbol.dispose](): void {
+            this.closeSync();
+        },
         [Symbol.asyncIterator](): AsyncIterableIterator<Dirent> {
             return directoryIterator(dir);
         },
-    } as Dir;
+    };
 
     return dir;
 }
@@ -694,38 +736,59 @@ export function createAsyncDir(
 export function createEagerAsyncDir(
     pathStr: string,
     entries: DirEntryWithParent[],
-): Dir {
+): Directory {
     let closed = false;
     let index = 0;
 
-    const dir: Dir = {
+    async function readNext(): Promise<Dirent | null> {
+        if (closed) throw dirClosedError();
+        if (index >= entries.length) return null;
+        const entry = entries[index++];
+        return toNodeDirentAsync(entry, entry.parentPath);
+    }
+    function read(): Promise<Dirent | null>;
+    function read(callback: (err: NodeJS.ErrnoException | null, dirent: Dirent | null) => void): void;
+    function read(callback?: (err: NodeJS.ErrnoException | null, dirent: Dirent | null) => void): Promise<Dirent | null> | void {
+        if (!callback) return readNext();
+        readNext().then(
+            value => callback(null, value),
+            error => callback(errorFromUnknown(error), null),
+        );
+    }
+    async function closeHandle(): Promise<void> {
+        if (closed) throw dirClosedError();
+        closed = true;
+        entries = [];
+    }
+    function close(): Promise<void>;
+    function close(callback: (err: NodeJS.ErrnoException | null) => void): void;
+    function close(callback?: (err: NodeJS.ErrnoException | null) => void): Promise<void> | void {
+        if (!callback) return closeHandle();
+        closeHandle().then(
+            () => callback(null),
+            error => callback(errorFromUnknown(error)),
+        );
+    }
+    const dir: Directory = {
         path: pathStr,
-
-        async read(): Promise<Dirent | null> {
-            if (closed) throw dirClosedError();
-            if (index >= entries.length) return null;
-            const entry = entries[index++];
-            return toNodeDirentAsync(entry, entry.parentPath);
-        },
-
+        read,
         readSync(): Dirent | null {
             throw new Error('readSync is not supported in async opendir');
         },
-
-        async close(): Promise<void> {
-            if (closed) throw dirClosedError();
-            closed = true;
-            entries = [];
-        },
-
+        close,
         closeSync(): void {
             throw new Error('closeSync is not supported in async opendir');
         },
-
+        [Symbol.asyncDispose](): Promise<void> {
+            return closeHandle();
+        },
+        [Symbol.dispose](): void {
+            this.closeSync();
+        },
         [Symbol.asyncIterator](): AsyncIterableIterator<Dirent> {
             return directoryIterator(dir);
         },
-    } as Dir;
+    };
 
     return dir;
 }

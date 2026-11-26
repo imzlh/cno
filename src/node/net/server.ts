@@ -7,7 +7,8 @@ const streams = import.meta.use('streams');
 const os = import.meta.use('os');
 
 import { EventEmitter } from '../events';
-import { matchesErrnoCode, normalizeErrnoError } from '../_internal/errno';
+import { normalizeErrnoError } from '../_internal/errno';
+import { matchesErrnoCode } from '../../utils/errno';
 import { onNetServerSocket } from '../diagnostics_channel/builtins';
 import {
     closeCounting,

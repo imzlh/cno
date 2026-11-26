@@ -2,7 +2,7 @@
  * Node.js fs module - callback-style API
  * All async operations support callback functions
  */
-import { toUint8Array, normalizeRwArgs, decodeBuffer, encodePathResult, toNodeStat, toNodeStatFs, toNodeDirentAsync, parseFlags, pathToString, splitPathOrFd, describeFd, removeRecursive, retryOnBusy, mkdirRecursive, modeToNumber, timeToUnixSeconds, timeToUnixMs, readFileFromFdSync, readFileFromHandle, randomHex, createAsyncDir, createEagerAsyncDir, readDirEntries, validateOpendirOptions, validateReaddirOptions, validateFd, errorFromUnknown, assertCopyFileMode, makeAbortError, rmIsDirectoryError, lchmodEnosysError, writeAllHandle, writeAllSync, type PathLike, type TimeLike, type Mode, type Stats, type StatsFs, type Dir } from './utils';
+import { toUint8Array, normalizeRwArgs, decodeBuffer, encodePathResult, toNodeStat, toNodeStatFs, toNodeDirentAsync, parseFlags, pathToString, splitPathOrFd, removeRecursive, retryOnBusy, mkdirRecursive, modeToNumber, timeToUnixSeconds, timeToUnixMs, readFileFromFdSync, readFileFromHandle, randomHex, createAsyncDir, createEagerAsyncDir, readDirEntries, validateOpendirOptions, validateReaddirOptions, validateFd, errorFromUnknown, validateCopyFileMode, makeAbortError, rmIsDirectoryError, lchmodEnosysError, writeAllHandle, writeAllSync, type PathLike, type TimeLike, type Mode, type Stats, type BigIntStats, type StatsFs, type Directory, type Dirent } from './utils';
 // `toAsyncFsErrnoException` is `toErrnoException` plus the JS-name -> libuv-name
 // correction for `err.syscall` (readdir -> scandir, utimes -> utime). Aliased so
 // every existing call site gets it; see fs/syscall-names.ts for why it is needed.
@@ -16,12 +16,9 @@ import { Buffer } from '../buffer';
 import { nsfs, nsasfs } from './syspath';
 const fs = nsfs;
 const asfs = nsasfs;
-const os = import.meta.use('os');
-/** Matches fs/constants.ts; see fchown for why this file needs it. */
-const isWindows = os.platform === 'windows' || os.platform === 'win32';
 
 type NoParamCallback = (err: NodeJS.ErrnoException | null) => void;
-type OpendirCallback = (err: NodeJS.ErrnoException | null, dir?: Dir) => void;
+type OpendirCallback = (err: NodeJS.ErrnoException | null, dir?: Directory) => void;
 type FsOptionBag = {
     encoding?: BufferEncoding | 'buffer' | null;
     flag?: string | number;
@@ -70,7 +67,9 @@ export function readFile(path: PathLike | number, options?: unknown, callback?: 
 
     const target = splitPathOrFd(path);
     const option = optionBag(options);
-    const encoding = typeof options === 'string' ? options as BufferEncoding : option.encoding;
+    const encoding = typeof options === 'string'
+        ? options as BufferEncoding
+        : option.encoding === 'buffer' ? undefined : option.encoding;
     const flag = option.flag;
     const signal = option.signal;
     assertCallback(callback);
@@ -89,7 +88,7 @@ export function readFile(path: PathLike | number, options?: unknown, callback?: 
                 const out = readFileFromFdSync(fs.read, target.fd, getTierLimits().readBufSize);
                 result = decodeBuffer(out, encoding);
             } catch (err) {
-                callback(toSyncErrnoException(err, 'readFile', describeFd(target.fd)));
+                callback(toSyncErrnoException(err, 'readFile'));
                 return;
             }
             callback(null, result);
@@ -181,7 +180,9 @@ function writeFileCallback(
     const option = optionBag(options);
     const mode = modeToNumber(option.mode);
     const flag = option.flag !== undefined ? parseFlags(option.flag) : syscall === 'appendFile' ? 'a' : 'w';
-    const encoding = typeof options === 'string' ? options as BufferEncoding : option.encoding;
+    const encoding = typeof options === 'string'
+        ? options as BufferEncoding
+        : option.encoding === 'buffer' ? undefined : option.encoding;
     const buffer = toUint8Array(data, encoding);
     assertCallback(callback);
     if ('fd' in target) {
@@ -190,7 +191,7 @@ function writeFileCallback(
             try {
                 writeAllSync(target.fd, buffer);
             } catch (err) {
-                callback(toSyncErrnoException(err, syscall, describeFd(target.fd)));
+                callback(toSyncErrnoException(err, syscall));
                 return;
             }
             callback(null);
@@ -198,14 +199,35 @@ function writeFileCallback(
         return;
     }
 
-    asfs.open(target.path, flag, mode).then(
-        handle =>
-            writeAllHandle(handle, buffer).then(
-                () => callback(null),
-                err => callback(toErrnoException(err, syscall, target.path))
-            ).finally(() => handle.close()),
-        err => callback(toErrnoException(err, syscall, target.path))
+    withFileHandle(target.path, flag, mode, syscall, handle => writeAllHandle(handle, buffer)).then(
+        () => callback(null),
+        err => callback(toErrnoException(err, syscall, target.path)),
     );
+}
+
+async function withFileHandle(
+    path: string,
+    flag: string | number,
+    mode: number | undefined,
+    syscall: string,
+    operation: (handle: CModuleAsyncFS.FileHandle) => Promise<void>,
+): Promise<void> {
+    const handle = await asfs.open(path, flag, mode);
+    let failure: NodeJS.ErrnoException | undefined;
+    try {
+        await operation(handle);
+    } catch (error) {
+        failure = toErrnoException(error, syscall, path);
+    }
+    try {
+        await handle.close();
+    } catch (error) {
+        const closeError = toErrnoException(error, 'close');
+        if (!failure) throw closeError;
+        if (failure === closeError) throw failure;
+        throw Object.assign(new AggregateError([failure, closeError], failure.message), { code: failure.code });
+    }
+    if (failure) throw failure;
 }
 
 // File status - callback style
@@ -230,11 +252,11 @@ Object.defineProperty(exists, Symbol.for('nodejs.util.promisify.custom'), {
     configurable: true,
 });
 
-export function stat(path: PathLike, callback: (err: NodeJS.ErrnoException | null, stats: Stats) => void): void;
+export function stat(path: PathLike, callback: (err: NodeJS.ErrnoException | null, stats: Stats | BigIntStats) => void): void;
 export function stat(
     path: PathLike,
     options: { bigint?: boolean; throwIfNoEntry?: boolean },
-    callback: (err: NodeJS.ErrnoException | null, stats: Stats) => void
+    callback: (err: NodeJS.ErrnoException | null, stats: Stats | BigIntStats) => void
 ): void;
 export function stat(path: PathLike, options?: unknown, callback?: unknown): void {
     if (typeof options === 'function') {
@@ -251,11 +273,11 @@ export function stat(path: PathLike, options?: unknown, callback?: unknown): voi
     );
 }
 
-export function lstat(path: PathLike, callback: (err: NodeJS.ErrnoException | null, stats: Stats) => void): void;
+export function lstat(path: PathLike, callback: (err: NodeJS.ErrnoException | null, stats: Stats | BigIntStats) => void): void;
 export function lstat(
     path: PathLike,
     options: { bigint?: boolean; throwIfNoEntry?: boolean },
-    callback: (err: NodeJS.ErrnoException | null, stats: Stats) => void
+    callback: (err: NodeJS.ErrnoException | null, stats: Stats | BigIntStats) => void
 ): void;
 export function lstat(path: PathLike, options?: unknown, callback?: unknown): void {
     if (typeof options === 'function') {
@@ -272,11 +294,11 @@ export function lstat(path: PathLike, options?: unknown, callback?: unknown): vo
     );
 }
 
-export function fstat(fd: number, callback: (err: NodeJS.ErrnoException | null, stats: Stats) => void): void;
+export function fstat(fd: number, callback: (err: NodeJS.ErrnoException | null, stats: Stats | BigIntStats) => void): void;
 export function fstat(
     fd: number,
     options: { bigint?: boolean },
-    callback: (err: NodeJS.ErrnoException | null, stats: Stats) => void
+    callback: (err: NodeJS.ErrnoException | null, stats: Stats | BigIntStats) => void
 ): void;
 export function fstat(fd: number, options?: unknown, callback?: unknown): void {
     if (typeof options === 'function') {
@@ -290,7 +312,7 @@ export function fstat(fd: number, options?: unknown, callback?: unknown): void {
         try {
             st = fs.fstat(fd);
         } catch (err) {
-            callback(toSyncErrnoException(err, 'fstat', describeFd(fd)));
+            callback(toSyncErrnoException(err, 'fstat'));
             return;
         }
         callback(null, toNodeStat(st, option));
@@ -414,7 +436,7 @@ export function readdir(
 export function readdir(
     path: PathLike,
     options: { encoding?: BufferEncoding | 'buffer'; withFileTypes?: boolean; recursive?: boolean } | BufferEncoding,
-    callback: (err: NodeJS.ErrnoException | null, files: Array<string | Buffer> | import('fs').Dirent<string | Buffer>[]) => void
+    callback: (err: NodeJS.ErrnoException | null, files: Array<string | Buffer> | Dirent<string | Buffer>[]) => void
 ): void;
 export function readdir(path: PathLike, options?: unknown, callback?: unknown): void {
     if (typeof options === 'function') {
@@ -440,14 +462,14 @@ export function readdir(path: PathLike, options?: unknown, callback?: unknown): 
                     const dirent = toNodeDirentAsync(
                         entry,
                         entry.parentPath,
-                        encodePathResult(entry.name, typeof options === 'string' ? options : option),
+                        encodePathResult(entry.name, typeof options === 'string' ? options as BufferEncoding : option.encoding),
                     );
                     if (path instanceof Uint8Array) {
                         Reflect.set(dirent, 'parentPath', encodePathResult(entry.parentPath, 'buffer'));
                     }
                     return dirent;
                 })
-                : entries.map(entry => encodePathResult(entry.relativePath, typeof options === 'string' ? options : option))
+                : entries.map(entry => encodePathResult(entry.relativePath, typeof options === 'string' ? options as BufferEncoding : option.encoding))
             );
         },
         err => callback(toErrnoException(err, 'readdir', pathStr))
@@ -483,13 +505,15 @@ export function copyFile(src: PathLike, dest: PathLike, mode?: unknown, callback
     assertCallback(callback);
     const srcStr = pathToString(src);
     const destStr = pathToString(dest);
+    const flags = validateCopyFileMode(mode);
+    let promise: Promise<void>;
     try {
-        assertCopyFileMode(srcStr, destStr, mode);
+        promise = asfs.copyFile(srcStr, destStr, flags);
     } catch (err) {
         queueMicrotask(() => callback(toErrnoException(err, 'copyFile', srcStr, destStr)));
         return;
     }
-    asfs.copyFile(srcStr, destStr).then(
+    promise.then(
         () => callback(null),
         err => callback(toErrnoException(err, 'copyFile', srcStr, destStr))
     );
@@ -514,7 +538,7 @@ export function cp(source: PathLike, destination: PathLike, options?: CopyOption
 
 export function glob(
     pattern: string | readonly string[],
-    callback: (error: NodeJS.ErrnoException | null, matches: string[]) => void,
+    callback: (error: NodeJS.ErrnoException | null, matches: string[] | GlobResult[]) => void,
 ): void;
 export function glob(
     pattern: string | readonly string[],
@@ -523,19 +547,21 @@ export function glob(
 ): void;
 export function glob(
     pattern: string | readonly string[],
-    options?: GlobOptions | ((error: NodeJS.ErrnoException | null, matches: string[]) => void),
-    callback?: (error: NodeJS.ErrnoException | null, matches: GlobResult[]) => void,
+    options?: unknown,
+    callback?: unknown,
 ): void {
     if (typeof options === 'function') {
         callback = options;
         options = undefined;
     }
     assertCallback(callback);
-    validateGlobOptions(options);
+    const callbackFn = callback as (error: NodeJS.ErrnoException | null, matches: string[] | GlobResult[]) => void;
+    const globOptions = options as GlobOptions | undefined;
+    validateGlobOptions(globOptions);
     validateGlobPatterns(pattern);
-    globPaths(pattern, options).then(
-        matches => callback(null, matches),
-        error => callback(toErrnoException(error, 'glob')),
+    globPaths(pattern, globOptions).then(
+        matches => callbackFn(null, matches),
+        error => callbackFn(toErrnoException(error, 'glob'), []),
     );
 }
 
@@ -550,13 +576,9 @@ export function truncate(path: PathLike, len?: unknown, callback?: unknown): voi
     assertCallback(callback);
     const pathStr = pathToString(path);
     const size = numberOr(len, 0);
-    asfs.open(pathStr, 'r+').then(
-        handle => 
-            handle.truncate(size).then(
-                () => callback(null),
-                err => callback(toErrnoException(err, 'truncate', pathStr))
-            ).finally(() => handle.close()),
-        err => callback(toErrnoException(err, 'truncate', pathStr))
+    withFileHandle(pathStr, 'r+', undefined, 'truncate', handle => handle.truncate(size)).then(
+        () => callback(null),
+        err => callback(toErrnoException(err, 'truncate', pathStr)),
     );
 }
 
@@ -574,7 +596,7 @@ export function ftruncate(fd: number, len?: unknown, callback?: unknown): void {
         try {
             fs.ftruncate(fd, size);
         } catch (err) {
-            cb(toSyncErrnoException(err, 'ftruncate', describeFd(fd)));
+            cb(toSyncErrnoException(err, 'ftruncate'));
             return;
         }
         cb(null);
@@ -624,7 +646,9 @@ export function readlink(path: PathLike, options?: unknown, callback?: unknown):
     }
 
     assertCallback(callback);
-    const encodingOpt = typeof options === 'string' ? options : optionBag(options);
+    const encodingOpt = typeof options === 'string'
+        ? options as BufferEncoding
+        : optionBag(options).encoding;
     asfs.readLink(pathToString(path)).then(
         result => callback(null, encodePathResult(result, encodingOpt)),
         err => callback(toErrnoException(err, 'readlink', pathToString(path)))
@@ -648,7 +672,9 @@ export function realpath(path: PathLike, options?: unknown, callback?: unknown):
 
     assertCallback(callback);
     const pathStr = pathToString(path);
-    const encodingOpt = typeof options === 'string' ? options : optionBag(options);
+    const encodingOpt = typeof options === 'string'
+        ? options as BufferEncoding
+        : optionBag(options).encoding;
     asfs.realPath(pathStr).then(
         result => callback(null, encodePathResult(result, encodingOpt)),
         err => callback(toErrnoException(err, 'realpath', pathStr))
@@ -668,7 +694,9 @@ Reflect.set(realpath, 'native', function realpathNative(path: PathLike, options?
     assertCallback(callback);
     const cb = callback as (err: NodeJS.ErrnoException | null, resolved?: string | Buffer) => void;
     const pathStr = pathToString(path);
-    const encodingOpt = typeof options === 'string' ? options : optionBag(options);
+    const encodingOpt = typeof options === 'string'
+        ? options as BufferEncoding
+        : optionBag(options).encoding;
     asfs.realPath(pathStr).then(
         result => cb(null, encodePathResult(result, encodingOpt)),
         // 'realpathNative': node reports syscall 'realpath' here but 'lstat' from
@@ -688,7 +716,7 @@ export function mkdtemp(prefix: string, options?: unknown, callback?: unknown): 
     assertCallback(callback);
     const dirPath = prefix + randomHex();
     const option = optionBag(options);
-    const result = encodePathResult(dirPath, typeof options === 'string' ? options : option);
+    const result = encodePathResult(dirPath, typeof options === 'string' ? options as BufferEncoding : option.encoding);
     asfs.mkdir(dirPath).then(
         () => callback(null, result),
         err => callback(toErrnoException(err, 'mkdtemp', dirPath), ''),
@@ -712,7 +740,7 @@ export function fchmod(fd: number, mode: Mode, callback: NoParamCallback): void 
         try {
             fs.fchmod(fd, parsedMode);
         } catch (err) {
-            callback(toSyncErrnoException(err, 'fchmod', describeFd(fd)));
+            callback(toSyncErrnoException(err, 'fchmod'));
             return;
         }
         callback(null);
@@ -724,18 +752,16 @@ export function lchmod(path: PathLike, mode: Mode, callback: NoParamCallback): v
     const pathStr = pathToString(path);
     const parsedMode = modeToNumber(mode);
     runFsCallback(callback, () => {
+        let failure: NodeJS.ErrnoException | null = null;
         try {
             const st = fs.lstat(pathStr);
             if (st.isSymbolicLink) {
-                callback(lchmodEnosysError(pathStr));
-                return;
-            }
-            fs.chmod(pathStr, parsedMode);
+                failure = lchmodEnosysError(pathStr);
+            } else fs.chmod(pathStr, parsedMode);
         } catch (err) {
-            callback(toSyncErrnoException(err, 'lchmod', pathStr));
-            return;
+            failure = toSyncErrnoException(err, 'lchmod', pathStr);
         }
-        callback(null);
+        callback(failure);
     });
 }
 
@@ -747,19 +773,10 @@ export function chown(path: PathLike, uid: number, gid: number, callback: NoPara
 
 export function fchown(fd: number, uid: number, gid: number, callback: NoParamCallback): void {
     runFsCallback(callback, () => {
-        // libuv's Windows `fs__fchown` is `SET_REQ_RESULT(req, 0)`, so Node
-        // succeeds for any fd — measured v24.18.0. The sync C layer instead
-        // throws a bare "fchown not supported on Windows" (no errno, surfaced as
-        // code UNKNOWN). asyncfs has no fchown to bridge to, so match libuv
-        // directly here and keep the native call on other platforms.
-        if (isWindows) {
-            callback(null);
-            return;
-        }
         try {
             fs.fchown(fd, uid, gid);
         } catch (err) {
-            callback(toSyncErrnoException(err, 'fchown', describeFd(fd)));
+            callback(toSyncErrnoException(err, 'fchown'));
             return;
         }
         callback(null);
@@ -791,7 +808,7 @@ export function futimes(fd: number, atime: TimeLike, mtime: TimeLike, callback: 
         try {
             fs.futimes(fd, atimeSec, mtimeSec);
         } catch (err) {
-            callback(toSyncErrnoException(err, 'futimes', describeFd(fd)));
+            callback(toSyncErrnoException(err, 'futimes'));
             return;
         }
         callback(null);
@@ -845,7 +862,7 @@ export function close(fd: number, callback: NoParamCallback = () => {}): void {
         try {
             fs.close(fd);
         } catch (err) {
-            callback(toSyncErrnoException(err, 'close', describeFd(fd)));
+            callback(toSyncErrnoException(err, 'close'));
             return;
         }
         callback(null);
@@ -894,7 +911,7 @@ export function read(fd: number, buffer: ArrayBufferView, offset?: unknown, leng
                 ? fs.pread(fd, window, readPosition)
                 : fs.read(fd, window);
         } catch (err) {
-            cb(toSyncErrnoException(err, 'read', describeFd(fd)), 0, buffer);
+            cb(toSyncErrnoException(err, 'read'), 0, buffer);
             return;
         }
         cb(null, bytesRead, buffer);
@@ -921,11 +938,14 @@ export function readv(fd: number, buffers: readonly ArrayBufferView[], position?
     assertCallback(callback);
     const cb = callback;
     runFsCallback(cb, () => {
+        let bytesRead: number;
         try {
-            cb(null, readvSync(fd, buffers, readPosition), buffers);
+            bytesRead = readvSync(fd, buffers, readPosition);
         } catch (err) {
-            cb(toSyncErrnoException(err, 'readv', describeFd(fd)), 0, buffers);
+            cb(toSyncErrnoException(err, 'readv'), 0, buffers);
+            return;
         }
+        cb(null, bytesRead, buffers);
     });
 }
 
@@ -976,7 +996,7 @@ export function write(fd: number, buffer: ArrayBufferView | string, offset?: unk
                 ? fs.pwrite(fd, window, writePosition)
                 : fs.write(fd, window);
         } catch (err) {
-            cb(toSyncErrnoException(err, 'write', describeFd(fd)), 0, buffer);
+            cb(toSyncErrnoException(err, 'write'), 0, buffer);
             return;
         }
         cb(null, written, buffer);
@@ -1003,11 +1023,14 @@ export function writev(fd: number, buffers: readonly ArrayBufferView[], position
     assertCallback(callback);
     const cb = callback;
     runFsCallback(cb, () => {
+        let bytesWritten: number;
         try {
-            cb(null, writevSync(fd, buffers, writePosition), buffers);
+            bytesWritten = writevSync(fd, buffers, writePosition);
         } catch (err) {
-            cb(toSyncErrnoException(err, 'writev', describeFd(fd)), 0, buffers);
+            cb(toSyncErrnoException(err, 'writev'), 0, buffers);
+            return;
         }
+        cb(null, bytesWritten, buffers);
     });
 }
 
@@ -1016,7 +1039,7 @@ export function fsync(fd: number, callback: NoParamCallback): void {
         try {
             fs.fsync(fd);
         } catch (err) {
-            callback(toSyncErrnoException(err, 'fsync', describeFd(fd)));
+            callback(toSyncErrnoException(err, 'fsync'));
             return;
         }
         callback(null);
@@ -1028,7 +1051,7 @@ export function fdatasync(fd: number, callback: NoParamCallback): void {
         try {
             fs.fdatasync(fd);
         } catch (err) {
-            callback(toSyncErrnoException(err, 'fdatasync', describeFd(fd)));
+            callback(toSyncErrnoException(err, 'fdatasync'));
             return;
         }
         callback(null);

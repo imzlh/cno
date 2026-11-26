@@ -1,6 +1,13 @@
+import {
+    _clearNativeQueueTimer,
+    _createNativeQueueResource,
+    type NativeQueueResource,
+} from '../../utils/native-queue-resource';
+
 const timer = import.meta.use('timers');
 
 type TimerCallback = (...args: unknown[]) => void;
+const noopTimerCallback: TimerCallback = () => {};
 
 // Node clamps every timer delay into [1, 2^31-1] and warns outside that range.
 const TIMEOUT_MAX = 2 ** 31 - 1;
@@ -75,12 +82,6 @@ function assertTimerOptions(options: unknown): asserts options is TimerOptions |
     }
 }
 
-function toTimerId(timeout: NodeJS.Timeout | string | number | undefined): number | undefined {
-    if (timeout === undefined) return undefined;
-    const id = typeof timeout === 'number' ? timeout : Number(timeout);
-    return Number.isNaN(id) ? undefined : id;
-}
-
 export interface TimerOptions {
     ref?: boolean;
     signal?: AbortSignal;
@@ -89,13 +90,12 @@ export interface TimerOptions {
 class Timeout implements NodeJS.Timeout {
     #id = 0;
     #isInterval: boolean;
-    #fn: TimerCallback;
+    #fn: TimerCallback | null;
     #ms: number;
     #args: unknown[];
-    #cleared = false;
+    #resource: NativeQueueResource;
     #active = false;
     #refed = true;
-    #generation = 0;
 
     // Node-visible internals relied on by ecosystem code.
     _idleTimeout: number;
@@ -109,27 +109,41 @@ class Timeout implements NodeJS.Timeout {
         this.#args = args;
         this._idleTimeout = ms;
         this._repeat = isInterval ? ms : null;
-        this.#schedule();
+        this.#resource = _createNativeQueueResource(isInterval ? 'Interval' : 'Timeout', fn, {
+            resource: this,
+            clearNative: timer.clearTimeout,
+            repeat: isInterval,
+            refreshable: true,
+            onCancel: () => {
+                this.#active = false;
+                this._destroyed = true;
+                this._idleTimeout = -1;
+                this.#fn = null;
+                this.#args = [];
+            },
+            onStart: resource => {
+                this.#resource = resource;
+                this.#id = this.#schedule();
+                resource.bind(this.#id);
+                this.#active = true;
+                this._destroyed = false;
+                if (!this.#refed) timer.unrefTimer(this.#id);
+            },
+        });
     }
 
-    #schedule(): void {
-        // A refresh inside the callback must keep the new timer alive.
-        const generation = ++this.#generation;
+    #schedule(): number {
         const callback = () => {
             if (!this.#isInterval) this.#active = false;
             try {
-                this.#fn.apply(this, this.#args);
+                this.#resource.invoke(this, this.#args);
             } finally {
-                if (!this.#isInterval && this.#generation === generation) {
-                    this._destroyed = true;
-                }
+                if (!this.#active) this._destroyed = true;
             }
         };
-        this.#id = this.#isInterval
+        return this.#isInterval
             ? timer.setInterval(callback, this.#ms)
             : timer.setTimeout(callback, this.#ms);
-        this.#active = true;
-        if (!this.#refed) timer.unrefTimer(this.#id);
     }
 
     hasRef(): boolean {
@@ -149,26 +163,12 @@ class Timeout implements NodeJS.Timeout {
     }
 
     refresh(): this {
-        if (this.#cleared) return this;
-        if (this.#active) {
-            const clearFn = this.#isInterval ? timer.clearInterval : timer.clearTimeout;
-            clearFn(this.#id);
-        }
-        this._idleTimeout = this.#ms;
-        this._destroyed = false;
-        this.#schedule();
+        this.#resource.refresh();
         return this;
     }
 
     close(): this {
-        if (this.#active) {
-            const clearFn = this.#isInterval ? timer.clearInterval : timer.clearTimeout;
-            clearFn(this.#id);
-            this.#active = false;
-        }
-        this.#cleared = true;
-        this._destroyed = true;
-        this._idleTimeout = -1;
+        _clearNativeQueueTimer(this);
         return this;
     }
 
@@ -180,8 +180,8 @@ class Timeout implements NodeJS.Timeout {
         this.close();
     }
 
-    get _onTimeout(): TimerCallback | null {
-        return this.#cleared ? null : this.#fn;
+    get _onTimeout(): TimerCallback {
+        return this.#fn ?? noopTimerCallback;
     }
 
     get __cno_timer_id(): number {
@@ -190,20 +190,38 @@ class Timeout implements NodeJS.Timeout {
 }
 
 class Immediate implements NodeJS.Immediate {
-    #id: number;
+    /* Backed by the native check-phase immediate (mod_timers.c) — the same
+       registry the global setImmediate uses, so cross-boundary clearImmediate
+       works through the shared id space. */
+    #id = 0;
     #active = true;
     #refed = true;
+    #resource: NativeQueueResource;
 
     _destroyed = false;
 
-    constructor(private handle: TimerCallback, args: unknown[] = []) {
-        this.#id = timer.setTimeout(() => {
-            if (!this.#active) return;
-            this.#active = false;
-            this.#refed = false;
-            this._destroyed = true;
-            handle.apply(this, args);
-        }, 0);
+    constructor(handle: TimerCallback, args: unknown[] = []) {
+        this.handle = handle;
+        this.#resource = _createNativeQueueResource('Immediate', handle, {
+            resource: this,
+            clearNative: timer.clearImmediate,
+            onCancel: () => this.#markDestroyed(),
+            onStart: resource => {
+                this.#resource = resource;
+                this.#id = timer.setImmediate(() => {
+                    this.#markDestroyed();
+                    resource.invoke(this, args);
+                });
+                resource.bind(this.#id);
+            },
+        });
+    }
+
+    #markDestroyed(): void {
+        this.#active = false;
+        this.#refed = false;
+        this._destroyed = true;
+        this.handle = null;
     }
 
     hasRef(): boolean {
@@ -213,14 +231,14 @@ class Immediate implements NodeJS.Immediate {
     ref(): this {
         if (!this.#active) return this;
         this.#refed = true;
-        timer.refTimer(this.#id);
+        timer.refImmediate(this.#id);
         return this;
     }
 
     unref(): this {
         if (!this.#active) return this;
         this.#refed = false;
-        timer.unrefTimer(this.#id);
+        timer.unrefImmediate(this.#id);
         return this;
     }
 
@@ -229,10 +247,7 @@ class Immediate implements NodeJS.Immediate {
     }
 
     close(): this {
-        if (this.#active) timer.clearTimeout(this.#id);
-        this.#active = false;
-        this.#refed = false;
-        this._destroyed = true;
+        _clearNativeQueueTimer(this, 'Immediate');
         return this;
     }
 
@@ -242,28 +257,15 @@ class Immediate implements NodeJS.Immediate {
         return Number(this.#id);
     }
 
+    private handle: TimerCallback | null;
+
     get _onImmediate(): TimerCallback {
-        return this.handle;
+        return this.handle ?? noopTimerCallback;
     }
 
     get __cno_timer_id(): number {
         return Number(this.#id);
     }
-}
-
-// The global setImmediate returns webapi/basic.ts's own Immediate class, so a
-// cross-boundary clearImmediate has to recognise foreign handles too. Both
-// classes share the native timer registry, so cancelling by id is sufficient.
-function clearForeignImmediate(handle: object): boolean {
-    if (!('_onImmediate' in handle)) return false;
-    const close = Reflect.get(handle, 'close');
-    if (typeof close === 'function') {
-        close.call(handle);
-        return true;
-    }
-    const id = Number(handle);
-    if (!Number.isNaN(id) && id !== 0) timer.clearTimeout(id);
-    return true;
 }
 
 export function setTimeout<T>(callback: (...args: T[]) => void, ms?: number, ...args: T[]): NodeJS.Timeout {
@@ -282,30 +284,15 @@ export function setImmediate<T>(callback: (...args: T[]) => void, ...args: T[]):
 }
 
 export function clearTimeout(timeout: NodeJS.Timeout | string | number | undefined): void {
-    if (timeout instanceof Timeout) {
-        timeout[Symbol.dispose]();
-    } else {
-        const id = toTimerId(timeout);
-        if (id !== undefined) timer.clearTimeout(id);
-    }
+    _clearNativeQueueTimer(timeout);
 }
 
 export function clearInterval(timeout: NodeJS.Timeout | string | number | undefined): void {
-    if (timeout instanceof Timeout) {
-        timeout[Symbol.dispose]();
-    } else {
-        const id = toTimerId(timeout);
-        if (id !== undefined) timer.clearInterval(id);
-    }
+    _clearNativeQueueTimer(timeout);
 }
 
-export function clearImmediate(immediate: NodeJS.Immediate | undefined): void {
-    if (immediate instanceof Immediate) {
-        immediate[Symbol.dispose]();
-        return;
-    }
-    // Foreign (global) Immediate handles must clear too; bare ids/objects stay no-ops.
-    if (typeof immediate === 'object' && immediate !== null) clearForeignImmediate(immediate);
+export function clearImmediate(immediate: NodeJS.Immediate | number | undefined): void {
+    _clearNativeQueueTimer(immediate, 'Immediate');
 }
 
 function timerPromise<T>(delay: number | undefined, value: T, options: TimerOptions | undefined, immediate = false): Promise<T> {
@@ -314,18 +301,50 @@ function timerPromise<T>(delay: number | undefined, value: T, options: TimerOpti
     if (signal?.aborted) return Promise.reject(new AbortError(signal.reason));
 
     return new Promise<T>((resolve, reject) => {
-        const onAbort = () => {
-            cleanup();
-            timer.clearTimeout(id);
-            reject(new AbortError(signal?.reason));
-        };
+        let resource: NativeQueueResource | undefined;
+        let settled = false;
         const cleanup = () => signal?.removeEventListener('abort', onAbort);
-        signal?.addEventListener('abort', onAbort, { once: true });
-        const id = timer.setTimeout(() => {
-            cleanup();
-            resolve(value);
-        }, immediate ? 0 : normalizeDelay(delay));
-        if (options?.ref === false) timer.unrefTimer(id);
+        const onAbort = () => {
+            if (settled) return;
+            settled = true;
+            try { reject(new AbortError(signal?.reason)); }
+            catch (error) { reject(error); }
+            finally { resource?.cancel(); }
+        };
+        try {
+            const ms = immediate ? 0 : normalizeDelay(delay);
+            const refed = options?.ref !== false;
+            const entry = resource = _createNativeQueueResource(immediate ? 'Immediate' : 'Timeout', () => {
+                settled = true;
+                try {
+                    cleanup();
+                    resolve(value);
+                } catch (error) {
+                    reject(error);
+                }
+            }, {
+                clearNative: immediate ? timer.clearImmediate : timer.clearTimeout,
+                onCancel: cleanup,
+            });
+            if (signal?.aborted) {
+                onAbort();
+                return;
+            }
+
+            const invoke = () => entry.invoke(undefined, []);
+            const id = immediate ? timer.setImmediate(invoke) : timer.setTimeout(invoke, ms);
+            entry.bind(id);
+            if (!refed) {
+                if (immediate) timer.unrefImmediate(id);
+                else timer.unrefTimer(id);
+            }
+            signal?.addEventListener('abort', onAbort, { once: true });
+            if (signal?.aborted) onAbort();
+        } catch (error) {
+            settled = true;
+            reject(error);
+            resource?.cancel();
+        }
     });
 }
 

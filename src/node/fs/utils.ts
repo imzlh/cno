@@ -16,7 +16,6 @@ export const asfs = nsasfs;
 export const nativeCrypto = import.meta.use('crypto');
 const algorithm = import.meta.use('algorithm');
 export const text = import.meta.use('text');
-const nativeError = import.meta.use('error');
 
 // Shared type definitions (used across _promises.ts, callbacks.ts, sync.ts, async.ts)
 
@@ -58,10 +57,6 @@ export function timeToUnixMs(time: TimeLike, name = 'time'): number {
 
 export function errorFromUnknown(error: unknown): Error {
     return error instanceof Error ? error : new Error(String(error));
-}
-
-export function errorCode(error: unknown): unknown {
-    return error !== null && typeof error === 'object' ? Reflect.get(error, 'code') : undefined;
 }
 
 export function rmIsDirectoryError(path: string): NodeJS.ErrnoException {
@@ -111,19 +106,21 @@ export async function writeAllHandle(
     }
 }
 
-/** stat → size-bounded read loop shared by the readFile paths. */
+/** Zero-size pseudo-files still need reading; a concurrent shrink ends at EOF. */
 export async function readFileFromHandle(
     handle: CModuleAsyncFS.FileHandle,
 ): Promise<Uint8Array<ArrayBuffer>> {
     const st = await handle.stat();
-    const buf = new Uint8Array(st.size);
-    let off = 0;
-    while (off < st.size) {
-        const n = await handle.read(buf.subarray(off));
-        if (n === 0) break;
-        off += n;
+    const chunks: Uint8Array[] = [];
+    let remaining = st.size > 0 ? st.size : Infinity;
+    while (remaining > 0) {
+        const buffer = new Uint8Array(Math.min(64 * 1024, remaining));
+        const n = await handle.read(buffer);
+        if (n === null || n <= 0) break;
+        chunks.push(buffer.subarray(0, n));
+        remaining -= n;
     }
-    return buf;
+    return concatChunks(chunks);
 }
 
 /**
@@ -281,7 +278,7 @@ export function decodeBuffer(buffer: Uint8Array<ArrayBuffer>, encoding?: BufferE
 
 export function encodePathResult(
     pathStr: string,
-    options?: { encoding?: BufferEncoding | 'buffer' | null } | BufferEncoding | 'buffer',
+    options?: { encoding?: BufferEncoding | 'buffer' | null } | BufferEncoding | 'buffer' | null,
 ): string | Buffer {
     const encoding = typeof options === 'string' ? options : options?.encoding;
     if (encoding == null) return pathStr;
@@ -396,21 +393,12 @@ export function makeAbortError(signal: AbortSignal): NodeJS.ErrnoException & Abo
     return new AbortError(signal.reason);
 }
 
-export function assertCopyFileMode(src: string, dest: string, mode?: unknown): void {
-    if (mode == null) return;
+export function validateCopyFileMode(mode?: unknown): number {
+    if (mode == null) return 0;
     if (typeof mode !== 'number' || !Number.isInteger(mode) || mode < -2147483648 || mode > 2147483647) {
         throw Object.assign(new TypeError('mode must be int32 or null/undefined'), { code: 'ERR_INVALID_ARG_TYPE' });
     }
-    if (!mode || (mode & 1) === 0 || !fs.exists(dest)) return;
-    const err = new Error(`EEXIST: file already exists, copyfile '${src}' -> '${dest}'`) as NodeJS.ErrnoException & { dest?: string };
-    err.name = 'ErrnoException';
-    err.code = 'EEXIST';
-    // UV errno values are platform-local — never hardcode (Windows differs).
-    err.errno = nativeError.errno.EEXIST;
-    err.syscall = 'copyfile';
-    err.path = src;
-    err.dest = dest;
-    throw err;
+    return mode;
 }
 
 // Stats conversion
@@ -422,25 +410,29 @@ const S_IFMT_BITS = fs.S_IFMT ?? 0o170000;
 
 type NativeStats = CModuleFS.Stats | CModuleAsyncFS.StatResult;
 
-export class Stats {
-    dev: StatValue;
-    ino: StatValue;
-    mode: StatValue;
-    nlink: StatValue;
-    uid: StatValue;
-    gid: StatValue;
-    rdev: StatValue;
-    size: StatValue;
-    blksize: StatValue;
-    blocks: StatValue;
-    atimeMs: StatValue;
-    mtimeMs: StatValue;
-    ctimeMs: StatValue;
-    birthtimeMs: StatValue;
+class StatsBase<T extends StatValue> {
+    dev: T;
+    ino: T;
+    mode: T;
+    nlink: T;
+    uid: T;
+    gid: T;
+    rdev: T;
+    size: T;
+    blksize: T;
+    blocks: T;
+    atimeMs: T;
+    mtimeMs: T;
+    ctimeMs: T;
+    birthtimeMs: T;
     atime: Date;
     mtime: Date;
     ctime: Date;
     birthtime: Date;
+    declare readonly atimeInstant: unknown;
+    declare readonly mtimeInstant: unknown;
+    declare readonly ctimeInstant: unknown;
+    declare readonly birthtimeInstant: unknown;
     // declare: no runtime field emitted, so the constructor's non-enumerable
     // defineProperty is not clobbered by a class-field definition.
     private declare readonly stat: Partial<CModuleFS.Stats>;
@@ -448,7 +440,8 @@ export class Stats {
 
     constructor(stat?: NativeStats, bigint = false) {
         const statInfo: Partial<CModuleFS.Stats> = stat ?? {};
-        const convert = bigint ? (value: number) => BigInt(value) : (value: number) => value;
+        const convert = (value: number): T =>
+            (bigint ? BigInt(value) : value) as T;
         // Node never exposes internals as own enumerable keys (Object.keys/spread).
         Object.defineProperty(this, 'stat', { value: statInfo, enumerable: false });
         Object.defineProperty(this, 'rawMode', { value: statInfo.mode ?? 0, enumerable: false });
@@ -487,8 +480,14 @@ export class Stats {
     isSocket(): boolean { return this.isType(this.stat.isSocket, 0o140000); }
 }
 
+export class Stats extends StatsBase<number> {
+    constructor(stat?: NativeStats) {
+        super(stat, false);
+    }
+}
+
 /** Node returns a distinct BigIntStats class carrying extra *Ns fields. */
-export class BigIntStats extends Stats {
+export class BigIntStats extends StatsBase<bigint> {
     atimeNs: bigint;
     mtimeNs: bigint;
     ctimeNs: bigint;
@@ -497,7 +496,7 @@ export class BigIntStats extends Stats {
     constructor(stat?: NativeStats) {
         super(stat, true);
         // Native stats are Date-backed (ms), so ns is ms scaled — not OS-exact.
-        const ns = (v: StatValue) => BigInt(v as bigint) * 1000000n;
+        const ns = (v: bigint) => v * 1000000n;
         this.atimeNs = ns(this.atimeMs);
         this.mtimeNs = ns(this.mtimeMs);
         this.ctimeNs = ns(this.ctimeMs);
@@ -505,26 +504,30 @@ export class BigIntStats extends Stats {
     }
 }
 
-export function toNodeStat(stat: NativeStats, options?: { bigint?: boolean }): Stats {
+export function toNodeStat(stat: NativeStats, options: { bigint: true }): BigIntStats;
+export function toNodeStat(stat: NativeStats, options?: { bigint?: false }): Stats;
+export function toNodeStat(stat: NativeStats, options?: { bigint?: boolean }): Stats | BigIntStats;
+export function toNodeStat(stat: NativeStats, options?: { bigint?: boolean }): Stats | BigIntStats {
     return options?.bigint === true ? new BigIntStats(stat) : new Stats(stat);
 }
 
 type StatFsInput = CModuleFS.StatFsResult | CModuleAsyncFS.StatFsResult;
-type StatFsValue = number | bigint;
-
-export class StatFs {
-    type: StatFsValue;
-    bsize: StatFsValue;
-    blocks: StatFsValue;
-    bfree: StatFsValue;
-    bavail: StatFsValue;
-    files: StatFsValue;
-    ffree: StatFsValue;
+class StatFsBase<T extends StatValue> {
+    type: T;
+    bsize: T;
+    frsize: T;
+    blocks: T;
+    bfree: T;
+    bavail: T;
+    files: T;
+    ffree: T;
 
     constructor(stat: StatFsInput, bigint = false) {
-        const convert = bigint ? (value: number) => BigInt(value) : (value: number) => value;
+        const convert = (value: number): T =>
+            (bigint ? BigInt(value) : value) as T;
         this.type = convert(stat.type);
         this.bsize = convert(stat.bsize);
+        this.frsize = convert(stat.frsize);
         this.blocks = convert(stat.blocks);
         this.bfree = convert(stat.bfree);
         this.bavail = convert(stat.bavail);
@@ -533,10 +536,25 @@ export class StatFs {
     }
 }
 
-export type StatsFs = StatFs;
+export class StatFs extends StatFsBase<number> {
+    constructor(stat: StatFsInput) {
+        super(stat, false);
+    }
+}
 
+export class BigIntStatFs extends StatFsBase<bigint> {
+    constructor(stat: StatFsInput) {
+        super(stat, true);
+    }
+}
+
+export type StatsFs = StatFs | BigIntStatFs;
+
+export function toNodeStatFs(stat: StatFsInput, options: { bigint: true }): BigIntStatFs;
+export function toNodeStatFs(stat: StatFsInput, options?: { bigint?: false }): StatFs;
+export function toNodeStatFs(stat: StatFsInput, options?: { bigint?: boolean }): StatsFs;
 export function toNodeStatFs(stat: StatFsInput, options?: StatFsOptions): StatsFs {
-    return new StatFs(stat, options?.bigint === true) as StatsFs;
+    return options?.bigint === true ? new BigIntStatFs(stat) : new StatFs(stat);
 }
 
 // Dirent conversion — parentPath is the directory containing `name` (Node 20.12+).

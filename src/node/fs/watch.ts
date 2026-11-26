@@ -1,17 +1,19 @@
 import { EventEmitter } from '../events';
-import buffer from '../buffer';
+import { AsyncLocalStorage } from '../async_hooks';
+import { setInterval, clearInterval, setImmediate } from '../timers';
+import { Buffer } from '../buffer';
 import { toErrnoException } from '../_internal/errno';
-import { pathToString, toNodeStat, type PathLike } from './utils';
-
+import { BigIntStats, Stats, pathToString, toNodeStat, type PathLike } from './utils';
 import { nsasfs, nsfswatch } from './syspath';
+
 const fswatch = nsfswatch;
 const asfs = nsasfs;
 const engine = import.meta.use('engine');
-const { Buffer } = buffer;
 
 type WatchEncoding = BufferEncoding | 'buffer';
 type WatchListener = (eventType: string, filename: string | Buffer | null) => void;
-type WatchFileListener = (curr: import('fs').Stats, prev: import('fs').Stats) => void;
+type WatchFileStats = Stats | BigIntStats;
+type WatchFileListener = (curr: WatchFileStats, prev: WatchFileStats) => void;
 
 export interface WatchOptions {
     persistent?: boolean;
@@ -149,40 +151,37 @@ export function watch(
     return watcher;
 }
 
-// The sync C stat truncates timestamps to whole seconds, so a same-size rewrite
-// within one second looks unchanged. asyncfs keeps ms precision — bridge it.
-function readStat(pathStr: string, bigint = false): import('fs').Stats {
-    const pending = asfs.stat(pathStr);
-    // engine.waitIO rethrows synchronously but leaves the underlying promise
-    // unclaimed, so a missing path also printed an "unhandled promise
-    // rejection" banner on every poll tick. Claim it before waiting.
-    void pending.catch(() => { /* surfaced synchronously by waitIO */ });
-    return toNodeStat(engine.waitIO(pending), { bigint });
-}
-
-/**
- * Node's watchFile polls a path that need not exist yet: the first callback for
- * a missing file reports an all-zero Stats and a later create fires a change.
- * Throwing ENOENT out of watchFile instead escaped as an unhandled rejection
- * from engine.waitIO and killed the process.
- */
-function readStatOrZero(pathStr: string, bigint: boolean): import('fs').Stats {
+async function readStatOrZero(pathStr: string, bigint: boolean): Promise<WatchFileStats> {
     try {
-        return readStat(pathStr, bigint);
+        return toNodeStat(await asfs.stat(pathStr), { bigint });
     } catch {
         return zeroStat(bigint);
     }
 }
 
-function zeroStat(bigint: boolean): import('fs').Stats {
-    // Stats/BigIntStats default every field to 0 and every date to epoch when the
-    // native stat is absent, which is exactly Node's "file does not exist" Stats.
-    return toNodeStat(undefined as unknown as Parameters<typeof toNodeStat>[0], { bigint });
+function readInitialStatOrZero(pathStr: string, bigint: boolean): WatchFileStats {
+    try {
+        const pending = asfs.stat(pathStr);
+        void pending.catch(() => {});
+        return toNodeStat(engine.waitIO(pending), { bigint });
+    } catch {
+        return zeroStat(bigint);
+    }
 }
 
-function statsEqual(a: import('fs').Stats, b: import('fs').Stats): boolean {
+function zeroStat(bigint: boolean): WatchFileStats {
+    // Stats/BigIntStats default every field to 0 and every date to epoch when the
+    // native stat is absent, which is exactly Node's "file does not exist" Stats.
+    return bigint ? new BigIntStats() : new Stats();
+}
+
+function statsEqual(a: WatchFileStats, b: WatchFileStats): boolean {
     return a.mtimeMs === b.mtimeMs && a.size === b.size && a.mode === b.mode
         && a.ino === b.ino && a.nlink === b.nlink;
+}
+
+function rethrowWatchFileListenerError(error: unknown): void {
+    setImmediate(() => { throw error; });
 }
 
 export function watchFile(
@@ -202,19 +201,37 @@ export function watchFile(
     }
 
     const listeners = new Set<WatchFileListener>([cb]);
+    const runInContext = AsyncLocalStorage.snapshot();
     const bigint = options.bigint === true;
-    let prev = readStatOrZero(pathStr, bigint);
+    let prev = readInitialStatOrZero(pathStr, bigint);
+    let initial = true;
+    let pending = false;
     const interval = Math.max(1, options.interval ?? 5007);
-    const timer = setInterval(() => {
-        const curr = readStatOrZero(pathStr, bigint);
+    const poll = async () => {
+        if (pending) return;
+        pending = true;
+        const curr = await readStatOrZero(pathStr, bigint);
+        pending = false;
+        if (watchFileRegistry.get(pathStr) !== entry) return;
         const old = prev;
         prev = curr;
-        if (!statsEqual(curr, old)) {
-            for (const fn of listeners) fn(curr, old);
+        const changed = !statsEqual(curr, old) || (initial && curr.nlink === (bigint ? 0n : 0));
+        initial = false;
+        if (changed) {
+            try {
+                runInContext(() => {
+                    for (const fn of listeners) fn(curr, old);
+                });
+            } catch (error) {
+                rethrowWatchFileListenerError(error);
+            }
         }
-    }, interval);
-
-    watchFileRegistry.set(pathStr, { listeners, timer });
+    };
+    const timer = setInterval(poll, interval);
+    const entry = { listeners, timer };
+    watchFileRegistry.set(pathStr, entry);
+    if (options.persistent === false) timer.unref();
+    void poll();
 }
 
 export function unwatchFile(filename: PathLike, listener?: WatchFileListener): void {

@@ -1,18 +1,26 @@
-const error = import.meta.use('error');
+import {
+    errnoCode,
+    errnoDescription,
+    errnoMessage,
+    errnoName,
+    errorCode,
+    isErrorValue,
+    matchesErrnoCode,
+    unknownErrno,
+} from '../../utils/errno';
 
-// Built from runtime UV table — never hand-maintain (platform-local values drift).
-const errnoToString: Record<number, string> = {};
-const stringToErrno: Record<string, number> = {};
-for (const name of Object.keys(error.errno) as Array<keyof typeof error.errno>) {
-    const v = error.errno[name];
-    if (typeof v !== 'number' || name === 'OK') continue;
-    // First name wins if two labels share a value (e.g. EOPNOTSUPP === ENOTSUP).
-    if (errnoToString[v] === undefined) errnoToString[v] = name;
-    stringToErrno[name] = v;
-}
+type ErrnoException = NodeJS.ErrnoException & { dest?: string };
 
-/** Peer/socket gone — normal for HTTP when the client aborts mid-response. */
-const DISCONNECT_CODES = new Set([
+export type NodeSystemError = NodeJS.ErrnoException & {
+    info: {
+        errno: number;
+        code: string;
+        message: string;
+        syscall: string;
+    };
+};
+
+const DISCONNECT_CODES = [
     'EPIPE',
     'ECONNRESET',
     'ECONNABORTED',
@@ -21,157 +29,93 @@ const DISCONNECT_CODES = new Set([
     'ESHUTDOWN',
     'ENOTCONN',
     'EOF',
-]);
+] as const;
 
-type NodeErrnoError = NodeJS.ErrnoException & { dest?: string };
-
-type NodeSystemError = Error & {
-    code: string;
-    errno: number;
-    syscall: string;
-    info: { errno: number; code: string; message: string; syscall: string };
+type ErrnoContext = {
+    syscall?: string;
+    path?: string;
+    dest?: string;
 };
 
-/**
- * Node's internal `SystemError`, with the message spelled `<prefix>: <syscall>
- * returned <UVCODE> (<description>)`. Take errno and description from the runtime
- * UV table: hardcoding them is platform-wrong and drifts with libuv.
- */
-export function uvSystemError(uvCode: string, syscall: string, code: string, prefix: string): NodeSystemError {
-    const errno = stringToErrno[uvCode] ?? error.errno.UNKNOWN;
-    const described = error.strerror(errno);
-    const message = described.startsWith(`${uvCode}: `) ? described.slice(uvCode.length + 2) : described;
-
-    const err = new Error(`${prefix}: ${syscall} returned ${uvCode} (${message})`) as NodeSystemError;
-    err.code = code;
-    err.errno = errno;
-    err.syscall = syscall;
-    err.info = { errno, code: uvCode, message, syscall };
-    // Node's `name` is an own but non-enumerable property, so it stays out of
-    // Object.keys(err) / JSON round-trips while String(err) keeps the tag.
-    Object.defineProperty(err, 'name', { value: 'SystemError', writable: true, configurable: true, enumerable: false });
-    return err;
+function createErrnoError(message: string, errno: number, source?: Error, context: ErrnoContext = {}): ErrnoException {
+    const error = new Error(message) as ErrnoException;
+    error.code = errnoName(errno) ?? 'UNKNOWN';
+    error.errno = errno;
+    if (context.syscall !== undefined) error.syscall = context.syscall;
+    if (context.path !== undefined) error.path = context.path;
+    if (context.dest !== undefined) error.dest = context.dest;
+    if (source?.stack) error.stack = source.stack;
+    return error;
 }
 
 /**
- * Convert C module errno error to Node.js ErrnoException
+ * Create Node's `SystemError` shape for APIs that wrap a lower-level UV call.
+ * The native errno table stays in `utils/errno`; this function owns only the
+ * Node-facing `info`, message and non-enumerable `name` fields.
  */
+export function createSystemError(options: {
+    nativeCode: string;
+    syscall: string;
+    code: string;
+    prefix: string;
+}): NodeSystemError {
+    const { nativeCode, syscall, code, prefix } = options;
+    const errno = errnoCode(nativeCode) ?? unknownErrno;
+    const message = errnoDescription(errno);
+    const error = new Error(`${prefix}: ${syscall} returned ${nativeCode} (${message})`) as NodeSystemError;
+
+    error.code = code;
+    error.errno = errno;
+    error.syscall = syscall;
+    error.info = { errno, code: nativeCode, message, syscall };
+    Object.defineProperty(error, 'name', {
+        value: 'SystemError',
+        writable: true,
+        configurable: true,
+        enumerable: false,
+    });
+    return error;
+}
+
+/** Convert a native numeric UV error into the public Node errno shape. */
 export function toErrnoException(
-    e: unknown,
+    value: unknown,
     syscall?: string,
     path?: string,
     dest?: string,
 ): NodeJS.ErrnoException {
-    if (!(e instanceof Error)) {
-        const err: NodeErrnoError = new Error(String(e));
-        err.code = 'UNKNOWN';
-        err.errno = error.errno.UNKNOWN;
-        if (syscall) err.syscall = syscall;
-        if (path) err.path = path;
-        if (dest) err.dest = dest;
-        return err;
+    const context = { syscall, path, dest };
+    if (!isErrorValue(value)) {
+        return createErrnoError(String(value), unknownErrno, undefined, context);
     }
 
-    const rawCode = Reflect.get(e, 'code');
-    if (typeof rawCode === 'string') return e;
-
-    // Not CModuleError.Error (no numeric .code errno)
-    if (typeof rawCode !== 'number') {
-        const err: NodeErrnoError = new Error(e.message);
-        err.code = 'UNKNOWN';
-        err.errno = error.errno.UNKNOWN;
-        if (syscall) err.syscall = syscall;
-        if (path) err.path = path;
-        if (dest) err.dest = dest;
-        return err;
+    const code = errorCode(value);
+    if (typeof code === 'string' || (typeof code === 'number' && !(code < 0))) {
+        return value as NodeJS.ErrnoException;
     }
 
-    const errnoValue = rawCode;
-    const codeStr = errnoToString[errnoValue] ?? 'UNKNOWN';
-    const message = e.message || error.strerror(errnoValue) || 'Unknown error';
-
-    const err: NodeErrnoError = new Error(message);
-    // Node does NOT set an own `name` on errno errors — measured v24.18.0, every
-    // fs/net/dns errno error has ownProps [code,errno,message,path?,syscall] and
-    // `name === 'Error'` inherited from the prototype. Setting an own 'ErrnoException'
-    // leaked into Object.keys/JSON round-trips and broke `e.name === 'Error'` checks.
-    err.code = codeStr;
-    err.errno = errnoValue;
-    if (syscall) err.syscall = syscall;
-    if (path) err.path = path;
-    if (dest) err.dest = dest;
-
-    // Preserve original stack
-    if (e.stack) {
-        err.stack = e.stack;
-    }
-
-    return err;
+    const errno = typeof code === 'number' ? code : unknownErrno;
+    const message = typeof code === 'number'
+        ? value.message || errnoMessage(errno) || 'Unknown error'
+        : value.message;
+    return createErrnoError(message, errno, value, context);
 }
 
-/**
- * Preserve ordinary JS errors, but normalize C-module errno errors to Node's
- * ErrnoException shape so npm libraries can key off string error codes.
- */
+/** Preserve ordinary application errors; only normalize native errno values. */
 export function normalizeErrnoError(
-    e: unknown,
+    value: unknown,
     syscall?: string,
     path?: string,
     dest?: string,
 ): Error & { code?: string } {
-    if (e instanceof Error) {
-        const code = Reflect.get(e, 'code');
-        if (typeof code === 'number' || typeof code === 'string') {
-            return toErrnoException(e, syscall, path, dest);
-        }
-        return e;
-    }
-    return new Error(String(e));
+    if (!isErrorValue(value)) return new Error(String(value));
+
+    const code = errorCode(value);
+    return typeof code === 'number' && code < 0
+        ? toErrnoException(value, syscall, path, dest)
+        : value;
 }
 
-/**
- * Match raw UV errno numbers and Node string codes only — never message text.
- */
-export function matchesErrnoCode(
-    e: unknown,
-    ...codes: string[]
-): boolean {
-    if (!(e instanceof Error)) return false;
-
-    const code = Reflect.get(e, 'code');
-    if (typeof code === 'string') return codes.includes(code);
-    if (typeof code === 'number') {
-        return codes.some((name) => stringToErrno[name] === code);
-    }
-    return false;
-}
-
-/**
- * Peer/socket gone. Structured `.code` only (UV number or Node string).
- * Synthetic adapter errors must set code (e.g. ECONNRESET), not rely on message.
- */
-export function isTransportDisconnectError(e: unknown): boolean {
-    if (!(e instanceof Error)) return false;
-
-    const code = Reflect.get(e, 'code');
-    if (typeof code === 'string') return DISCONNECT_CODES.has(code);
-    if (typeof code === 'number') {
-        const name = errnoToString[code];
-        return !!name && DISCONNECT_CODES.has(name);
-    }
-    return false;
-}
-
-/**
- * Convert Promise returning C module errno error to reject with ErrnoException
- */
-export function wrapPromise<T>(
-    promise: Promise<T>,
-    syscall?: string,
-    path?: string,
-    dest?: string,
-): Promise<T> {
-    return promise.catch((e: unknown) => {
-        throw toErrnoException(e, syscall, path, dest);
-    });
+export function isTransportDisconnectError(value: unknown): boolean {
+    return matchesErrnoCode(value, ...DISCONNECT_CODES);
 }

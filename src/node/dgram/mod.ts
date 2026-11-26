@@ -11,7 +11,7 @@ const engine = import.meta.use('engine');
 
 import { EventEmitter } from '../events';
 import { Buffer } from '../buffer';
-import { toErrnoException, uvSystemError } from '../_internal/errno';
+import { createSystemError, toErrnoException } from '../_internal/errno';
 import { flattenPrototype } from '../_internal/prototype';
 import { tryCloseQuietly } from '../_internal/close';
 import {
@@ -812,8 +812,13 @@ function bufferSizeSocket(self: Socket, syscall: string): CModuleSocket.Socket {
     return s;
 }
 
-function bufferSizeError(code: string, syscall: string): NodeJS.ErrnoException {
-    return uvSystemError(code, syscall, 'ERR_SOCKET_BUFFER_SIZE', 'Could not get or set buffer size');
+function bufferSizeError(nativeCode: string, syscall: string) {
+    return createSystemError({
+        nativeCode,
+        syscall,
+        code: 'ERR_SOCKET_BUFFER_SIZE',
+        prefix: 'Could not get or set buffer size',
+    });
 }
 
 const BUFFER_SIZE_OPTIONS = {

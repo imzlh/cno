@@ -22,46 +22,50 @@ type NativeHook = (
     parent?: Promise<unknown>
 ) => void;
 
-const callbacks = new Set<PromiseHookCallback>();
-let dispatcher: NativeHook | null = null;
-let previousHook: NativeHook | null = null;
+interface Dispatcher {
+    callbacks: Set<{ callback: PromiseHookCallback }>;
+    hook: NativeHook;
+    previous: NativeHook | undefined;
+}
 
-function installDispatcher(): void {
-    if (dispatcher) return;
-    const existing: unknown = engine.promiseHook();
-    previousHook = typeof existing === 'function' ? (existing as NativeHook) : null;
-    dispatcher = (state: number, promise: Promise<unknown>, parent?: Promise<unknown>) => {
+let dispatcher: Dispatcher | undefined;
+
+function installDispatcher(): Dispatcher {
+    if (dispatcher) return dispatcher;
+    // Foreign wrappers can retain this hook after removal, so each installation
+    // owns its registrations while keeping its previous hook chain intact.
+    const callbacks = new Set<{ callback: PromiseHookCallback }>();
+    const previous = engine.promiseHook();
+    const hook: NativeHook = (state, promise, parent) => {
+        const currentCallbacks = [...callbacks];
         // Chain to the previous hook first (if any foreign code installed one)
-        if (previousHook) {
+        if (previous) {
             try {
-                previousHook(state, promise, parent);
+                previous(state, promise, parent);
             } catch {
                 // Foreign hook must not break ours
             }
         }
         // Then dispatch to all registered consumers
-        for (const cb of callbacks) {
+        for (const { callback } of currentCallbacks) {
             try {
-                cb(state, promise, parent);
+                callback(state, promise, parent);
             } catch {
                 // A consumer hook must not break other consumers
             }
         }
     };
-    engine.promiseHook(dispatcher);
-    // The hook is replaced rather than chained, so tell async_hooks to wrap the
-    // dispatcher again (its continuation hook).
-    const rebind = Reflect.get(globalThis, '__cnoOnPromiseHookThisInstalled');
-    if (typeof rebind === 'function') Reflect.apply(rebind, globalThis, []);
+    const installed = { callbacks, hook, previous };
+    dispatcher = installed;
+    engine.promiseHook(hook);
+    return installed;
 }
 
-function uninstallDispatcher(): void {
-    if (!dispatcher) return;
-    if (callbacks.size > 0) return; // Still have active consumers
-    dispatcher = null;
+function uninstallDispatcher(installed: Dispatcher): void {
+    if (dispatcher !== installed || installed.callbacks.size > 0) return;
     // Restore the previous hook (if any)
-    engine.promiseHook(previousHook ?? (() => {}));
-    previousHook = null;
+    if (engine.promiseHook() === installed.hook) engine.promiseHook(installed.previous);
+    dispatcher = undefined;
 }
 
 /**
@@ -72,13 +76,14 @@ export function addPromiseHook(callback: PromiseHookCallback): () => void {
     if (typeof callback !== 'function') {
         throw new TypeError('Promise hook callback must be a function');
     }
-    installDispatcher();
-    callbacks.add(callback);
+    const installed = installDispatcher();
+    const registration = { callback };
+    installed.callbacks.add(registration);
     let removed = false;
     return () => {
         if (removed) return;
         removed = true;
-        callbacks.delete(callback);
-        uninstallDispatcher();
+        installed.callbacks.delete(registration);
+        uninstallDispatcher(installed);
     };
 }

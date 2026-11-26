@@ -6,6 +6,11 @@ import { DOMException } from "./events";
 import { messagePortTransferHooks } from "./messaging";
 import { stdin, stdout } from "../utils/stdio";
 import { errMsg } from "../utils/error";
+import {
+    _clearNativeQueueTimer,
+    _createNativeQueueResource,
+    type NativeQueueResource,
+} from "../utils/native-queue-resource";
 
 type TimerOptions = { signal?: AbortSignal };
 
@@ -15,6 +20,11 @@ const os = import.meta.use('os');
 const timer = import.meta.use('timers');
 const streams = import.meta.use('streams');
 const console = import.meta.use('console');
+
+// Preserve the engine's job boundary before installing the Web API wrapper.
+// Promise reactions use the unhandled-rejection path for thrown callbacks;
+// queueMicrotask jobs must instead reach the runtime JOB_EXCEPTION dispatch.
+const nativeQueueMicrotask = globalThis.queueMicrotask;
 
 const NativeError = globalThis.Error;
 const nativeCaptureStackTrace = NativeError.captureStackTrace;
@@ -696,43 +706,89 @@ if (typeof nativeBtoa === 'function') {
 
 
 class TimeoutOrInterval extends Number {
-    #cleared = false;
+    private fd = 0;
+    #resource: NativeQueueResource;
+    #active = false;
+    #refed = true;
 
-    // `schedule` re-arms the same wrapper (args included) for refresh().
+    static schedule(
+        isInterval: boolean,
+        callback: TimerCallback,
+        ms: number,
+        args: unknown[],
+    ): TimeoutOrInterval {
+        const run = () => runTimerCallback(callback, args);
+        return new TimeoutOrInterval(run, typeof callback === 'function' ? callback : run, isInterval, ms);
+    }
+
     constructor(
-        private fd: number,
-        readonly _onTimeout: () => void,
-        private readonly schedule?: () => number,
+        callback: () => void,
+        onTimeout: () => void,
+        private readonly isInterval: boolean,
+        private readonly ms: number,
     ) {
-        super(fd);
+        super(0);
+        this._onTimeout = onTimeout;
+        this.#resource = _createNativeQueueResource(isInterval ? 'Interval' : 'Timeout', callback, {
+            resource: this,
+            clearNative: timer.clearTimeout,
+            repeat: isInterval,
+            refreshable: true,
+            onCancel: () => {
+                this.#active = false;
+                this._onTimeout = null;
+            },
+            onStart: resource => {
+                this.#resource = resource;
+                const schedule = this.isInterval ? timer.setInterval : timer.setTimeout;
+                this.fd = schedule(() => this.#fire(), this.ms);
+                resource.bind(this.fd);
+                this.#active = true;
+                if (!this.#refed) timer.unrefTimer(this.fd);
+            },
+        });
+    }
+
+    _onTimeout: (() => void) | null;
+
+    #fire(): void {
+        if (!this.isInterval) {
+            this.#refed = timer.hasRef(this.fd);
+            this.#active = false;
+        }
+        this.#resource.invoke(globalThis, []);
     }
 
     close() {
-        this.#cleared = true;
-        timer.clearTimeout(this.fd);
+        _clearNativeQueueTimer(this);
         return this;
     }
 
     ref() {
-        timer.refTimer(this.fd);
+        this.#refed = true;
+        if (this.#active) timer.refTimer(this.fd);
         return this;
     }
 
     unref() {
-        timer.unrefTimer(this.fd);
+        this.#refed = false;
+        if (this.#active) timer.unrefTimer(this.fd);
         return this;
     }
 
     hasRef() {
-        return timer.hasRef(this.fd);
+        if (this.#active) this.#refed = timer.hasRef(this.fd);
+        return this.#refed;
     }
 
     refresh() {
-        // Node restarts the countdown; a cleared timer stays cleared.
-        if (this.#cleared || !this.schedule) return this;
-        timer.clearTimeout(this.fd);
-        this.fd = this.schedule();
+        if (this.#active) this.#refed = timer.hasRef(this.fd);
+        this.#resource.refresh();
         return this;
+    }
+
+    valueOf() {
+        return this.fd;
     }
 
     [Symbol.toPrimitive]() {
@@ -749,25 +805,64 @@ class TimeoutOrInterval extends Number {
 }
 
 class Immediate extends Number {
-    constructor(private fd: number, readonly _onImmediate: () => void) {
-        super(fd);
+    private fd = 0;
+    _destroyed = false;
+    _onImmediate: (() => void) | null;
+    #resource: NativeQueueResource;
+
+    static schedule(callback: (...args: unknown[]) => void, args: unknown[]): Immediate {
+        return new Immediate(callback, args);
+    }
+
+    #markDestroyed(): void {
+        this._destroyed = true;
+        this._onImmediate = null;
+    }
+
+    constructor(
+        onImmediate: () => void,
+        args: unknown[],
+    ) {
+        super(0);
+        this._onImmediate = onImmediate;
+        this.#resource = _createNativeQueueResource('Immediate', onImmediate, {
+            resource: this,
+            clearNative: timer.clearImmediate,
+            onCancel: () => this.#markDestroyed(),
+            onStart: resource => {
+                this.#resource = resource;
+                this.fd = timer.setImmediate(() => {
+                    this.#markDestroyed();
+                    resource.invoke(this, args);
+                });
+                resource.bind(this.fd);
+            },
+        });
     }
 
     close() {
-        timer.clearTimeout(this.fd);
+        _clearNativeQueueTimer(this, 'Immediate');
         return this;
     }
 
     ref() {
+        if (this._destroyed) return this;
+        timer.refImmediate(this.fd);
         return this;
     }
 
     unref() {
+        if (this._destroyed) return this;
+        timer.unrefImmediate(this.fd);
         return this;
     }
 
     hasRef() {
-        return false;
+        return !this._destroyed && timer.hasRefImmediate(this.fd);
+    }
+
+    valueOf() {
+        return this.fd;
     }
 
     [Symbol.toPrimitive]() {
@@ -791,12 +886,6 @@ function toTimerDelay(value: unknown): number {
     return number;
 }
 
-function toTimerId(value: unknown): number {
-    if (value === undefined || value === null) return 0;
-    if (typeof value === 'bigint') throw new TypeError('Cannot convert a BigInt value to a number');
-    return Number(value);
-}
-
 function runTimerCallback(callback: TimerCallback, args: unknown[]): void {
     if (typeof callback === 'function') {
         callback.apply(globalThis, args);
@@ -806,77 +895,93 @@ function runTimerCallback(callback: TimerCallback, args: unknown[]): void {
 }
 
 function setTimeout(this: unknown, cb: TimerCallback, delay?: number | undefined, ...args: unknown[]) {
-    const ms = toTimerDelay(delay);
-    const run = () => runTimerCallback(cb, args);
-    return new TimeoutOrInterval(
-        timer.setTimeout(run, ms),
-        typeof cb === 'function' ? cb : run,
-        () => timer.setTimeout(run, ms),
-    );
+    return TimeoutOrInterval.schedule(false, cb, toTimerDelay(delay), args);
 }
 Object.defineProperty(setTimeout, 'length', { value: 1, configurable: true });
 Reflect.set(globalThis, 'setTimeout', setTimeout);
 const setTimeoutPromisified = <T = void>(delay?: number | undefined, value?: T | undefined, options?: TimerOptions | undefined): Promise<T> => new Promise((rs, rj) => {
     const ms = toTimerDelay(delay);
-    if (options?.signal?.aborted) {
-        rj(options.signal.reason ?? new DOMException('The operation was aborted', 'AbortError'));
+    const signal = options?.signal;
+    if (signal?.aborted) {
+        rj(signal.reason ?? new DOMException('The operation was aborted', 'AbortError'));
         return;
     }
-    let fd = 0;
+    let resource: NativeQueueResource | undefined;
+    let settled = false;
+    const cleanup = () => signal?.removeEventListener('abort', onAbort);
     const onAbort = () => {
-        timer.clearTimeout(fd);
-        rj(options?.signal?.reason ?? new DOMException('The operation was aborted', 'AbortError'));
+        if (settled) return;
+        settled = true;
+        try {
+            rj(signal?.reason ?? new DOMException('The operation was aborted', 'AbortError'));
+        } catch (error) {
+            rj(error);
+        } finally {
+            resource?.cancel();
+        }
     };
-    fd = timer.setTimeout(() => {
-        options?.signal?.removeEventListener('abort', onAbort);
-        rs(value as T);
-    }, ms);
-    if (options?.signal) {
-        options.signal.addEventListener('abort', onAbort, { once: true });
+    try {
+        const entry = resource = _createNativeQueueResource('Timeout', () => {
+            settled = true;
+            try {
+                cleanup();
+                rs(value as T);
+            } catch (error) {
+                rj(error);
+            }
+        }, { clearNative: timer.clearTimeout, onCancel: cleanup });
+        if (signal?.aborted) {
+            onAbort();
+            return;
+        }
+        entry.bind(timer.setTimeout(() => entry.invoke(globalThis, []), ms));
+        signal?.addEventListener('abort', onAbort, { once: true });
+        if (signal?.aborted) onAbort();
+    } catch (error) {
+        settled = true;
+        rj(error);
+        resource?.cancel();
     }
 });
 Reflect.set(setTimeout, '__promisify__', setTimeoutPromisified);
 Reflect.set(setTimeout, Symbol.for('nodejs.util.promisify.custom'), setTimeoutPromisified);
 
+function clearGlobalTimer(id: unknown): void {
+    if (typeof id === 'bigint') throw new TypeError('Cannot convert a BigInt value to a number');
+    _clearNativeQueueTimer(id);
+}
+
 function clearTimeout(this: unknown, id?: unknown) {
-    const timerId = toTimerId(id);
-    if (!timerId) return;
-    timer.clearTimeout(timerId);
+    clearGlobalTimer(id);
 }
 Object.defineProperty(clearTimeout, 'length', { value: 0, configurable: true });
 Reflect.set(globalThis, 'clearTimeout', clearTimeout);
 
 function setInterval(this: unknown, cb: TimerCallback, timeout?: number, ...args: unknown[]) {
-    const ms = toTimerDelay(timeout);
-    const run = () => runTimerCallback(cb, args);
-    return new TimeoutOrInterval(
-        timer.setInterval(run, ms),
-        typeof cb === 'function' ? cb : run,
-        () => timer.setInterval(run, ms),
-    );
+    return TimeoutOrInterval.schedule(true, cb, toTimerDelay(timeout), args);
 }
 Object.defineProperty(setInterval, 'length', { value: 1, configurable: true });
 Reflect.set(globalThis, 'setInterval', setInterval);
 
 function clearInterval(this: unknown, id?: unknown) {
-    const timerId = toTimerId(id);
-    if (!timerId) return;
-    timer.clearTimeout(timerId);
+    clearGlobalTimer(id);
 }
 Object.defineProperty(clearInterval, 'length', { value: 0, configurable: true });
 Reflect.set(globalThis, 'clearInterval', clearInterval);
 
+// Native check-phase immediates (mod_timers.c): they run after the poll
+// phase of a loop pass, so work started here sees setTimeout(0) listeners
+// attach before threadpool completions are delivered — and Node's ordering
+// guarantees around setImmediate vs setTimeout(0) hold.
 Reflect.set(globalThis, 'setImmediate', function(cb: (...args: unknown[]) => void, ...args: unknown[]) {
     if (typeof cb !== 'function') {
         throw new TypeError('callback must be a function');
     }
-    const fd = timer.setTimeout(() => cb(...args), 0);
-    return new Immediate(fd, cb);
+    return Immediate.schedule(cb, args);
 });
 
 Reflect.set(globalThis, 'clearImmediate', function(id: Immediate | number | undefined) {
-    if (!id) return;
-    timer.clearTimeout(Number(id));
+    _clearNativeQueueTimer(id, 'Immediate');
 });
 
 globalThis.structuredClone = function(v, opt){
@@ -892,7 +997,17 @@ globalThis.queueMicrotask = function(callback: () => void) {
     if (typeof callback !== 'function') {
         throw new TypeError('callback is not a function');
     }
-    Promise.resolve().then(() => callback());
+    const resource = _createNativeQueueResource('Microtask', callback);
+    try {
+        nativeQueueMicrotask(() => resource.invoke(undefined, []));
+    } catch (error) {
+        try {
+            resource.cancel();
+        } catch {
+            // Preserve the enqueue failure after releasing the async resource.
+        }
+        throw error;
+    }
 };
 
 globalThis.reportError = function(e) {

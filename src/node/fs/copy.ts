@@ -1,7 +1,7 @@
-import { matchesErrnoCode } from '../_internal/errno';
+import { matchesErrnoCode } from '../../utils/errno';
 import { normalizeFsErrnoError as normalizeErrnoError, wrapFsPromise as wrapPromise, wrapSync } from './errno-fix';
 import path from '../path';
-import { assertCopyFileMode, mkdirRecursive, mkdirRecursiveSync } from './utils';
+import { mkdirRecursive, mkdirRecursiveSync } from './utils';
 import { withCode } from '../_internal/errors';
 
 const { dirname, isAbsolute, join, parse, relative, resolve } = path;
@@ -234,8 +234,7 @@ async function copyAsyncFile(
         await wrapPromise(asfs.unlink(destination), 'unlink', destination);
     }
 
-    assertCopyFileMode(source, destination, options.mode);
-    await wrapPromise(asfs.copyFile(source, destination), 'copyfile', source, destination);
+    await wrapPromise(asfs.copyFile(source, destination, options.mode), 'copyfile', source, destination);
     if (options.preserveTimestamps) {
         if ((sourceStat.mode & 0o200) === 0) {
             await wrapPromise(asfs.chmod(destination, sourceStat.mode | 0o200), 'chmod', destination);
@@ -267,10 +266,7 @@ function copySyncFile(
         wrapSync(() => fs.unlink(destination), 'unlink', destination);
     }
 
-    wrapSync(() => {
-        assertCopyFileMode(source, destination, options.mode);
-        fs.copy(source, destination);
-    }, 'copyfile', source, destination);
+    wrapSync(() => fs.copy(source, destination, options.mode), 'copyfile', source, destination);
     if (options.preserveTimestamps) {
         if ((sourceStat.mode & 0o200) === 0) {
             wrapSync(() => fs.chmod(destination, sourceStat.mode | 0o200), 'chmod', destination);
