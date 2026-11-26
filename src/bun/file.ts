@@ -1,4 +1,4 @@
-import { arrayBufferBackedBytes, sanitizeSurrogates } from '../utils/bytes';
+import { arrayBufferBackedBytes, nativeLittleEndian, sanitizeSurrogates, utf8Decode } from '../utils/bytes';
 import { basename, dirname, join, toFsPath } from '../utils/path';
 import { ensureDirectory } from '../utils/fs-path';
 import { blobBytesOf } from './blob-intrinsics';
@@ -21,7 +21,7 @@ const MISSING_LAST_MODIFIED = 2 ** 52 - 1;
 type FileBacking =
     | { readonly kind: 'path'; readonly path: string }
     | { readonly kind: 'fd'; readonly fd: number };
-const fileBackings = new WeakMap<BunFile, FileBacking>();
+const fileBackings = new WeakMap<object, FileBacking>();
 const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
 const typedArrayBuffer = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'buffer')!.get!;
 const typedArrayByteOffset = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteOffset')!.get!;
@@ -115,7 +115,7 @@ interface FileOptions {
 
 /** Internal, realm-stable BunFile brand check for other Bun polyfills. */
 export function isBunFile(value: unknown): value is BunFile {
-    return isObject(value) && fileBackings.has(value as BunFile);
+    return isObject(value) && fileBackings.has(value);
 }
 
 function isObject(value: unknown): value is Record<PropertyKey, unknown> {
@@ -524,7 +524,7 @@ export class BunFile extends Blob implements BunFileLike {
     // Construction stays lazy; only this explicit protocol hook performs sync I/O.
     [blobBytesSymbol](): Uint8Array<ArrayBuffer> {
         if (this.#backing.kind === 'fd') {
-            return this.#readBorrowedSync();
+            return this.#readBorrowedSync(this.#backing.fd);
         }
         const fd = fs.open(this.#backing.path, 'r');
         try {
@@ -590,7 +590,7 @@ export class BunFile extends Blob implements BunFileLike {
         return borrowedBodyStream(this.#backing.fd);
     }
 
-    #readBorrowedSync(): Uint8Array<ArrayBuffer> {
+    #readBorrowedSync(fd: number): Uint8Array<ArrayBuffer> {
         if (this.#hasSlices()) {
             throw new TypeError(
                 'Reading a sliced Bun.file(fd) as a body is unsupported because this runtime cannot seek a borrowed descriptor',
@@ -601,9 +601,9 @@ export class BunFile extends Blob implements BunFileLike {
         while (true) {
             const buffer = new Uint8Array(BUN_FILE_CHUNK_SIZE);
             const count = wrapSyncFs(
-                () => fs.read(this.#backing.fd, buffer),
+                () => fs.read(fd, buffer),
                 'read',
-                `fd:${this.#backing.fd}`,
+                `fd:${fd}`,
             );
             if (count <= 0) break;
             const chunk = buffer.slice(0, count);
@@ -614,7 +614,7 @@ export class BunFile extends Blob implements BunFileLike {
     }
 
     async bytes(): Promise<Uint8Array<ArrayBuffer>> {
-        if (this.#backing.kind === 'fd') return this.#readBorrowedSync();
+        if (this.#backing.kind === 'fd') return this.#readBorrowedSync(this.#backing.fd);
         const reader = this.stream().getReader();
         const chunks: Uint8Array<ArrayBuffer>[] = [];
         let length = 0;
@@ -640,8 +640,21 @@ export class BunFile extends Blob implements BunFileLike {
 
     async text(): Promise<string> {
         const bytes = await this.bytes();
-        const decoder = import.meta.use('text').Decoder;
-        return new decoder().decode(bytes);
+        if (bytes.byteLength > 2 && bytes[0] === 0xff && bytes[1] === 0xfe) {
+            const length = Math.floor((bytes.byteLength - 2) / 2);
+            const offset = bytes.byteOffset + 2;
+            if (nativeLittleEndian && offset % 2 === 0) {
+                return engine.decodeU16String(new Uint16Array(bytes.buffer, offset, length));
+            }
+            const units = new Uint16Array(length);
+            for (let index = 0; index < length; index++) {
+                units[index] = bytes[index * 2 + 2] | (bytes[index * 2 + 3] << 8);
+            }
+            return engine.decodeU16String(units);
+        }
+        return utf8Decode(bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf
+            ? bytes.subarray(3)
+            : bytes);
     }
 
     formData(): Promise<FormData> {
