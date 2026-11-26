@@ -1,4 +1,9 @@
 ﻿import { EventEmitter } from '../events';
+import {
+    _createNativeQueueResource,
+    _getNativeNextTickState,
+    type NativeNextTickEntry,
+} from '../../utils/native-queue-resource';
 import { IPCChannel, type IPCSerialization } from '../ipc_channel';
 import { stdout, stderr, stdin } from './streams';
 import { hrtime, memoryUsage, cpuUsage, resourceUsage } from './metrics';
@@ -484,38 +489,9 @@ function emitUserProcessEvent(event: string | symbol, ...args: unknown[]): boole
     const emit = uncaughtCaptureState.rawEmit ?? processEE.emit;
     return Reflect.apply(emit, processEE, [event, ...args]);
 }
-// Baked and cache copies share one queue because the native drain hook is single-slot.
-const NEXT_TICK_SLOT = Symbol.for('cno.node.process.nextTickQueue.v1');
+const tickState = _getNativeNextTickState();
 
-type NextTickEntry = { callback: NextTickCallback; args: unknown[] };
-type NextTickState = {
-    queue: NextTickEntry[];
-    scheduled: boolean;
-    draining: boolean;
-    nativeInstalled: boolean;
-};
-
-function resolveNextTickState(): NextTickState {
-    const fresh: NextTickState = {
-        queue: [],
-        scheduled: false,
-        draining: false,
-        nativeInstalled: false,
-    };
-    try {
-        const slots = globalThis as unknown as Record<symbol, NextTickState | undefined>;
-        const existing = slots[NEXT_TICK_SLOT];
-        if (existing && Array.isArray(existing.queue)) return existing;
-        slots[NEXT_TICK_SLOT] = fresh;
-    } catch {
-        // A frozen global falls back to per-copy scheduling.
-    }
-    return fresh;
-}
-
-const tickState: NextTickState = resolveNextTickState();
-
-const nextTickQueue: NextTickEntry[] = tickState.queue;
+const nextTickQueue: NativeNextTickEntry[] = tickState.queue;
 
 function drainNextTickQueue(): void {
     tickState.draining = true;
@@ -702,9 +678,12 @@ function installNativeTickDrain(): boolean {
 function scheduleNextTickDrain(): void {
     if (tickState.scheduled) return;
     tickState.scheduled = true;
-    queueMicrotask(drainNextTickQueue);
-    if (nativeTickDrain && !tickState.draining) {
-        (engine as unknown as NextTickEngineHook).notifyNextTick!();
+    if (nativeTickDrain) {
+        if (!tickState.draining) {
+            (engine as unknown as NextTickEngineHook).notifyNextTick!();
+        }
+    } else if (!tickState.draining) {
+        queueMicrotask(drainNextTickQueue);
     }
 }
 
@@ -1370,7 +1349,11 @@ export function nextTick(callback: NextTickCallback, ...args: unknown[]): void {
     if (typeof callback !== 'function') {
         throw new TypeError('The "callback" argument must be of type Function');
     }
-    nextTickQueue.push({ callback, args });
+    const resource = _createNativeQueueResource('TickObject', callback);
+    nextTickQueue.push({
+        callback: (...callbackArgs: unknown[]) => { resource.invoke(undefined, callbackArgs); },
+        args,
+    });
     scheduleNextTickDrain();
 }
 
