@@ -255,6 +255,7 @@ export function parseSpawn(input: unknown, second?: unknown): ParsedSpawnOptions
         windowsVerbatimArguments: optionalBoolean(options.windowsVerbatimArguments),
         onExit: typeof options.onExit === 'function' ? options.onExit as ParsedSpawnOptions['onExit'] : undefined,
         signal: signal as AbortSignal | undefined,
+        lazy: options.lazy === true,
         timeout: optionalTimeout(options.timeout),
         killSignal: optionalSignal(options.killSignal),
         maxBuffer: optionalMaxBuffer(options.maxBuffer),

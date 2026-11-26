@@ -23,6 +23,7 @@ import type {
 } from './types';
 
 const processBinding = import.meta.use('process');
+const timers = import.meta.use('timers');
 
 function nativeOptions(options: ParsedSpawnOptions, stdinPipe: boolean): CModuleProcess.SpawnOptions<false> {
     return {
@@ -74,12 +75,14 @@ function callbackFailure(error: unknown): void {
 
 // Timer delays above this overflow to 1ms and would fire immediately.
 const MAX_TIMER_DELAY = 2 ** 31 - 1;
+type ProcessOutput = ReadableStream<Uint8Array<ArrayBuffer>> | number | undefined;
 
 class SubprocessImpl {
     #native: CModuleProcess.ChildProcess;
     #stdin: FileSink | ReadableStream<Uint8Array> | number | undefined;
-    #stdout: ReadableStream<Uint8Array<ArrayBuffer>> | number | undefined;
-    #stderr: ReadableStream<Uint8Array<ArrayBuffer>> | number | undefined;
+    #outputs: [ProcessOutput, ProcessOutput] = [undefined, undefined];
+    #outputPipes: [CModuleProcess.Pipe | undefined, CModuleProcess.Pipe | undefined] = [undefined, undefined];
+    #bufferGuard: (() => (length: number) => void) | undefined;
     #pid: number;
     #exited: Promise<number>;
     #exitCode: number | null = null;
@@ -102,7 +105,7 @@ class SubprocessImpl {
 
         // maxBuffer is per stream, like Bun: exceeding it kills the child.
         const limit = options.maxBuffer;
-        const bufferGuard = limit === undefined ? undefined : () => {
+        this.#bufferGuard = limit === undefined ? undefined : () => {
             let total = 0;
             return (length: number) => {
                 total += length;
@@ -111,16 +114,20 @@ class SubprocessImpl {
                 }
             };
         };
-        if (native.stdout) this.#stdout = readablePipe(native.stdout, bufferGuard?.());
-        else if (typeof options.stdout === 'number') this.#stdout = options.stdout;
-        if (native.stderr) this.#stderr = readablePipe(native.stderr, bufferGuard?.());
-        else if (typeof options.stderr === 'number') this.#stderr = options.stderr;
+        if (native.stdout) {
+            if (options.lazy) this.#outputPipes[0] = native.stdout;
+            else this.#outputs[0] = readablePipe(native.stdout, this.#bufferGuard?.());
+        } else if (typeof options.stdout === 'number') this.#outputs[0] = options.stdout;
+        if (native.stderr) {
+            if (options.lazy) this.#outputPipes[1] = native.stderr;
+            else this.#outputs[1] = readablePipe(native.stderr, this.#bufferGuard?.());
+        } else if (typeof options.stderr === 'number') this.#outputs[1] = options.stderr;
 
         const onExit = options.onExit;
         this.#exited = native.wait().then((info) => {
             this.#finished = true;
             if (info.term_signal) {
-                this.#signalCode = nativeSignalName(info.term_signal) as BunSignal | null;
+                this.#signalCode = (nativeSignalName(info.term_signal) as NodeJS.Signals | null) ?? info.term_signal;
                 this.#exitCode = null;
             } else {
                 this.#exitCode = info.exit_status;
@@ -149,11 +156,11 @@ class SubprocessImpl {
             throw error;
         });
 
-        let timeout: ReturnType<typeof setTimeout> | undefined;
+        let timeout: number | undefined;
         if (options.timeout !== undefined && options.timeout > 0) {
             const arm = (remaining: number): void => {
                 const step = Math.min(remaining, MAX_TIMER_DELAY);
-                timeout = setTimeout(() => {
+                timeout = timers.setTimeout(() => {
                     if (remaining > step) arm(remaining - step);
                     else {
                         try { this.kill(options.killSignal); } catch (error) { callbackFailure(error); }
@@ -169,7 +176,7 @@ class SubprocessImpl {
             : undefined;
         options.signal?.addEventListener('abort', abort!, { once: true });
         void this.#exited.finally(() => {
-            if (timeout !== undefined) clearTimeout(timeout);
+            if (timeout !== undefined) timers.clearTimeout(timeout);
             if (abort) options.signal?.removeEventListener('abort', abort);
         }).catch(() => {});
 
@@ -180,10 +187,19 @@ class SubprocessImpl {
         }
     }
 
+    #outputStream(index: 0 | 1): ProcessOutput {
+        const pipe = this.#outputPipes[index];
+        if (pipe) {
+            this.#outputs[index] = readablePipe(pipe, this.#bufferGuard?.());
+            this.#outputPipes[index] = undefined;
+        }
+        return this.#outputs[index];
+    }
+
     get stdin(): FileSink | ReadableStream<Uint8Array> | number | undefined { return this.#stdin; }
-    get stdout(): ReadableStream<Uint8Array<ArrayBuffer>> | number | undefined { return this.#stdout; }
-    get stderr(): ReadableStream<Uint8Array<ArrayBuffer>> | number | undefined { return this.#stderr; }
-    get readable(): ReadableStream<Uint8Array<ArrayBuffer>> | number | undefined { return this.#stdout; }
+    get stdout(): ProcessOutput { return this.#outputStream(0); }
+    get stderr(): ProcessOutput { return this.#outputStream(1); }
+    get readable(): ProcessOutput { return this.#outputStream(0); }
     get writable(): FileSink | ReadableStream<Uint8Array> | number | undefined { return this.#stdin; }
     get terminal(): undefined { return undefined; }
     get stdio(): [null, null, null] { return this.#stdio; }
@@ -283,7 +299,7 @@ function spawnSyncImpl(input: unknown, options?: unknown): BunSyncSubprocess {
     }
     if (result.error) throw normalizeErrnoError(result.error, 'posix_spawn', command);
 
-    const signalCode = nativeSignalName(result.signal) as BunSignal | null;
+    const signalCode = nativeSignalName(result.signal) ?? result.signal;
     const exitCode = signalCode === null ? (result.status ?? 0) : null;
     const output: Record<string, unknown> = { exitCode };
     if (signalCode !== null) output.signalCode = signalCode;

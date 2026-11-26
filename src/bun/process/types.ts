@@ -75,6 +75,7 @@ export interface ParsedSpawnOptions {
     windowsVerbatimArguments?: boolean;
     onExit?: BunSpawnOptions['onExit'];
     signal?: AbortSignal;
+    lazy: boolean;
     timeout?: number;
     killSignal?: BunSignal;
     maxBuffer?: number;
