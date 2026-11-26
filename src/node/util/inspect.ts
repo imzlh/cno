@@ -1779,7 +1779,7 @@ function toPublicOptions(ctx: Ctx): InspectOptions {
 // Public API
 // ---------------------------------------------------------------------------
 
-interface InspectFn {
+export interface InspectFn {
     (value: unknown, opts?: InspectOptions): string;
     (value: unknown, showHidden?: boolean, depth?: number | null, colors?: boolean): string;
     custom: symbol;

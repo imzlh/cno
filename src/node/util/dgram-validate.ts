@@ -4,7 +4,8 @@
  */
 
 const engine = import.meta.use('engine');
-const uverror = import.meta.use('error');
+
+import { errnoCode } from '../../utils/errno';
 
 type CodedError<T extends Error> = T & { code: string };
 
@@ -30,15 +31,14 @@ export function errnoError(
     syscall: string,
     detail?: { address: string; port?: number },
 ): NodeJS.ErrnoException {
-    const table = uverror.errno as unknown as Record<string, number | undefined>;
     const where = detail === undefined
         ? ''
         : ` ${detail.port ? `${detail.address}:${detail.port}` : detail.address}`;
     const err: NodeJS.ErrnoException & { address?: string; port?: number } =
         new Error(`${syscall} ${code}${where}`);
     err.code = code;
-    const errno = Reflect.get(table, code);
-    if (typeof errno === 'number') err.errno = errno;
+    const errno = errnoCode(code);
+    if (errno !== undefined) err.errno = errno;
     err.syscall = syscall;
     if (detail) {
         err.address = detail.address;
@@ -161,6 +161,12 @@ export function viewToBytes(view: ArrayBufferView): Uint8Array {
         : new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
 }
 
+export function normalizeBuffer(msg: unknown): Uint8Array {
+    if (typeof msg === 'string') return engine.encodeString(msg);
+    if (!isView(msg)) throw invalidBufferArg('buffer', msg);
+    return viewToBytes(msg);
+}
+
 function invalidBufferArg(name: string, value: unknown): TypeError & { code: string } {
     return invalidArgType(
         `The "${name}" argument must be of type string or an instance of Buffer, `
@@ -207,9 +213,7 @@ export function validateBufferList(msg: unknown): void {
 
 export function normalizeMessage(msg: unknown): Uint8Array[] {
     if (!Array.isArray(msg)) {
-        if (typeof msg === 'string') return [engine.encodeString(msg)];
-        if (!isView(msg)) throw invalidBufferArg('buffer', msg);
-        return [viewToBytes(msg)];
+        return [normalizeBuffer(msg)];
     }
     const list = fixBufferList(msg);
     if (list === null) throw invalidBufferArg('buffer list arguments', msg);
