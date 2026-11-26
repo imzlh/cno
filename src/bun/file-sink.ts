@@ -1,4 +1,5 @@
 import { arrayBufferBackedBytes, sanitizeSurrogates, toOwnedBytes } from '../utils/bytes';
+import { wrapSync } from '../node/fs/errno-fix';
 
 const engine = import.meta.use('engine');
 const fs = import.meta.use('fs');
@@ -85,13 +86,12 @@ function pathTarget(path: string): SinkTarget {
     let position = 0;
     return {
         // Bun's FileSink overwrites from byte zero without truncating a longer
-        // existing file. Create missing files, then reopen read/write.
+        // existing file and does not require read permission.
         open() {
-            if (!fs.exists(path)) fs.close(fs.open(path, 'w', 0o664));
-            return fs.open(path, 'r+');
+            return wrapSync(() => fs.open(path, fs.OPEN_WRONLY | fs.OPEN_CREAT | fs.OPEN_NONBLOCK, 0o664), 'open', path);
         },
         write(fd, bytes) {
-            const written = fs.pwrite(fd, bytes, position);
+            const written = wrapSync(() => fs.pwrite(fd, bytes, position), 'write', path);
             position += written;
             return written;
         },
@@ -102,7 +102,7 @@ function pathTarget(path: string): SinkTarget {
 function fdTarget(fd: number): SinkTarget {
     return {
         open: () => fd,
-        write: (targetFd, bytes) => fs.write(targetFd, bytes),
+        write: (targetFd, bytes) => wrapSync(() => fs.write(targetFd, bytes), 'write'),
         close: () => {
             // stdio descriptors are process-owned and never closed here.
         },
