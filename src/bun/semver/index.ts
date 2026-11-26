@@ -7,6 +7,8 @@ const identifier = '[0-9A-Za-z-]+';
 const looseIdentifier = '[0-9A-Za-z-]*';
 const looseIdentifiers = `${looseIdentifier}(?:\\.${looseIdentifier})*`;
 const versionPattern = new RegExp(`^[v=]*(\\d+|[xX*])(?:\\.(\\d+|[xX*]))?(?:\\.(\\d+|[xX*]))?(?:-(${looseIdentifiers})|(${identifier}(?:\\.${looseIdentifier})*))?(?:\\+(${looseIdentifiers}))?$`);
+const maxComponent = 18_446_744_073_709_551_615n;
+const maxComponentText = String(maxComponent);
 
 function parse(input: string, partial: boolean, range = false): PartialVersion | null {
     let text = input.trim();
@@ -18,8 +20,11 @@ function parse(input: string, partial: boolean, range = false): PartialVersion |
     let wildcard = false;
     for (const part of m.slice(1, 4)) {
         if (part === undefined || /^[xX*]$/.test(part)) wildcard = true;
-        else if (wildcard) continue;
-        else parts.push(BigInt(part));
+        else {
+            const value = BigInt(part);
+            if (!range && value > maxComponent) return null;
+            if (!wildcard) parts.push(value);
+        }
     }
     const preText = m[4] ?? m[5];
     const pre = preText ? preText.split('.') : [];
@@ -31,9 +36,17 @@ function parse(input: string, partial: boolean, range = false): PartialVersion |
 function full(p: PartialVersion): Version {
     return { parts: [p.parts[0] ?? 0n, p.parts[1] ?? 0n, p.parts[2] ?? 0n], pre: p.pre };
 }
-function compareNumber(a: string, b: string): Ordering {
+function compareNumericIdentifier(a: string, b: string): Ordering {
     a = a.replace(/^0+(?=\d)/, '');
     b = b.replace(/^0+(?=\d)/, '');
+    const aOverflow = a.length > maxComponentText.length
+        || (a.length === maxComponentText.length && a > maxComponentText);
+    const bOverflow = b.length > maxComponentText.length
+        || (b.length === maxComponentText.length && b > maxComponentText);
+    if (aOverflow !== bOverflow) return aOverflow ? 1 : -1;
+    // Bun compares identifiers that overflow its native numeric representation
+    // as strings, rather than as arbitrary-precision decimal integers.
+    if (aOverflow) return a === b ? 0 : a < b ? -1 : 1;
     if (a.length !== b.length) return a.length < b.length ? -1 : 1;
     return a === b ? 0 : a < b ? -1 : 1;
 }
@@ -46,8 +59,13 @@ function compare(a: Version, b: Version): Ordering {
         const x = a.pre[i], y = b.pre[i];
         if (x === undefined || y === undefined) return x === undefined ? -1 : 1;
         if (x === y) continue;
-        const xn = /^\d+$/.test(x), yn = /^\d+$/.test(y);
-        if (xn && yn) return compareNumber(x, y);
+        const xn = /^\d+$/.test(x);
+        const yn = /^\d+$/.test(y);
+        if (xn && yn) {
+            const result = compareNumericIdentifier(x, y);
+            if (result !== 0) return result;
+            continue;
+        }
         if (xn !== yn) return xn ? -1 : 1;
         return x < y ? -1 : 1;
     }
@@ -79,15 +97,19 @@ function expand(op: string, p: PartialVersion): Comparator[] {
     if (op === '>=') return [{ op: '>=', version: v }];
     return [{ op: '>=', version: v }, { op: '<', version: upper(p, n - 1) }];
 }
-function parseRange(range: string): { comparators: Comparator[]; explicit: boolean; invalid: boolean } {
+function parseRange(range: string): { comparators: Comparator[]; explicit: boolean; impossible: boolean } {
     const comparators: Comparator[] = [];
     let explicit = false;
-    let invalid = false;
+    let impossible = false;
     // Hyphen ranges have inclusive lower and upper endpoints, including partials.
     range = range.replace(/([^\s]+)\s+-\s+([^\s]+)/g, (_, lo: string, hi: string) => {
         const a = parse(lo, true, true), b = parse(hi, true, true);
         if (!a || !b) return `${lo} - ${hi}`;
         explicit = true;
+        if (a.parts.some(part => part > maxComponent) || b.parts.some(part => part > maxComponent)) {
+            impossible = true;
+            return '';
+        }
         if (a.parts.length) comparators.push(...expand('>=', a));
         if (b.parts.length) comparators.push(...expand('<=', b));
         return '';
@@ -103,13 +125,17 @@ function parseRange(range: string): { comparators: Comparator[]; explicit: boole
             if (!m[2] && (m[1] === '>' || m[1] === '<' || m[1] === '=' || m[1] === '>=' || m[1] === '<=')) {
                 comparators.push({ op: m[1], version: full({ parts: [], pre: [] }) });
                 explicit = true;
-            } else invalid = true;
+            }
             continue;
         }
         explicit = true;
+        if (p.parts.some(part => part > maxComponent)) {
+            impossible = true;
+            continue;
+        }
         comparators.push(...expand(m[1] || '', p));
     }
-    return { comparators, explicit, invalid };
+    return { comparators, explicit, impossible };
 }
 
 export const order = (v1: unknown, v2: unknown): Ordering => {
@@ -140,6 +166,7 @@ export const satisfies = (version: unknown, range: unknown): boolean => {
     const alternatives = text.split('||');
     const sets = alternatives.map(parseRange);
     const hasNonempty = sets.some(set => set.explicit);
+    if (sets.some(set => set.impossible)) return false;
     return sets.some(set => {
         // Unrecognized text is ignored by Bun's range parser. An invalid-only
         // branch is wildcard-like unless another OR branch contains a range.
