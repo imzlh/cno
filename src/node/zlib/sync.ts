@@ -245,8 +245,14 @@ export function wrapCallback(syncFn: SyncFn, validator: (options?: ZlibOptions |
         const input = new Uint8Array(toUint8Array(buffer));
         validator(opts);
         queueMicrotask(() => {
-            try { cb(null, syncFn(input, opts)); }
-            catch (err) { cb(asError(err)); }
+            let result: Buffer | ZlibInfoResult;
+            try {
+                result = syncFn(input, opts);
+            } catch (err) {
+                cb(asError(err));
+                return;
+            }
+            cb(null, result);
         });
     };
 }
