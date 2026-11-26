@@ -2,20 +2,17 @@
  * Node.js child_process module - the async `spawn` entry point.
  */
 
-const proc = import.meta.use('process');
-const os = import.meta.use('os');
-
+import { errorCode, matchesErrnoCode } from '../../utils/errno';
 import { type IPCSerialization } from '../ipc_channel';
+import { clearTimeout, setTimeout } from '../timers';
 import { buildShellInvocation } from './_shared';
 import { ChildProcessImpl } from './child';
 import {
-    getImmediateSpawnError,
     isBatchFileCommand,
     makeBatchFileError,
     normalizeEnv,
     normalizeSpawnArgs,
     normalizeSpawnFailure,
-    resolveCommandForCwd,
 } from './command';
 import type { ChildProcess, SpawnOptions } from './types';
 import {
@@ -25,6 +22,9 @@ import {
     validateStdioFdRedirects,
     validateTimeout,
 } from './validate';
+
+const proc = import.meta.use('process');
+const os = import.meta.use('os');
 
 export function spawn(command: string): ChildProcess;
 export function spawn(command: string, options: SpawnOptions): ChildProcess;
@@ -91,12 +91,6 @@ export function spawn(command: string, argsOrOptions?: string[] | SpawnOptions, 
         ...((spawnOpts.stdioExtra ?? []) as (string | undefined)[]),
     ];
 
-    const immediateError = getImmediateSpawnError(command, 'spawn', opts.cwd, args);
-    if (immediateError) {
-        child._failSpawn(immediateError, failStdioKinds);
-        return child;
-    }
-
     // Set IPC option in spawn options
     if (ipcFd >= 0) {
         const serialization: IPCSerialization = opts.serialization === 'advanced' ? 'advanced' : 'json';
@@ -117,19 +111,18 @@ export function spawn(command: string, argsOrOptions?: string[] | SpawnOptions, 
 
     let process: CModuleProcess.ChildProcess;
     try {
-        // Only the native argv gets the cwd-resolved path (see resolveCommandForCwd).
-        // spawnfile/spawnargs and every error keep the caller's spec, as Node does:
-        // `spawn('./where.exe', { cwd })` reports spawnfile './where.exe' (measured).
-        process = proc.spawn([resolveCommandForCwd(command, opts.cwd), ...args], spawnOpts);
-        child._init(process, command, args, opts);
+        process = proc.spawn([command, ...args], spawnOpts);
     } catch (err) {
-        // Node's async spawn failure carries the same shape as the sync one,
-        // including `spawnargs` (measured v24.18: [code,errno,path,spawnargs,
-        // syscall] on both). `asError` takes no args and so silently dropped
-        // spawnargs, which execa/cross-spawn read when formatting a failure.
-        child._failSpawn(normalizeSpawnFailure(err, command, 'spawn', opts.cwd, args) as NodeJS.ErrnoException, failStdioKinds);
+        const code = errorCode(err);
+        if (typeof code === 'number' && code < 0
+            && !matchesErrnoCode(err, 'EACCES', 'EAGAIN', 'EMFILE', 'ENFILE', 'ENOENT')) {
+            throw normalizeSpawnFailure(err, undefined, 'spawn');
+        }
+        child._failSpawn(normalizeSpawnFailure(err, command, 'spawn', args), failStdioKinds);
         return child;
     }
+
+    child._init(process, command, args, opts);
 
     // Set up IPC channel if created
     if (ipcFd >= 0 && process.ipc) {

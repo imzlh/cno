@@ -2,20 +2,16 @@
  * Node.js child_process module - spawnSync / execSync / execFileSync.
  */
 
-const proc = import.meta.use('process');
-const nativeError = import.meta.use('error');
-
 import { Buffer } from '../buffer';
 import { buildShellInvocation, decodeOutput } from './_shared';
 import {
-    getImmediateSpawnError,
     isBatchFileCommand,
     makeBatchFileError,
     normalizeEnv,
     normalizeInput,
     normalizeSpawnArgs,
     normalizeSpawnFailure,
-    resolveCommandForCwd,
+    resolveWindowsSyncCommand,
     withRequiredEnvVars,
 } from './command';
 import type { ExecFileOptions, ExecOptions, SpawnOptions, SpawnSyncResult } from './types';
@@ -27,6 +23,9 @@ import {
     validateTimeout,
 } from './validate';
 import { nodeSignalName } from '../_internal/signals';
+
+const proc = import.meta.use('process');
+const nativeError = import.meta.use('error');
 
 export function spawnSync(command: string, options?: SpawnOptions): SpawnSyncResult;
 export function spawnSync(command: string, args?: string[], options?: SpawnOptions): SpawnSyncResult;
@@ -86,17 +85,8 @@ export function spawnSync(command: string, argsOrOptions?: string[] | SpawnOptio
 
     Object.assign(opts, nativeStdioOptions(optsSource.stdio));
 
-    const immediateError = getImmediateSpawnError(command, 'spawnSync', optsSource.cwd, args);
-    if (immediateError) {
-        return {
-            error: immediateError,
-            status: null,
-            signal: null,
-        };
-    }
-
     try {
-        const result = proc.spawnSync(resolveCommandForCwd(command, optsSource.cwd), args, opts);
+        const result = proc.spawnSync(resolveWindowsSyncCommand(command, optsSource.cwd), args, opts);
         // Node defaults spawnSync to raw Buffers — only an explicit encoding
         // (other than 'buffer') turns stdout/stderr into strings.
         const encoding = optsSource.encoding;
@@ -114,7 +104,7 @@ export function spawnSync(command: string, argsOrOptions?: string[] | SpawnOptio
         // (measured: realtime signals); the native wait result carries the raw
         // number, so translate with an empty-string fallback.
         let signal = result.signal === null ? null : nodeSignalName(result.signal) ?? '';
-        let error = result.error ? normalizeSpawnFailure(result.error, command, 'spawnSync', optsSource.cwd, args) : undefined;
+        let error = result.error ? normalizeSpawnFailure(result.error, command, 'spawnSync', args) : undefined;
 
         // Native sync spawn currently captures to completion. Keep the existing
         // chunk-rounded capture limit, but count the combined raw bytes before
@@ -161,7 +151,7 @@ export function spawnSync(command: string, argsOrOptions?: string[] | SpawnOptio
         return syncResult;
     } catch (err) {
         return {
-            error: normalizeSpawnFailure(err, command, 'spawnSync', optsSource.cwd, args),
+            error: normalizeSpawnFailure(err, command, 'spawnSync', args),
             status: null,
             signal: null,
         };

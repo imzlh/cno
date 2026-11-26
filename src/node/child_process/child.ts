@@ -1,11 +1,8 @@
-const nativeError = import.meta.use('error');
-
 import { IPCChannel, type IPCSerialization } from '../ipc_channel';
 import { EventEmitter } from '../events';
 import { closeQuietly } from '../_internal/close';
 import { Writable, Readable, Duplex } from '../stream';
 import {
-    asError,
     clearHeldPipeBytes,
     deliverPipeChunk,
     destroyChildStdin,
@@ -19,6 +16,10 @@ import {
 } from './_shared';
 import type { ChildProcess as ChildProcessInterface, SpawnOptions } from './types';
 import { nodeSignalName, probeProcess } from '../_internal/signals';
+import { matchesErrnoCode } from '../../utils/errno';
+import { normalizeErrnoError } from '../_internal/errno';
+
+const nativeError = import.meta.use('error');
 
 export type ChildProcess = ChildProcessInterface;
 
@@ -242,7 +243,7 @@ ChildProcessImpl.prototype._createReadable = function _createReadable(this: Chil
     // The chunk is delivered without re-entering _read() — see deliverPipeChunk.
     pipe.onread = (data: Uint8Array | null | undefined, err?: unknown) => {
         if (err) {
-            readable.destroy(asError(err));
+            readable.destroy(normalizeErrnoError(err));
             return;
         }
         if (data === null || data === undefined) {
@@ -279,7 +280,7 @@ ChildProcessImpl.prototype._createDuplex = function _createDuplex(this: ChildPro
 
     pipe.onread = (data: Uint8Array | null | undefined, err?: unknown) => {
         if (err) {
-            duplex.destroy(asError(err));
+            duplex.destroy(normalizeErrnoError(err));
             return;
         }
         if (data === null || data === undefined) {
@@ -324,11 +325,7 @@ ChildProcessImpl.prototype._waitExit = async function _waitExit(this: ChildProce
 
 // Windows rejects some signals; retry those as SIGKILL using native errno values.
 function isUnsupportedSignalError(err: unknown): boolean {
-    const code = err instanceof Error ? Reflect.get(err, 'code') : undefined;
-    if (typeof code === 'number') {
-        return code === nativeError.errno.ENOSYS || code === nativeError.errno.EINVAL;
-    }
-    return code === 'ENOSYS' || code === 'EINVAL';
+    return matchesErrnoCode(err, 'ENOSYS', 'EINVAL');
 }
 
 ChildProcessImpl.prototype.kill = function kill(this: ChildProcessImpl, signal?: string | number): boolean {
@@ -415,7 +412,7 @@ ChildProcessImpl.prototype.send = function send(this: ChildProcessImpl, message:
     try {
         this._ipcChannel.send(message);
     } catch (err) {
-        const wrapped = asError(err, 'write');
+        const wrapped = normalizeErrnoError(err, 'write');
         if (cb) queueMicrotask(() => cb(wrapped));
         else queueMicrotask(() => this.emit('error', wrapped));
         return false;

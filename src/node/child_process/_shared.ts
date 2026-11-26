@@ -1,19 +1,14 @@
 // Internal to the module: nothing here is part of the public surface.
 
-const os = import.meta.use('os');
-const engine = import.meta.use('engine');
-
 import { Readable, Writable, type Duplex } from '../stream';
 import { addReadableLength, decoderBytes, flowReadable, scheduleReadableEmit, scheduleReadableFlow, subtractReadableLength } from '../stream/_shared';
 import { viewToUint8Array } from '../_internal/buffer';
-import { normalizeErrnoError } from '../_internal/errno';
 import { Buffer } from '../buffer';
 import { nativeSignalFromNumber, nodeNativeSignalNumber, unknownSignalError } from '../_internal/signals';
 export { flattenPrototype } from '../_internal/prototype';
 
-export function asError(error: unknown, syscall?: string, path?: string): Error {
-    return normalizeErrnoError(error, syscall, path);
-}
+const os = import.meta.use('os');
+const engine = import.meta.use('engine');
 
 // A Readable's pending read ends with each chunk, while the native pipe keeps
 // watching until stopRead(). Track those lifetimes separately to avoid starting
