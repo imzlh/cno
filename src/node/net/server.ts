@@ -187,7 +187,7 @@ function validateListenPort(value: unknown): number {
 Server.prototype.listen = function listen(
     this: Server,
     portOrPathOrOptions?: unknown,
-    ...args: Array<string | number | (() => void)>
+    ...args: Array<string | number | (() => void) | undefined>
 ): Server {
     if (this._listening || this._closing) {
         throw Object.assign(new Error('Listen method has been called more than once without closing'), {
@@ -356,15 +356,16 @@ Server.prototype._acceptLoop = function _acceptLoop(this: Server): Promise<void>
         if (!this._listening) return rs();
 
         const socket = new Socket({ allowHalfOpen: this._allowHalfOpen });
-        socket._tcp = clientTcp;
+        socket._tcp = clientTcp as CModuleStreams.TCP;
         socket.readyState = 'open';
 
-        const localInfo = (clientTcp as CModuleStreams.TCP).sockname;
+        const tcpClient = clientTcp as CModuleStreams.TCP;
+        const localInfo = tcpClient.sockname;
         socket.localAddress = localInfo.ip;
         socket.localPort = localInfo.port;
         socket.localFamily = `IPv${localInfo.family}`;
 
-        const remoteInfo = (clientTcp as CModuleStreams.TCP).peername;
+        const remoteInfo = tcpClient.peername;
         socket.remoteAddress = remoteInfo.ip;
         socket.remotePort = remoteInfo.port;
         socket.remoteFamily = `IPv${remoteInfo.family}`;

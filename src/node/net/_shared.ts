@@ -6,36 +6,22 @@
  * mod.ts re-exports only `isIP` / `isIPv4` / `isIPv6` from here.
  */
 
-const nativeError = import.meta.use('error');
-const os = import.meta.use('os');
-const nativeDns = import.meta.use('dns');
-
 import type { EventEmitter } from '../events';
 import { normalizeErrnoError } from '../_internal/errno';
+import { errnoDescription, errnoName, errorCode, hasErrno, isErrorValue } from '../../utils/errno';
 export { flattenPrototype } from '../_internal/prototype';
 import type { Server, Socket, TcpNetConnectOpts } from './types';
 
 export { closeQuietly } from '../_internal/close';
 
+const os = import.meta.use('os');
+const nativeDns = import.meta.use('dns');
+const nativeError = import.meta.use('error');
+
 export function normalizeTcpHost(host: string): string {
     if (!host || host === '*') return '0.0.0.0';
     if (host === 'localhost') return '127.0.0.1';
     return host;
-}
-
-export function isUnsupportedSocketOption(error: unknown): boolean {
-    return String(error && typeof error === 'object' && 'message' in error ? error.message : error)
-        .includes('Not implemented');
-}
-
-export function isInvalidArgument(error: unknown): boolean {
-    return String(error && typeof error === 'object' && 'message' in error ? error.message : error)
-        .includes('EINVAL');
-}
-
-export function setTcpNoDelay(tcp: CModuleStreams.TCP, enabled: boolean): void {
-    try { tcp.setNoDelay(enabled); }
-    catch (error) { if (!isUnsupportedSocketOption(error)) throw error; }
 }
 
 export function keepAliveDelayToSeconds(delayMs: number): number {
@@ -47,11 +33,10 @@ export function setTcpKeepAlive(tcp: CModuleStreams.TCP, enabled: boolean, delay
     const delay = enabled ? keepAliveDelayToSeconds(delayMs) : 0;
     try { tcp.setKeepAlive(enabled, delay); }
     catch (error) {
-        if (isUnsupportedSocketOption(error)) return;
         // libuv rejects uv_tcp_keepalive(1, 0) with EINVAL on Windows, and Node
         // ignores that return value, so `setKeepAlive(true)` with the default
         // delay is a no-op there rather than a throw.
-        if (enabled && delay === 0 && isInvalidArgument(error)) return;
+        if (enabled && delay === 0 && hasErrno(error, nativeError.errno.EINVAL)) return;
         throw error;
     }
 }
@@ -87,23 +72,21 @@ export function emitErrorQuietly(emitter: EventEmitter, error: Error): void {
 //   listen EADDRINUSE: address already in use 127.0.0.1:49625
 //   listen EACCES: permission denied C:\...\x.sock
 export function toListenError(raw: unknown, address: string, port?: number): Error {
-    const err = normalizeErrnoError(raw, 'listen') as NodeJS.ErrnoException & {
+    if (!isErrorValue(raw)) return new Error(String(raw));
+    const code = errorCode(raw);
+    if (typeof code !== 'number' || !(code < 0)) return raw;
+    const name = errnoName(code);
+    if (name === undefined) return raw;
+    const where = port === undefined ? address : `${address}:${port}`;
+    const err = new Error(`listen ${name}: ${errnoDescription(code)}${where ? ` ${where}` : ''}`) as NodeJS.ErrnoException & {
         address?: string;
         port?: number;
     };
-    const code = typeof err.code === 'string' ? err.code : 'UNKNOWN';
-    let desc = typeof err.errno === 'number' ? nativeError.strerror(err.errno) : '';
-    if (!desc) desc = err.message;
-    // strerror/message already carry a `CODE: ` prefix; keep the readable half.
-    desc = desc.replace(/^[A-Z][A-Z0-9]*:\s*/, '').trim() || 'unknown error';
-    const where = port === undefined ? address : `${address}:${port}`;
-    err.message = `listen ${code}: ${desc}${where ? ` ${where}` : ''}`;
+    err.code = name;
+    err.errno = code;
     err.syscall = 'listen';
     err.address = address;
     if (port !== undefined) err.port = port;
-    // toErrnoException stamps an own `name`; Node's listen errors do not carry
-    // one, so `Object.keys(err)` would otherwise not match upstream.
-    delete (err as { name?: string }).name;
     return err;
 }
 

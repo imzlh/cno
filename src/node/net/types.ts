@@ -3,6 +3,7 @@
 
 import type { EventEmitter } from '../events';
 import type { Duplex } from '../stream';
+import type { setTimeout as nodeSetTimeout } from '../timers';
 
 export interface AddressInfo {
     address: string;
@@ -100,7 +101,7 @@ export interface Socket extends Duplex {
     _address: AddressInfo | null;
     _remoteAddress: AddressInfo | null;
     _timeout: number | null;
-    _timeoutId: ReturnType<typeof setTimeout> | null;
+    _timeoutId: ReturnType<typeof nodeSetTimeout> | null;
     _keepAlive: boolean;
     _keepAliveDelay: number;
     _noDelay: boolean;

@@ -3,7 +3,9 @@ const os = import.meta.use('os');
 const engine = import.meta.use('engine');
 
 import { Duplex } from '../stream';
-import { matchesErrnoCode, normalizeErrnoError } from '../_internal/errno';
+import { clearTimeout, setTimeout } from '../timers';
+import { normalizeErrnoError } from '../_internal/errno';
+import { matchesErrnoCode } from '../../utils/errno';
 import { onNetClientSocket } from '../diagnostics_channel/builtins';
 import {
     abortError,
@@ -16,7 +18,6 @@ import {
     isIPv6,
     resolveConnectAddress,
     setTcpKeepAlive,
-    setTcpNoDelay,
     stopPipeReadQuietly,
     validatePort,
 } from './_shared';
@@ -34,7 +35,7 @@ import type {
 /** Guards net.client.socket against the pipe branch's re-entrant connect(). */
 const kNetClientSocketPublished = Symbol('kNetClientSocketPublished');
 
-type NativeReadResult = Uint8Array<ArrayBuffer> | null | undefined;
+type NativeReadResult = Uint8Array<ArrayBufferLike> | null | undefined;
 type NativeReadError = CModuleError.Error | undefined;
 
 export interface Socket extends SocketShape {}
@@ -208,6 +209,7 @@ function armSocketTimeout(socket: Socket): void {
         socket._timeoutId = null;
         socket.emit('timeout');
     }, socket._timeout);
+    socket._timeoutId.unref();
 }
 
 Socket.prototype.connect = function connect(
@@ -237,14 +239,14 @@ Socket.prototype.connect = function connect(
         if (pipePath !== undefined && pipePath !== null && pipePath !== '') {
             return this.connect(pipePath as string, typeof hostOrCb === 'function' ? hostOrCb : undefined);
         }
-        options = portOrPath;
-        port = portOrPath.port;
-        host = portOrPath.host ?? 'localhost';
+        options = portOrPath as TcpNetConnectOpts;
+        port = options.port;
+        host = options.host ?? 'localhost';
         connectListener = typeof hostOrCb === 'function' ? hostOrCb : undefined;
-        if (portOrPath.noDelay !== undefined) this._noDelay = portOrPath.noDelay;
-        if (portOrPath.keepAlive !== undefined) this._keepAlive = portOrPath.keepAlive;
-        if (portOrPath.keepAliveInitialDelay !== undefined) this._keepAliveDelay = portOrPath.keepAliveInitialDelay;
-        if (portOrPath.timeout !== undefined) this.setTimeout(portOrPath.timeout);
+        if (options.noDelay !== undefined) this._noDelay = options.noDelay;
+        if (options.keepAlive !== undefined) this._keepAlive = options.keepAlive;
+        if (options.keepAliveInitialDelay !== undefined) this._keepAliveDelay = options.keepAliveInitialDelay;
+        if (options.timeout !== undefined) this.setTimeout(options.timeout);
     } else if (typeof portOrPath === 'number') {
         port = portOrPath;
         options = { port };
@@ -325,7 +327,7 @@ Socket.prototype.connect = function connect(
                 port: localPort ?? 0,
             });
         }
-        if (this._noDelay) setTcpNoDelay(tcp, true);
+        if (this._noDelay) tcp.setNoDelay(true);
         return tcp.connect({ ip: address, port }).then(() => tcp);
     }).then((tcp) => {
         if (!tcp || this._destroyed) return;
@@ -451,7 +453,7 @@ Socket.prototype.setTimeout = function (this: Socket, timeout: number, callback?
 Socket.prototype.setNoDelay = function setNoDelay(this: Socket, noDelay?: boolean): Socket {
     this._noDelay = noDelay ?? true;
     if (this._tcp) {
-        setTcpNoDelay(this._tcp, this._noDelay);
+        this._tcp.setNoDelay(this._noDelay);
     }
     return this;
 };
@@ -742,7 +744,7 @@ Socket.prototype.destroy = function destroy(this: Socket, error?: Error): Socket
     } else if (this._tcp) {
         // resetAndDestroy(): RST instead of the graceful shutdown-and-drain, so
         // the peer observes ECONNRESET even with in-flight unread bytes.
-        if (this._resetPending) this._tcp.reset();
+        if (this._resetPending) (this._tcp as CModuleStreams.TCP & { reset(): void }).reset();
         else closeQuietly(this._tcp);
         this._tcp = null;
     }
