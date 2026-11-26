@@ -12,17 +12,17 @@ const disentangleListenersSymbol = Symbol('disentangleListeners');
 
 type QueuedMessage = { data: unknown; ports: MessagePort[] };
 type PortMessageHandler = (this: globalThis.MessagePort, ev: globalThis.MessageEvent) => unknown;
-type PortDisentangleListener = () => void;
+type PortDisentangleListener = (closed: boolean) => void;
 
 export function isMessagePort(value: unknown): value is MessagePort {
     return value instanceof MessagePort;
 }
 
-function notifyPortDisentangled(port: MessagePort): void {
+function notifyPortDisentangled(port: MessagePort, closed: boolean): void {
     const listeners = Array.from(port[disentangleListenersSymbol]);
     port[disentangleListenersSymbol].clear();
     for (const listener of listeners) {
-        try { listener(); } catch { /* close/disentangle notification is best-effort */ }
+        try { listener(closed); } catch { /* close/disentangle notification is best-effort */ }
     }
 }
 
@@ -32,7 +32,7 @@ export function addMessagePortDisentangleListener(
     listener: PortDisentangleListener,
 ): () => void {
     if (port[closedSymbol]) {
-        try { listener(); } catch { /* close/disentangle notification is best-effort */ }
+        try { listener(true); } catch { /* close/disentangle notification is best-effort */ }
         return () => {};
     }
     port[disentangleListenersSymbol].add(listener);
@@ -58,7 +58,7 @@ function commitTransferredPort(port: MessagePort, clone: MessagePort): void {
     port[messageQueueSymbol] = [];
     // A transferred endpoint is closed synchronously. Notify owners that may
     // retain it in a routing registry so the old entry cannot outlive the move.
-    notifyPortDisentangled(port);
+    notifyPortDisentangled(port, false);
 }
 
 export const messagePortTransferHooks = {
@@ -184,10 +184,10 @@ export class MessagePort extends EventTarget implements globalThis.MessagePort {
         const otherPort = this[otherPortSymbol];
         this[otherPortSymbol] = null;
         this[messageQueueSymbol] = [];
-        notifyPortDisentangled(this);
+        notifyPortDisentangled(this, true);
         if (otherPort?.[otherPortSymbol] === this) {
             otherPort[otherPortSymbol] = null;
-            notifyPortDisentangled(otherPort);
+            notifyPortDisentangled(otherPort, true);
         }
     }
 

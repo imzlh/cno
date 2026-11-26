@@ -19,6 +19,10 @@ import {
     handleWorkerBroadcastControl,
 } from './broadcast-channel';
 import { resolveObjectURLBytes } from './object-url';
+import {
+    createPipeRefLease,
+    type PipeRefLease,
+} from '../utils/worker-pipe-ref';
 
 const worker = import.meta.use('worker');
 const crypto = import.meta.use('crypto');
@@ -30,6 +34,7 @@ const PORT_PLACEHOLDER = '__cno_transferred_message_port__';
 type LocalPortEndpoint = {
     port: MessagePort;
     pipe: CModuleWorker.MessagePipe;
+    pipeLease: PipeRefLease;
     listener: EventListener;
     nativeClose: () => void;
     removeDisentangleListener: () => void;
@@ -37,6 +42,7 @@ type LocalPortEndpoint = {
 type RemotePortEndpoint = {
     port: MessagePort;
     pipe: CModuleWorker.MessagePipe;
+    pipeLease: PipeRefLease;
     nativeClose: () => void;
     removeDisentangleListener: () => void;
 };
@@ -47,61 +53,6 @@ type RemotePortEndpoint = {
 const localPortEndpoints = new Map<string, LocalPortEndpoint>();
 const remotePorts = new Map<string, RemotePortEndpoint>();
 
-type PipeRefState = {
-    message: boolean;
-    ports: number;
-    refed: boolean;
-};
-
-// A worker control pipe can be kept alive by either global `message`
-// listeners or transferred MessagePort endpoints. Track both reasons so
-// removing one kind of listener cannot accidentally unref the other.
-const pipeRefStates = new Map<CModuleWorker.MessagePipe, PipeRefState>();
-
-function pipeRefState(pipe: CModuleWorker.MessagePipe): PipeRefState {
-    let state = pipeRefStates.get(pipe);
-    if (!state) {
-        // Native MessagePipe handles start ref'ed.
-        state = { message: false, ports: 0, refed: true };
-        pipeRefStates.set(pipe, state);
-    }
-    return state;
-}
-
-function refreshPipeRef(pipe: CModuleWorker.MessagePipe, state = pipeRefState(pipe)): void {
-    const shouldRef = state.message || state.ports > 0;
-    if (state.refed === shouldRef) return;
-    state.refed = shouldRef;
-    try {
-        if (shouldRef) pipe.ref();
-        else pipe.unref();
-    } catch {
-        // The native handle may already be closing during runtime teardown.
-    }
-}
-
-function setMessagePipeRef(pipe: CModuleWorker.MessagePipe, refed: boolean): void {
-    const state = pipeRefState(pipe);
-    state.message = refed;
-    refreshPipeRef(pipe, state);
-}
-
-function retainPortPipe(pipe: CModuleWorker.MessagePipe): void {
-    const state = pipeRefState(pipe);
-    state.ports++;
-    refreshPipeRef(pipe, state);
-}
-
-function releasePortPipe(pipe: CModuleWorker.MessagePipe): void {
-    const state = pipeRefStates.get(pipe);
-    if (!state) return;
-    if (state.ports > 0) state.ports--;
-    refreshPipeRef(pipe, state);
-}
-
-function disposePipeRefState(pipe: CModuleWorker.MessagePipe): void {
-    pipeRefStates.delete(pipe);
-}
 type PortPlaceholder = { [PORT_PLACEHOLDER]: string };
 type MessagePipePayload = { data: unknown; transfer?: { ports?: string[] } };
 type RecordLike = Record<PropertyKey, unknown>;
@@ -145,6 +96,10 @@ function isPipeEof(value: unknown): boolean {
     return isRecord(value) && Reflect.get(value, 'code') === error.errno.EOF;
 }
 
+function isNativePipeFailure(value: unknown): boolean {
+    return isRecord(value) && typeof Reflect.get(value, 'code') === 'number';
+}
+
 function generateId(): string {
     const bytes = new Uint8Array(8);
     crypto.randomFill(bytes);
@@ -166,6 +121,7 @@ function createRemotePort(id: string, pipe: CModuleWorker.MessagePipe): MessageP
     const endpoint: RemotePortEndpoint = {
         port,
         pipe,
+        pipeLease: createPipeRefLease(pipe),
         nativeClose: close,
         removeDisentangleListener: () => {},
     };
@@ -181,11 +137,8 @@ function createRemotePort(id: string, pipe: CModuleWorker.MessagePipe): MessageP
         closeRemotePortEndpoint(id, endpoint, true);
     };
     remotePorts.set(id, endpoint);
-    retainPortPipe(pipe);
-    endpoint.removeDisentangleListener = addMessagePortDisentangleListener(port, () => {
-        // Disentanglement also occurs when the endpoint is transferred again;
-        // that path must not signal a peer-side close.
-        closeRemotePortEndpoint(id, endpoint, false);
+    endpoint.removeDisentangleListener = addMessagePortDisentangleListener(port, (closed) => {
+        closeRemotePortEndpoint(id, endpoint, closed);
     });
     return port;
 }
@@ -233,6 +186,7 @@ function bindLocalPortEndpoint(id: string, port: MessagePort, pipe: CModuleWorke
     const endpoint: LocalPortEndpoint = {
         port,
         pipe,
+        pipeLease: createPipeRefLease(pipe),
         listener,
         nativeClose: port.close.bind(port),
         removeDisentangleListener: () => {},
@@ -240,16 +194,13 @@ function bindLocalPortEndpoint(id: string, port: MessagePort, pipe: CModuleWorke
     // Publish the endpoint before installing the lifecycle hook: registering a
     // hook on an already-closed port invokes it synchronously.
     localPortEndpoints.set(id, endpoint);
-    retainPortPipe(pipe);
     port.close = () => {
         if (isClosedPort(port)) return;
         closeLocalPortEndpoint(id, endpoint, true);
     };
     port.addEventListener('message', listener);
-    endpoint.removeDisentangleListener = addMessagePortDisentangleListener(port, () => {
-        // A transfer also disentangles the old endpoint. The new clone owns
-        // the route, so only an explicit close should notify the peer.
-        closeLocalPortEndpoint(id, endpoint, false);
+    endpoint.removeDisentangleListener = addMessagePortDisentangleListener(port, (closed) => {
+        closeLocalPortEndpoint(id, endpoint, closed);
     });
 }
 
@@ -262,7 +213,7 @@ function closeLocalPortEndpoint(id: string, endpoint: LocalPortEndpoint, notifyP
     if (notifyPeer) {
         try { endpoint.pipe.postMessage({ __cno_port_close: { id } }); } catch { /* pipe teardown already owns cleanup */ }
     }
-    releasePortPipe(endpoint.pipe);
+    endpoint.pipeLease.release();
 }
 
 function closeRemotePortEndpoint(id: string, endpoint: RemotePortEndpoint, notifyPeer: boolean): void {
@@ -273,18 +224,61 @@ function closeRemotePortEndpoint(id: string, endpoint: RemotePortEndpoint, notif
     if (notifyPeer) {
         try { endpoint.pipe.postMessage({ __cno_port_close: { id } }); } catch { /* pipe teardown already owns cleanup */ }
     }
-    releasePortPipe(endpoint.pipe);
+    endpoint.pipeLease.release();
+}
+
+type CleanupResult = { hasError: boolean; error: unknown };
+
+function recordCleanupError(result: CleanupResult, error: unknown): void {
+    if (!result.hasError) {
+        result.hasError = true;
+        result.error = error;
+    }
 }
 
 /** Release all transferred ports and their listeners associated with a pipe. */
-function detachWorkerPortPipe(pipe: CModuleWorker.MessagePipe): void {
+function detachWorkerPortPipe(pipe: CModuleWorker.MessagePipe, notifyPeer = false): CleanupResult {
+    const result: CleanupResult = { hasError: false, error: undefined };
+    const closeEndpoint = (id: string, endpoint: LocalPortEndpoint | RemotePortEndpoint): void => {
+        try {
+            if ('listener' in endpoint) closeLocalPortEndpoint(id, endpoint, notifyPeer);
+            else closeRemotePortEndpoint(id, endpoint, notifyPeer);
+        } catch (error) {
+            // A failed endpoint teardown must not prevent the remaining
+            // endpoints from releasing their routes and leases.
+            try { endpoint.pipeLease.release(); } catch { /* best effort */ }
+            recordCleanupError(result, error);
+        }
+    };
     for (const [id, endpoint] of localPortEndpoints) {
-        if (endpoint.pipe === pipe) closeLocalPortEndpoint(id, endpoint, false);
+        if (endpoint.pipe === pipe) closeEndpoint(id, endpoint);
     }
     for (const [id, endpoint] of remotePorts) {
-        if (endpoint.pipe === pipe) closeRemotePortEndpoint(id, endpoint, false);
+        if (endpoint.pipe === pipe) closeEndpoint(id, endpoint);
     }
-    disposePipeRefState(pipe);
+    return result;
+}
+
+function detachWorkerPipeResources(
+    pipe: CModuleWorker.MessagePipe,
+    notifyPeer = false,
+): CleanupResult {
+    const result: CleanupResult = { hasError: false, error: undefined };
+    try {
+        detachWorkerBroadcastPipe(pipe);
+    } catch (error) {
+        recordCleanupError(result, error);
+    } finally {
+        try {
+            const portResult = detachWorkerPortPipe(pipe, notifyPeer);
+            if (portResult.hasError) recordCleanupError(result, portResult.error);
+        } catch (error) {
+            // Keep the event and lease cleanup paths alive even if the
+            // endpoint registry itself fails while being traversed.
+            recordCleanupError(result, error);
+        }
+    }
+    return result;
 }
 
 function encodeMessageForPipe(
@@ -327,7 +321,7 @@ function decodeMessageFromPipe(rawData: unknown, pipe: CModuleWorker.MessagePipe
     const rawPorts = isRecord(rawTransfer) ? Reflect.get(rawTransfer, 'ports') : undefined;
     const portIds = Array.isArray(rawPorts) ? rawPorts.filter((id): id is string => typeof id === 'string') : [];
     const ports = portIds.map((id) => createRemotePort(id, pipe));
-    return { data: decodeStructuredCloneFromPipe(revivePortPlaceholders(data, pipe)), ports };
+    return { data: revivePortPlaceholders(decodeStructuredCloneFromPipe(data), pipe), ports };
 }
 
 function errorFromWorkerPayload(payload: unknown, fallbackMessage: string): Error {
@@ -466,8 +460,16 @@ class Worker extends EventTarget implements globalThis.Worker {
             if (this.#terminated) return;
             if (isPipeEof(e)) {
                 this.#terminated = true;
-                this.#detachMessagePipe(p);
-                this.#worker.terminate();
+                try {
+                    this.#detachMessagePipe(p);
+                } catch {
+                    // Preserve the native EOF/messageerror as the observable
+                    // event; resource cleanup is best effort on this path.
+                } finally {
+                    try {
+                        this.#worker.terminate();
+                    } catch { /* the worker is already terminating */ }
+                }
             }
             this.dispatchEvent(new MessageEvent('messageerror', { data: e }, true));
         };
@@ -576,12 +578,11 @@ class Worker extends EventTarget implements globalThis.Worker {
     }
 
     #detachMessagePipe(pipe: CModuleWorker.MessagePipe): void {
+        this.#messageQueue.length = 0;
         pipe.onmessage = undefined;
         pipe.onmessageerror = undefined;
         pipe.onclose = undefined;
-        detachWorkerBroadcastPipe(pipe);
-        detachWorkerPortPipe(pipe);
-        this.#messageQueue.length = 0;
+        detachWorkerPipeResources(pipe);
     }
 }
 
@@ -629,8 +630,16 @@ if (worker.isWorker) {
     const messageListeners: MessageListenerRecord[] = [];
     const addEventListener = self.addEventListener.bind(self);
     const removeEventListener = self.removeEventListener.bind(self);
+    const pipeLease = createPipeRefLease(pipe, false);
+    let pipeResourcesDetached = false;
+    const detachPipeResources = (notifyPeer = false): CleanupResult => {
+        if (pipeResourcesDetached) return { hasError: false, error: undefined };
+        pipeResourcesDetached = true;
+        return detachWorkerPipeResources(pipe, notifyPeer);
+    };
     const setPipeRef = (refed: boolean): void => {
-        setMessagePipeRef(pipe, refed);
+        if (refed) pipeLease.ref();
+        else pipeLease.unref();
     };
 
     const captureOption = (options?: boolean | EventListenerOptions): boolean =>
@@ -684,7 +693,6 @@ if (worker.isWorker) {
     };
     // The control pipe is an implementation detail. It must not keep a worker
     // alive until user code opts into receiving messages.
-    setPipeRef(false);
     let messageListener: ((event: Event) => void) | null = null;
     let messageErrorListener: ((event: Event) => void) | null = null;
     let errorListener: ((event: Event) => void) | null = null;
@@ -698,7 +706,24 @@ if (worker.isWorker) {
     Reflect.set(self, 'close', () => {
         if (workerClosing) return;
         workerClosing = true;
-        timers.setTimeout(() => os.exit(0), 10);
+        messageQueue.length = 0;
+        pipe.onmessage = undefined;
+        pipe.onmessageerror = undefined;
+        const cleanupResult: CleanupResult = { hasError: false, error: undefined };
+        try {
+            const result = detachPipeResources(true);
+            if (result.hasError) recordCleanupError(cleanupResult, result.error);
+        } catch (error) {
+            recordCleanupError(cleanupResult, error);
+        } finally {
+            try {
+                pipeLease.release();
+            } catch (error) {
+                recordCleanupError(cleanupResult, error);
+            }
+            timers.setTimeout(() => os.exit(0), 10);
+        }
+        if (cleanupResult.hasError) throw cleanupResult.error;
         const error = new Error('Worker closed');
         error.name = 'WorkerCloseError';
         Object.defineProperty(error, '__cno_worker_close', { value: true });
@@ -721,7 +746,7 @@ if (worker.isWorker) {
         if (flushingMessages) return;
         flushingMessages = true;
         try {
-            while (messageQueue.length > 0) {
+            while (!workerClosing && messageQueue.length > 0) {
                 const event = messageQueue.shift();
                 if (event !== undefined) self.dispatchEvent(event);
             }
@@ -849,6 +874,7 @@ if (worker.isWorker) {
     });
 
     pipe.onmessage = (rawData: unknown) => {
+        if (workerClosing) return;
         if (handleBroadcastDelivery(rawData)) return;
         if (handlePortControlMessage(rawData, pipe)) return;
         const { data, ports } = decodeMessageFromPipe(rawData, pipe);
@@ -856,8 +882,19 @@ if (worker.isWorker) {
     };
 
     pipe.onmessageerror = (e: unknown) => {
-        detachWorkerBroadcastPipe(pipe);
-        detachWorkerPortPipe(pipe);
+        if (workerClosing) return;
+        if (isNativePipeFailure(e)) {
+            try {
+                detachPipeResources();
+            } catch {
+                // Preserve the native pipe error for the user event. Cleanup
+                // failures cannot replace that event during teardown.
+            } finally {
+                try {
+                    pipeLease.release();
+                } catch { /* lease release is best effort during teardown */ }
+            }
+        }
         const event = new MessageEvent('messageerror', { data: e }, true);
         self.dispatchEvent(event);
     };

@@ -15,11 +15,18 @@ import {
     getTransferList,
     structuredCloneWithTransfer,
 } from '../_internal/structured-clone';
+import {
+    handleBroadcastDelivery,
+    handleWorkerBroadcastControl,
+    detachWorkerBroadcastPipe,
+} from '../../utils/worker-broadcast-channel';
+import { createPipeRefLease, type PipeRefLease } from '../../utils/worker-pipe-ref';
 
 const wk = import.meta.use('worker');
 const osmod = import.meta.use('os');
 const error = import.meta.use('error');
 const engine = import.meta.use('engine');
+const timers = import.meta.use('timers');
 
 const INTERNAL_KEYS = new Set([
     '__cts_entry',
@@ -36,13 +43,16 @@ const INTERNAL_KEYS = new Set([
 const NODE_WORKER_READY = '__cno_node_worker_ready__';
 const NODE_WORKER_EXIT = '__cno_node_worker_exit__';
 const NODE_WORKER_ERROR = '__cno_node_worker_error__';
+const WORKER_JOIN_GRACE_MS = 250;
 const otherPortSymbol = Symbol('otherPort');
 const startedSymbol = Symbol('started');
 const closedSymbol = Symbol('closed');
 const messageQueueSymbol = Symbol('messageQueue');
 const dispatchQueuedSymbol = Symbol('dispatchQueued');
+const dispatchingSymbol = Symbol('dispatching');
 const refedSymbol = Symbol('refed');
-const pipeRefedSymbol = Symbol('pipeRefed');
+const pipeRefLeaseSymbol = Symbol('pipeRefLease');
+const messagePipeRefLeaseSymbol = Symbol('messagePipeRefLease');
 const onMessageSymbol = Symbol('onmessage');
 const onMessageErrorSymbol = Symbol('onmessageerror');
 
@@ -56,8 +66,8 @@ type MessagePortErrorHandler = (this: MessagePort, ev: MessagePortErrorEvent) =>
 type NativeMessagePipe = CModuleWorker.MessagePipe & {
     postMessage(data: unknown, transferList?: unknown[]): void;
 };
-type MessagePipeWithRef = NativeMessagePipe & { ref?: () => void; unref?: () => void };
 type NativeWorkerConstructor = new (userData: unknown, transferList?: unknown[]) => CModuleWorker.Worker;
+type WorkerStdio = PassThrough & NodeJS.ReadableStream;
 type RawWorkerData = {
     __node_workerData?: unknown;
     __node_threadId?: unknown;
@@ -114,6 +124,10 @@ function currentRuntimeConfig(): unknown {
 
 function isRecord(value: unknown): value is Record<PropertyKey, unknown> {
     return value !== null && typeof value === 'object';
+}
+
+function asWorkerStdio(stream: PassThrough): WorkerStdio {
+    return stream as unknown as WorkerStdio;
 }
 
 /** A byte cap of 0 means "unlimited" in cts (TIER_MEM_LIMIT.high), so compare as +Infinity. */
@@ -309,28 +323,61 @@ function schedulePortDispatch(port: MessagePort): void {
     port[dispatchQueuedSymbol] = true;
     queueMicrotask(() => {
         port[dispatchQueuedSymbol] = false;
-        if (!port[startedSymbol] || port[closedSymbol]) return;
+        if (!port[startedSymbol]) return;
 
-        // Preserve messages already captured by a drain when its handler closes the port.
+        port[dispatchingSymbol] = true;
         const queue = port[messageQueueSymbol];
-        while (queue.length > 0) {
-            const item = queue.shift();
-            if (item !== undefined) emitMessage(port, item);
+        try {
+            // Keep draining messages added reentrantly by a listener. close()
+            // only discards a queue before this drain has started.
+            while (queue.length > 0) {
+                const item = queue.shift();
+                if (item !== undefined) emitMessage(port, item);
+            }
+        } finally {
+            port[dispatchingSymbol] = false;
+            if (queue.length > 0) schedulePortDispatch(port);
         }
     });
 }
 
-function updatePipeRef(port: MessagePort): void {
-    const pipe = port.__pipe as MessagePipeWithRef | undefined;
-    if (!pipe) return;
-    const hasMessageConsumer = port.listenerCount('message') > 0 || port[onMessageSymbol] !== null;
-    if (hasMessageConsumer && !port[pipeRefedSymbol]) {
-        port[pipeRefedSymbol] = true;
-        pipe.ref?.();
-    } else if (!hasMessageConsumer && port[pipeRefedSymbol]) {
-        port[pipeRefedSymbol] = false;
-        pipe.unref?.();
+function closePort(port: MessagePort, preserveQueuedMessages: boolean): void {
+    if (port[closedSymbol]) return;
+    port[closedSymbol] = true;
+    const otherPort = port[otherPortSymbol];
+    port[otherPortSymbol] = null;
+    if (!preserveQueuedMessages && !port[dispatchingSymbol]) port[messageQueueSymbol].length = 0;
+    const lease = port[pipeRefLeaseSymbol];
+    const messageLease = port[messagePipeRefLeaseSymbol];
+    try {
+        port.unref();
+    } finally {
+        port[pipeRefLeaseSymbol] = undefined;
+        port[messagePipeRefLeaseSymbol] = undefined;
+        lease?.release();
+        messageLease?.release();
     }
+    deferPortClose(port);
+
+    // A local channel loses both entangled endpoints when either side closes.
+    // The EOF path has no entangled endpoint, so only that path can request
+    // delivery of frames already decoded by the native pipe.
+    if (otherPort && !otherPort[closedSymbol]) {
+        if (otherPort[otherPortSymbol] === port) otherPort[otherPortSymbol] = null;
+        closePort(otherPort, false);
+    }
+}
+
+function closePortAfterEof(port: MessagePort): void {
+    closePort(port, true);
+}
+
+function updatePipeRef(port: MessagePort): void {
+    const lease = port[messagePipeRefLeaseSymbol];
+    if (!lease) return;
+    const hasMessageConsumer = port.listenerCount('message') > 0 || port[onMessageSymbol] !== null;
+    if (hasMessageConsumer) lease.ref();
+    else lease.unref();
 }
 
 function enqueuePortMessage(port: MessagePort, item: QueuedMessage): void {
@@ -350,9 +397,14 @@ function deferPortClose(port: MessagePort): void {
 function wrapMessagePipe(pipe: CModuleWorker.MessagePipe): MessagePort {
     const port = new MessagePort();
     port.__pipe = pipe;
+    port[pipeRefLeaseSymbol] = createPipeRefLease(pipe);
+    port[messagePipeRefLeaseSymbol] = createPipeRefLease(pipe, false);
 
     pipe.onmessage = (data: unknown) => {
-        enqueuePortMessage(port, { data: decodeStructuredCloneFromPipe(data), ports: [] });
+        const decoded = decodeStructuredCloneFromPipe(data);
+        if (handleBroadcastDelivery(decoded)) return;
+        if (handleWorkerBroadcastControl(pipe, decoded)) return;
+        enqueuePortMessage(port, { data: decoded, ports: [] });
     };
     pipe.onmessageerror = (err: unknown) => {
         queueMicrotask(() => {
@@ -385,9 +437,11 @@ export class MessagePort extends EventEmitter {
     [closedSymbol] = false;
     [messageQueueSymbol]: QueuedMessage[] = [];
     [dispatchQueuedSymbol] = false;
+    [dispatchingSymbol] = false;
     // A port holds the loop only after start().
     [refedSymbol] = false;
-    [pipeRefedSymbol] = true;
+    [pipeRefLeaseSymbol]?: PipeRefLease;
+    [messagePipeRefLeaseSymbol]?: PipeRefLease;
     __pipe?: NativeMessagePipe;
 
     get onmessage(): MessagePortEventHandler | null {
@@ -412,6 +466,12 @@ export class MessagePort extends EventEmitter {
         const pipe = this.__pipe;
         if (pipe) {
             const transfers = assertNoPortsAcrossThreads(value, transferList);
+            if (this[closedSymbol]) {
+                // No native write occurs after close, so perform the same
+                // clone and transfer commit that the pipe would have done.
+                structuredCloneWithTransfer(value, transfers);
+                return true;
+            }
             pipe.postMessage(encodeStructuredCloneForPipe(value), transfers);
             return true;
         }
@@ -429,18 +489,7 @@ export class MessagePort extends EventEmitter {
     }
 
     close(): void {
-        if (this[closedSymbol]) return;
-        this[closedSymbol] = true;
-        const otherPort = this[otherPortSymbol];
-        this[otherPortSymbol] = null;
-        this.unref();
-        // Keep messages already being drained ahead of the deferred close event.
-        deferPortClose(this);
-        // Closing one end closes the entangled end too.
-        if (otherPort && !otherPort[closedSymbol]) {
-            if (otherPort[otherPortSymbol] === this) otherPort[otherPortSymbol] = null;
-            otherPort.close();
-        }
+        closePort(this, false);
     }
 
     hasRef(): boolean {
@@ -449,14 +498,13 @@ export class MessagePort extends EventEmitter {
 
     ref(): void {
         this[refedSymbol] = true;
-        this[pipeRefedSymbol] = true;
-        (this.__pipe as MessagePipeWithRef | undefined)?.ref?.();
+        this[pipeRefLeaseSymbol]?.ref();
     }
 
     unref(): void {
         this[refedSymbol] = false;
-        this[pipeRefedSymbol] = false;
-        (this.__pipe as MessagePipeWithRef | undefined)?.unref?.();
+        this[pipeRefLeaseSymbol]?.unref();
+        this[messagePipeRefLeaseSymbol]?.unref();
     }
 
     start(): void {
@@ -533,13 +581,28 @@ export class Worker extends EventEmitter {
     private _native: CModuleWorker.Worker;
     private _port: MessagePort;
     private _exited = false;
-    private _exitCode = 0;
     private _refed = true;
     private _readyToken: string;
-    private _stdout: PassThrough | null = null;
-    private _stderr: PassThrough | null = null;
+    private _stdout: WorkerStdio | null = null;
+    private _stderr: WorkerStdio | null = null;
     // Wait for pipe EOF before synchronously joining the native worker.
     private _joinPending = false;
+    private _joined = false;
+    private _joinPromise: Promise<void> | null = null;
+    private _resolveJoin: (() => void) | null = null;
+    private _terminatePromise: Promise<number> | null = null;
+    private _exitStatus: number | 'uncaughtException' | undefined;
+    private _broadcastPipeDetached = false;
+
+    private _detachBroadcastPipe(): void {
+        if (this._broadcastPipeDetached) return;
+        this._broadcastPipeDetached = true;
+        try {
+            detachWorkerBroadcastPipe(this._native.messagePipe);
+        } catch {
+            // BroadcastChannel close listeners must not prevent worker reaping.
+        }
+    }
 
     constructor(filename: string | URL, options?: WorkerOptions) {
         super();
@@ -566,35 +629,34 @@ export class Worker extends EventEmitter {
             __node_envData: Array.from(envDataMap.entries()),
             __node_readyToken: this._readyToken,
         }, transfers);
-        if (options?.stdout) this._stdout = new PassThrough();
-        if (options?.stderr) this._stderr = new PassThrough();
+        if (options?.stdout) this._stdout = asWorkerStdio(new PassThrough());
+        if (options?.stderr) this._stderr = asWorkerStdio(new PassThrough());
         this._port = wrapMessagePipe(this._native.messagePipe);
-        this._native.messagePipe.onclose = () => {
-            this._joinPending = true;
-            this._reap();
-            if (!this._exited) this._finish(undefined, 0);
-        };
+        this._native.messagePipe.onclose = () => queueMicrotask(() => this._onPipeEof(0));
         this._port.on('message', (data: unknown) => {
+            if (this._exited || this._exitStatus === 'uncaughtException') return;
+            if (handleWorkerBroadcastControl(this._native.messagePipe, data)) return;
             if (isWorkerReadyMessage(data, this._readyToken)) {
                 return;
             }
             if (isWorkerErrorMessage(data)) {
-                this._finish(data[NODE_WORKER_ERROR], 1);
+                this._exitStatus = 'uncaughtException';
+                this._joinPending = true;
+                this._native.stop();
+                this.emit('error', errorFromWorkerPayload(data[NODE_WORKER_ERROR]));
                 return;
             }
             if (isWorkerExitMessage(data)) {
                 const code = data[NODE_WORKER_EXIT]?.code;
                 this._joinPending = true;
-                this._finish(undefined, typeof code === 'number' ? code : 0);
+                this._exitStatus = typeof code === 'number' ? code : 0;
                 return;
             }
-            if (!this._exited) this.emit('message', data);
+            this.emit('message', data);
         });
         this._port.on('messageerror', (err: unknown) => {
             if (isPipeEof(err)) {
-                this._joinPending = true;
-                this._reap();
-                if (!this._exited) this._finish(undefined, 1);
+                this._onPipeEof(1);
                 return;
             }
             if (this._exited) return;
@@ -616,31 +678,57 @@ export class Worker extends EventEmitter {
             .postMessage(encodeStructuredCloneForPipe(value), transfers);
     }
 
-    private _reap(): void {
-        if (!this._joinPending) return;
+    private _onPipeEof(defaultCode: number): void {
+        if (this._joined) return;
         this._joinPending = false;
+        this._detachBroadcastPipe();
         this._native.terminate();
+        this._joined = true;
         abandonedWorkers.delete(this);
         this._native.messagePipe.onmessage = undefined;
         this._native.messagePipe.onmessageerror = undefined;
         this._native.messagePipe.onclose = undefined;
-        this._port.close();
-    }
-
-    private _finish(error: WorkerErrorPayload | undefined, code: number): void {
+        closePortAfterEof(this._port);
+        this._resolveJoin?.();
+        this._resolveJoin = null;
         if (this._exited) return;
         this._exited = true;
-        this._exitCode = code;
         workerRegistry.delete(this.threadId);
-        if (this._joinPending) {
-            // EOF drives the pending native join without keeping the loop alive.
-            this._port.unref();
-        } else {
-            this._port.close();
-        }
         this._closeStdio();
-        if (error) this.emit('error', errorFromWorkerPayload(error));
-        this.emit('exit', code);
+        this.emit('exit', this._exitStatus === 'uncaughtException' ? 1 : this._exitStatus ?? defaultCode);
+    }
+
+    private _waitForJoin(): Promise<void> {
+        if (this._joined) return Promise.resolve();
+        if (!this._joinPromise) {
+            this._joinPromise = new Promise((resolve) => {
+                this._resolveJoin = resolve;
+            });
+        }
+        return this._joinPromise;
+    }
+
+    private _waitForJoinWithGrace(): Promise<void> {
+        if (this._joined) return Promise.resolve();
+        return new Promise((resolve) => {
+            let settled = false;
+            let timer: number | undefined;
+            const settle = () => {
+                if (settled) return;
+                settled = true;
+                if (timer !== undefined) timers.clearTimeout(timer);
+                if (!this._joined) {
+                    // Keep the native join asynchronous only after the grace
+                    // period. Until then the referenced pipe must stay alive
+                    // long enough to observe EOF and reap a responsive worker.
+                    this._port.unref();
+                    markAbandoned(this);
+                }
+                resolve();
+            };
+            this._waitForJoin().then(settle, settle);
+            timer = timers.setTimeout(settle, WORKER_JOIN_GRACE_MS);
+        });
     }
 
     private _closeStdio(): void {
@@ -652,28 +740,39 @@ export class Worker extends EventEmitter {
         return postMessageToThread(targetThreadId, value, transferList, timeout);
     }
 
-    terminate(): Promise<number> {
+    terminate(): Promise<number | undefined> {
         // Node reports a terminated worker with exit code 1.
-        if (this._exited) return Promise.resolve(this._exitCode);
+        if (this._terminatePromise) return this._terminatePromise;
+        if (this._exited) return Promise.resolve(undefined);
+        let resolveTermination!: (code: number) => void;
+        const termination = new Promise<number>(resolve => { resolveTermination = resolve; });
+        this._terminatePromise = termination;
         this._exited = true;
-        this._exitCode = 1;
         workerRegistry.delete(this.threadId);
+        this._detachBroadcastPipe();
 
         // Native terminate() joins synchronously; request a stop and join after
         // EOF so an unresponsive worker cannot block the parent event loop.
         this._joinPending = true;
         this._native.stop();
         markAbandoned(this);
-        // EOF can still drive _reap() without keeping the process open.
-        this._port.unref();
+        // Keep the pipe referenced during the short join grace period. An
+        // immediate unref can let the parent loop stop before EOF dispatches,
+        // leaving an otherwise responsive native worker joinable.
+        this._port.ref();
         this._closeStdio();
-        // Let immediately attached listeners observe 'exit'.
-        return new Promise((resolve) => {
-            queueMicrotask(() => {
-                this.emit('exit', 1);
-                resolve(1);
-            });
+        // Start the join/grace path before user exit listeners run. An exit
+        // listener may throw; that exception must still escape the microtask,
+        // but it cannot strand the native worker or this termination promise.
+        this._waitForJoinWithGrace().then(() => {
+            this._terminatePromise = null;
+            resolveTermination(1);
         });
+        // Let immediately attached listeners observe 'exit'.
+        queueMicrotask(() => {
+            this.emit('exit', 1);
+        });
+        return termination;
     }
 
     ref(): void {
