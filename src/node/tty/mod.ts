@@ -2,6 +2,8 @@ import { Readable, Writable, type ReadableOptions, type WritableOptions } from '
 import { getTierLimits } from '../_internal/memory';
 import type { NodeStdioStream as Stream } from '../_internal/stdio';
 import { withCode } from '../_internal/errors';
+import { normalizeErrnoError } from '../_internal/errno';
+import { matchesErrnoCode } from '../../utils/errno';
 
 const os = import.meta.use('os');
 const fs = import.meta.use('fs');
@@ -24,18 +26,6 @@ function validateFd(fd: number): void {
     if (!Number.isInteger(fd) || fd < 0) {
         throw new TypeError('The "fd" argument must be a non-negative integer');
     }
-}
-
-function asError(error: unknown): Error {
-    return error instanceof Error ? error : new Error(String(error));
-}
-
-function isAgainError(error: unknown): boolean {
-    if (!error || typeof error !== 'object') return false;
-    const code = Reflect.get(error, 'code');
-    if (code === 'EAGAIN' || code === 'EWOULDBLOCK') return true;
-    if (code === -11) return true;
-    return /EAGAIN|EWOULDBLOCK/.test(String(error));
 }
 
 function stdioStream(fd: number): Stream | null {
@@ -286,11 +276,11 @@ export class ReadStream extends Readable {
             this.push(buf.subarray(0, n));
         } catch (e) {
             this.readPending = false;
-            if (isAgainError(e)) {
+            if (matchesErrnoCode(e, 'EAGAIN', 'EWOULDBLOCK')) {
                 this.retryRead();
                 return;
             }
-            this.destroy(asError(e));
+            this.destroy(normalizeErrnoError(e, 'read'));
         }
     }
 }
@@ -324,7 +314,7 @@ export class WriteStream extends Writable {
             this.refreshSize();
             callback();
         } catch (e) {
-            callback(asError(e));
+            callback(normalizeErrnoError(e, 'write'));
         }
     }
 
