@@ -100,6 +100,7 @@ import { which, type WhichOptions } from './utils/which';
 import { TOML } from './utils/toml';
 import { XML } from './utils/xml';
 import { normalizeTlsOptions } from './tls';
+import { YAML } from './utils/yaml';
 import { randomUUIDv7 } from './uuid';
 import { randomUUIDv5 } from './uuid/v5';
 
@@ -187,6 +188,7 @@ export {
     indexOfLine,
     inflateSync,
     listen,
+    YAML,
     nanoseconds,
     pathToFileURL,
     peek,
@@ -310,6 +312,7 @@ export interface BunApi {
     readonly MD4: typeof MD4;
     readonly SHA224: typeof SHA224;
     readonly SHA256: typeof SHA256;
+    readonly YAML: typeof YAML;
     readonly SHA384: typeof SHA384;
     readonly SHA512: typeof SHA512;
     readonly SHA512_256: typeof SHA512_256;
@@ -490,6 +493,7 @@ const Bun: BunApi = {
     MD4,
     SHA224,
     SHA256,
+    YAML,
     SHA384,
     SHA512,
     SHA512_256,
