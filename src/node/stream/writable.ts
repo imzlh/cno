@@ -181,18 +181,22 @@ Writable.prototype._writeBuffered = function _writeBuffered(this: Writable): voi
         updateWritableLength(this);
 
         if (err) {
-            const failedEntries = entries.concat(state.buffer.splice(0));
+            const buffered = state.buffer.splice(0);
             updateWritableLength(this);
-            this.errored = err;
+            this.errored ??= err;
+            const streamError = this.errored;
             this.writableAborted = true;
             this.writable = false;
             /* Order measured against node 24: every write callback, then every
              * end callback, then 'error', then 'close'. The teardown therefore
              * runs after the WHOLE queue drains rather than as a member of it. */
-            const callbacks = failedEntries.map((entry) => () => entry.callback(err));
+            const callbacks = [
+                ...entries.map((entry) => () => entry.callback(err)),
+                ...buffered.map((entry) => () => entry.callback(streamError)),
+            ];
             const teardown = () => {
-                settleEndCallbacks(this, err);
-                writableErrorOrDestroy(this, err);
+                settleEndCallbacks(this, streamError);
+                writableErrorOrDestroy(this, streamError);
             };
             if (synchronous) {
                 // First failure owns the teardown; later ones reuse its error.
@@ -206,6 +210,18 @@ Writable.prototype._writeBuffered = function _writeBuffered(this: Writable): voi
         }
 
         const callbacks = entries.map((entry) => () => entry.callback());
+        if (state.destroyed) {
+            const buffered = state.buffer.splice(0);
+            updateWritableLength(this);
+            const streamError = this.errored ?? createDestroyedError();
+            callbacks.push(
+                ...buffered.map((entry) => () => entry.callback(streamError)),
+                () => settleEndCallbacks(this, streamError),
+            );
+            if (synchronous) queueSynchronousWriteCallbacks(this, callbacks);
+            else for (const callback of callbacks) callback();
+            return;
+        }
         if (synchronous) queueSynchronousWriteCallbacks(this, callbacks);
 
         if (state.buffer.length > 0) {

@@ -669,7 +669,7 @@ class WriteStreamClass extends Writable {
         operation.then(
             () => {
                 if (state.ioPromise === operation) state.ioPromise = null;
-                callback(this.destroyed ? createDestroyedError() : undefined);
+                callback(this.destroyed ? this.errored ?? createDestroyedError() : undefined);
             },
             (err) => {
                 if (state.ioPromise === operation) state.ioPromise = null;
