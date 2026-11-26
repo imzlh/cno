@@ -14,6 +14,7 @@ const NS_PER_MS = 1e6;
 // Node reports INT64_MAX as `min` while a histogram is still empty.
 const EMPTY_MIN = 9223372036854775807;
 const EMPTY_MIN_BIGINT = 9223372036854775807n;
+const timers = import.meta.use('timers');
 const PERCENTILE_KEYS = [0, 25, 50, 75, 90, 99, 99.9, 100];
 
 export const constants = {
@@ -146,7 +147,7 @@ export class RecordableHistogram extends HistogramBase {
 
 export class IntervalHistogram extends HistogramBase {
     #resolution: number;
-    #timer: ReturnType<typeof setInterval> | undefined;
+    #timer: ReturnType<typeof timers.setInterval> | undefined;
     #last = 0;
     #enabled = false;
 
@@ -159,7 +160,7 @@ export class IntervalHistogram extends HistogramBase {
         if (this.#enabled) return false;
         this.#enabled = true;
         this.#last = nowMs();
-        this.#timer = setInterval(() => {
+        this.#timer = timers.setInterval(() => {
             const now = nowMs();
             // Node's histogram is in NANOSECONDS and holds integers.
             this._samples.push(Math.max(1, Math.round((now - this.#last) * NS_PER_MS)));
@@ -172,7 +173,7 @@ export class IntervalHistogram extends HistogramBase {
     disable(): boolean {
         if (!this.#enabled) return false;
         this.#enabled = false;
-        clearInterval(this.#timer);
+        if (this.#timer !== undefined) timers.clearInterval(this.#timer);
         this.#timer = undefined;
         return true;
     }
