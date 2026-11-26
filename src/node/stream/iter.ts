@@ -93,6 +93,10 @@ function isView(value: unknown): value is ArrayBufferView {
     return ArrayBuffer.isView(value);
 }
 
+function isObjectLike(value: unknown): value is object {
+    return value !== null && (typeof value === 'object' || typeof value === 'function');
+}
+
 function directBytes(value: unknown): Uint8Array | null {
     if (typeof value === 'string') return Buffer.from(value);
     if (isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
@@ -113,23 +117,25 @@ async function* flattenAsync(input: Source): AsyncGenerator<Uint8Array> {
         yield bytes;
         return;
     }
-    const asyncStreamable = input && Reflect.get(input, toAsyncStreamable);
-    if (typeof asyncStreamable === 'function') {
-        yield* flattenAsync(Reflect.apply(asyncStreamable, input, []) as Source);
-        return;
-    }
-    const streamable = input && Reflect.get(input, toStreamable);
-    if (typeof streamable === 'function') {
-        yield* flattenAsync(Reflect.apply(streamable, input, []) as SyncSource);
-        return;
-    }
-    if (input && typeof Reflect.get(input, Symbol.asyncIterator) === 'function') {
-        for await (const item of input as AsyncIterable<Source>) yield* flattenAsync(item);
-        return;
-    }
-    if (input && typeof Reflect.get(input, Symbol.iterator) === 'function') {
-        for (const item of input as Iterable<SyncSource>) yield* flattenAsync(item);
-        return;
+    if (isObjectLike(input)) {
+        const asyncStreamable = Reflect.get(input, toAsyncStreamable);
+        if (typeof asyncStreamable === 'function') {
+            yield* flattenAsync(Reflect.apply(asyncStreamable, input, []) as Source);
+            return;
+        }
+        const streamable = Reflect.get(input, toStreamable);
+        if (typeof streamable === 'function') {
+            yield* flattenAsync(Reflect.apply(streamable, input, []) as SyncSource);
+            return;
+        }
+        if (typeof Reflect.get(input, Symbol.asyncIterator) === 'function') {
+            for await (const item of input as AsyncIterable<Source>) yield* flattenAsync(item);
+            return;
+        }
+        if (typeof Reflect.get(input, Symbol.iterator) === 'function') {
+            for (const item of input as Iterable<SyncSource>) yield* flattenAsync(item);
+            return;
+        }
     }
     throw new TypeError('The "input" argument must be a byte source');
 }
@@ -140,14 +146,16 @@ function* flattenSync(input: SyncSource): Generator<Uint8Array> {
         yield bytes;
         return;
     }
-    const streamable = input && Reflect.get(input, toStreamable);
-    if (typeof streamable === 'function') {
-        yield* flattenSync(Reflect.apply(streamable, input, []) as SyncSource);
-        return;
-    }
-    if (input && typeof Reflect.get(input, Symbol.iterator) === 'function') {
-        for (const item of input as Iterable<SyncSource>) yield* flattenSync(item);
-        return;
+    if (isObjectLike(input)) {
+        const streamable = Reflect.get(input, toStreamable);
+        if (typeof streamable === 'function') {
+            yield* flattenSync(Reflect.apply(streamable, input, []) as SyncSource);
+            return;
+        }
+        if (typeof Reflect.get(input, Symbol.iterator) === 'function') {
+            for (const item of input as Iterable<SyncSource>) yield* flattenSync(item);
+            return;
+        }
     }
     throw new TypeError('The "input" argument must be a synchronous byte source');
 }
@@ -244,7 +252,7 @@ export function pullSync(source: SyncSource, ...transforms: SyncTransform[]): Sy
     return result;
 }
 
-function splitPipeArgs<T>(args: T[], isWriter: (value: T) => boolean): { transforms: T[]; writer: T; options: Record<string, unknown> } {
+function splitPipeArgs<T, W extends T>(args: T[], isWriter: (value: T) => value is W): { transforms: T[]; writer: W; options: Record<string, unknown> } {
     let options: Record<string, unknown> = {};
     const tail = args[args.length - 1];
     if (tail && typeof tail === 'object' && !isWriter(tail) && !stateful(tail as Transform)) {
@@ -256,7 +264,8 @@ function splitPipeArgs<T>(args: T[], isWriter: (value: T) => boolean): { transfo
 }
 
 export async function pipeTo(source: Source, ...args: Array<Transform | PartialWriter | { signal?: AbortSignal; preventClose?: boolean; preventFail?: boolean }>): Promise<number> {
-    const { transforms, writer, options } = splitPipeArgs(args, value => typeof Reflect.get(value as object, 'write') === 'function');
+    const { transforms, writer, options } = splitPipeArgs(args, (value): value is PartialWriter =>
+        isObjectLike(value) && typeof Reflect.get(value, 'write') === 'function');
     const output = pull(source, ...(transforms as Transform[]), { signal: options.signal as AbortSignal | undefined });
     let written = 0;
     try {
@@ -274,7 +283,8 @@ export async function pipeTo(source: Source, ...args: Array<Transform | PartialW
 }
 
 export function pipeToSync(source: SyncSource, ...args: Array<SyncTransform | PartialSyncWriter | { preventClose?: boolean; preventFail?: boolean }>): number {
-    const { transforms, writer, options } = splitPipeArgs(args, value => typeof Reflect.get(value as object, 'writeSync') === 'function');
+    const { transforms, writer, options } = splitPipeArgs(args, (value): value is PartialSyncWriter =>
+        isObjectLike(value) && typeof Reflect.get(value, 'writeSync') === 'function');
     let written = 0;
     try {
         for (const batch of pullSync(source, ...(transforms as SyncTransform[]))) {
