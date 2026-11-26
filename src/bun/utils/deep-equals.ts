@@ -2,8 +2,14 @@
 
 type Key = string | symbol;
 type Shape = { keys: Key[]; prototype: object | null };
+type WebCollectionKind = 'Headers' | 'URLSearchParams';
 type BrandName = 'Date' | 'RegExp' | 'Map' | 'Set' | 'ArrayBuffer' | 'SharedArrayBuffer'
-    | 'Number' | 'String' | 'Boolean' | 'BigInt' | 'Symbol' | 'URL';
+    | 'Number' | 'String' | 'Boolean' | 'BigInt' | 'Symbol' | 'URL' | WebCollectionKind;
+type WebCollectionSlot = {
+    kind: WebCollectionKind;
+    entries: [string, string][];
+    baseConstructor: Function;
+};
 type SlotInfo =
     | { kind: 'Date'; value: number }
     | { kind: 'RegExp'; source: string; flags: string }
@@ -11,7 +17,8 @@ type SlotInfo =
     | { kind: 'Set'; iterator: Iterator<unknown> }
     | { kind: 'ArrayBuffer' | 'SharedArrayBuffer'; value: object; byteLength: number }
     | { kind: 'Number' | 'String' | 'Boolean' | 'BigInt' | 'Symbol'; value: unknown }
-    | { kind: 'URL'; href: string };
+    | { kind: 'URL'; href: string }
+    | WebCollectionSlot;
 
 const getOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
 const getPrototypeOf = Object.getPrototypeOf;
@@ -45,10 +52,35 @@ const boxedValueOf: Record<'Number' | 'String' | 'Boolean' | 'BigInt' | 'Symbol'
 };
 const urlHref = typeof URL === 'undefined' ? undefined
     : getOwnPropertyDescriptor(URL.prototype, 'href')?.get as Function | undefined;
+const webCollections: {
+    kind: WebCollectionKind;
+    constructor: Function;
+    has: Function;
+    entries: Function;
+    next: Function;
+}[] = [];
+if (typeof Headers !== 'undefined') {
+    webCollections.push({
+        kind: 'Headers',
+        constructor: Headers,
+        has: Headers.prototype.has,
+        entries: Headers.prototype.entries,
+        next: getPrototypeOf(Headers.prototype.entries.call(new Headers())).next as Function,
+    });
+}
+if (typeof URLSearchParams !== 'undefined') {
+    webCollections.push({
+        kind: 'URLSearchParams',
+        constructor: URLSearchParams,
+        has: URLSearchParams.prototype.has,
+        entries: URLSearchParams.prototype.entries,
+        next: getPrototypeOf(URLSearchParams.prototype.entries.call(new URLSearchParams())).next as Function,
+    });
+}
 const nativeErrorIsError = (Error as ErrorConstructor & { isError?: (value: unknown) => boolean }).isError;
 const knownBrands = new Set<BrandName>([
     'Date', 'RegExp', 'Map', 'Set', 'ArrayBuffer', 'SharedArrayBuffer',
-    'Number', 'String', 'Boolean', 'BigInt', 'Symbol', 'URL',
+    'Number', 'String', 'Boolean', 'BigInt', 'Symbol', 'URL', 'Headers', 'URLSearchParams',
 ]);
 
 function call(fn: Function, value: unknown): unknown {
@@ -93,7 +125,25 @@ function regexpFlagsOf(value: object): string {
     return result;
 }
 
-function collectionSlotInfo(value: object): Extract<SlotInfo, { kind: 'Map' | 'Set' }> | undefined {
+function webCollectionSlotInfo(value: object, hint?: WebCollectionKind): WebCollectionSlot | undefined {
+    for (const collection of webCollections) {
+        if (hint !== undefined && collection.kind !== hint) continue;
+        try {
+            Reflect.apply(collection.has, value, ['x']);
+        } catch {
+            continue;
+        }
+        const iterator = Reflect.apply(collection.entries, value, []) as Iterator<[string, string]>;
+        return {
+            kind: collection.kind,
+            entries: iteratorValues(iterator, collection.next),
+            baseConstructor: collection.constructor,
+        };
+    }
+    return undefined;
+}
+
+function collectionSlotInfo(value: object): Extract<SlotInfo, { kind: 'Map' | 'Set' }> | WebCollectionSlot | undefined {
     try {
         return { kind: 'Map', iterator: Reflect.apply(mapEntries, value, []) as Iterator<[unknown, unknown]> };
     } catch {
@@ -101,7 +151,7 @@ function collectionSlotInfo(value: object): Extract<SlotInfo, { kind: 'Map' | 'S
             return { kind: 'Set', iterator: Reflect.apply(setValues, value, []) as Iterator<unknown> };
         } catch {
             // Forged prototypes and Proxies do not carry the collection's internal slot.
-            return undefined;
+            return webCollectionSlotInfo(value);
         }
     }
 }
@@ -144,6 +194,9 @@ function slotInfo(value: object, prototype: object | null): SlotInfo | undefined
             case 'URL':
                 if (!urlHref) return undefined;
                 return { kind: hint, href: call(urlHref, value) as string };
+            case 'Headers':
+            case 'URLSearchParams':
+                return webCollectionSlotInfo(value, hint) ?? collectionSlotInfo(value);
         }
     } catch {
         // A hint can be forged or replaced; intrinsic collection calls recover the real brand.
@@ -158,6 +211,28 @@ function iteratorValues<T>(iterator: Iterator<T>, next: Function): T[] {
         if (item.done) return result;
         result.push(item.value);
     }
+}
+
+function webCollectionEntriesEqual(left: WebCollectionSlot, right: WebCollectionSlot): boolean {
+    if (left.entries.length !== right.entries.length) return false;
+    const values: Map<string, string>[] = [];
+    for (const collection of [left, right]) {
+        const firstValues = new Map<string, string>();
+        for (const [key, value] of collection.entries) {
+            if (!firstValues.has(key)) firstValues.set(key, value);
+            else if (collection.kind === 'Headers') firstValues.set(key, `${firstValues.get(key)}, ${value}`);
+        }
+        values.push(firstValues);
+    }
+    // Bun compares each entry to get(key), including repeated keys.
+    for (let side = 0; side < 2; side++) {
+        const collection = side === 0 ? left : right;
+        const otherValues = values[1 - side];
+        for (const [key, value] of collection.entries) {
+            if (otherValues.get(key) !== value) return false;
+        }
+    }
+    return true;
 }
 
 function isObjectConstructor(value: unknown, prototype: object): boolean {
@@ -365,8 +440,9 @@ export function deepEquals(a: unknown, b: unknown, strict = false): boolean {
         const xSlot = slotInfo(x, xShape.prototype), ySlot = slotInfo(y, yShape.prototype);
         if (xSlot || ySlot) {
             if (!xSlot || !ySlot || xSlot.kind !== ySlot.kind) {
-                // URL and DataView are object-like when only one side has the slot.
-                if (!(xSlot?.kind === 'URL' && !ySlot) && !(ySlot?.kind === 'URL' && !xSlot)) return false;
+                const xObjectLike = !xSlot || xSlot.kind === 'URL' || xSlot.kind === 'Headers' || xSlot.kind === 'URLSearchParams';
+                const yObjectLike = !ySlot || ySlot.kind === 'URL' || ySlot.kind === 'Headers' || ySlot.kind === 'URLSearchParams';
+                if (!xObjectLike || !yObjectLike) return false;
             } else {
                 switch (xSlot.kind) {
                     case 'Date':
@@ -403,6 +479,18 @@ export function deepEquals(a: unknown, b: unknown, strict = false): boolean {
                     case 'URL':
                         return xSlot.href === (ySlot as Extract<SlotInfo, { kind: 'URL' }>).href
                             && propertiesFromShapes(x, y, xShape, yShape, depth, false);
+                    case 'Headers':
+                    case 'URLSearchParams': {
+                        const other = ySlot as WebCollectionSlot;
+                        if (!webCollectionEntriesEqual(xSlot, other)) return false;
+                        if (strictMode) {
+                            const xConstructor = inheritedConstructor(xShape.prototype);
+                            const yConstructor = inheritedConstructor(yShape.prototype);
+                            if ((xConstructor === xSlot.baseConstructor ? undefined : xConstructor)
+                                !== (yConstructor === other.baseConstructor ? undefined : yConstructor)) return false;
+                        }
+                        return propertiesFromShapes(x, y, xShape, yShape, depth, false);
+                    }
                 }
             }
         }
