@@ -287,7 +287,11 @@ export async function copyFile(src: PathLike, dest: PathLike, mode?: number): Pr
     const srcStr = pathToString(src);
     const destStr = pathToString(dest);
     const flags = validateCopyFileMode(mode);
-    await w(asfs.copyFile(srcStr, destStr, flags), 'copyFile', srcStr, destStr);
+    try {
+        await asfs.copyFile(srcStr, destStr, flags);
+    } catch (error) {
+        throw normalizeErrnoError(error, 'copyFile', srcStr, destStr);
+    }
 }
 
 export async function truncate(path: PathLike, len?: number): Promise<void> {

@@ -133,6 +133,7 @@ export class Dir implements Directory {
     private entries: DirEntryWithParent[];
     private index = 0;
     private closed = false;
+    private closePromise: Promise<void> | null = null;
 
     constructor(path: PathLike, recursive = false) {
         const pathStr = pathToString(path);
@@ -176,25 +177,27 @@ export class Dir implements Directory {
     close(callback: (err: NodeJS.ErrnoException | null) => void): void;
     close(): Promise<void>;
     close(callback?: (err: NodeJS.ErrnoException | null) => void): Promise<void> | void {
-        if (callback) {
-            queueMicrotask(() => {
-                try {
-                    this.closeSync();
-                } catch (err) {
-                    callback(errorFromUnknown(err));
-                    return;
-                }
-                callback(null);
+        let promise: Promise<void>;
+        if (this.closed || this.closePromise) {
+            promise = Promise.reject(dirClosedError());
+        } else {
+            promise = Promise.resolve().then(() => {
+                if (!this.closed) this.closeSync();
             });
-            return;
+            this.closePromise = promise;
         }
-        return Promise.resolve().then(() => this.closeSync());
+        if (!callback) return promise;
+        promise.then(
+            () => callback(null),
+            error => callback(errorFromUnknown(error)),
+        );
     }
 
     closeSync(): void {
         if (this.closed) throw dirClosedError();
         this.closed = true;
         this.entries = [];
+        this.closePromise ??= Promise.resolve();
     }
 
     [Symbol.asyncIterator](): AsyncIterableIterator<Dirent> {
@@ -202,11 +205,11 @@ export class Dir implements Directory {
     }
 
     [Symbol.asyncDispose](): Promise<void> {
-        return this.close();
+        return this.closePromise ?? this.close();
     }
 
     [Symbol.dispose](): void {
-        this.closeSync();
+        if (!this.closed && !this.closePromise) this.closeSync();
     }
 }
 
@@ -672,6 +675,7 @@ export function createAsyncDir(
     dirHandle: CModuleAsyncFS.DirHandle,
 ): Directory {
     let closed = false;
+    let closePromise: Promise<void> | null = null;
     let exhausted = false;
 
     async function readNext(): Promise<Dirent | null> {
@@ -694,10 +698,11 @@ export function createAsyncDir(
             error => callback(errorFromUnknown(error), null),
         );
     }
-    async function closeHandle(): Promise<void> {
-        if (closed) throw dirClosedError();
+    function closeHandle(): Promise<void> {
+        if (closed) return Promise.reject(dirClosedError());
         closed = true;
-        await dirHandle.close();
+        closePromise = Promise.resolve().then(() => dirHandle.close());
+        return closePromise;
     }
     function close(): Promise<void>;
     function close(callback: (err: NodeJS.ErrnoException | null) => void): void;
@@ -719,10 +724,10 @@ export function createAsyncDir(
             throw new Error('closeSync is not supported in async opendir');
         },
         [Symbol.asyncDispose](): Promise<void> {
-            return closeHandle();
+            return closePromise ?? closeHandle();
         },
         [Symbol.dispose](): void {
-            this.closeSync();
+            if (!closed) this.closeSync();
         },
         [Symbol.asyncIterator](): AsyncIterableIterator<Dirent> {
             return directoryIterator(dir);
@@ -738,6 +743,7 @@ export function createEagerAsyncDir(
     entries: DirEntryWithParent[],
 ): Directory {
     let closed = false;
+    let closePromise: Promise<void> | null = null;
     let index = 0;
 
     async function readNext(): Promise<Dirent | null> {
@@ -755,10 +761,12 @@ export function createEagerAsyncDir(
             error => callback(errorFromUnknown(error), null),
         );
     }
-    async function closeHandle(): Promise<void> {
-        if (closed) throw dirClosedError();
+    function closeHandle(): Promise<void> {
+        if (closed) return Promise.reject(dirClosedError());
         closed = true;
         entries = [];
+        closePromise = Promise.resolve();
+        return closePromise;
     }
     function close(): Promise<void>;
     function close(callback: (err: NodeJS.ErrnoException | null) => void): void;
@@ -780,10 +788,10 @@ export function createEagerAsyncDir(
             throw new Error('closeSync is not supported in async opendir');
         },
         [Symbol.asyncDispose](): Promise<void> {
-            return closeHandle();
+            return closePromise ?? closeHandle();
         },
         [Symbol.dispose](): void {
-            this.closeSync();
+            if (!closed) this.closeSync();
         },
         [Symbol.asyncIterator](): AsyncIterableIterator<Dirent> {
             return directoryIterator(dir);
