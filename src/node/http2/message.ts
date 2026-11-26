@@ -155,13 +155,16 @@ export class Http2ServerResponse extends Writable {
     statusCode = 200;
     statusMessage = '';
     headersSent = false;
-    finished = false;
     private bodyless = false;
     private headers = new Map<string, { name: string; values: string[] }>();
 
     constructor(stream: ServerHttp2Stream) {
         super();
         this.stream = stream;
+    }
+
+    get finished(): boolean {
+        return this.writableEnded;
     }
 
     setHeader(name: string, value: string | number | readonly string[]): this {
@@ -228,33 +231,44 @@ export class Http2ServerResponse extends Writable {
     }
 
     _final(callback: (error?: Error | null) => void): void {
+        let settled = false;
+        const settle = (error?: Error | null) => {
+            if (settled) return;
+            settled = true;
+            this.stream.removeListener('error', onError);
+            this.stream.removeListener('close', onClose);
+            callback(error);
+        };
+        const onError = (error: Error) => settle(error);
+        const onClose = () => {
+            if (!this.stream.writableFinished) {
+                settle(this.stream.errored ?? Object.assign(new Error('HTTP/2 stream closed before response completed'), {
+                    code: 'ERR_STREAM_PREMATURE_CLOSE',
+                }));
+            }
+        };
+        this.stream.once('error', onError);
+        this.stream.once('close', onClose);
+        if (this.stream.errored) {
+            settle(this.stream.errored);
+            return;
+        }
+        if (this.stream.destroyed && !this.stream.writableFinished) {
+            onClose();
+            return;
+        }
         try {
-            if (!this.headersSent) {
-                this.writeHead(this.statusCode, this.statusMessage || undefined);
-                this.stream.end(() => {
-                    this.finished = true;
-                    callback();
-                });
-                return;
-            }
-            if (this.bodyless) {
-                this.stream.end(() => {
-                    this.finished = true;
-                    callback();
-                });
-                return;
-            }
-            this.stream.end(() => {
-                this.finished = true;
-                callback();
-            });
+            if (!this.headersSent) this.writeHead(this.statusCode, this.statusMessage || undefined);
+            this.stream.end();
+            void this.stream.__waitForLocalEnd().then(() => settle(), error =>
+                settle(error instanceof Error ? error : new Error(String(error))));
         } catch (error) {
-            callback(error instanceof Error ? error : new Error(String(error)));
+            settle(error instanceof Error ? error : new Error(String(error)));
         }
     }
 
     destroy(error?: Error | null): this {
-        closeQuietly(this.stream);
+        if (error || !this.writableFinished) closeQuietly(this.stream);
         return super.destroy(error) as this;
     }
 }

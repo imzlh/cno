@@ -285,60 +285,62 @@ export class Http2Session extends EventEmitter {
         this.pendingSettingsAck = false;
     }
 
-    private clearPingRequests(): void {
-        const requests = Array.from(this.pingRequests.values()).flat();
-        this.pingRequests.clear();
-        if (requests.length === 0) return;
-        const error = h2Error('ERR_HTTP2_PING_CANCEL', 'HTTP/2 ping was cancelled');
-        // Node cancels an outstanding ping as part of session teardown: the
-        // callback receives only the error and runs before the session's
-        // `close` event. Do not fabricate an ACK duration/payload or defer it
-        // past close; both details are observable by callers.
-        for (const request of requests) Reflect.apply(request.callback, undefined, [error]);
-    }
-
-    private clearPendingStreams(error: Error): void {
-        for (const stream of this.pendingStreams) stream.destroy(error);
-        this.pendingStreams.clear();
-    }
-
     close(cb?: () => void): void {
         if (this.closed) {
             if (cb) queueMicrotask(cb);
             return;
         }
-        this.closed = true;
-        this.clearPendingStreams(h2Error('ERR_HTTP2_GOAWAY_SESSION', 'The session has been closed'));
-        this.clearSettings();
-        this.clearPingRequests();
-        if (this.timeoutTimer) {
-            clearTimeout(this.timeoutTimer);
-            this.timeoutTimer = null;
+        try {
+            this.terminate('close');
+        } finally {
+            if (cb) queueMicrotask(cb);
         }
-        this.conn?.close();
-        if (!this.conn) this.socket?.destroy();
-        this.conn = null;
-        this.emit('close');
-        if (cb) queueMicrotask(cb);
     }
 
     destroy(error?: Error): void {
         if (this.destroyed) return;
+        this.terminate('destroy', error);
+    }
+
+    private terminate(operation: 'close' | 'destroy', error?: Error): void {
         const wasClosed = this.closed;
-        this.destroyed = true;
+        if (operation === 'destroy') this.destroyed = true;
         this.closed = true;
-        this.clearPendingStreams(error ?? h2Error('ERR_HTTP2_INVALID_SESSION', 'The session has been destroyed'));
+        const conn = this.conn;
+        this.conn = null;
+        const streams = Array.from(this.pendingStreams);
+        this.pendingStreams.clear();
+        const pings = Array.from(this.pingRequests.values()).flat();
+        this.pingRequests.clear();
         this.clearSettings();
-        this.clearPingRequests();
         if (this.timeoutTimer) {
             clearTimeout(this.timeoutTimer);
             this.timeoutTimer = null;
         }
-        this.conn?.destroy();
-        if (!this.conn) this.socket?.destroy();
-        this.conn = null;
-        if (error) this.emit('error', error);
-        if (!wasClosed) this.emit('close');
+
+        // User callbacks may throw or reenter; all ownership is detached first.
+        const failures: unknown[] = [];
+        const complete = (action: () => void): void => {
+            try { action(); } catch (failure) { failures.push(failure); }
+        };
+        const streamError = error ?? (operation === 'close'
+            ? h2Error('ERR_HTTP2_GOAWAY_SESSION', 'The session has been closed')
+            : h2Error('ERR_HTTP2_INVALID_SESSION', 'The session has been destroyed'));
+        for (const stream of streams) complete(() => { stream.destroy(streamError); });
+        const pingError = h2Error('ERR_HTTP2_PING_CANCEL', 'HTTP/2 ping was cancelled');
+        // Cancellation carries only the error and precedes the close event.
+        for (const ping of pings) complete(() => { Reflect.apply(ping.callback, undefined, [pingError]); });
+        complete(() => {
+            if (conn) {
+                if (operation === 'destroy') conn.destroy(error);
+                else conn.close();
+            } else {
+                this.socket?.destroy();
+            }
+        });
+        if (error) complete(() => { this.emit('error', error); });
+        if (!wasClosed) complete(() => { this.emit('close'); });
+        if (failures.length) throw failures[0];
     }
 
     ping(payload?: Buffer | Uint8Array, cb?: (err: Error | null, duration: number, payload: Buffer) => void): boolean {

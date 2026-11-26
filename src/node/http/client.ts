@@ -37,6 +37,8 @@ import { Socket } from '../net';
 import { flattenPrototype } from '../_internal/prototype';
 import { IncomingMessageImpl, OutgoingMessageImpl, validateRequestMethod, validateRequestPath } from './server';
 
+const timers = import.meta.use('timers');
+
 export { METHODS } from './constants';
 
 export interface ClientRequestArgs extends ClientRequestOptions {
@@ -352,7 +354,7 @@ export class Agent extends EventEmitter {
      * Sockets counted across every origin, for maxTotalSockets.
      */
     totalSocketCount: number = 0;
-    private _freeTimers = new WeakMap<Socket, ReturnType<typeof setTimeout>>();
+    private _freeTimers = new WeakMap<Socket, number>();
     /**
      * Slots reserved per origin between addRequest() and the connect callback.
      * `sockets[name]` only grows in the async callback, so without this a
@@ -597,7 +599,7 @@ export class Agent extends EventEmitter {
     private _clearFreeTimer(socket: Socket): void {
         const t = this._freeTimers.get(socket);
         if (t !== undefined) {
-            clearTimeout(t);
+            timers.clearTimeout(t);
             this._freeTimers.delete(socket);
         }
     }
@@ -606,7 +608,7 @@ export class Agent extends EventEmitter {
         this._clearFreeTimer(socket);
         const idle = this.options.timeout;
         if (idle === undefined || idle <= 0) return;
-        const timer = setTimeout(() => {
+        const timer = timers.setTimeout(() => {
             this._freeTimers.delete(socket);
             // Drop idle free socket (Node Agent free-socket timeout).
             const name = this.getName(options);
@@ -619,7 +621,7 @@ export class Agent extends EventEmitter {
             if (isReusableSocket(socket) || !socket._destroyed) socket.destroy();
         }, idle);
         // Idle free-socket timer must not keep the event loop alive.
-        timer.unref?.();
+        timers.unrefTimer(timer);
         this._freeTimers.set(socket, timer);
     }
 

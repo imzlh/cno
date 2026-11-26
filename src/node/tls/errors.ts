@@ -5,7 +5,7 @@ import type { CodedError, PeerCertificate } from './types';
 const ssl = import.meta.use('ssl');
 
 export function asError(error: unknown): Error {
-    return error instanceof Error ? error : new Error(String(error));
+    return Error.isError(error) ? error : new Error(String(error));
 }
 
 /**

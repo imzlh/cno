@@ -16,8 +16,19 @@ import { headerObject } from './headers';
 import { isTlsSocket, takeTcpForH2, takeTlsForH2 } from './transport';
 import { ServerHttp2Stream } from './stream';
 import { Http2ServerRequest, Http2ServerResponse } from './message';
-import { Http2Session } from './session';
-import { getPackedSettings } from './settings';
+import { Http2Session, normalizeSessionSettings } from './session';
+
+function normalizeServerSettingsUpdate(settings: Record<string, unknown>): Record<string, unknown> {
+    const update = normalizeSessionSettings(settings);
+    const customSettings = settings['customSettings'];
+    if (Object.hasOwn(settings, 'customSettings')
+        && customSettings !== null
+        && typeof customSettings === 'object'
+        && Object.keys(customSettings).length === 0) {
+        update.customSettings = {};
+    }
+    return update;
+}
 
 /* ── Server ───────────────────────────────────────────────────── */
 
@@ -38,9 +49,9 @@ export function attachServerSession(
     sessions: Set<Http2Session>,
     socket: Socket | TLSSocket,
     secure: boolean,
-    requestListener: RequestListener | null,
-    streamListener: StreamListener | null,
+    settings?: Record<string, unknown>,
 ): Http2Session | null {
+    const session = new Http2Session(constants.NGHTTP2_SESSION_SERVER, settings);
     let transport: TcpSocket;
     try {
         if (secure || isTlsSocket(socket)) {
@@ -58,8 +69,7 @@ export function attachServerSession(
         }
         return null;
     }
-    const conn = new H2Connection(transport, true, secure);
-    const session = new Http2Session(constants.NGHTTP2_SESSION_SERVER);
+    const conn = new H2Connection(transport, true, secure, session['initialSettings']);
     session['conn'] = conn;
     session['socket'] = socket as Socket;
     session['onTransportAttached'](
@@ -67,35 +77,31 @@ export function attachServerSession(
         secure ? ((socket as TLSSocket).alpnProtocol || 'h2') : undefined,
     );
     sessions.add(session);
+    session.on('error', err => host.emit('sessionError', err, session));
+    session.once('close', () => { sessions.delete(session); });
     conn.on({
-        onError: err => host.emit('sessionError', err, session),
-        onClose: () => {
-            sessions.delete(session);
-            session.close();
-        },
+        onError: err => session.destroy(err),
+        onClose: () => session.close(),
     });
-    conn.onStreamOpen = stream => {
-        stream.whenHeaders((hdrs, _ended) => {
-            const obj = headerObject(hdrs);
-            const serverStream = new ServerHttp2Stream(stream);
-            host.emit('stream', serverStream, obj, 0, hdrs);
-            if (streamListener) streamListener(serverStream, obj, 0);
-            if (requestListener || host.listenerCount('request') > 0) {
-                const request = new Http2ServerRequest(serverStream, hdrs);
-                const response = new Http2ServerResponse(serverStream);
-                host.emit('request', request, response);
-                if (requestListener) Reflect.apply(requestListener, host, [request, response]);
-            }
-        });
+    session.on('stream', (stream: ServerHttp2Stream, headers: Record<string, string | string[]>, flags: number, raw: string[]) => {
+        host.emit('stream', stream, headers, flags, raw);
+        if (host.listenerCount('request')) {
+            host.emit('request', new Http2ServerRequest(stream, headers, undefined, raw), new Http2ServerResponse(stream));
+        }
+    });
+    const acceptStream = conn.session.onstream;
+    conn.session.onstream = (id, headers, flags) => {
+        if (typeof acceptStream === 'function') acceptStream(id, headers, flags);
+        const stream = conn.getStream(id);
+        if (stream) session.emit('stream', new ServerHttp2Stream(stream, session), headerObject(headers), flags, headers.flat());
     };
     host.emit('session', session);
     return session;
 }
 
 export class Http2Server extends NetServer {
-    private streamListener: StreamListener | null = null;
-    private requestListener: RequestListener | null = null;
     private sessions = new Set<Http2Session>();
+    private settings: Record<string, unknown> | undefined;
 
     constructor(
         options?: Record<string, unknown> | StreamListener | RequestListener,
@@ -105,19 +111,27 @@ export class Http2Server extends NetServer {
         // attaches. `checkH2` runs inside the super() argument list so the gate
         // is checked before a net.Server is constructed and thrown away.
         super(Http2Server.checkH2({ pauseOnConnect: true }));
-        if (typeof options === 'function') {
-            this.requestListener = options as RequestListener;
-        } else if (typeof onRequest === 'function') {
-            this.requestListener = onRequest as RequestListener;
+        if (options && typeof options === 'object') {
+            const settings = options['settings'] as Record<string, unknown> | undefined;
+            if (settings !== undefined) {
+                this.settings = normalizeSessionSettings(settings);
+            }
         }
+        const requestListener = (typeof options === 'function' ? options : onRequest) as RequestListener | undefined;
+        if (requestListener) this.on('request', requestListener);
         this.on('connection', (socket: Socket) => {
-            attachServerSession(this, this.sessions, socket, false, this.requestListener, this.streamListener);
+            attachServerSession(this, this.sessions, socket, false, this.settings);
         });
     }
 
     private static checkH2<T>(value: T): T {
         ensureH2();
         return value;
+    }
+
+    updateSettings(settings: Record<string, unknown>): void {
+        const update = normalizeServerSettingsUpdate(settings);
+        this.settings = { ...this.settings, ...update };
     }
 
     close(cb?: (err?: Error) => void): this {
@@ -134,8 +148,7 @@ export class Http2Server extends NetServer {
  */
 export class Http2SecureServer extends tls.Server {
     private sessions = new Set<Http2Session>();
-    private streamListener: StreamListener | null = null;
-    private requestListener: RequestListener | null = null;
+    private settings: Record<string, unknown> | undefined;
     /** Retained so setSecureContext can rebuild the underlying context. */
     private secureOptions: Record<string, unknown>;
 
@@ -150,10 +163,10 @@ export class Http2SecureServer extends tls.Server {
         // ensureH2 inside the super() arguments: no TLS listener is built when
         // the h2 gate is shut.
         super(Http2SecureServer.tlsOptions(opts, alpn));
-        this.secureOptions = opts;
-        if (typeof onRequest === 'function') {
-            this.requestListener = onRequest as RequestListener;
-        }
+        const { settings, ...secureOptions } = opts;
+        this.secureOptions = secureOptions;
+        if (settings !== undefined) this.settings = normalizeSessionSettings(settings as Record<string, unknown>);
+        if (onRequest) this.on('request', onRequest as RequestListener);
         this.on('secureConnection', (tlsSocket: TLSSocket) => {
             const negotiated = tlsSocket.alpnProtocol;
             // Fail closed unless ALPN is h2 (or empty after a broken peer).
@@ -166,8 +179,7 @@ export class Http2SecureServer extends tls.Server {
                 this.sessions,
                 tlsSocket,
                 true,
-                this.requestListener,
-                this.streamListener,
+                this.settings,
             );
         });
     }
@@ -208,13 +220,8 @@ export class Http2SecureServer extends tls.Server {
 
     /** Node accepts and validates these; the wire change needs the h2 build. */
     updateSettings(settings: Record<string, unknown>): void {
-        if (settings === null || typeof settings !== 'object') {
-            throw invalidArgType('settings', 'of type object', settings);
-        }
-        // Validate with the same machinery as getPackedSettings so a bad value
-        // is rejected here rather than silently ignored.
-        getPackedSettings(settings as Parameters<typeof getPackedSettings>[0]);
-        this.secureOptions = { ...this.secureOptions, settings };
+        const update = normalizeServerSettingsUpdate(settings);
+        this.settings = { ...this.settings, ...update };
     }
 
     close(cb?: (err?: Error) => void): this {
@@ -285,8 +292,7 @@ export function performServerHandshake(
         sessions,
         socket,
         Boolean(options['secure']) || isTlsSocket(socket),
-        null,
-        null,
+        options['settings'] as Record<string, unknown> | undefined,
     );
     if (!session) throw h2Error('ERR_HTTP2_ERROR', 'HTTP/2 server handshake failed');
     return session;

@@ -1,6 +1,3 @@
-﻿const http = import.meta.use('http');
-const engine = import.meta.use('engine');
-
 import { Readable, Writable } from '../stream';
 import { createWriteAfterEndError } from '../stream/_shared';
 import { Socket, Server as NetServer, AddressInfo, type HttpOwnedTransport } from '../net';
@@ -15,13 +12,13 @@ import {
     headerEntriesToRecord,
     nextNodeRequestId,
     nodeTs,
-        toUint8Array,
+    toUint8Array,
 } from '../_internal/network-debug';
 import { isTransportDisconnectError, normalizeErrnoError } from '../_internal/errno';
 import { arrayBufferBackedBytes, viewToUint8Array } from '../_internal/buffer';
 import {
     createHeadersSentError,
-        ServerResponseAdapter,
+    ServerResponseAdapter,
     type ResponseAdapterServeHook,
 } from '../_internal/server-response-adapter';
 import { dispatchServerRequest } from '../_internal/server-request-runtime';
@@ -37,10 +34,13 @@ import {
     onServerResponseFinish,
 } from '../diagnostics_channel/builtins';
 import type { OutgoingHttpHeader, OutgoingHttpHeaders, IncomingMessage, OutgoingMessage, ServerResponse, ListenOptions, Server, RequestListener, MessageSocket } from './types';
-import { IOpaque } from '../_internal/inject';
+import type { IOpaque } from '../_internal/inject';
 import { flattenPrototype } from '../_internal/prototype';
 import { STATUS_CODES } from './constants';
 export type { IncomingHttpHeaders, OutgoingHttpHeader, OutgoingHttpHeaders, IncomingMessage, OutgoingMessage, ServerResponse, ListenOptions, Server, RequestListener } from './types';
+
+const http = import.meta.use('http');
+const engine = import.meta.use('engine');
 const { createServer: createHttpServer } = (import.meta.use('evbus')?.get('cno.node', 'httpInternals') ?? {}) as IOpaque;
 
 type Uint8Array = globalThis.Uint8Array<ArrayBuffer>;
@@ -715,7 +715,6 @@ export class ServerImpl extends NetServer implements Server {
     private _httpSocketByTcp = new WeakMap<object, Socket>();
     private _httpClosePromise: Promise<void> | null = null;
     private _httpCloseCallbacks: Array<(err?: Error) => void> = [];
-    private _httpDeferredClose: (() => void) | null = null;
 
     constructor(options: ServerOptions | RequestListener, requestListener?: RequestListener) {
         super();
@@ -748,7 +747,6 @@ export class ServerImpl extends NetServer implements Server {
             socket.destroy();
         }
         this._httpActiveSockets.clear();
-        if (this._httpDeferredClose) this._httpDeferredClose();
     }
 
     closeIdleConnections(): void {
@@ -766,7 +764,7 @@ export class ServerImpl extends NetServer implements Server {
         socket.once('close', () => {
             this._httpConnections.delete(socket);
             this._httpUpgradedSockets.delete(socket);
-            this.releaseActiveHttpSocket(socket);
+            this._httpActiveSockets.delete(socket);
         });
     }
 
@@ -774,26 +772,18 @@ export class ServerImpl extends NetServer implements Server {
         if (socket) this._httpUpgradedSockets.add(socket);
     }
 
-    private releaseActiveHttpSocket(socket: Socket | null): void {
-        if (!socket) return;
-        this._httpActiveSockets.delete(socket);
-        if (this._httpDeferredClose && this._httpActiveSockets.size === 0) {
-            this._httpDeferredClose();
-        }
-    }
-
     /** Facade for a core-owned TCP; reused across keep-alive requests on the same handle. */
-    private socketForCoreRequest(tcp: CModuleStreams.TCP, res: HttpResponse): Socket {
+    private socketForCoreRequest(tcp: CModuleStreams.TCP, connection: HttpRequest['connection'], res: HttpResponse): Socket {
         const existing = this._httpSocketByTcp.get(tcp);
         if (existing && !existing.destroyed) return existing;
 
         const owned: HttpOwnedTransport = {
             close: () => {
-                closeQuietly(res);
+                closeQuietly(connection);
             },
         };
         const socket = createAttachedSocket(tcp, owned);
-        res.onTerminalClose?.(() => {
+        res.onTerminalClose(() => {
             if (socket._httpOwned !== owned) return;
             socket._httpOwned = null;
             socket.destroy();
@@ -819,10 +809,10 @@ export class ServerImpl extends NetServer implements Server {
         const requestCallFrames = listenEntryCallFrames ?? captureNodeNetworkCallFrames();
         const requestHeaders = headerEntriesToRecord(req.headers);
         const requestUrl = buildNodeServerUrl('http:', req.url, requestHeaders, host);
-        const rawTcp = Reflect.get(req, '__cnoTcp') ?? Reflect.get(res, '__cnoTcp');
-        // Core owns wire I/O; Node socket is addresses + destroy → res.close only.
-        const nodeSocket = typeof rawTcp === 'object' && rawTcp !== null
-            ? this.socketForCoreRequest(rawTcp as CModuleStreams.TCP, res)
+        const transport = req.connection.transport;
+        // Core owns wire I/O; the Node facade closes the connection, not an old response.
+        const nodeSocket = 'setNoDelay' in transport
+            ? this.socketForCoreRequest(transport, req.connection, res)
             : null;
         if (nodeSocket) this._httpActiveSockets.add(nodeSocket);
         const { incoming, response } = createServerRequestObjects(nodeSocket);
@@ -834,7 +824,7 @@ export class ServerImpl extends NetServer implements Server {
         if (incoming.method === 'CONNECT') {
             if (this.listenerCount('connect') <= 0) {
                 res.close();
-                this.releaseActiveHttpSocket(nodeSocket);
+                if (nodeSocket) this._httpActiveSockets.delete(nodeSocket);
                 return;
             }
             let connectSocket: Socket | null = null;
@@ -847,13 +837,13 @@ export class ServerImpl extends NetServer implements Server {
             if (connectSocket && !connectSocket.destroyed) connectSocket.destroy();
                 this.emit('error', err);
             }
-            this.releaseActiveHttpSocket(nodeSocket);
+            if (nodeSocket) this._httpActiveSockets.delete(nodeSocket);
             return;
         }
         const upgradeResult = emitNodeServerUpgrade(this, res, incoming);
         if (upgradeResult.handled) {
             if (upgradeResult.upgraded) this.markHttpSocketUpgraded(nodeSocket);
-            this.releaseActiveHttpSocket(nodeSocket);
+            if (nodeSocket) this._httpActiveSockets.delete(nodeSocket);
             return;
         }
 
@@ -907,7 +897,7 @@ export class ServerImpl extends NetServer implements Server {
                 },
             });
         } finally {
-            this.releaseActiveHttpSocket(nodeSocket);
+            if (nodeSocket) this._httpActiveSockets.delete(nodeSocket);
         }
     }
 
@@ -987,7 +977,8 @@ export class ServerImpl extends NetServer implements Server {
     close(callback?: (err?: Error) => void): this {
         if (callback) this._httpCloseCallbacks.push(callback);
         if (this._httpClosePromise) return this;
-        if (!this._listening) {
+        const core = this._httpServer;
+        if (!this._listening || !core) {
             const error = Object.assign(new Error('Server is not running'), {
                 code: 'ERR_SERVER_NOT_RUNNING',
             });
@@ -1000,31 +991,7 @@ export class ServerImpl extends NetServer implements Server {
 
         // Node flips `listening` false at once; the callback/event still wait for requests to drain.
         this.listening = false;
-        const core = this._httpServer;
-        const gracefulClose = core ? Reflect.get(core, 'closeGracefully') : null;
-        const forceClose = core ? Reflect.get(core, 'shutdown') : null;
-        const invoke = (method: unknown): Promise<void> => {
-            if (typeof method !== 'function') return Promise.resolve();
-            return Promise.resolve().then(() => method.call(core)).then(() => undefined);
-        };
-        if (typeof gracefulClose === 'function') {
-            this._httpClosePromise = invoke(gracefulClose);
-        } else if (typeof forceClose === 'function' && this._httpActiveSockets.size > 0) {
-            // Only shutdown() exists: defer that destructive call until the active set drains.
-            const listener = core ? Reflect.get(core, 'listener') : null;
-            const stopAccepting = listener && Reflect.get(listener, 'close');
-            if (typeof stopAccepting === 'function') {
-                try { stopAccepting.call(listener); } catch { /* already closed */ }
-            }
-            this._httpClosePromise = new Promise<void>((resolve, reject) => {
-                this._httpDeferredClose = () => {
-                    this._httpDeferredClose = null;
-                    invoke(forceClose).then(resolve, reject);
-                };
-            });
-        } else {
-            this._httpClosePromise = invoke(forceClose);
-        }
+        this._httpClosePromise = Promise.resolve().then(() => core.closeGracefully());
         void this._httpClosePromise.then(() => {
             this._httpServer = null;
             this._listening = false;

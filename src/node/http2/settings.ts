@@ -15,7 +15,7 @@ import {
     SETTING_NAME_TO_ID,
     constants,
 } from './constants';
-import { describeReceived, invalidSettingValue, tooManyCustomSettings } from './errors';
+import { describeReceived, invalidArgType, invalidSettingValue, tooManyCustomSettings } from './errors';
 
 export function settingsValueAsUint32(id: number, value: unknown): number {
     const name = SETTING_ID_TO_NAME[id] ?? String(id);
@@ -47,7 +47,10 @@ export const MAX_ADDITIONAL_SETTINGS = 10;
  * Node keys these by numeric id; ids must be uint16 and values uint32.
  */
 export function customSettingEntries(raw: unknown): Array<[number, number]> {
-    if (raw === null || typeof raw !== 'object') return [];
+    if (raw === undefined) return [];
+    if (raw === null || typeof raw !== 'object') {
+        throw invalidArgType('customSettings', 'an object', raw);
+    }
     const keys = Object.keys(raw as Record<string, unknown>);
     if (keys.length > MAX_ADDITIONAL_SETTINGS) throw tooManyCustomSettings();
     const entries: Array<[number, number]> = [];
@@ -95,7 +98,7 @@ export function getDefaultSettings(): Record<string, number | boolean> {
  * Matches Node.js `http2.getPackedSettings`.
  */
 export function getPackedSettings(
-    settings?: Record<string, number | boolean | Record<string, number> | undefined>,
+    settings?: Record<string, unknown>,
 ): Buffer {
     // Node treats a missing/undefined argument as {} and returns an empty
     // buffer; only null and non-objects are ERR_INVALID_ARG_TYPE.

@@ -127,11 +127,7 @@ export interface PeerCertificate {
     /** Aliases of valid_from / valid_to. */
     validFrom?: string;
     validTo?: string;
-    /**
-     * Node reports the SHA-1 digest here. The C layer computes only SHA-256 and
-     * does not expose the raw DER, so this is left unset rather than filled with
-     * a SHA-256 value that a pin comparison would silently reject.
-     */
+    /** SHA-1 digest of the DER encoding (Node's spelling). */
     fingerprint?: string;
     fingerprint256?: string;
     raw?: Buffer;

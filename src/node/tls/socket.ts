@@ -387,7 +387,6 @@ TLSSocket.prototype._settleAuthorization = function _settleAuthorization(this: T
         }
         if (identityError) {
             const coded = identityError as CodedError;
-            if (!coded.code) coded.code = 'ERR_TLS_CERT_ALTNAME_INVALID';
             this.authorized = false;
             this.authorizationError = coded;
             return coded;
@@ -448,43 +447,68 @@ TLSSocket.prototype.getPeerCertificate = function getPeerCertificate(this: TLSSo
     const cert = this._sslPipe.certificate;
     if (!cert) return {};
 
+    const info = cert.info;
+    // The C layer prints one "SN=value" per line, escaping bytes RFC 2253 style.
     const parseDN = (dn: string): Record<string, string> => {
+        const decodeValue = (value: string): string => {
+            let output = '';
+            let bytes: number[] = [];
+            const flushBytes = () => {
+                if (bytes.length === 0) return;
+                output += engine.decodeString(new Uint8Array(bytes));
+                bytes = [];
+            };
+
+            for (let index = 0; index < value.length;) {
+                if (value[index] === '\\') {
+                    const hex = value.slice(index + 1, index + 3);
+                    if (/^[0-9a-fA-F]{2}$/.test(hex)) {
+                        bytes.push(parseInt(hex, 16));
+                        index += 3;
+                        continue;
+                    }
+                    flushBytes();
+                    if (index + 1 < value.length) {
+                        output += value[index + 1];
+                        index += 2;
+                    } else {
+                        output += '\\';
+                        index++;
+                    }
+                    continue;
+                }
+                flushBytes();
+                output += value[index++];
+            }
+            flushBytes();
+            return output;
+        };
+
         const result: Record<string, string> = {};
-        for (const part of dn.split('/')) {
+        for (const part of dn.split('\n')) {
             const eq = part.indexOf('=');
-            if (eq > 0) result[part.slice(0, eq)] = part.slice(eq + 1);
+            if (eq <= 0) continue;
+            result[part.slice(0, eq)] = decodeValue(part.slice(eq + 1));
         }
         return result;
     };
 
-    // Typed entries required: bare names make the SAN filter fall back to the CN.
-    const rawNames = cert.subjectAltNames ?? [];
-    const isIp = (v: string) => /^[0-9.]+$/.test(v) || v.includes(':');
-    const typed = rawNames.map(n => (n.startsWith('DNS:') || n.startsWith('IP Address:') || n.startsWith('URI:') || n.startsWith('email:'))
-        ? n
-        : (isIp(n) ? `IP Address:${n}` : `DNS:${n}`));
-    const subjectaltname = typed.length ? typed.join(', ') : undefined;
-
     const out: PeerCertificate = {
-        subject: parseDN(cert.subject),
-        issuer: parseDN(cert.issuer),
+        subject: parseDN(info.subject),
+        issuer: parseDN(info.issuer),
         // Node's key is lowercase `subjectaltname`. The camelCase spelling is
         // kept as an alias so existing callers of this module keep working.
-        subjectaltname,
-        subjectAltName: subjectaltname,
-        serialNumber: cert.serialNumber,
-        valid_from: cert.validFrom,
-        valid_to: cert.validTo,
-        validFrom: cert.validFrom,
-        validTo: cert.validTo,
+        subjectaltname: info.subjectAltName,
+        subjectAltName: info.subjectAltName,
+        serialNumber: info.serialNumber,
+        valid_from: info.validFrom,
+        valid_to: info.validTo,
+        validFrom: info.validFrom,
+        validTo: info.validTo,
+        fingerprint: cert.fingerprint,
         fingerprint256: cert.fingerprint256,
-        raw: Buffer.from([]),
+        raw: Buffer.from(cert.raw),
     };
-    // Node's `fingerprint` is the SHA-1 digest. The C layer only computes
-    // SHA-256 (mod_ssl.c tjs_ssl_pipe_get_peer_certificate) and does not expose
-    // the raw DER, so SHA-1 cannot be derived here. Reporting the SHA-256 digest
-    // under the `fingerprint` name would make a pin comparison silently
-    // mismatch, so the field is omitted rather than filled with the wrong hash.
     return out;
 };
 

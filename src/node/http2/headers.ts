@@ -84,16 +84,19 @@ export function headerObject(pairs: H2Header[]): Record<string, string | string[
 }
 
 export function toHeaderPairs(headers: Record<string, unknown>): H2Header[] {
-    const pairs: H2Header[] = [];
-    for (const [k, v] of Object.entries(headers)) {
-        if (v === undefined || v === null) continue;
-        if (Array.isArray(v)) {
-            for (const item of v) pairs.push([k, String(item)]);
+    const pseudo: H2Header[] = [];
+    const regular: H2Header[] = [];
+    for (const [name, value] of Object.entries(headers)) {
+        if (value === undefined || value === null) continue;
+        const lower = name.toLowerCase();
+        const pairs = lower.startsWith(':') ? pseudo : regular;
+        if (Array.isArray(value)) {
+            for (const item of value) pairs.push([lower, String(item)]);
         } else {
-            pairs.push([k, String(v)]);
+            pairs.push([lower, String(value)]);
         }
     }
-    return pairs;
+    return [...pseudo, ...regular];
 }
 
 /**

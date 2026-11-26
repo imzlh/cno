@@ -52,14 +52,22 @@ function pemValueToString(value: TlsPemValue | undefined): string | undefined {
     return typeof value === 'string' ? value : value.toString();
 }
 
+function isTlsKeyObject(value: TlsKeyInput): value is Exclude<TlsKeyInput, TlsPemValue> {
+    return typeof value === 'object' && value !== null && !(value instanceof Uint8Array);
+}
+
+function isTlsCertObject(value: TlsCertInput): value is Exclude<TlsCertInput, TlsPemValue> {
+    return typeof value === 'object' && value !== null && !(value instanceof Uint8Array);
+}
+
 export function keyInputToString(input: TlsKeyInput): string | undefined {
-    if (typeof input === 'string' || input instanceof Buffer) return pemValueToString(input);
-    return pemValueToString(input.pem ?? input.key);
+    if (isTlsKeyObject(input)) return pemValueToString(input.pem ?? input.key);
+    return pemValueToString(input);
 }
 
 export function certInputToString(input: TlsCertInput): string | undefined {
-    if (typeof input === 'string' || input instanceof Buffer) return pemValueToString(input);
-    return pemValueToString(input.pem ?? input.cert);
+    if (isTlsCertObject(input)) return pemValueToString(input.pem ?? input.cert);
+    return pemValueToString(input);
 }
 
 export function isPromiseLikeResult(value: unknown): value is PromiseLikeResult {

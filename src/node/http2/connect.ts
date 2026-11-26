@@ -2,7 +2,6 @@
  * node:http2 client entry point: authority/target resolution and `connect()`.
  */
 
-import { Buffer } from '../buffer';
 import { Socket, connect as netConnect } from '../net';
 import * as tls from '../tls';
 import type { TLSSocket } from '../tls';
@@ -142,54 +141,57 @@ export function connect(
 
     session.setAuthority(target.authority);
 
-    if (secure) {
-        const createConnection = opts['createConnection'];
-        if (typeof createConnection === 'function') {
-            const sock = createConnection(opts, () => {}) as Socket | TLSSocket;
-            const attach = () => {
-                try {
-                    if (isTlsSocket(sock)) session.attachTls(sock);
-                    else session.attach(sock as Socket, true);
-                } catch (e) {
-                    session.emit('error', e);
-                }
-            };
-            if (isTlsSocket(sock) && sock.alpnProtocol) {
-                queueMicrotask(attach);
-            } else {
-                sock.once('secureConnect', attach);
-                sock.once('connect', attach);
-                if ((sock as Socket).readyState === 'open' && isTlsSocket(sock) && sock._handshakeComplete) {
-                    queueMicrotask(attach);
-                }
+    const bindSocket = (socket: Socket | TLSSocket, tlsTransport: boolean): void => {
+        const event = tlsTransport ? 'secureConnect' : 'connect';
+        const onError = (error: Error) => session.destroy(error);
+        const onClose = () => { if (!session.closed) session.destroy(); };
+        const attach = () => {
+            socket.removeListener(event, attach);
+            try {
+                if (tlsTransport) session.attachTls(socket as TLSSocket);
+                else session.attach(socket as Socket, secure);
+            } catch (error) {
+                session.destroy(error instanceof Error ? error : new Error(String(error)));
             }
-            sock.on('error', err => session.emit('error', err));
-            return session;
-        }
+        };
+        session.socket = socket as Socket;
+        socket.on('error', onError);
+        socket.once('close', onClose);
+        session.once('close', () => {
+            socket.removeListener(event, attach);
+            socket.removeListener('error', onError);
+            socket.removeListener('close', onClose);
+        });
+        const connected = tlsTransport
+            ? (socket as TLSSocket)._handshakeComplete || Boolean((socket as TLSSocket).alpnProtocol)
+            : !(socket as Socket).connecting;
+        if (connected) queueMicrotask(attach);
+        else socket.once(event, attach);
+    };
 
-        const tlsSocket = tls.connect({
+    const createConnection = opts['createConnection'];
+    if (typeof createConnection === 'function') {
+        const socket = createConnection(authority, opts) as Socket | TLSSocket;
+        bindSocket(socket, socket instanceof tls.TLSSocket || isTlsSocket(socket));
+        return session;
+    }
+
+    if (secure) {
+        const socket = tls.connect({
             host,
             port,
             servername: (opts['servername'] as string) ?? host,
             rejectUnauthorized: (opts['rejectUnauthorized'] as boolean | undefined) ?? true,
-            ca: opts['ca'] as string | Buffer | undefined,
-            cert: opts['cert'] as string | Buffer | undefined,
-            key: opts['key'] as string | Buffer | undefined,
+            ca: opts['ca'] as tls.TlsConnectOptions['ca'],
+            cert: opts['cert'] as tls.TlsConnectOptions['cert'],
+            key: opts['key'] as tls.TlsConnectOptions['key'],
             ALPNProtocols: (opts['ALPNProtocols'] as string[]) ?? ['h2'],
-        }, () => {
-            try {
-                session.attachTls(tlsSocket);
-            } catch (e) {
-                session.emit('error', e);
-            }
         });
-        tlsSocket.on('error', err => session.emit('error', err));
+        bindSocket(socket, true);
         return session;
     }
 
-    const socket = netConnect({ port, host }, () => {
-        session.attach(socket, false);
-    });
-    socket.on('error', err => session.emit('error', err));
+    const socket = netConnect({ port, host });
+    bindSocket(socket, false);
     return session;
 }
