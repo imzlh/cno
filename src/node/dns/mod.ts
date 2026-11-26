@@ -21,6 +21,7 @@ import {
     getAddressFamily,
     getDefaultLookupOrder,
     getDefaultServers,
+    getDefaultServersForQuery,
     snapshotDefaultServers,
     isAddressAnswer,
     normalizeLookupError,
@@ -99,7 +100,7 @@ export interface TxtRecord {
 }
 
 type ResolveResult = ReturnType<typeof shapeAnswers>;
-type DnsCallback = (error: NodeJS.ErrnoException | null, result: ResolveResult) => void;
+type DnsCallback = (error: NodeJS.ErrnoException | null, result?: ResolveResult) => void;
 type QuerySource = (hostname: string, rrtype: Rrtype) => Promise<CModuleDNS.DNSAnswer[]>;
 
 function assertCallback(callback: unknown): asserts callback is (...args: unknown[]) => void {
@@ -116,7 +117,7 @@ function wantsTtl(options: unknown): boolean {
 }
 
 function globalQuery(hostname: string, rrtype: Rrtype): Promise<CModuleDNS.DNSAnswer[]> {
-    return queryDns(hostname, rrtype, getDefaultServers());
+    return queryDns(hostname, rrtype, getDefaultServersForQuery());
 }
 
 function completeResolve(
@@ -137,7 +138,7 @@ function completeResolve(
         // Node invokes the callback with the error alone on failure, so the
         // callback observes arguments.length === 1. Passing an explicit null
         // second argument makes it 2 and breaks arity-sensitive wrappers.
-        error => callback(error, null),
+        error => callback(error),
     );
 }
 

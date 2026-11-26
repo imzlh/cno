@@ -21,6 +21,7 @@ import {
     getAddressFamily,
     getDefaultLookupOrder,
     getDefaultServers,
+    getDefaultServersForQuery,
     snapshotDefaultServers,
     isAddressAnswer,
     normalizeLookupError,
@@ -79,7 +80,7 @@ function wantsTtl(options: unknown): boolean {
 }
 
 function globalQuery(hostname: string, rrtype: Rrtype): Promise<CModuleDNS.DNSAnswer[]> {
-    return queryDns(hostname, rrtype, getDefaultServers());
+    return queryDns(hostname, rrtype, getDefaultServersForQuery());
 }
 
 function shaped<T extends Rrtype>(hostname: string, rrtype: T, query: QuerySource): Promise<DnsResultMap[T]> {

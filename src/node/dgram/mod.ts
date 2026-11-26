@@ -14,10 +14,12 @@ import { Buffer } from '../buffer';
 import { createSystemError, toErrnoException } from '../_internal/errno';
 import { flattenPrototype } from '../_internal/prototype';
 import { tryCloseQuietly } from '../_internal/close';
+import { errnoName, errorCode, isErrorValue } from '../../utils/errno';
 import {
     errnoError,
     makeError,
     normalizeMessage,
+    normalizeBuffer,
     notRunning,
     sliceBuffer,
     validateBufferList,
@@ -113,8 +115,7 @@ export interface SocketOptions {
 // Socket class
 
 /**
- * Decorate a native bind/connect failure for delivery through a callback or an
- * 'error' event: Node's shape carries `address`/`port`, unlike uvSystemError.
+ * Decorate a native bind/connect failure with the address metadata Node exposes.
  */
 function bindConnectError(err: unknown, code: string, syscall: string, detail: { address: string; port?: number }): NodeJS.ErrnoException {
     const out = toErrnoException(err, syscall);
@@ -183,15 +184,26 @@ const WSA_TO_UV: Record<number, string> = {
 
 /** Best-effort UV code for an error raised by the `socket` module. */
 function sockErrCode(err: unknown, syscall: string): string {
+    // mod_socket.c passes POSIX errno directly to tjs_throw_errno(), while its
+    // Windows path already translates WSA errors to negative UV codes. Only
+    // re-sign native IOError values here; ordinary positive application codes
+    // must remain untouched by the shared errno conversion layer.
+    if (isErrorValue(err) && err.name === 'IOError') {
+        const code = errorCode(err);
+        if (typeof code === 'number') {
+            const name = errnoName(code < 0 ? code : -code);
+            if (name) return name;
+        }
+    }
     const normalized = toErrnoException(err, syscall);
-    if (normalized.code && normalized.code !== 'UNKNOWN') return normalized.code;
+    if (typeof normalized.code === 'string' && normalized.code !== 'UNKNOWN') return normalized.code;
     const message = errMsg(err);
     const match = /WSA error (\d+)/.exec(message);
     if (match) {
         const mapped = WSA_TO_UV[Number(match[1])];
         if (mapped) return mapped;
     }
-    return normalized.code ?? 'UNKNOWN';
+    return typeof normalized.code === 'string' ? normalized.code : 'UNKNOWN';
 }
 
 function normalizeSockOptError(err: unknown, syscall: string): NodeJS.ErrnoException {
@@ -534,9 +546,8 @@ function sendLayout(args: readonly unknown[], connected: boolean): SendLayoutSpe
 }
 
 /** Node's `sliceBuffer`, over the message as a string or a view. */
-function sliceSendMessage(msg: string | ArrayBufferView, offset: unknown, length: unknown): Uint8Array {
-    const bytes = typeof msg === 'string' ? engine.encodeString(msg) : viewToBytes(msg);
-    return sliceBuffer(bytes, offset, length);
+function sliceSendMessage(msg: unknown, offset: unknown, length: unknown): Uint8Array {
+    return sliceBuffer(normalizeBuffer(msg), offset, length);
 }
 
 /** Resolves the address and callback of a send that names a destination. */
@@ -570,13 +581,13 @@ function normalizeSendArgs(
             ? next !== undefined && typeof next !== 'function'
             : tail !== undefined;
         if (destination) throw makeError('Already connected', 'ERR_SOCKET_DGRAM_IS_CONNECTED');
-        if (sliced) msg = sliceSendMessage(msg, args[0], args[1]) as typeof msg;
+        if (sliced) msg = sliceSendMessage(msg, args[0], args[1]);
         // Connected sends put the callback where an unconnected send puts its port.
         const cb = args[portIndex];
         return { data: encodeMessage(msg), connected: true, callback: typeof cb === 'function' ? cb as SendCallback : undefined };
     }
 
-    if (sliced) msg = sliceSendMessage(msg, args[0], args[1]) as typeof msg;
+    if (sliced) msg = sliceSendMessage(msg, args[0], args[1]);
     else validateBufferList(msg);
     const data = encodeMessage(msg);
     const port = validatePort(args[portIndex], 'Port', false);
@@ -785,18 +796,18 @@ Socket.prototype.dropMembership = function dropMembership(this: Socket, multicas
     modifyMembership(this, 'dropMembership', IP_DROP_MEMBERSHIP, IPV6_DROP_MEMBERSHIP, membershipRequest(this, multicastAddress, multicastInterface));
 };
 
-function unsupportedMembership(this: Socket, name: string): void {
+function warnUnsupportedMembership(name: string): void {
     const emitWarning = Reflect.get(process, 'emitWarning');
     if (typeof emitWarning === 'function') Reflect.apply(emitWarning, process, [`dgram.${name}() is not fully supported in this runtime`, 'UnsupportedWarning']);
 }
 
 Socket.prototype.addSourceSpecificMembership = function addSourceSpecificMembership(this: Socket, _sourceAddress: string, _groupAddress: string, _multicastInterface?: string): void {
     // MCAST_JOIN_SOURCE_GROUP - C layer doesn't expose this constant
-    unsupportedMembership(this, 'addSourceSpecificMembership');
+    warnUnsupportedMembership('addSourceSpecificMembership');
 };
 
 Socket.prototype.dropSourceSpecificMembership = function dropSourceSpecificMembership(this: Socket, _sourceAddress: string, _groupAddress: string, _multicastInterface?: string): void {
-    unsupportedMembership(this, 'dropSourceSpecificMembership');
+    warnUnsupportedMembership('dropSourceSpecificMembership');
 };
 
 /**
