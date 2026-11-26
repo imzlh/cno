@@ -5,6 +5,7 @@ import { getEnv } from "../../utils/env";
 const engine = import.meta.use('engine');
 const console = import.meta.use('console');
 const asyncfs = import.meta.use('asyncfs');
+const timers = import.meta.use('timers');
 
 interface SnapshotPathOptions {
     dir?: string;
@@ -181,6 +182,31 @@ export async function runTestHook(hook: () => void | Promise<void>, name: string
         console.error(message, e);
         recordHookFailure(name, e);
     }
+}
+
+export function runTestBody(test: Deno.TestDefinition, context: Deno.TestContext): Promise<void> {
+    let timeoutId: number | undefined;
+    let immediateId: number | undefined;
+    const result = new Promise<void>((resolve, reject) => {
+        if (test.timeout && test.timeout > 0) {
+            timeoutId = timers.setTimeout(
+                () => reject(new Error(`Test timed out after ${test.timeout}ms`)),
+                test.timeout,
+            );
+        }
+        immediateId = timers.setImmediate(() => {
+            immediateId = undefined;
+            try {
+                Promise.resolve(test.fn(context)).then(resolve, reject);
+            } catch (error) {
+                reject(error);
+            }
+        });
+    });
+    return result.finally(() => {
+        if (timeoutId !== undefined) timers.clearTimeout(timeoutId);
+        if (immediateId !== undefined) timers.clearImmediate(immediateId);
+    });
 }
 
 export function createTestContext(name: string, origin: string, parent?: Deno.TestContext): Deno.TestContext {

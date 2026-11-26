@@ -2,6 +2,7 @@ import packageJson from '../../package.json';
 import { buildDenoArgs } from "../utils/args";
 import { toFsPath } from "../utils/path";
 import { wrapFSErr } from "../utils/wrap";
+import { hasErrno } from '../utils/errno';
 import { errors } from "./01_errors";
 import { defineLazy } from "../utils/lazy-accessor";
 import { getEnv } from "../utils/env";
@@ -19,6 +20,7 @@ import {
     failedTests,
     filterMatches,
     getFailedTests,
+    runTestBody,
     runTestHook,
     testRegistry,
     toError,
@@ -90,9 +92,9 @@ function toDenoArch(arch: string): string {
 function toDenoTarget(arch: string, os: string): string {
     const a = toDenoArch(arch);
     if (os === 'windows') return `${a}-pc-windows-msvc`;
-    if (os === 'darwin')  return `${a}-apple-darwin`;
+    if (os === 'darwin') return `${a}-apple-darwin`;
     if (os === 'freebsd') return `${a}-unknown-freebsd`;
-    if (os === 'netbsd')  return `${a}-unknown-netbsd`;
+    if (os === 'netbsd') return `${a}-unknown-netbsd`;
     // Runtime uname data cannot reliably distinguish Linux glibc from musl.
     return `${a}-unknown-linux-gnu`;
 }
@@ -175,91 +177,6 @@ function toNativeInspectOptions(opt?: Deno.InspectOptions) {
     };
 }
 
-function iteratorToArray(iterator: unknown): unknown[] {
-    if (!iterator || (typeof iterator !== 'object' && typeof iterator !== 'function')) return [];
-    const next = Reflect.get(iterator, 'next');
-    if (typeof next !== 'function') return [];
-    const out: unknown[] = [];
-    while (true) {
-        const step = Reflect.apply(next, iterator, []);
-        if (!step || typeof step !== 'object') break;
-        if (Reflect.get(step, 'done') === true) break;
-        out.push(Reflect.get(step, 'value'));
-    }
-    return out;
-}
-
-function inspectErrorCause(value: unknown, seen: WeakSet<object>): string {
-    if (value && (typeof value === 'object' || typeof value === 'function')) {
-        const objectValue = Object(value);
-        if (seen.has(objectValue)) return '[Circular]';
-        return inspectRealmValue(value, seen) ?? String(console.inspect(value, { colors: false, depth: 2, showHidden: false }));
-    }
-    return String(console.inspect(value, { colors: false, depth: 2, showHidden: false }));
-}
-
-function inspectRealmValue(value: unknown, seen: WeakSet<object> = new WeakSet()): string | undefined {
-    let tag = '';
-    try {
-        tag = Object.prototype.toString.call(value);
-    } catch {
-        return undefined;
-    }
-    if (tag === '[object Date]') {
-        const getTime = Reflect.get(Object(value), 'getTime');
-        let timeValue: unknown = NaN;
-        try {
-            if (typeof getTime === 'function') timeValue = Reflect.apply(getTime, value, []);
-        } catch {
-            return 'Invalid Date';
-        }
-        const time = typeof timeValue === 'number' ? timeValue : NaN;
-        return Number.isNaN(time) ? 'Invalid Date' : new Date(time).toISOString();
-    }
-    if (tag === '[object Error]' || value instanceof Error) {
-        const error = Object(value);
-        const base = `${String(Reflect.get(error, 'name') || 'Error')}: ${String(Reflect.get(error, 'message') || '')}`;
-        if (!Object.prototype.hasOwnProperty.call(error, 'cause')) return base;
-        seen.add(error);
-        return `${base}\nCaused by ${inspectErrorCause(Reflect.get(error, 'cause'), seen)}`;
-    }
-    if (tag === '[object Map]') {
-        const map = Object(value);
-        const getEntries = Reflect.get(map, 'entries');
-        let entries: unknown[] = [];
-        try {
-            if (typeof getEntries === 'function') entries = iteratorToArray(Reflect.apply(getEntries, map, []));
-        } catch {
-            return 'Map { }';
-        }
-        const shown = entries.slice(0, 3).map((entry) => {
-            if (!Array.isArray(entry)) return inspectMapSetItem(entry);
-            return `${inspectMapSetItem(entry[0])} => ${inspectMapSetItem(entry[1])}`;
-        }).join(', ');
-        const sizeValue = Reflect.get(map, 'size');
-        const size = typeof sizeValue === 'number' ? sizeValue : entries.length;
-        return `Map(${size}) {${shown}${size > 3 ? ', ...' : ''}}`;
-    }
-    if (tag === '[object Set]') {
-        const set = Object(value);
-        const getValues = Reflect.get(set, 'values');
-        let values: unknown[] = [];
-        try {
-            if (typeof getValues === 'function') values = iteratorToArray(Reflect.apply(getValues, set, []));
-        } catch {
-            return 'Set { }';
-        }
-        const shown = values.slice(0, 3).map(inspectMapSetItem).join(', ');
-        const sizeValue = Reflect.get(set, 'size');
-        const size = typeof sizeValue === 'number' ? sizeValue : values.length;
-        return `Set(${size}) {${shown}${size > 3 ? ', ...' : ''}}`;
-    }
-}
-
-function inspectMapSetItem(value: unknown): string {
-    return inspectRealmValue(value) ?? String(console.inspect(value, { colors: false, depth: 2, showHidden: false }));
-}
-
 type TestDefinitionWithNoRun = Deno.TestDefinition & { noRun?: boolean };
 
 export async function startTest(contextName = '<core>', test = true, bench = true, options: StartTestOptions = {}) {
@@ -287,166 +204,153 @@ export async function startTest(contextName = '<core>', test = true, bench = tru
     }
 
     try {
-    if (test) {
-        // Run beforeAll hooks (registration order)
-        for (const hook of beforeAllHooks) {
-            await runTestHook(hook, 'beforeAll hook', 'beforeAll hook failed');
-        }
-
-        const hasOnly = testRegistry.some(t => t.only);
-        let stopTests = options.failFast === true && failedTests.length > 0;
-
-        for (const testItem of testRegistry) {
-            if (stopTests || suiteUncaught) break;
-            if (hasOnly && !testItem.only) continue;
-            if (!filterMatches(testItem.name, options.filter)) continue;
-            if ((testItem as TestDefinitionWithNoRun).noRun) continue;
-            if (testItem.ignore) {
-                console.warn(`  skip ${testItem.name}`);
-                continue;
+        if (test) {
+            // Run beforeAll hooks (registration order)
+            for (const hook of beforeAllHooks) {
+                await runTestHook(hook, 'beforeAll hook', 'beforeAll hook failed');
             }
 
-            const repeats = testItem.repeats ?? 0;
-            const retryCount = testItem.retry ?? 0;
-            const totalRuns = repeats + 1;
+            const hasOnly = testRegistry.some(t => t.only);
+            let stopTests = options.failFast === true && failedTests.length > 0;
 
-            for (let run = 0; run < totalRuns; run++) {
+            for (const testItem of testRegistry) {
                 if (stopTests || suiteUncaught) break;
-                const runLabel = totalRuns > 1 ? `${testItem.name} (${run + 1}/${totalRuns})` : testItem.name;
-                const failureCountBefore = failedTests.length;
-
-                // beforeEach hooks (registration order)
-                for (const hook of beforeEachHooks) {
-                    await runTestHook(
-                        hook,
-                        `beforeEach hook for ${runLabel}`,
-                        `beforeEach hook failed for ${runLabel}`,
-                    );
-                }
-
-                let lastError: unknown;
-                let success = false;
-
-                for (let attempt = 0; attempt <= retryCount; attempt++) {
-                    const stepCtx = createTestContext(runLabel, contextName);
-                    try {
-                        if (testItem.timeout && testItem.timeout > 0) {
-                            const timeout = testItem.timeout;
-                            let timeoutId = 0;
-                            await Promise.race([
-                                testItem.fn(stepCtx),
-                                new Promise<never>((_, reject) => {
-                                    timeoutId = timers.setTimeout(() => reject(new Error(`Test timed out after ${timeout}ms`)), timeout);
-                                }),
-                            ]).finally(() => {
-                                if (timeoutId) timers.clearTimeout(timeoutId);
-                            });
-                        } else {
-                            await testItem.fn(stepCtx);
-                        }
-                        // Drain reportError microtask before sanitizers (preventDefault race).
-                        await Promise.resolve();
-                        success = true;
-                        break;
-                    } catch (e) {
-                        lastError = e;
-                        if (attempt < retryCount) {
-                            console.warn(`  retry ${runLabel} (attempt ${attempt + 2}/${retryCount + 1})`);
-                        }
-                    }
-                }
-                // Drain once more after attempts (uncaught may queue after throw path).
-                await Promise.resolve();
-
-                // specs/test/exit_code*: non-zero Deno.exitCode fails a clean test and resets;
-                // if the test already threw, keep the sticky code for later tests.
-                if (denoExitCode !== 0) {
-                    if (success) {
-                        success = false;
-                        lastError = new Error(`Test case finished with exit code set to ${denoExitCode}`);
-                        setDenoExitCode(0);
-                    }
-                }
-
-                if (suiteUncaught && success) {
-                    success = false;
-                    lastError = suiteUncaught;
-                }
-
-                if (success) {
-                    console.info(`  ok ${runLabel}`);
-                } else {
-                    console.error(`  fail ${runLabel}`, lastError);
-                    failedTests.push({ ...testItem, name: runLabel, error: toError(lastError) });
-                }
-
-                // afterEach hooks run LIFO (Deno/Jest style)
-                for (const hook of [...afterEachHooks].reverse()) {
-                    await runTestHook(
-                        hook,
-                        `afterEach hook for ${runLabel}`,
-                        `afterEach hook failed for ${runLabel}`,
-                    );
-                }
-
-                if (options.failFast === true && failedTests.length > failureCountBefore) {
-                    stopTests = true;
-                    break;
-                }
-                if (suiteUncaught) {
-                    stopTests = true;
-                    break;
-                }
-            }
-        }
-
-        // afterAll hooks run LIFO
-        for (const hook of [...afterAllHooks].reverse()) {
-            await runTestHook(hook, 'afterAll hook', 'afterAll hook failed');
-        }
-
-        // only option fails the overall run even when selected tests pass
-        if (hasOnly) {
-            failedTests.push({
-                name: 'only option',
-                fn: () => {},
-                error: new Error('Test failed because the "only" option was used'),
-            });
-        }
-        if (suiteUncaught && !failedTests.some(t => t.error === suiteUncaught)) {
-            failedTests.push({
-                name: `${contextName} (uncaught error)`,
-                fn: () => {},
-                error: suiteUncaught,
-            });
-        }
-    }
-
-    if (bench) {
-        const hasOnly = benchRegistry.some(b => b.only);
-        for (const benchItem of benchRegistry) {
-            try {
-                if (hasOnly && !benchItem.only) continue;
-                if (benchItem.ignore) {
-                    console.warn(`  skip ${benchItem.name}`);
+                if (hasOnly && !testItem.only) continue;
+                if (!filterMatches(testItem.name, options.filter)) continue;
+                if ((testItem as TestDefinitionWithNoRun).noRun) continue;
+                if (testItem.ignore) {
+                    console.warn(`  skip ${testItem.name}`);
                     continue;
                 }
-                const bctx = createBenchContext(benchItem.name, contextName);
-                bctx.start();
-                await benchItem.fn(bctx);
-                bctx.end();
-            } catch (e) {
-                console.error(`  fail ${benchItem.name}`);
-                console.error(e);
+
+                const repeats = testItem.repeats ?? 0;
+                const retryCount = testItem.retry ?? 0;
+                const totalRuns = repeats + 1;
+
+                for (let run = 0; run < totalRuns; run++) {
+                    if (stopTests || suiteUncaught) break;
+                    const runLabel = totalRuns > 1 ? `${testItem.name} (${run + 1}/${totalRuns})` : testItem.name;
+                    const failureCountBefore = failedTests.length;
+
+                    // beforeEach hooks (registration order)
+                    for (const hook of beforeEachHooks) {
+                        await runTestHook(
+                            hook,
+                            `beforeEach hook for ${runLabel}`,
+                            `beforeEach hook failed for ${runLabel}`,
+                        );
+                    }
+
+                    let lastError: unknown;
+                    let success = false;
+
+                    for (let attempt = 0; attempt <= retryCount; attempt++) {
+                        const stepCtx = createTestContext(runLabel, contextName);
+                        try {
+                            await runTestBody(testItem, stepCtx);
+                            // Drain reportError microtask before sanitizers (preventDefault race).
+                            await Promise.resolve();
+                            success = true;
+                            break;
+                        } catch (e) {
+                            lastError = e;
+                            if (attempt < retryCount) {
+                                console.warn(`  retry ${runLabel} (attempt ${attempt + 2}/${retryCount + 1})`);
+                            }
+                        }
+                    }
+                    // Drain once more after attempts (uncaught may queue after throw path).
+                    await Promise.resolve();
+
+                    // specs/test/exit_code*: non-zero Deno.exitCode fails a clean test and resets;
+                    // if the test already threw, keep the sticky code for later tests.
+                    if (denoExitCode !== 0) {
+                        if (success) {
+                            success = false;
+                            lastError = new Error(`Test case finished with exit code set to ${denoExitCode}`);
+                            setDenoExitCode(0);
+                        }
+                    }
+
+                    if (suiteUncaught && success) {
+                        success = false;
+                        lastError = suiteUncaught;
+                    }
+
+                    if (success) {
+                        console.info(`  ok ${runLabel}`);
+                    } else {
+                        console.error(`  fail ${runLabel}`, lastError);
+                        failedTests.push({ ...testItem, name: runLabel, error: toError(lastError) });
+                    }
+
+                    // afterEach hooks run LIFO (Deno/Jest style)
+                    for (const hook of [...afterEachHooks].reverse()) {
+                        await runTestHook(
+                            hook,
+                            `afterEach hook for ${runLabel}`,
+                            `afterEach hook failed for ${runLabel}`,
+                        );
+                    }
+
+                    if (options.failFast === true && failedTests.length > failureCountBefore) {
+                        stopTests = true;
+                        break;
+                    }
+                    if (suiteUncaught) {
+                        stopTests = true;
+                        break;
+                    }
+                }
+            }
+
+            // afterAll hooks run LIFO
+            for (const hook of [...afterAllHooks].reverse()) {
+                await runTestHook(hook, 'afterAll hook', 'afterAll hook failed');
+            }
+
+            // only option fails the overall run even when selected tests pass
+            if (hasOnly) {
+                failedTests.push({
+                    name: 'only option',
+                    fn: () => { },
+                    error: new Error('Test failed because the "only" option was used'),
+                });
+            }
+            if (suiteUncaught && !failedTests.some(t => t.error === suiteUncaught)) {
+                failedTests.push({
+                    name: `${contextName} (uncaught error)`,
+                    fn: () => { },
+                    error: suiteUncaught,
+                });
             }
         }
-    }
 
-    if (test) {
-        return failedTests.length === 0;
-    } else {
-        return true;
-    }
+        if (bench) {
+            const hasOnly = benchRegistry.some(b => b.only);
+            for (const benchItem of benchRegistry) {
+                try {
+                    if (hasOnly && !benchItem.only) continue;
+                    if (benchItem.ignore) {
+                        console.warn(`  skip ${benchItem.name}`);
+                        continue;
+                    }
+                    const bctx = createBenchContext(benchItem.name, contextName);
+                    bctx.start();
+                    await benchItem.fn(bctx);
+                    bctx.end();
+                } catch (e) {
+                    console.error(`  fail ${benchItem.name}`);
+                    console.error(e);
+                }
+            }
+        }
+
+        if (test) {
+            return failedTests.length === 0;
+        } else {
+            return true;
+        }
     } finally {
         if (test) {
             globalThis.removeEventListener('error', onSuiteError);
@@ -514,7 +418,7 @@ Object.defineProperty(globalThis, "Deno", {
                     if (key[0] == '=') continue;    // windows cmd legacy env var
                     const value = os.getenv(key);
                     if (value !== undefined) env[key] = value;
-                } catch {}
+                } catch { }
                 return env;
             },
         },
@@ -538,7 +442,7 @@ Object.defineProperty(globalThis, "Deno", {
             } catch (e) {
                 // A removed working directory reports ENOENT from getcwd; real
                 // Deno raises NotFound for it.
-                if (Reflect.get(e as object, 'code') === error.errno.ENOENT) {
+                if (hasErrno(e, error.errno.ENOENT)) {
                     throw new errors.NotFound('The current working directory was removed');
                 }
                 throw e;
@@ -650,15 +554,13 @@ Object.defineProperty(globalThis, "Deno", {
             const custom = customInspect === false
                 ? undefined
                 : ((typeof obj === 'object' && obj !== null) || typeof obj === 'function')
-                ? (obj as CustomInspectable)[customInspectSymbol]
-                : undefined;
+                    ? (obj as CustomInspectable)[customInspectSymbol]
+                    : undefined;
             if (typeof custom === 'function') {
                 const inspect = (value: unknown, options?: Deno.InspectOptions) =>
                     Deno.inspect(value, { ...opt, ...options });
                 return String(custom.call(obj, inspect, opt ?? {}));
             }
-            const realmValue = inspectRealmValue(obj);
-            if (realmValue !== undefined) return realmValue;
             return console.inspect(obj, toNativeInspectOptions(opt));
         },
 
