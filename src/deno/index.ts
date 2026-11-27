@@ -177,6 +177,27 @@ function toNativeInspectOptions(opt?: Deno.InspectOptions) {
     };
 }
 
+function inspectDenoError(error: Error, options: Deno.InspectOptions | undefined, seen: Error[]): string {
+    if (seen.includes(error)) return '[Circular]';
+
+    const cause = Object.getOwnPropertyDescriptor(error, 'cause');
+    if (!cause || !('value' in cause)) return console.inspect(error, toNativeInspectOptions(options));
+
+    const copy = new Error();
+    Object.setPrototypeOf(copy, Object.getPrototypeOf(error));
+    for (const key of Object.getOwnPropertyNames(error)) {
+        if (key === 'cause') continue;
+        const descriptor = Object.getOwnPropertyDescriptor(error, key);
+        if (descriptor) Object.defineProperty(copy, key, descriptor);
+    }
+
+    const summary = console.inspect(copy, toNativeInspectOptions(options));
+    const causeSummary = cause.value instanceof Error
+        ? inspectDenoError(cause.value, options, [...seen, error])
+        : console.inspect(cause.value, toNativeInspectOptions(options));
+    return `${summary}\nCaused by ${causeSummary}`;
+}
+
 type TestDefinitionWithNoRun = Deno.TestDefinition & { noRun?: boolean };
 
 export async function startTest(contextName = '<core>', test = true, bench = true, options: StartTestOptions = {}) {
@@ -561,6 +582,7 @@ Object.defineProperty(globalThis, "Deno", {
                     Deno.inspect(value, { ...opt, ...options });
                 return String(custom.call(obj, inspect, opt ?? {}));
             }
+            if (obj instanceof Error) return inspectDenoError(obj, opt, []);
             return console.inspect(obj, toNativeInspectOptions(opt));
         },
 
