@@ -548,6 +548,8 @@ export class BigIntStatFs extends StatFsBase<bigint> {
     }
 }
 
+Object.defineProperty(BigIntStatFs, 'name', { value: 'StatFs' });
+
 export type StatsFs = StatFs | BigIntStatFs;
 
 export function toNodeStatFs(stat: StatFsInput, options: { bigint: true }): BigIntStatFs;
