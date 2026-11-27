@@ -36,11 +36,15 @@ const nativeStackGetter = typeof nativeStackDescriptor?.get === 'function' ? nat
 
 function readNativeStack(error: object): unknown {
     if (!nativeStackGetter) return undefined;
-    try {
-        return nativeStackGetter.call(error);
-    } catch {
-        return undefined;
-    }
+    // Reading `.stack` is observable: a user Error.prepareStackTrace hook may
+    // throw, and Node propagates that exception.  This helper is only used by
+    // actual stack reads; the prototype setter below uses a brand check so an
+    // assignment never evaluates the getter as a side effect.
+    return nativeStackGetter.call(error);
+}
+
+function isNativeErrorObject(value: object): boolean {
+    return engine.isError(value);
 }
 
 function formatErrorStackHeader(error: { name?: unknown; message?: unknown }): string {
@@ -337,7 +341,7 @@ if (nativeStackDescriptor && nativeStackDescriptor.configurable && nativeStackGe
             // leaked the stack into `JSON.stringify(err)` and `Object.keys(err)`.
             // Node latches any value on a non-enumerable own property.
             if (!this || (typeof this !== 'object' && typeof this !== 'function')) return;
-            if (readNativeStack(this) === undefined) {
+            if (!isNativeErrorObject(this)) {
                 // Not an error instance (e.g. Object.create(Error.prototype)):
                 // Node performs an ordinary assignment there, so match it.
                 // `__proto__: null`: defineProperty resolves descriptor fields with

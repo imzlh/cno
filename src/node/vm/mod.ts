@@ -617,6 +617,11 @@ export function createContext(contextObject?: Context | symbol, options?: Create
     if (target !== undefined) validateContextObject(target);
     const context = (target ?? {}) as Context;
     const sandbox = new engine.Sandbox();
+    // A fresh Sandbox has an empty global on purpose; a vm context is a normal
+    // realm, so ask for every intrinsic (Date, RegExp, JSON, Map, Promise, …).
+    // Without this, code that merely contains a regular expression literal
+    // fails with "RegExp are not supported".
+    sandbox.initGlobal();
     const scope = sandbox.global as Context;
     Reflect.set(scope, 'global', scope);
     Reflect.set(scope, 'self', scope);
@@ -662,20 +667,18 @@ const SANDBOX_ERROR_CTORS = [
     'TypeError', 'URIError', 'InternalError', 'AggregateError', 'SuppressedError',
 ] as const;
 
-function installLazySandboxErrorStack(error: unknown): unknown {
-    if (!error || (typeof error !== 'object' && typeof error !== 'function')) return error;
-    let frames: unknown;
-    try {
-        frames = (error as { stack?: unknown }).stack;
-    } catch {
-        return error; // hostile getter
+function findSandboxStackDescriptor(error: object): PropertyDescriptor | undefined {
+    let current: object | null = error;
+    while (current) {
+        const descriptor = Object.getOwnPropertyDescriptor(current, 'stack');
+        if (descriptor) return descriptor;
+        current = Object.getPrototypeOf(current) as object | null;
     }
-    // Leave non-string stacks alone (prepareStackTrace CallSite arrays).
-    if (typeof frames !== 'string') return error;
-    // Drop the frames our own Proxy traps add. Without this the user sees
-    // `at construct (native)` / `at construct (node:vm/mod:…)` above their real
-    // frame — the host's Error proxy strips the same pair in webapi/basic.ts.
-    const captured = frames
+    return undefined;
+}
+
+function stripSandboxProxyFrames(frames: string): string {
+    return frames
         .split('\n')
         .filter((line) => {
             const frame = line.trimStart();
@@ -686,6 +689,19 @@ function installLazySandboxErrorStack(error: unknown): unknown {
         })
         .join('\n')
         .replace(/\n$/, '');
+}
+
+function installLazySandboxErrorStack(error: unknown, errorConstructor?: object): unknown {
+    if (!error || (typeof error !== 'object' && typeof error !== 'function')) return error;
+
+    // Capture the original descriptor without reading it.  Reading here made
+    // construction eager and ran a realm's Error.prepareStackTrace hook before
+    // user code touched `.stack`.
+    const source = findSandboxStackDescriptor(error);
+    if (!source) return error;
+    const sourceGetter = typeof source.get === 'function' ? source.get : undefined;
+    const sourceValue = 'value' in source ? source.value : undefined;
+    const hasSourceValue = 'value' in source;
 
     let customStack: unknown;
     let hasCustomStack = false;
@@ -696,10 +712,41 @@ function installLazySandboxErrorStack(error: unknown): unknown {
             get() {
                 if (hasCustomStack) return customStack;
                 const self = this as { name?: unknown; message?: unknown };
+                const frames = sourceGetter ? sourceGetter.call(self) : (hasSourceValue ? sourceValue : undefined);
+                // Leave non-string stacks alone (prepareStackTrace CallSite
+                // arrays and arbitrary hook results must pass through).
+                if (typeof frames !== 'string') {
+                    customStack = frames;
+                    hasCustomStack = true;
+                    return frames;
+                }
+                // QuickJS stores the result of Error.prepareStackTrace in the
+                // same stack slot as its ordinary string.  A hook's string is
+                // already the complete public value and must not receive our
+                // synthetic `name: message` header.
+                let prepared = false;
+                try {
+                    prepared = typeof (errorConstructor && Reflect.get(errorConstructor, 'prepareStackTrace')) === 'function';
+                } catch {
+                    // The stack getter has already produced the observable
+                    // result; a hostile constructor property must not change
+                    // the formatting decision.
+                }
+                if (prepared) {
+                    customStack = frames;
+                    hasCustomStack = true;
+                    return frames;
+                }
                 const name = self?.name === undefined ? 'Error' : String(self.name);
                 const message = self?.message === undefined ? '' : String(self.message);
                 const header = message === '' ? name : (name === '' ? message : `${name}: ${message}`);
-                return captured ? `${header}\n${captured}` : header;
+                // Drop the frames our own Proxy traps add. Without this the
+                // user sees the VM wrapper above their real frame.
+                const captured = stripSandboxProxyFrames(frames);
+                const value = captured ? `${header}\n${captured}` : header;
+                customStack = value;
+                hasCustomStack = true;
+                return value;
             },
             set(value) {
                 customStack = value;
@@ -716,11 +763,11 @@ function installSandboxErrorStacks(scope: Context): void {
         if (typeof ctor !== 'function') continue;
         const proxy = new Proxy(ctor, {
             apply(target, thisArg, args) {
-                return installLazySandboxErrorStack(Reflect.apply(target, thisArg, args));
+                return installLazySandboxErrorStack(Reflect.apply(target, thisArg, args), target);
             },
             construct(target, args, newTarget) {
                 // newTarget is forwarded so subclasses keep their own prototype.
-                return installLazySandboxErrorStack(Reflect.construct(target, args, newTarget)) as object;
+                return installLazySandboxErrorStack(Reflect.construct(target, args, newTarget), target) as object;
             },
         });
         try {
