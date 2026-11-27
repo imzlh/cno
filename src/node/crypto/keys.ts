@@ -73,6 +73,17 @@ export function exportKeyObjectBytes(keyObject: KeyObject, format: 'pem' | 'der'
         : new Uint8Array(crypto.exportPublicKeyDer(keyObject[kKeyData]));
 }
 
+let keyObjectConstructionAllowed = false;
+
+export function createKeyObject(type: 'private' | 'public' | 'secret', asymmetricKeyType: AsymmetricKeyType | undefined, data: BinaryInput, format: KeyFormat, details?: { namedCurve?: string; modulusLength?: number; publicExponent?: bigint }): KeyObject {
+    keyObjectConstructionAllowed = true;
+    try {
+        return new KeyObject(type, asymmetricKeyType, data, format, details);
+    } finally {
+        keyObjectConstructionAllowed = false;
+    }
+}
+
 export class KeyObject implements KeyObjectShape {
     readonly [Symbol.toStringTag] = 'KeyObject' as const;
     readonly type: 'private' | 'public' | 'secret';
@@ -83,6 +94,8 @@ export class KeyObject implements KeyObjectShape {
     [kKeyFormat]: KeyFormat;
 
     constructor(type: 'private' | 'public' | 'secret', asymmetricKeyType: AsymmetricKeyType | undefined, data: BinaryInput, format: KeyFormat, details?: { namedCurve?: string; modulusLength?: number; publicExponent?: bigint }) {
+        if (!keyObjectConstructionAllowed) throw new TypeError('Illegal constructor');
+        keyObjectConstructionAllowed = false;
         markKeyObject(this);
         this.type = type;
         this.asymmetricKeyType = asymmetricKeyType;
@@ -128,7 +141,7 @@ function importAsymmetricKey(type: 'private' | 'public', source: { bytes: Uint8A
         ? (format === 'pem' ? crypto.exportPrivateKeyPem(source.bytes) : crypto.exportPrivateKeyDer(source.bytes))
         : (format === 'pem' ? crypto.exportPublicKeyPem(source.bytes) : crypto.exportPublicKeyDer(source.bytes));
     const bytes = new Uint8Array(encoded);
-    return new KeyObject(type, asymmetricKeyType, bytes, format, keyDetailsFromBytes(bytes));
+    return createKeyObject(type, asymmetricKeyType, bytes, format, keyDetailsFromBytes(bytes));
 }
 
 export function createPrivateKey(input: KeyInput | { key: KeyInput; type?: string; format?: 'pem' | 'der' }): KeyObject {
@@ -145,7 +158,7 @@ export function createPrivateKey(input: KeyInput | { key: KeyInput; type?: strin
 }
 
 export function createSecretKey(key: BinaryInput): KeyObject {
-    return new KeyObject('secret', undefined, key, 'raw');
+    return createKeyObject('secret', undefined, key, 'raw');
 }
 
 // The C layer says "Unsupported key type" only when the key structure parsed
@@ -165,7 +178,7 @@ export function createPublicKey(input: KeyInput | { key: KeyInput; type?: string
         }
         if (!input.asymmetricKeyType) throw new TypeError('Private key type is unknown');
         const derived = new Uint8Array(crypto.derivePublicKeyDer(input[kKeyData]));
-        return new KeyObject('public', input.asymmetricKeyType, derived, 'der', input.asymmetricKeyDetails);
+        return createKeyObject('public', input.asymmetricKeyType, derived, 'der', input.asymmetricKeyDetails);
     }
 
     const source = normalizeKeySource(input);
@@ -188,7 +201,7 @@ export function createPublicKey(input: KeyInput | { key: KeyInput; type?: string
         // Details come from the ORIGINAL private bytes: the derived SPKI is
         // equivalent, but reading what we were handed avoids depending on the
         // derivation preserving the algorithm parameters.
-        return new KeyObject('public', asym, derived, 'der', keyDetailsFromBytes(source.bytes));
+        return createKeyObject('public', asym, derived, 'der', keyDetailsFromBytes(source.bytes));
     } catch (privateError) {
         throw isUnsupportedKeyType(privateError) ? privateError : publicError;
     }

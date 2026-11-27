@@ -1,5 +1,5 @@
 import type { AsymmetricKeyType } from './types';
-import { KeyObject, type KeyEncodingSpec, type GenerateKeyPairOptions } from './keys';
+import { createKeyObject, type KeyObject, type KeyEncodingSpec, type GenerateKeyPairOptions } from './keys';
 import { resolveCurve } from './curves';
 import { assertCallback, asError, withCode } from './errors';
 import { randomBytes } from './random';
@@ -48,8 +48,8 @@ function generateRfc8410KeyPair(type: string): { publicKey: KeyObject; privateKe
     const spki = new Uint8Array(crypto.derivePublicKeyDer(pkcs8));
     // Node reports an empty details object for these types, not undefined.
     return {
-        publicKey: new KeyObject('public', type as AsymmetricKeyType, spki, 'der', {}),
-        privateKey: new KeyObject('private', type as AsymmetricKeyType, pkcs8, 'der', {}),
+        publicKey: createKeyObject('public', type as AsymmetricKeyType, spki, 'der', {}),
+        privateKey: createKeyObject('private', type as AsymmetricKeyType, pkcs8, 'der', {}),
     };
 }
 
@@ -90,8 +90,8 @@ function generateKeyPairSyncImpl(type: string, options: GenerateKeyPairOptions |
         // The C generator always uses F4.
         const details = { modulusLength, publicExponent: 65537n };
         return {
-            publicKey: new KeyObject('public', 'rsa', keyPair.publicKey, 'pem', details),
-            privateKey: new KeyObject('private', 'rsa', keyPair.privateKey, 'pem', details),
+            publicKey: createKeyObject('public', 'rsa', keyPair.publicKey, 'pem', details),
+            privateKey: createKeyObject('private', 'rsa', keyPair.privateKey, 'pem', details),
         };
     }
 
@@ -108,8 +108,8 @@ function generateKeyPairSyncImpl(type: string, options: GenerateKeyPairOptions |
         }
 
         return {
-            publicKey: new KeyObject('public', 'ec', keyPair.publicKey, 'raw', { namedCurve }),
-            privateKey: new KeyObject('private', 'ec', keyPair.privateKey, 'raw', { namedCurve }),
+            publicKey: createKeyObject('public', 'ec', keyPair.publicKey, 'raw', { namedCurve }),
+            privateKey: createKeyObject('private', 'ec', keyPair.privateKey, 'raw', { namedCurve }),
         };
     }
 
