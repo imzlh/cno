@@ -1,5 +1,5 @@
 import { malloc } from "../utils/malloc";
-import { wrapFsClassDec as wrap, wrapFSErr, wrapFSns } from "../utils/wrap";
+import { wrapFSErr, wrapFSns, wrapDenoError } from "../utils/wrap";
 import { DOMException } from "../webapi/events";
 
 const os = import.meta.use('os');
@@ -13,6 +13,7 @@ const error = import.meta.use('error');
 
 import { dnsCache } from '@cnojs/http/dns-cache';
 import { errors } from "./01_errors";
+import { matchesErrnoCode } from "../utils/errno";
 import { systemDnsServers } from "../utils/osdns";
 import { closeStreamQuietly } from "./utils/pipe-streams";
 
@@ -50,7 +51,7 @@ class Conn<T extends Deno.Addr = Deno.Addr> implements Deno.Conn<T> {
         if (this.$consumed) throw new errors.BadResource('Connection has been consumed');
     }
 
-    @wrap
+    @wrapDenoError
     async read(p: Uint8Array): Promise<number | null> {
         this.assertUsable();
         this.$readOps++;
@@ -62,7 +63,7 @@ class Conn<T extends Deno.Addr = Deno.Addr> implements Deno.Conn<T> {
         }
     }
 
-    @wrap
+    @wrapDenoError
     async write(p: Uint8Array): Promise<number> {
         this.assertUsable();
         this.$writeOps++;
@@ -73,13 +74,13 @@ class Conn<T extends Deno.Addr = Deno.Addr> implements Deno.Conn<T> {
         }
     }
 
-    @wrap
+    @wrapDenoError
     close(): void {
         if (this.$consumed) return;
         this.pipe.close();
     }
 
-    @wrap
+    @wrapDenoError
     async closeWrite(): Promise<void> {
         this.assertUsable();
         this.$writeOps++;
@@ -110,7 +111,7 @@ class Conn<T extends Deno.Addr = Deno.Addr> implements Deno.Conn<T> {
         return this.$writable;
     }
 
-    @wrap
+    @wrapDenoError
     [Symbol.dispose]() {
         return this.pipe.close();
     }
@@ -213,12 +214,12 @@ class TcpConn extends Conn<Deno.NetAddr> implements Deno.TcpConn {
         super(pipe, addrinfo2deno(pipe.sockname), addrinfo2deno(pipe.peername));
     }
 
-    @wrap
+    @wrapDenoError
     setNoDelay(noDelay?: boolean): void {
         (this.pipe as CModuleStreams.TCP).setNoDelay(noDelay ?? false);
     }
 
-    @wrap
+    @wrapDenoError
     setKeepAlive(keepAlive?: boolean): void {
         (this.pipe as CModuleStreams.TCP).setKeepAlive(!!keepAlive, DEFAULT_TCP_KEEPALIVE_INITIAL_DELAY);
     }
@@ -299,7 +300,7 @@ class TlsConn implements Deno.TlsConn {
         this.startEncryptedRead();
     }
 
-    @wrap
+    @wrapDenoError
     private async output() {
         while (true) {
             const obuf = this.$pipe.getOutput();
@@ -431,7 +432,7 @@ class TlsConn implements Deno.TlsConn {
         return this.$writable;
     }
 
-    @wrap
+    @wrapDenoError
     async close(): Promise<void> {
         if (this.$closed || this.$closing) return;
         this.$closing = true;
@@ -453,6 +454,7 @@ class TlsConn implements Deno.TlsConn {
         this.resumeEncryptedRead(true);
     }
 
+    @wrapDenoError
     handshake(): Promise<Deno.TlsHandshakeInfo> {
         return this.$handshake;
     }
@@ -465,7 +467,7 @@ class TlsConn implements Deno.TlsConn {
         this.$rawPipe.unref();
     }
 
-    @wrap
+    @wrapDenoError
     async read(p: Uint8Array): Promise<number | null> {
         if (p.byteLength === 0) return 0;
         await this.$handshake;
@@ -493,7 +495,7 @@ class TlsConn implements Deno.TlsConn {
         return copied;
     }
 
-    @wrap
+    @wrapDenoError
     async write(p: Uint8Array): Promise<number> {
         await this.$handshake;
         let written = 0;
@@ -510,14 +512,14 @@ class TlsConn implements Deno.TlsConn {
         return written;
     }
 
-    @wrap
+    @wrapDenoError
     async closeWrite(): Promise<void> {
         this.$pipe.shutdown();
         await this.output();
         await this.$rawPipe.shutdown();
     }
 
-    @wrap
+    @wrapDenoError
     [Symbol.dispose]() {
         this.close();
     }
@@ -548,7 +550,7 @@ class UdpDatagramConn implements Deno.DatagramConn {
         return Promise.reject(new errors.NotSupported('UDP multicast is not supported'));
     }
 
-    @wrap
+    @wrapDenoError
     async receive(p?: Uint8Array): Promise<[Uint8Array<ArrayBuffer>, Deno.Addr]> {
         if (this.$closed) throw new errors.BadResource('Datagram socket has been closed');
         const buf = p ?? new Uint8Array(65536);
@@ -558,7 +560,7 @@ class UdpDatagramConn implements Deno.DatagramConn {
         return [data, addrinfo2deno(addr, 'udp')];
     }
 
-    @wrap
+    @wrapDenoError
     send(p: Uint8Array, addr: Deno.Addr): Promise<number> {
         if (this.$closed) throw new errors.BadResource('Datagram socket has been closed');
         if (addr.transport !== 'udp') throw new errors.NotSupported(`Unsupported datagram transport: ${addr.transport}`);
@@ -614,7 +616,7 @@ class Listener implements Deno.Listener {
         };
     }
 
-    @wrap
+    @wrapDenoError
     async accept(): Promise<Deno.Conn<Deno.Addr>> {
         if (this.$acceptPromise) {
             throw new errors.Busy('Listener already in use');
@@ -659,7 +661,7 @@ class Listener implements Deno.Listener {
         return this.$addr;
     }
 
-    @wrap
+    @wrapDenoError
     [Symbol.asyncIterator]() {
         return this.acceptIterator(() => this.accept());
     }
@@ -680,7 +682,7 @@ class Listener implements Deno.Listener {
         }
     }
 
-    @wrap
+    @wrapDenoError
     [Symbol.dispose]() {
         return this.close();
     }
@@ -914,12 +916,12 @@ class TcpListener extends Listener implements Deno.TcpListener {
         return this.$addr as Deno.NetAddr;
     }
 
-    @wrap
+    @wrapDenoError
     accept(): Promise<Deno.TcpConn> {
         return super.accept() as Promise<Deno.TcpConn>;
     }
 
-    @wrap
+    @wrapDenoError
     [Symbol.asyncIterator]() {
         return this.acceptIterator(() => this.accept());
     }
@@ -930,12 +932,12 @@ class UnixListener extends Listener implements Deno.UnixListener {
         return this.$addr as Deno.UnixAddr;
     }
 
-    @wrap
+    @wrapDenoError
     accept(): Promise<Deno.UnixConn> {
         return super.accept() as Promise<Deno.UnixConn>;
     }
 
-    @wrap
+    @wrapDenoError
     [Symbol.asyncIterator]() {
         return this.acceptIterator(() => this.accept());
     }
@@ -946,7 +948,7 @@ class TlsListener extends Listener implements Deno.TlsListener {
         super(pipe, true, addr);
     }
 
-    @wrap
+    @wrapDenoError
     async accept(): Promise<Deno.TlsConn> {
         const conn = await super.accept();
 
@@ -956,7 +958,7 @@ class TlsListener extends Listener implements Deno.TlsListener {
         return toConn(sslpipe, Reflect.get(conn, kRawPipe) as CModuleStreams.TCP);
     }
 
-    @wrap
+    @wrapDenoError
     [Symbol.asyncIterator]() {
         return this.acceptIterator(() => this.accept());
     }
@@ -1055,8 +1057,7 @@ const denoNetNs = {
                 if (addresses.length === 0) throw new errors.NotFound(`No ${type} records found for ${query}`);
                 return addresses.map(address => address.ip);
             } catch (cause) {
-                const code = (cause as { code?: string })?.code;
-                if (code === 'ENOTFOUND' || code === 'EAI_NONAME' || code === 'EAI_NODATA') {
+                if (matchesErrnoCode(cause, 'ENOTFOUND', 'EAI_NONAME', 'EAI_NODATA')) {
                     throw new errors.NotFound(`No ${type} records found for ${query}`);
                 }
                 throw cause;
@@ -1070,10 +1071,8 @@ const denoNetNs = {
             const request = dns.query(query, nativeType, server, port);
             info = await withTimeoutAbort(request, 5000, opt?.signal, () => request.abort?.());
         } catch (cause) {
-            const code = (cause as CModuleError.Error)?.code;
-            if (code === error.errno.ENOENT || (code as unknown) === 'ENOTFOUND' || code == error.errno.ENODATA) {
+            if (matchesErrnoCode(cause, 'ENOENT', 'ENOTFOUND', 'ENODATA'))
                 throw new errors.NotFound(`No ${type} records found for ${query}`);
-            }
             throw cause;
         }
         switch (type) {
