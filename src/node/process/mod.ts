@@ -18,7 +18,13 @@ import {
     type EnvFilePath,
 } from '../_internal/envfile';
 import path from '../path';
-import { nativeSignalFromNumber, nodeNativeSignalNumber, probeProcess, unknownSignalError } from '../_internal/signals';
+import {
+    nativeSignalFromNumber,
+    nodeNativeSignalNumber,
+    probeProcess,
+    probeProcessSignalPermission,
+    unknownSignalError,
+} from '../_internal/signals';
 
 const { basename, isAbsolute: isAbsolutePath, join } = path;
 
@@ -1363,7 +1369,7 @@ export let channel: IPCChannel | null = null;
 export function kill(pid: number, signal?: string | number | null): boolean {
     try {
         const normalizedPid = normalizeKillPid(pid);
-        if (signal === 0) probeProcess(normalizedPid);
+        if (signal === 0) probeProcessSignalPermission(normalizedPid);
         else proc.kill(normalizedPid, normalizeSignal(signal));
     } catch (e) {
         throw normalizeErrnoError(e, 'kill');

@@ -4,6 +4,7 @@
 const nativeSignals = import.meta.use('signals');
 const process = import.meta.use('process');
 const nativeError = import.meta.use('error');
+const processWithProbe = process as typeof process & { probe(pid: number): void };
 
 const namesByNumber = new Map<number, string>();
 const nativeSignalNumbers = new Set<number>();
@@ -51,6 +52,11 @@ export function nodeSignalName(number: number | null | undefined): string | null
 export function probeProcess(pid: number): void {
     if (process.isAlive(pid)) return;
     throw nativeError.Error(nativeError.errno.ESRCH);
+}
+
+/** Probe signal permission while preserving ESRCH and EPERM/EACCES details. */
+export function probeProcessSignalPermission(pid: number): void {
+    processWithProbe.probe(pid);
 }
 
 /** Node-style ERR_UNKNOWN_SIGNAL TypeError for unresolvable signal values. */
