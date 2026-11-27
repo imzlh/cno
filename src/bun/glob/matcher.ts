@@ -401,6 +401,12 @@ function matchExpanded(value: string, pattern: string, dot: boolean): boolean {
         const prefix = normalizedPattern.slice(0, -3);
         if (value === prefix) return false;
     }
+    if (value.endsWith('/')
+        && patternSegments.length >= 2
+        && patternSegments.at(-2) === '**'
+        && patternSegments.at(-1) === '*') {
+        return false;
+    }
     return matchSegments(splitPath(value), patternSegments, 0, 0, { dot }, new Map());
 }
 
