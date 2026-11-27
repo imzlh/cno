@@ -1,8 +1,8 @@
 /** WebTransport-compatible streams backed by the native QUIC extension. */
-import { requireQuic } from '../quic-native';
+import { requireQuic } from '../utils/quic-native';
 import { toOwnedBytes } from '../utils/bytes';
 import { systemCaCerts } from '../utils/ca-certs';
-import { DOMException } from './events';
+import { DOMException } from './dom-exception';
 
 const WEBTRANSPORT_ALPN = 'webtransport';
 const DEFAULT_MAX_DATAGRAM_SIZE = 1200;

@@ -1,4 +1,4 @@
-import { requireQuic } from "../quic-native";
+import { requireQuic } from "../utils/quic-native";
 import { bytesToArrayBuffer, toOwnedBytes } from "../utils/bytes";
 import { withSystemCaCerts } from "../utils/ca-certs";
 import { closeStreamQuietly } from "./utils/pipe-streams";
@@ -10,9 +10,8 @@ const DEFAULT_ALPN = "cno-quic";
 const MAX_QUEUED_DATAGRAMS = 1024;
 const MAX_QUEUED_INCOMING = 1024;
 
-function firstAlpn(protocols?: string[]): string {
-    if (!protocols || protocols.length === 0) return DEFAULT_ALPN;
-    return protocols[0];
+function alpnProtocols(protocols?: string[]): string[] {
+    return protocols?.length ? protocols.slice() : [DEFAULT_ALPN];
 }
 
 function nativeTransport(options: Deno.QuicTransportOptions): CModuleExternalQuic.TransportParams {
@@ -41,6 +40,7 @@ function streamErrorCode(reason: unknown): number {
 type SendStreamState = {
     closed: boolean;
     controller?: WritableStreamDefaultController;
+    onClosed: () => void;
 };
 
 class QuicSendStream extends WritableStream<Uint8Array<ArrayBufferLike>> {
@@ -48,8 +48,8 @@ class QuicSendStream extends WritableStream<Uint8Array<ArrayBufferLike>> {
     sendOrder = 0;
     #state: SendStreamState;
 
-    constructor(conn: CModuleExternalQuic.Connection, id: number, sendOrder = 0) {
-        const state: SendStreamState = { closed: false };
+    constructor(conn: CModuleExternalQuic.Connection, id: number, onClosed: () => void, sendOrder = 0) {
+        const state: SendStreamState = { closed: false, onClosed };
         super({
             start(controller) {
                 state.controller = controller;
@@ -60,13 +60,21 @@ class QuicSendStream extends WritableStream<Uint8Array<ArrayBufferLike>> {
             close() {
                 if (!state.closed) {
                     state.closed = true;
-                    conn.sendStream(id, new ArrayBuffer(0), true);
+                    try {
+                        conn.sendStream(id, new ArrayBuffer(0), true);
+                    } finally {
+                        state.onClosed();
+                    }
                 }
             },
             abort(reason) {
                 if (state.closed) return;
                 state.closed = true;
-                conn.resetStream(id, streamErrorCode(reason));
+                try {
+                    conn.resetStream(id, streamErrorCode(reason));
+                } finally {
+                    state.onClosed();
+                }
             },
         });
         this.id = BigInt(id);
@@ -78,12 +86,14 @@ class QuicSendStream extends WritableStream<Uint8Array<ArrayBufferLike>> {
         if (this.#state.closed) return;
         this.#state.closed = true;
         this.#state.controller?.error(new Error(`QUIC stream stopped (${errorCode})`));
+        this.#state.onClosed();
     }
 
     connectionClosed(reason: string): void {
         if (this.#state.closed) return;
         this.#state.closed = true;
         this.#state.controller?.error(new Error(reason || "QUIC connection closed"));
+        this.#state.onClosed();
     }
 }
 
@@ -91,8 +101,9 @@ class QuicReceiveStream extends ReadableStream<Uint8Array<ArrayBuffer>> {
     readonly id: bigint;
     #controller?: ReadableStreamDefaultController<Uint8Array<ArrayBuffer>>;
     #state: { closed: boolean };
+    #onClosed: () => void;
 
-    constructor(conn: CModuleExternalQuic.Connection, id: number) {
+    constructor(conn: CModuleExternalQuic.Connection, id: number, onClosed: () => void) {
         let controller: ReadableStreamDefaultController<Uint8Array<ArrayBuffer>> | undefined;
         const state = { closed: false };
         super({
@@ -100,13 +111,19 @@ class QuicReceiveStream extends ReadableStream<Uint8Array<ArrayBuffer>> {
                 controller = c;
             },
             cancel(reason) {
+                if (state.closed) return;
                 state.closed = true;
-                conn.stopSending(id, streamErrorCode(reason));
+                try {
+                    conn.stopSending(id, streamErrorCode(reason));
+                } finally {
+                    onClosed();
+                }
             },
         });
         this.id = BigInt(id);
         this.#controller = controller;
         this.#state = state;
+        this.#onClosed = onClosed;
     }
 
     push(chunk: Uint8Array<ArrayBufferLike>, fin: boolean) {
@@ -116,6 +133,7 @@ class QuicReceiveStream extends ReadableStream<Uint8Array<ArrayBuffer>> {
         if (fin) {
             this.#state.closed = true;
             this.#controller?.close();
+            this.#onClosed();
         }
     }
 
@@ -123,12 +141,14 @@ class QuicReceiveStream extends ReadableStream<Uint8Array<ArrayBuffer>> {
         if (this.#state.closed) return;
         this.#state.closed = true;
         this.#controller?.error(new Error(`QUIC stream reset (${errorCode})`));
+        this.#onClosed();
     }
 
     connectionClosed(reason: string): void {
         if (this.#state.closed) return;
         this.#state.closed = true;
         this.#controller?.error(new Error(reason || "QUIC connection closed"));
+        this.#onClosed();
     }
 }
 
@@ -136,13 +156,13 @@ type QuicStreamEntry = {
     readable?: QuicReceiveStream;
     writable?: QuicSendStream;
     incomingQueued?: boolean;
+    readableClosed?: boolean;
+    writableClosed?: boolean;
 };
 
 class QuicConnImpl implements Deno.QuicConn {
     readonly endpoint: QuicEndpointImpl;
     readonly remoteAddr: Deno.NetAddr;
-    readonly protocol: string | undefined;
-    readonly serverName: string | undefined;
     readonly maxDatagramSize = 1200;
     readonly incomingBidirectionalStreams: ReadableStream<Deno.QuicBidirectionalStream>;
     readonly incomingUnidirectionalStreams: ReadableStream<Deno.QuicReceiveStream>;
@@ -160,24 +180,30 @@ class QuicConnImpl implements Deno.QuicConn {
     #uniController?: ReadableStreamDefaultController<Deno.QuicReceiveStream>;
     #handshakeDone = false;
     #closedDone = false;
+    #protocol: string | undefined;
+    #serverName: string | undefined;
 
-    constructor(endpoint: QuicEndpointImpl, conn: CModuleExternalQuic.Connection, remoteAddr: Deno.NetAddr, protocol?: string) {
+    constructor(endpoint: QuicEndpointImpl, conn: CModuleExternalQuic.Connection) {
         this.endpoint = endpoint;
         this.#conn = conn;
-        this.remoteAddr = remoteAddr;
-        this.protocol = protocol;
+        const peer = conn.peerAddress;
+        if (!peer) throw new Error("QUIC connection has no peer address");
+        this.remoteAddr = { transport: "udp", hostname: peer.ip, port: peer.port };
         const handshake = Promise.withResolvers<void>();
         const closed = Promise.withResolvers<Deno.QuicCloseInfo>();
         this.handshake = handshake.promise;
+        void this.handshake.catch(() => {});
         this.closed = closed.promise;
         this.#handshakeResolve = handshake.resolve;
         this.#handshakeReject = handshake.reject;
         this.#closedResolve = closed.resolve;
         this.incomingBidirectionalStreams = new ReadableStream({
             start: (controller) => this.#bidiController = controller,
+            cancel: () => { this.#bidiController = undefined; },
         });
         this.incomingUnidirectionalStreams = new ReadableStream({
             start: (controller) => this.#uniController = controller,
+            cancel: () => { this.#uniController = undefined; },
         });
         endpoint.register(this);
         this.#bind();
@@ -185,7 +211,9 @@ class QuicConnImpl implements Deno.QuicConn {
 
     #bind() {
         this.#conn.onconnected = () => {
-            if (!this.#handshakeDone) {
+            if (!this.#handshakeDone && !this.#closedDone) {
+                this.#protocol = this.#conn.protocol;
+                this.#serverName = this.endpoint.role === "server" ? this.#conn.serverName : undefined;
                 this.#handshakeDone = true;
                 this.#handshakeResolve();
             }
@@ -211,16 +239,10 @@ class QuicConnImpl implements Deno.QuicConn {
             this.#queueIncomingStream(entry, bidirectional);
         };
         this.#conn.ondata = (id: number, data: Uint8Array<ArrayBufferLike>, fin: boolean) => {
-            const existed = this.#streams.has(id);
-            const bidirectional = (id & 2) === 0;
-            const entry = this.#ensureStream(id, bidirectional);
-            if (!existed) this.#queueIncomingStream(entry, bidirectional);
-            entry.readable?.push(data, fin);
-            if (fin && !entry.writable) this.#streams.delete(id);
+            this.#streams.get(id)?.readable?.push(data, fin);
         };
         this.#conn.onstreamreset = (id: number, errorCode: number) => {
             this.#streams.get(id)?.readable?.reset(errorCode);
-            this.#streams.delete(id);
         };
         this.#conn.onstreamstop = (id: number, errorCode: number) => {
             this.#streams.get(id)?.writable?.stop(errorCode);
@@ -232,14 +254,39 @@ class QuicConnImpl implements Deno.QuicConn {
         };
     }
 
+    get protocol(): string | undefined {
+        return this.#protocol;
+    }
+
+    get serverName(): string | undefined {
+        return this.#serverName;
+    }
+
     #ensureStream(id: number, bidirectional: boolean): QuicStreamEntry {
         let entry = this.#streams.get(id);
         if (!entry) {
-            entry = { readable: new QuicReceiveStream(this.#conn, id) };
+            entry = {};
             this.#streams.set(id, entry);
+            const receiving = entry;
+            entry.readable = new QuicReceiveStream(this.#conn, id, () => {
+                receiving.readableClosed = true;
+                this.#releaseStream(id, receiving);
+            });
         }
-        if (bidirectional && !entry.writable) entry.writable = new QuicSendStream(this.#conn, id);
+        if (bidirectional && !entry.writable) {
+            const sending = entry;
+            entry.writable = new QuicSendStream(this.#conn, id, () => {
+                sending.writableClosed = true;
+                this.#releaseStream(id, sending);
+            });
+        }
         return entry;
+    }
+
+    #releaseStream(id: number, entry: QuicStreamEntry): void {
+        if ((!entry.readable || entry.readableClosed) && (!entry.writable || entry.writableClosed)) {
+            this.#streams.delete(id);
+        }
     }
 
     #queueIncomingStream(entry: QuicStreamEntry, bidirectional: boolean) {
@@ -279,7 +326,7 @@ class QuicConnImpl implements Deno.QuicConn {
     async createUnidirectionalStream(options: Deno.QuicSendStreamOptions = {}): Promise<Deno.QuicSendStream> {
         if (this.#closedDone) throw new Error("QUIC connection closed");
         const id = this.#conn.openStream(false);
-        const send = new QuicSendStream(this.#conn, id, options.sendOrder);
+        const send = new QuicSendStream(this.#conn, id, () => this.#streams.delete(id), options.sendOrder);
         this.#streams.set(id, { writable: send });
         return send;
     }
@@ -311,6 +358,7 @@ class QuicConnImpl implements Deno.QuicConn {
         if (!this.#handshakeDone) this.#handshakeReject(new Error(info.reason || "QUIC connection closed during handshake"));
         for (const waiter of this.#datagramWaiters) waiter.reject(new Error(info.reason || "QUIC connection closed"));
         this.#datagramWaiters.length = 0;
+        this.#datagrams.length = 0;
         for (const entry of this.#streams.values()) {
             entry.readable?.connectionClosed(info.reason);
             entry.writable?.connectionClosed(info.reason);
@@ -328,6 +376,7 @@ class QuicIncomingImpl implements Deno.QuicIncoming {
     readonly remoteAddressValidated = false;
     readonly remoteAddr: Deno.NetAddr;
     #conn: QuicConnImpl;
+    #accepted = false;
 
     constructor(conn: QuicConnImpl) {
         this.#conn = conn;
@@ -338,10 +387,14 @@ class QuicIncomingImpl implements Deno.QuicIncoming {
     accept(options: Deno.QuicAcceptOptions<true>): Deno.QuicConn;
     accept(options?: Deno.QuicAcceptOptions<false>): Promise<Deno.QuicConn>;
     accept(options?: Deno.QuicAcceptOptions<boolean>): Deno.QuicConn | Promise<Deno.QuicConn> {
-        return options?.zeroRtt ? this.#conn : Promise.resolve(this.#conn);
+        if (this.#accepted) throw new TypeError("QUIC incoming connection is already handled");
+        this.#accepted = true;
+        return options?.zeroRtt ? this.#conn : this.#conn.handshake.then(() => this.#conn);
     }
 
     refuse(): void {
+        if (this.#accepted) throw new TypeError("QUIC incoming connection is already handled");
+        this.#accepted = true;
         this.#conn.close({ closeCode: 0, reason: "refused" });
     }
 
@@ -371,12 +424,7 @@ class QuicListenerImpl implements Deno.QuicListener {
                 nativeConn.close(0, "accept backlog full");
                 return;
             }
-            const conn = new QuicConnImpl(
-                endpoint,
-                nativeConn,
-                { transport: "udp", hostname: "0.0.0.0", port: 0 },
-                endpoint.alpn,
-            );
+            const conn = new QuicConnImpl(endpoint, nativeConn);
             const incoming = new QuicIncomingImpl(conn);
             const waiter = this.#waiters.shift();
             if (waiter) waiter.resolve(incoming);
@@ -404,23 +452,36 @@ class QuicListenerImpl implements Deno.QuicListener {
         const err = new Error("QUIC listener stopped");
         for (const waiter of this.#waiters) waiter.reject(err);
         this.#waiters.length = 0;
+        for (const incoming of this.#incoming) incoming.refuse();
+        this.#incoming.length = 0;
     }
 
     async *[Symbol.asyncIterator](): AsyncIterableIterator<Deno.QuicIncoming> {
-        while (!this.#stopped) yield await this.incoming();
+        while (!this.#stopped) {
+            try {
+                yield await this.incoming();
+            } catch (error) {
+                if (!this.#stopped) throw error;
+            }
+        }
     }
 }
 
 class QuicEndpointImpl implements Deno.QuicEndpoint {
     readonly addr: Deno.NetAddr;
+    readonly bindHostname?: string;
     socket?: CModuleExternalQuic.Socket;
-    alpn = DEFAULT_ALPN;
+    alpnProtocols = [DEFAULT_ALPN];
     /** Native sockets bake in role/ALPN/trust at construction — reuse must match. */
     role?: "client" | "server";
     #connections = new Set<QuicConnImpl>();
     #closed = false;
+    #listener?: QuicListenerImpl;
+    #closeWhenUnused: boolean;
 
-    constructor(options: Deno.QuicEndpointOptions = {}) {
+    constructor(options: Deno.QuicEndpointOptions = {}, closeWhenUnused = false) {
+        this.#closeWhenUnused = closeWhenUnused;
+        this.bindHostname = options.hostname;
         this.addr = {
             transport: "udp",
             hostname: options.hostname ?? "0.0.0.0",
@@ -431,7 +492,7 @@ class QuicEndpointImpl implements Deno.QuicEndpoint {
     listen(options: Deno.QuicListenOptions): Deno.QuicListener {
         if (this.#closed) throw new Error("QUIC endpoint closed");
         if (this.socket) throw new Error("QUIC endpoint is already in use");
-        this.alpn = firstAlpn(options.alpnProtocols);
+        this.alpnProtocols = alpnProtocols(options.alpnProtocols);
         const nativeQuic = requireQuic();
         this.socket = new nativeQuic.Socket({
             isServer: true,
@@ -439,17 +500,19 @@ class QuicEndpointImpl implements Deno.QuicEndpoint {
             port: this.addr.port,
             cert: options.cert,
             key: options.key,
-            alpn: this.alpn,
+            alpnProtocols: this.alpnProtocols,
             transport: nativeTransport(options),
         });
         this.socket.onerror = (message: string) => this.fail(message);
         this.role = "server";
-        return new QuicListenerImpl(this, this.socket);
+        this.updateAddress();
+        return this.#listener = new QuicListenerImpl(this, this.socket);
     }
 
     close(info: Deno.QuicCloseInfo = { closeCode: 0, reason: "" }): void {
         if (this.#closed) return;
         this.#closed = true;
+        this.#listener?.stop();
         for (const conn of [...this.#connections]) conn.endpointClosed(info);
         if (this.socket) {
             closeStreamQuietly(this.socket);
@@ -464,6 +527,19 @@ class QuicEndpointImpl implements Deno.QuicEndpoint {
 
     unregister(conn: QuicConnImpl): void {
         this.#connections.delete(conn);
+        if (this.#closeWhenUnused && this.#connections.size === 0) {
+            queueMicrotask(() => {
+                if (this.#connections.size === 0) this.close();
+            });
+        }
+    }
+
+    updateAddress(): void {
+        const local = this.socket?.localAddress;
+        if (local) {
+            this.addr.hostname = local.ip;
+            this.addr.port = local.port;
+        }
     }
 
     ensureOpen(): void {
@@ -477,33 +553,34 @@ class QuicEndpointImpl implements Deno.QuicEndpoint {
 
 function connectQuic(options: Deno.ConnectQuicOptions<boolean>): Promise<Deno.QuicConn> {
     let endpoint: QuicEndpointImpl;
-    if (options.endpoint === undefined) endpoint = new QuicEndpointImpl();
+    if (options.endpoint === undefined) endpoint = new QuicEndpointImpl({}, true);
     else if (options.endpoint instanceof QuicEndpointImpl) endpoint = options.endpoint;
     else throw new TypeError("endpoint must be a Deno.QuicEndpoint created by this runtime");
     endpoint.ensureOpen();
     const nativeQuic = requireQuic();
-    const alpn = firstAlpn(options.alpnProtocols);
+    const protocols = alpnProtocols(options.alpnProtocols);
     // A native Socket bakes in its role, ALPN and trust store at construction.
     // A server socket has no verify_certificate at all, so reusing one for a
     // client handshake would skip chain *and* signature verification entirely.
     if (endpoint.socket && endpoint.role !== "client") {
         throw new Error("QUIC endpoint is already in use as a server; use a separate endpoint to connect");
     }
-    if (endpoint.socket && endpoint.alpn !== alpn) {
+    if (endpoint.socket && (endpoint.alpnProtocols.length !== protocols.length ||
+        endpoint.alpnProtocols.some((protocol, index) => protocol !== protocols[index]))) {
         throw new Error(
-            `QUIC endpoint is already connected with ALPN ${JSON.stringify(endpoint.alpn)}; ` +
-            `reuse cannot renegotiate to ${JSON.stringify(alpn)}`,
+            `QUIC endpoint is already connected with ALPN ${JSON.stringify(endpoint.alpnProtocols)}; ` +
+            `reuse cannot renegotiate to ${JSON.stringify(protocols)}`,
         );
     }
     if (endpoint.socket && options.caCerts?.length) {
         throw new Error("QUIC endpoint is already connected; caCerts cannot be changed on reuse");
     }
     if (!endpoint.socket) {
-        endpoint.alpn = alpn;
+        endpoint.alpnProtocols = protocols;
         endpoint.socket = new nativeQuic.Socket({
-            host: endpoint.addr.hostname,
+            host: endpoint.bindHostname,
             port: endpoint.addr.port,
-            alpn: endpoint.alpn,
+            alpnProtocols: endpoint.alpnProtocols,
             transport: nativeTransport(options),
             verifyPeer: true,
             // OpenSSL's default verify paths are empty on Windows — merge the OS store.
@@ -512,18 +589,19 @@ function connectQuic(options: Deno.ConnectQuicOptions<boolean>): Promise<Deno.Qu
         endpoint.role = "client";
         endpoint.socket.onerror = (message: string) => endpoint.fail(message);
     }
-    const nativeConn = endpoint.socket.connect(
-        options.hostname,
-        options.port,
-        options.serverName ?? options.hostname,
-    );
-    const conn = new QuicConnImpl(
-        endpoint,
-        nativeConn,
-        { transport: "udp", hostname: options.hostname, port: options.port },
-        endpoint.alpn,
-    );
-    return conn.handshake.then(() => conn);
+    try {
+        const nativeConn = endpoint.socket.connect(
+            options.hostname,
+            options.port,
+            options.serverName ?? options.hostname,
+        );
+        endpoint.updateAddress();
+        const conn = new QuicConnImpl(endpoint, nativeConn);
+        return conn.handshake.then(() => conn);
+    } catch (error) {
+        if (options.endpoint === undefined) endpoint.close();
+        throw error;
+    }
 }
 
 export { QuicEndpointImpl as QuicEndpoint, connectQuic };

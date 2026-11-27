@@ -4,7 +4,7 @@
  * Dynamic:  `ext:quic` (DEF_MODULE when built as .so).
  */
 
-/// <reference path="../../ext-quic/native.d.ts" />
+/// <reference path="../../../ext-quic/native.d.ts" />
 
 export type QuicModule = {
     Socket: typeof CModuleExternalQuic.Socket;
@@ -18,7 +18,7 @@ function isQuicModule(value: unknown): value is QuicModule {
     return typeof socket === 'function' && constants !== null && typeof constants === 'object';
 }
 
-let cached: QuicModule | null | undefined;
+let cached: QuicModule | null = null;
 const forceUnavailableKey = Symbol.for('cno.quic.forceUnavailable');
 
 function forceUnavailable(): boolean {
@@ -37,10 +37,7 @@ function tryUse(name: '@cnojs/quic' | 'ext:quic'): QuicModule | null {
 /** null when the native extension is not linked/loaded. */
 export function tryLoadQuic(): QuicModule | null {
     if (forceUnavailable()) return null;
-    if (cached !== undefined) return cached;
-    const mod = tryUse('@cnojs/quic') ?? tryUse('ext:quic');
-    cached = mod;
-    return mod;
+    return cached ??= tryUse('@cnojs/quic') ?? tryUse('ext:quic');
 }
 
 export function requireQuic(): QuicModule {
@@ -63,5 +60,4 @@ export function quicAvailable(): boolean {
  */
 export function __forceQuicUnavailable(force: boolean): void {
     Reflect.set(globalThis, forceUnavailableKey, force);
-    cached = undefined;
 }
