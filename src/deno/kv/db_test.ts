@@ -2,9 +2,6 @@ import { KvDatabase } from './db';
 
 const sqlite3 = import.meta.use('sqlite3');
 
-type Handle = CModuleSQLite3.Sqlite3Handle;
-type Statement = CModuleSQLite3.Sqlite3Stmt;
-
 function assert(condition: unknown, message: string): asserts condition {
     if (!condition) throw new Error(message);
 }
@@ -30,42 +27,33 @@ function installSqliteMock(failExecAt?: number): {
     const originalOpen = sqlite3.open;
     let execCount = 0;
 
-    sqlite3.open = (() => {
+    sqlite3.open = (...args) => {
         counters.opens++;
-        const statements = new Set<Statement>();
-        const handle = {
-            exec(): void {
-                execCount++;
-                if (failExecAt === execCount) throw new Error(`injected exec failure ${execCount}`);
-            },
-            prepare(): Statement {
-                counters.prepares++;
-                let finalized = false;
-                const statement = {
-                    all(): CModuleSQLite3.SqliteRow[] {
-                        return [];
-                    },
-                    run(): void {},
-                    finalize(): void {
-                        if (finalized) return;
-                        finalized = true;
-                        counters.finalizes++;
-                        statements.delete(statement as Statement);
-                    }
-                } as Statement;
-                statements.add(statement);
-                return statement;
-            },
-            changes(): number {
-                return 0;
-            },
-            close(): void {
-                counters.closes++;
-                for (const statement of [...statements]) statement.finalize();
-            }
-        } as Handle;
+        const handle = originalOpen(...args);
+        const { exec, prepare, close } = handle;
+        handle.exec = sql => {
+            execCount++;
+            if (failExecAt === execCount) throw new Error(`injected exec failure ${execCount}`);
+            exec.call(handle, sql);
+        };
+        handle.prepare = sql => {
+            const statement = prepare.call(handle, sql);
+            counters.prepares++;
+            const { finalize } = statement;
+            let finalized = false;
+            statement.finalize = () => {
+                finalize.call(statement);
+                if (!finalized) counters.finalizes++;
+                finalized = true;
+            };
+            return statement;
+        };
+        handle.close = () => {
+            counters.closes++;
+            close.call(handle);
+        };
         return handle;
-    }) as typeof sqlite3.open;
+    };
 
     return {
         counters,
