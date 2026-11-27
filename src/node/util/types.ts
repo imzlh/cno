@@ -1,3 +1,5 @@
+import { isKeyObject as hasKeyObjectBrand } from '../crypto/key-brand';
+
 const engine = import.meta.use('engine');
 
 const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
@@ -10,6 +12,9 @@ const numberValueOf = Number.prototype.valueOf;
 const stringValueOf = String.prototype.valueOf;
 const bigintValueOf = BigInt.prototype.valueOf;
 const symbolValueOf = Symbol.prototype.valueOf;
+const cryptoKeyTypeGetter = typeof CryptoKey === 'function'
+    ? Object.getOwnPropertyDescriptor(CryptoKey.prototype, 'type')?.get
+    : undefined;
 
 function hasBoxedSlot(value: unknown, valueOf: (this: unknown) => unknown): boolean {
     if (!value || typeof value !== 'object') return false;
@@ -148,11 +153,15 @@ export function isExternal(_value: unknown): boolean {
 }
 
 export function isKeyObject(value: unknown): boolean {
-    return value !== null && typeof value === 'object'
-        && toStringTag(value) === 'KeyObject';
+    return hasKeyObjectBrand(value);
 }
 
 export function isCryptoKey(value: unknown): boolean {
-    return value !== null && typeof value === 'object'
-        && toStringTag(value) === 'CryptoKey';
+    if (value === null || typeof value !== 'object' || !cryptoKeyTypeGetter) return false;
+    try {
+        Reflect.apply(cryptoKeyTypeGetter, value, []);
+        return true;
+    } catch {
+        return false;
+    }
 }

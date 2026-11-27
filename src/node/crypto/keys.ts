@@ -1,6 +1,7 @@
 import { Buffer } from '../buffer';
 import type { BinaryInput, KeyInput, KeyObject as KeyObjectShape, KeyExportOptions, SecretJwk, AsymmetricKeyType } from './types';
 import { getKeyBytes, toBuffer, keyDetailsFromBytes, kKeyData, kKeyFormat, isKeyObject, type KeyFormat } from './helpers';
+import { markKeyObject } from './key-brand';
 
 /**
  * KeyObject plus the import/export surface: createPrivateKey, createPublicKey,
@@ -82,6 +83,7 @@ export class KeyObject implements KeyObjectShape {
     [kKeyFormat]: KeyFormat;
 
     constructor(type: 'private' | 'public' | 'secret', asymmetricKeyType: AsymmetricKeyType | undefined, data: BinaryInput, format: KeyFormat, details?: { namedCurve?: string; modulusLength?: number; publicExponent?: bigint }) {
+        markKeyObject(this);
         this.type = type;
         this.asymmetricKeyType = asymmetricKeyType;
         this[kKeyData] = new Uint8Array(toBuffer(data));

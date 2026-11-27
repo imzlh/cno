@@ -1,6 +1,7 @@
 import { Buffer } from '../buffer';
 import type { BinaryInput, KeyInput, KeyObject, KeyWithOptions, AsymmetricKeyType } from './types';
 import { base64ToBytes, concatChunks as concatBuffers, hexToBytes } from '../_internal/buffer';
+import { isKeyObject as hasKeyObjectBrand } from './key-brand';
 export { concatBuffers };
 
 const engine = import.meta.use('engine');
@@ -92,9 +93,7 @@ export function isKeyObject(value: unknown): value is KeyObject & {
     [kKeyFormat]: KeyFormat;
     asymmetricKeyType?: AsymmetricKeyType;
 } {
-    return value !== null && typeof value === 'object'
-        && Reflect.get(value, Symbol.toStringTag) === 'KeyObject'
-        && kKeyData in value;
+    return hasKeyObjectBrand(value) && kKeyData in value;
 }
 
 export function getKeyBytes(input: KeyInput): Uint8Array {
