@@ -919,6 +919,8 @@ export class Module {
 
     static _cache: Record<string, unknown> = {};
 
+    static declare _extensions: RequireExtensionMap;
+
     static _pathCache = _pathCache;
 
     static _nodeModulePaths = _nodeModulePaths;

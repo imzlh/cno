@@ -1,5 +1,7 @@
 import { concatChunks } from '../_internal/buffer';
 import { addPromiseHook, PromiseState } from '../_internal/promise-hook';
+import type { Readable } from 'node:stream';
+import type { HeapSnapshotOptions } from 'node:v8';
 
 /**
  * Node.js v8 module
@@ -64,6 +66,12 @@ function writeDoubleLE(value: number): Uint8Array {
     const out = new Uint8Array(8);
     new DataView(out.buffer).setFloat64(0, value, true);
     return out;
+}
+
+function unsupported(name: string): never {
+    throw Object.assign(new Error(`${name} is not supported by this runtime`), {
+        code: 'ERR_METHOD_NOT_IMPLEMENTED',
+    });
 }
 
 function ensureHookCallback(name: string, callback: HookCallable): void {
@@ -178,6 +186,14 @@ export function getHeapCodeStatistics(): {
         external_script_source_size: 0,
         cpu_profiler_metadata_size: 0,
     };
+}
+
+export function getHeapSnapshot(_options?: HeapSnapshotOptions): Readable {
+    return unsupported('getHeapSnapshot');
+}
+
+export function writeHeapSnapshot(_filename?: string, _options?: HeapSnapshotOptions): string {
+    return unsupported('writeHeapSnapshot');
 }
 
 export function setFlagsFromString(flags: string): void {

@@ -449,6 +449,10 @@ export class CookieMap implements Iterable<[string, string]> {
     }
 }
 
+export interface CookieMap {
+    [Symbol.iterator](): IterableIterator<[string, string]>;
+}
+
 for (const property of [
     'get', 'toSetCookieHeaders', 'has', 'set', 'delete',
     'entries', 'keys', 'values', 'forEach', 'toJSON',
